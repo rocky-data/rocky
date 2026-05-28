@@ -4,5 +4,19 @@
   "total": 3,
   "passed": 3,
   "failed": 0,
-  "failures": []
+  "failures": [],
+  "model_results": [
+    {
+      "model": "raw_orders",
+      "status": "pass"
+    },
+    {
+      "model": "customer_orders",
+      "status": "pass"
+    },
+    {
+      "model": "revenue_summary",
+      "status": "pass"
+    }
+  ]
 }

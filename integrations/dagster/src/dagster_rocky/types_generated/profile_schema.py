@@ -33,6 +33,8 @@ class ProfileOutput(BaseModel):
     JSON output for `rocky profile <model> [--column <col>]`.
 
     A per-column data profile (row / null / distinct counts, min / max, and the low-cardinality domain) for a model's target table, computed by a single aggregate query per column. DuckDB-only this release; a non-DuckDB target reports `unavailable` with an empty `columns` list rather than erroring.
+
+    When the model's declared target isn't materialized (the agentic authoring loop pre-`rocky run`, or a replication-pipeline POC that doesn't run the transformation models), profile falls back to the model's first resolvable source table. The fallback is labelled via `profiled_table` (the table actually queried) and `fell_back_from` (the missing target), so consumers can surface "source preview, not model output" in the UI.
     """
 
     columns: list[ProfileColumnStats]
@@ -40,7 +42,15 @@ class ProfileOutput(BaseModel):
     One entry per profiled column.
     """
     command: str
+    fell_back_from: str | None = None
+    """
+    When set, profile fell back to a source because the model's declared target wasn't materialized; carries the declared-target FQN that was missing. `None` when the declared target was profiled directly.
+    """
     model: str
+    profiled_table: str | None = None
+    """
+    Fully-qualified table actually profiled (e.g. `staging.raw_orders` or `raw__orders.orders`). When `fell_back_from` is set, this differs from the model's declared target. Omitted when `unavailable` is set.
+    """
     unavailable: str | None = None
     """
     Set when profiling could not run (e.g. a non-DuckDB target this release).

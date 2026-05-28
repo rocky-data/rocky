@@ -98,6 +98,29 @@
       ],
       "type": "object"
     },
+    "ModelTestResult": {
+      "description": "One per-model outcome from the local model-execution test.\n\n`status` is `\"pass\"` or `\"fail\"`. `error` is set only when `status = \"fail\"`. Mirrors `rocky_engine::test_runner::ModelTestResult` with the status flattened to a string so consumers (Pydantic, TypeScript) get a stable, JSON-Schema-friendly shape.",
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "status": {
+          "description": "`\"pass\"` or `\"fail\"`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model",
+        "status"
+      ],
+      "type": "object"
+    },
     "TestFailure": {
       "description": "One failed test, mirroring the (name, error) tuple in `rocky_engine::test_runner::TestResult::failures` but with named fields because schemars/JSON Schema can't represent positional tuples cleanly.",
       "properties": {
@@ -139,6 +162,14 @@
     "failures": {
       "items": {
         "$ref": "#/definitions/TestFailure"
+      },
+      "type": "array"
+    },
+    "model_results": {
+      "default": [],
+      "description": "Per-model outcomes for the (DuckDB-backed) model-execution test — passes too, not just failures. Lets the VS Code Inspector Tests tab and the dagster integration render \"good_mart: pass\" without inferring it from `total - failures`. Empty when only declarative tests ran. Filtered to `--model` when that flag is set.",
+      "items": {
+        "$ref": "#/definitions/ModelTestResult"
       },
       "type": "array"
     },

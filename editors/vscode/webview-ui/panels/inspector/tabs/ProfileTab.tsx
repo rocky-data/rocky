@@ -48,8 +48,24 @@ export function ProfileTab({ profile }: { profile: ProfileOutput | null }) {
   if (profile.columns.length === 0) {
     return <EmptyState title="No columns to profile" />;
   }
+  // Source-fallback: the model's target isn't materialized, so these stats
+  // come from the upstream source (`profiled_table`), not the model output.
+  // Label it so the numbers aren't mistaken for the materialized model.
+  const fallback =
+    profile.fell_back_from != null ? (
+      <p className="mb-3 rounded border border-vscode-border px-3 py-2 text-xs text-vscode-desc">
+        Showing source{" "}
+        <span className="font-mono text-vscode-fg">{profile.profiled_table}</span> —
+        the model target{" "}
+        <span className="font-mono text-vscode-fg">{profile.fell_back_from}</span> isn't
+        materialized yet. Run <span className="font-mono">rocky run</span> to profile the
+        model's own output.
+      </p>
+    ) : null;
   return (
-    <table className="w-full border-collapse text-sm">
+    <div>
+      {fallback}
+      <table className="w-full border-collapse text-sm">
       <thead>
         <tr className="text-vscode-desc">
           <th className="border-b border-vscode-border py-1 pr-4 text-left font-medium">
@@ -114,6 +130,7 @@ export function ProfileTab({ profile }: { profile: ProfileOutput | null }) {
           </tr>
         ))}
       </tbody>
-    </table>
+      </table>
+    </div>
   );
 }

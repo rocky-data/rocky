@@ -112,29 +112,53 @@ async function loadModelData(model: string): Promise<InspectorModelData> {
 }
 
 /**
- * Run declarative tests and scope the results to `model`. Invoked lazily (the
- * Tests tab) because it executes SQL.
+ * Load tests for `model`, scoped to one model. Invoked lazily (the Tests tab)
+ * because it executes SQL. Two engine calls:
  *
- * `rocky test` currently runs the whole project — its `model_filter` is an
- * unimplemented TODO in `commands/test.rs` — so we run the full declarative
- * suite and filter client-side. Switch to a per-model invocation once the
- * engine scopes test execution.
+ * 1. `rocky test --declarative` — the `[[tests]]` assertions from sidecars.
+ *    Still project-wide on the wire, so we filter client-side.
+ * 2. `rocky test --model <model>` — the DuckDB model-execution check. The
+ *    engine now scopes this to one model and itemizes passes (not just
+ *    failures), so a model with no declarative assertions still reports
+ *    green here instead of leaving the tab empty.
  */
 async function loadTests(model: string): Promise<InspectorTestsData> {
+  let results: InspectorTestsData["results"] = [];
+  let modelExecution: InspectorTestsData["modelExecution"];
+  let unavailable: string | undefined;
+
   try {
-    const out = await runRockyJson<TestOutput>([
+    const declarative = await runRockyJson<TestOutput>([
       "test",
       "--declarative",
       "--output",
       "json",
     ]);
-    const results = (out.declarative?.results ?? []).filter(
+    results = (declarative.declarative?.results ?? []).filter(
       (r) => r.model === model,
     );
-    return { results };
   } catch (err) {
-    return { results: [], unavailable: errMessage(err) };
+    unavailable = errMessage(err);
   }
+
+  try {
+    const execution = await runRockyJson<TestOutput>([
+      "test",
+      "--model",
+      model,
+      "--output",
+      "json",
+    ]);
+    modelExecution = (execution.model_results ?? []).find(
+      (r) => r.model === model,
+    );
+  } catch (err) {
+    // Keep any declarative results we got; only report unavailable when both
+    // calls failed (nothing to show).
+    if (results.length === 0) unavailable = unavailable ?? errMessage(err);
+  }
+
+  return { results, modelExecution, unavailable };
 }
 
 /**

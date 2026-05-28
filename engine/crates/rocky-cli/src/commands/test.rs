@@ -11,9 +11,28 @@ use rocky_core::tests::{TestSeverity, TestType, generate_test_sql_with_dialect};
 use rocky_core::traits::WarehouseAdapter;
 
 use crate::output::{
-    DeclarativeTestResult, DeclarativeTestSummary, TestFailure, TestOutput, print_json,
+    DeclarativeTestResult, DeclarativeTestSummary, ModelTestResult, TestFailure, TestOutput,
+    print_json,
 };
 use crate::registry::{self, AdapterRegistry};
+
+/// Map the engine test runner's `ModelTestResult` to the JsonSchema-derived
+/// output shape. Centralized so `test_output` + `run_test` agree.
+fn to_output_results(
+    results: &[rocky_engine::test_runner::ModelTestResult],
+) -> Vec<ModelTestResult> {
+    results
+        .iter()
+        .map(|r| ModelTestResult {
+            model: r.model.clone(),
+            status: match r.status {
+                rocky_engine::test_runner::ModelTestStatus::Pass => "pass".to_string(),
+                rocky_engine::test_runner::ModelTestStatus::Fail => "fail".to_string(),
+            },
+            error: r.error.clone(),
+        })
+        .collect()
+}
 
 /// Side-effect-free core of `rocky test` (DuckDB-based local tests): run the
 /// tests and assemble the typed [`TestOutput`] without printing.
@@ -22,8 +41,12 @@ use crate::registry::{self, AdapterRegistry};
 /// (`rocky-mcp`) obtains the struct directly.
 // Reusable typed-output core for the in-process MCP server. `run_test`
 // re-runs the test runner so it can also render text.
-pub fn test_output(models_dir: &Path, contracts_dir: Option<&Path>) -> Result<TestOutput> {
-    let result = rocky_engine::test_runner::run_tests(models_dir, contracts_dir)?;
+pub fn test_output(
+    models_dir: &Path,
+    contracts_dir: Option<&Path>,
+    model_filter: Option<&str>,
+) -> Result<TestOutput> {
+    let result = rocky_engine::test_runner::run_tests(models_dir, contracts_dir, model_filter)?;
     let failures: Vec<TestFailure> = result
         .failures
         .iter()
@@ -32,7 +55,8 @@ pub fn test_output(models_dir: &Path, contracts_dir: Option<&Path>) -> Result<Te
             error: error.clone(),
         })
         .collect();
-    Ok(TestOutput::new(result.total, result.passed, failures))
+    let model_results = to_output_results(&result.model_results);
+    Ok(TestOutput::new(result.total, result.passed, failures).with_model_results(model_results))
 }
 
 /// Execute `rocky test` (DuckDB-based local tests).
@@ -42,7 +66,7 @@ pub fn run_test(
     model_filter: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
-    let result = rocky_engine::test_runner::run_tests(models_dir, contracts_dir)?;
+    let result = rocky_engine::test_runner::run_tests(models_dir, contracts_dir, model_filter)?;
 
     if output_json {
         let failures: Vec<TestFailure> = result
@@ -53,10 +77,16 @@ pub fn run_test(
                 error: error.clone(),
             })
             .collect();
-        let output = TestOutput::new(result.total, result.passed, failures);
+        let model_results = to_output_results(&result.model_results);
+        let output = TestOutput::new(result.total, result.passed, failures)
+            .with_model_results(model_results);
         print_json(&output)?;
     } else {
-        println!("Testing {} models...", result.total);
+        let scope = match model_filter {
+            Some(m) => format!(" (model={m})"),
+            None => String::new(),
+        };
+        println!("Testing {} models{scope}...", result.total);
         println!();
 
         for d in &result.diagnostics {
@@ -85,8 +115,6 @@ pub fn run_test(
             result.failures.len()
         );
     }
-
-    let _ = model_filter; // TODO: filter to single model
 
     if !result.failures.is_empty() {
         anyhow::bail!("test failures detected");

@@ -56,7 +56,7 @@ pub fn run_ci(models_dir: &Path, contracts_dir: Option<&Path>) -> anyhow::Result
 
     // Step 1: Compile
     info!("step 1: compile");
-    let test_result = crate::test_runner::run_tests(models_dir, contracts_dir)?;
+    let test_result = crate::test_runner::run_tests(models_dir, contracts_dir, None)?;
 
     let compile_ok = !test_result
         .diagnostics

@@ -5,7 +5,7 @@
  */
 import type { CatalogColumn, CatalogEdge } from "../../types/generated/catalog";
 import type { CostHint, ModelFreshnessConfig } from "../../types/generated/compile";
-import type { DeclarativeTestResult } from "../../types/generated/test";
+import type { DeclarativeTestResult, ModelTestResult } from "../../types/generated/test";
 import type { PreviewRowsOutput } from "../../types/generated/preview_rows";
 
 /**
@@ -36,9 +36,17 @@ export interface InspectorModelData {
   costHint: CostHint | null;
 }
 
-/** Declarative test results scoped to one model (lazy "Tests" tab). */
+/** Test results scoped to one model (lazy "Tests" tab). */
 export interface InspectorTestsData {
+  /** Declarative `[[tests]]` assertions from the model's sidecar. */
   results: DeclarativeTestResult[];
+  /**
+   * Model-execution check: does the model compile and materialize against a
+   * local DuckDB. Present even when the model declares no `[[tests]]`, so a
+   * model that has no assertions but passes `rocky test` still shows green
+   * instead of an empty state.
+   */
+  modelExecution?: ModelTestResult;
   /** Set when tests could not run (e.g. CLI error); `results` is then empty. */
   unavailable?: string;
 }

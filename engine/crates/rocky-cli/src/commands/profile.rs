@@ -11,7 +11,9 @@ use anyhow::Result;
 
 use crate::output::{ProfileColumnStats, ProfileOutput, print_json};
 
-use super::ai_contract::{PreparedKind, compile_project, prepare_table_query, profile_column};
+use super::ai_contract::{
+    FallbackPolicy, PreparedKind, compile_project, prepare_table_query, profile_column,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -39,13 +41,28 @@ pub async fn build_profile_output(
             )
         })?;
 
-    let prepared = match prepare_table_query(config_path, &compile_result, model_name)? {
+    // `SourceFallback`: if the model's declared target isn't materialized
+    // (agentic authoring loop pre-`rocky run`, or a replication-pipeline POC
+    // that doesn't run the transformation models), profile its first
+    // resolvable source instead so the caller still gets observed data. The
+    // fallback is labelled via `profiled_table` + `fell_back_from` so the JSON
+    // tells the truth.
+    let prepared = match prepare_table_query(
+        config_path,
+        &compile_result,
+        model_name,
+        FallbackPolicy::SourceFallback,
+    )
+    .await?
+    {
         PreparedKind::Ready(p) => p,
         PreparedKind::Unavailable(reason) => {
             return Ok(ProfileOutput {
                 version: VERSION.to_string(),
                 command: "profile".to_string(),
                 model: model_name.to_string(),
+                profiled_table: None,
+                fell_back_from: None,
                 columns: Vec::new(),
                 unavailable: Some(reason),
             });
@@ -62,26 +79,41 @@ pub async fn build_profile_output(
         anyhow::bail!("column '{name}' not found in model '{model_name}'");
     }
 
+    let fell_back = prepared.fell_back_from.is_some();
     let mut columns = Vec::with_capacity(targets.len());
     for col in targets {
-        let p = profile_column(prepared.adapter.as_ref(), &prepared.table_ref, col).await?;
-        columns.push(ProfileColumnStats {
-            name: p.name,
-            type_name: p.type_name,
-            rows: p.rows,
-            nulls: p.nulls,
-            null_rate: p.null_rate,
-            distinct: p.distinct,
-            observed_values: p.observed_values,
-            min: p.min,
-            max: p.max,
-        });
+        // On the source-fallback path, a column from the model's inferred
+        // schema may not exist on the source (the model added/renamed it).
+        // Skip such columns rather than aborting the whole profile — the
+        // caller gets whatever overlap exists, plus `fell_back_from` to
+        // signal "this is a source preview." On the target path we keep
+        // strict behaviour: any per-column error is a real problem.
+        let result = profile_column(prepared.adapter.as_ref(), &prepared.table_ref, col).await;
+        match result {
+            Ok(p) => columns.push(ProfileColumnStats {
+                name: p.name,
+                type_name: p.type_name,
+                rows: p.rows,
+                nulls: p.nulls,
+                null_rate: p.null_rate,
+                distinct: p.distinct,
+                observed_values: p.observed_values,
+                min: p.min,
+                max: p.max,
+            }),
+            Err(e) if fell_back => {
+                tracing::debug!(column = %col.name, error = %e, "skipping column in source-fallback profile");
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     Ok(ProfileOutput {
         version: VERSION.to_string(),
         command: "profile".to_string(),
         model: model_name.to_string(),
+        profiled_table: Some(prepared.table_ref),
+        fell_back_from: prepared.fell_back_from,
         columns,
         unavailable: None,
     })
@@ -187,5 +219,110 @@ mod tests {
             .unwrap();
         assert_eq!(id_profile.rows, 3);
         assert_eq!(id_profile.nulls, 1);
+    }
+
+    /// Set up a temp DuckDB + rocky.toml + a `raw_orders` model whose SQL
+    /// reads `FROM raw__orders.orders`. The seed creates the source table;
+    /// the caller chooses whether to also materialize the declared target,
+    /// which exercises the source-fallback vs no-fallback paths in one
+    /// shared scaffold.
+    async fn scaffold_fallback_poc(
+        materialize_target: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wh.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter.warehouse]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.t]\ntype = \"transformation\"\n\n\
+                 [pipeline.t.target]\nadapter = \"warehouse\"\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("raw_orders.sql"),
+            "SELECT order_id, amount FROM raw__orders.orders",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("raw_orders.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"wh\"\nschema = \"staging\"\n",
+        )
+        .unwrap();
+
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let registry = crate::registry::AdapterRegistry::from_config(&cfg).unwrap();
+        let adapter = registry.warehouse_adapter("warehouse").unwrap();
+        for stmt in [
+            "CREATE SCHEMA IF NOT EXISTS raw__orders",
+            "CREATE TABLE raw__orders.orders (order_id BIGINT, amount DOUBLE)",
+            "INSERT INTO raw__orders.orders VALUES (1, 10.0), (2, 20.0), (3, 30.0)",
+        ] {
+            adapter.execute_statement(stmt).await.unwrap();
+        }
+        if materialize_target {
+            for stmt in [
+                "CREATE SCHEMA IF NOT EXISTS staging",
+                "CREATE TABLE staging.raw_orders AS \
+                 SELECT order_id, amount FROM raw__orders.orders",
+            ] {
+                adapter.execute_statement(stmt).await.unwrap();
+            }
+        }
+        (dir, config_path, models_dir)
+    }
+
+    /// Target table absent + a source table exists → profile falls back to
+    /// the source and labels the fallback. The agentic authoring loop and
+    /// replication-pipeline demos rely on this branch.
+    #[tokio::test]
+    async fn falls_back_to_source_when_target_missing() {
+        let (_tmp, config_path, models_dir) = scaffold_fallback_poc(false).await;
+        let state_path = config_path.parent().unwrap().join(".rocky_state");
+        let output = build_profile_output(
+            &config_path,
+            &state_path,
+            models_dir.to_str().unwrap(),
+            "raw_orders",
+            None,
+            None,
+        )
+        .await
+        .expect("profile should succeed via source fallback");
+        assert_eq!(output.profiled_table.as_deref(), Some("raw__orders.orders"));
+        assert_eq!(output.fell_back_from.as_deref(), Some("staging.raw_orders"));
+        assert_eq!(output.unavailable, None);
+        // Both source columns exist on the model → both should profile.
+        let names: Vec<_> = output.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"order_id"));
+        assert!(names.contains(&"amount"));
+        assert_eq!(output.columns[0].rows, 3);
+    }
+
+    /// Target table materialized → profile uses it directly, no fallback.
+    /// Guards against accidentally falling back when the model is healthy.
+    #[tokio::test]
+    async fn no_fallback_when_target_materialized() {
+        let (_tmp, config_path, models_dir) = scaffold_fallback_poc(true).await;
+        let state_path = config_path.parent().unwrap().join(".rocky_state");
+        let output = build_profile_output(
+            &config_path,
+            &state_path,
+            models_dir.to_str().unwrap(),
+            "raw_orders",
+            None,
+            None,
+        )
+        .await
+        .expect("profile should succeed against the materialized target");
+        assert_eq!(output.profiled_table.as_deref(), Some("staging.raw_orders"));
+        assert_eq!(output.fell_back_from, None);
+        assert_eq!(output.columns[0].rows, 3);
     }
 }

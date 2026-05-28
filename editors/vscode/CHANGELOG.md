@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.30.2] — 2026-05-28
+
+### Fixed
+
+- **Inspector Profile tab shows data again.** The tab was blank whenever a model's target table wasn't materialized. It now renders the column profile the engine returns, and when the engine profiled the upstream source instead of the model's own (not-yet-materialized) target, a banner names the source so the numbers aren't mistaken for the model's output. Requires engine 1.46.1.
+- **Inspector Tests tab reflects passing models.** A model that passes `rocky test` but declares no `[[tests]]` showed only an empty "No declarative tests" state. The tab now shows a "Model executes" pass/fail banner from the engine's per-model test results, above the declarative-test list. Requires engine 1.46.1.
+
 ## [1.30.1] — 2026-05-28
 
 ### Fixed
