@@ -3,4 +3,4 @@ type = "full_refresh"
 
 [target]
 catalog = "playground"
-schema = "staging"
+schema = "main"

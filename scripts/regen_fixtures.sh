@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Regenerate the dagster test fixtures by running the live `rocky` binary
-# against the 00-playground-default POC and capturing JSON output.
+# against the 01-replication-basics POC and capturing JSON output.
 #
 # Usage:
 #   ./scripts/regen_fixtures.sh                    # write to fixtures_generated/
@@ -28,7 +28,7 @@ set -euo pipefail
 readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 readonly WORKSPACE_ROOT="$(dirname "$SCRIPT_DIR")"
 readonly ROCKY="$WORKSPACE_ROOT/engine/target/release/rocky"
-readonly POC="$WORKSPACE_ROOT/examples/playground/pocs/00-foundations/00-playground-default"
+readonly POC="$WORKSPACE_ROOT/examples/playground/pocs/00-foundations/01-replication-basics"
 readonly PARTITION_POC="$WORKSPACE_ROOT/examples/playground/pocs/02-performance/03-partition-checksum"
 readonly NORMALIZER="$SCRIPT_DIR/_normalize_fixture.py"
 
@@ -107,7 +107,7 @@ capture dag dag --models models
 capture cost cost latest
 
 # Drift detection requires the engine to detect schema changes against an
-# already-existing target. The 00-playground-default POC always uses
+# already-existing target. The 01-replication-basics POC always uses
 # full_refresh, so there's no drift to detect. We capture an empty drift
 # baseline by running the same command and verifying it returns the
 # expected zero-drift envelope.
@@ -124,7 +124,7 @@ rm -f .rocky-state.redb models/.rocky-state.redb poc.duckdb playground.duckdb /t
 # ---------------------------------------------------------------------------
 # Partition fixtures (time_interval shape)
 #
-# The 00-playground-default POC uses `full_refresh`, so it never produces
+# The 01-replication-basics POC uses `full_refresh`, so it never produces
 # `partition_summaries` (top-level) or per-materialization `partition`
 # fields. To document those shapes in the corpus, we additionally run the
 # 02-performance/03-partition-checksum POC, which has a `time_interval`
@@ -186,7 +186,7 @@ fi
 # ---------------------------------------------------------------------------
 # Feature-coverage fixtures (Option B — rich shapes from purpose-built POCs)
 #
-# The 00-playground-default POC uses full_refresh on a single source, so its
+# The 01-replication-basics POC uses full_refresh on a single source, so its
 # captures only cover the happy path: empty drift, empty check_results, no
 # anomalies, no diagnostics, no incremental watermark, no run history, no
 # optimize recommendations. To document those rich shapes for the dagster

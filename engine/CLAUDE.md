@@ -292,7 +292,7 @@ Every Rocky CLI command that emits `--output json` has a typed Rust output struc
 
 Plus one shared schema: `adapter_config.schema.json` — generated from `AdapterConfig` (derives `JsonSchema` since Phase 1 of the schemars migration in PR #107). It's embedded in other command outputs rather than emitted standalone.
 
-Test fixtures for the dagster integration are captured from the live binary by `../scripts/regen_fixtures.sh` (runs against `examples/playground/pocs/00-foundations/00-playground-default/`).
+Test fixtures for the dagster integration are captured from the live binary by `../scripts/regen_fixtures.sh` (runs against `examples/playground/pocs/00-foundations/01-replication-basics/` — the replication-shape POC; `00-playground-default` is now a transformation pipeline).
 
 ## Configuration
 

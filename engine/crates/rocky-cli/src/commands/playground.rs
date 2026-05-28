@@ -76,8 +76,10 @@ pub fn run_playground_with_template(target_dir: &str, template_name: &str) -> Re
     println!("  Try:");
     println!("    cd {target_dir}");
     println!("    rocky compile                           # type-check the models");
-    println!("    rocky test                              # run models on DuckDB");
-    println!("    rocky bench compile                     # benchmark compile speed");
+    println!("    rocky test                              # run models on an in-memory DuckDB");
+    println!("    duckdb playground.duckdb < data/seed.sql # seed the file DB");
+    println!("    rocky run                               # materialize the model DAG");
+    println!("    rocky preview rows --model customer_orders  # peek at materialized rows");
     println!();
 
     Ok(())
@@ -104,8 +106,8 @@ fn write_quickstart(dir: &Path) -> Result<()> {
         include_str!("playground_data/raw_orders.toml"),
     )?;
     std::fs::write(
-        dir.join("models/customer_orders.rocky"),
-        include_str!("playground_data/customer_orders.rocky"),
+        dir.join("models/customer_orders.sql"),
+        include_str!("playground_data/customer_orders.sql"),
     )?;
     std::fs::write(
         dir.join("models/customer_orders.toml"),

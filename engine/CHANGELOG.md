@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`rocky playground` now scaffolds a runnable transformation pipeline.** The quickstart project's models materialize via `rocky run` into the database's default schema (`playground.main`), so `rocky run` → `rocky preview rows` / `rocky profile` (and the VS Code Inspector) work end-to-end on a fresh scaffold. Previously the scaffold was a replication pipeline whose models only ran under `rocky test`.
+
+### Fixed
+
+- **`rocky preview rows` gives accurate guidance on replication pipelines.** When a referenced model isn't materialized, the error no longer unconditionally advises `rocky run` — on a replication pipeline (which copies sources rather than materializing transformation models) it now says so instead of suggesting a command that won't help.
+
 ## [1.46.2] — 2026-05-28
 
 ### Fixed

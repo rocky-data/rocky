@@ -1,0 +1,24 @@
+# Loose contract suitable for the playground.
+# Type checker can't infer non-null from `SELECT col FROM raw__orders.orders`
+# (the source schema is unknown to the compiler), so columns are declared
+# nullable here to keep `rocky compile --contracts contracts` clean.
+# For a strict-contract demonstration see pocs/01-quality/01-data-contracts-strict.
+
+[[columns]]
+name = "customer_id"
+type = "Int64"
+nullable = true
+
+[[columns]]
+name = "total_revenue"
+type = "Decimal"
+nullable = true
+
+[[columns]]
+name = "order_count"
+type = "Int64"
+nullable = true
+
+[rules]
+required = ["customer_id", "total_revenue", "order_count"]
+protected = ["customer_id"]

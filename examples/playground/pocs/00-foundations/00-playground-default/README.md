@@ -3,23 +3,31 @@
 > **Category:** 00-foundations
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 5s
-> **Rocky features:** baseline pipeline config, model TOML sidecar, Rocky DSL aggregation, contract
+> **Rocky features:** transformation pipeline, model DAG, Rocky DSL aggregation, contract, materialize + inspect
 
 ## What it shows
 
-This is the **exact output** of `rocky playground my-project` (from rocky 0.1.x). It's preserved here as a known-good baseline so the rest of the catalog has a reference point — if `rocky test` ever fails on this POC after a binary upgrade, something regressed in the playground generator.
+This is the **exact output** of `rocky playground my-project` — a small, runnable
+transformation DAG you can materialize locally and inspect end-to-end. It doubles as
+the known-good baseline for the catalog: if `rocky run` or `rocky test` ever fails here
+after a binary upgrade, the playground generator regressed.
 
-The pipeline:
+The pipeline (all models materialize into the default schema `playground.main`):
 
 ```
 raw__orders.orders   →  raw_orders        →  customer_orders   →  revenue_summary
-(seeded by data)        (SQL replication)    (Rocky DSL group)    (SQL aggregation)
+(seeded source)         (SQL passthrough)    (Rocky DSL group)    (SQL aggregation)
 ```
+
+Because every model targets the database's default schema, a model can reference an
+upstream by name (`from raw_orders`) and it resolves both when materialized by
+`rocky run` and in the in-memory `rocky test` run. `depends_on` in each sidecar pins
+the execution order.
 
 ## Why it's distinctive
 
-- **The only POC that intentionally mirrors the binary's stock output.** Every other POC in this catalog covers a feature the playground generator doesn't show.
-- Acts as a smoke test for `rocky playground`, `rocky test`, `rocky validate`, and the auto-loaded `data/seed.sql` path.
+- **The only POC that intentionally mirrors the binary's stock output.** Every other POC covers a feature the generator doesn't show.
+- Materializes a real multi-model DAG with `rocky run`, then `rocky preview rows` / `rocky profile` (and the VS Code Inspector) read the materialized tables — the simplest end-to-end "see your data" loop.
 
 ## Layout
 
@@ -27,46 +35,51 @@ raw__orders.orders   →  raw_orders        →  customer_orders   →  revenue_
 .
 ├── README.md
 ├── rocky.toml
+├── data/
+│   └── seed.sql          # seeds raw__orders.orders
 ├── models/
-│   ├── raw_orders.sql
+│   ├── raw_orders.sql        # FROM raw__orders.orders
 │   ├── raw_orders.toml
-│   ├── customer_orders.rocky
-│   ├── customer_orders.toml
-│   ├── revenue_summary.sql
-│   └── revenue_summary.toml
+│   ├── customer_orders.rocky # from raw_orders (Rocky DSL group-by)
+│   ├── customer_orders.toml  # depends_on = ["raw_orders"]
+│   ├── revenue_summary.sql   # FROM customer_orders
+│   └── revenue_summary.toml  # depends_on = ["customer_orders"]
 └── contracts/
     └── revenue_summary.contract.toml
 ```
 
-(Note: this folder doesn't ship a `data/seed.sql` because the test runner now auto-generates seed from the in-memory CTAS path. To run the full pipeline path, regenerate via `rocky playground tmp/` and copy `data/seed.sql` here.)
-
 ## Prerequisites
 
 - `rocky` CLI on PATH
-- `duckdb` CLI for the optional pipeline path (`brew install duckdb`)
+- `duckdb` CLI (`brew install duckdb`)
 
 ## Run
 
 ```bash
-# Model-level (no warehouse needed)
-rocky compile --models models --contracts contracts
+./run.sh
+# or, by hand:
+duckdb playground.duckdb < data/seed.sql   # seed the source
+rocky run                                  # materialize raw_orders → customer_orders → revenue_summary
+rocky preview rows --model customer_orders # peek at real rows
+rocky profile customer_orders              # observed per-column stats
 rocky test --models models --contracts contracts
-rocky lineage revenue_summary --models models
 ```
 
 ## Expected output
 
 ```text
+materialized in playground.main: customer_orders, raw_orders, revenue_summary
 test result: 3 passed, 0 failed
 ```
 
 ## What happened
 
-1. `rocky compile` type-checks the 3 models against each other and validates the contract.
-2. `rocky test` executes them locally against an in-memory DuckDB and verifies the contract on `revenue_summary`.
-3. `rocky lineage` traces every column in `revenue_summary` back to its source.
+1. `duckdb … < data/seed.sql` seeds the `raw__orders.orders` source.
+2. `rocky run` materializes the three models in DAG order into `playground.main`.
+3. `rocky preview rows` / `rocky profile` read those materialized tables — the same data the VS Code Inspector surfaces.
+4. `rocky test` re-executes the models against an in-memory DuckDB and verifies the `revenue_summary` contract.
 
 ## Related
 
-- Source of the scaffold: `rocky/crates/rocky-cli/src/commands/playground_data/`
-- Companion: [`quickstart`](https://github.com/rocky-data/rocky/tree/main/examples/quickstart) (similar shape with a different schema layout)
+- Source of the scaffold: `engine/crates/rocky-cli/src/commands/playground_data/`
+- Companion: [`01-replication-basics`](../01-replication-basics) — the source→staging **replication** pattern (schema-pattern routing), which this transformation playground doesn't show.
