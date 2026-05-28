@@ -326,9 +326,7 @@ pub async fn run_preview_rows(
                 "missing_catalog" => format!(
                     "the target catalog doesn't exist (`rocky run` won't create one) — check that the `catalog` in your config matches an existing database; for DuckDB that's the file name, e.g. `playground` for `playground.duckdb`. ({msg})"
                 ),
-                "upstream_not_materialized" => format!(
-                    "a referenced table doesn't exist yet — run upstream models first (`rocky run`). ({msg})"
-                ),
+                "upstream_not_materialized" => upstream_not_materialized_message(pipeline, &msg),
                 _ => format!("query failed: {msg}"),
             };
             return Err(err(output_json, kind, &human, None));
@@ -363,6 +361,23 @@ pub async fn run_preview_rows(
 /// warehouse cost, so it's never gated.
 fn is_local_adapter(adapter_type: &str) -> bool {
     adapter_type.eq_ignore_ascii_case("duckdb")
+}
+
+/// Human message for a missing referenced table, scoped to the pipeline type.
+/// `rocky run` only materializes models on a **transformation** pipeline; on a
+/// replication pipeline it copies sources, so advising `rocky run` would be
+/// misleading — the referenced model is never built by this pipeline.
+fn upstream_not_materialized_message(pipeline: &PipelineConfig, adapter_msg: &str) -> String {
+    if matches!(pipeline, PipelineConfig::Transformation(_)) {
+        format!(
+            "a referenced table doesn't exist yet — run upstream models first (`rocky run`). ({adapter_msg})"
+        )
+    } else {
+        format!(
+            "a referenced table doesn't exist yet, and this '{}' pipeline doesn't materialize transformation models (it replicates sources). Materialize the referenced model with a transformation pipeline first. ({adapter_msg})",
+            pipeline.pipeline_type_str()
+        )
+    }
 }
 
 /// Target adapter name for any pipeline variant (preview reads the model's
@@ -643,5 +658,47 @@ mod tests {
             classify_query_error_kind("syntax error near SELECT"),
             "execution_error"
         );
+    }
+
+    /// Parse a `rocky.toml` body into its single pipeline config.
+    fn single_pipeline(toml_body: &str) -> rocky_core::config::PipelineConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(&path, toml_body).unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&path).unwrap();
+        let (_, pipeline) = registry::resolve_pipeline(&cfg, None).unwrap();
+        pipeline.clone()
+    }
+
+    /// Transformation pipeline → `rocky run` *does* materialize models, so the
+    /// "run upstream models first" advice is correct.
+    #[test]
+    fn upstream_message_transformation_advises_run() {
+        let pipeline = single_pipeline(
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.t]\ntype = \"transformation\"\n\n\
+             [pipeline.t.target]\nadapter = \"default\"\n",
+        );
+        let msg = upstream_not_materialized_message(&pipeline, "Catalog Error: no such table");
+        assert!(
+            msg.contains("run upstream models first (`rocky run`)"),
+            "{msg}"
+        );
+    }
+
+    /// Replication pipeline → `rocky run` copies sources, it doesn't build
+    /// models, so it must NOT advise `rocky run` for a missing model.
+    #[test]
+    fn upstream_message_replication_does_not_advise_run() {
+        let pipeline = single_pipeline(
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.r]\ntype = \"replication\"\n\n\
+             [pipeline.r.source.schema_pattern]\nprefix = \"raw__\"\nseparator = \"__\"\ncomponents = [\"source\"]\n\n\
+             [pipeline.r.target]\ncatalog_template = \"c\"\nschema_template = \"s__{source}\"\n",
+        );
+        let msg = upstream_not_materialized_message(&pipeline, "Catalog Error: no such table");
+        assert!(!msg.contains("run upstream models first"), "{msg}");
+        assert!(msg.contains("replicates sources"), "{msg}");
+        assert!(msg.contains("replication"), "{msg}");
     }
 }

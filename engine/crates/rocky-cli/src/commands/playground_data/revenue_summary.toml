@@ -1,9 +1,8 @@
-name = "revenue_summary"
+depends_on = ["customer_orders"]
 
 [strategy]
 type = "full_refresh"
 
 [target]
 catalog = "playground"
-schema = "gold"
-table = "revenue_summary"
+schema = "main"

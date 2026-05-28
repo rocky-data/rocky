@@ -64,7 +64,7 @@ The script hard-fails if either is missing:
 
 | POC | Purpose | Fixtures produced |
 |---|---|---|
-| `examples/playground/pocs/00-foundations/00-playground-default/` | Baseline `full_refresh` pipeline. Produces most fixtures. | `discover.json`, `plan.json`, `run.json`, `state.json`, `compile.json`, `test.json`, `ci.json`, `lineage.json`, `doctor.json`, `history.json`, `metrics.json`, `optimize.json`, etc. |
+| `examples/playground/pocs/00-foundations/01-replication-basics/` | Baseline `full_refresh` replication pipeline. Produces most fixtures. (`00-playground-default` is now a transformation pipeline; this is its verbatim replication clone, kept as the fixture source so captures stay byte-identical.) | `discover.json`, `plan.json`, `run.json`, `state.json`, `compile.json`, `test.json`, `ci.json`, `lineage.json`, `doctor.json`, `history.json`, `metrics.json`, `optimize.json`, etc. |
 | `examples/playground/pocs/02-performance/03-partition-checksum/` | `time_interval` (partition-keyed) pipeline. Exercises partition-specific shapes. | `partition/compile.json`, `partition/run_single.json`, `partition/run_backfill.json`, `partition/run_late.json` |
 
 If you need a fixture shape that neither POC produces naturally (e.g. `drift.json` from a non-zero schema diff), add it as a `scenarios.py` entry rather than coercing the POC into producing it.

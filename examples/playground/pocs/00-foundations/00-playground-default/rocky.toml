@@ -1,37 +1,27 @@
-# Rocky Playground — DuckDB-based sample pipeline
-# No external credentials needed!
+# Rocky Playground — a runnable, inspectable DuckDB pipeline. No credentials.
 #
-# `rocky test` runs models against an in-memory DuckDB and auto-loads
-# data/seed.sql.
-# `rocky discover/plan/run` use the file at `path` below — seed it once with:
+# Seed the local DuckDB once, then materialize the model DAG:
 #   duckdb playground.duckdb < data/seed.sql
+#   rocky run
+#
+# `rocky test` runs the models against an in-memory DuckDB (auto-loading
+# data/seed.sql), so it needs no manual seeding. After `rocky run` you can
+# `rocky preview rows --model customer_orders`, `rocky profile customer_orders`,
+# or open a model in the VS Code Inspector to see real materialized data.
 
 [adapter]
 type = "duckdb"
 path = "playground.duckdb"
 
 [pipeline.playground]
-strategy = "full_refresh"
-timestamp_column = "_updated_at"
+type = "transformation"
+models = "models/**"
 
-[pipeline.playground.source.discovery]
-adapter = "default"
-
-[pipeline.playground.source.schema_pattern]
-prefix = "raw__"
-separator = "__"
-components = ["source"]
-
-[pipeline.playground.target]
-catalog_template = "playground"
-schema_template = "staging__{source}"
-
+# Models land in the database's default schema (`playground.main`), so a model
+# can reference an upstream by name (`from raw_orders`) and it resolves both
+# when materialized by `rocky run` and in the in-memory `rocky test` run.
 [pipeline.playground.target.governance]
 auto_create_schemas = true
-
-[pipeline.playground.checks]
-row_count = false
-column_match = false
 
 [pipeline.playground.execution]
 concurrency = 4

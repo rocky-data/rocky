@@ -473,7 +473,7 @@ CLI: `rocky run --partition KEY` / `--from KEY --to KEY` / `--latest` / `--missi
 
 ## Full canonical example
 
-See `examples/playground/pocs/00-foundations/00-playground-default/rocky.toml` for the minimal DuckDB case, or `engine/examples/multi-layer/rocky.toml` for a full Bronze/Silver/Gold setup.
+See `examples/playground/pocs/00-foundations/01-replication-basics/rocky.toml` for the minimal DuckDB **replication** case (schema-pattern routing), `examples/playground/pocs/00-foundations/00-playground-default/rocky.toml` for the minimal **transformation** case (model DAG), or `engine/examples/multi-layer/rocky.toml` for a full Bronze/Silver/Gold setup.
 
 ## What NOT to write (pre-Phase-2 legacy)
 

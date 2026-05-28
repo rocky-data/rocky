@@ -1,6 +1,8 @@
+depends_on = ["customer_orders"]
+
 [strategy]
 type = "full_refresh"
 
 [target]
 catalog = "playground"
-schema = "gold"
+schema = "main"
