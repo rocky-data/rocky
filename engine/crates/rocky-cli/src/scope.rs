@@ -174,22 +174,9 @@ pub(crate) fn resolve_transformation_managed_tables(
         );
     }
 
-    // Load models the same way `rocky list models` does: top-level +
-    // immediate subdirectories.
-    let mut all_models = rocky_core::models::load_models_from_dir(&models_dir).context(format!(
-        "failed to load models from {}",
-        models_dir.display()
-    ))?;
-
-    if let Ok(entries) = std::fs::read_dir(&models_dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir()
-                && let Ok(sub) = rocky_core::models::load_models_from_dir(&entry.path())
-            {
-                all_models.extend(sub);
-            }
-        }
-    }
+    // Load all models the same way `rocky list models` does: top-level +
+    // immediate subdirectories, including `.rocky` DSL files.
+    let all_models = crate::models_loader::load_project_models(&models_dir)?;
 
     let mut managed = HashSet::new();
     for model in &all_models {

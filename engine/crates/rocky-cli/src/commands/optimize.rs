@@ -5,7 +5,6 @@ use std::path::Path;
 use anyhow::Result;
 
 use rocky_core::cost::downstream_counts;
-use rocky_core::models;
 use rocky_core::optimize::{CostConfig, MaterializationCost, ModelStats, recommend_strategy};
 use rocky_core::state::StateStore;
 use rocky_ir::dag::DagNode;
@@ -173,21 +172,10 @@ fn load_dag_from_models(models_dir: Option<&Path>) -> Vec<DagNode> {
         return vec![];
     };
 
-    let mut all_models = match models::load_models_from_dir(dir) {
-        Ok(m) => m,
-        Err(_) => return vec![],
+    // Top-level + immediate subdirectories, including `.rocky` DSL files.
+    let Ok(all_models) = crate::models_loader::load_project_models(dir) else {
+        return vec![];
     };
-
-    // Also check one level of subdirectories (same pattern as estimate.rs).
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir()
-                && let Ok(sub) = models::load_models_from_dir(&entry.path())
-            {
-                all_models.extend(sub);
-            }
-        }
-    }
 
     all_models
         .iter()

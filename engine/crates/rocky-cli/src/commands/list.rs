@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::output::*;
 
@@ -259,22 +259,9 @@ pub fn list_sources(config_path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Load all models from a directory (with subdirectory scan).
+/// Load all models from a directory (with subdirectory scan, incl. `.rocky`).
 fn load_all_models(models_dir: &Path) -> Result<Vec<rocky_core::models::Model>> {
-    let mut all = rocky_core::models::load_models_from_dir(models_dir).context(format!(
-        "failed to load models from {}",
-        models_dir.display()
-    ))?;
-
-    if let Ok(entries) = std::fs::read_dir(models_dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir()
-                && let Ok(sub) = rocky_core::models::load_models_from_dir(&entry.path())
-            {
-                all.extend(sub);
-            }
-        }
-    }
+    let mut all = crate::models_loader::load_project_models(models_dir)?;
     all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(all)
 }

@@ -393,8 +393,7 @@ async fn apply_bisection_to_models(
     };
     let adapter = registry.warehouse_adapter(&adapter_name)?;
 
-    let models = rocky_core::models::load_models_from_dir(models_dir)
-        .with_context(|| format!("loading models from {}", models_dir.display()))?;
+    let models = crate::models_loader::load_project_models(models_dir)?;
     let model_by_name: BTreeMap<String, &rocky_core::models::Model> =
         models.iter().map(|m| (m.config.name.clone(), m)).collect();
     let mut model_out_idx: HashMap<String, usize> = HashMap::new();
@@ -1000,7 +999,7 @@ pub async fn run_preview_cost(
     // silently degrades to an empty per-model budget map. Project-level
     // budget projection still runs.
     let model_budgets: BTreeMap<String, rocky_core::config::ModelBudgetConfig> =
-        rocky_core::models::load_models_from_dir(models_dir)
+        crate::models_loader::load_project_models(models_dir)
             .ok()
             .map(|models| {
                 models
@@ -1859,8 +1858,7 @@ async fn execute_copy_from_base(
         .unwrap_or_else(|| "unknown".to_string());
 
     // Load the model sidecars to resolve each model's source schema.
-    let models = rocky_core::models::load_models_from_dir(models_dir)
-        .with_context(|| format!("loading models from {}", models_dir.display()))?;
+    let models = crate::models_loader::load_project_models(models_dir)?;
     let model_by_name: BTreeMap<String, &rocky_core::models::Model> =
         models.iter().map(|m| (m.config.name.clone(), m)).collect();
 

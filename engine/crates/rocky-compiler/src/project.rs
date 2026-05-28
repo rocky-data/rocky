@@ -153,6 +153,24 @@ impl Project {
     }
 }
 
+/// Load every model in a single directory — both `.sql` (with sidecar
+/// `.toml`) and `.rocky` DSL files — without resolving the DAG.
+///
+/// This is the loader CLI commands should use when they need the model list
+/// but not the dependency graph (`list`, `dag`, `validate`'s count, `docs`,
+/// `optimize`, `compliance`, `preview`, `estimate`, branch scoping, …).
+/// [`rocky_core::models::load_models_from_dir`] alone collects only `.sql`
+/// files, so any command on that path silently drops `.rocky` DSL models —
+/// this includes them. Unlike [`Project::load`] it never fails on dependency
+/// resolution (it does none), so a partial or broken DAG still yields the
+/// models that parsed.
+pub fn load_dir_models(dir: &Path) -> Result<Vec<Model>, ProjectError> {
+    let mut models = models::load_models_from_dir(dir)?;
+    let mut db = crate::salsa_compile::RockyDatabase::default();
+    models.extend(load_rocky_models_with_db(dir, &mut db)?);
+    Ok(models)
+}
+
 /// Load `.rocky` files from a directory through the salsa database.
 ///
 /// Sequential rather than rayon-parallel: salsa's `RockyDatabase` is
@@ -591,5 +609,41 @@ mod tests {
         let result = Project::from_models(models);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("circular"));
+    }
+
+    /// `load_dir_models` must pick up BOTH `.sql` (sidecar) and `.rocky` DSL
+    /// files — the gap that made `load_models_from_dir` (sql-only) silently
+    /// drop DSL models from `validate` / `list` / `dag` / etc.
+    #[test]
+    fn load_dir_models_includes_sql_and_rocky() {
+        // Loading a `.rocky` file runs the salsa-tracked `file_typecheck`,
+        // which bumps the process-global invocation counter the salsa tests
+        // assert on — hold their lock so we don't race those assertions.
+        let _guard = crate::salsa_compile::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join("stg.sql"), "SELECT 1 AS id FROM raw__x.y").unwrap();
+        std::fs::write(
+            d.join("stg.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"c\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("agg.rocky"),
+            "from stg\ngroup id {\n    n: count()\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("agg.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"c\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+
+        let models = load_dir_models(d).unwrap();
+        let names: Vec<_> = models.iter().map(|m| m.config.name.as_str()).collect();
+        assert!(names.contains(&"stg"), "sql model loaded: {names:?}");
+        assert!(names.contains(&"agg"), "rocky DSL model loaded: {names:?}");
     }
 }
