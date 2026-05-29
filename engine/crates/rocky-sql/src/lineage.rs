@@ -161,6 +161,18 @@ fn build_alias_map(tables: &[TableReference]) -> HashMap<String, String> {
     map
 }
 
+/// A model output column with no column-level lineage to any source — an
+/// aliased `COUNT(*)`, a literal, a computed expression. It belongs in the
+/// model's column set but has no upstream edge.
+fn source_less_column(target: &str) -> ColumnLineage {
+    ColumnLineage {
+        source_table: None,
+        source_column: String::new(),
+        target_column: target.to_string(),
+        transform: TransformKind::Expression,
+    }
+}
+
 fn extract_select_columns(
     projection: &[SelectItem],
     alias_map: &HashMap<String, String>,
@@ -181,21 +193,41 @@ fn extract_select_columns(
                 if let Some(lineage) = extract_expr_lineage(expr, alias_map, source_tables) {
                     columns.push(lineage);
                 }
+                // An unnamed expression with no traceable source (e.g. a bare
+                // `COUNT(*)` or a literal) has no portable output name, so we
+                // can't emit a column entry for it. Aliased forms below are the
+                // ones that matter — and models alias their aggregates.
             }
             SelectItem::ExprWithAlias { expr, alias } => {
-                if let Some(mut lineage) = extract_expr_lineage(expr, alias_map, source_tables) {
-                    lineage.target_column = alias.value.clone();
-                    columns.push(lineage);
+                match extract_expr_lineage(expr, alias_map, source_tables) {
+                    Some(mut lineage) => {
+                        lineage.target_column = alias.value.clone();
+                        columns.push(lineage);
+                    }
+                    // A named projection with no upstream column — `COUNT(*)`,
+                    // a literal, a multi-column expression — is still a real
+                    // output column. Emit a source-less entry so it's not
+                    // dropped from the model's schema (the column set drives
+                    // `rocky profile` / the Inspector Columns tab and the
+                    // typed schema); it simply has no column-level lineage edge.
+                    None => columns.push(source_less_column(&alias.value)),
                 }
             }
             // Spark SQL `SELECT expr AS (a, b, c)` — multi-alias binding.
             // Emit one lineage entry per alias, cloning the upstream lineage.
             SelectItem::ExprWithAliases { expr, aliases } => {
-                if let Some(base) = extract_expr_lineage(expr, alias_map, source_tables) {
-                    for alias in aliases {
-                        let mut lineage = base.clone();
-                        lineage.target_column = alias.value.clone();
-                        columns.push(lineage);
+                match extract_expr_lineage(expr, alias_map, source_tables) {
+                    Some(base) => {
+                        for alias in aliases {
+                            let mut lineage = base.clone();
+                            lineage.target_column = alias.value.clone();
+                            columns.push(lineage);
+                        }
+                    }
+                    None => {
+                        for alias in aliases {
+                            columns.push(source_less_column(&alias.value));
+                        }
                     }
                 }
             }
@@ -415,5 +447,35 @@ mod tests {
             result.columns[0].transform,
             TransformKind::Aggregation("SUM".to_string())
         );
+    }
+
+    /// Named projections with no traceable source (an aliased `COUNT(*)`, a
+    /// computed multi-source expression) must still appear as output columns —
+    /// with no source, so they carry no lineage edge but aren't dropped from
+    /// the model's schema. (Regression: `COUNT(*) AS order_count` was silently
+    /// omitted, so it vanished from `rocky profile` / the Inspector Columns.)
+    #[test]
+    fn source_less_named_projections_are_kept() {
+        let result = extract_lineage(
+            "SELECT customer_id, COUNT(*) AS order_count, \
+             total_revenue / order_count AS avg_order_value \
+             FROM cat.sch.customer_orders GROUP BY customer_id",
+        )
+        .unwrap();
+        let by_name: std::collections::HashMap<_, _> = result
+            .columns
+            .iter()
+            .map(|c| (c.target_column.as_str(), c))
+            .collect();
+        // COUNT(*) and the division expression both lack a source column, but
+        // are present in the column set.
+        let order_count = by_name.get("order_count").expect("order_count kept");
+        assert_eq!(order_count.source_table, None);
+        let avg = by_name
+            .get("avg_order_value")
+            .expect("avg_order_value kept");
+        assert_eq!(avg.source_table, None);
+        // The sourced column still resolves normally.
+        assert!(by_name.contains_key("customer_id"));
     }
 }

@@ -13,6 +13,9 @@
       "name": "order_count"
     },
     {
+      "name": "avg_order_value"
+    },
+    {
       "name": "first_order"
     }
   ],
