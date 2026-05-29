@@ -37,7 +37,7 @@
         "strategy": "time_interval",
         "target_table_full_name": ".marts.fct_daily_orders",
         "sql_hash": "a8975e5a44e05fc9",
-        "column_count": 3,
+        "column_count": 4,
         "compile_time_ms": 0
       },
       "partition": {
@@ -60,7 +60,7 @@
         "strategy": "time_interval",
         "target_table_full_name": ".marts.fct_daily_orders",
         "sql_hash": "6841226935681d42",
-        "column_count": 3,
+        "column_count": 4,
         "compile_time_ms": 0
       },
       "partition": {
@@ -83,7 +83,7 @@
         "strategy": "time_interval",
         "target_table_full_name": ".marts.fct_daily_orders",
         "sql_hash": "43c5cc76b5aad342",
-        "column_count": 3,
+        "column_count": 4,
         "compile_time_ms": 0
       },
       "partition": {
@@ -106,7 +106,7 @@
         "strategy": "time_interval",
         "target_table_full_name": ".marts.fct_daily_orders",
         "sql_hash": "ce0fd1a2df2e4b0d",
-        "column_count": 3,
+        "column_count": 4,
         "compile_time_ms": 0
       },
       "partition": {
@@ -129,7 +129,7 @@
         "strategy": "time_interval",
         "target_table_full_name": ".marts.fct_daily_orders",
         "sql_hash": "d0e9a49c9722f466",
-        "column_count": 3,
+        "column_count": 4,
         "compile_time_ms": 0
       },
       "partition": {
