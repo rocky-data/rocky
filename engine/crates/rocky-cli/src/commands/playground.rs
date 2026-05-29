@@ -106,8 +106,8 @@ fn write_quickstart(dir: &Path) -> Result<()> {
         include_str!("playground_data/raw_orders.toml"),
     )?;
     std::fs::write(
-        dir.join("models/customer_orders.sql"),
-        include_str!("playground_data/customer_orders.sql"),
+        dir.join("models/customer_orders.rocky"),
+        include_str!("playground_data/customer_orders.rocky"),
     )?;
     std::fs::write(
         dir.join("models/customer_orders.toml"),
