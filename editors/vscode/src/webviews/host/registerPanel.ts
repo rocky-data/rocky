@@ -46,6 +46,7 @@ export function createWebviewPanelApp(
 export class WebviewViewController {
   private host: WebviewHost | undefined;
   private readonly preResolve: Array<{ type: string; payload: unknown }> = [];
+  private isVisible = false;
 
   /** @internal Bind the live host once the view resolves; flushes buffered pushes. */
   attach(host: WebviewHost): void {
@@ -58,6 +59,20 @@ export class WebviewViewController {
   /** @internal Unbind when the view is disposed. */
   detach(): void {
     this.host = undefined;
+    this.isVisible = false;
+  }
+
+  /** @internal Track the view's visibility (panel tab shown vs hidden). */
+  setVisible(visible: boolean): void {
+    this.isVisible = visible;
+  }
+
+  /**
+   * Whether the view is currently visible (resolved and its panel tab shown).
+   * Callers use this to avoid pushing/retargeting while the panel is hidden.
+   */
+  get visible(): boolean {
+    return this.host !== undefined && this.isVisible;
   }
 
   /** Push to the view, buffering until it is resolved and ready. */
@@ -88,6 +103,8 @@ export function registerWebviewViewApp(
       // rather than being wiped by render().
       host.render({ entry: opts.entry, title: opts.title });
       controller.attach(host);
+      controller.setVisible(view.visible);
+      view.onDidChangeVisibility(() => controller.setVisible(view.visible));
       view.onDidDispose(() => {
         host.dispose();
         if (extra) extra.dispose();

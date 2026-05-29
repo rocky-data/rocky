@@ -54,6 +54,42 @@ export function registerInspectorView(context: vscode.ExtensionContext): void {
       h.onRequest("governance", () => loadGovernance());
     },
   });
+
+  registerActiveEditorFollow(context);
+}
+
+/**
+ * Auto-follow: when the active editor switches to a model file, retarget the
+ * Inspector to that model — but only while the panel is visible (so it never
+ * steals focus or churns while hidden), debounced against rapid tab-flipping,
+ * and skipping non-model files (a stray `.ts`/`.md` shouldn't blank the panel).
+ * Explicit triggers (Open-in-Inspector, canvas node click, Cmd+K) still work;
+ * this just makes browsing model files in the editor track along.
+ */
+function registerActiveEditorFollow(context: vscode.ExtensionContext): void {
+  let lastModel: string | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const isModelFile = (doc: vscode.TextDocument): boolean =>
+    doc.languageId === "rocky" ||
+    (doc.fileName.endsWith(".sql") && /[\\/]models[\\/]/.test(doc.fileName));
+
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (!editor || !controller?.visible || !isModelFile(editor.document)) {
+        return;
+      }
+      const model = path
+        .basename(editor.document.fileName)
+        .replace(/\.(rocky|sql)$/i, "");
+      if (model === lastModel) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        lastModel = model;
+        controller?.push<InspectorTarget>("target", { model });
+      }, 250);
+    }),
+  );
 }
 
 /**
