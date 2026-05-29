@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import type {
   AiAction,
   AiActionParam,
@@ -14,7 +14,6 @@ import type {
 import type { ProfileOutput } from "../../../src/types/generated/profile";
 import { getRpc } from "../../runtime/rpcClient";
 import { LineageCanvasView } from "./LineageCanvasView";
-import { ModelSearch } from "./ModelSearch";
 import { ColumnsTab } from "./tabs/ColumnsTab";
 import { LineageTab } from "./tabs/LineageTab";
 import { OverviewTab } from "./tabs/OverviewTab";
@@ -55,7 +54,6 @@ export function InspectorApp() {
   const [model, setModel] = useState<ModelPush | null>(null);
   const [tab, setTab] = useState<TabId>("overview");
   const [lineageView, setLineageView] = useState<"graph" | "columns">("graph");
-  const [searchOpen, setSearchOpen] = useState(false);
   // Defer mounting the canvas until its tab is first shown: ReactFlow measures
   // its container on mount, and a hidden (display:none) container is 0×0, which
   // leaves it stuck at a bad zero-size fit. Once mounted at a real size it stays
@@ -147,29 +145,6 @@ export function InspectorApp() {
     if (tab === "lineage") setSeenLineage(true);
   }, [tab]);
 
-  // Cmd/Ctrl+K opens the model-search command palette.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setSearchOpen(true);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  const searchModels = useMemo(
-    () =>
-      (lineage.graph?.nodes ?? []).map((n) => ({
-        id: n.id,
-        label: n.label,
-        fqn: n.fqn,
-        kind: n.kind,
-      })),
-    [lineage.graph],
-  );
-
   const data = model?.ok ? model.data : null;
   const showCanvas = tab === "lineage" || seenLineage;
 
@@ -198,18 +173,6 @@ export function InspectorApp() {
             {focusedModel ?? "Rocky Inspector"}
           </h1>
         )}
-        <button
-          type="button"
-          onClick={() => setSearchOpen(true)}
-          aria-label="Search models"
-          title="Search models (⌘K)"
-          className="ml-auto flex items-center gap-1.5 self-center rounded border border-vscode-border px-2 py-1 text-xs text-vscode-desc hover:text-vscode-fg"
-        >
-          Search models
-          <kbd className="rounded bg-vscode-badge-bg px-1 text-[10px] text-vscode-badge-fg">
-            ⌘K
-          </kbd>
-        </button>
       </header>
 
       <nav className="flex gap-1 border-b border-vscode-border px-2">
@@ -329,13 +292,6 @@ export function InspectorApp() {
           </div>
         )}
       </div>
-
-      <ModelSearch
-        models={searchModels}
-        open={searchOpen}
-        onClose={() => setSearchOpen(false)}
-        onSelect={setFocusedModel}
-      />
     </div>
   );
 }
