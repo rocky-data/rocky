@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.46.4] — 2026-05-29
+
 ### Fixed
 
 - **`.rocky` DSL models are no longer invisible to non-run commands.** `validate`, `list`, `dag`, `optimize`, `compliance`, `preview`, `estimate`, `docs`, and branch scoping loaded models through a `.sql`-only path, so a project with `.rocky` DSL models had them silently dropped — most visibly, `rocky validate` reported a false `DAG error: unknown dependency` when a `.rocky` model sat between two `.sql` models in a transformation DAG. All these commands now load `.sql` and `.rocky` models through one shared loader.

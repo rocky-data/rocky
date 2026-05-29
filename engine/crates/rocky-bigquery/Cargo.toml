@@ -1,6 +1,6 @@
 [package]
 name = "rocky-bigquery"
-version = "1.46.3"
+version = "1.46.4"
 description = "BigQuery warehouse adapter for Rocky"
 edition.workspace = true
 license.workspace = true

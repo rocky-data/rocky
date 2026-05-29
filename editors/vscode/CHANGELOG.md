@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.31.0] — 2026-05-29
+
 ### Added
 
 - **The Inspector follows the active editor.** When the Inspector panel is open and you switch to a model file (`.rocky`, or `.sql` under `models/`), it retargets to that model automatically — no need to re-run "Open in Inspector". Gated to when the panel is visible (never steals focus), debounced against rapid tab-switching, and ignores non-model files. The explicit triggers (Open-in-Inspector, lineage-canvas node click) still work.
