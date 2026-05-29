@@ -63,8 +63,8 @@ export function registerInspectorView(context: vscode.ExtensionContext): void {
  * Inspector to that model — but only while the panel is visible (so it never
  * steals focus or churns while hidden), debounced against rapid tab-flipping,
  * and skipping non-model files (a stray `.ts`/`.md` shouldn't blank the panel).
- * Explicit triggers (Open-in-Inspector, canvas node click, Cmd+K) still work;
- * this just makes browsing model files in the editor track along.
+ * Explicit triggers (Open-in-Inspector, a lineage-canvas node click) still
+ * work; this just makes browsing model files in the editor track along.
  */
 function registerActiveEditorFollow(context: vscode.ExtensionContext): void {
   let lastModel: string | undefined;

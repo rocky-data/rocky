@@ -9,7 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **The Inspector follows the active editor.** When the Inspector panel is open and you switch to a model file (`.rocky`, or `.sql` under `models/`), it retargets to that model automatically — no need to re-run "Open in Inspector". Gated to when the panel is visible (never steals focus), debounced against rapid tab-switching, and ignores non-model files. The explicit triggers (Open-in-Inspector, lineage-canvas node click, Cmd+K) still work.
+- **The Inspector follows the active editor.** When the Inspector panel is open and you switch to a model file (`.rocky`, or `.sql` under `models/`), it retargets to that model automatically — no need to re-run "Open in Inspector". Gated to when the panel is visible (never steals focus), debounced against rapid tab-switching, and ignores non-model files. The explicit triggers (Open-in-Inspector, lineage-canvas node click) still work.
+
+### Removed
+
+- **The Inspector's Cmd+K model-search command palette.** Removed the palette, its header "Search models" button, and the Cmd+K shortcut. Switching models is now covered by editor auto-follow (above), a lineage-canvas node click, and "Open in Inspector".
 
 ## [1.30.3] — 2026-05-28
 
