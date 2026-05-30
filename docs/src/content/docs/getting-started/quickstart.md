@@ -101,7 +101,13 @@ rocky apply "$plan_id"
 
 Executes the plan: discover → create catalogs/schemas → apply drift → copy data → run checks. Outputs a versioned JSON result with materializations, check results, drift actions, and permissions.
 
-Resume from the last checkpoint after a failure. The resume flag currently lives on the legacy `rocky run` alias (which continues to work alongside `rocky plan` + `rocky apply`):
+`rocky plan` + `rocky apply` is the auditable two-step for production and PR gating — the persisted plan is reviewable before anything writes. For local iteration and automation, `rocky run` does the same work in a single step:
+
+```bash
+rocky run --filter tenant=acme
+```
+
+Either path resumes from the last checkpoint after a failure with `--resume-latest`:
 
 ```bash
 rocky run --filter tenant=acme --resume-latest

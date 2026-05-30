@@ -38,6 +38,8 @@ rocky compile && rocky test && rocky run
 
 No credentials needed; the playground runs end-to-end on local DuckDB.
 
+`rocky run` is the one-step path for local iteration and automation. For production or PR-gated deploys, split it into `rocky plan` (builds and persists an auditable plan to `.rocky/plans/<id>.json`) followed by `rocky apply <plan-id>`.
+
 ## Who Rocky is for
 
 Rocky is built first for **data platform engineers running production-critical, multi-tenant pipelines on Databricks**, where silent failures cost real money and Dagster is already the orchestrator. That is the launch wedge, and where Rocky is most battle-tested.
