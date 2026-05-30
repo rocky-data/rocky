@@ -69,7 +69,9 @@ impl TracingGuard {
 ///   dagster-rocky).
 /// - `json=false`: human-readable compact output (for local dev).
 ///
-/// Log level controlled by `RUST_LOG` env var (default `info`).
+/// Log level controlled by `RUST_LOG` env var. The default
+/// (`info,salsa=warn`) keeps Rocky's own spans at `info` while silencing the
+/// chatty salsa query-cache trace.
 ///
 /// **Hold the returned [`TracingGuard`] for the lifetime of the
 /// process** — dropping it earlier flushes and shuts down the batch
@@ -77,7 +79,12 @@ impl TracingGuard {
 /// tracer.
 #[must_use]
 pub fn init_tracing(json: bool) -> TracingGuard {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Default to `info` for Rocky's own spans (so `rocky trace` / replay keep
+    // capturing `pipeline.run`, `materialize.table`, ...) but silence the
+    // chatty `salsa::function::execute` query-cache trace that would otherwise
+    // dump on every bare `rocky compile`. `RUST_LOG` overrides this entirely.
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,salsa=warn"));
 
     // `Layer::boxed()` erases the layer type so the if/else branch
     // returns a uniform `BoxLayer` that still implements

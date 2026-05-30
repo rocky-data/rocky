@@ -230,27 +230,23 @@ pub async fn doctor(
         let start = Instant::now();
         if let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) {
             let backend = &cfg.state.backend;
-            let has_remote = *backend != rocky_core::config::StateBackend::Local;
             let details = if verbose {
                 vec![("backend".into(), backend.to_string())]
             } else {
                 Vec::new()
             };
+            // A `local` state backend is the healthy default for a single-node
+            // project (it mirrors the `state_rw` check, which already treats
+            // local as Healthy — no remote probe needed). `Warning` is
+            // reserved for a misconfigured remote backend, surfaced by the
+            // `state_rw` RW probe below.
             checks.push(HealthCheck {
                 name: "state_sync".into(),
-                status: if has_remote {
-                    HealthStatus::Healthy
-                } else {
-                    HealthStatus::Warning
-                },
+                status: HealthStatus::Healthy,
                 message: format!("State backend: {backend}"),
                 duration_ms: start.elapsed().as_millis() as u64,
                 details,
             });
-            if !has_remote {
-                suggestions
-                    .push("Consider using 'tiered' state backend for distributed execution".into());
-            }
         }
     }
 
