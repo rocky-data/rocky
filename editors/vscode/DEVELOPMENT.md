@@ -41,7 +41,7 @@ editors/vscode/                  # path inside the rocky-data/rocky monorepo
 │   │   ├── compile.ts            # compile, validate, ci
 │   │   ├── hooks.ts              # hooksList, hooksTest
 │   │   ├── inspect.ts            # history, metrics
-│   │   ├── lineage.ts            # showLineage (DOT → SVG webview)
+│   │   ├── lineage.ts            # Inspector Lineage-tab data: graph + overlays + node AI actions
 │   │   ├── migration.ts          # importDbt, validateMigration
 │   │   ├── ops.ts                # doctor, optimize
 │   │   ├── run.ts                # run, plan, discover, compare
@@ -111,7 +111,7 @@ The extension registers 58 commands organized by concern under `src/commands/` (
 | Command | What it does |
 |---------|-------------|
 | `rocky.restartServer` | Stops and restarts the LSP server |
-| `rocky.showLineage` | Renders model DAG as an interactive SVG (webview) |
+| `rocky.showLineage` | Open the Inspector's lineage canvas, framed on the current model |
 | `rocky.compile` | Type-check models, validate contracts |
 | `rocky.validate` | Validate config and models without API calls |
 | `rocky.ci` | Combined compile + test for CI |
@@ -138,9 +138,9 @@ The extension registers 58 commands organized by concern under `src/commands/` (
 
 Commands use `cp.execFile()` (not `exec()`) for safe subprocess execution and `vscode.window.withProgress()` for long-running operations.
 
-### Lineage Webview
+### Lineage canvas (Inspector)
 
-The `rocky.showLineage` command extracts the model name from the current file, calls `rocky lineage <model> --format dot`, and renders the DOT graph as SVG using viz.js. The webview uses VS Code CSS variables for theme-aware styling.
+The `rocky.showLineage` command reveals the Rocky Inspector (a bottom-panel React webview under `webview-ui/`) on its Lineage tab, framed on the current model. The canvas is built from `rocky catalog` + `rocky compile` JSON and rendered with `@xyflow/react` (React Flow) using `@dagrejs/dagre` for layout. Trust-plane overlays (cost, freshness, drift, governance, breaking changes, last run) are drawn on the graph, and right-clicking a node exposes scoped AI actions.
 
 ## Common Commands
 

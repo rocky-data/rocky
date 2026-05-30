@@ -128,6 +128,24 @@ Tag PII columns in the model sidecar, and bind tags to mask strategies in `[mask
 
 [POC: `02-performance/01-incremental-watermark`](examples/playground/pocs/02-performance/01-incremental-watermark/)
 
+## In your editor
+
+The same compiler runs as a language server inside VS Code, so you catch drift, type errors, and contract violations where you write the code, not just in CI.
+
+Your `.rocky` models compile to SQL live as you type, with type-aware hover, inline column types, and go-to-definition across the graph.
+
+<p align="center">
+  <img src="editors/vscode/media/demo-compiledSql.gif" alt="A Rocky DSL model on the left and its compiled SQL on the right, updating live as you type" width="900" />
+</p>
+
+The Inspector turns any model into a trust dashboard: schema, column-level lineage, tests, per-model cost, and a governance card that flags classified columns and unmasked PII.
+
+<p align="center">
+  <img src="editors/vscode/media/demo-inspector.gif" alt="The Rocky Inspector's Overview as a model trust dashboard, its Governance card flagging two classified columns with one left unmasked" width="900" />
+</p>
+
+[Install the VS Code extension →](https://marketplace.visualstudio.com/items?itemName=rocky-data.rocky)
+
 ## Where Rocky is today
 
 The trust primitives (compiler, branches, replay, lineage, contracts, cost attribution) are production-grade on Databricks. The rest is in progress:
