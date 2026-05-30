@@ -269,13 +269,45 @@ impl ObjectStoreProvider {
     }
 
     /// Download an object from the store to a local file.
+    ///
+    /// The bytes are written to a uniquely-named temp file in the **same
+    /// directory** as `local_path` and then atomically `rename`d into place
+    /// (POSIX rename is atomic within a filesystem). This guarantees readers
+    /// never observe a half-written `state.redb`: they see either the old file
+    /// or the complete new one, never a truncated mix. Writing in place would
+    /// leave a corrupt redb if the process died mid-write.
     pub async fn download_file(
         &self,
         relative_path: &str,
         local_path: &Path,
     ) -> ObjectStoreResult<()> {
         let bytes = self.get(relative_path).await?;
-        tokio::fs::write(local_path, &bytes).await?;
+
+        let parent = local_path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = local_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "state".to_string());
+        // Same-directory temp name so the rename stays on one filesystem (a
+        // cross-device rename is not atomic and would error). The pid + a
+        // nanosecond timestamp keep concurrent downloads from colliding.
+        let unique = format!(
+            "{}.{}.{}.tmp",
+            file_name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let tmp_path = parent.join(unique);
+
+        tokio::fs::write(&tmp_path, &bytes).await?;
+        // Atomic publish. On failure, best-effort clean up the temp file.
+        if let Err(e) = tokio::fs::rename(&tmp_path, local_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -406,6 +438,41 @@ mod tests {
         provider.download_file("copy", out.path()).await.unwrap();
         let back = std::fs::read(out.path()).unwrap();
         assert_eq!(back, b"file-data");
+    }
+
+    /// `download_file` must atomically replace an existing file with the
+    /// correct content and leave no temp file behind in the directory.
+    #[tokio::test]
+    async fn test_download_overwrites_atomically_no_temp_left() {
+        let provider = ObjectStoreProvider::in_memory();
+        provider
+            .put("state", Bytes::from_static(b"new-state-bytes"))
+            .await
+            .unwrap();
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("state.redb");
+        // Pre-existing (stale) content that must be fully replaced.
+        std::fs::write(&target, b"old-stale-content").unwrap();
+
+        provider.download_file("state", &target).await.unwrap();
+
+        let back = std::fs::read(&target).unwrap();
+        assert_eq!(
+            back, b"new-state-bytes",
+            "content must be the downloaded bytes"
+        );
+
+        // The same-directory temp file must have been renamed away, not left.
+        let leftover: Vec<_> = std::fs::read_dir(target_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no .tmp file should remain after an atomic download"
+        );
     }
 
     #[test]
