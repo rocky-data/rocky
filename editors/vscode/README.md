@@ -40,7 +40,7 @@ Editor support for [Rocky](https://github.com/rocky-data/rocky), the typed graph
 ## Requirements
 
 - **[Rocky CLI](https://github.com/rocky-data/rocky/releases?q=engine)** on your `PATH` (or set `rocky.server.path`)
-- **VS Code** 1.116.0+
+- **VS Code** 1.120.0+
 
 ## Install
 
