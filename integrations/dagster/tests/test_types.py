@@ -664,6 +664,14 @@ def test_parse_missing_command_key():
         parse_rocky_output('{"version": "0.1.0"}')
 
 
+@pytest.mark.parametrize("payload", ["null", "[]", "5"])
+def test_parse_non_dict_json_raises_value_error(payload: str):
+    """Valid JSON that is not an object must raise the documented
+    ValueError, not crash on ``.get`` with an uncaught AttributeError."""
+    with pytest.raises(ValueError, match="not a JSON object"):
+        parse_rocky_output(payload)
+
+
 def test_parse_drift_result(drift_json: str):
     result = DriftDetectResult.model_validate_json(drift_json)
     assert result.command == "drift"

@@ -1887,6 +1887,12 @@ class RockyResource(dg.ConfigurableResource):
             # the caller will hit when it parses the apply output —
             # giving up here would mask the actual JSON shape problem.
             return None
+        if not isinstance(payload, dict):
+            # Valid JSON that is not an object (``null``, ``[]``, ``5``).
+            # Route into the same ``plan_id is None`` -> ``dg.Failure``
+            # path the caller already raises, instead of crashing on
+            # ``.get`` with an uncaught AttributeError.
+            return None
         plan_id = payload.get("plan_id")
         if not isinstance(plan_id, str):
             return None
