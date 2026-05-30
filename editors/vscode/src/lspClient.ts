@@ -11,6 +11,14 @@ import {
 import { getConfig } from "./config";
 import { getOutputChannel } from "./output";
 
+/**
+ * Install instructions for the Rocky CLI. Opened from the "Install Rocky"
+ * action on the missing-binary startup toast so a Marketplace user with no CLI
+ * has a one-click path off the dead end. Points at the README quickstart (the
+ * `curl … | bash` one-liner), not the raw releases list.
+ */
+const ROCKY_INSTALL_URL = "https://github.com/rocky-data/rocky#readme";
+
 let client: LanguageClient | undefined;
 let statusBarItem: vscode.StatusBarItem;
 
@@ -436,11 +444,13 @@ function handleStartupFailure(err: Error): void {
     : `Rocky language server failed to start: ${err.message}`;
 
   const actions = isMissingBinary
-    ? ["Configure Path", "Show Logs"]
+    ? ["Install Rocky", "Configure Path", "Show Logs"]
     : ["Show Logs"];
 
   vscode.window.showErrorMessage(message, ...actions).then((choice) => {
-    if (choice === "Configure Path") {
+    if (choice === "Install Rocky") {
+      void vscode.env.openExternal(vscode.Uri.parse(ROCKY_INSTALL_URL));
+    } else if (choice === "Configure Path") {
       void vscode.commands.executeCommand(
         "workbench.action.openSettings",
         "rocky.server.path",

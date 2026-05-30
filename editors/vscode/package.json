@@ -107,25 +107,10 @@
           "default": [],
           "markdownDescription": "Optional status bar segments to show after the LSP state. Each segment silently no-ops if its data is unavailable. Options: `warehouse`, `lastRunAge`, `driftCount`, `branchState`."
         },
-        "rocky.defaultWarehouse": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Default warehouse identifier shown in status bar and command prompts. Read-only contract — consumed by future commands; changing this has no immediate effect beyond display."
-        },
-        "rocky.defaultBranch": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Default branch name for `rocky.branchApprove` / `rocky.branchPromote` prompts. Read-only contract — consumed by future commands."
-        },
         "rocky.diagnostics.enabled": {
           "type": "boolean",
           "default": true,
           "markdownDescription": "Enable drift diagnostics (inline errors/warnings from `rocky compile`). Set to `false` to disable all Rocky diagnostics without uninstalling the extension."
-        },
-        "rocky.autoRunOnSave": {
-          "type": "boolean",
-          "default": false,
-          "markdownDescription": "Automatically run the pipeline when a model file is saved. Read-only contract — consumed by future commands; has no effect in this release."
         },
         "rocky.costAnnotations.enabled": {
           "type": "boolean",
@@ -904,12 +889,21 @@
       {
         "id": "rocky.getStartedWalkthrough",
         "title": "Get Started with Rocky",
-        "description": "Set up Rocky and run your first pipeline in five steps.",
+        "description": "Set up Rocky and run your first pipeline.",
         "steps": [
           {
             "id": "rocky.walkthrough.installCli",
             "title": "Install the Rocky CLI",
-            "description": "Rocky needs the `rocky` binary on your PATH. Run Doctor to verify your installation.\n\n[Run Health Check](command:rocky.doctor)",
+            "description": "Rocky needs the `rocky` binary on your PATH. The extension talks to it; it isn't bundled.\n\n[Install instructions](https://github.com/rocky-data/rocky#readme)\n\nmacOS / Linux:\n\n```\ncurl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash\n```",
+            "media": {
+              "image": "media/rocky-readme-light.png",
+              "altText": "Rocky logo"
+            }
+          },
+          {
+            "id": "rocky.walkthrough.verifyCli",
+            "title": "Verify Your Installation",
+            "description": "Once the CLI is installed, run the health check to confirm the extension can find and talk to it.\n\n[Run Health Check](command:rocky.doctor)",
             "media": {
               "image": "media/rocky-readme-light.png",
               "altText": "Rocky logo"
