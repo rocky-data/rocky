@@ -433,26 +433,38 @@ impl SnowflakeConnector {
         // transactional unit. Single-statement calls keep the parameters
         // map empty so the body is byte-identical to the pre-Bug-1 payload.
         //
-        // For multi-statement scripts we also set `TRANSACTION_ABORT_ON_ERROR
+        // For multi-statement scripts we also need `TRANSACTION_ABORT_ON_ERROR
         // = TRUE`. Without it, a failed DML rolls back only its own changes
         // and leaves the transaction open — subsequent statements (including
         // the trailing `COMMIT`) are skipped, and the in-flight transaction
         // only rolls back implicitly when the REST session ends. That
-        // session-close cleanup is incidental, not contractual: setting
-        // `ABORT_ON_ERROR` makes Snowflake roll back the entire transaction
-        // at the moment of error, which is what `insert_overwrite_partition`
-        // semantically requires.
-        let statement_count = count_statements(sql);
+        // session-close cleanup is incidental, not contractual: abort-on-error
+        // makes Snowflake roll back the entire transaction at the moment of
+        // error, which is what `insert_overwrite_partition` semantically
+        // requires.
+        //
+        // It CANNOT be passed in `parameters`, though: the SQL API rejects
+        // `TRANSACTION_ABORT_ON_ERROR` there with HTTP 400 / code `391917`
+        // ("not allowed or invalid for SQL API"). Instead we prepend an
+        // `ALTER SESSION SET` statement to the script — it runs in the same
+        // session immediately before the `BEGIN`, so the abort-on-error
+        // behavior applies to the transaction that follows. The statement
+        // count is recomputed on the wrapped SQL so `MULTI_STATEMENT_COUNT`
+        // stays correct. Single-statement calls keep the body byte-identical
+        // to the pre-Bug-1 payload (empty parameters, original SQL).
+        let mut statement_sql = sql.to_string();
+        let mut statement_count = count_statements(sql);
         let mut parameters = std::collections::BTreeMap::new();
         if statement_count > 1 {
+            statement_sql = format!("ALTER SESSION SET TRANSACTION_ABORT_ON_ERROR = TRUE;\n{sql}");
+            statement_count = count_statements(&statement_sql);
             parameters.insert(
                 "MULTI_STATEMENT_COUNT".to_string(),
                 statement_count.to_string(),
             );
-            parameters.insert("TRANSACTION_ABORT_ON_ERROR".to_string(), "TRUE".to_string());
         }
         let body = SubmitRequest {
-            statement: sql.to_string(),
+            statement: statement_sql,
             warehouse: self.config.warehouse.clone(),
             database: self.config.database.clone(),
             schema: self.config.schema.clone(),

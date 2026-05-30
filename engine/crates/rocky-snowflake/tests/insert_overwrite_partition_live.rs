@@ -24,12 +24,19 @@
 //! `DELETE` autocommits, and the trailing `COMMIT`/`ROLLBACK` is a no-op.
 //!
 //! The dialect now returns a single semicolon-joined script, and the
-//! connector sets `MULTI_STATEMENT_COUNT` so Snowflake parses and runs all
-//! four statements as one transactional unit. This test plants a SQL-level
-//! failure between DELETE and INSERT (the INSERT projects a type-mismatched
-//! literal into a numeric column) and asserts that the partition's
-//! pre-existing rows are still present after the failure — proving the
-//! DELETE was rolled back rather than autocommitted.
+//! connector sets `MULTI_STATEMENT_COUNT` (plus a prepended `ALTER SESSION SET
+//! TRANSACTION_ABORT_ON_ERROR = TRUE`) so Snowflake parses and runs all the
+//! statements as one transactional unit that aborts on error. The happy-path
+//! test (`commits_on_success`) is the load-bearing proof: a replaced target
+//! partition with the untouched sibling can only result from DELETE + INSERT +
+//! COMMIT all running in one transaction. The partial-failure test plants a
+//! SQL-level error at the INSERT (a type-mismatched literal into a numeric
+//! column) and asserts the partition's pre-existing rows survive — i.e.
+//! partition integrity is preserved on failure. (Row counts are read in
+//! separate sessions, which see only committed data, so they confirm
+//! integrity without distinguishing error-time rollback from a never-committed
+//! transaction; the assertion that the error is the *planted* one guards
+//! against false-passing on a pre-execution API rejection.)
 //!
 //! Schemas use the `hc_iop_*` prefix per Hugo's Databricks/Snowflake
 //! convention; the per-run microsecond suffix isolates parallel runs.
@@ -146,9 +153,10 @@ async fn count_rows_in_partition(
 /// Builds the four-statement script via the dialect (the production code path)
 /// but substitutes the INSERT's SELECT with a SQL-level failure that fires
 /// AFTER the DELETE would have committed under the old non-transactional
-/// implementation. Asserts the pre-existing partition rows survive — proving
-/// Snowflake auto-rolled back the DELETE because the script ran in one
-/// session with `MULTI_STATEMENT_COUNT=4`.
+/// implementation. Asserts the pre-existing partition rows survive AND that the
+/// failure is the planted numeric error (not a pre-execution API rejection) —
+/// i.e. the script ran as one aborting transaction and partition integrity was
+/// preserved on failure.
 #[tokio::test]
 #[ignore]
 async fn live_insert_overwrite_partition_rolls_back_on_partial_failure() {
@@ -196,9 +204,20 @@ async fn live_insert_overwrite_partition_rolls_back_on_partial_failure() {
 
     drop_schema(&adapter, &database, &schema).await;
 
+    let err = exec_result.expect_err("script with malformed INSERT should fail end-to-end, got Ok");
+    // The failure must be the planted numeric type-conversion error raised at
+    // the INSERT — proof the script actually executed through DELETE to INSERT
+    // in one session. A pre-execution API rejection (e.g. a forbidden session
+    // parameter, HTTP 400 / code 391917) ALSO satisfies `is_err()` and leaves
+    // the partition untouched, so a bare `is_err()` here false-passes when the
+    // request never runs at all. Match on the planted literal / Snowflake's
+    // numeric-conversion message so this can only pass when execution genuinely
+    // reached the INSERT.
+    let err_text = format!("{err:?}");
     assert!(
-        exec_result.is_err(),
-        "script with malformed INSERT should fail end-to-end, got Ok"
+        err_text.contains("not_a_number") || err_text.contains("Numeric value"),
+        "expected the planted numeric type-conversion failure at the INSERT, but got a \
+         different error — did the request bounce before executing? {err_text}"
     );
     assert_eq!(
         target_partition_count,
