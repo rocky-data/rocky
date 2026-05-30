@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.47.1] — 2026-05-30
+
+### Fixed
+
+- **Snowflake `insert_overwrite_partition` now works against the live SQL API.** The connector sent `TRANSACTION_ABORT_ON_ERROR` as a `/api/v2/statements` request parameter, which the SQL API rejects (HTTP 400 / code 391917), so the multi-statement `DELETE` + `INSERT` transaction failed before executing. The setting is now enabled by prepending an `ALTER SESSION SET TRANSACTION_ABORT_ON_ERROR = TRUE` statement to the script. (#754)
+
 ## [1.47.0] — 2026-05-30
 
 ### Added
