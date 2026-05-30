@@ -1,37 +1,25 @@
-//! Deprecation-notice emission for CLI aliases retained during the Phase 4
-//! deprecation cycle.
+//! Deprecation-notice emission for the bare-verb `rocky branch promote
+//! <name>` alias.
 //!
-//! `rocky run` and the bare-verb form of `rocky branch promote <name>` are
-//! kept as aliases that internally chain `plan + apply` (per Phases 1–3 of
-//! the plan/apply spine, shipped in engine-v1.32.0). They emit a one-line
-//! `[deprecated]` notice to stderr on every invocation pointing at the
-//! canonical two-step flow. Removal target: a future major release.
+//! `rocky branch promote <name>` (without `--plan`) is kept as an alias that
+//! internally chains `plan + apply`. It emits a one-line `[deprecated]`
+//! notice to stderr on every invocation pointing at the canonical
+//! `rocky plan promote` + `rocky apply` flow, which runs the approval +
+//! breaking-change gates before any production data is touched. Removal
+//! target: a future major release.
+//!
+//! (`rocky run` is intentionally *not* deprecated — it stays first-class as
+//! the fused single-step plan+apply convenience for local iteration and
+//! automation, alongside the canonical auditable two-step.)
 //!
 //! Suppression: set `ROCKY_SUPPRESS_DEPRECATION=1` in the environment to
 //! silence the warning. The dagster integration sets this on every
-//! subprocess invocation so existing `RockyResource.materialize()` callers
-//! don't see noise on every run while their orchestration code still
-//! routes through the alias verbs.
+//! subprocess invocation so existing callers don't see noise on every
+//! run while their orchestration code still routes through the alias verb.
 
 use std::io::{self, Write};
 
 const SUPPRESS_ENV_VAR: &str = "ROCKY_SUPPRESS_DEPRECATION";
-
-/// Stderr message emitted by `rocky run`.
-///
-/// As of the flag-surface parity work, `rocky plan` accepts the full flag
-/// surface of `rocky run` (`--resume`, `--shadow`, `--partition`,
-/// `--idempotency-key`, `--parallel`, `--all`, `--branch`,
-/// `--governance-override`, `--dag`, `--model`, `--models`, `--from`,
-/// `--to`, `--latest`, `--missing`, `--lookback`, `--resume-latest`,
-/// `--shadow-suffix`, `--shadow-schema`). `--watch` remains on `rocky run`
-/// because its re-run-loop semantics have no plan/apply analogue.
-pub const RUN_DEPRECATION: &str = "\
-`rocky run` is deprecated — the canonical form is `rocky plan [flags]` followed by `rocky apply <plan-id>`, \
-which persists an auditable artifact at `.rocky/plans/<plan-id>.json`. \
-`rocky plan` accepts the same flag surface as `rocky run` (filter, pipeline, partition, shadow, branch, resume, idempotency-key, parallel, all, dag, governance-override, model, models, env). \
-The only exception is `--watch`, whose re-run-loop semantics are inherently runtime-only; it remains on `rocky run`. \
-Suppress this warning with ROCKY_SUPPRESS_DEPRECATION=1.";
 
 /// Stderr message emitted by bare `rocky branch promote <name>` (without `--plan`).
 pub const BRANCH_PROMOTE_DEPRECATION: &str = "\
@@ -67,16 +55,15 @@ mod tests {
     /// parallel cargo-test threads — we deliberately don't try to test
     /// `warn()` in-process for that reason.
     #[test]
-    fn warning_messages_are_one_logical_line() {
-        for msg in [RUN_DEPRECATION, BRANCH_PROMOTE_DEPRECATION] {
-            assert!(
-                !msg.contains('\n'),
-                "message must not embed newlines: {msg:?}"
-            );
-            assert!(
-                msg.contains("ROCKY_SUPPRESS_DEPRECATION=1"),
-                "suppress hint missing: {msg:?}"
-            );
-        }
+    fn warning_message_is_one_logical_line() {
+        let msg = BRANCH_PROMOTE_DEPRECATION;
+        assert!(
+            !msg.contains('\n'),
+            "message must not embed newlines: {msg:?}"
+        );
+        assert!(
+            msg.contains("ROCKY_SUPPRESS_DEPRECATION=1"),
+            "suppress hint missing: {msg:?}"
+        );
     }
 }
