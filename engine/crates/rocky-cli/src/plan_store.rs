@@ -273,6 +273,27 @@ pub fn read_plan(root: &Path, plan_id: &str) -> Result<PersistedPlan> {
     let plan: PersistedPlan = serde_json::from_slice(&bytes)
         .with_context(|| format!("plan file at {} is not valid JSON", path.display()))?;
 
+    // Integrity check: the plan_id is the blake3 digest of `{kind, payload}`.
+    // Recompute it from the bytes we just parsed and reject the plan if it does
+    // not match the requested id (and the stored id). This binds the applied
+    // bytes to the reviewed plan id — a plan whose payload was tampered with or
+    // truncated-but-still-parseable after it was written (and reviewed) no
+    // longer matches its filename / stored id, so apply refuses it.
+    let recomputed = compute_plan_id(&plan.kind, &plan.payload);
+    if recomputed != plan_id || recomputed != plan.plan_id {
+        bail!(
+            "plan '{}' failed its integrity check: the payload hashes to '{}', \
+             which does not match the requested id '{}' (stored id '{}'). \
+             The plan file at {} may have been modified after it was written — \
+             re-generate the plan and (if AI-authored) re-review it before applying.",
+            plan_id,
+            recomputed,
+            plan_id,
+            plan.plan_id,
+            path.display()
+        );
+    }
+
     Ok(plan)
 }
 
@@ -305,6 +326,43 @@ mod tests {
         assert_eq!(plan.kind, PlanKind::Compact);
         assert_eq!(plan.payload["model"], json!("mydb.myschema.orders"));
         assert_eq!(plan.payload["statement_count"], json!(2));
+        Ok(())
+    }
+
+    /// L3: a persisted plan whose payload is mutated after write (so it no
+    /// longer hashes to its filename / stored id) must be rejected by
+    /// `read_plan`, not silently applied.
+    #[test]
+    fn tampered_payload_is_rejected() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = DummyPayload {
+            model: "cat.sc.tbl",
+            statement_count: 2,
+        };
+        let plan_id = write_plan(dir.path(), PlanKind::Compact, &payload)?;
+
+        // It reads cleanly before tampering.
+        assert!(read_plan(dir.path(), &plan_id).is_ok());
+
+        // Mutate the payload on disk while leaving the JSON valid and the
+        // filename + stored plan_id unchanged — exactly the post-review
+        // tamper the integrity check must catch.
+        let path = dir
+            .path()
+            .join(".rocky")
+            .join("plans")
+            .join(format!("{plan_id}.json"));
+        let raw = std::fs::read_to_string(&path)?;
+        let mut record: serde_json::Value = serde_json::from_str(&raw)?;
+        record["payload"]["statement_count"] = json!(999);
+        std::fs::write(&path, serde_json::to_vec_pretty(&record)?)?;
+
+        let err = read_plan(dir.path(), &plan_id).expect_err("a tampered plan must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("integrity check"),
+            "expected an integrity-check error, got: {msg}"
+        );
         Ok(())
     }
 
@@ -592,12 +650,16 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let plans_dir = dir.path().join(".rocky").join("plans");
         std::fs::create_dir_all(&plans_dir)?;
-        let plan_id = "a".repeat(64);
+        // Use a hash-consistent plan_id for the payload so the integrity check
+        // passes — this test exercises the `format_version` default, not a
+        // tamper case. (Pre-integrity-check this used a fabricated all-`a` id.)
+        let payload = serde_json::json!({"dummy": true});
+        let plan_id = compute_plan_id(&PlanKind::Compact, &payload);
         let legacy_json = serde_json::json!({
             "plan_id": plan_id,
             "kind": "compact",
             "created_at": "2026-05-15T12:34:56Z",
-            "payload": {"dummy": true}
+            "payload": payload
         });
         std::fs::write(
             plans_dir.join(format!("{plan_id}.json")),
