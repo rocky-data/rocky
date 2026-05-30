@@ -87,16 +87,22 @@ pub struct InspectSchemaArgs {}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SampleRowsArgs {
-    /// The model whose target table to sample. Must be a compiled model.
+    /// What to sample: a compiled model name, OR a qualified `schema.table`
+    /// (or `catalog.schema.table`) reference to a raw source table. A dotted
+    /// reference resolves directly against the warehouse and needs no compiled
+    /// model, so it also works at cold start (a project with zero models yet).
     pub model: String,
-    /// Sample percentage (1–100). Defaults to 10.
+    /// Random-sample percentage (1–100). Omit to return the first rows
+    /// deterministically — the right default for small tables, where a low
+    /// percentage sample can return zero rows.
     #[serde(default)]
     pub percent: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ProfileColumnArgs {
-    /// The model whose target table to profile.
+    /// What to profile: a compiled model name, OR a qualified `schema.table`
+    /// (or `catalog.schema.table`) reference to a raw source table.
     pub model: String,
     /// The column to profile.
     pub column: String,
@@ -175,6 +181,9 @@ pub struct BuildModelArgs {
 const SAMPLE_MAX_ROWS: usize = 50;
 const SAMPLE_MAX_BYTES: usize = 16 * 1024;
 const CELL_MAX_CHARS: usize = 256;
+/// Max distinct values `profile_column` lists in `top_values`; above this the
+/// column is treated as high-cardinality and the value list is omitted.
+const PROFILE_TOP_VALUES_MAX: usize = 25;
 
 #[tool_router(router = tool_router)]
 impl RockyMcpServer {
@@ -505,8 +514,6 @@ impl RockyMcpServer {
         &self,
         _params: Parameters<InspectSchemaArgs>,
     ) -> Result<Json<InspectSchemaResult>, String> {
-        let result = self.compile_full().map_err(|e| format!("{e:#}"))?;
-        let (model_schemas, source_tables) = commands::build_schema_context(&result);
         let to_entries = |buckets: Vec<(String, Vec<rocky_compiler::types::TypedColumn>)>| {
             buckets
                 .into_iter()
@@ -523,10 +530,46 @@ impl RockyMcpServer {
                 })
                 .collect::<Vec<_>>()
         };
-        Ok(Json(InspectSchemaResult {
-            models: to_entries(model_schemas),
-            sources: to_entries(source_tables),
-        }))
+
+        // Compile to learn the project's models. Tolerate a models-less project
+        // (cold start) — there, the source discovery below is the whole point.
+        let (models, mut sources, model_targets) = match self.compile_full() {
+            Ok(result) => {
+                let (model_schemas, source_tables) = commands::build_schema_context(&result);
+                let targets: std::collections::HashSet<String> = result
+                    .project
+                    .models
+                    .iter()
+                    .map(|m| format!("{}.{}", m.config.target.schema, m.config.target.table))
+                    .collect();
+                (
+                    to_entries(model_schemas),
+                    to_entries(source_tables),
+                    targets,
+                )
+            }
+            Err(e) if e.to_string().contains("no models found") => {
+                (Vec::new(), Vec::new(), std::collections::HashSet::new())
+            }
+            Err(e) => return Err(format!("{e:#}")),
+        };
+
+        // On DuckDB, surface the physical warehouse tables so an agent can
+        // ground a raw source the project never declared — and at cold start,
+        // before any model exists. Skip a table that is a model's target or is
+        // already reported as a compile-derived source.
+        if let Ok(Some(adapter)) = self.duckdb_warehouse() {
+            let seen: std::collections::HashSet<String> =
+                sources.iter().map(|s| s.name.clone()).collect();
+            for entry in discover_source_tables(adapter.as_ref()).await {
+                if model_targets.contains(&entry.name) || seen.contains(&entry.name) {
+                    continue;
+                }
+                sources.push(entry);
+            }
+        }
+
+        Ok(Json(InspectSchemaResult { models, sources }))
     }
 
     #[tool(
@@ -759,16 +802,17 @@ impl RockyMcpServer {
     // ------------------------- SHOULD tools --------------------------------
 
     #[tool(
-        description = "Sample real rows from a model's target table (DuckDB only). Look at \
-         literal values, units, and null patterns the schema can't tell you. Capped at 50 rows / \
-         16 KB; long cells truncated. Returns {unavailable:true} on non-DuckDB adapters."
+        description = "Sample real rows from a model's target table OR a qualified `schema.table` \
+         source reference (DuckDB only). Look at literal values, units, and null patterns the \
+         schema can't tell you. Omit `percent` to get the first rows (the right default for small \
+         tables); set 1–100 for a random-percentage sample. Capped at 50 rows / 16 KB; long cells \
+         truncated. Returns {unavailable:true} on non-DuckDB adapters."
     )]
     async fn sample_rows(
         &self,
         params: Parameters<SampleRowsArgs>,
     ) -> Result<Json<SampleRowsResult>, String> {
         let args = params.0;
-        let percent = args.percent.unwrap_or(10).clamp(1, 100);
 
         let prepared = match self.prepare_table_query(&args.model).await {
             Ok(PreparedTable::Ready(p)) => p,
@@ -782,11 +826,14 @@ impl RockyMcpServer {
             Err(e) => return Err(format!("{e:#}")),
         };
 
-        // Build: SELECT * FROM <ref> <tablesample> LIMIT n. The table ref is
-        // built only from validated identifiers; never `format!`'d from raw
-        // input. `percent` is a clamped integer.
-        let sample = prepared
-            .dialect_tablesample(percent)
+        // Build: SELECT * FROM <ref> [tablesample] LIMIT n. The ref is built
+        // only from validated identifiers; never `format!`'d from raw input.
+        // With no `percent`, return the first rows deterministically — a low
+        // percentage sample returns ~0 rows on a small table, which is the most
+        // common grounding case. `percent`, when given, is a clamped integer.
+        let sample = args
+            .percent
+            .and_then(|p| prepared.dialect_tablesample(p.clamp(1, 100)))
             .map(|s| format!(" {s}"))
             .unwrap_or_default();
         let sql = format!(
@@ -824,9 +871,11 @@ impl RockyMcpServer {
     }
 
     #[tool(
-        description = "Profile one column of a model's target table in a single aggregate query \
-         (DuckDB only): row count, nulls, null rate, distinct count, min, max. Returns \
-         {unavailable:true} on non-DuckDB adapters."
+        description = "Profile one column of a model's target table OR a qualified `schema.table` \
+         source (DuckDB only): row count, nulls, null rate, distinct count, min, max — and, for a \
+         low-cardinality column (≤25 distinct), the distinct values with their counts \
+         (`top_values`), which surfaces exact literals (e.g. a status string) that min/max hide. \
+         Returns {unavailable:true} on non-DuckDB adapters."
     )]
     async fn profile_column(
         &self,
@@ -890,6 +939,31 @@ impl RockyMcpServer {
             }
         };
 
+        // For a low-cardinality column, surface the distinct values + their
+        // counts — what `min`/`max` alone can't reveal (e.g. that `status`
+        // holds 'COMPLETE', not 'completed'). One extra grouped query, run only
+        // when the cardinality makes it cheap.
+        let top_values = if distinct > 0 && distinct <= PROFILE_TOP_VALUES_MAX as u64 {
+            let q = format!(
+                "SELECT CAST({col} AS VARCHAR) AS v, COUNT(*) AS c FROM {} \
+                 GROUP BY {col} ORDER BY c DESC, v LIMIT {}",
+                prepared.table_ref, PROFILE_TOP_VALUES_MAX
+            );
+            match prepared.adapter.execute_query(&q).await {
+                Ok(r) => r
+                    .rows
+                    .into_iter()
+                    .map(|row| ValueCount {
+                        value: str_cell(row.first()),
+                        count: row.get(1).map(as_u64).unwrap_or(0),
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
         Ok(Json(ProfileColumnResult {
             unavailable: false,
             reason: None,
@@ -899,6 +973,7 @@ impl RockyMcpServer {
             distinct,
             min: str_cell(row.get(3)),
             max: str_cell(row.get(4)),
+            top_values,
         }))
     }
 
@@ -945,45 +1020,81 @@ impl RockyMcpServer {
     /// Resolve a model's target table into a runnable, validated table ref +
     /// the warehouse adapter — but only on DuckDB. Other adapters return the
     /// typed "unavailable" result so the grounding tools degrade cleanly.
-    async fn prepare_table_query(&self, model_name: &str) -> anyhow::Result<PreparedTable> {
+    /// The project's target warehouse adapter, but only when it is DuckDB — the
+    /// data-grounding tools (`sample_rows`, `profile_column`, and
+    /// `inspect_schema`'s source discovery) are DuckDB-only in this release.
+    /// Returns `Ok(None)` on any other adapter so callers degrade cleanly.
+    fn duckdb_warehouse(
+        &self,
+    ) -> anyhow::Result<Option<std::sync::Arc<dyn rocky_core::traits::WarehouseAdapter>>> {
         let cfg = rocky_core::config::load_rocky_config(&self.config_path)?;
         let registry = commands_adapter_registry(&cfg)?;
         let (_, pipeline) = rocky_cli::registry::resolve_pipeline(&cfg, None)?;
         let target_adapter = pipeline.target_adapter().to_string();
-
         let adapter_type = registry
             .adapter_config(&target_adapter)
             .map(|a| a.adapter_type.clone())
             .unwrap_or_default();
         if adapter_type != "duckdb" {
+            return Ok(None);
+        }
+        Ok(Some(registry.warehouse_adapter(&target_adapter)?))
+    }
+
+    /// Resolve a grounding-tool target into a runnable, validated table ref plus
+    /// the warehouse adapter — DuckDB only.
+    ///
+    /// The target is either a **compiled model name** (resolved to its target
+    /// table, which requires the models to compile) or a **qualified
+    /// `schema.table` / `catalog.schema.table` source reference** (any dotted
+    /// name — resolved directly with no compile, so it reaches raw sources the
+    /// project never declared and works at cold start, before any model exists).
+    async fn prepare_table_query(&self, target: &str) -> anyhow::Result<PreparedTable> {
+        let Some(adapter) = self.duckdb_warehouse()? else {
             return Ok(PreparedTable::Unavailable(
                 "sample_rows/profile_column are DuckDB-only in this release".to_string(),
             ));
-        }
+        };
 
-        // Resolve the model's target coordinates by loading the models dir.
-        let result = self.compile_full()?;
-        let model = result
-            .project
-            .models
-            .iter()
-            .find(|m| m.config.name == model_name)
-            .ok_or_else(|| anyhow::anyhow!("model '{model_name}' not found in project"))?;
-        let t = &model.config.target;
+        let table_ref = if target.contains('.') {
+            // Qualified raw reference — validate each segment and use it as-is.
+            // No compile required: this is how an agent grounds a source before
+            // (or without) authoring any model.
+            let parts: Vec<&str> = target.split('.').collect();
+            if !(2..=3).contains(&parts.len()) {
+                return Err(anyhow::anyhow!(
+                    "table reference '{target}' must be `schema.table` or \
+                     `catalog.schema.table`"
+                ));
+            }
+            for part in &parts {
+                rocky_sql::validation::validate_identifier(part)
+                    .map_err(|e| anyhow::anyhow!("invalid identifier '{part}': {e}"))?;
+            }
+            parts.join(".")
+        } else {
+            // Bare name — resolve the model's target coordinates by compiling
+            // the models dir. DuckDB has no catalog level, so we emit a two-part
+            // `schema.table` name.
+            let result = self.compile_full()?;
+            let model = result
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == target)
+                .ok_or_else(|| anyhow::anyhow!("model '{target}' not found in project"))?;
+            let t = &model.config.target;
+            let schema = rocky_sql::validation::validate_identifier(&t.schema)
+                .map_err(|e| anyhow::anyhow!("invalid schema identifier: {e}"))?;
+            let table = rocky_sql::validation::validate_identifier(&t.table)
+                .map_err(|e| anyhow::anyhow!("invalid table identifier: {e}"))?;
+            if !t.catalog.is_empty() {
+                rocky_sql::validation::validate_identifier(&t.catalog)
+                    .map_err(|e| anyhow::anyhow!("invalid catalog identifier: {e}"))?;
+            }
+            format!("{schema}.{table}")
+        };
 
-        // Validate every identifier before composing the ref. DuckDB has no
-        // catalog level, so we emit a two-part `schema.table` name.
-        let schema = rocky_sql::validation::validate_identifier(&t.schema)
-            .map_err(|e| anyhow::anyhow!("invalid schema identifier: {e}"))?;
-        let table = rocky_sql::validation::validate_identifier(&t.table)
-            .map_err(|e| anyhow::anyhow!("invalid table identifier: {e}"))?;
-        if !t.catalog.is_empty() {
-            rocky_sql::validation::validate_identifier(&t.catalog)
-                .map_err(|e| anyhow::anyhow!("invalid catalog identifier: {e}"))?;
-        }
-        let table_ref = format!("{schema}.{table}");
-
-        let adapter = registry.warehouse_adapter(&target_adapter)?;
         Ok(PreparedTable::Ready(Prepared { adapter, table_ref }))
     }
 }
@@ -1245,6 +1356,59 @@ fn breaking_finding_lite(f: &rocky_core::breaking_change::BreakingFinding) -> Br
         column,
         message: format!("{:?}", f.change),
     }
+}
+
+/// Discover the physical tables in the DuckDB warehouse as schema-qualified
+/// source entries (best-effort — returns empty on any query error). Excludes
+/// the system schemas. Lets `inspect_schema` show an agent the raw sources the
+/// project never declared, including at cold start.
+async fn discover_source_tables(
+    adapter: &dyn rocky_core::traits::WarehouseAdapter,
+) -> Vec<SchemaEntry> {
+    let sql = "SELECT table_schema, table_name, column_name, data_type, is_nullable \
+               FROM information_schema.columns \
+               WHERE table_schema NOT IN ('information_schema', 'pg_catalog') \
+               ORDER BY table_schema, table_name, ordinal_position";
+    let Ok(qr) = adapter.execute_query(sql).await else {
+        return Vec::new();
+    };
+    let cell = |v: Option<&serde_json::Value>| -> String {
+        match v {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Null) | None => String::new(),
+            Some(other) => other.to_string(),
+        }
+    };
+    // Group columns under their `schema.table`, preserving first-seen order.
+    let mut order: Vec<String> = Vec::new();
+    let mut columns: std::collections::HashMap<String, Vec<ColumnLite>> =
+        std::collections::HashMap::new();
+    for row in qr.rows {
+        let schema = cell(row.first());
+        let table = cell(row.get(1));
+        if schema.is_empty() || table.is_empty() {
+            continue;
+        }
+        let key = format!("{schema}.{table}");
+        if !columns.contains_key(&key) {
+            order.push(key.clone());
+        }
+        columns.entry(key).or_default().push(ColumnLite {
+            name: cell(row.get(2)),
+            data_type: cell(row.get(3)),
+            nullable: !cell(row.get(4)).eq_ignore_ascii_case("NO"),
+        });
+    }
+    order
+        .into_iter()
+        .map(|name| {
+            let cols = columns.remove(&name).unwrap_or_default();
+            SchemaEntry {
+                name,
+                columns: cols,
+            }
+        })
+        .collect()
 }
 
 /// Render one query cell as a display string, truncating long values.

@@ -94,17 +94,23 @@ Open this directory in Claude Code (it picks up `.mcp.json`), confirm the `rocky
 
 > Build a Rocky model for total completed-order revenue in USD from the orders source.
 
+### Prerequisite: seed the warehouse
+
+The MCP grounding tools read the **warehouse**, so the source data must exist in `poc.duckdb` first. Run `./run.sh` once (it seeds `poc.duckdb` with `seeds.orders`) before the interactive demo.
+
 ### Expected agent trajectory
 
-1. **`inspect_schema`** — learns the source columns: `order_id`, `customer_id`, `status`, `amount_cents`, `ordered_at`. A column called `status` and one called `amount_cents` are all the schema offers.
-2. **`sample_rows`** — sees real rows. The `status` values are `'COMPLETE'` (uppercase), never `'completed'`. This is the step a schema-only agent skips.
-3. **`profile_column`** on `amount_cents` — sees the scale: values like 12500, 30000, 45000. Integer cents, not dollars.
+1. **`inspect_schema`** — lists `seeds.orders` under `sources` with its typed columns: `order_id`, `customer_id`, `status`, `amount_cents`, `ordered_at`. (Physical warehouse tables the project never declared as a Rocky source are discovered here too, so the agent can find what to ground against.)
+2. **`sample_rows`** on `seeds.orders` — sees real rows. The `status` values are `'COMPLETE'` (uppercase), never `'completed'`. With no `percent`, the first rows come back deterministically — the right default for a small table. This is the step a schema-only agent skips.
+3. **`profile_column`** on `seeds.orders` / `amount_cents` — sees the scale: values like 12500, 30000, 45000. Integer cents, not dollars. On `status`, the result's `top_values` lists the exact literals (`COMPLETE`, `PENDING`, `CANCELLED`) that a `min`/`max` pair would hide.
 4. **Writes the model** — `WHERE status = 'COMPLETE'`, `SUM(amount_cents) / 100.0 AS revenue_usd`. Equivalent to `revenue_correct.sql`.
 5. **`compile`** — type-checks clean. So would the naive model; compile is necessary, not sufficient.
 6. **`plan_preview`** — reads the exact SQL that would run and confirms it matches intent.
 7. **`propose`** — records an AI-authored plan and returns a `plan_id`. The agent stops here. It does not apply.
 8. **Human review** — you run `rocky review <plan-id>` to read the breaking-change report, then `rocky review <plan-id> --approve` to sign off, then `rocky apply <plan-id>` to materialize.
 9. **`rocky test --declarative`** — the `SUM(revenue_usd) = 1000` assertion reconciles green.
+
+Both grounding tools accept either a compiled model name **or** a qualified `schema.table` source reference (like `seeds.orders`), so an agent can ground a raw source before it has authored any model.
 
 ### Why a schema-only agent ships `revenue_naive`
 

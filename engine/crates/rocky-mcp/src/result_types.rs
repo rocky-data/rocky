@@ -226,6 +226,23 @@ pub struct ProfileColumnResult {
     pub min: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<String>,
+    /// For a low-cardinality column (≤25 distinct), the distinct values with
+    /// their row counts — surfaces exact literals that `min`/`max` hide (e.g.
+    /// `status` = 'COMPLETE', not 'completed'). Empty for high-cardinality
+    /// columns, and omitted from JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_values: Vec<ValueCount>,
+}
+
+/// One distinct value of a column and how many rows carry it — the entries of
+/// `ProfileColumnResult::top_values`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ValueCount {
+    /// The value rendered as text; omitted (JSON null) for the SQL NULL group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Number of rows carrying this value.
+    pub count: u64,
 }
 
 /// serde `skip_serializing_if` predicate for `bool` fields.
