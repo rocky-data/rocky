@@ -187,11 +187,25 @@ struct LoginResponse {
     success: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct LoginData {
     token: Option<String>,
     #[serde(rename = "validityInSeconds")]
     validity_in_seconds: Option<u64>,
+}
+
+// Custom `Debug` that masks the session token. The derive would print `token`
+// verbatim, so a future `{:?}` of a `LoginResponse` (which still derives
+// `Debug` and embeds this) would leak the secret. The masking lives here so
+// the embedding type stays safe too. Nothing currently relies on the derived
+// `Debug`.
+impl std::fmt::Debug for LoginData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginData")
+            .field("token", &self.token.as_ref().map(|_| "***"))
+            .field("validity_in_seconds", &self.validity_in_seconds)
+            .finish()
+    }
 }
 
 impl Auth {

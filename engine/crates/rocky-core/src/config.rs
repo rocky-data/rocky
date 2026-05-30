@@ -543,6 +543,8 @@ pub struct StateConfig {
     /// GCS key prefix (default: "rocky/state/")
     pub gcs_prefix: Option<String>,
     /// Valkey/Redis URL for state persistence
+    // SECURITY: may embed credentials (`redis://:password@host`). Never log
+    // this value; redact it if it ever reaches an error/trace message.
     pub valkey_url: Option<String>,
     /// Valkey key prefix (default: "rocky:state:")
     pub valkey_prefix: Option<String>,
@@ -1683,6 +1685,11 @@ impl ModelBudgetConfig {
 /// (schemas section).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValkeyCacheConfig {
+    // SECURITY: may embed credentials (`redis://:password@host`). Never log
+    // this value; redact it if it ever reaches an error/trace message. (Not
+    // wrapped in RedactedString because the cache client consumes it as a
+    // plain connection URL — threading RedactedString through that
+    // construction is invasive; this comment is the guard instead.)
     pub valkey_url: String,
 }
 
@@ -2552,6 +2559,8 @@ pub struct FivetranCacheConfig {
 
     /// Connection URL for `backend = "valkey"` or `backend = "tiered"`
     /// (primary layer). Standard `redis://` (plain) or `rediss://` (TLS).
+    // SECURITY: may embed credentials (`redis://:password@host`). Never log
+    // this value; redact it if it ever reaches an error/trace message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valkey_url: Option<String>,
 
@@ -2687,6 +2696,8 @@ pub struct FivetranRatelimitConfig {
 
     /// Connection URL for `backend = "valkey"`. Standard `redis://`
     /// (plain) or `rediss://` (TLS).
+    // SECURITY: may embed credentials (`redis://:password@host`). Never log
+    // this value; redact it if it ever reaches an error/trace message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valkey_url: Option<String>,
 
@@ -2780,6 +2791,8 @@ pub struct FivetranStampedeConfig {
 
     /// Connection URL for `backend = "valkey"`. Standard `redis://`
     /// (plain) or `rediss://` (TLS).
+    // SECURITY: may embed credentials (`redis://:password@host`). Never log
+    // this value; redact it if it ever reaches an error/trace message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valkey_url: Option<String>,
 
@@ -2883,6 +2896,8 @@ pub struct FivetranCircuitBreakerConfig {
 
     /// Connection URL for `backend = "valkey"`. Standard `redis://`
     /// (plain) or `rediss://` (TLS).
+    // SECURITY: may embed credentials (`redis://:password@host`). Never log
+    // this value; redact it if it ever reaches an error/trace message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valkey_url: Option<String>,
 
