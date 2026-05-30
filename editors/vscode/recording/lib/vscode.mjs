@@ -27,6 +27,7 @@ const DEFAULT_SETTINGS = {
   "update.mode": "none",
   "workbench.tips.enabled": false,
   "editor.fontSize": 14,
+  "workbench.colorTheme": "Default Dark Modern",
 };
 
 function shortUserDataDir() {

@@ -1,0 +1,35 @@
+# inspector-showcase — VS Code "Rocky Inspector" demo recording fixture.
+#
+# This is NOT a playground POC. It is the backing workspace for the
+# Inspector demo recording: a ~9-model SaaS-analytics transformation DAG
+# whose focal model `customer_360` has 3 upstreams + 2 downstreams,
+# carries PII classification that lights the Inspector's Governance card
+# red, has declarative tests, and materializes into DuckDB so the
+# Preview/Profile tabs show real data.
+#
+# The `restricted` classification tag on `customer_360.tax_id` is left
+# WITHOUT a matching `[mask]` strategy on purpose — that omission is the
+# unmasked "exception" `rocky compliance` flags (the red Governance signal).
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+type = "transformation"
+models = "models/**"
+
+[pipeline.poc.target]
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true
+
+# Workspace-default masking policy. `pii` resolves to a strategy in both
+# the workspace default and the `prod` override; `restricted` resolves in
+# NEITHER, so every column tagged `restricted` (here: customer_360.tax_id)
+# becomes a compliance exception. That omission is intentional.
+[mask]
+pii = "hash"
+
+[mask.prod]
+pii = "redact"

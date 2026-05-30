@@ -1,0 +1,8 @@
+# `depends_on` is declared explicitly so the DAG edge
+# raw_payments->stg_payments survives even when the DSL `from
+# demo.raw_payments` ref is read as a two-part (catalog-omitted)
+# reference. It also pins build order for the in-memory `rocky test` path.
+depends_on = ["raw_payments"]
+
+[strategy]
+type = "full_refresh"

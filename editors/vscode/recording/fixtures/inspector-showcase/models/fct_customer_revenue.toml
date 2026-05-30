@@ -1,0 +1,4 @@
+depends_on = ["customer_360"]
+
+[strategy]
+type = "full_refresh"

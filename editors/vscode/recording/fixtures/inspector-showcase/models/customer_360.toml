@@ -1,0 +1,26 @@
+depends_on = ["dim_customers", "stg_orders", "stg_payments"]
+
+[strategy]
+type = "full_refresh"
+
+# Per-column classification tags. `email` is tagged `pii`, which resolves
+# to a `[mask]` strategy (hash in dev, redact in prod). `tax_id` is tagged
+# `restricted`, which has NO matching `[mask]` strategy — that's the
+# unmasked compliance exception the Inspector's Governance card flags red.
+[classification]
+email = "pii"
+tax_id = "restricted"
+
+# Declarative assertions. customer_360 is one row per customer (both the
+# orders and payments sides are pre-aggregated by customer_id and joined
+# onto the dim), so `unique` on customer_id holds structurally and
+# `not_null` holds because customer_id is the dim's grain.
+[[tests]]
+type = "not_null"
+column = "customer_id"
+severity = "error"
+
+[[tests]]
+type = "unique"
+column = "customer_id"
+severity = "error"

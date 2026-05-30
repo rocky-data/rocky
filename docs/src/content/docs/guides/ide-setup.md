@@ -251,8 +251,6 @@ The Inspector has a tab per concern, each backed by a Rocky CLI command and degr
 
 The **Lineage** tab renders the project's column-level graph as an interactive canvas. Open it directly with **Cmd+Shift+P** > **Rocky: Show Model Lineage**, framed on the current model.
 
-![The lineage canvas focused on a model's neighborhood, with a cost overlay drawn on the graph](/demo-vscode-lineage.gif)
-
 - Opens focused on a model's neighborhood and expands out to the whole project
 - Built from `rocky catalog` (assets and dependencies) and `rocky compile` (per-model materialization)
 - Trust-plane overlays drawn on the graph itself: cost, freshness, drift, governance, breaking changes against the base ref, and the last run

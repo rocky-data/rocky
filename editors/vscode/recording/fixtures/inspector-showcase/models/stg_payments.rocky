@@ -1,0 +1,2 @@
+from demo.raw_payments
+where method != "refund"
