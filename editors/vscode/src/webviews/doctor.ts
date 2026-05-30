@@ -12,7 +12,15 @@ export function showDoctorResult(result: DoctorResult): void {
     "rockyDoctor",
     "Rocky Doctor",
     vscode.ViewColumn.Beside,
-    { enableScripts: true, retainContextWhenHidden: true, enableCommandUris: true },
+    {
+      enableScripts: true,
+      retainContextWhenHidden: true,
+      // Allow only the exact command: URIs this webview's HTML links to, so a
+      // future templating bug can't smuggle in an arbitrary command. Every
+      // command: anchor here resolves to workbench.action.openSettings (the
+      // ?"…" query is the settings filter, not a separate command).
+      enableCommandUris: ["workbench.action.openSettings"],
+    },
   );
 
   panel.webview.html = renderDoctorHtml(panel.webview, result);
@@ -124,9 +132,10 @@ function badgeFor(status: string | undefined): string {
 /**
  * Returns inline `command:` anchor tags for a failed check.
  *
- * Uses VS Code `command:` URIs — these work because `enableCommandUris: true`
- * is set on the webview. All links are hardcoded to commands that are always
- * registered; no user-supplied data is interpolated into the href.
+ * Uses VS Code `command:` URIs — these work because
+ * `workbench.action.openSettings` is on the webview's `enableCommandUris`
+ * allowlist. All links are hardcoded to that command; no user-supplied data is
+ * interpolated into the href.
  */
 function buildCheckActionLinks(checkName: string): string {
   // Always offer "Open settings" for any failed check.
