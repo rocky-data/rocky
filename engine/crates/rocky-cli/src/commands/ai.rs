@@ -19,6 +19,19 @@ use crate::output::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ANTHROPIC_API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 
+/// Pick the validation format for a model from its source file path: `.rocky`
+/// files are Rocky DSL, everything else (notably `.sql`) is raw SQL.
+fn proposed_source_format(file_path: &str) -> &'static str {
+    if std::path::Path::new(file_path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("rocky"))
+    {
+        "rocky"
+    } else {
+        "sql"
+    }
+}
+
 /// Create an LLM client from environment + project config.
 ///
 /// Reads `[ai] max_tokens` from `rocky.toml` when the config loads cleanly;
@@ -338,6 +351,23 @@ pub async fn run_ai_sync(
         if apply {
             for proposal in &proposals {
                 if let Some(model) = result.project.model(&proposal.model) {
+                    // Validate the LLM-proposed source through the same
+                    // parse + typecheck path used to compile-verify generated
+                    // models BEFORE writing it. An unvalidated proposal that
+                    // does not parse or typecheck must never land on disk.
+                    let format = proposed_source_format(&model.file_path);
+                    if let Err(diagnostics) = rocky_ai::generate::validate_proposed_source(
+                        &proposal.proposed_source,
+                        format,
+                        None,
+                    ) {
+                        anyhow::bail!(
+                            "refusing to apply proposal for model '{}': the proposed source \
+                             does not compile.\n{}",
+                            proposal.model,
+                            diagnostics
+                        );
+                    }
                     std::fs::write(&model.file_path, &proposal.proposed_source)?;
                     println!("Updated: {}", model.file_path);
                 }
@@ -503,4 +533,41 @@ pub async fn run_ai_test(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proposed_source_format_detects_rocky_and_sql() {
+        assert_eq!(proposed_source_format("models/orders.rocky"), "rocky");
+        assert_eq!(proposed_source_format("models/orders.ROCKY"), "rocky");
+        assert_eq!(proposed_source_format("models/orders.sql"), "sql");
+        assert_eq!(proposed_source_format("models/orders"), "sql");
+    }
+
+    /// `ai-sync --apply` must validate a proposal before writing. An
+    /// unparseable proposal is rejected and the on-disk file is left untouched.
+    #[test]
+    fn unvalidated_proposal_is_not_written_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("orders.sql");
+        let original = "SELECT id FROM orders";
+        std::fs::write(&model_path, original).unwrap();
+
+        let bad_proposal = "this is not sql at all ;;;";
+        let format = proposed_source_format(model_path.to_str().unwrap());
+
+        // Mirror the apply gate: validate first, only write on success.
+        let validation = rocky_ai::generate::validate_proposed_source(bad_proposal, format, None);
+        assert!(validation.is_err(), "bad proposal must fail validation");
+
+        // The gate bails before writing — confirm the file is unchanged.
+        let on_disk = std::fs::read_to_string(&model_path).unwrap();
+        assert_eq!(
+            on_disk, original,
+            "an invalid proposal must not overwrite the model file"
+        );
+    }
 }

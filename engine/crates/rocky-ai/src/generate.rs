@@ -148,6 +148,24 @@ pub fn extract_code(content: &str) -> String {
     trimmed.to_string()
 }
 
+/// Validate an LLM-proposed model source through the same parse + typecheck
+/// path used to compile-verify freshly generated models.
+///
+/// `format` is `"rocky"` or `"sql"`. When `context` is `Some`, the proposal is
+/// typechecked inside the full project graph (upstream schemas visible);
+/// otherwise it is validated in isolation. Returns the merged error
+/// diagnostics on failure.
+///
+/// This is the public entry point callers use to gate writing an unvalidated
+/// proposal to disk (e.g. `rocky ai-sync --apply`).
+pub fn validate_proposed_source(
+    source: &str,
+    format: &str,
+    context: Option<&ValidationContext<'_>>,
+) -> Result<(), String> {
+    validate_generated_code(source, format, context).map(|_name| ())
+}
+
 /// Validate generated code. When `context` is `Some`, typechecks against the
 /// full project (upstream typed schemas visible); otherwise isolates the
 /// generated model (legacy behavior, used in unit tests).
@@ -314,6 +332,26 @@ mod tests {
     fn test_validate_invalid_rocky() {
         let result = validate_generated_code("this is not valid rocky", "rocky", None);
         assert!(result.is_err());
+    }
+
+    // M3: the public gate `ai-sync --apply` uses before writing a proposal.
+
+    #[test]
+    fn validate_proposed_source_rejects_unparseable_sql() {
+        // Garbage that is not a valid SQL statement must be rejected so it is
+        // never written to a model file.
+        let result = validate_proposed_source("this is not sql at all ;;;", "sql", None);
+        assert!(result.is_err(), "unparseable SQL must be rejected");
+    }
+
+    #[test]
+    fn validate_proposed_source_rejects_empty() {
+        assert!(validate_proposed_source("", "sql", None).is_err());
+    }
+
+    #[test]
+    fn validate_proposed_source_accepts_valid_sql() {
+        assert!(validate_proposed_source("SELECT id FROM orders", "sql", None).is_ok());
     }
 
     /// Build an upstream `Model` by hand. Used in project-aware validation tests.
