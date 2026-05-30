@@ -53,43 +53,31 @@ cd my-project
 The pipeline config uses a local DuckDB adapter instead of Databricks. No credentials are required:
 
 ```toml
-[adapter.local]
+[adapter]
 type = "duckdb"
 path = "playground.duckdb"
 
 [pipeline.playground]
-type = "replication"
-strategy = "full_refresh"
+type = "transformation"
+models = "models/**"
 
-[pipeline.playground.source]
-adapter = "local"
+# Models land in the database's default schema (`playground.main`), so a model
+# can reference an upstream by name (`from raw_orders`) and it resolves both
+# when materialized by `rocky run` and in the in-memory `rocky test` run.
+[pipeline.playground.target.governance]
+auto_create_schemas = true
 
-[pipeline.playground.source.discovery]
-adapter = "local"
-
-[pipeline.playground.source.schema_pattern]
-prefix = "raw__"
-separator = "__"
-components = ["source"]
-
-[pipeline.playground.target]
-adapter = "local"
-catalog_template = "playground"
-schema_template = "staging__{source}"
-
-[state]
-backend = "local"
+[pipeline.playground.execution]
+concurrency = 4
 ```
 
-The same `local` DuckDB adapter is used for discovery, the source, and the target — they all share the same `playground.duckdb` file, so writes from the warehouse side are visible to the discovery side. `rocky test` ignores `path` and runs models against an in-memory database with `data/seed.sql` auto-loaded; `rocky discover/plan/run` use the file at `path`, which you seed once with:
+This is a `transformation` pipeline: the unnamed `[adapter]` block auto-wraps as the default adapter, and `models = "models/**"` builds the model DAG from the `models/` directory. Because every model lands in the database's default schema, an upstream can be referenced by bare name (`from raw_orders`).
 
-```bash
-duckdb playground.duckdb < data/seed.sql
-```
+The same `playground.duckdb` file backs the whole run. `rocky test` ignores `path` and runs models against an in-memory database; `rocky run` materializes them into the file. Both auto-load `data/seed.sql`, so the playground works end-to-end with no manual seeding step.
 
 ### raw_orders.sql + raw_orders.toml
 
-The first model is a replication layer that selects raw order data:
+The first model selects raw order data from the seeded source table:
 
 **raw_orders.sql:**
 
@@ -104,20 +92,17 @@ SELECT
 FROM raw__orders.orders
 ```
 
-The seed file in `data/seed.sql` creates the `raw__orders.orders` table — the schema name matches the pipeline's `prefix = "raw__"` so `rocky discover` finds it.
+The `data/seed.sql` file creates the `raw__orders.orders` table; `rocky test` and `rocky run` both load it automatically, so this model has data to read from the first run.
 
 **raw_orders.toml:**
 
 ```toml
-name = "raw_orders"
-
 [strategy]
 type = "full_refresh"
 
 [target]
 catalog = "playground"
-schema = "staging"
-table = "raw_orders"
+schema = "main"
 ```
 
 ### customer_orders.rocky
@@ -418,7 +403,7 @@ The playground includes a curated catalog of {pocCounts.total} POCs across {pocC
 | `04-column-propagation` | Column-level lineage pruning -- skip unchanged downstream models |
 | `05-optimize-recommendations` | `rocky optimize` + `profile-storage` + `compact --dry-run` |
 | `06-schema-drift-recover` | Drift detection, auto-widening, DROP+RECREATE |
-| `07-ephemeral-cte` | `materialization = "ephemeral"` CTE inlining |
+| `07-ephemeral-cte` | `strategy = "ephemeral"` CTE inlining |
 | `08-delete-insert-partitioned` | Partitioned `delete+insert` strategy |
 | `09-adaptive-concurrency` | AIMD dynamic parallelism via the throttle module |
 | `10-cost-budgets` | Trust arc 2: per-run cost summary + `[budget]` breach |
@@ -451,12 +436,12 @@ The playground includes a curated catalog of {pocCounts.total} POCs across {pocC
 | `01-shell-hooks` | Lifecycle hooks with stdin-JSON context |
 | `02-webhook-slack-preset` | Webhook presets (Slack, PagerDuty, Datadog, Teams) |
 | `03-remote-state-s3` | S3 state backend via MinIO docker-compose |
-| `04-checkpoint-resume` | `rocky plan --resume-latest && rocky apply <plan-id>` after mid-pipeline failure (legacy `rocky run --resume-latest` alias still accepted) |
+| `04-checkpoint-resume` | `rocky run --resume-latest` (or `rocky plan` + `rocky apply`) after a mid-pipeline failure |
 | `05-webhook-presets-multi` | Multiple webhook presets composed on the same run |
 | `06-valkey-distributed-cache` | Distributed cache + tiered state via Valkey/Redis |
 | `07-dagster-dag-mode` | Full asset-graph rendering from Rocky's unified DAG |
 | `08-circuit-breaker` | Trust arc 3: retry policy + three-state circuit breaker |
-| `09-idempotency-key` | `rocky plan --idempotency-key` dedup + skip semantics (legacy `rocky run --idempotency-key` alias still accepted) |
+| `09-idempotency-key` | `rocky run --idempotency-key` dedup + skip semantics (also available via `rocky plan` + `rocky apply`) |
 
 ### Developer Experience ({pocCounts.perCategory["06-developer-experience"]} POCs)
 

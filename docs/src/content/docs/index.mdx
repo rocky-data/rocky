@@ -55,11 +55,12 @@ rocky playground my-first-project
 cd my-first-project
 rocky compile            # type-check
 rocky test               # run assertions locally
-rocky plan               # build a plan, prints plan_id
-rocky apply <plan-id>    # execute the plan
+rocky run                # materialize the DAG against local DuckDB
 ```
 
-No credentials needed — the playground is DuckDB-backed.
+No credentials needed — the playground is DuckDB-backed and seeds itself on first run.
+
+`rocky run` is the one-step path for local iteration and automation. For production or PR-gated deploys, split it into `rocky plan` (persists an auditable plan to `.rocky/plans/<id>.json`) and `rocky apply <plan-id>`.
 
 ## One trace, one cost graph, one replay handle
 
