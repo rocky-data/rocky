@@ -1,13 +1,14 @@
 # Rocky Playground — a runnable, inspectable DuckDB pipeline. No credentials.
 #
-# Seed the local DuckDB once, then materialize the model DAG:
-#   duckdb playground.duckdb < data/seed.sql
+# `rocky playground` already seeded the local DuckDB (data/seed.sql), so you
+# can materialize the model DAG straight away:
 #   rocky run
 #
 # `rocky test` runs the models against an in-memory DuckDB (auto-loading
-# data/seed.sql), so it needs no manual seeding. After `rocky run` you can
-# `rocky preview rows --model customer_orders`, `rocky profile customer_orders`,
-# or open a model in the VS Code Inspector to see real materialized data.
+# data/seed.sql), so it needs no manual seeding either. After `rocky run` you
+# can `rocky preview rows --model customer_orders`, `rocky profile
+# customer_orders`, or open a model in the VS Code Inspector to see real
+# materialized data. Re-seed any time with `duckdb playground.duckdb < data/seed.sql`.
 
 [adapter]
 type = "duckdb"

@@ -61,6 +61,15 @@ pub fn run_playground_with_template(target_dir: &str, template_name: &str) -> Re
         Template::Showcase => write_showcase(dir)?,
     }
 
+    // Auto-seed the persistent DuckDB file for the quickstart template so the
+    // `rocky compile && rocky test && rocky run` golden path works first-try
+    // with no manual `duckdb playground.duckdb < data/seed.sql` step and no
+    // DuckDB-CLI prerequisite. The quickstart `rocky.toml` points its adapter
+    // at `playground.duckdb`; we load the seed into that exact file.
+    if template == Template::Quickstart {
+        seed_quickstart_db(dir)?;
+    }
+
     let template_label = match template {
         Template::Quickstart => "Quickstart (3 models)",
         Template::Ecommerce => "E-Commerce (11 models, incremental + merge)",
@@ -77,11 +86,38 @@ pub fn run_playground_with_template(target_dir: &str, template_name: &str) -> Re
     println!("    cd {target_dir}");
     println!("    rocky compile                           # type-check the models");
     println!("    rocky test                              # run models on an in-memory DuckDB");
-    println!("    duckdb playground.duckdb < data/seed.sql # seed the file DB");
     println!("    rocky run                               # materialize the model DAG");
     println!("    rocky preview rows --model customer_orders  # peek at materialized rows");
     println!();
 
+    Ok(())
+}
+
+/// Load `data/seed.sql` into the quickstart's persistent `playground.duckdb`
+/// file so `rocky run` has source tables to read on the very first invocation.
+///
+/// The seed is applied to `<dir>/playground.duckdb` — the exact path the
+/// scaffolded `rocky.toml` adapter points at. We open the file, execute the
+/// (already-written) seed script, then drop the connection before returning so
+/// the file isn't locked when the user's `rocky run` opens it.
+#[cfg(feature = "duckdb")]
+fn seed_quickstart_db(dir: &Path) -> Result<()> {
+    use rocky_duckdb::DuckDbConnector;
+
+    let db_path = dir.join("playground.duckdb");
+    let conn = DuckDbConnector::open(&db_path)
+        .with_context(|| format!("failed to open {}", db_path.display()))?;
+    conn.execute_statement(QUICKSTART_SEED)
+        .context("failed to seed playground.duckdb")?;
+    // `conn` drops here, releasing the file lock before the next-steps print.
+    Ok(())
+}
+
+/// No-op when the `duckdb` feature is disabled: the scaffold still writes
+/// `data/seed.sql`, and the printed next-steps tell the user to seed manually
+/// is no longer applicable for such builds (which can't run DuckDB anyway).
+#[cfg(not(feature = "duckdb"))]
+fn seed_quickstart_db(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -136,12 +172,12 @@ fn write_quickstart(dir: &Path) -> Result<()> {
 
 const QUICKSTART_SEED: &str = r#"-- Seed data for quickstart playground.
 --
--- `rocky test` auto-loads this file into an in-memory DuckDB before
--- executing models, so the playground is runnable end-to-end with no
--- manual setup.
+-- `rocky playground` auto-loads this file into the persistent
+-- `playground.duckdb` during scaffold, so `rocky run` works first-try with
+-- no manual setup. `rocky test` also auto-loads it into an in-memory DuckDB
+-- before executing models.
 --
--- For the `rocky discover/plan/run` flow you need to seed the persistent
--- file referenced by `path` in rocky.toml first:
+-- Re-seed at any time (e.g. after editing this file) with:
 --   duckdb playground.duckdb < data/seed.sql
 
 CREATE SCHEMA IF NOT EXISTS raw__orders;
