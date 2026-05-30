@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -63,9 +64,14 @@ struct Cli {
     #[arg(short, long, default_value = "rocky.toml")]
     config: PathBuf,
 
-    /// Output format
-    #[arg(short, long, default_value = "json", global = true)]
-    output: OutputFormat,
+    /// Output format.
+    ///
+    /// When unset, Rocky picks a default by inspecting stdout: human-readable
+    /// `table` when stdout is an interactive terminal, `json` otherwise (so
+    /// piped consumers — Dagster, the LSP, CI — keep getting machine-readable
+    /// JSON). Pass `--output json` or `--output table` to force one explicitly.
+    #[arg(short, long, global = true)]
+    output: Option<OutputFormat>,
 
     /// State store path.
     ///
@@ -100,10 +106,28 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Clone, clap::ValueEnum)]
+#[derive(Clone, clap::ValueEnum, PartialEq, Eq, Debug)]
 enum OutputFormat {
     Json,
     Table,
+}
+
+/// Resolve the effective output format from the (optional) `--output` flag.
+///
+/// Precedence: an explicit `--output json|table` always wins. When the flag is
+/// unset, default by TTY-detection — `table` for an interactive terminal,
+/// `json` otherwise. The non-TTY (pipe) fallback to `json` is load-bearing:
+/// Dagster, the LSP, and CI capture stdout as a pipe and rely on JSON.
+///
+/// Split out as a pure function so the precedence logic is unit-testable
+/// without a real terminal (`is_terminal()` itself can't be exercised in a
+/// test harness, hence the bool parameter).
+fn resolve_output(explicit: Option<OutputFormat>, is_tty: bool) -> OutputFormat {
+    match explicit {
+        Some(fmt) => fmt,
+        None if is_tty => OutputFormat::Table,
+        None => OutputFormat::Json,
+    }
 }
 
 /// Artefact family selector for `rocky catalog --format`.
@@ -1878,7 +1902,11 @@ fn main() -> Result<()> {
     reset_sigpipe();
 
     let cli = Cli::parse();
-    let json = matches!(cli.output, OutputFormat::Json);
+    // Resolve the effective output format: an explicit `--output` always wins;
+    // otherwise TTY-detect (table at a terminal, json when piped). Computed
+    // here because `json` feeds both `init_tracing` and the miette hook.
+    let output = resolve_output(cli.output.clone(), std::io::stdout().is_terminal());
+    let json = matches!(output, OutputFormat::Json);
 
     // Install the rustls crypto provider before any TLS handshake. Runs
     // after `Cli::parse()` so the `--version` / `--help` fast-exit stays
@@ -3114,6 +3142,38 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::sync::Mutex;
+
+    // -----------------------------------------------------------------------
+    // resolve_output — `--output` default resolution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_output_explicit_json_wins_over_tty() {
+        assert_eq!(
+            resolve_output(Some(OutputFormat::Json), true),
+            OutputFormat::Json
+        );
+    }
+
+    #[test]
+    fn resolve_output_explicit_table_wins_over_pipe() {
+        assert_eq!(
+            resolve_output(Some(OutputFormat::Table), false),
+            OutputFormat::Table
+        );
+    }
+
+    #[test]
+    fn resolve_output_default_tty_is_table() {
+        assert_eq!(resolve_output(None, true), OutputFormat::Table);
+    }
+
+    /// Load-bearing: a piped (non-TTY) stdout must default to JSON so
+    /// Dagster / LSP / CI keep parsing structured output.
+    #[test]
+    fn resolve_output_default_pipe_is_json() {
+        assert_eq!(resolve_output(None, false), OutputFormat::Json);
+    }
 
     /// Serialises every env-mutating test in this module so concurrent
     /// `cargo test` threads don't race on the shared process env.
