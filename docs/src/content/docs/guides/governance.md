@@ -714,7 +714,7 @@ Each `RunRecord` carries:
 | `session_source` | Auto-detected: `Cli` / `Dagster` / `Lsp` / `HttpApi`. |
 | `git_commit` | Resolved at run start from the current repo. |
 | `git_branch` | Resolved at run start from the current repo. |
-| `idempotency_key` | Echoed from `rocky plan --idempotency-key <KEY>` (or the legacy `rocky run --idempotency-key` alias) when passed. |
+| `idempotency_key` | Echoed from `rocky plan --idempotency-key <KEY>` (or the single-step `rocky run --idempotency-key` alias) when passed. |
 | `target_catalog` | The catalog(s) the run wrote to. |
 | `hostname` | The host that executed the run. |
 | `rocky_version` | The CLI version that produced the record. |

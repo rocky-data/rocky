@@ -636,7 +636,7 @@ Terminal outcomes surface as structured `outcome` fields on `state.upload` / `st
 
 ### `[state.idempotency]`
 
-Tuning knobs for `rocky plan --idempotency-key <KEY>` dedup (also accepted on the legacy `rocky run --idempotency-key` alias). All fields are optional with the shown defaults; the block is a no-op on runs that don't pass `--idempotency-key`. Unknown fields are rejected.
+Tuning knobs for `rocky plan --idempotency-key <KEY>` dedup (also accepted on the `rocky run --idempotency-key` alias). All fields are optional with the shown defaults; the block is a no-op on runs that don't pass `--idempotency-key`. Unknown fields are rejected.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

@@ -126,7 +126,7 @@ key         = "id" | <component name from schema_pattern>
 value       = any non-empty string
 ```
 
-The filter flag is mandatory for `plan` and `compare` (and the legacy `run` alias) — these commands require explicit scoping so a typo like `--filter tenat=acme` surfaces as "0 sources matched", not as "oh, I ran everything by accident".
+The filter flag is mandatory for `plan` and `compare` (and the `run` alias) — these commands require explicit scoping so a typo like `--filter tenat=acme` surfaces as "0 sources matched", not as "oh, I ran everything by accident".
 
 ## What's NOT supported today
 

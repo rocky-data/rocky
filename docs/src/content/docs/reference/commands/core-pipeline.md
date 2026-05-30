@@ -286,7 +286,7 @@ rocky plan --filter client=acme --pipeline shopify_us
 
 ## `rocky run`
 
-> Note: as of engine v1.33, the canonical form is `rocky plan` followed by `rocky apply <plan-id>`. `rocky run` continues to work and is now an alias; it emits a one-line `[deprecated]` notice to stderr that can be silenced with `ROCKY_SUPPRESS_DEPRECATION=1`.
+> Note: the canonical, auditable form is `rocky plan` followed by `rocky apply <plan-id>`. The `rocky run` single-step alias fuses plan + apply into one invocation for local iteration and automation.
 
 Execute the full pipeline end-to-end: discover sources, detect schema drift, create catalogs/schemas, copy data, apply governance, and run quality checks.
 
@@ -468,7 +468,7 @@ acme_warehouse.staging__eu_central__stripe.charges    | 2026-03-29T22:15:00Z    
 
 ## `rocky branch`
 
-Manage named virtual branches. A branch is the persistent, named analogue of `--shadow` mode: it records a `schema_prefix` in the state store and, when `rocky plan --branch <name>` + `rocky apply <plan-id>` is invoked (or the legacy `rocky run --branch <name>` alias), every model target has the prefix applied. Schema-prefix branches work uniformly across every adapter today; warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake zero-copy `CLONE`) are a follow-up.
+Manage named virtual branches. A branch is the persistent, named analogue of `--shadow` mode: it records a `schema_prefix` in the state store and, when `rocky plan --branch <name>` + `rocky apply <plan-id>` is invoked (or the single-step `rocky run --branch <name>` alias), every model target has the prefix applied. Schema-prefix branches work uniformly across every adapter today; warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake zero-copy `CLONE`) are a follow-up.
 
 ```bash
 rocky branch create <name> [--description <text>]
