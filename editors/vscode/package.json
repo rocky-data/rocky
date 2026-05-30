@@ -76,6 +76,7 @@
         "rocky.server.path": {
           "type": "string",
           "default": "rocky",
+          "scope": "machine",
           "description": "Path to the Rocky binary"
         },
         "rocky.server.extraArgs": {
@@ -84,6 +85,7 @@
             "type": "string"
           },
           "default": [],
+          "scope": "machine",
           "description": "Extra arguments to pass to rocky lsp"
         },
         "rocky.inlayHints.enabled": {
