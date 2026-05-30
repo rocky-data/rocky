@@ -1883,6 +1883,11 @@ def test_extract_plan_id_returns_none_for_malformed_payload():
     assert RockyResource._extract_plan_id(json.dumps({"plan_id": None})) is None
     assert RockyResource._extract_plan_id(json.dumps({"plan_id": 42})) is None
     assert RockyResource._extract_plan_id(json.dumps({"plan_id": "abc"})) == "abc"
+    # Valid JSON that is not an object must return None (not raise
+    # AttributeError on ``.get``) so the caller's clean dg.Failure fires.
+    assert RockyResource._extract_plan_id("null") is None
+    assert RockyResource._extract_plan_id("[]") is None
+    assert RockyResource._extract_plan_id("5") is None
 
 
 def test_build_plan_args_mirrors_build_run_args_flag_surface():

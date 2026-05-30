@@ -1246,9 +1246,15 @@ def parse_rocky_output(json_str: str) -> RockyOutput:
     """Parse a Rocky JSON output payload, auto-detecting the command type.
 
     Raises:
-        ValueError: If the ``command`` field is missing or unrecognized.
+        ValueError: If the payload is not a JSON object, or the
+            ``command`` field is missing or unrecognized.
     """
     data = json.loads(json_str)
+    if not isinstance(data, dict):
+        # Valid JSON that is not an object (``null``, ``[]``, ``5``) would
+        # otherwise crash on ``.get`` with an uncaught AttributeError —
+        # honour the documented ValueError contract instead.
+        raise ValueError(f"Rocky output is not a JSON object: {data!r}")
     command = data.get("command", "")
 
     # Lineage and history have multiple shapes that share the same command name.
