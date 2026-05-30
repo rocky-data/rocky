@@ -184,13 +184,14 @@ async fn live_noop_diff_examines_root_chunks_only() {
         pk_hi: 10_000,
     };
 
-    let result = bisection_diff(&adapter, &adapter, &target, &config)
-        .await
-        .expect("noop bisection on Snowflake should succeed");
+    let result = bisection_diff(&adapter, &adapter, &target, &config).await;
 
+    // Drop the schemas BEFORE unwrapping the result, so a failed diff doesn't
+    // leak the seeded schemas (capture-before-cleanup, as clone_live does).
     drop_schema(&adapter, &database, &base_schema).await;
     drop_schema(&adapter, &database, &branch_schema).await;
 
+    let result = result.expect("noop bisection on Snowflake should succeed");
     assert_eq!(result.rows_added, 0);
     assert_eq!(result.rows_removed, 0);
     assert_eq!(result.rows_changed, 0);
@@ -247,13 +248,14 @@ async fn live_finds_planted_change() {
         pk_hi: 10_000,
     };
 
-    let result = bisection_diff(&adapter, &adapter, &target, &config)
-        .await
-        .expect("planted-change bisection on Snowflake should succeed");
+    let result = bisection_diff(&adapter, &adapter, &target, &config).await;
 
+    // Drop the schemas BEFORE unwrapping the result, so a failed diff doesn't
+    // leak the seeded schemas (capture-before-cleanup, as clone_live does).
     drop_schema(&adapter, &database, &base_schema).await;
     drop_schema(&adapter, &database, &branch_schema).await;
 
+    let result = result.expect("planted-change bisection on Snowflake should succeed");
     assert_eq!(result.rows_added, 0);
     assert_eq!(result.rows_removed, 0);
     assert_eq!(result.rows_changed, 1, "exactly one row should differ");
