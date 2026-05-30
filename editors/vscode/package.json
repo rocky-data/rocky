@@ -105,25 +105,10 @@
           "default": [],
           "markdownDescription": "Optional status bar segments to show after the LSP state. Each segment silently no-ops if its data is unavailable. Options: `warehouse`, `lastRunAge`, `driftCount`, `branchState`."
         },
-        "rocky.defaultWarehouse": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Default warehouse identifier shown in status bar and command prompts. Read-only contract — consumed by future commands; changing this has no immediate effect beyond display."
-        },
-        "rocky.defaultBranch": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Default branch name for `rocky.branchApprove` / `rocky.branchPromote` prompts. Read-only contract — consumed by future commands."
-        },
         "rocky.diagnostics.enabled": {
           "type": "boolean",
           "default": true,
           "markdownDescription": "Enable drift diagnostics (inline errors/warnings from `rocky compile`). Set to `false` to disable all Rocky diagnostics without uninstalling the extension."
-        },
-        "rocky.autoRunOnSave": {
-          "type": "boolean",
-          "default": false,
-          "markdownDescription": "Automatically run the pipeline when a model file is saved. Read-only contract — consumed by future commands; has no effect in this release."
         },
         "rocky.costAnnotations.enabled": {
           "type": "boolean",
