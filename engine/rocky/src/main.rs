@@ -877,6 +877,12 @@ enum Command {
         /// directory (default: print to stdout)
         #[arg(long)]
         save: bool,
+        /// Include observed cell VALUES (min/max + low-cardinality domain
+        /// samples) in the prompt sent to Anthropic. Off by default — only
+        /// schema and aggregate statistics (row/null/distinct counts) leave
+        /// the machine. Opt in when sending sample values is acceptable.
+        #[arg(long)]
+        with_data: bool,
         /// Models directory (compiled to obtain the model's inferred schema,
         /// and the destination directory when `--save` is passed)
         #[arg(long, default_value = "models")]
@@ -2486,6 +2492,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::AiContract {
             model,
             save,
+            with_data,
             models,
         } => {
             rocky_cli::commands::run_ai_contract(
@@ -2494,6 +2501,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 &models,
                 &model,
                 save,
+                with_data,
                 json,
                 cli.cache_ttl,
             )

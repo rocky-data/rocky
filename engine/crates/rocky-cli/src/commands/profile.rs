@@ -131,7 +131,10 @@ pub async fn build_profile_output(
         // caller gets whatever overlap exists, plus `fell_back_from` to
         // signal "this is a source preview." On the target path we keep
         // strict behaviour: any per-column error is a real problem.
-        let result = profile_column(prepared.adapter.as_ref(), &prepared.table_ref, col).await;
+        // `rocky profile` prints min/max/distinct to the user locally — no LLM
+        // egress — so it always wants the full per-column values.
+        let result =
+            profile_column(prepared.adapter.as_ref(), &prepared.table_ref, col, true).await;
         match result {
             Ok(p) => columns.push(ProfileColumnStats {
                 // Prefer the observed warehouse type; fall back to the
@@ -249,7 +252,7 @@ mod tests {
             data_type: RockyType::String,
             nullable: true,
         };
-        let profile = profile_column(adapter.as_ref(), "main.orders", &status_col)
+        let profile = profile_column(adapter.as_ref(), "main.orders", &status_col, true)
             .await
             .expect("profile_column should succeed on duckdb");
         assert_eq!(profile.rows, 3);
@@ -263,7 +266,7 @@ mod tests {
             data_type: RockyType::Int64,
             nullable: true,
         };
-        let id_profile = profile_column(adapter.as_ref(), "main.orders", &id_col)
+        let id_profile = profile_column(adapter.as_ref(), "main.orders", &id_col, true)
             .await
             .unwrap();
         assert_eq!(id_profile.rows, 3);

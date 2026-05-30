@@ -301,23 +301,40 @@ fn str_cell(v: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
-/// Profile one column: a single aggregate query for count/nulls/distinct/min/max,
-/// plus a bounded domain query when the distinct count is low. SQL is built
-/// from the already-validated `table_ref` and a freshly-validated column
-/// identifier — never from raw input.
+/// Profile one column.
+///
+/// By default this issues only aggregate **statistics** queries
+/// (count / non-null / distinct count) — no raw cell values leave the machine.
+/// When `with_data` is `true` the caller has opted into sending observed cell
+/// values to the LLM, so it additionally captures `MIN`/`MAX` and (for
+/// low-cardinality columns) the observed domain values.
+///
+/// SQL is built from the already-validated `table_ref` and a freshly-validated
+/// column identifier — never from raw input.
 pub(crate) async fn profile_column(
     adapter: &dyn WarehouseAdapter,
     table_ref: &str,
     typed_col: &TypedColumn,
+    with_data: bool,
 ) -> Result<ColumnProfile> {
     let col = rocky_sql::validation::validate_identifier(&typed_col.name)
         .map_err(|e| anyhow::anyhow!("invalid column identifier: {e}"))?;
 
-    let agg_sql = format!(
-        "SELECT COUNT(*) AS n, COUNT({col}) AS non_null, COUNT(DISTINCT {col}) AS distinct_n, \
-         CAST(MIN({col}) AS VARCHAR) AS min_v, CAST(MAX({col}) AS VARCHAR) AS max_v \
-         FROM {table_ref}"
-    );
+    // Aggregate STATISTICS only — counts, not row values. These are computed
+    // on every path. MIN/MAX (which are real cell values) are only selected
+    // when the caller opted into `--with-data`.
+    let agg_sql = if with_data {
+        format!(
+            "SELECT COUNT(*) AS n, COUNT({col}) AS non_null, COUNT(DISTINCT {col}) AS distinct_n, \
+             CAST(MIN({col}) AS VARCHAR) AS min_v, CAST(MAX({col}) AS VARCHAR) AS max_v \
+             FROM {table_ref}"
+        )
+    } else {
+        format!(
+            "SELECT COUNT(*) AS n, COUNT({col}) AS non_null, COUNT(DISTINCT {col}) AS distinct_n \
+             FROM {table_ref}"
+        )
+    };
     let qr = adapter.execute_query(&agg_sql).await.map_err(|e| {
         anyhow::anyhow!("profile query failed for column '{}': {e}", typed_col.name)
     })?;
@@ -334,11 +351,15 @@ pub(crate) async fn profile_column(
     } else {
         nulls as f64 / total as f64
     };
-    let min = str_cell(row.get(3));
-    let max = str_cell(row.get(4));
+    let (min, max) = if with_data {
+        (str_cell(row.get(3)), str_cell(row.get(4)))
+    } else {
+        (None, None)
+    };
 
-    // For low-cardinality columns, fetch the observed domain as evidence.
-    let observed_values = if distinct > 0 && distinct <= LOW_CARDINALITY_CAP {
+    // For low-cardinality columns, fetch the observed domain as evidence —
+    // only when `--with-data` opted into shipping raw cell values.
+    let observed_values = if with_data && distinct > 0 && distinct <= LOW_CARDINALITY_CAP {
         let domain_sql = format!(
             "SELECT DISTINCT CAST({col} AS VARCHAR) AS v FROM {table_ref} \
              WHERE {col} IS NOT NULL ORDER BY v LIMIT {DOMAIN_FETCH_LIMIT}"
@@ -373,6 +394,7 @@ pub async fn run_ai_contract(
     models_dir: &str,
     model_name: &str,
     save: bool,
+    with_data: bool,
     output_json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
@@ -409,13 +431,45 @@ pub async fn run_ai_contract(
         }
     };
 
+    // Egress notice: `rocky ai-contract` sends an LLM prompt to
+    // api.anthropic.com. By default that prompt carries only aggregate
+    // STATISTICS (row/null/distinct counts) — no raw cell values. `--with-data`
+    // opts into additionally sending observed MIN/MAX and low-cardinality
+    // domain samples, which ARE real cell values; name that explicitly on
+    // stderr so it's never silent.
+    if with_data {
+        eprintln!(
+            "ai-contract: --with-data enabled — will send observed min/max and \
+             low-cardinality domain samples for {} column(s) of model '{}' to \
+             api.anthropic.com (alongside schema + aggregate statistics).",
+            inferred_schema.len(),
+            model_name,
+        );
+    } else {
+        eprintln!(
+            "ai-contract: sending schema + aggregate statistics (row/null/distinct \
+             counts) for {} column(s) of model '{}' to api.anthropic.com. No raw \
+             cell values are sent. Pass --with-data to also include observed \
+             min/max and domain samples.",
+            inferred_schema.len(),
+            model_name,
+        );
+    }
+
     // Profile each column of the model's inferred schema. The profile reads
     // the full target table (no sampling): a sampled `null_rate` of 0 would
     // not justify proposing `nullable = false`, so soundness requires the
-    // exact count.
+    // exact count. By default only aggregate statistics are computed; raw cell
+    // values (min/max/domain) are gated behind `--with-data`.
     let mut profiles = Vec::with_capacity(inferred_schema.len());
     for col in &inferred_schema {
-        let p = profile_column(prepared.adapter.as_ref(), &prepared.table_ref, col).await?;
+        let p = profile_column(
+            prepared.adapter.as_ref(),
+            &prepared.table_ref,
+            col,
+            with_data,
+        )
+        .await?;
         profiles.push(p);
     }
 
@@ -553,6 +607,192 @@ adapter = "warehouse"
         assert!(duckdb_only_refusal(&resolved.adapter_type).is_none());
     }
 
+    // ── Egress safety: no raw cell values without --with-data (H2) ────────
+
+    use std::sync::Mutex;
+
+    use rocky_compiler::types::RockyType;
+    use rocky_core::traits::{
+        AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter,
+    };
+    use rocky_ir::{ColumnInfo, TableRef};
+
+    /// A `WarehouseAdapter` that records every SQL string passed to
+    /// `execute_query` and replies with a fixed three-column count row. Only
+    /// `execute_query` is exercised by `profile_column`; the other trait
+    /// methods are never called on this path and panic if they are.
+    struct RecordingAdapter {
+        queries: Mutex<Vec<String>>,
+    }
+
+    impl RecordingAdapter {
+        fn new() -> Self {
+            Self {
+                queries: Mutex::new(Vec::new()),
+            }
+        }
+        fn recorded(&self) -> Vec<String> {
+            self.queries.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WarehouseAdapter for RecordingAdapter {
+        fn dialect(&self) -> &dyn SqlDialect {
+            unimplemented!("profile_column never calls dialect()")
+        }
+        async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
+            unimplemented!("profile_column never calls execute_statement()")
+        }
+        async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+            self.queries.lock().unwrap().push(sql.to_string());
+            // n=100, non_null=100, distinct=3 — distinct is low enough that the
+            // with-data path WOULD fire the domain query, so the no-data path's
+            // absence of it is meaningful.
+            Ok(QueryResult {
+                columns: vec!["n".into(), "non_null".into(), "distinct_n".into()],
+                rows: vec![vec![
+                    serde_json::json!(100),
+                    serde_json::json!(100),
+                    serde_json::json!(3),
+                ]],
+            })
+        }
+        async fn describe_table(&self, _table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+            Err(AdapterError::msg("not used"))
+        }
+    }
+
+    fn col(name: &str) -> TypedColumn {
+        TypedColumn {
+            name: name.to_string(),
+            data_type: RockyType::String,
+            nullable: true,
+        }
+    }
+
+    /// Without `--with-data`, `profile_column` must issue ONLY the statistics
+    /// aggregate — no `MIN`/`MAX`, no `DISTINCT ... LIMIT` domain query — and
+    /// the resulting profile must carry no cell values.
+    #[tokio::test]
+    async fn profile_column_without_data_sends_no_values() {
+        let adapter = RecordingAdapter::new();
+        let profile = profile_column(&adapter, "main.orders", &col("status"), false)
+            .await
+            .expect("profile should succeed");
+
+        let queries = adapter.recorded();
+        assert_eq!(queries.len(), 1, "exactly one statistics query expected");
+        let q = &queries[0];
+        assert!(
+            !q.contains("MIN(") && !q.contains("MAX("),
+            "no-data path must not select MIN/MAX: {q}"
+        );
+        assert!(
+            !q.to_uppercase().contains("DISTINCT CAST"),
+            "no-data path must not issue the domain-values query: {q}"
+        );
+        assert!(
+            q.contains("COUNT(DISTINCT"),
+            "distinct COUNT is a statistic and is fine: {q}"
+        );
+
+        assert!(profile.observed_values.is_empty(), "no domain values");
+        assert!(profile.min.is_none(), "no min value");
+        assert!(profile.max.is_none(), "no max value");
+        assert_eq!(profile.rows, 100);
+        assert_eq!(profile.distinct, 3);
+
+        // And the assembled prompt evidence carries no value lines.
+        let table = TableProfile {
+            model: "orders".to_string(),
+            columns: vec![profile],
+        };
+        let evidence = rocky_ai::contract::render_profile_evidence(&table);
+        assert!(
+            !evidence.contains("min="),
+            "prompt must omit min: {evidence}"
+        );
+        assert!(
+            !evidence.contains("max="),
+            "prompt must omit max: {evidence}"
+        );
+        assert!(
+            !evidence.contains("observed_domain="),
+            "prompt must omit observed domain: {evidence}"
+        );
+    }
+
+    /// With `--with-data`, the domain query fires for a low-cardinality column
+    /// (sanity that the opt-in still works).
+    #[tokio::test]
+    async fn profile_column_with_data_issues_value_queries() {
+        // A custom adapter that answers both the agg (5 cols) and domain query.
+        struct WithDataAdapter {
+            queries: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl WarehouseAdapter for WithDataAdapter {
+            fn dialect(&self) -> &dyn SqlDialect {
+                unimplemented!()
+            }
+            async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
+                unimplemented!()
+            }
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.queries.lock().unwrap().push(sql.to_string());
+                if sql.to_uppercase().contains("DISTINCT CAST") {
+                    Ok(QueryResult {
+                        columns: vec!["v".into()],
+                        rows: vec![vec![serde_json::json!("active")]],
+                    })
+                } else {
+                    Ok(QueryResult {
+                        columns: vec![
+                            "n".into(),
+                            "non_null".into(),
+                            "distinct_n".into(),
+                            "min_v".into(),
+                            "max_v".into(),
+                        ],
+                        rows: vec![vec![
+                            serde_json::json!(10),
+                            serde_json::json!(10),
+                            serde_json::json!(2),
+                            serde_json::json!("active"),
+                            serde_json::json!("inactive"),
+                        ]],
+                    })
+                }
+            }
+            async fn describe_table(&self, _t: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+                Err(AdapterError::msg("not used"))
+            }
+        }
+
+        let adapter = WithDataAdapter {
+            queries: Mutex::new(Vec::new()),
+        };
+        let profile = profile_column(&adapter, "main.orders", &col("status"), true)
+            .await
+            .expect("profile should succeed");
+
+        assert_eq!(profile.min.as_deref(), Some("active"));
+        assert_eq!(profile.max.as_deref(), Some("inactive"));
+        assert_eq!(profile.observed_values, vec!["active".to_string()]);
+        let recorded = adapter.queries.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|q| q.contains("MIN(")),
+            "with-data path must select MIN/MAX"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|q| q.to_uppercase().contains("DISTINCT CAST")),
+            "with-data path must issue the domain query"
+        );
+    }
+
     /// Live end-to-end: profiles a real DuckDB table and drafts a
     /// compile-verified contract. Gated on `ANTHROPIC_API_KEY` + `#[ignore]`
     /// per the repo convention for LLM commands. Run with:
@@ -632,9 +872,10 @@ type = "full_refresh"
             &state_path,
             models_dir.to_str().unwrap(),
             "orders",
-            true,
-            true,
-            None,
+            true, // save
+            true, // with_data (exercise the values-included path)
+            true, // output_json
+            None, // cache_ttl
         )
         .await;
         assert!(result.is_ok(), "ai-contract failed: {result:?}");
