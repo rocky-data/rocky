@@ -727,3 +727,199 @@ async fn optimize_reports_message_without_history() {
 
     client.cancel().await.unwrap();
 }
+
+/// Like `write_project` but with zero model files — exercises the cold-start
+/// path (a project an agent has not authored any model into yet).
+fn write_empty_project(dir: &Path, db_path: &Path) {
+    std::fs::create_dir_all(dir.join("models")).unwrap();
+    std::fs::write(
+        dir.join("rocky.toml"),
+        format!(
+            r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.p]
+strategy = "full_refresh"
+
+[pipeline.p.source.discovery]
+adapter = "default"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+catalog_template = "main"
+schema_template = "out"
+"#,
+            db_path.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// Pre-materialize `out.orders` with the given `VALUES` body on `db_path`.
+async fn materialize_orders(db_path: &Path, schema: &str, values: &str) {
+    use rocky_core::traits::WarehouseAdapter;
+    let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(db_path).unwrap();
+    adapter
+        .execute_statement(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+        .await
+        .unwrap();
+    adapter
+        .execute_statement(&format!(
+            "CREATE OR REPLACE TABLE {schema}.orders AS \
+             SELECT * FROM (VALUES {values}) AS t(id, status)"
+        ))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn sample_rows_default_returns_rows_on_small_table() {
+    // Regression: the old default (10% bernoulli) returned ~0 rows on a tiny
+    // table. With no `percent`, sample_rows now returns the first rows.
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("small.duckdb");
+    write_project(dir.path(), &db_path);
+    materialize_orders(
+        &db_path,
+        "out",
+        "(1,'COMPLETE'),(2,'COMPLETE'),(3,'PENDING')",
+    )
+    .await;
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    // No `percent` → deterministic first-rows, not a percentage sample.
+    let args = serde_json::json!({ "model": "orders" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let sc = client
+        .call_tool(CallToolRequestParams::new("sample_rows").with_arguments(args))
+        .await
+        .expect("sample_rows call")
+        .structured_content
+        .expect("structured content");
+    let rows = sc["rows"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "all 3 rows returned without sampling; got {rows:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_column_lists_top_values_for_low_cardinality() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("profile.duckdb");
+    write_project(dir.path(), &db_path);
+    materialize_orders(
+        &db_path,
+        "out",
+        "(1,'COMPLETE'),(2,'COMPLETE'),(3,'PENDING')",
+    )
+    .await;
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    let args = serde_json::json!({ "model": "orders", "column": "status" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let sc = client
+        .call_tool(CallToolRequestParams::new("profile_column").with_arguments(args))
+        .await
+        .expect("profile_column call")
+        .structured_content
+        .expect("structured content");
+
+    assert_eq!(sc["distinct"], serde_json::json!(2));
+    let top_values = sc["top_values"]
+        .as_array()
+        .expect("top_values present for a low-cardinality column");
+    // The exact literal 'COMPLETE' is surfaced — what min/max alone cannot show.
+    let complete = top_values
+        .iter()
+        .find(|v| v["value"] == serde_json::json!("COMPLETE"))
+        .expect("COMPLETE listed in top_values");
+    assert_eq!(complete["count"], serde_json::json!(2));
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn sample_rows_reaches_raw_source_by_qualified_ref() {
+    // Source-reach: a qualified `schema.table` that is NOT a model is sampled
+    // directly, with no compile required.
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("src.duckdb");
+    write_project(dir.path(), &db_path);
+    materialize_orders(&db_path, "seeds", "(1,'COMPLETE'),(2,'PENDING')").await;
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    // `seeds.orders` is a raw table, not a model — reached by its qualified name.
+    let args = serde_json::json!({ "model": "seeds.orders" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let sc = client
+        .call_tool(CallToolRequestParams::new("sample_rows").with_arguments(args))
+        .await
+        .expect("sample_rows call")
+        .structured_content
+        .expect("structured content");
+
+    assert_ne!(sc["unavailable"], serde_json::json!(true));
+    assert_eq!(
+        sc["columns"].as_array().unwrap().len(),
+        2,
+        "id + status from the raw source"
+    );
+    assert_eq!(sc["rows"].as_array().unwrap().len(), 2);
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn inspect_schema_discovers_raw_sources_and_tolerates_cold_start() {
+    // Cold start: a project with ZERO models must not error, and the physical
+    // raw source tables must still be discovered with their columns.
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("cold.duckdb");
+    write_empty_project(dir.path(), &db_path);
+    materialize_orders(&db_path, "seeds", "(1,'COMPLETE')").await;
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    let sc = client
+        .call_tool(CallToolRequestParams::new("inspect_schema"))
+        .await
+        .expect("inspect_schema must not error at cold start")
+        .structured_content
+        .expect("structured content");
+
+    assert!(
+        sc["models"].as_array().unwrap().is_empty(),
+        "no models authored yet"
+    );
+    let sources = sc["sources"].as_array().unwrap();
+    let orders = sources
+        .iter()
+        .find(|s| s["name"] == serde_json::json!("seeds.orders"))
+        .expect("seeds.orders discovered as a source");
+    let cols = orders["columns"].as_array().unwrap();
+    assert!(
+        cols.iter()
+            .any(|c| c["name"] == serde_json::json!("status")),
+        "discovered source carries its columns; got {cols:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
