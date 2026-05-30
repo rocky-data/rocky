@@ -902,12 +902,21 @@
       {
         "id": "rocky.getStartedWalkthrough",
         "title": "Get Started with Rocky",
-        "description": "Set up Rocky and run your first pipeline in five steps.",
+        "description": "Set up Rocky and run your first pipeline.",
         "steps": [
           {
             "id": "rocky.walkthrough.installCli",
             "title": "Install the Rocky CLI",
-            "description": "Rocky needs the `rocky` binary on your PATH. Run Doctor to verify your installation.\n\n[Run Health Check](command:rocky.doctor)",
+            "description": "Rocky needs the `rocky` binary on your PATH. The extension talks to it; it isn't bundled.\n\n[Install instructions](https://github.com/rocky-data/rocky#readme)\n\nmacOS / Linux:\n\n```\ncurl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash\n```",
+            "media": {
+              "image": "media/rocky-readme-light.png",
+              "altText": "Rocky logo"
+            }
+          },
+          {
+            "id": "rocky.walkthrough.verifyCli",
+            "title": "Verify Your Installation",
+            "description": "Once the CLI is installed, run the health check to confirm the extension can find and talk to it.\n\n[Run Health Check](command:rocky.doctor)",
             "media": {
               "image": "media/rocky-readme-light.png",
               "altText": "Rocky logo"
