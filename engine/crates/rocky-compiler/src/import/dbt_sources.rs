@@ -254,11 +254,24 @@ pub fn scan_sources_in_dir(dir: &Path) -> Result<Vec<DbtSource>, String> {
         return Ok(all_sources);
     }
 
-    scan_sources_recursive(dir, &mut all_sources)?;
+    scan_sources_recursive(dir, &mut all_sources, 0)?;
     Ok(all_sources)
 }
 
-fn scan_sources_recursive(dir: &Path, sources: &mut Vec<DbtSource>) -> Result<(), String> {
+fn scan_sources_recursive(
+    dir: &Path,
+    sources: &mut Vec<DbtSource>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > super::MAX_IMPORT_RECURSION_DEPTH {
+        return Err(format!(
+            "sources directory tree exceeds the maximum import depth of {} at {} — \
+             refusing to recurse further (possible symlink cycle)",
+            super::MAX_IMPORT_RECURSION_DEPTH,
+            dir.display()
+        ));
+    }
+
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
 
@@ -266,8 +279,8 @@ fn scan_sources_recursive(dir: &Path, sources: &mut Vec<DbtSource>) -> Result<()
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
 
-        if path.is_dir() {
-            scan_sources_recursive(&path, sources)?;
+        if super::is_traversable_subdir(&entry) {
+            scan_sources_recursive(&path, sources, depth + 1)?;
         } else if is_yaml_file(&path) {
             match parse_sources(&path) {
                 Ok(found) => sources.extend(found),
