@@ -294,7 +294,14 @@ enum Command {
         no_cache: bool,
     },
 
-    /// Generate SQL without executing (dry-run).
+    /// Generate SQL without executing (dry-run) — the deliberate, auditable
+    /// first half of the two-step rollout.
+    ///
+    /// `rocky plan` + `rocky apply <plan-id>` is the canonical path for
+    /// production and PR gating: the plan is persisted at
+    /// `.rocky/plans/<plan-id>.json` so it can be inspected and reviewed
+    /// before any data is touched. For local iteration where you just want
+    /// the pipeline to run now, the single-step `rocky run` is the sibling.
     ///
     /// With no subcommand: emits a replication-pipeline SQL dry-run plus an
     /// optional `RunPlan` blueprint (when a `models/` directory is present).
@@ -450,7 +457,13 @@ enum Command {
         env: Option<String>,
     },
 
-    /// Execute the full pipeline: discover → drift → create → copy → check
+    /// Execute the full pipeline in one step: discover → drift → create → copy → check.
+    ///
+    /// `rocky run` is the imperative single-step path — a fused plan+apply for
+    /// local development and automation where you want the pipeline to execute
+    /// now. For deliberate, auditable rollouts (production, PR gating) use the
+    /// two-step `rocky plan` + `rocky apply <plan-id>`, which persists the plan
+    /// at `.rocky/plans/<plan-id>.json` so it can be reviewed before it runs.
     Run {
         /// Filter sources by component value (e.g., --filter client=acme)
         #[arg(long, long_help = FILTER_LONG_HELP)]
@@ -2210,12 +2223,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     }
                 }
             } else {
-                // `rocky run` is routed through `apply::run_apply_inline_for_run`
-                // (the Phase 2 alias path). This is a thin passthrough — behaviour
-                // is unchanged. Phase 4 emits a deprecation notice; the canonical
-                // flow is `rocky plan` + `rocky apply <plan-id>`. The notice
-                // honours `ROCKY_SUPPRESS_DEPRECATION=1` (dagster sets it).
-                rocky_cli::deprecation::warn(rocky_cli::deprecation::RUN_DEPRECATION);
+                // `rocky run` is the first-class fused plan+apply convenience
+                // for local iteration and automation; it routes through
+                // `apply::run_apply_inline_for_run`. The canonical auditable
+                // two-step (`rocky plan` + `rocky apply <plan-id>`) remains
+                // available for production / PR gating.
                 //
                 // `rocky_cli::commands::run` handles SIGINT internally so it
                 // can flush watermarks + mark in-flight tables as
