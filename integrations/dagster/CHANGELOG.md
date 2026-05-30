@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.43.0] — 2026-05-30
+
+Companion to engine `v1.47.0`. Codegen-driven — regenerated Pydantic bindings for the engine's `rocky profile` output (the new `profile_schema`) and updated `rocky test` results, plus documentation examples on the public health helpers and a dependency refresh. No new resource wiring or behaviour.
+
 ## [1.42.0] — 2026-05-25
 
 Companion to engine `v1.44.0`. Codegen-driven — regenerated Pydantic bindings for the engine's new AI surface (`rocky ai-contract`, `rocky preview rows`, and the `rocky review` AI-authored-plan gate). No new resource wiring or behaviour.
