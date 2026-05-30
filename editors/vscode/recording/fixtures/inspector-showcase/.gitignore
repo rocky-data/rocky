@@ -1,0 +1,14 @@
+# Generated at record/verify time — never commit.
+poc.duckdb
+*.duckdb
+*.duckdb.wal
+.rocky-state.redb
+.rocky_state
+.rocky-state.redb.lock
+.rocky_state.redb.lock
+.rocky/
+expected/
+
+# Stray state files the engine may drop under models/
+**/.rocky-state.redb
+**/.rocky-state.redb.lock

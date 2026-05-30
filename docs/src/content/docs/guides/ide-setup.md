@@ -7,6 +7,8 @@ sidebar:
 
 The Rocky VS Code extension connects to the Rocky language server to provide real-time compilation, type-aware hover, go-to-definition, column-level lineage, and AI model generation directly in your editor.
 
+![A Rocky DSL model on the left and its compiled SQL on the right, updating live as you type](/demo-vscode-compiled-sql.gif)
+
 The extension source is in the monorepo at [`editors/vscode/`](https://github.com/rocky-data/rocky/tree/main/editors/vscode).
 
 ## 1. Install the Extension
@@ -118,6 +120,11 @@ Pass additional flags to the language server:
 | `rocky.server.path` | `"rocky"` | Path to the Rocky binary |
 | `rocky.server.extraArgs` | `[]` | Extra arguments passed to `rocky lsp` |
 | `rocky.inlayHints.enabled` | `true` | Show inferred column types inline |
+| `rocky.diagnostics.enabled` | `true` | Show inline compile errors and warnings (set `false` to silence all Rocky diagnostics without uninstalling) |
+| `rocky.costAnnotations.enabled` | `true` | Show inline per-model cost annotations above model files (fetched from `rocky optimize`) |
+| `rocky.statusBar.segments` | `[]` | Extra status-bar segments after the server state. Any of `warehouse`, `lastRunAge`, `driftCount`, `branchState` |
+| `rocky.preview.rowLimit` | `100` | Maximum rows returned by **Rocky: Preview Model Rows** |
+| `rocky.preview.allowWarehouse` | `false` | Allow row previews to run against a non-DuckDB warehouse (may incur query cost; each run is confirmed) |
 
 ## 3. Verify the Connection
 
@@ -225,20 +232,29 @@ FROM stg_orders
 
 Inlay hints update in real time as you edit.
 
-## 6. Lineage View
+## 6. The Rocky Inspector
 
-The extension includes a lineage visualization panel. Open it via:
+The **Rocky Inspector** is a bottom-panel view that turns the active model into a trust dashboard. Open it from **Cmd+Shift+P** > **Rocky: Open in Inspector**, or just browse between model files -- while the panel is visible it follows the active editor. Clicking a node in the lineage canvas retargets the Inspector to that model.
 
-- **Cmd+Shift+P** > **Rocky: Show Model Lineage**
+![The Rocky Inspector's Overview as a model trust dashboard, its Governance card flagging two classified columns with one left unmasked](/demo-vscode-inspector.gif)
 
-This opens a side panel with an interactive DAG rendered from the compiler's column-level lineage graph. The visualization:
+The Inspector has a tab per concern, each backed by a Rocky CLI command and degrading gracefully when its data isn't available yet:
 
-- Shows upstream and downstream models
-- Highlights column-level data flow with edges
-- Uses the Graphviz DOT format rendered via viz.js
-- Updates when you switch between model files
+- **Overview** -- cost, blast radius, drift, governance, and freshness for the model in one place
+- **Columns** -- the model's columns with inferred types, tracing each one's upstream lineage
+- **Lineage** -- the interactive lineage canvas (below)
+- **Tests** -- declarative `[[tests]]` assertions plus the model-execution check (`rocky test`)
+- **Preview** -- a sample of the model's output rows (`rocky preview rows`); DuckDB runs locally, other warehouses require `rocky.preview.allowWarehouse`
+- **Profile** -- per-column profiling of the materialized table (`rocky profile`, DuckDB-only)
 
-The lineage view runs `rocky lineage <model> --format dot` under the hood and renders the result as an SVG in a webview panel.
+### Lineage canvas
+
+The **Lineage** tab renders the project's column-level graph as an interactive canvas. Open it directly with **Cmd+Shift+P** > **Rocky: Show Model Lineage**, framed on the current model.
+
+- Opens focused on a model's neighborhood and expands out to the whole project
+- Built from `rocky catalog` (assets and dependencies) and `rocky compile` (per-model materialization)
+- Trust-plane overlays drawn on the graph itself: cost, freshness, drift, governance, breaking changes against the base ref, and the last run
+- Right-click a node for actions scoped to that model: open its file, refocus the graph, or run an AI action -- explain (generate intent), generate tests, draft a data-grounded contract, or build a downstream model
 
 ## 7. AI Commands
 
@@ -264,13 +280,27 @@ The extension runs `rocky ai "<intent>"` under the hood. You can also use this d
 rocky ai "top 10 customers by lifetime value from customer_orders"
 ```
 
+### Other AI commands
+
+Three more AI commands work on existing models, each saving its result back into the project:
+
+- **Rocky: Sync Models (AI Schema Change Detection)** -- reconcile a model against upstream schema changes, guided by its stored intent (`rocky ai-sync`)
+- **Rocky: Explain Model (Generate Intent)** -- write a plain-English `intent` for a model from its code (`rocky ai-explain`)
+- **Rocky: Generate Tests from Intent** -- derive `[[tests]]` assertions from a model's intent (`rocky ai-test`)
+
+You can also trigger these -- plus data-grounded contract drafting and "build a downstream model" -- by right-clicking a node in the Inspector's lineage canvas.
+
 ### All commands
 
 | Command | Description |
 |---|---|
-| **Rocky: Restart Language Server** | Restart the LSP (fixes stale state) |
-| **Rocky: Show Model Lineage** | Open lineage DAG visualization |
-| **Rocky: Generate Model from Intent** | AI model generation from natural language |
+| **Rocky: Generate Model from Intent** | Generate a model from a natural language description (`rocky ai`) |
+| **Rocky: Sync Models (AI Schema Change Detection)** | Detect upstream schema changes and propose updates (`rocky ai-sync`) |
+| **Rocky: Explain Model (Generate Intent)** | Generate an intent description from a model's code (`rocky ai-explain`) |
+| **Rocky: Generate Tests from Intent** | Generate test assertions from a model's intent (`rocky ai-test`) |
+| **Rocky: Open in Inspector** | Open the active model in the Rocky Inspector |
+| **Rocky: Show Model Lineage** | Open the Inspector's lineage canvas, framed on the current model |
+| **Rocky: Restart Language Server** | Restart the language server (fixes stale state) |
 
 Access via the Command Palette (**Cmd+Shift+P** / **Ctrl+Shift+P**).
 

@@ -39,7 +39,7 @@ src/
 │   ├── compile.ts        # compile, validate, ci
 │   ├── hooks.ts          # hooksList, hooksTest
 │   ├── inspect.ts        # history, metrics
-│   ├── lineage.ts        # showLineage (DOT → SVG webview)
+│   ├── lineage.ts        # Inspector Lineage-tab data: graph + overlays + node AI actions
 │   ├── migration.ts      # importDbt, validateMigration
 │   ├── ops.ts            # doctor, optimize
 │   ├── run.ts            # run, plan, discover, compare
@@ -98,7 +98,7 @@ Selected commands below — see `CLAUDE.md` for the full table.
 | Command | What It Does |
 |---------|-------------|
 | `rocky.restartServer` | Restart LSP server |
-| `rocky.showLineage` | Render model DAG as interactive SVG |
+| `rocky.showLineage` | Open the Inspector's lineage canvas, framed on the current model |
 | `rocky.compile` | Type-check models |
 | `rocky.validate` | Validate config and models |
 | `rocky.ci` | Combined compile + test |

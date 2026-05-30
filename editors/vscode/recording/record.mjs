@@ -49,6 +49,15 @@ const runDir = path.join(HERE, ".run", `${name}-${Date.now()}`);
 
 console.log(`▶ recording "${name}" — ${scenario.description ?? ""}`);
 buildExtension();
+
+// Optional per-scenario setup, run before VS Code launches. Used to
+// materialize a workspace (seed + `rocky run`) so data-backed Inspector tabs
+// (Preview/Profile/Tests) show real rows instead of an empty/loading state.
+if (scenario.setup) {
+  console.log("⚙ scenario setup (materializing the workspace)…");
+  await scenario.setup(workspace, REPO);
+}
+
 const { app, win, windowReadyAt, cleanup } = await launchVSCode({
   vscodeDir: VSCODE_DIR,
   workspace,

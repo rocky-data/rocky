@@ -15,13 +15,9 @@ Editor support for [Rocky](https://github.com/rocky-data/rocky), the typed graph
 
 <p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-compiledSql.gif" alt="A Rocky DSL model on the left and its compiled SQL on the right, updating live" width="820" /></p>
 
-**See how it connects.** The lineage view is an interactive canvas, opening focused on a model's neighborhood and expandable to the whole project, with cost, freshness, and drift shown on the graph itself.
+**Inspect any model.** The Inspector is a model trust dashboard in the bottom panel: an Overview (cost, blast radius, drift, governance, freshness), Columns, an interactive Lineage canvas, Tests, Preview, and per-column Profile. Here a PII-classified model flags a column left unmasked, the Columns tab traces each column's upstream lineage, and the Lineage canvas shows the model's neighborhood with a cost overlay.
 
-<p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-lineage.gif" alt="The lineage canvas focused on a model's neighborhood, with a cost overlay drawn on the graph" width="820" /></p>
-
-**Inspect any model.** The Inspector's Overview is a model trust dashboard: cost, blast radius, drift, governance, and freshness in one place. Here a PII-classified model flags a column left unmasked, and the Columns tab traces each column's upstream lineage.
-
-<p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-inspector.gif" alt="The Rocky Inspector's Overview as a model trust dashboard, its Governance card flagging two classified columns with one left unmasked" width="820" /></p>
+<p align="center"><img src="https://raw.githubusercontent.com/rocky-data/rocky/main/editors/vscode/media/demo-inspector.gif" alt="The Rocky Inspector touring a PII-classified model: an Overview trust dashboard with a red Governance card, Columns, the lineage canvas with a cost overlay, Tests, and per-column Profile" width="820" /></p>
 
 **Drive it from the keyboard.** Every Rocky command is one palette away.
 

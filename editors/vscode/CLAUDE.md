@@ -20,7 +20,7 @@ The extension is an LSP client. All language intelligence (diagnostics, completi
 - 58 commands grouped by concern under `src/commands/` (AI, branch, compile, hooks, info, inspect, lineage, migration, ops, preview, run, storage, test, plus the `commandPalette` entry point and 2 inline code-lens commands)
 - Code lens (inline run/compile above models)
 - Activity bar sidebar with 6 views (Get Started, Extension Info, Models, Runs, Sources, Help) — empty-state copy is gated on the `rocky.hasProject` context flag so a workspace without a `rocky.toml` shows orientation instead of CLI errors
-- Lineage webview (DOT → SVG via viz.js)
+- Rocky Inspector (bottom-panel React webview under `webview-ui/`): per-model trust dashboard + interactive lineage canvas (`@xyflow/react` + `@dagrejs/dagre` layout)
 - Test explorer integration
 - Drift diagnostics, formatting, folding providers
 
@@ -65,7 +65,7 @@ src/
     ├── hooks.ts          # rocky.hooksList / hooksTest
     ├── info.ts           # rocky.init / playground / openDocumentation / openOutputChannel / reportBug / viewMarketplace / refreshInfo
     ├── inspect.ts        # rocky.history / metrics
-    ├── lineage.ts        # rocky.showLineage (DOT → SVG webview)
+    ├── lineage.ts        # Inspector Lineage-tab data: graph build + trust overlays + node AI actions
     ├── migration.ts      # rocky.importDbt / validateMigration
     ├── ops.ts            # rocky.doctor / optimize / catalog
     ├── preview.ts        # rocky.previewCreate / previewDiff / previewCost
@@ -135,7 +135,7 @@ code --install-extension rocky-*.vsix
 | `rocky.commandPalette` | Open the command palette filtered to Rocky commands |
 | `rocky.init` | Scaffold a new Rocky project in the current workspace |
 | `rocky.playground` | Create the self-contained DuckDB playground |
-| `rocky.showLineage` | Render model DAG as interactive SVG |
+| `rocky.showLineage` | Open the Inspector's lineage canvas, framed on the current model |
 | `rocky.compile` | Type-check models, validate contracts |
 | `rocky.validate` | Validate config and models |
 | `rocky.ci` | Combined compile + test |
