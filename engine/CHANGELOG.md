@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.47.0] — 2026-05-30
+
+### Added
+
+- **`rocky mcp` data-grounding tools reach raw sources and cold-start projects.** The MCP grounding tools now sample qualified `schema.table` sources (not just materialized models), discover an uncompiled project's schema on cold start via `inspect_schema`, default to a deterministic sample, and `profile_column` reports top values. (#752)
+
 ## [1.46.4] — 2026-05-29
 
 ### Fixed
