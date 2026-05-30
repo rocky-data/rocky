@@ -4,6 +4,8 @@ A curated catalog of small POCs that showcase the distinctive capabilities of [R
 
 This catalog is a **learning / reference** companion to the official [rocky/engine/examples/](https://github.com/rocky-data/rocky/tree/main/engine/examples) starter projects. The starters show you the shape of a Rocky project; the POCs here show you *what Rocky can do that other tools can't*.
 
+To start your own project, run `rocky playground my-project` — it scaffolds a throwaway DuckDB project you can iterate on freely (the recommended starting point). The [`quickstart`](https://github.com/rocky-data/rocky/tree/main/engine/examples/quickstart) example below is the same shape, checked into the repo as a fixed reference to read rather than scaffold.
+
 ## When to look here vs `engine/examples/`
 
 | You want to... | Look at |
@@ -36,17 +38,18 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**62 of 75 POCs run with no external credentials.** See each POC's README for prerequisites.
+**71 of 83 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
-### 00 — Foundations (13 POCs · DuckDB)
+### 00 — Foundations (14 POCs · DuckDB)
 
 DSL syntax, materialization basics, playground baseline, the trust-arc 1 storage primitives, file-format ingest and per-tenant routing, plus the plan/apply deployment workflow and project scaffolding.
 
 | POC | Feature |
 |---|---|
 | [00-playground-default](pocs/00-foundations/00-playground-default) | Stock 3-model scaffold from `rocky playground` — baseline smoke test |
+| [01-replication-basics](pocs/00-foundations/01-replication-basics) | Minimal replication-shape pipeline — backs the Dagster integration test fixtures |
 | [01-dsl-pipeline-syntax](pocs/00-foundations/01-dsl-pipeline-syntax) | Every Rocky DSL operator in one file (`from→where→derive→group→join→select→sort→take→distinct`) |
 | [02-null-safe-operators](pocs/00-foundations/02-null-safe-operators) | `!=` lowering to `IS DISTINCT FROM` — side-by-side `.rocky` vs `.sql` |
 | [03-date-literals-and-match](pocs/00-foundations/03-date-literals-and-match) | `@2025-01-01` date literals and `match { ... }` pattern matching |
