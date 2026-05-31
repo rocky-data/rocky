@@ -13,19 +13,19 @@ Rocky is a Cargo workspace composed of several crates, each with a focused respo
 
 Rocky separates concerns through two adapter types:
 
-**Source adapters** handle *discovery* — finding what schemas and tables exist and are available for processing. They do NOT extract data. The data must already be in the warehouse, landed by an ingestion tool (Fivetran, Airbyte, etc.) or loaded manually.
+**Source adapters** handle *discovery*: finding what schemas and tables exist and are available for processing. They do NOT extract data. The data must already be in the warehouse, landed by an ingestion tool (Fivetran, Airbyte, etc.) or loaded manually.
 
-- `rocky-fivetran` — Calls the Fivetran REST API to list connectors and their enabled tables in the destination
-- `rocky-duckdb` — Queries `information_schema` to discover schemas and tables in a local DuckDB database
-- Manual source (built into `rocky-core`) — Reads schema/table definitions from `rocky.toml`
+- `rocky-fivetran`: calls the Fivetran REST API to list connectors and their enabled tables in the destination
+- `rocky-duckdb`: queries `information_schema` to discover schemas and tables in a local DuckDB database
+- Manual source (built into `rocky-core`): reads schema/table definitions from `rocky.toml`
 
-**Warehouse adapters** handle *execution* — running SQL, managing catalog lifecycle, and applying governance (tags, permissions, workspace isolation).
+**Warehouse adapters** handle *execution*: running SQL, managing catalog lifecycle, and applying governance (tags, permissions, workspace isolation).
 
-- `rocky-databricks` — Executes via the Databricks SQL Statement API and manages Unity Catalog, with adaptive concurrency (AIMD algorithm)
-- `rocky-snowflake` — Executes via the Snowflake REST API with OAuth, key-pair JWT, and password auth
-- `rocky-bigquery` — Executes via the BigQuery REST API with service account / ADC auth
-- `rocky-trino` — Executes via Trino's `/v1/statement` REST polling state machine with HTTP Basic / JWT bearer auth (Beta as of engine v1.28.0)
-- `rocky-duckdb` — Local in-process execution for development, testing, and CI
+- `rocky-databricks`: executes via the Databricks SQL Statement API and manages Unity Catalog, with adaptive concurrency (AIMD algorithm)
+- `rocky-snowflake`: executes via the Snowflake REST API with OAuth, key-pair JWT, and password auth
+- `rocky-bigquery`: executes via the BigQuery REST API with service account / ADC auth
+- `rocky-trino`: executes via Trino's `/v1/statement` REST polling state machine with HTTP Basic / JWT bearer auth (Beta as of engine v1.28.0)
+- `rocky-duckdb`: local in-process execution for development, testing, and CI
 
 **rocky-ir** defines the typed Intermediate Representation (`ModelIr`, `MaterializationStrategy`, source/target descriptors). It was extracted from `rocky-core` in engine v1.30.0 so adapter crates can depend on the IR without pulling in the SQL-generation surface.
 
@@ -46,7 +46,7 @@ rocky-data/
 └── docs/                    # Documentation site (Astro + Starlight)
 ```
 
-The playground catalog currently ships {pocCounts.total} POCs across {pocCounts.categoryCount} categories — see the [playground guide](/guides/playground/) for the full list.
+The playground catalog currently ships {pocCounts.total} POCs across {pocCounts.categoryCount} categories. See the [playground guide](/guides/playground/) for the full list.
 
 ## Crate overview
 
@@ -81,65 +81,65 @@ engine/
 
 The typed Intermediate Representation. Extracted from `rocky-core` in engine v1.30.0 (Phase G1) so adapter crates can depend on the IR without pulling in the SQL-generation surface.
 
-- **`ModelIr`** — single in-memory plan representation; replaced the legacy `Plan` enum + `ReplicationPlan` / `TransformationPlan` structs (deleted in v1.30.0).
-- **`MaterializationStrategy`** — `FullRefresh`, `Incremental`, `Merge`, `MaterializedView`, `DynamicTable`, `TimeInterval`, `Ephemeral`, `DeleteInsert`, `Microbatch`, `ContentAddressed`.
+- **`ModelIr`**: single in-memory plan representation; replaced the legacy `Plan` enum + `ReplicationPlan` / `TransformationPlan` structs (deleted in v1.30.0).
+- **`MaterializationStrategy`**: `FullRefresh`, `Incremental`, `Merge`, `MaterializedView`, `DynamicTable`, `TimeInterval`, `Ephemeral`, `DeleteInsert`, `Microbatch`, `ContentAddressed`.
 - Source / target descriptors and partition windows.
 
 ### rocky-core
 
-The warehouse-agnostic transformation engine. This crate has no knowledge of specific warehouses or sources — it works entirely through adapter abstractions, consuming IR from `rocky-ir` and producing dialect-specific SQL.
+The warehouse-agnostic transformation engine. This crate has no knowledge of specific warehouses or sources; it works entirely through adapter abstractions, consuming IR from `rocky-ir` and producing dialect-specific SQL.
 
 Key modules:
 
-- **schema.rs** — Configurable schema pattern parsing (e.g., `src__acme__us_west__shopify` into structured components)
-- **drift.rs** — Schema drift detection (compares column types between source and target)
-- **sql_gen.rs** — IR to dialect-specific SQL generation
-- **state.rs** — Embedded state store backed by `redb` for watermarks and run history
-- **state_sync.rs** — Remote state persistence: download/upload state from S3, Valkey, or tiered (Valkey + S3)
-- **catalog.rs** — Catalog and schema lifecycle management (CREATE IF NOT EXISTS, tagging)
-- **checks.rs** — Inline data quality checks (row counts, column matching, freshness, null rate, custom)
-- **contracts.rs** — Data contracts (required columns, protected columns, allowed type changes)
-- **dag.rs** — DAG resolution for model dependencies (topological sort)
-- **models.rs** — SQL model loading (sidecar `.sql` + `.toml` files)
-- **source.rs** — Source adapter traits and manual source configuration
-- **config.rs** — TOML configuration parsing with environment variable substitution (`${VAR}` and `${VAR:-default}`)
+- **schema.rs**: configurable schema pattern parsing (e.g., `src__acme__us_west__shopify` into structured components)
+- **drift.rs**: schema drift detection (compares column types between source and target)
+- **sql_gen.rs**: IR to dialect-specific SQL generation
+- **state.rs**: embedded state store backed by `redb` for watermarks and run history
+- **state_sync.rs**: remote state persistence: download/upload state from S3, Valkey, or tiered (Valkey + S3)
+- **catalog.rs**: catalog and schema lifecycle management (CREATE IF NOT EXISTS, tagging)
+- **checks.rs**: inline data quality checks (row counts, column matching, freshness, null rate, custom)
+- **contracts.rs**: data contracts (required columns, protected columns, allowed type changes)
+- **dag.rs**: DAG resolution for model dependencies (topological sort)
+- **models.rs**: SQL model loading (sidecar `.sql` + `.toml` files)
+- **source.rs**: source adapter traits and manual source configuration
+- **config.rs**: TOML configuration parsing with environment variable substitution (`${VAR}` and `${VAR:-default}`)
 
 ### rocky-sql
 
 SQL parsing and validation built on `sqlparser-rs`.
 
-- **parser.rs** — Wraps sqlparser-rs with typed extensions for Rocky's needs
-- **dialect.rs** — Databricks SQL dialect support
-- **validation.rs** — SQL identifier validation using strict regex patterns. All identifiers must pass through this module before being interpolated into SQL. This prevents SQL injection by rejecting anything that doesn't match `^[a-zA-Z0-9_]+$`.
+- **parser.rs**: wraps sqlparser-rs with typed extensions for Rocky's needs
+- **dialect.rs**: Databricks SQL dialect support
+- **validation.rs**: SQL identifier validation using strict regex patterns. All identifiers must pass through this module before being interpolated into SQL. This prevents SQL injection by rejecting anything that doesn't match `^[a-zA-Z0-9_]+$`.
 
 ### rocky-databricks
 
 The Databricks warehouse adapter. Implements the warehouse traits defined in rocky-core.
 
-- **connector.rs** — SQL Statement Execution REST API client (`POST /api/2.0/sql/statements`, polling for results)
-- **catalog.rs** — Unity Catalog CRUD operations, tagging, and catalog isolation
-- **permissions.rs** — GRANT/REVOKE execution, SHOW GRANTS parsing
-- **workspace.rs** — Workspace binding management for catalog isolation
-- **auth.rs** — Authentication with auto-detection: tries PAT (`DATABRICKS_TOKEN`) first, falls back to OAuth M2M (`DATABRICKS_CLIENT_ID` + `DATABRICKS_CLIENT_SECRET`)
-- **batch.rs** — Batched information_schema queries using UNION ALL (batches of 200)
+- **connector.rs**: SQL Statement Execution REST API client (`POST /api/2.0/sql/statements`, polling for results)
+- **catalog.rs**: Unity Catalog CRUD operations, tagging, and catalog isolation
+- **permissions.rs**: GRANT/REVOKE execution, SHOW GRANTS parsing
+- **workspace.rs**: workspace binding management for catalog isolation
+- **auth.rs**: authentication with auto-detection: tries PAT (`DATABRICKS_TOKEN`) first, falls back to OAuth M2M (`DATABRICKS_CLIENT_ID` + `DATABRICKS_CLIENT_SECRET`)
+- **batch.rs**: batched information_schema queries using UNION ALL (batches of 200)
 
 ### rocky-fivetran
 
-The Fivetran source adapter. Discovers what schemas and tables exist in the Fivetran destination. This is a metadata-only operation — the actual data is already in the warehouse, landed by Fivetran's sync process.
+The Fivetran source adapter. Discovers what schemas and tables exist in the Fivetran destination. This is a metadata-only operation; the actual data is already in the warehouse, landed by Fivetran's sync process.
 
-- **client.rs** — Async REST client using reqwest with Basic Auth
-- **connector.rs** — Connector discovery and filtering
-- **schema.rs** — Schema configuration parsing (nested JSON structures from Fivetran's API)
-- **pagination.rs** — Cursor-based pagination for large result sets
-- **sync.rs** — Sync detection via timestamp comparison (determines if new data is available)
+- **client.rs**: async REST client using reqwest with Basic Auth
+- **connector.rs**: connector discovery and filtering
+- **schema.rs**: schema configuration parsing (nested JSON structures from Fivetran's API)
+- **pagination.rs**: cursor-based pagination for large result sets
+- **sync.rs**: sync detection via timestamp comparison (determines if new data is available)
 
 ### rocky-cache
 
 Three-tier caching system that reduces API calls and speeds up repeated operations.
 
-- **memory.rs** — In-process LRU cache with configurable TTL
-- **valkey.rs** — Valkey/Redis distributed cache with distributed locks
-- **tiered.rs** — Fallback chain: memory -> Valkey -> API. A cache miss at one tier populates all tiers above it.
+- **memory.rs**: in-process LRU cache with configurable TTL
+- **valkey.rs**: Valkey/Redis distributed cache with distributed locks
+- **tiered.rs**: fallback chain: memory -> Valkey -> API. A cache miss at one tier populates all tiers above it.
 
 ### rocky-duckdb
 
@@ -149,53 +149,53 @@ DuckDB local execution adapter. Minimal implementation providing a local warehou
 
 Observability infrastructure.
 
-- **metrics.rs** — In-process metrics collection: counters (tables processed/failed, statements executed, retries, anomalies) and duration histograms (p50/p95/max for tables and queries). Thread-safe via atomics, serialized to JSON in run output.
-- **tracing.rs** — Structured JSON logging via the `tracing` crate
-- **events.rs** — Event broadcasting over Valkey Pub/Sub for real-time monitoring
-- **otel.rs** — Feature-gated OpenTelemetry exporter. When the engine is built with `--features otel`, `rocky apply` exports in-process metrics as OTLP via an `OtelGuard` RAII handle. Send metrics to any OTLP-compatible collector (Honeycomb, Datadog, Grafana Tempo, Prometheus via the OTel collector) without bespoke integration code.
+- **metrics.rs**: in-process metrics collection: counters (tables processed/failed, statements executed, retries, anomalies) and duration histograms (p50/p95/max for tables and queries). Thread-safe via atomics, serialized to JSON in run output.
+- **tracing.rs**: structured JSON logging via the `tracing` crate
+- **events.rs**: event broadcasting over Valkey Pub/Sub for real-time monitoring
+- **otel.rs**: feature-gated OpenTelemetry exporter. When the engine is built with `--features otel`, `rocky apply` exports in-process metrics as OTLP via an `OtelGuard` RAII handle. Send metrics to any OTLP-compatible collector (Honeycomb, Datadog, Grafana Tempo, Prometheus via the OTel collector) without bespoke integration code.
 
 ### rocky-lang
 
 Rocky DSL parser for `.rocky` files. Converts pipeline-oriented syntax into an AST that lowers to standard SQL.
 
-- **lexer.rs** — Token scanner built on the `logos` crate
-- **parser.rs** — Recursive descent parser producing a typed AST
-- **lowering.rs** — AST to SQL lowering
+- **lexer.rs**: token scanner built on the `logos` crate
+- **parser.rs**: recursive descent parser producing a typed AST
+- **lowering.rs**: AST to SQL lowering
 
 ### rocky-compiler
 
 Type checking and semantic analysis for Rocky models.
 
-- **typecheck.rs** — Column-level type inference across the DAG
-- **semantic_graph.rs** — Tracks column lineage, dependencies, and contracts
-- **diagnostics.rs** — Compiler errors and warnings with source locations and suggestions
+- **typecheck.rs**: column-level type inference across the DAG
+- **semantic_graph.rs**: tracks column lineage, dependencies, and contracts
+- **diagnostics.rs**: compiler errors and warnings with source locations and suggestions
 
 ### rocky-adapter-sdk
 
 Stable, versioned traits for building custom warehouse adapters:
 
-- **`WarehouseAdapter`** — execute SQL, describe tables, manage catalog objects
-- **`SqlDialect`** — format SQL for a specific warehouse
-- **`DiscoveryAdapter`** — discover connectors and tables
-- **`GovernanceAdapter`** — manage tags, grants, workspace bindings
+- **`WarehouseAdapter`**: execute SQL, describe tables, manage catalog objects
+- **`SqlDialect`**: format SQL for a specific warehouse
+- **`DiscoveryAdapter`**: discover connectors and tables
+- **`GovernanceAdapter`**: manage tags, grants, workspace bindings
 - Includes 26 conformance tests (19 core + 7 optional)
 
 ### rocky-snowflake
 
 Snowflake warehouse adapter.
 
-- **auth.rs** — OAuth, password, RS256 key-pair JWT auth (auto-detection)
-- **connector.rs** — Snowflake REST API client
-- **dialect.rs** — Snowflake SQL dialect (dynamic tables, multi-statement transactions)
+- **auth.rs**: OAuth, password, RS256 key-pair JWT auth (auto-detection)
+- **connector.rs**: Snowflake REST API client
+- **dialect.rs**: Snowflake SQL dialect (dynamic tables, multi-statement transactions)
 
 ### rocky-trino
 
 Trino warehouse adapter (Beta as of engine v1.28.0). First first-party warehouse adapter built natively against `rocky-adapter-sdk`.
 
-- **connector.rs** — Async REST client driving Trino's `POST /v1/statement` + `nextUri` polling state machine. Same-origin guard on every `nextUri` follow-up (same scheme + host + port as the configured coordinator).
-- **dialect.rs** — Double-quoted identifiers, three-part `<catalog>.<schema>.<table>` references, `DESCRIBE <table>` column introspection, ANSI `INSERT INTO` / `CREATE TABLE AS`, `TABLESAMPLE BERNOULLI`.
-- **auth.rs** — HTTP Basic + JWT bearer with `RedactedString`-wrapped credentials.
-- **adapter.rs** — `WarehouseAdapter` impl: `dialect`, `execute_statement`, `execute_query`, `describe_table`.
+- **connector.rs**: async REST client driving Trino's `POST /v1/statement` + `nextUri` polling state machine. Same-origin guard on every `nextUri` follow-up (same scheme + host + port as the configured coordinator).
+- **dialect.rs**: double-quoted identifiers, three-part `<catalog>.<schema>.<table>` references, `DESCRIBE <table>` column introspection, ANSI `INSERT INTO` / `CREATE TABLE AS`, `TABLESAMPLE BERNOULLI`.
+- **auth.rs**: HTTP Basic + JWT bearer with `RedactedString`-wrapped credentials.
+- **adapter.rs**: `WarehouseAdapter` impl: `dialect`, `execute_statement`, `execute_query`, `describe_table`.
 
 A Docker conformance harness is gated behind the `trino-conformance` cargo feature: `cargo test -p rocky-trino --features trino-conformance -- --ignored` drives the adapter end-to-end against a real `trinodb/trino` coordinator. The default `cargo test -p rocky-trino` run stays credential- and network-free.
 
@@ -220,8 +220,8 @@ Local query engine built on DataFusion + Arrow. Powers `rocky test` and type inf
 
 HTTP API and Language Server Protocol (LSP) server.
 
-- **REST API** (via `axum`) — model metadata, lineage, DAG endpoints for `rocky serve`
-- **LSP** (via `tower-lsp`) — diagnostics, hover, completion, go-to-definition, rename for `rocky lsp`
+- **REST API** (via `axum`): model metadata, lineage, DAG endpoints for `rocky serve`
+- **LSP** (via `tower-lsp`): diagnostics, hover, completion, go-to-definition, rename for `rocky lsp`
 
 ### rocky-ai
 
@@ -234,9 +234,9 @@ AI intent layer using Claude for model generation, intent extraction, schema cha
 
 CLI framework built on `clap`.
 
-- **commands/** — 35+ command implementations organized by category
-- **output.rs** — Typed JSON output structs (63 schemas) with `JsonSchema` derivation for codegen
-- **pipes.rs** — Dagster Pipes protocol emitter (activates when `DAGSTER_PIPES_CONTEXT` is set)
+- **commands/**: 35+ command implementations organized by category
+- **output.rs**: typed JSON output structs (63 schemas) with `JsonSchema` derivation for codegen
+- **pipes.rs**: Dagster Pipes protocol emitter (activates when `DAGSTER_PIPES_CONTEXT` is set)
 
 ### rocky (binary)
 
@@ -244,26 +244,26 @@ The `rocky` binary crate. Contains only `main.rs`, which wires all the library c
 
 ## Intermediate Representation (IR)
 
-Rocky compiles configuration and SQL into an intermediate representation before generating executable SQL. This separation means the core engine never deals with raw strings — everything is typed and validated. The IR lives in the [`rocky-ir`](#rocky-ir) crate.
+Rocky compiles configuration and SQL into an intermediate representation before generating executable SQL. This separation means the core engine never deals with raw strings; everything is typed and validated. The IR lives in the [`rocky-ir`](#rocky-ir) crate.
 
 ### ModelIr
 
-`ModelIr` is the single in-memory plan representation. As of engine v1.30.0, the legacy `Plan` enum (and the `ReplicationPlan` / `TransformationPlan` / `From<&Plan>` bridge layer) is gone — `ModelIr` directly carries the source/target descriptors, the materialization strategy, and any dependency / sources / contracts / checks the model declares. Both replication and transformation pipelines compile to the same `ModelIr` shape, with the kind discriminated by which descriptors are populated.
+`ModelIr` is the single in-memory plan representation. As of engine v1.30.0, the legacy `Plan` enum (and the `ReplicationPlan` / `TransformationPlan` / `From<&Plan>` bridge layer) is gone. `ModelIr` directly carries the source/target descriptors, the materialization strategy, and any dependency / sources / contracts / checks the model declares. Both replication and transformation pipelines compile to the same `ModelIr` shape, with the kind discriminated by which descriptors are populated.
 
 ### MaterializationStrategy
 
 Controls how data is written to the target table. Variants:
 
-- **FullRefresh** — `CREATE OR REPLACE TABLE ... AS SELECT ...`. Rebuilds the entire table on every run.
-- **Incremental** — `INSERT INTO ... SELECT ... WHERE ts > watermark`. Only processes new rows. The watermark is read from the embedded state store at SQL-generation time (not carried on the strategy itself, so recipe-hash inputs stay runtime-state-free).
-- **Merge** — `MERGE INTO ... USING (...) ON key WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT`. Upserts based on a unique key.
-- **MaterializedView** — `CREATE OR REPLACE MATERIALIZED VIEW ... AS SELECT ...`. Databricks-specific.
-- **DynamicTable** — `CREATE OR REPLACE DYNAMIC TABLE ... TARGET_LAG = '...' AS SELECT ...`. Snowflake-specific.
-- **TimeInterval** — Partition-keyed materialization. The model SQL uses `@start_date` and `@end_date` placeholders; the runtime substitutes per-partition timestamps. Supports `--partition`, `--from/--to`, `--latest`, `--missing` CLI flags.
-- **Ephemeral** — Not materialized; inlined as a CTE in downstream consumers.
-- **DeleteInsert** — Delete rows matching the partition key, then insert fresh data. Cheaper alternative to `Merge` when the partition key identifies the rows being rewritten.
-- **Microbatch** — Alias for `TimeInterval` with `hour`-granularity defaults; dbt-compatible naming.
-- **ContentAddressed** — Content-addressed Parquet + Delta log commit via the `rocky-iceberg` writer. Designed for cross-engine reads (DuckDB `iceberg_scan`, Trino, Spark). SQL generation does not run for this strategy — the runtime drives `rocky-iceberg::uniform_writer` directly. See [Content-Addressed Materialization](/concepts/content-addressed/).
+- **FullRefresh**: `CREATE OR REPLACE TABLE ... AS SELECT ...`. Rebuilds the entire table on every run.
+- **Incremental**: `INSERT INTO ... SELECT ... WHERE ts > watermark`. Only processes new rows. The watermark is read from the embedded state store at SQL-generation time (not carried on the strategy itself, so recipe-hash inputs stay runtime-state-free).
+- **Merge**: `MERGE INTO ... USING (...) ON key WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT`. Upserts based on a unique key.
+- **MaterializedView**: `CREATE OR REPLACE MATERIALIZED VIEW ... AS SELECT ...`. Databricks-specific.
+- **DynamicTable**: `CREATE OR REPLACE DYNAMIC TABLE ... TARGET_LAG = '...' AS SELECT ...`. Snowflake-specific.
+- **TimeInterval**: partition-keyed materialization. The model SQL uses `@start_date` and `@end_date` placeholders; the runtime substitutes per-partition timestamps. Supports `--partition`, `--from/--to`, `--latest`, `--missing` CLI flags.
+- **Ephemeral**: not materialized; inlined as a CTE in downstream consumers.
+- **DeleteInsert**: delete rows matching the partition key, then insert fresh data. Cheaper alternative to `Merge` when the partition key identifies the rows being rewritten.
+- **Microbatch**: alias for `TimeInterval` with `hour`-granularity defaults; dbt-compatible naming.
+- **ContentAddressed**: content-addressed Parquet + Delta log commit via the `rocky-iceberg` writer. Designed for cross-engine reads (DuckDB `iceberg_scan`, Trino, Spark). SQL generation does not run for this strategy; the runtime drives `rocky-iceberg::uniform_writer` directly. See [Content-Addressed Materialization](/concepts/content-addressed/).
 
 The full enum lives in `rocky-ir::ir::MaterializationStrategy`. SQL generation (where applicable) lives in `rocky-core::sql_gen`.
 
@@ -271,11 +271,11 @@ The full enum lives in `rocky-ir::ir::MaterializationStrategy`. SQL generation (
 
 The `rocky-adapter-sdk` crate provides stable, versioned traits for building custom warehouse adapters:
 
-- **`WarehouseAdapter`** — execute SQL, describe tables, manage catalog objects
-- **`SqlDialect`** — format SQL for a specific warehouse (table refs, DDL, DML, type mapping)
-- **`DiscoveryAdapter`** — discover connectors and tables from a source
-- **`GovernanceAdapter`** — manage tags, grants, and workspace bindings
-- **`AdapterManifest`** — declares capabilities per adapter (which traits it implements)
+- **`WarehouseAdapter`**: execute SQL, describe tables, manage catalog objects
+- **`SqlDialect`**: format SQL for a specific warehouse (table refs, DDL, DML, type mapping)
+- **`DiscoveryAdapter`**: discover connectors and tables from a source
+- **`GovernanceAdapter`**: manage tags, grants, and workspace bindings
+- **`AdapterManifest`**: declares capabilities per adapter (which traits it implements)
 
 Adapters can be built in Rust (direct trait implementation) or in any language via the **process adapter protocol** (JSON-RPC over stdio).
 
