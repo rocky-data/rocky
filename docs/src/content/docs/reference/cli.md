@@ -7,7 +7,7 @@ sidebar:
 
 Rocky provides a single binary with subcommands for the full pipeline lifecycle. Commands are organized into categories:
 
-- **Core Pipeline**: `init`, `validate`, `discover`, `plan`, `apply`, `state`, `branch` (legacy alias: `run`)
+- **Core Pipeline**: `init`, `validate`, `discover`, `plan`, `apply`, `state`, `branch` (single-step alias: `run`)
 - **Modeling**: `compile`, `lineage`, `lineage-diff`, `test`, `ci`, `ci-diff`, `preview`
 - **Data**: `seed`, `snapshot`, `docs`
 - **AI**: `ai`, `ai-sync`, `ai-explain`, `ai-test`
@@ -193,7 +193,7 @@ rocky plan --filter <key=value> [--pipeline NAME]
 
 ### `rocky run`
 
-> Note: as of engine v1.33, the canonical form is `rocky plan` followed by `rocky apply <plan-id>`. `rocky run` continues to work and is now an alias; it emits a one-line `[deprecated]` notice to stderr that can be silenced with `ROCKY_SUPPRESS_DEPRECATION=1`.
+> Note: the canonical, auditable form is `rocky plan` followed by `rocky apply <plan-id>`. The `rocky run` single-step alias fuses plan + apply into one invocation for local iteration and automation.
 
 Executes the full pipeline end-to-end.
 
@@ -423,7 +423,7 @@ data_type = "DATE"
 
 ### `rocky compare`
 
-Compare shadow tables against production tables. Used after `rocky plan --shadow` + `rocky apply <plan-id>` (or the legacy `rocky run --shadow` alias) to validate results before promoting shadow data to production.
+Compare shadow tables against production tables. Used after `rocky plan --shadow` + `rocky apply <plan-id>` (or the single-step `rocky run --shadow` alias) to validate results before promoting shadow data to production.
 
 ```bash
 rocky compare --filter <key=value> [flags]

@@ -19,7 +19,7 @@ rocky discover  →  rocky plan  →  rocky apply
 
 1. **Discover** — Finds what schemas and tables are available for processing. For `fivetran` adapters, calls the Fivetran REST API to list connectors and enabled tables. For `duckdb` adapters, queries `information_schema`. For `manual` adapters, reads inline schema/table definitions. Discovery is metadata-only — it identifies what exists, it does not extract data.
 2. **Plan** — Parses source schema names, resolves target catalogs/schemas, generates SQL statements. Records a deterministic plan keyed by `plan_id`.
-3. **Apply** — Executes the plan by id: creates catalogs/schemas, copies data, runs quality checks, updates watermarks. The legacy `rocky run` alias collapses plan + apply into a single invocation and still works.
+3. **Apply** — Executes the plan by id: creates catalogs/schemas, copies data, runs quality checks, updates watermarks. The `rocky run` alias collapses plan + apply into a single invocation, for local iteration and automation.
 
 ## Schema pattern parsing
 

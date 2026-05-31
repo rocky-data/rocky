@@ -35,7 +35,7 @@ What this does:
 3. Computes the **copy set** — every working-DAG model not in the prune set.
 4. Registers a branch in the state store (mirrors `rocky branch create`).
 5. Issues `CREATE TABLE <branch_schema>.<model> AS SELECT * FROM <base_schema>.<model>` for each copy-set model.
-6. Calls `rocky plan --branch <name>` followed by `rocky apply <plan-id>` (or the legacy `rocky run --branch <name>` alias) with a model selector limited to the prune set.
+6. Calls `rocky plan --branch <name>` followed by `rocky apply <plan-id>` (or the single-step `rocky run --branch <name>` alias) with a model selector limited to the prune set.
 
 The output is a `PreviewCreateOutput` JSON document:
 

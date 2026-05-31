@@ -112,7 +112,7 @@ run_20260401_080015      | 2026-04-01T08:00:15Z  | 52.1s     | 19     | 1      |
 
 ### Audit trail
 
-`--audit` (added in v1.16.0) expands each run record with an eight-field governance trail captured by every `rocky apply` (and the legacy `rocky run` alias) against redb schema v6. Default output omits these fields for byte-stability with pre-v1.16 consumers.
+`--audit` (added in v1.16.0) expands each run record with an eight-field governance trail captured by every `rocky apply` (and the `rocky run` alias) against redb schema v6. Default output omits these fields for byte-stability with pre-v1.16 consumers.
 
 | Field | Description |
 |-------|-------------|
