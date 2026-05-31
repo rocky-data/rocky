@@ -17,6 +17,10 @@ rocky-cli = { path = "../rocky-cli" }
 rocky-core = { path = "../rocky-core" }
 rocky-sql = { path = "../rocky-sql" }
 rocky-compiler = { path = "../rocky-compiler" }
+# Direct dependency for the suggest_freshness_block tool: the hoisted
+# freshness-prompt builder, the LLM client, and extract_code. No cycle —
+# rocky-ai depends only on compiler/core/ir/lang/sql.
+rocky-ai = { path = "../rocky-ai" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -34,6 +38,7 @@ schemars = "1"
 
 [dev-dependencies]
 rocky-duckdb = { path = "../rocky-duckdb" }
+rocky-ai = { path = "../rocky-ai" }
 tempfile = "3"
 serde_json = { workspace = true }
 # The scripted round-trip test drives the stdio server in-process with an rmcp

@@ -160,6 +160,19 @@ pub struct OptimizeArgs {
     pub model: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SuggestFreshnessBlockArgs {
+    /// The model the `[freshness]` block is for (used in the prompt context).
+    pub model: String,
+    /// Candidate temporal columns (timestamp/date) the block's `time_column`
+    /// may be chosen from — typically the model's date/timestamp columns.
+    pub temporal_columns: Vec<String>,
+    /// The model's current sidecar `.toml` text, so the draft does not
+    /// duplicate or conflict with an existing block. Optional.
+    #[serde(default)]
+    pub current_sidecar: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Prompt argument structs (schemars 1.x — rmcp's `Parameters<T>` bound).
 // MCP prompt arguments are string-typed on the wire; `Serialize` is part of
@@ -797,6 +810,72 @@ impl RockyMcpServer {
         Ok(Json(OptimizeResult {
             recommendations,
             message: out.message,
+        }))
+    }
+
+    #[tool(
+        description = "Draft a `[freshness]` TOML block for a model with temporal columns (the \
+         W005 fix): an LLM picks a sensible `expected_lag_seconds` TTL and a `time_column` from \
+         the supplied candidates. Returns the ready-to-paste block directly (NOT a TextEdit); the \
+         caller appends it to the model's sidecar. Requires ANTHROPIC_API_KEY in the server \
+         environment — without it, `freshness_block` is null and `message` explains why."
+    )]
+    async fn suggest_freshness_block(
+        &self,
+        params: Parameters<SuggestFreshnessBlockArgs>,
+    ) -> Result<Json<SuggestFreshnessBlockResult>, String> {
+        let args = params.0;
+
+        // Gate on the API key the same way the LSP's freshness arm does;
+        // degrade to a null block + message rather than erroring.
+        let api_key = match std::env::var(rocky_ai::client::AI_API_KEY_ENV) {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
+                return Ok(Json(SuggestFreshnessBlockResult {
+                    freshness_block: None,
+                    message: Some(format!(
+                        "{} not set in the server environment",
+                        rocky_ai::client::AI_API_KEY_ENV
+                    )),
+                }));
+            }
+        };
+
+        let sidecar_text = args.current_sidecar.unwrap_or_default();
+        let (system_prompt, user_prompt) = rocky_ai::prompt::build_freshness_fix_prompt(
+            &args.model,
+            &args.temporal_columns,
+            &sidecar_text,
+        );
+
+        // Mirror the LSP's AiConfig: anthropic / sonnet / TOML / single attempt.
+        let ai_config = rocky_ai::client::AiConfig {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            api_key: rocky_core::redacted::RedactedString::new(api_key),
+            default_format: "toml".to_string(),
+            max_attempts: 1,
+            max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
+        };
+        let client = rocky_ai::client::LlmClient::new(ai_config)
+            .map_err(|e| format!("AI client init failed: {e}"))?;
+        let response = client
+            .generate(&system_prompt, &user_prompt, None)
+            .await
+            .map_err(|e| format!("AI request failed: {e}"))?;
+
+        let extracted = rocky_ai::generate::extract_code(&response.content);
+        let snippet = extracted.trim();
+        if snippet.is_empty() {
+            return Ok(Json(SuggestFreshnessBlockResult {
+                freshness_block: None,
+                message: Some("AI response did not contain a TOML code block".to_string()),
+            }));
+        }
+
+        Ok(Json(SuggestFreshnessBlockResult {
+            freshness_block: Some(snippet.to_string()),
+            message: None,
         }))
     }
 

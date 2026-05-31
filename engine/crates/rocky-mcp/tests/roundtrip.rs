@@ -92,6 +92,7 @@ async fn tools_list_returns_expected_set() {
             "profile_column",
             "propose",
             "sample_rows",
+            "suggest_freshness_block",
             "test",
         ]
     );
@@ -849,6 +850,52 @@ async fn inspect_schema_discovers_raw_sources_and_tolerates_cold_start() {
         cols.iter()
             .any(|c| c["name"] == serde_json::json!("status")),
         "discovered source carries its columns; got {cols:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn suggest_freshness_block_returns_null_without_api_key() {
+    // Without ANTHROPIC_API_KEY the tool degrades gracefully: a null block
+    // plus an explanatory message, never an error and never a network call.
+    // SAFETY: `#[tokio::test]` runs on a current-thread runtime, so the
+    // spawned server task shares this single thread; nothing else reads the
+    // env concurrently.
+    unsafe {
+        std::env::remove_var(rocky_ai::client::AI_API_KEY_ENV);
+    }
+
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let args = serde_json::json!({
+        "model": "orders",
+        "temporal_columns": ["created_at", "updated_at"],
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("suggest_freshness_block").with_arguments(args))
+        .await
+        .expect("suggest_freshness_block call");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "missing key is a graceful no-op, not an error"
+    );
+    let sc = result.structured_content.expect("structured content");
+    assert!(
+        sc.get("freshness_block").is_none() || sc["freshness_block"].is_null(),
+        "no block without a key; got {sc:?}"
+    );
+    let message = sc["message"].as_str().expect("explanatory message");
+    assert!(
+        message.contains(rocky_ai::client::AI_API_KEY_ENV),
+        "message should name the missing env var; got `{message}`"
     );
 
     client.cancel().await.unwrap();

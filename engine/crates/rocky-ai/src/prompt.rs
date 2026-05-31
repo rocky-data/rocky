@@ -105,6 +105,44 @@ pub fn build_system_prompt(
     prompt
 }
 
+/// Build the LLM prompt for a W005 freshness-coverage fix.
+///
+/// The system half encodes the role + output-format constraint; the user half
+/// supplies the per-call context (model name, candidate temporal columns,
+/// current sidecar). Splitting this way keeps the system portion stable across
+/// calls for prompt caching. Returns `(system, user)`.
+///
+/// Shared by the LSP's `[freshness]` code-action arm and the MCP
+/// `suggest_freshness_block` tool so the two never drift.
+pub fn build_freshness_fix_prompt(
+    model_name: &str,
+    temporal_columns: &[String],
+    sidecar_text: &str,
+) -> (String, String) {
+    let system = "You are an expert Rocky data-pipeline reviewer. Your task is to \
+                 propose a TOML `[freshness]` block for a model's sidecar `.toml` so \
+                 the model declares a time-to-live after which it is considered \
+                 stale. Set `expected_lag_seconds` to a sensible TTL for the model \
+                 (e.g. 3600 for hourly data, 86400 for daily). Set `time_column` to \
+                 the most appropriate timestamp/date column from the supplied \
+                 candidates. Output ONLY the new TOML block inside a single ```toml \
+                 fenced block — no commentary, no explanation, no diff. The block \
+                 must start with `[freshness]` on its own line."
+        .to_string();
+
+    let candidates = temporal_columns.join(", ");
+    let user = format!(
+        "Model: `{model_name}`\n\
+         Candidate temporal columns: {candidates}\n\n\
+         Current sidecar `.toml`:\n```toml\n{sidecar_text}\n```\n\n\
+         Emit a `[freshness]` block with `expected_lag_seconds` and a \
+         `time_column` chosen from the candidates. Do not duplicate or modify \
+         any existing block."
+    );
+
+    (system, user)
+}
+
 /// Render a column list as a compact one-liner: `id: INT64, amount: DECIMAL(10,2)`.
 fn render_columns(cols: &[TypedColumn]) -> String {
     cols.iter()
@@ -189,5 +227,24 @@ mod tests {
         let prompt = build_system_prompt(&[], &[], "rocky");
         assert!(!prompt.contains("# Existing Models"));
         assert!(!prompt.contains("# Available Source Tables"));
+    }
+
+    #[test]
+    fn test_build_freshness_fix_prompt_threads_context() {
+        let (system, user) = build_freshness_fix_prompt(
+            "daily_revenue",
+            &["created_at".to_string(), "updated_at".to_string()],
+            "name = \"daily_revenue\"\n",
+        );
+        // System half: the role + output-format constraint.
+        assert!(system.contains("[freshness]"));
+        assert!(system.contains("expected_lag_seconds"));
+        assert!(system.contains("time_column"));
+        assert!(system.contains("```toml"));
+        // User half: the per-call context (model + candidates + sidecar).
+        assert!(user.contains("daily_revenue"));
+        assert!(user.contains("created_at"));
+        assert!(user.contains("updated_at"));
+        assert!(user.contains("name = \"daily_revenue\""));
     }
 }

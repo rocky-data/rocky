@@ -4187,6 +4187,7 @@ dependencies = [
  "arrow",
  "chrono",
  "rmcp",
+ "rocky-ai",
  "rocky-cli",
  "rocky-compiler",
  "rocky-core",

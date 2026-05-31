@@ -14,6 +14,12 @@ use thiserror::Error;
 /// `[ai] max_tokens` in `rocky.toml`.
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
+/// Environment variable that holds the Anthropic API key. Both the LSP's AI
+/// code-action arms and the MCP `suggest_freshness_block` tool gate on it;
+/// keeping the name in one place keeps their behaviour aligned with
+/// `rocky ai`.
+pub const AI_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+
 /// AI provider configuration.
 ///
 /// `api_key` is wrapped in [`RedactedString`] so accidental `?config` /

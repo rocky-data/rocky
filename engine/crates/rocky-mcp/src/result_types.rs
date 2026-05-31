@@ -491,3 +491,21 @@ pub struct OptimizeResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
+
+/// `suggest_freshness_block` result — an LLM-drafted `[freshness]` TOML block
+/// for a model with temporal columns (the W005 fix).
+///
+/// `freshness_block` is the ready-to-paste TOML when drafting succeeds;
+/// `message` explains why no block was produced (the API key is unset, or the
+/// model returned no fenced block) so the caller can distinguish a real draft
+/// from a graceful no-op rather than seeing an error.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct SuggestFreshnessBlockResult {
+    /// The drafted `[freshness]` TOML block, when one was produced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness_block: Option<String>,
+    /// Why no block was produced (key unset / no fenced block), when
+    /// `freshness_block` is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
