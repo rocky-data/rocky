@@ -66,7 +66,7 @@ Swap `"run_history"` for `"output_artifacts"` or `"branches"` to dump those tabl
 
 ## The walkthrough
 
-This walks an auditor through verifying a single run of a three-model replication pipeline (`raw_orders` → `stg_orders` → `fct_revenue`). The outputs shown are representative; identity fields are scrubbed to placeholders.
+This walks an auditor through verifying a single run of a three-model transformation pipeline (`raw_orders` → `stg_orders` → `fct_revenue`). The outputs shown are representative; identity fields are scrubbed to placeholders.
 
 ### Step 1 — Open the ledger
 
