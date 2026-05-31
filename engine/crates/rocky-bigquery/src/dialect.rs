@@ -208,6 +208,32 @@ impl SqlDialect for BigQueryDialect {
         "STRING"
     }
 
+    fn ground_table_ref(&self, parts: &[&str]) -> AdapterResult<String> {
+        // BigQuery refs are `project.dataset.table`. The project (catalog)
+        // segment allows hyphens — every real GCP project ID has them — so it
+        // gets the hyphen-allowing `validate_gcp_project_id` rule while the
+        // dataset + table stay on the strict SQL-identifier rule. Each segment
+        // is backtick-quoted: a hyphenated ref like
+        // `bigquery-public-data.samples.shakespeare` parses as subtraction
+        // unless quoted, and double quotes denote STRING literals in BigQuery.
+        match parts {
+            [project, dataset, table] => {
+                validation::validate_gcp_project_id(project).map_err(AdapterError::new)?;
+                validation::validate_identifier(dataset).map_err(AdapterError::new)?;
+                validation::validate_identifier(table).map_err(AdapterError::new)?;
+                Ok(format!("`{project}`.`{dataset}`.`{table}`"))
+            }
+            [dataset, table] => {
+                validation::validate_identifier(dataset).map_err(AdapterError::new)?;
+                validation::validate_identifier(table).map_err(AdapterError::new)?;
+                Ok(format!("`{dataset}`.`{table}`"))
+            }
+            _ => Err(AdapterError::msg(
+                "table reference must be `dataset.table` or `project.dataset.table`",
+            )),
+        }
+    }
+
     fn quote_identifier(&self, name: &str) -> String {
         // BigQuery uses backticks for identifiers; double quotes denote
         // STRING literals. The default `"name"` quoting from the trait
@@ -486,6 +512,54 @@ mod tests {
         // BigQuery has no VARCHAR; the variable-length string type is STRING.
         let d = BigQueryDialect;
         assert_eq!(d.string_type_name(), "STRING");
+    }
+
+    #[test]
+    fn ground_table_ref_backtick_quotes_hyphenated_project() {
+        // Every real GCP project ID carries hyphens. The grounding ref builder
+        // must accept the hyphenated project segment (via the project-id rule)
+        // and backtick-quote the ref so `project.dataset.table` doesn't parse
+        // as subtraction.
+        let d = BigQueryDialect;
+        assert_eq!(
+            d.ground_table_ref(&["bigquery-public-data", "samples", "shakespeare"])
+                .unwrap(),
+            "`bigquery-public-data`.`samples`.`shakespeare`"
+        );
+        assert_eq!(
+            d.ground_table_ref(&["my-proj-123", "ds", "tbl"]).unwrap(),
+            "`my-proj-123`.`ds`.`tbl`"
+        );
+    }
+
+    #[test]
+    fn ground_table_ref_two_part_is_backtick_quoted() {
+        // Dataset-qualified ref (no project) — both segments stay on the strict
+        // identifier rule but are still backtick-quoted.
+        let d = BigQueryDialect;
+        assert_eq!(
+            d.ground_table_ref(&["samples", "shakespeare"]).unwrap(),
+            "`samples`.`shakespeare`"
+        );
+    }
+
+    #[test]
+    fn ground_table_ref_rejects_injection_and_bad_arity() {
+        let d = BigQueryDialect;
+        // Injection in any segment is rejected.
+        assert!(
+            d.ground_table_ref(&["bigquery-public-data", "samples", "a; DROP TABLE x"])
+                .is_err()
+        );
+        // The strict project-id rule still rejects a hyphen in the dataset /
+        // table segments (only the project segment allows hyphens).
+        assert!(
+            d.ground_table_ref(&["proj-ok-123", "bad-dataset", "tbl"])
+                .is_err()
+        );
+        // Out-of-range arity.
+        assert!(d.ground_table_ref(&["a", "b", "c", "d"]).is_err());
+        assert!(d.ground_table_ref(&["just_one"]).is_err());
     }
 
     #[test]

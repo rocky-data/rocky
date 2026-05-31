@@ -188,6 +188,15 @@ impl SqlDialect for DatabricksSqlDialect {
         format!("`{name}`")
     }
 
+    fn string_type_name(&self) -> &'static str {
+        // Spark SQL (Databricks) rejects a bare `VARCHAR` in `CAST(... AS
+        // VARCHAR)` with `[DATATYPE_MISSING_SIZE] DataType "VARCHAR" requires
+        // a length parameter`. The unbounded variable-length text type is
+        // `STRING`, so the data-grounding cast must target that instead of the
+        // trait default `"VARCHAR"`.
+        "STRING"
+    }
+
     fn materialized_view_ddl(&self, target: &str, select_sql: &str) -> AdapterResult<String> {
         // Unity Catalog managed materialized views — refresh schedule is
         // configured server-side via `ALTER MATERIALIZED VIEW … SET
@@ -247,6 +256,15 @@ mod tests {
     fn test_format_table_ref_rejects_bad_identifier() {
         let d = dialect();
         assert!(d.format_table_ref("bad; DROP", "sch", "tbl").is_err());
+    }
+
+    #[test]
+    fn string_type_name_is_spark_string_not_varchar() {
+        // Spark SQL rejects a bare `CAST(... AS VARCHAR)` (DATATYPE_MISSING_SIZE);
+        // the unbounded text type is STRING. The data-grounding profile cast
+        // depends on this override.
+        let d = dialect();
+        assert_eq!(d.string_type_name(), "STRING");
     }
 
     #[test]

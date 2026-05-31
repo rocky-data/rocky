@@ -448,6 +448,38 @@ mod tests {
     }
 
     #[test]
+    fn string_type_name_is_varchar() {
+        // Snowflake accepts `CAST(... AS VARCHAR)`, so the data-grounding cast
+        // uses the trait default rather than overriding to STRING.
+        let d = dialect();
+        assert_eq!(d.string_type_name(), "VARCHAR");
+    }
+
+    #[test]
+    fn ground_table_ref_stays_unquoted() {
+        // Critical regression guard: the grounding ref must stay UNQUOTED on
+        // Snowflake even though `format_table_ref` double-quotes. Snowflake
+        // folds unquoted identifiers to its default uppercase casing, so an
+        // unquoted lowercase input still resolves a default-uppercase object;
+        // double-quoting would lock in a case-sensitive lowercase name that
+        // would not match. The MCP grounding path was live-verified against
+        // Snowflake on the unquoted form.
+        let d = dialect();
+        assert_eq!(
+            d.ground_table_ref(&["mydb", "public", "users"]).unwrap(),
+            "mydb.public.users"
+        );
+        assert_eq!(
+            d.ground_table_ref(&["public", "users"]).unwrap(),
+            "public.users"
+        );
+        assert!(
+            d.ground_table_ref(&["public", "users; DROP TABLE x"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_format_table_ref_two_part() {
         let d = dialect();
         assert_eq!(
