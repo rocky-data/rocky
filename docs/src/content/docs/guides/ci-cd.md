@@ -62,7 +62,7 @@ In GitHub Actions, post the pre-rendered Markdown block to the PR directly:
 rocky ci-diff --semantic --output json | jq '.breaking_findings'
 ```
 
-Each finding has a tagged `change.kind` (e.g. `column_dropped`, `column_type_changed`, `target_renamed`) and a `severity` (`breaking` / `warning` / `info`). `ci-diff --semantic` is **informational** — even a `breaking` finding does not change `ci-diff`'s exit code. Use it on every PR to make breaking changes visible to reviewers before promotion.
+Each finding has a tagged `change.kind` (e.g. `column_dropped`, `column_type_changed`, `target_renamed`) and a `severity` (`breaking` / `warning` / `info`). `ci-diff --semantic` is **informational**: even a `breaking` finding does not change `ci-diff`'s exit code. Use it on every PR to make breaking changes visible to reviewers before promotion.
 
 The hard gate lives on `rocky plan promote` + `rocky apply`. When promoting a branch to production, Rocky runs the same classifier against `--base-ref` (default `main`); any finding with `severity == "breaking"` blocks the promote at plan time and the apply step refuses to execute the plan. To override (e.g. a planned breaking release with downstream consumers already migrated), pass `--allow-breaking` at plan time. The override emits a `breaking_changes_allowed` audit event so the bypass leaves a paper trail.
 
@@ -281,7 +281,7 @@ rocky ai-explain --all --save --models models
 rocky ai-test --all --save --models models
 ```
 
-This creates test files in the `tests/` directory. Commit them to your repository -- they run as part of `rocky ci` and `rocky test` on every PR.
+This creates test files in the `tests/` directory. Commit them to your repository. They run as part of `rocky ci` and `rocky test` on every PR.
 
 ### Generate tests for a single model
 

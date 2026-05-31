@@ -320,7 +320,7 @@ See the [configuration reference](../reference/configuration.md) for the full sc
 
 `rocky compliance` is a static resolver that answers one question: **are all classified columns masked wherever policy says they should be?**
 
-It is a thin rollup over the Wave A configuration (classifications + masks) -- no warehouse calls, no network round-trips. Shipped in engine-v1.16.0 (Wave B).
+It is a thin rollup over the classifications and masks configuration. No warehouse calls, no network round-trips. Shipped in engine-v1.16.0 (Wave B).
 
 ### Basic usage
 
@@ -375,7 +375,7 @@ The JSON payload is the `ComplianceOutput` schema: a `summary` block with counte
 
 Rocky supports hierarchical role declarations that flatten into a resolved permission set per role. Inheritance is declarative and composable; cycles and unknown parents are rejected at config-load time.
 
-Shipped in engine-v1.16.0 (Wave C-1). The Databricks v1 adapter implementation is **log-only** -- it validates the flattened graph and emits `debug!` events, but SCIM group creation and per-catalog GRANT emission are deferred to a follow-up.
+Shipped in engine-v1.16.0 (Wave C-1). The Databricks v1 adapter implementation is **log-only**: it validates the flattened graph and emits `debug!` events, but SCIM group creation and per-catalog GRANT emission are deferred to a follow-up.
 
 ### Declare roles in `rocky.toml`
 
