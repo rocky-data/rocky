@@ -84,22 +84,24 @@ List `run_history` and pick the run by its timestamp. Each row is one `RunRecord
 
 ```json
 {
-  "run_id": "run_2026-05-30T11-04-22Z_8f1a",
-  "started_at": "2026-05-30T11:04:22Z",
-  "finished_at": "2026-05-30T11:04:25Z",
+  "run_id": "run-20260530-110422-643",
+  "started_at": "2026-05-30T11:04:22.643494Z",
+  "finished_at": "2026-05-30T11:04:25.265016Z",
   "status": "Success",
   "trigger": "Ci",
-  "config_hash": "c0ffee11d00dface",
+  "config_hash": "a54e8a0fa524b6a2",
   "triggering_identity": "data-eng@example.com",
-  "session_source": "Ci",
+  "session_source": "ci",
   "git_commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
   "git_branch": "main",
   "target_catalog": "analytics_prod",
   "hostname": "ci-runner-01",
-  "rocky_version": "1.47.0",
+  "rocky_version": "1.47.1",
   "models_executed": [ /* ... see step 3 ... */ ]
 }
 ```
+
+The `run_id` is Rocky's `run-<UTC-date>-<UTC-time>-<millis>` form. The `status` and `trigger` values are the capitalized enum forms as they serialize on disk (`"Success"`, `"Ci"` / `"Manual"`); `session_source` serializes lowercase (`"cli"`, `"ci"`, ...).
 
 That single row answers *who* (`triggering_identity` + `git_commit`), *when* (`started_at` / `finished_at`), and *under what config* (`config_hash`). The `git_commit` is the anchor for the next step.
 
