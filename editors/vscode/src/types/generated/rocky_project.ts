@@ -370,6 +370,14 @@ export interface RockyConfig {
    */
   hook?: HooksConfig;
   /**
+   * Imported producer-project snapshots, keyed by import name.
+   *
+   * Each `[imports.<name>]` block points at a vendored snapshot of a producer project's compiled IR. During `rocky compile`, the consumer's column references are checked against the producer's published schema: a column the producer dropped but the consumer still reads surfaces as an error (E030), and a recipe-hash mismatch against a configured `pin` surfaces as E033. Empty by default — a project with no imports incurs no extra work.
+   */
+  imports?: {
+    [k: string]: ImportEntry;
+  };
+  /**
    * Workspace-default column-masking strategies plus optional per-env overrides. See [`MaskEntry`] for the TOML shape:
    *
    * ```toml [mask] pii = "hash"            # default strategy for "pii" classification confidential = "redact" # default strategy for "confidential"
@@ -935,6 +943,31 @@ export interface WebhookConfig {
    * Target URL for the webhook request.
    */
   url: string;
+}
+/**
+ * A single imported producer-project snapshot.
+ *
+ * Declared as `[imports.<name>]` in `rocky.toml`. A producer project publishes a serialized snapshot of its compiled project (via `rocky publish-ir`); a consumer project vendors that snapshot file and references it here so `rocky compile` can verify that the columns the consumer reads still exist in the producer's output.
+ *
+ * ```toml [imports.orders] path = "vendor/orders"        # directory holding the vendored snapshots snapshot = "current.json"     # the producer's current published snapshot baseline = "baseline.json"    # optional prior snapshot used for diffing pin = "*"                     # optional recipe-hash pin ("*" = trust any) ```
+ */
+export interface ImportEntry {
+  /**
+   * Optional filename of a prior/pinned snapshot used as the diff baseline, relative to `path`. When set, `rocky compile` diffs `baseline` against `snapshot` to detect columns the producer dropped.
+   */
+  baseline?: string | null;
+  /**
+   * Directory (relative to `rocky.toml`) holding the vendored snapshot files.
+   */
+  path: string;
+  /**
+   * Optional recipe-hash pin (hex). When set to a concrete hash, the snapshot's recipe hash must match or compilation fails. `"*"` (or absent) trusts whatever snapshot is vendored.
+   */
+  pin?: string | null;
+  /**
+   * Filename of the producer's current published snapshot, relative to `path`.
+   */
+  snapshot: string;
 }
 /**
  * Replication pipeline configuration.
