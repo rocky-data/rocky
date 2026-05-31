@@ -49,7 +49,11 @@ pub enum ProjectError {
     #[error("dependency resolution failed: {0}")]
     Resolve(#[from] resolve::ResolveError),
 
-    #[error("DAG error: {0}")]
+    // Transparent: the leaf `DagError` already carries a fully
+    // self-describing message (incl. the `did you mean?` hint). Re-
+    // prefixing it here only produced a duplicated `Caused by` layer in
+    // the rendered anyhow chain.
+    #[error(transparent)]
     Dag(#[from] dag::DagError),
 
     #[error("no models found in {path}")]

@@ -112,7 +112,10 @@ pub struct CompileResult {
 /// Compile error.
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
-    #[error("project loading failed: {0}")]
+    // Transparent: `ProjectError` variants are self-describing, so
+    // wrapping them with a "project loading failed:" prefix only added a
+    // redundant layer to the rendered `Caused by` chain.
+    #[error(transparent)]
     Project(#[from] ProjectError),
 
     #[error("semantic graph failed: {0}")]

@@ -9,8 +9,57 @@ pub enum DagError {
     #[error("circular dependency detected involving: {nodes:?}")]
     CyclicDependency { nodes: Vec<String> },
 
-    #[error("unknown dependency '{dependency}' referenced by '{node}'")]
-    UnknownDependency { node: String, dependency: String },
+    #[error(
+        "unknown dependency '{dependency}' referenced by '{node}'{}",
+        .suggestion.as_deref().map(|s| format!(" — did you mean '{s}'?")).unwrap_or_default()
+    )]
+    UnknownDependency {
+        node: String,
+        dependency: String,
+        /// Closest known model name to `dependency`, when one is a near
+        /// miss (helps the user spot a typo). `None` when nothing is close.
+        suggestion: Option<String>,
+    },
+}
+
+/// Case-insensitive Levenshtein edit distance.
+///
+/// Small inline implementation so `rocky-ir` (a data-only crate) can
+/// surface a "did you mean?" near-miss on an unknown `depends_on`
+/// reference without pulling in a string-similarity dependency.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.to_lowercase().chars().collect();
+    let b: Vec<char> = b.to_lowercase().chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// Best near-miss for `name` among `candidates`, if one is close enough.
+///
+/// Threshold scales with the typo's length (distance must be at most a
+/// third of the longer string, capped at 3) so short names don't match
+/// everything and long names tolerate a couple of typos.
+fn nearest_name(name: &str, candidates: impl Iterator<Item = String>) -> Option<String> {
+    candidates
+        .map(|c| {
+            let d = edit_distance(name, &c);
+            (c, d)
+        })
+        .filter(|(c, d)| {
+            let limit = (name.len().max(c.len()) / 3).clamp(1, 3);
+            *d <= limit
+        })
+        .min_by_key(|(_, d)| *d)
+        .map(|(c, _)| c)
 }
 
 /// A node in the transformation DAG.
@@ -31,9 +80,12 @@ pub fn topological_sort(nodes: &[DagNode]) -> Result<Vec<String>, DagError> {
     for node in nodes {
         for dep in &node.depends_on {
             if !names.contains(dep.as_str()) {
+                let suggestion =
+                    nearest_name(dep, nodes.iter().map(|n| n.name.clone())).filter(|s| s != dep);
                 return Err(DagError::UnknownDependency {
                     node: node.name.clone(),
                     dependency: dep.clone(),
+                    suggestion,
                 });
             }
         }
@@ -221,6 +273,56 @@ mod tests {
         }];
         let result = topological_sort(&nodes);
         assert!(matches!(result, Err(DagError::UnknownDependency { .. })));
+    }
+
+    #[test]
+    fn test_unknown_dependency_suggests_near_miss() {
+        let nodes = vec![
+            DagNode {
+                name: "orders".into(),
+                depends_on: vec!["custmers".into()],
+            },
+            DagNode {
+                name: "customers".into(),
+                depends_on: vec![],
+            },
+        ];
+        let err = topological_sort(&nodes).unwrap_err();
+        let DagError::UnknownDependency {
+            dependency,
+            suggestion,
+            ..
+        } = &err
+        else {
+            panic!("expected UnknownDependency, got {err:?}");
+        };
+        assert_eq!(dependency, "custmers");
+        assert_eq!(suggestion.as_deref(), Some("customers"));
+        // The suggestion is folded into the single Display message.
+        assert!(
+            err.to_string().contains("did you mean 'customers'?"),
+            "message should carry the suggestion: {err}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_dependency_no_suggestion_when_distant() {
+        let nodes = vec![
+            DagNode {
+                name: "orders".into(),
+                depends_on: vec!["zzzzzzzz".into()],
+            },
+            DagNode {
+                name: "customers".into(),
+                depends_on: vec![],
+            },
+        ];
+        let err = topological_sort(&nodes).unwrap_err();
+        let DagError::UnknownDependency { suggestion, .. } = &err else {
+            panic!("expected UnknownDependency");
+        };
+        assert!(suggestion.is_none(), "distant name must not match");
+        assert!(!err.to_string().contains("did you mean"));
     }
 
     #[test]
