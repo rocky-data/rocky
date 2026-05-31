@@ -435,11 +435,24 @@ fn validate_adapter(
                     field: None,
                 });
             } else {
+                // Unknown adapter types are a hard error, not a cosmetic
+                // warning: `rocky run` rejects them outright (registry.rs
+                // `from_config` bails), so `rocky validate` must agree and
+                // set `valid = false`. Reuse the same supported-types list
+                // and `did_you_mean` suggestion the runtime error uses.
+                use crate::error_reporter::{self, KNOWN_ADAPTER_TYPES};
+                let mut message = format!(
+                    "adapter.{name}: unknown type '{other}'. Supported: {}",
+                    KNOWN_ADAPTER_TYPES.join(", "),
+                );
+                if let Some(suggestion) = error_reporter::did_you_mean(other, KNOWN_ADAPTER_TYPES) {
+                    message.push_str(&format!(". Did you mean '{suggestion}'?"));
+                }
                 ok = false;
                 msgs.push(ValidateMessage {
-                    severity: "warn".into(),
+                    severity: "error".into(),
                     code: "V017".into(),
-                    message: format!("adapter.{name}: unknown type '{other}'"),
+                    message,
                     file: None,
                     field: Some(format!("adapter.{name}.type")),
                 });
@@ -1439,6 +1452,50 @@ schema_template = "demo"
         let unknown: Vec<_> = out.messages.iter().filter(|m| m.code == "V017").collect();
         assert_eq!(unknown.len(), 1);
         assert!(unknown[0].message.contains("postgres"));
+        // An unknown adapter type is a hard error: `rocky run` rejects it,
+        // so `rocky validate` must report `valid = false` (non-zero exit),
+        // not a cosmetic warning.
+        assert_eq!(unknown[0].severity, "error");
+        assert!(!out.valid, "unknown adapter type must invalidate config");
+        // No close match for "postgres" — message lists supported types
+        // but offers no suggestion.
+        assert!(unknown[0].message.contains("Supported:"));
+        assert!(!unknown[0].message.contains("Did you mean"));
+    }
+
+    #[test]
+    fn test_unknown_adapter_type_suggests_near_miss() {
+        let out = validate_toml(
+            r#"
+[adapter.wh]
+type = "databrick"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "wh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "wh"
+catalog_template = "poc"
+schema_template = "demo"
+"#,
+        );
+        let v017: Vec<_> = out.messages.iter().filter(|m| m.code == "V017").collect();
+        assert_eq!(v017.len(), 1);
+        assert_eq!(v017[0].severity, "error");
+        assert!(!out.valid);
+        assert!(
+            v017[0].message.contains("Did you mean 'databricks'?"),
+            "expected a near-miss suggestion, got: {}",
+            v017[0].message
+        );
     }
 
     /// L002 must NOT fire when `target.table` is declared as a
