@@ -5,10 +5,10 @@ sidebar:
   order: 3
 ---
 
-The silver layer is where you write custom SQL transformations — the equivalent of dbt models. Each model is a SQL query paired with TOML configuration that declares dependencies, materialization strategy, and target table.
+The silver layer is where you write custom SQL transformations, the equivalent of dbt models. Each model is a SQL query paired with TOML configuration that declares dependencies, materialization strategy, and target table.
 
 :::tip[SQL stays first-class]
-Rocky models are plain SQL files. No Jinja, no `{{ ref() }}` macros, no templating. Dependencies and materialization live in a sidecar TOML file — your `.sql` is what the warehouse sees.
+Rocky models are plain SQL files. No Jinja, no `{{ ref() }}` macros, no templating. Dependencies and materialization live in a sidecar TOML file; your `.sql` is what the warehouse sees.
 :::
 
 ## Model formats
@@ -52,7 +52,7 @@ Model TOML fields (full reference: [Model Format](/reference/model-format/)):
 |---|---|---|
 | `name` | Yes | Model identifier, used in `depends_on` references |
 | `depends_on` | No | List of upstream model names (execution order) |
-| `[strategy]` | No | Materialization config (see below) — defaults to `full_refresh` |
+| `[strategy]` | No | Materialization config (see below); defaults to `full_refresh` |
 | `[target]` | Yes | Output table: `{ catalog, schema, table }` |
 | `[[sources]]` | No | Input tables (for documentation and lineage) |
 

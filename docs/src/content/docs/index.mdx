@@ -22,9 +22,9 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 ## The disasters Rocky prevents
 
-Rocky exists because the most expensive failures in modern data platforms aren't slow queries — they're trust failures. A column type changes upstream and a revenue dashboard quietly diverges for three days. A `SELECT *` pulls a new column nobody designed for. A Snowflake-only function lands in a Databricks-targeted project and only fails in prod. Warehouse spend doubles and nobody can attribute which model caused it. An auditor asks who changed `fct_revenue.amount` and when.
+Rocky exists because the most expensive failures in modern data platforms aren't slow queries. They're trust failures. A column type changes upstream and a revenue dashboard quietly diverges for three days. A `SELECT *` pulls a new column nobody designed for. A Snowflake-only function lands in a Databricks-targeted project and only fails in prod. Warehouse spend doubles and nobody can attribute which model caused it. An auditor asks who changed `fct_revenue.amount` and when.
 
-dbt is a templating engine; it can't catch any of these at compile time. SQLMesh moved correctness to the planner. **Rocky moved it to the compiler** — so the disasters above become `E013` diagnostics, blocked PRs, `rocky lineage-diff` comments, and content-addressed replay artifacts.
+dbt Core is a templating engine; it can't catch any of these at compile time. SQLMesh moved correctness to the planner. **Rocky moved it to the compiler.** The disasters above become `E013` diagnostics, blocked PRs, `rocky lineage-diff` comments, and content-addressed replay artifacts.
 
 <CardGrid>
   <Card title="Typed compiler, not a templating engine" icon="approve-check">
@@ -34,13 +34,13 @@ dbt is a templating engine; it can't catch any of these at compile time. SQLMesh
     Every column traced through every transformation, before execution. `rocky lineage-diff main` lists per-column downstream blast radius for PR review.
   </Card>
   <Card title="Branches + deterministic replay" icon="random">
-    Named branches as isolated schemas. `rocky replay <run_id>` reconstructs a run bit-for-bit — inputs, code, and outputs as a content-addressed artifact.
+    Named branches as isolated schemas. `rocky replay <run_id>` reconstructs a run bit-for-bit: inputs, code, and outputs as a content-addressed artifact.
   </Card>
   <Card title="Per-model cost attribution" icon="rocket">
     Cost is a column on every run, not a dashboard. `[budget]` blocks fail the run on overspend. `rocky preview cost` projects spend at PR time.
   </Card>
   <Card title="AI gated through the compiler" icon="star">
-    Every AI suggestion type-checks before it lands. Generate → compile → auto-fix → ship — the closed-loop nobody else has.
+    Every AI suggestion type-checks before it lands. Generate, compile, auto-fix, ship. The closed loop nobody else has.
   </Card>
   <Card title="Dialect-divergence lint" icon="puzzle">
     `P001` catches Snowflake-only constructs in a Databricks project, and the reverse. Cross-warehouse teams stop discovering portability bugs in prod.
@@ -58,23 +58,23 @@ rocky test               # run assertions locally
 rocky run                # materialize the DAG against local DuckDB
 ```
 
-No credentials needed — the playground is DuckDB-backed and seeds itself on first run.
+No credentials needed; the playground is DuckDB-backed and seeds itself on first run.
 
 `rocky run` is the one-step path for local iteration and automation. For production or PR-gated deploys, split it into `rocky plan` (persists an auditable plan to `.rocky/plans/<id>.json`) and `rocky apply <plan-id>`.
 
 ## One trace, one cost graph, one replay handle
 
-`rocky run` writes a single `RunRecord` to the state store. Three read commands — `rocky trace`, `rocky cost`, `rocky replay` — each project that same record from a different angle: causality and concurrency, per-model warehouse spend, and the byte-for-byte reproducibility artefact. Three views of one tree, not three telemetry domains stitched together after the fact. Walk through it end-to-end in [POC #17 (trace + cost + replay against the same run_id)](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo).
+`rocky run` writes a single `RunRecord` to the state store. Three read commands project that record from different angles: `rocky trace` for causality and concurrency, `rocky cost` for per-model warehouse spend, and `rocky replay` for the byte-for-byte reproduction. One record, three views. Walk through it end-to-end in [POC #17 (trace + cost + replay against the same run_id)](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo).
 
 <video src="/trace-cost-replay-combo.mp4" controls width="720"></video>
 
 ## Who Rocky is for
 
-Rocky is built first for **data platform engineers running production-critical, multi-tenant pipelines on Databricks** — the team where silent failures cost real money and dbt has hit a ceiling. The trust primitives are most battle-tested there.
+Rocky is built first for **data platform engineers running production-critical, multi-tenant pipelines on Databricks**, the team where silent failures cost real money and dbt Core has hit a ceiling. The trust primitives are most battle-tested there.
 
-The next ring out: **Snowflake and BigQuery shops evaluating SQLMesh**, who want correctness moved to the compiler (not the planner) and prefer SQL by default. Adapters are Beta today — see the [introduction](/getting-started/introduction/#where-rocky-is-today) for the honest 2026 roadmap.
+The next ring out: **Snowflake and BigQuery shops evaluating SQLMesh**, who want correctness moved to the compiler rather than the planner, and prefer SQL by default. Adapters are Beta today; see the [Roadmap](/getting-started/roadmap/).
 
 <CardGrid>
-  <LinkCard title="Coming from dbt?" href="/guides/migrate-from-dbt/" description="Run rocky import-dbt against your project, get a Rocky repo on disk, ship the gains incrementally — no rewrite." />
-  <LinkCard title="Using Dagster?" href="/dagster/introduction/" description="dagster-rocky wraps the CLI as a ConfigurableResource. Auto-discovery, asset checks, Pipes — one subprocess hop." />
+  <LinkCard title="Coming from dbt?" href="/guides/migrate-from-dbt/" description="Run rocky import-dbt against your project, get a Rocky repo on disk, and ship the gains incrementally with no rewrite." />
+  <LinkCard title="Using Dagster?" href="/dagster/introduction/" description="dagster-rocky wraps the CLI as a ConfigurableResource: auto-discovery, asset checks, and Pipes through one subprocess hop." />
 </CardGrid>

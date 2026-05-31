@@ -31,7 +31,7 @@ The default incremental strategy for replication. It relies on a monotonically i
 
 1. **Read watermark.** Rocky reads the last stored watermark for the table from the state store. The watermark is keyed by the fully qualified table name (`catalog.schema.table`).
 
-2. **No watermark (first run).** If no watermark exists, Rocky performs a full refresh -- it copies all rows from the source. This establishes the baseline.
+2. **No watermark (first run).** If no watermark exists, Rocky performs a full refresh and copies all rows from the source. This establishes the baseline.
 
 3. **Watermark exists.** Rocky generates an incremental query that filters to rows newer than the watermark:
 
@@ -117,8 +117,8 @@ orders (source) → orders_summary (uses: amount, customer_id)
 
 If an upstream schema change only affects the `status` column, Rocky determines:
 
-- `orders_summary` does not depend on `status` -- skip
-- `orders_audit` depends on `status` -- recompute
+- `orders_summary` does not depend on `status`, so it is skipped
+- `orders_audit` depends on `status`, so it is recomputed
 
 This is a `PropagationDecision`: either `Recompute` or `Skip { reason }`. The skip reason is logged so you can verify the decision.
 
@@ -185,7 +185,7 @@ Target: orders.amount (STRING)
 
 ### Missing watermark
 
-If the state store doesn't contain a watermark for a table — either because the table is new, the state backend was wiped, or the table was renamed — Rocky treats the next run as a first run and performs a full refresh, establishing a new baseline watermark.
+If the state store has no watermark for a table (the table is new, the state backend was wiped, or the table was renamed), Rocky treats the next run as a first run and performs a full refresh, establishing a new baseline watermark.
 
 ## State store
 
@@ -193,10 +193,10 @@ Watermarks and partition checksums are stored in an embedded key-value store bac
 
 The state store tracks:
 
-- **Watermarks** -- last successfully replicated timestamp per table
-- **Check history** -- historical row counts for anomaly detection
-- **Run history** -- metadata about previous runs
-- **Partition checksums** -- per-partition hashes for checksum-based incremental
-- **DAG snapshots** -- previous DAG structure for change detection
+- **Watermarks:** last successfully replicated timestamp per table
+- **Check history:** historical row counts for anomaly detection
+- **Run history:** metadata about previous runs
+- **Partition checksums:** per-partition hashes for checksum-based incremental
+- **DAG snapshots:** previous DAG structure for change detection
 
 All state is scoped per environment. Dev, staging, and prod maintain independent state with no cross-environment coordination.
