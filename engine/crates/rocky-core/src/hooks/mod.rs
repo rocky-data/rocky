@@ -831,12 +831,30 @@ fn build_http_client() -> reqwest::Client {
 // Hook executor — runs a single shell command
 // ---------------------------------------------------------------------------
 
+/// Build the platform shell command that runs a hook's command string.
+///
+/// On Unix this is `sh -c <command>`; on Windows there is no `sh`, so it
+/// is `cmd /C <command>`. Returning a `tokio::process::Command` lets the
+/// caller wire up stdio / env without duplicating the cfg branch.
+fn shell_command(command: &str) -> tokio::process::Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = tokio::process::Command::new("cmd");
+        cmd.args(["/C", command]);
+        cmd
+    }
+    #[cfg(unix)]
+    {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    }
+}
+
 async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
     use tokio::io::AsyncWriteExt;
-    use tokio::process::Command;
 
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(&hook.command);
+    let mut cmd = shell_command(&hook.command);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -904,6 +922,26 @@ async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Shell-command platform builder --
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_command_uses_sh_on_unix() {
+        let cmd = shell_command("echo hi");
+        assert_eq!(cmd.as_std().get_program(), "sh");
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert_eq!(args, ["-c", "echo hi"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_command_uses_cmd_on_windows() {
+        let cmd = shell_command("echo hi");
+        assert_eq!(cmd.as_std().get_program(), "cmd");
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert_eq!(args, ["/C", "echo hi"]);
+    }
 
     // -- Registry tests --
 
