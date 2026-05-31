@@ -187,12 +187,14 @@ pub struct InspectSchemaResult {
 
 /// `sample_rows` result — a capped sample of real rows.
 ///
-/// On a non-DuckDB adapter, `unavailable` is `true`, `reason` explains why,
-/// and the data fields are empty. (A single concrete schema is required:
-/// rmcp's output-schema derivation rejects an untyped union.)
+/// `unavailable` / `reason` are reserved for the case where the tool could not
+/// run (e.g. the target adapter has no live credentials); the data fields are
+/// then empty. (A single concrete schema is required: rmcp's output-schema
+/// derivation rejects an untyped union.)
 #[derive(Debug, Default, Serialize, JsonSchema)]
 pub struct SampleRowsResult {
-    /// `true` when the tool could not run (e.g. non-DuckDB adapter).
+    /// `true` when the tool could not run (reserved for future degradation
+    /// paths; the fields below carry the sample when `false`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub unavailable: bool,
     /// Why the tool is unavailable, when `unavailable` is `true`.
@@ -209,10 +211,12 @@ pub struct SampleRowsResult {
 
 /// `profile_column` result — one-pass aggregate stats for a column.
 ///
-/// On a non-DuckDB adapter, `unavailable` is `true` and `reason` explains why.
+/// `unavailable` / `reason` are reserved for the case where the tool could not
+/// run (e.g. the target adapter has no live credentials).
 #[derive(Debug, Default, Serialize, JsonSchema)]
 pub struct ProfileColumnResult {
-    /// `true` when the tool could not run (e.g. non-DuckDB adapter).
+    /// `true` when the tool could not run (reserved for future degradation
+    /// paths).
     #[serde(default, skip_serializing_if = "is_false")]
     pub unavailable: bool,
     /// Why the tool is unavailable, when `unavailable` is `true`.
@@ -484,6 +488,24 @@ pub struct OptimizeRecommendationLite {
 pub struct OptimizeResult {
     pub recommendations: Vec<OptimizeRecommendationLite>,
     /// Why there are no recommendations, when run history is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// `suggest_freshness_block` result — an LLM-drafted `[freshness]` TOML block
+/// for a model with temporal columns (the W005 fix).
+///
+/// `freshness_block` is the ready-to-paste TOML when drafting succeeds;
+/// `message` explains why no block was produced (the API key is unset, or the
+/// model returned no fenced block) so the caller can distinguish a real draft
+/// from a graceful no-op rather than seeing an error.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct SuggestFreshnessBlockResult {
+    /// The drafted `[freshness]` TOML block, when one was produced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness_block: Option<String>,
+    /// Why no block was produced (key unset / no fenced block), when
+    /// `freshness_block` is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }

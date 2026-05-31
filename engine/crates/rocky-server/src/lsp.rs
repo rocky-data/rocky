@@ -3053,10 +3053,10 @@ const AI_FRESHNESS_FIX_KIND: &str = "rocky.ai-freshness-fix.v1";
 /// `code_action` can hook the AI fix.
 const E028: &str = "E028";
 
-/// Environment variable that gates every AI fallback arm. Only env-var-based;
-/// the LSP server doesn't currently surface a richer credentials channel
-/// and matching `rocky ai`'s behaviour keeps the rules predictable.
-const AI_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+// Environment variable that gates every AI fallback arm. Shared with the MCP
+// `suggest_freshness_block` tool via `rocky_ai::client::AI_API_KEY_ENV` so the
+// two stay aligned; matching `rocky ai`'s behaviour keeps the rules predictable.
+use rocky_ai::client::AI_API_KEY_ENV;
 
 /// Serializable payload threaded from [`code_action`] into
 /// [`code_action_resolve`] via the LSP `CodeAction.data` field.
@@ -3605,8 +3605,11 @@ async fn resolve_ai_freshness_action(data: &AiFreshnessActionData) -> AiResolveO
         }
     };
 
-    let (system_prompt, user_prompt) =
-        build_freshness_fix_prompt(&data.model_name, &data.temporal_columns, &data.sidecar_text);
+    let (system_prompt, user_prompt) = rocky_ai::prompt::build_freshness_fix_prompt(
+        &data.model_name,
+        &data.temporal_columns,
+        &data.sidecar_text,
+    );
 
     let ai_config = rocky_ai::client::AiConfig {
         provider: "anthropic".to_string(),
@@ -3649,40 +3652,6 @@ async fn resolve_ai_freshness_action(data: &AiFreshnessActionData) -> AiResolveO
         range: Range::new(append_position, append_position),
         new_text,
     })
-}
-
-/// Build the LLM prompt for a W005 freshness-coverage fix. The system
-/// half encodes the role + output-format constraint; the user half
-/// supplies the per-call context (model name, candidate temporal
-/// columns, current sidecar). Splitting this way keeps the system
-/// portion stable across resolves for prompt caching.
-fn build_freshness_fix_prompt(
-    model_name: &str,
-    temporal_columns: &[String],
-    sidecar_text: &str,
-) -> (String, String) {
-    let system = "You are an expert Rocky data-pipeline reviewer. Your task is to \
-                 propose a TOML `[freshness]` block for a model's sidecar `.toml` so \
-                 the model declares a time-to-live after which it is considered \
-                 stale. Set `expected_lag_seconds` to a sensible TTL for the model \
-                 (e.g. 3600 for hourly data, 86400 for daily). Set `time_column` to \
-                 the most appropriate timestamp/date column from the supplied \
-                 candidates. Output ONLY the new TOML block inside a single ```toml \
-                 fenced block — no commentary, no explanation, no diff. The block \
-                 must start with `[freshness]` on its own line."
-        .to_string();
-
-    let candidates = temporal_columns.join(", ");
-    let user = format!(
-        "Model: `{model_name}`\n\
-         Candidate temporal columns: {candidates}\n\n\
-         Current sidecar `.toml`:\n```toml\n{sidecar_text}\n```\n\n\
-         Emit a `[freshness]` block with `expected_lag_seconds` and a \
-         `time_column` chosen from the candidates. Do not duplicate or modify \
-         any existing block."
-    );
-
-    (system, user)
 }
 
 // ── AI fallback for `.rocky` DSL parse errors (E028) ───────────────────────

@@ -895,6 +895,17 @@ pub trait SqlDialect: Send + Sync {
         "CURRENT_TIMESTAMP"
     }
 
+    /// The dialect's variable-length string type name, for an explicit
+    /// `CAST(... AS <type>)`. Used by the data-grounding tools to coerce a
+    /// column to text for min/max display and value listing.
+    ///
+    /// Default: `"VARCHAR"` — accepted by DuckDB, Snowflake, Databricks, and
+    /// Trino. BigQuery overrides to `"STRING"` because `VARCHAR` is not a
+    /// BigQuery type and the cast is rejected.
+    fn string_type_name(&self) -> &'static str {
+        "VARCHAR"
+    }
+
     /// Build a NULL-safe inequality predicate: `lhs` differs from `rhs`,
     /// treating two NULLs as equal and a single NULL as a real difference.
     /// Used by SCD2 change detection on the watermark / check columns —

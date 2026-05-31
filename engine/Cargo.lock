@@ -4184,8 +4184,10 @@ name = "rocky-mcp"
 version = "1.47.1"
 dependencies = [
  "anyhow",
+ "arrow",
  "chrono",
  "rmcp",
+ "rocky-ai",
  "rocky-cli",
  "rocky-compiler",
  "rocky-core",

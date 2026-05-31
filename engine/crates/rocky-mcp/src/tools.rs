@@ -160,6 +160,19 @@ pub struct OptimizeArgs {
     pub model: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SuggestFreshnessBlockArgs {
+    /// The model the `[freshness]` block is for (used in the prompt context).
+    pub model: String,
+    /// Candidate temporal columns (timestamp/date) the block's `time_column`
+    /// may be chosen from — typically the model's date/timestamp columns.
+    pub temporal_columns: Vec<String>,
+    /// The model's current sidecar `.toml` text, so the draft does not
+    /// duplicate or conflict with an existing block. Optional.
+    #[serde(default)]
+    pub current_sidecar: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Prompt argument structs (schemars 1.x — rmcp's `Parameters<T>` bound).
 // MCP prompt arguments are string-typed on the wire; `Serialize` is part of
@@ -554,11 +567,12 @@ impl RockyMcpServer {
             Err(e) => return Err(format!("{e:#}")),
         };
 
-        // On DuckDB, surface the physical warehouse tables so an agent can
-        // ground a raw source the project never declared — and at cold start,
-        // before any model exists. Skip a table that is a model's target or is
-        // already reported as a compile-derived source.
-        if let Ok(Some(adapter)) = self.duckdb_warehouse() {
+        // Surface the physical warehouse tables so an agent can ground a raw
+        // source the project never declared — and at cold start, before any
+        // model exists. Skip a table that is a model's target or is already
+        // reported as a compile-derived source. Best-effort across warehouses:
+        // the discovery query degrades to an empty list on any error.
+        if let Ok(Some(adapter)) = self.warehouse_adapter() {
             let seen: std::collections::HashSet<String> =
                 sources.iter().map(|s| s.name.clone()).collect();
             for entry in discover_source_tables(adapter.as_ref()).await {
@@ -799,14 +813,80 @@ impl RockyMcpServer {
         }))
     }
 
+    #[tool(
+        description = "Draft a `[freshness]` TOML block for a model with temporal columns (the \
+         W005 fix): an LLM picks a sensible `expected_lag_seconds` TTL and a `time_column` from \
+         the supplied candidates. Returns the ready-to-paste block directly (NOT a TextEdit); the \
+         caller appends it to the model's sidecar. Requires ANTHROPIC_API_KEY in the server \
+         environment — without it, `freshness_block` is null and `message` explains why."
+    )]
+    async fn suggest_freshness_block(
+        &self,
+        params: Parameters<SuggestFreshnessBlockArgs>,
+    ) -> Result<Json<SuggestFreshnessBlockResult>, String> {
+        let args = params.0;
+
+        // Gate on the API key the same way the LSP's freshness arm does;
+        // degrade to a null block + message rather than erroring.
+        let api_key = match std::env::var(rocky_ai::client::AI_API_KEY_ENV) {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
+                return Ok(Json(SuggestFreshnessBlockResult {
+                    freshness_block: None,
+                    message: Some(format!(
+                        "{} not set in the server environment",
+                        rocky_ai::client::AI_API_KEY_ENV
+                    )),
+                }));
+            }
+        };
+
+        let sidecar_text = args.current_sidecar.unwrap_or_default();
+        let (system_prompt, user_prompt) = rocky_ai::prompt::build_freshness_fix_prompt(
+            &args.model,
+            &args.temporal_columns,
+            &sidecar_text,
+        );
+
+        // Mirror the LSP's AiConfig: anthropic / sonnet / TOML / single attempt.
+        let ai_config = rocky_ai::client::AiConfig {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            api_key: rocky_core::redacted::RedactedString::new(api_key),
+            default_format: "toml".to_string(),
+            max_attempts: 1,
+            max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
+        };
+        let client = rocky_ai::client::LlmClient::new(ai_config)
+            .map_err(|e| format!("AI client init failed: {e}"))?;
+        let response = client
+            .generate(&system_prompt, &user_prompt, None)
+            .await
+            .map_err(|e| format!("AI request failed: {e}"))?;
+
+        let extracted = rocky_ai::generate::extract_code(&response.content);
+        let snippet = extracted.trim();
+        if snippet.is_empty() {
+            return Ok(Json(SuggestFreshnessBlockResult {
+                freshness_block: None,
+                message: Some("AI response did not contain a TOML code block".to_string()),
+            }));
+        }
+
+        Ok(Json(SuggestFreshnessBlockResult {
+            freshness_block: Some(snippet.to_string()),
+            message: None,
+        }))
+    }
+
     // ------------------------- SHOULD tools --------------------------------
 
     #[tool(
         description = "Sample real rows from a model's target table OR a qualified `schema.table` \
-         source reference (DuckDB only). Look at literal values, units, and null patterns the \
-         schema can't tell you. Omit `percent` to get the first rows (the right default for small \
-         tables); set 1–100 for a random-percentage sample. Capped at 50 rows / 16 KB; long cells \
-         truncated. Returns {unavailable:true} on non-DuckDB adapters."
+         source reference. Look at literal values, units, and null patterns the schema can't tell \
+         you. Omit `percent` to get the first rows (the right default for small tables); set 1–100 \
+         for a random-percentage sample. Capped at 50 rows / 16 KB; long cells truncated. Requires \
+         live warehouse credentials in the target adapter (rocky.toml)."
     )]
     async fn sample_rows(
         &self,
@@ -814,17 +894,10 @@ impl RockyMcpServer {
     ) -> Result<Json<SampleRowsResult>, String> {
         let args = params.0;
 
-        let prepared = match self.prepare_table_query(&args.model).await {
-            Ok(PreparedTable::Ready(p)) => p,
-            Ok(PreparedTable::Unavailable(reason)) => {
-                return Ok(Json(SampleRowsResult {
-                    unavailable: true,
-                    reason: Some(reason),
-                    ..Default::default()
-                }));
-            }
-            Err(e) => return Err(format!("{e:#}")),
-        };
+        let prepared = self
+            .prepare_table_query(&args.model)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
 
         // Build: SELECT * FROM <ref> [tablesample] LIMIT n. The ref is built
         // only from validated identifiers; never `format!`'d from raw input.
@@ -841,9 +914,7 @@ impl RockyMcpServer {
             prepared.table_ref, sample, SAMPLE_MAX_ROWS
         );
 
-        let qr = prepared
-            .adapter
-            .execute_query(&sql)
+        let qr = query_grounding(prepared.adapter.as_ref(), &sql)
             .await
             .map_err(|e| format!("sample query failed: {e}"))?;
 
@@ -872,10 +943,10 @@ impl RockyMcpServer {
 
     #[tool(
         description = "Profile one column of a model's target table OR a qualified `schema.table` \
-         source (DuckDB only): row count, nulls, null rate, distinct count, min, max — and, for a \
+         source: row count, nulls, null rate, distinct count, min, max — and, for a \
          low-cardinality column (≤25 distinct), the distinct values with their counts \
          (`top_values`), which surfaces exact literals (e.g. a status string) that min/max hide. \
-         Returns {unavailable:true} on non-DuckDB adapters."
+         Requires live warehouse credentials in the target adapter (rocky.toml)."
     )]
     async fn profile_column(
         &self,
@@ -883,31 +954,26 @@ impl RockyMcpServer {
     ) -> Result<Json<ProfileColumnResult>, String> {
         let args = params.0;
 
-        let prepared = match self.prepare_table_query(&args.model).await {
-            Ok(PreparedTable::Ready(p)) => p,
-            Ok(PreparedTable::Unavailable(reason)) => {
-                return Ok(Json(ProfileColumnResult {
-                    unavailable: true,
-                    reason: Some(reason),
-                    ..Default::default()
-                }));
-            }
-            Err(e) => return Err(format!("{e:#}")),
-        };
+        let prepared = self
+            .prepare_table_query(&args.model)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
 
         let col = rocky_sql::validation::validate_identifier(&args.column)
             .map_err(|e| format!("invalid column identifier: {e}"))?;
 
+        // Cast to the dialect's string type — `VARCHAR` everywhere except
+        // BigQuery, where it is `STRING` (BigQuery rejects `CAST(... AS VARCHAR)`).
+        let string_type = prepared.adapter.dialect().string_type_name();
         let sql = format!(
             "SELECT COUNT(*) AS n, COUNT({col}) AS non_null, COUNT(DISTINCT {col}) AS distinct_n, \
-             CAST(MIN({col}) AS VARCHAR) AS min_v, CAST(MAX({col}) AS VARCHAR) AS max_v \
+             CAST(MIN({col}) AS {string_type}) AS min_v, \
+             CAST(MAX({col}) AS {string_type}) AS max_v \
              FROM {}",
             prepared.table_ref
         );
 
-        let qr = prepared
-            .adapter
-            .execute_query(&sql)
+        let qr = query_grounding(prepared.adapter.as_ref(), &sql)
             .await
             .map_err(|e| format!("profile query failed: {e}"))?;
         let row = qr
@@ -945,11 +1011,11 @@ impl RockyMcpServer {
         // when the cardinality makes it cheap.
         let top_values = if distinct > 0 && distinct <= PROFILE_TOP_VALUES_MAX as u64 {
             let q = format!(
-                "SELECT CAST({col} AS VARCHAR) AS v, COUNT(*) AS c FROM {} \
+                "SELECT CAST({col} AS {string_type}) AS v, COUNT(*) AS c FROM {} \
                  GROUP BY {col} ORDER BY c DESC, v LIMIT {}",
                 prepared.table_ref, PROFILE_TOP_VALUES_MAX
             );
-            match prepared.adapter.execute_query(&q).await {
+            match query_grounding(prepared.adapter.as_ref(), &q).await {
                 Ok(r) => r
                     .rows
                     .into_iter()
@@ -1017,44 +1083,36 @@ impl RockyMcpServer {
         Ok(Json(ProposeResult { plan_id, models }))
     }
 
-    /// Resolve a model's target table into a runnable, validated table ref +
-    /// the warehouse adapter — but only on DuckDB. Other adapters return the
-    /// typed "unavailable" result so the grounding tools degrade cleanly.
-    /// The project's target warehouse adapter, but only when it is DuckDB — the
-    /// data-grounding tools (`sample_rows`, `profile_column`, and
-    /// `inspect_schema`'s source discovery) are DuckDB-only in this release.
-    /// Returns `Ok(None)` on any other adapter so callers degrade cleanly.
-    fn duckdb_warehouse(
+    /// Resolve the project's target warehouse adapter from `rocky.toml`.
+    ///
+    /// Returns the configured target adapter for the resolved pipeline — any
+    /// warehouse (DuckDB, Snowflake, BigQuery, Databricks, Trino). The data
+    /// grounding tools (`sample_rows`, `profile_column`, and `inspect_schema`'s
+    /// source discovery) reach the live warehouse through it. Kept as
+    /// `Result<Option<...>>` so `inspect_schema`'s `if let Ok(Some(_))`
+    /// graceful-degradation path survives a resolution failure.
+    fn warehouse_adapter(
         &self,
     ) -> anyhow::Result<Option<std::sync::Arc<dyn rocky_core::traits::WarehouseAdapter>>> {
         let cfg = rocky_core::config::load_rocky_config(&self.config_path)?;
         let registry = commands_adapter_registry(&cfg)?;
         let (_, pipeline) = rocky_cli::registry::resolve_pipeline(&cfg, None)?;
         let target_adapter = pipeline.target_adapter().to_string();
-        let adapter_type = registry
-            .adapter_config(&target_adapter)
-            .map(|a| a.adapter_type.clone())
-            .unwrap_or_default();
-        if adapter_type != "duckdb" {
-            return Ok(None);
-        }
         Ok(Some(registry.warehouse_adapter(&target_adapter)?))
     }
 
     /// Resolve a grounding-tool target into a runnable, validated table ref plus
-    /// the warehouse adapter — DuckDB only.
+    /// the warehouse adapter.
     ///
     /// The target is either a **compiled model name** (resolved to its target
     /// table, which requires the models to compile) or a **qualified
     /// `schema.table` / `catalog.schema.table` source reference** (any dotted
     /// name — resolved directly with no compile, so it reaches raw sources the
     /// project never declared and works at cold start, before any model exists).
-    async fn prepare_table_query(&self, target: &str) -> anyhow::Result<PreparedTable> {
-        let Some(adapter) = self.duckdb_warehouse()? else {
-            return Ok(PreparedTable::Unavailable(
-                "sample_rows/profile_column are DuckDB-only in this release".to_string(),
-            ));
-        };
+    async fn prepare_table_query(&self, target: &str) -> anyhow::Result<Prepared> {
+        let adapter = self
+            .warehouse_adapter()?
+            .ok_or_else(|| anyhow::anyhow!("could not resolve the target warehouse adapter"))?;
 
         let table_ref = if target.contains('.') {
             // Qualified raw reference — validate each segment and use it as-is.
@@ -1074,8 +1132,9 @@ impl RockyMcpServer {
             parts.join(".")
         } else {
             // Bare name — resolve the model's target coordinates by compiling
-            // the models dir. DuckDB has no catalog level, so we emit a two-part
-            // `schema.table` name.
+            // the models dir. Emit `catalog.schema.table` when the target
+            // carries a catalog (Snowflake/BigQuery/Databricks); DuckDB has no
+            // catalog level so it stays a two-part `schema.table` name.
             let result = self.compile_full()?;
             let model = result
                 .project
@@ -1084,18 +1143,10 @@ impl RockyMcpServer {
                 .find(|m| m.config.name == target)
                 .ok_or_else(|| anyhow::anyhow!("model '{target}' not found in project"))?;
             let t = &model.config.target;
-            let schema = rocky_sql::validation::validate_identifier(&t.schema)
-                .map_err(|e| anyhow::anyhow!("invalid schema identifier: {e}"))?;
-            let table = rocky_sql::validation::validate_identifier(&t.table)
-                .map_err(|e| anyhow::anyhow!("invalid table identifier: {e}"))?;
-            if !t.catalog.is_empty() {
-                rocky_sql::validation::validate_identifier(&t.catalog)
-                    .map_err(|e| anyhow::anyhow!("invalid catalog identifier: {e}"))?;
-            }
-            format!("{schema}.{table}")
+            qualify_table_ref(&t.catalog, &t.schema, &t.table)?
         };
 
-        Ok(PreparedTable::Ready(Prepared { adapter, table_ref }))
+        Ok(Prepared { adapter, table_ref })
     }
 }
 
@@ -1193,7 +1244,7 @@ impl ServerHandler for RockyMcpServer {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// A validated, DuckDB-runnable table reference plus the adapter to run it on.
+/// A validated, runnable table reference plus the warehouse adapter to run it on.
 struct Prepared {
     adapter: std::sync::Arc<dyn rocky_core::traits::WarehouseAdapter>,
     table_ref: String,
@@ -1205,11 +1256,88 @@ impl Prepared {
     }
 }
 
-/// Either a runnable table query or the reason a non-DuckDB adapter makes the
-/// data-grounding tool unavailable.
-enum PreparedTable {
-    Ready(Prepared),
-    Unavailable(String),
+/// Build a validated, dialect-agnostic table reference from a model's target
+/// coordinates. Emits `catalog.schema.table` when a catalog is set
+/// (Snowflake/BigQuery/Databricks), or `schema.table` otherwise (DuckDB has no
+/// catalog level). Each segment is validated as a SQL identifier.
+fn qualify_table_ref(catalog: &str, schema: &str, table: &str) -> anyhow::Result<String> {
+    let schema = rocky_sql::validation::validate_identifier(schema)
+        .map_err(|e| anyhow::anyhow!("invalid schema identifier: {e}"))?;
+    let table = rocky_sql::validation::validate_identifier(table)
+        .map_err(|e| anyhow::anyhow!("invalid table identifier: {e}"))?;
+    if catalog.is_empty() {
+        Ok(format!("{schema}.{table}"))
+    } else {
+        let catalog = rocky_sql::validation::validate_identifier(catalog)
+            .map_err(|e| anyhow::anyhow!("invalid catalog identifier: {e}"))?;
+        Ok(format!("{catalog}.{schema}.{table}"))
+    }
+}
+
+/// Run a grounding query, preferring the columnar Arrow path and falling back
+/// to the row-based JSON path.
+///
+/// `fetch_arrow_batch` is implemented on DuckDB / BigQuery / Databricks / Trino;
+/// Snowflake inherits the trait default that errors before running any SQL, so
+/// it always falls back to [`WarehouseAdapter::execute_query`]. A genuine SQL
+/// error on an Arrow-capable adapter re-surfaces with its real message via the
+/// `execute_query` arm — nothing is swallowed, just one extra round-trip on a
+/// real failure. The inner conversion `Err` (an unformattable Arrow type) also
+/// falls back rather than hard-erroring.
+async fn query_grounding(
+    adapter: &dyn rocky_core::traits::WarehouseAdapter,
+    sql: &str,
+) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+    if let Ok(batch) = adapter.fetch_arrow_batch(sql).await
+        && let Ok(qr) = record_batch_to_query_result(&batch)
+    {
+        return Ok(qr);
+    }
+    adapter.execute_query(sql).await
+}
+
+/// Convert an Arrow [`RecordBatch`](arrow::record_batch::RecordBatch) into the
+/// row-based [`QueryResult`](rocky_core::traits::QueryResult) the grounding
+/// tools consume.
+///
+/// Each cell renders to text via `arrow`'s `ArrayFormatter`, EXCEPT SQL NULL:
+/// the default `FormatOptions` renders NULL as the empty string, which would be
+/// indistinguishable from an empty value, so NULL is emitted as
+/// `serde_json::Value::Null` explicitly (checked via `Array::is_null`). All
+/// other cells become `Value::String`, matching the JSON path's effective shape
+/// for the grounding tools (which render every cell to a display string and
+/// parse aggregates back out of strings).
+fn record_batch_to_query_result(
+    batch: &arrow::record_batch::RecordBatch,
+) -> Result<rocky_core::traits::QueryResult, arrow::error::ArrowError> {
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+    let schema = batch.schema();
+    let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+
+    let options = FormatOptions::default();
+    // One formatter per column, built once, then indexed per row.
+    let formatters: Vec<ArrayFormatter> = batch
+        .columns()
+        .iter()
+        .map(|col| ArrayFormatter::try_new(col.as_ref(), &options))
+        .collect::<Result<_, _>>()?;
+
+    let mut rows: Vec<Vec<serde_json::Value>> = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let mut cells: Vec<serde_json::Value> = Vec::with_capacity(batch.num_columns());
+        for (col_idx, fmt) in formatters.iter().enumerate() {
+            let cell = if batch.column(col_idx).is_null(row) {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(fmt.value(row).to_string())
+            };
+            cells.push(cell);
+        }
+        rows.push(cells);
+    }
+
+    Ok(rocky_core::traits::QueryResult { columns, rows })
 }
 
 /// Build the `AdapterRegistry` from the loaded config. Thin wrapper so the
@@ -1522,6 +1650,59 @@ mod tests {
         assert_eq!(lite.model, "c.s.orders");
         assert_eq!(lite.column.as_deref(), Some("legacy_flag"));
         assert!(lite.message.contains("ColumnDropped"));
+    }
+
+    #[test]
+    fn qualify_table_ref_emits_catalog_when_present() {
+        // Catalog set (Snowflake/BigQuery/Databricks) → three-part name.
+        assert_eq!(
+            qualify_table_ref("analytics", "raw", "orders").unwrap(),
+            "analytics.raw.orders"
+        );
+        // No catalog (DuckDB) → two-part name.
+        assert_eq!(
+            qualify_table_ref("", "raw", "orders").unwrap(),
+            "raw.orders"
+        );
+    }
+
+    #[test]
+    fn qualify_table_ref_rejects_bad_identifier() {
+        assert!(qualify_table_ref("", "raw", "orders; DROP TABLE x").is_err());
+        assert!(qualify_table_ref("a.b", "raw", "orders").is_err());
+    }
+
+    #[test]
+    fn record_batch_to_query_result_renders_null_as_json_null() {
+        use std::sync::Arc;
+
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        // A 2-row batch where row 1 is NULL in both columns. The default
+        // `FormatOptions` renders NULL as "", so the converter MUST emit
+        // `Value::Null` for those cells (checked via `is_null`), not "".
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let ints = Int64Array::from(vec![Some(42), None]);
+        let strs = StringArray::from(vec![Some("hello"), None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ints), Arc::new(strs)]).unwrap();
+
+        let qr = record_batch_to_query_result(&batch).unwrap();
+        assert_eq!(qr.columns, vec!["n".to_string(), "s".to_string()]);
+        assert_eq!(qr.rows.len(), 2);
+        // Row 0: non-null cells render to strings.
+        assert_eq!(qr.rows[0][0], serde_json::Value::String("42".to_string()));
+        assert_eq!(
+            qr.rows[0][1],
+            serde_json::Value::String("hello".to_string())
+        );
+        // Row 1: SQL NULL → JSON null, NOT the empty string.
+        assert_eq!(qr.rows[1][0], serde_json::Value::Null);
+        assert_eq!(qr.rows[1][1], serde_json::Value::Null);
     }
 
     #[test]
