@@ -4792,8 +4792,10 @@ fn resolve_merge_update_columns(
 }
 
 /// `MAX(<timestamp_column>) FROM <target>` — the post-execute watermark for the
-/// replication path. Mirrors [`query_source_max_timestamp`] but reads the
-/// **target** table, so the recorded value reflects exactly what was loaded.
+/// replication path. Reads the **target** table so the recorded value reflects
+/// exactly what was loaded (closing the source-side TOCTOU described on
+/// [`resolve_new_watermark`]). Returns `None` on NULL / empty / failure so the
+/// caller can keep the prior watermark.
 async fn query_target_max_timestamp(
     warehouse: &dyn WarehouseAdapter,
     dialect: &dyn rocky_core::traits::SqlDialect,
@@ -7063,19 +7065,18 @@ merge_keys = ["id"]
         }
     }
 
-    /// End-to-end test for `query_source_max_timestamp` against an
+    /// End-to-end test for `query_target_max_timestamp` against an
     /// in-memory DuckDB.
     ///
-    /// Seeds a source table with three rows at known timestamps, asks the
-    /// helper to query `MAX(ts) FROM source`, and asserts the returned
-    /// `DateTime<Utc>` matches the max seed value. This is the
-    /// discriminating check the SqlDialect-level tests don't cover —
-    /// the runner reads the warehouse result row, parses the timestamp
-    /// shape DuckDB returns, and we want to find out at unit-test time
-    /// (not at the first live run) if those assumptions ever shift.
+    /// Seeds a table with three rows at known timestamps, asks the helper to
+    /// query `MAX(ts)`, and asserts the returned `DateTime<Utc>` matches the
+    /// max seed value. This is the discriminating check the SqlDialect-level
+    /// tests don't cover — the runner reads the warehouse result row, parses
+    /// the timestamp shape DuckDB returns, and we want to find out at
+    /// unit-test time (not at the first live run) if those assumptions shift.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn query_source_max_timestamp_returns_max_of_seeded_source() {
+    async fn query_target_max_timestamp_returns_max_of_seeded_table() {
         use chrono::TimeZone;
         use rocky_core::traits::{SqlDialect, WarehouseAdapter};
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
@@ -7129,11 +7130,11 @@ merge_keys = ["id"]
         );
     }
 
-    /// `query_source_max_timestamp` returns `None` for an empty source so
-    /// `process_table` can fall back to `Utc::now()` without panicking.
+    /// `query_target_max_timestamp` returns `None` for an empty table so
+    /// `resolve_new_watermark` keeps the prior watermark rather than advancing.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn query_source_max_timestamp_returns_none_for_empty_source() {
+    async fn query_target_max_timestamp_returns_none_for_empty_table() {
         use rocky_core::traits::{SqlDialect, WarehouseAdapter};
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
         use rocky_duckdb::dialect::DuckDbSqlDialect;
@@ -7391,7 +7392,7 @@ merge_keys = ["id"]
     /// parameter (the runner reads it from `rocky.toml`).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn query_source_max_timestamp_rejects_unsafe_timestamp_column() {
+    async fn query_target_max_timestamp_rejects_unsafe_timestamp_column() {
         use rocky_core::traits::{SqlDialect, WarehouseAdapter};
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
         use rocky_duckdb::dialect::DuckDbSqlDialect;
