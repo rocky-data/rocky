@@ -1,0 +1,144 @@
+---
+title: Connect to a warehouse
+description: Point Rocky at a real Databricks, Snowflake, or BigQuery warehouse and run your first plan.
+sidebar:
+  order: 1.5
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+The [playground](/guides/playground/) runs on local DuckDB with no credentials. To run against a real warehouse, you swap one block: the `[adapter]` definition. Storage and compute stay in your warehouse; Rocky connects over its API and drives the SQL.
+
+## The shape
+
+Rocky uses **named adapters** plus **named pipelines**. An adapter defines one connection; a pipeline's `target` points at it by name:
+
+```toml
+[adapter.prod]
+type = "databricks"   # or "snowflake", "bigquery"
+# ...connection fields...
+
+[pipeline.bronze.target]
+adapter = "prod"
+```
+
+Connection fields use `${VAR}` substitution so secrets never land in the file. Export the variables in your shell or CI, and keep `rocky.toml` checked in safely.
+
+## Configure the adapter
+
+<Tabs syncKey="warehouse">
+<TabItem label="Databricks">
+
+Databricks is the production target. Auth is Personal Access Token first, OAuth M2M (service principal) as a fallback.
+
+```toml
+[adapter.prod]
+type = "databricks"
+host = "${DATABRICKS_HOST}"
+http_path = "${DATABRICKS_HTTP_PATH}"
+token = "${DATABRICKS_TOKEN}"
+```
+
+```bash
+export DATABRICKS_HOST="workspace.cloud.databricks.com"
+export DATABRICKS_HTTP_PATH="/sql/1.0/warehouses/abc123"
+export DATABRICKS_TOKEN="dapi..."
+```
+
+For OAuth M2M instead of a PAT, drop `token` and set a service principal:
+
+```toml
+[adapter.prod]
+type = "databricks"
+host = "${DATABRICKS_HOST}"
+http_path = "${DATABRICKS_HTTP_PATH}"
+client_id = "${DATABRICKS_CLIENT_ID}"
+client_secret = "${DATABRICKS_CLIENT_SECRET}"
+```
+
+</TabItem>
+<TabItem label="Snowflake">
+
+Snowflake is Beta. Auth priority is PAT, then OAuth, then key-pair JWT, then password. A Programmatic Access Token (Snowsight → User Profile → Personal Access Tokens) is the simplest:
+
+```toml
+[adapter.prod]
+type = "snowflake"
+account = "${SNOWFLAKE_ACCOUNT}"
+warehouse = "COMPUTE_WH"
+pat = "${SNOWFLAKE_PAT}"
+```
+
+For key-pair JWT auth (rotatable, scoped per user), set a username and a PKCS#8 PEM key path instead:
+
+```toml
+[adapter.prod]
+type = "snowflake"
+account = "${SNOWFLAKE_ACCOUNT}"
+warehouse = "COMPUTE_WH"
+username = "${SNOWFLAKE_USER}"
+private_key_path = "${SNOWFLAKE_KEY_PATH}"
+```
+
+`database`, `schema`, and `role` are optional defaults you can set on the adapter.
+
+</TabItem>
+<TabItem label="BigQuery">
+
+BigQuery is Beta. The adapter takes a project and a location; credentials come from the environment, not the config file:
+
+```toml
+[adapter.prod]
+type = "bigquery"
+project_id = "${GCP_PROJECT_ID}"
+location = "EU"
+```
+
+Authenticate with a service-account key or Application Default Credentials:
+
+```bash
+# Service-account key file
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+
+# ...or use ADC from the gcloud CLI
+gcloud auth application-default login
+```
+
+</TabItem>
+<TabItem label="DuckDB">
+
+DuckDB runs in-process with no credentials. It powers the playground and `rocky test`, and is handy for local development against a file:
+
+```toml
+[adapter.local]
+type = "duckdb"
+path = "warehouse.duckdb"
+```
+
+</TabItem>
+</Tabs>
+
+:::note[Adapter status]
+Databricks is production-grade. Snowflake, BigQuery, and Trino are Beta: connection, execution, and the core run loop work, but conformance coverage is still growing. See the [Roadmap](/getting-started/roadmap/) for the honest breakdown.
+:::
+
+## Run against it
+
+Once the adapter is configured and the env vars are exported:
+
+```bash
+rocky validate          # config + adapter wiring; no network calls
+rocky doctor            # pings the warehouse to verify credentials and connectivity
+plan_id=$(rocky plan --output json | jq -r .plan_id)
+rocky apply "$plan_id"
+```
+
+Run `rocky doctor` first: it's the credentials and connectivity smoke test, and it tells you which adapter Rocky can reach before you spend any warehouse time. For a replication pipeline, scope the run with `--filter` (for example `rocky plan --filter tenant=acme`).
+
+The full field reference for every adapter is in [Configuration](/reference/configuration/#adaptername); per-adapter auth detail is in [Authentication](/features/authentication/).
+
+## Next steps
+
+- [Migrating from dbt](/guides/migrate-from-dbt/): import an existing dbt project and point it at this adapter.
+- [CI/CD integration](/guides/ci-cd/): gate PRs with `rocky ci` and preview changes before they merge.
+- [Governance](/guides/governance/): grants, classification, masking, and retention on the warehouse.
