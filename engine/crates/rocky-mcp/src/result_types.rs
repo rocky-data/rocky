@@ -187,12 +187,14 @@ pub struct InspectSchemaResult {
 
 /// `sample_rows` result — a capped sample of real rows.
 ///
-/// On a non-DuckDB adapter, `unavailable` is `true`, `reason` explains why,
-/// and the data fields are empty. (A single concrete schema is required:
-/// rmcp's output-schema derivation rejects an untyped union.)
+/// `unavailable` / `reason` are reserved for the case where the tool could not
+/// run (e.g. the target adapter has no live credentials); the data fields are
+/// then empty. (A single concrete schema is required: rmcp's output-schema
+/// derivation rejects an untyped union.)
 #[derive(Debug, Default, Serialize, JsonSchema)]
 pub struct SampleRowsResult {
-    /// `true` when the tool could not run (e.g. non-DuckDB adapter).
+    /// `true` when the tool could not run (reserved for future degradation
+    /// paths; the fields below carry the sample when `false`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub unavailable: bool,
     /// Why the tool is unavailable, when `unavailable` is `true`.
@@ -209,10 +211,12 @@ pub struct SampleRowsResult {
 
 /// `profile_column` result — one-pass aggregate stats for a column.
 ///
-/// On a non-DuckDB adapter, `unavailable` is `true` and `reason` explains why.
+/// `unavailable` / `reason` are reserved for the case where the tool could not
+/// run (e.g. the target adapter has no live credentials).
 #[derive(Debug, Default, Serialize, JsonSchema)]
 pub struct ProfileColumnResult {
-    /// `true` when the tool could not run (e.g. non-DuckDB adapter).
+    /// `true` when the tool could not run (reserved for future degradation
+    /// paths).
     #[serde(default, skip_serializing_if = "is_false")]
     pub unavailable: bool,
     /// Why the tool is unavailable, when `unavailable` is `true`.

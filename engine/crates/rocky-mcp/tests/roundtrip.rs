@@ -34,7 +34,7 @@ separator = "__"
 components = ["source"]
 
 [pipeline.p.target]
-catalog_template = "main"
+catalog_template = "warehouse"
 schema_template = "out"
 "#,
             db_path.display()
@@ -48,7 +48,7 @@ schema_template = "out"
     .unwrap();
     std::fs::write(
         dir.join("models").join("orders.toml"),
-        "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"main\"\nschema = \"out\"\ntable = \"orders\"\n",
+        "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"out\"\ntable = \"orders\"\n",
     )
     .unwrap();
 }
@@ -186,88 +186,14 @@ async fn propose_writes_ai_authored_plan() {
     client.cancel().await.unwrap();
 }
 
-/// Write a project whose target adapter is Snowflake (not DuckDB) so the
-/// grounding tools must report `unavailable` without touching a warehouse.
-fn write_snowflake_project(dir: &Path) {
-    std::fs::create_dir_all(dir.join("models")).unwrap();
-    std::fs::write(
-        dir.join("rocky.toml"),
-        r#"[adapter]
-type = "snowflake"
-account = "acct"
-username = "u"
-password = "p"
-warehouse = "wh"
-database = "db"
-
-[pipeline.p]
-type = "transformation"
-target = { adapter = "default" }
-"#,
-    )
-    .unwrap();
-    std::fs::write(dir.join("models").join("orders.sql"), "SELECT 1 AS id\n").unwrap();
-    std::fs::write(
-        dir.join("models").join("orders.toml"),
-        "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"db\"\nschema = \"out\"\ntable = \"orders\"\n",
-    )
-    .unwrap();
-}
-
-#[tokio::test]
-async fn sample_rows_unavailable_on_non_duckdb_adapter() {
-    let dir = TempDir::new().unwrap();
-    write_snowflake_project(dir.path());
-    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
-
-    let client = connect(server).await;
-    let args = serde_json::json!({ "model": "orders" })
-        .as_object()
-        .unwrap()
-        .clone();
-    let result = client
-        .call_tool(CallToolRequestParams::new("sample_rows").with_arguments(args))
-        .await
-        .expect("sample_rows call");
-    let sc = result.structured_content.expect("structured content");
-    assert_eq!(sc["unavailable"], serde_json::json!(true));
-    assert!(
-        sc["reason"].as_str().unwrap().contains("DuckDB-only"),
-        "reason should explain the DuckDB-only limitation"
-    );
-    // Data fields must be empty on the unavailable path.
-    assert!(sc["columns"].as_array().unwrap().is_empty());
-    assert!(sc["rows"].as_array().unwrap().is_empty());
-
-    client.cancel().await.unwrap();
-}
-
-#[tokio::test]
-async fn profile_column_unavailable_on_non_duckdb_adapter() {
-    let dir = TempDir::new().unwrap();
-    write_snowflake_project(dir.path());
-    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
-
-    let client = connect(server).await;
-    let args = serde_json::json!({ "model": "orders", "column": "id" })
-        .as_object()
-        .unwrap()
-        .clone();
-    let result = client
-        .call_tool(CallToolRequestParams::new("profile_column").with_arguments(args))
-        .await
-        .expect("profile_column call");
-    let sc = result.structured_content.expect("structured content");
-    assert_eq!(sc["unavailable"], serde_json::json!(true));
-    assert!(sc["reason"].as_str().unwrap().contains("DuckDB-only"));
-
-    client.cancel().await.unwrap();
-}
-
 #[tokio::test]
 async fn sample_rows_returns_capped_rows_on_duckdb() {
     let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("sample.duckdb");
+    // The model declares `catalog = "warehouse"`; the bare-model ref the tool
+    // builds is the runner.s three-part `warehouse.out.orders`. On DuckDB the
+    // catalog name is the file stem, so the file must be `warehouse.duckdb`.
+    // (DuckDB reserves `main`, renaming a `main.duckdb` catalog to `main_db`.)
+    let db_path = dir.path().join("warehouse.duckdb");
     write_project(dir.path(), &db_path);
 
     // Pre-materialize the model's target table so sample_rows has data to read.
@@ -346,7 +272,7 @@ async fn dependents_returns_downstream_consumers() {
     .unwrap();
     std::fs::write(
         dir.path().join("models").join("order_ids.toml"),
-        "name = \"order_ids\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"main\"\nschema = \"out\"\ntable = \"order_ids\"\n",
+        "name = \"order_ids\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"out\"\ntable = \"order_ids\"\n",
     )
     .unwrap();
 
@@ -539,7 +465,7 @@ async fn catalog_returns_project_assets() {
     .unwrap();
     std::fs::write(
         dir.path().join("models").join("order_ids.toml"),
-        "name = \"order_ids\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"main\"\nschema = \"out\"\ntable = \"order_ids\"\n",
+        "name = \"order_ids\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"warehouse\"\nschema = \"out\"\ntable = \"order_ids\"\n",
     )
     .unwrap();
     let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
@@ -751,7 +677,7 @@ separator = "__"
 components = ["source"]
 
 [pipeline.p.target]
-catalog_template = "main"
+catalog_template = "warehouse"
 schema_template = "out"
 "#,
             db_path.display()
@@ -782,7 +708,9 @@ async fn sample_rows_default_returns_rows_on_small_table() {
     // Regression: the old default (10% bernoulli) returned ~0 rows on a tiny
     // table. With no `percent`, sample_rows now returns the first rows.
     let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("small.duckdb");
+    // File stem must equal the model.s declared catalog (`warehouse`) so the
+    // runner-shaped three-part ref `warehouse.out.orders` resolves on DuckDB.
+    let db_path = dir.path().join("warehouse.duckdb");
     write_project(dir.path(), &db_path);
     materialize_orders(
         &db_path,
@@ -817,7 +745,9 @@ async fn sample_rows_default_returns_rows_on_small_table() {
 #[tokio::test]
 async fn profile_column_lists_top_values_for_low_cardinality() {
     let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("profile.duckdb");
+    // File stem must equal the model.s declared catalog (`warehouse`) so the
+    // runner-shaped three-part ref `warehouse.out.orders` resolves on DuckDB.
+    let db_path = dir.path().join("warehouse.duckdb");
     write_project(dir.path(), &db_path);
     materialize_orders(
         &db_path,

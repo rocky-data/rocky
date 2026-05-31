@@ -201,6 +201,13 @@ impl SqlDialect for BigQueryDialect {
         "CURRENT_TIMESTAMP()"
     }
 
+    fn string_type_name(&self) -> &'static str {
+        // BigQuery has no `VARCHAR` type; the variable-length string type is
+        // `STRING`. The trait default `"VARCHAR"` would make `CAST(... AS
+        // VARCHAR)` a query error on BigQuery.
+        "STRING"
+    }
+
     fn quote_identifier(&self, name: &str) -> String {
         // BigQuery uses backticks for identifiers; double quotes denote
         // STRING literals. The default `"name"` quoting from the trait
@@ -472,6 +479,13 @@ mod tests {
             d.drop_table_sql("`p`.`d`.`t`"),
             "DROP TABLE IF EXISTS `p`.`d`.`t`"
         );
+    }
+
+    #[test]
+    fn string_type_name_is_bigquery_string_not_varchar() {
+        // BigQuery has no VARCHAR; the variable-length string type is STRING.
+        let d = BigQueryDialect;
+        assert_eq!(d.string_type_name(), "STRING");
     }
 
     #[test]
