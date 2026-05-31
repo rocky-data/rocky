@@ -1,0 +1,138 @@
+---
+title: Quickstart
+description: Get a Rocky pipeline running in 5 minutes
+sidebar:
+  order: 3
+---
+
+import { Steps } from '@astrojs/starlight/components';
+
+This walks through a Rocky pipeline that replicates Fivetran-landed sources into Databricks.
+
+:::tip[No warehouse credentials?]
+The [Playground](/guides/playground/) runs the same flow against a local DuckDB file, with nothing to configure. Start there if you just want to see Rocky work.
+:::
+
+<Steps>
+
+1. **Scaffold the project.**
+
+   ```bash
+   rocky init my-pipeline
+   cd my-pipeline
+   ```
+
+   This creates `rocky.toml` and an empty `models/` directory.
+
+2. **Configure a source, a target, and the pipeline that wires them together.**
+
+   ```toml
+   [adapter.fivetran]
+   type = "fivetran"
+   destination_id = "${FIVETRAN_DESTINATION_ID}"
+   api_key = "${FIVETRAN_API_KEY}"
+   api_secret = "${FIVETRAN_API_SECRET}"
+
+   [adapter.prod]
+   type = "databricks"
+   host = "${DATABRICKS_HOST}"
+   http_path = "${DATABRICKS_HTTP_PATH}"
+   token = "${DATABRICKS_TOKEN}"
+
+   [pipeline.bronze]
+   type = "replication"
+   strategy = "incremental"
+   timestamp_column = "_fivetran_synced"
+
+   [pipeline.bronze.source]
+   adapter = "fivetran"
+
+   [pipeline.bronze.source.schema_pattern]
+   prefix = "src__"
+   separator = "__"
+   components = ["source"]
+
+   [pipeline.bronze.target]
+   adapter = "prod"
+   catalog_template = "warehouse"
+   schema_template = "stage__{source}"
+
+   [pipeline.bronze.target.governance]
+   auto_create_catalogs = true
+   auto_create_schemas = true
+
+   [pipeline.bronze.checks]
+   enabled = true
+   row_count = true
+   column_match = true
+   freshness = { threshold_seconds = 86400 }
+
+   [state]
+   backend = "local"
+   ```
+
+   `[adapter.*]` blocks define connections; `[pipeline.*]` blocks tie them together. Select between pipelines with `--pipeline NAME`. Export the referenced environment variables (`DATABRICKS_HOST`, `FIVETRAN_API_KEY`, and the rest) before running Rocky.
+
+3. **Validate the config.**
+
+   ```bash
+   rocky validate
+   ```
+
+   Checks config syntax and adapter wiring. It does not call external APIs.
+
+4. **Discover the sources.**
+
+   ```bash
+   rocky -o table discover
+   ```
+
+   Calls the Fivetran API and lists connectors matching the schema pattern.
+
+5. **Build a plan.**
+
+   ```bash
+   plan_id=$(rocky plan --filter tenant=acme --output json | jq -r .plan_id)
+   ```
+
+   Compiles the pipeline, runs drift detection, and records a deterministic plan keyed by `plan_id`. Inspect the SQL, drift actions, and checks before you commit to a run.
+
+6. **Apply the plan.**
+
+   ```bash
+   rocky apply "$plan_id"
+   ```
+
+   Executes the plan: discover, create catalogs and schemas, apply drift, copy data, run checks. Outputs a versioned JSON result with materializations, check results, drift actions, and permissions.
+
+7. **Inspect the state.**
+
+   ```bash
+   rocky state
+   ```
+
+   Shows the stored watermarks for every table.
+
+</Steps>
+
+## Plan and apply, or just run
+
+`rocky plan` then `rocky apply` is the auditable two-step for production and PR gating: the persisted plan is reviewable before anything writes. For local iteration and automation, `rocky run` does the same work in one step:
+
+```bash
+rocky run --filter tenant=acme
+```
+
+Either path resumes from the last checkpoint after a failure with `--resume-latest`:
+
+```bash
+rocky run --filter tenant=acme --resume-latest
+```
+
+## Next steps
+
+- [Playground](/guides/playground/): the credential-free DuckDB version of this flow.
+- [Schema patterns](/concepts/schema-patterns/): customize source-to-target mapping.
+- [Silver layer](/concepts/silver-layer/): add transformation models on top of the bronze copy.
+- [Data quality checks](/features/data-quality-checks/): assertions that run inline with the load.
+- [Dagster integration](/dagster/introduction/): run Rocky as Dagster assets.
