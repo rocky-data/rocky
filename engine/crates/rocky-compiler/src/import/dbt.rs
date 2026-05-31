@@ -993,6 +993,63 @@ fn collect_unresolvable_macros(sql: &str, model_name: &str, result: &mut ImportR
 // Import from raw SQL files (regex path)
 // ---------------------------------------------------------------------------
 
+/// Join an untrusted relative model path under `base`, rejecting any path that
+/// would escape the project root.
+///
+/// `dbt_project.yml`'s `model-paths` is third-party input. A path that is
+/// absolute or contains a `..` (`ParentDir`) component could steer the import
+/// into reading files outside the project. This rejects those syntactically
+/// (no filesystem access required), and — when the joined path exists —
+/// canonicalizes it and asserts it stays within the canonicalized `base`,
+/// catching symlink-based escapes too. A not-yet-existing joined path that
+/// passed the syntactic check is allowed through (the caller already tolerates
+/// missing model dirs).
+fn safe_join_under(base: &Path, rel: &Path) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+
+    if rel.is_absolute() {
+        return Err(format!(
+            "model path '{}' is absolute — model paths must be relative to the dbt project",
+            rel.display()
+        ));
+    }
+    if rel.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!(
+            "model path '{}' contains a '..' component — model paths may not escape the dbt project",
+            rel.display()
+        ));
+    }
+
+    let joined = base.join(rel);
+
+    // Defense in depth: if the path exists, canonicalize and confirm
+    // containment (catches symlink escapes the syntactic check can't see).
+    if joined.exists() {
+        let canon_base = base.canonicalize().map_err(|e| {
+            format!(
+                "failed to canonicalize project root {}: {e}",
+                base.display()
+            )
+        })?;
+        let canon_joined = joined.canonicalize().map_err(|e| {
+            format!(
+                "failed to canonicalize model path {}: {e}",
+                joined.display()
+            )
+        })?;
+        if !canon_joined.starts_with(&canon_base) {
+            return Err(format!(
+                "model path '{}' resolves to {}, outside the dbt project at {}",
+                rel.display(),
+                canon_joined.display(),
+                canon_base.display()
+            ));
+        }
+    }
+
+    Ok(joined)
+}
+
 /// Import a dbt project directory.
 ///
 /// Scans `dbt_project/models/` for `.sql` files, extracts Jinja refs/sources,
@@ -1018,9 +1075,18 @@ pub fn import_dbt_project(
         }
     };
 
-    // Determine model paths
+    // Determine model paths. Model paths come from an untrusted
+    // `dbt_project.yml`; reject any that escape the project root (absolute or
+    // containing a `..` component) so an import can't be steered into reading
+    // files outside `dbt_dir`.
     let model_dirs: Vec<std::path::PathBuf> = match &project_config {
-        Some(cfg) => cfg.model_paths.iter().map(|p| dbt_dir.join(p)).collect(),
+        Some(cfg) => {
+            let mut dirs = Vec::with_capacity(cfg.model_paths.len());
+            for p in &cfg.model_paths {
+                dirs.push(safe_join_under(dbt_dir, p)?);
+            }
+            dirs
+        }
         None => vec![dbt_dir.join("models")],
     };
 
@@ -1083,6 +1149,7 @@ pub fn import_dbt_project(
                 &project_config,
                 &source_map,
                 &mut result,
+                0,
             )?;
         }
     }
@@ -1116,7 +1183,17 @@ fn visit_dbt_models(
     project_config: &Option<DbtProjectConfig>,
     source_map: &HashMap<(String, String), dbt_sources::RockySourceMapping>,
     result: &mut ImportResult,
+    depth: usize,
 ) -> Result<(), String> {
+    if depth > super::MAX_IMPORT_RECURSION_DEPTH {
+        return Err(format!(
+            "model directory tree exceeds the maximum import depth of {} at {} — \
+             refusing to recurse further (possible symlink cycle)",
+            super::MAX_IMPORT_RECURSION_DEPTH,
+            dir.display()
+        ));
+    }
+
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
 
@@ -1124,7 +1201,7 @@ fn visit_dbt_models(
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
 
-        if path.is_dir() {
+        if super::is_traversable_subdir(&entry) {
             visit_dbt_models(
                 &path,
                 models_root,
@@ -1132,6 +1209,7 @@ fn visit_dbt_models(
                 project_config,
                 source_map,
                 result,
+                depth + 1,
             )?;
         } else if path.extension().is_some_and(|ext| ext == "sql") {
             let name = path
@@ -2761,5 +2839,85 @@ FROM {{ ref('stg_events') }}
         assert_eq!(result.unit_tests_skipped, 0);
         let imported = result.imported.iter().find(|m| m.name == "m").unwrap();
         assert_eq!(imported.unit_tests.len(), 1);
+    }
+
+    // --- L1: model-path traversal rejection ---
+
+    #[test]
+    fn safe_join_rejects_parent_dir_component() {
+        let base = std::path::Path::new("/tmp/project");
+        let err = safe_join_under(base, std::path::Path::new("../../etc"))
+            .expect_err("a `..` path must be rejected");
+        assert!(err.contains(".."), "error should mention the escape: {err}");
+    }
+
+    #[test]
+    fn safe_join_rejects_absolute_path() {
+        let base = std::path::Path::new("/tmp/project");
+        let err = safe_join_under(base, std::path::Path::new("/etc/passwd"))
+            .expect_err("an absolute path must be rejected");
+        assert!(err.contains("absolute"), "error should explain: {err}");
+    }
+
+    #[test]
+    fn safe_join_allows_normal_relative_path() {
+        let base = std::path::Path::new("/tmp/project");
+        let joined = safe_join_under(base, std::path::Path::new("models"))
+            .expect("a normal relative path is allowed");
+        assert_eq!(joined, std::path::Path::new("/tmp/project/models"));
+    }
+
+    /// A `dbt_project.yml` declaring a traversal `model-paths` must be rejected
+    /// by the full import entry point, not silently read.
+    #[test]
+    fn import_rejects_traversal_model_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("dbt_project.yml"),
+            "name: evil\nmodel-paths: [\"../../etc\"]\n",
+        )
+        .unwrap();
+        let target = TargetConfig {
+            catalog: "cat".into(),
+            schema: "sch".into(),
+            table: String::new(),
+        };
+        let err = match import_dbt_project(dir.path(), &target) {
+            Err(e) => e,
+            Ok(_) => panic!("traversal model path must abort the import"),
+        };
+        assert!(
+            err.contains("..") || err.contains("escape"),
+            "expected a traversal-rejection error, got: {err}"
+        );
+    }
+
+    // --- M1: symlink-cycle recursion guard ---
+
+    /// A directory symlink cycle (`loop -> ..`) inside the models tree must not
+    /// drive the importer into unbounded recursion — the symlink is skipped
+    /// (and the depth cap is a backstop), so the import terminates.
+    #[cfg(unix)]
+    #[test]
+    fn import_terminates_on_directory_symlink_cycle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("ok.sql"), "SELECT 1 AS x").unwrap();
+        // models/loop -> models (a cycle back into the tree being walked).
+        std::os::unix::fs::symlink(&models, models.join("loop")).unwrap();
+
+        let target = TargetConfig {
+            catalog: "cat".into(),
+            schema: "sch".into(),
+            table: String::new(),
+        };
+        // The key assertion is that this RETURNS (no stack overflow / hang).
+        let result =
+            import_dbt_project(dir.path(), &target).expect("import should terminate cleanly");
+        assert!(
+            result.imported.iter().any(|m| m.name == "ok"),
+            "the real model should still be imported"
+        );
     }
 }

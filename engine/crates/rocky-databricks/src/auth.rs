@@ -77,12 +77,25 @@ async fn read_fresh_token(cache: &RwLock<Option<CachedToken>>) -> Option<String>
         .map(|ct| ct.access_token.expose().to_string())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct OAuthTokenResponse {
     access_token: String,
     #[allow(dead_code)]
     token_type: String,
     expires_in: u64,
+}
+
+// Custom `Debug` that masks the bearer token. The derive would print
+// `access_token` verbatim, so a future `tracing`/`{:?}` of this response would
+// leak the secret into logs. Nothing currently relies on the derived `Debug`.
+impl std::fmt::Debug for OAuthTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthTokenResponse")
+            .field("access_token", &"***")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 /// Configuration for Databricks auth, typically from env vars or config.

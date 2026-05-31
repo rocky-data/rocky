@@ -345,6 +345,31 @@ impl UniformWriter {
                     });
                 }
                 Err(object_store::Error::AlreadyExists { .. }) => {
+                    // Distinguish a genuine version race from a competing writer
+                    // that already landed this exact content-addressed file. If
+                    // an existing `add` action references our `add_file_path`, a
+                    // concurrent identical write won — return its commit version
+                    // rather than adding the same file a second time at a higher
+                    // version (which would double-count rows/bytes).
+                    if let Some(existing_version) =
+                        discover::find_commit_with_add_path(&*self.store, &prefix, &add_file_path)
+                            .await?
+                    {
+                        tracing::info!(
+                            add_file_path = %add_file_path,
+                            existing_version,
+                            "cond-put 412: identical content-addressed file already \
+                             committed by a concurrent writer; returning existing commit"
+                        );
+                        return Ok(WriteResult {
+                            file_path: parquet_path.to_string(),
+                            blake3_hash: hash,
+                            commit_version: existing_version,
+                            num_records: batch.num_rows(),
+                            size_bytes: file_size,
+                        });
+                    }
+
                     let observed = discover::next_commit_version(&*self.store, &prefix).await?;
                     state.next_commit_version = observed.max(target_version.saturating_add(1));
                     // The cond-put loser may also be racing on the

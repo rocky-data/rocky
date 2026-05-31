@@ -105,14 +105,24 @@ pub fn parse_model_yamls(models_dir: &Path) -> Result<HashMap<String, DbtModelYa
         return Ok(models);
     }
 
-    scan_models_recursive(models_dir, &mut models)?;
+    scan_models_recursive(models_dir, &mut models, 0)?;
     Ok(models)
 }
 
 fn scan_models_recursive(
     dir: &Path,
     models: &mut HashMap<String, DbtModelYaml>,
+    depth: usize,
 ) -> Result<(), String> {
+    if depth > super::MAX_IMPORT_RECURSION_DEPTH {
+        return Err(format!(
+            "model YAML tree exceeds the maximum import depth of {} at {} — \
+             refusing to recurse further (possible symlink cycle)",
+            super::MAX_IMPORT_RECURSION_DEPTH,
+            dir.display()
+        ));
+    }
+
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
 
@@ -120,8 +130,8 @@ fn scan_models_recursive(
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
 
-        if path.is_dir() {
-            scan_models_recursive(&path, models)?;
+        if super::is_traversable_subdir(&entry) {
+            scan_models_recursive(&path, models, depth + 1)?;
         } else if is_yaml_file(&path) {
             match parse_model_yaml_file(&path) {
                 Ok(parsed) => {

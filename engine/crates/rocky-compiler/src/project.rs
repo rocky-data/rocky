@@ -56,6 +56,12 @@ pub enum ProjectError {
     #[error("no models found in {path}")]
     NoModels { path: String },
 
+    #[error(
+        "duplicate model name '{name}': two or more models share this name. \
+         Model names must be unique within a project — rename one."
+    )]
+    DuplicateModel { name: String },
+
     #[error("failed to parse .rocky file '{path}': {reason}")]
     RockyParse { path: String, reason: String },
 
@@ -117,6 +123,19 @@ impl Project {
     /// Useful when models come from sources other than a directory
     /// (e.g., DSL lowering, dbt import).
     pub fn from_models(models: Vec<Model>) -> Result<Self, ProjectError> {
+        // Reject duplicate model names up front. `model()` is first-wins and
+        // `resolve` collapses names into a HashSet, so a second model with the
+        // same name would silently shadow the first — a real source of "my edit
+        // had no effect" confusion. Fail loudly instead.
+        let mut seen = std::collections::HashSet::with_capacity(models.len());
+        for m in &models {
+            if !seen.insert(m.config.name.as_str()) {
+                return Err(ProjectError::DuplicateModel {
+                    name: m.config.name.clone(),
+                });
+            }
+        }
+
         let (dag_nodes, lineage_cache, resolve_diagnostics) =
             resolve::resolve_dependencies(&models)?;
         let execution_order = dag::topological_sort(&dag_nodes)?;
@@ -506,6 +525,20 @@ mod tests {
             sql: sql.to_string(),
             file_path: format!("models/{name}.sql"),
             contract_path: None,
+        }
+    }
+
+    #[test]
+    fn duplicate_model_name_is_rejected() {
+        let models = vec![
+            make_model("orders", "SELECT 1 AS id"),
+            make_model("orders", "SELECT 2 AS id"),
+        ];
+        let err =
+            Project::from_models(models).expect_err("two models sharing a name must be rejected");
+        match err {
+            ProjectError::DuplicateModel { name } => assert_eq!(name, "orders"),
+            other => panic!("expected DuplicateModel, got {other:?}"),
         }
     }
 

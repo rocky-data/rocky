@@ -735,10 +735,10 @@ impl RockyLsp {
     /// Get the word at a cursor position in document text.
     fn word_at_position(text: &str, line: u32, col: u32) -> Option<String> {
         let target_line = text.lines().nth(line as usize)?;
-        let col = col as usize;
-        if col > target_line.len() {
-            return None;
-        }
+        // `col` is a UTF-16 code-unit offset (LSP `Position.character`); convert
+        // it to a byte offset before slicing or we panic on any multibyte char
+        // before the cursor.
+        let col = utf16_to_byte_offset(target_line, col as usize);
 
         let start = target_line[..col]
             .rfind(|c: char| !c.is_alphanumeric() && c != '_')
@@ -763,10 +763,9 @@ impl RockyLsp {
     /// or immediately after the `@` prefix of a macro invocation.
     fn macro_at_position(text: &str, line: u32, col: u32) -> Option<String> {
         let target_line = text.lines().nth(line as usize)?;
-        let col = col as usize;
-        if col > target_line.len() {
-            return None;
-        }
+        // `col` is a UTF-16 code-unit offset; convert to a byte offset before
+        // slicing (panics otherwise on a multibyte char before the cursor).
+        let col = utf16_to_byte_offset(target_line, col as usize);
 
         // Walk left from cursor to find the identifier start.
         let start = target_line[..col]
@@ -1882,8 +1881,10 @@ impl LanguageServer for RockyLsp {
         if let Some(schema) = result.semantic_graph.model_schema(model_name)
             && let Some(ref intent) = schema.intent
         {
-            let display = if intent.len() > 80 {
-                format!("{}...", &intent[..77])
+            // Truncate by characters, not bytes: `&intent[..77]` panics if a
+            // multibyte char straddles byte 77.
+            let display = if intent.chars().count() > 80 {
+                format!("{}...", intent.chars().take(77).collect::<String>())
             } else {
                 intent.clone()
             };
@@ -2015,12 +2016,10 @@ impl LanguageServer for RockyLsp {
         }
 
         let line = lines[pos.line as usize];
-        let col = pos.character as usize;
-        let before = if col <= line.len() {
-            &line[..col]
-        } else {
-            line
-        };
+        // `pos.character` is a UTF-16 code-unit offset; convert to a byte
+        // offset before slicing or a multibyte char before the cursor panics.
+        let col = utf16_to_byte_offset(line, pos.character as usize);
+        let before = &line[..col];
 
         // Walk backward to find the enclosing function call
         let mut paren_depth = 0i32;
@@ -2568,11 +2567,10 @@ fn get_completion_context(text: &str, line: usize, col: usize) -> CompletionCont
     }
 
     let current_line = lines[line];
-    let before_cursor = if col <= current_line.len() {
-        &current_line[..col]
-    } else {
-        current_line
-    };
+    // `col` is a UTF-16 code-unit offset (LSP `Position.character`); convert to
+    // a byte offset before slicing or a multibyte char before the cursor panics.
+    let byte_col = utf16_to_byte_offset(current_line, col);
+    let before_cursor = &current_line[..byte_col];
 
     let trimmed = before_cursor.trim();
 
@@ -3850,6 +3848,33 @@ fn lsp_range_from_parse_error(err: &rocky_lang::ParseError, source: &str) -> (Ra
         .unwrap_or_else(|| Position::new(0, 0));
     let end = Position::new(position.line, position.character.saturating_add(1));
     (Range::new(position, end), message)
+}
+
+/// Convert an LSP UTF-16 character offset within a single line into a Rust
+/// byte offset.
+///
+/// LSP `Position.character` is a count of UTF-16 code units, not bytes. Using
+/// it directly to slice a `&str` panics the moment a multibyte character
+/// (e.g. `é`, an emoji) sits before the cursor, because the offset lands
+/// inside a UTF-8 code point. This walks `char_indices`, accumulating each
+/// character's `len_utf16()` until the requested UTF-16 count is reached, and
+/// returns the byte index of the boundary. The result is always a valid char
+/// boundary and is clamped to `line.len()` when the offset runs past the end
+/// of the line (e.g. a column past the last character).
+fn utf16_to_byte_offset(line: &str, utf16_character: usize) -> usize {
+    if utf16_character == 0 {
+        return 0;
+    }
+    let mut utf16_count = 0usize;
+    for (byte_idx, ch) in line.char_indices() {
+        if utf16_count >= utf16_character {
+            return byte_idx;
+        }
+        utf16_count += ch.len_utf16();
+    }
+    // The offset reached or exceeded the end of the line — clamp to the end,
+    // which is always a valid char boundary.
+    line.len()
 }
 
 /// Convert a byte offset into an LSP `(line, character)` `Position` by
@@ -5886,5 +5911,62 @@ mod tests {
             salsa_sources.read().await.is_empty(),
             "failed seed must not populate the URI → SourceFile map",
         );
+    }
+
+    // ── UTF-16 offset handling (H1: multibyte-char panic regression) ──────
+
+    #[test]
+    fn utf16_to_byte_offset_handles_multibyte() {
+        // `é` is 2 UTF-8 bytes but 1 UTF-16 code unit; `🦀` is 4 UTF-8 bytes
+        // and 2 UTF-16 code units (a surrogate pair).
+        // Bytes:  c a f  é   ' ' 🦀     ' ' x
+        // byte:   0 1 2  3,4  5  6,7,8,9 10  11
+        // utf16:  0 1 2  3    4  5,6     7   8
+        let line = "café 🦀 x";
+        // c=1 a=1 f=1 (utf16) → byte 3 is just before 'é'.
+        assert_eq!(utf16_to_byte_offset(line, 3), 3);
+        // After 'é' (utf16 idx 4) we're at the space → byte 5 (é is 2 bytes).
+        assert_eq!(utf16_to_byte_offset(line, 4), 5);
+        // 🦀 spans utf16 units 5..7 (surrogate pair); idx 7 is the space → byte 10.
+        assert_eq!(utf16_to_byte_offset(line, 7), 10);
+        // Past the end clamps to the byte length (never panics).
+        assert_eq!(utf16_to_byte_offset(line, 999), line.len());
+        assert_eq!(utf16_to_byte_offset(line, 0), 0);
+    }
+
+    /// A cursor placed *after* a multibyte character on a comment line used to
+    /// panic because `col` (a UTF-16 offset) was sliced as a byte index. The
+    /// word-extraction path must now return cleanly.
+    #[test]
+    fn word_at_position_after_multibyte_does_not_panic() {
+        // "-- café customer_id" — cursor on `customer_id`.
+        let text = "-- café customer_id";
+        // UTF-16 column of the first char of `customer_id`:
+        // "-- café " is 8 chars / 8 UTF-16 units (é is 1 unit) → place cursor
+        // a few units into the identifier.
+        let utf16_col = "-- café cust".chars().map(char::len_utf16).sum::<usize>() as u32;
+        let word = RockyLsp::word_at_position(text, 0, utf16_col);
+        assert_eq!(word.as_deref(), Some("customer_id"));
+    }
+
+    /// Hover over the word containing a multibyte char itself must not panic.
+    #[test]
+    fn word_at_position_on_multibyte_word() {
+        let text = "from café_table";
+        // Cursor inside `café_table` (after the é).
+        let utf16_col = "from café".chars().map(char::len_utf16).sum::<usize>() as u32;
+        let word = RockyLsp::word_at_position(text, 0, utf16_col);
+        assert_eq!(word.as_deref(), Some("café_table"));
+    }
+
+    /// `macro_at_position` walks bytes around the cursor; a multibyte prefix
+    /// must not panic the byte-slice.
+    #[test]
+    fn macro_at_position_after_multibyte_does_not_panic() {
+        let text = "-- café @my_macro(x)";
+        let utf16_col = "-- café @my_ma".chars().map(char::len_utf16).sum::<usize>() as u32;
+        // Should detect the macro name without panicking.
+        let m = RockyLsp::macro_at_position(text, 0, utf16_col);
+        assert_eq!(m.as_deref(), Some("my_macro"));
     }
 }
