@@ -284,7 +284,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "dagster", specifier = ">=1.13.2" },
+    { name = "dagster", specifier = ">=1.13.6" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pygments", specifier = ">=2.20.0" },
 ]
