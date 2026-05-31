@@ -38,7 +38,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**71 of 83 POCs run with no external credentials.** See each POC's README for prerequisites.
+**72 of 84 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
