@@ -251,7 +251,7 @@ GRANT USE CATALOG ON CATALOG acme_warehouse TO `group:data engineers`
 
 Classification tags identify sensitive columns; masking strategies decide how those columns are obfuscated in the warehouse. Rocky splits the two concerns so teams can tag columns for discovery and lineage without committing to a specific obfuscation policy, then map tags to strategies in one place (with per-environment overrides).
 
-Shipped in engine-v1.16.0 (Wave A). Currently implemented on Databricks; other adapters default to no-op.
+Shipped in engine-v1.16.0. Currently implemented on Databricks; other adapters default to no-op.
 
 ### Tag columns in the model sidecar
 
@@ -320,7 +320,7 @@ See the [configuration reference](../reference/configuration.md) for the full sc
 
 `rocky compliance` is a static resolver that answers one question: **are all classified columns masked wherever policy says they should be?**
 
-It is a thin rollup over the classifications and masks configuration. No warehouse calls, no network round-trips. Shipped in engine-v1.16.0 (Wave B).
+It is a thin rollup over the classifications and masks configuration. No warehouse calls, no network round-trips. Shipped in engine-v1.16.0.
 
 ### Basic usage
 
@@ -375,7 +375,7 @@ The JSON payload is the `ComplianceOutput` schema: a `summary` block with counte
 
 Rocky supports hierarchical role declarations that flatten into a resolved permission set per role. Inheritance is declarative and composable; cycles and unknown parents are rejected at config-load time.
 
-Shipped in engine-v1.16.0 (Wave C-1). The Databricks v1 adapter implementation is **log-only**: it validates the flattened graph and emits `debug!` events, but SCIM group creation and per-catalog GRANT emission are deferred to a follow-up.
+Shipped in engine-v1.16.0. The Databricks v1 adapter implementation is **log-only**: it validates the flattened graph and emits `debug!` events, but SCIM group creation and per-catalog GRANT emission are deferred to a follow-up.
 
 ### Declare roles in `rocky.toml`
 
@@ -417,7 +417,7 @@ The Databricks implementation of `GovernanceAdapter::reconcile_role_graph` valid
 - Create SCIM groups for each role
 - Emit per-catalog / per-schema `GRANT` statements from the flattened role graph
 
-SCIM group creation and GRANT emission are the Wave C-1 follow-up. If you need grants applied today, use the `[pipeline.*.target.governance.grants]` blocks from Pillar 1.
+SCIM group creation and GRANT emission are a follow-up. If you need grants applied today, use the `[pipeline.*.target.governance.grants]` blocks from Pillar 1.
 
 Other adapters default to no-op.
 
@@ -433,7 +433,7 @@ Landing the resolver ahead of the warehouse-side apply means teams can:
 
 Data retention policies tell the warehouse how long to keep historical data for each table. Rocky expresses retention as a single sidecar key; each adapter translates it to the warehouse-native TBLPROPERTIES or session parameter.
 
-Shipped in engine-v1.16.0 (Wave C-2).
+Shipped in engine-v1.16.0.
 
 ### Declare retention on a model
 
@@ -695,7 +695,7 @@ The check passes if the query result is less than or equal to the threshold.
 
 ## 11. Audit Trail
 
-Rocky stores run history and quality metrics in the embedded state store (redb), providing a queryable audit trail. Every `rocky apply` now stamps eight extra governance fields on its `RunRecord` (shipped in engine-v1.16.0, Wave A); the full trail is available via `rocky history --audit`.
+Rocky stores run history and quality metrics in the embedded state store (redb), providing a queryable audit trail. Every `rocky apply` now stamps eight extra governance fields on its `RunRecord` (shipped in engine-v1.16.0); the full trail is available via `rocky history --audit`.
 
 ### `rocky history --audit` and the 8 audit fields
 

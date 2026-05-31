@@ -207,9 +207,8 @@ that case.
 
 ## Engine-side: Dagster Pipes message emission
 
-The engine half of T2 (committed in `ef08cae`) adds a hand-rolled
-Dagster Pipes protocol module at
-`engine/crates/rocky-cli/src/pipes.rs` that:
+The `rocky` engine implements the Dagster Pipes protocol directly, with
+no external dependency. On a run it:
 
 1. Detects `DAGSTER_PIPES_CONTEXT` and `DAGSTER_PIPES_MESSAGES` env
    vars at the start of `rocky run`.
