@@ -687,6 +687,36 @@ class IdempotencyConfig(BaseModel):
     """
 
 
+class ImportEntry(BaseModel):
+    """
+    A single imported producer-project snapshot.
+
+    Declared as `[imports.<name>]` in `rocky.toml`. A producer project publishes a serialized snapshot of its compiled project (via `rocky publish-ir`); a consumer project vendors that snapshot file and references it here so `rocky compile` can verify that the columns the consumer reads still exist in the producer's output.
+
+    ```toml [imports.orders] path = "vendor/orders"        # directory holding the vendored snapshots snapshot = "current.json"     # the producer's current published snapshot baseline = "baseline.json"    # optional prior snapshot used for diffing pin = "*"                     # optional recipe-hash pin ("*" = trust any) ```
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    baseline: str | None = None
+    """
+    Optional filename of a prior/pinned snapshot used as the diff baseline, relative to `path`. When set, `rocky compile` diffs `baseline` against `snapshot` to detect columns the producer dropped.
+    """
+    path: str
+    """
+    Directory (relative to `rocky.toml`) holding the vendored snapshot files.
+    """
+    pin: str | None = None
+    """
+    Optional recipe-hash pin (hex). When set to a concrete hash, the snapshot's recipe hash must match or compilation fails. `"*"` (or absent) trusts whatever snapshot is vendored.
+    """
+    snapshot: str
+    """
+    Filename of the producer's current published snapshot, relative to `path`.
+    """
+
+
 class LoadFileFormat(StrEnum):
     """
     File format for load pipelines, parsed from TOML.
@@ -2928,6 +2958,12 @@ class RockyConfig(BaseModel):
     hook: HooksConfig | None = Field({"webhooks": {}}, validate_default=True)
     """
     Shell hooks configuration.
+    """
+    imports: dict[str, ImportEntry] | None = Field({}, validate_default=True)
+    """
+    Imported producer-project snapshots, keyed by import name.
+
+    Each `[imports.<name>]` block points at a vendored snapshot of a producer project's compiled IR. During `rocky compile`, the consumer's column references are checked against the producer's published schema: a column the producer dropped but the consumer still reads surfaces as an error (E030), and a recipe-hash mismatch against a configured `pin` surfaces as E033. Empty by default — a project with no imports incurs no extra work.
     """
     mask: (
         dict[

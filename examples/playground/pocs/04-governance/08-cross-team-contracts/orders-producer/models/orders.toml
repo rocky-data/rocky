@@ -1,0 +1,11 @@
+name = "orders"
+
+[target]
+catalog = "shop"
+schema = "core"
+table = "orders"
+
+[[sources]]
+catalog = "raw__orders"
+schema = "raw__orders"
+table = "orders"

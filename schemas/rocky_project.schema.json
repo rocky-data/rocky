@@ -1312,6 +1312,41 @@
       },
       "type": "object"
     },
+    "ImportEntry": {
+      "additionalProperties": false,
+      "description": "A single imported producer-project snapshot.\n\nDeclared as `[imports.<name>]` in `rocky.toml`. A producer project publishes a serialized snapshot of its compiled project (via `rocky publish-ir`); a consumer project vendors that snapshot file and references it here so `rocky compile` can verify that the columns the consumer reads still exist in the producer's output.\n\n```toml [imports.orders] path = \"vendor/orders\"        # directory holding the vendored snapshots snapshot = \"current.json\"     # the producer's current published snapshot baseline = \"baseline.json\"    # optional prior snapshot used for diffing pin = \"*\"                     # optional recipe-hash pin (\"*\" = trust any) ```",
+      "properties": {
+        "baseline": {
+          "default": null,
+          "description": "Optional filename of a prior/pinned snapshot used as the diff baseline, relative to `path`. When set, `rocky compile` diffs `baseline` against `snapshot` to detect columns the producer dropped.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Directory (relative to `rocky.toml`) holding the vendored snapshot files.",
+          "type": "string"
+        },
+        "pin": {
+          "default": null,
+          "description": "Optional recipe-hash pin (hex). When set to a concrete hash, the snapshot's recipe hash must match or compilation fails. `\"*\"` (or absent) trusts whatever snapshot is vendored.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "snapshot": {
+          "description": "Filename of the producer's current published snapshot, relative to `path`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "snapshot"
+      ],
+      "type": "object"
+    },
     "IsolationConfig": {
       "additionalProperties": false,
       "description": "Workspace isolation configuration (Databricks-specific).\n\n```toml [governance.isolation] enabled = true\n\n[[governance.isolation.workspace_ids]] id = 7474656540609532 binding_type = \"READ_WRITE\"\n\n[[governance.isolation.workspace_ids]] id = 7474647537929812 binding_type = \"READ_ONLY\" ```",
@@ -3511,6 +3546,14 @@
         "webhooks": {}
       },
       "description": "Shell hooks configuration."
+    },
+    "imports": {
+      "additionalProperties": {
+        "$ref": "#/definitions/ImportEntry"
+      },
+      "default": {},
+      "description": "Imported producer-project snapshots, keyed by import name.\n\nEach `[imports.<name>]` block points at a vendored snapshot of a producer project's compiled IR. During `rocky compile`, the consumer's column references are checked against the producer's published schema: a column the producer dropped but the consumer still reads surfaces as an error (E030), and a recipe-hash mismatch against a configured `pin` surfaces as E033. Empty by default — a project with no imports incurs no extra work.",
+      "type": "object"
     },
     "mask": {
       "additionalProperties": {

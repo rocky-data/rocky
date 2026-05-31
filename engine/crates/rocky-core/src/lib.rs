@@ -20,6 +20,7 @@ pub mod docs;
 pub mod drift;
 pub mod hooks;
 pub mod idempotency;
+pub mod imports;
 pub mod incremental;
 pub mod lakehouse;
 pub mod macros;

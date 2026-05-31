@@ -932,6 +932,7 @@ mod tests {
             ai: Default::default(),
             branch: Default::default(),
             freshness: Default::default(),
+            imports: Default::default(),
         }
     }
 

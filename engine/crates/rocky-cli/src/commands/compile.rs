@@ -238,6 +238,27 @@ fn compile_inner(
         result.has_errors = true;
     }
 
+    // Cross-team-contracts: check the consumer's column references against
+    // any imported producer snapshots (`[imports.<name>]`). A producer that
+    // dropped a column the consumer still reads surfaces as E030; a
+    // recipe-hash pin mismatch surfaces as E033. Projects with no `[imports]`
+    // block incur no work — `imports_diagnostics` returns empty immediately.
+    if let Some(path) = config_path
+        && let Ok(cfg) = rocky_config::load_rocky_config(path)
+        && !cfg.imports.is_empty()
+    {
+        let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let import_diags = crate::commands::imports_check::imports_diagnostics(
+            &cfg,
+            config_dir,
+            &result.project.models,
+        );
+        if import_diags.iter().any(|d| d.severity == Severity::Error) {
+            result.has_errors = true;
+        }
+        result.diagnostics.extend(import_diags);
+    }
+
     // Re-apply model filter to diagnostics (may now include E027).
     let diagnostics: Vec<_> = if let Some(filter) = model_filter {
         result
@@ -485,7 +506,9 @@ fn build_p001_diagnostic(
 /// `rocky-compiler/src/typecheck.rs:152` lands the type info on the path
 /// the producing-edge lookup walks.
 #[cfg(feature = "duckdb")]
-fn load_source_schemas_from_seed(models_dir: &Path) -> Result<HashMap<String, Vec<TypedColumn>>> {
+pub(crate) fn load_source_schemas_from_seed(
+    models_dir: &Path,
+) -> Result<HashMap<String, Vec<TypedColumn>>> {
     use anyhow::Context;
     use rocky_duckdb::DuckDbConnector;
 
@@ -548,7 +571,9 @@ fn load_source_schemas_from_seed(models_dir: &Path) -> Result<HashMap<String, Ve
 /// flag exists in the clap definition unconditionally so feature-stripped
 /// builds give a clear error rather than a silent no-op.
 #[cfg(not(feature = "duckdb"))]
-fn load_source_schemas_from_seed(_models_dir: &Path) -> Result<HashMap<String, Vec<TypedColumn>>> {
+pub(crate) fn load_source_schemas_from_seed(
+    _models_dir: &Path,
+) -> Result<HashMap<String, Vec<TypedColumn>>> {
     anyhow::bail!("--with-seed requires the `duckdb` feature; rebuild with `--features duckdb`");
 }
 
