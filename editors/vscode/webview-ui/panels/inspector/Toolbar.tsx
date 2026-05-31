@@ -1,4 +1,8 @@
+import { useEffect, useRef, useState } from "react";
 import type { ColorMode, OverlayKind } from "./context";
+
+/** Delay before a keystroke propagates to the (graph-rebuilding) search filter. */
+const SEARCH_DEBOUNCE_MS = 180;
 
 const OVERLAY_LABELS: Record<OverlayKind, string> = {
   cost: "Cost",
@@ -33,11 +37,26 @@ export function Toolbar({
   activeOverlays: Set<OverlayKind>;
   onToggleOverlay: (kind: OverlayKind) => void;
 }) {
+  // Local state keeps the input responsive on every keystroke; the
+  // graph-rebuilding `onSearch` is debounced so each keypress doesn't re-derive
+  // every node/edge in the canvas. Kept in sync when `search` is reset upstream.
+  const [draft, setDraft] = useState(search);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  useEffect(() => setDraft(search), [search]);
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  const onChange = (value: string): void => {
+    setDraft(value);
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => onSearch(value), SEARCH_DEBOUNCE_MS);
+  };
+
   return (
     <div className="flex flex-wrap items-center gap-2 border-b border-vscode-border px-3 py-2">
       <input
-        value={search}
-        onChange={(e) => onSearch(e.target.value)}
+        value={draft}
+        onChange={(e) => onChange(e.target.value)}
         placeholder="Filter models (substring or /regex/)…"
         className="w-56 rounded border border-vscode-border bg-transparent px-2 py-1 text-sm text-vscode-fg outline-none focus:border-vscode-focus"
       />

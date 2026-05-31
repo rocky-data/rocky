@@ -296,6 +296,125 @@ export async function runRockyJson<T = unknown>(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Idempotent-output cache (catalog / compile)
+// ---------------------------------------------------------------------------
+
+/**
+ * Short-lived, in-memory cache for the *idempotent* project-wide CLI outputs —
+ * `rocky catalog` and `rocky compile`. Both are pure functions of the model
+ * sources on disk between edits, so the Inspector can fan several requests into
+ * one spawn instead of re-shelling per UI event.
+ *
+ * Why this exists: opening the Inspector fires two RPC requests concurrently —
+ * the Lineage tab's `graph` (catalog + compile) and the focused model's
+ * `model` (catalog + compile) — and every node-click re-runs the model request.
+ * Without coalescing, that is 4 cold-start spawns on open and 2 more per click.
+ *
+ * The cache has three layers:
+ * - an **in-flight** map so two identical requests issued before the first
+ *   resolves share one spawn (a completion-populated TTL store alone would let
+ *   both miss);
+ * - a **completed** store with a {@link CACHE_TTL_MS} fallback so a request that
+ *   arrives shortly after still hits without re-spawning;
+ * - **explicit invalidation** via {@link invalidateRockyCache}, wired to the
+ *   extension's `.rocky` / model FS watchers so an edit drops stale results.
+ *
+ * Only call {@link runRockyJsonCached} for `catalog` / `compile`. Mutating or
+ * per-run commands (run / apply / test / preview / history) must never be
+ * routed through it.
+ */
+const CACHE_TTL_MS = 60_000;
+
+interface CacheEntry<T> {
+  value: T;
+  fetchedAt: number;
+}
+
+const completedCache = new Map<string, CacheEntry<unknown>>();
+const inFlight = new Map<string, Promise<unknown>>();
+
+/** Stable cache key: the normalized cwd plus the full argument vector. */
+function cacheKey(args: readonly string[], cwd: string | undefined): string {
+  return `${cwd ?? ""} ${args.join(" ")}`;
+}
+
+/**
+ * JSON-parsing CLI call with the catalog/compile cache in front of it. On a
+ * fresh miss it coalesces concurrent identical calls into a single spawn,
+ * stores the parsed result for {@link CACHE_TTL_MS}, and returns it. Rejections
+ * are never cached — the in-flight entry is removed and nothing is written to
+ * the completed store, so one transient failure does not stick for the TTL.
+ *
+ * The `cwd` is normalized to the value {@link runRocky} would actually use
+ * (`opts.cwd ?? workspace root`) so two call sites that resolve to the same
+ * project root share one key.
+ */
+export function runRockyJsonCached<T = unknown>(
+  args: string[],
+  opts: RunRockyOptions = {},
+): Promise<T> {
+  const cwd = opts.cwd ?? getWorkspaceFolder();
+  const key = cacheKey(args, cwd);
+
+  const now = Date.now();
+  const cached = completedCache.get(key);
+  if (cached && now - cached.fetchedAt < CACHE_TTL_MS) {
+    return Promise.resolve(cached.value as T);
+  }
+
+  const pending = inFlight.get(key);
+  if (pending) return pending as Promise<T>;
+
+  const promise = runRockyJson<T>(args, opts)
+    .then((value) => {
+      completedCache.set(key, { value, fetchedAt: Date.now() });
+      return value;
+    })
+    .finally(() => {
+      inFlight.delete(key);
+    });
+
+  inFlight.set(key, promise);
+  return promise;
+}
+
+/**
+ * Drop every cached catalog/compile result. Called from the extension's FS
+ * watchers when a model source changes — editing one model can change a
+ * downstream model's compile output, so invalidation is whole-store, not
+ * per-key. In-flight requests are left to settle (they reflect the on-disk
+ * state at spawn time and their callers already awaited them).
+ */
+export function invalidateRockyCache(): void {
+  completedCache.clear();
+}
+
+/**
+ * Wire the catalog/compile cache invalidation to file-system change signals.
+ *
+ * Compile freshness depends on model *content*, not just the file set, so this
+ * watches create / delete **and** change for `.rocky` / `.sql` model sources
+ * and `rocky.toml` (the brace group stays around the extensions only — the
+ * proven glob form). It also invalidates on document save — `onDidChange` from
+ * the FS watcher can lag an in-editor save, and a save is the moment a
+ * re-inspect most wants fresh output. Called once from `activate()`.
+ */
+export function registerRockyCacheInvalidation(
+  context: vscode.ExtensionContext,
+): void {
+  const watcher = vscode.workspace.createFileSystemWatcher(
+    "**/*.{rocky,sql,toml}",
+  );
+  watcher.onDidCreate(invalidateRockyCache);
+  watcher.onDidDelete(invalidateRockyCache);
+  watcher.onDidChange(invalidateRockyCache);
+  context.subscriptions.push(
+    watcher,
+    vscode.workspace.onDidSaveTextDocument(() => invalidateRockyCache()),
+  );
+}
+
 /**
  * Wrap {@link runRocky} in a cancellable progress notification. The notification
  * cancel button propagates as an `AbortSignal` to the underlying process.

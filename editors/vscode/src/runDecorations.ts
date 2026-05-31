@@ -78,6 +78,36 @@ const ALL_DECORATION_TYPES = [
 ];
 
 // ---------------------------------------------------------------------------
+// Per-model history cache
+// ---------------------------------------------------------------------------
+
+/**
+ * Short-TTL cache of `rocky history --model <name>` results, keyed by model.
+ * Switching tabs between two model files (or flipping back and forth) used to
+ * re-shell on every `onDidChangeActiveTextEditor`; this serves a recent result
+ * instead. Busted wholesale by {@link refreshRunDecorations} so a fresh run's
+ * decoration is never masked by a stale cached entry.
+ */
+const HISTORY_TTL_MS = 30_000;
+
+interface HistoryCacheEntry {
+  value: ModelHistoryOutput;
+  fetchedAt: number;
+}
+
+const historyCache = new Map<string, HistoryCacheEntry>();
+
+function getCachedHistory(model: string): ModelHistoryOutput | undefined {
+  const entry = historyCache.get(model);
+  if (!entry) return undefined;
+  if (Date.now() - entry.fetchedAt >= HISTORY_TTL_MS) {
+    historyCache.delete(model);
+    return undefined;
+  }
+  return entry.value;
+}
+
+// ---------------------------------------------------------------------------
 // Core logic
 // ---------------------------------------------------------------------------
 
@@ -111,28 +141,34 @@ async function applyRunDecoration(editor: vscode.TextEditor): Promise<void> {
   const range = new vscode.Range(line, 0, line, document.lineAt(line).text.length);
 
   let result: ModelHistoryOutput;
-  try {
-    result = await runRockyJson<ModelHistoryOutput>(
-      ["history", "--model", modelName, "--output", "json"],
-      { timeoutMs: 10_000 },
-    );
-  } catch (err) {
-    // CLI not available or model not found — show gray "no history"
-    if (err instanceof RockyCliError) {
-      const channel = getOutputChannel();
-      channel.appendLine(
-        `[runDecorations] history lookup failed for ${modelName}: ${err.message}`,
+  const cached = getCachedHistory(modelName);
+  if (cached) {
+    result = cached;
+  } else {
+    try {
+      result = await runRockyJson<ModelHistoryOutput>(
+        ["history", "--model", modelName, "--output", "json"],
+        { timeoutMs: 10_000 },
       );
-    }
-    editor.setDecorations(noHistoryDecorationType, [
-      {
-        range,
-        renderOptions: {
-          after: { contentText: "○  no run history" },
+      historyCache.set(modelName, { value: result, fetchedAt: Date.now() });
+    } catch (err) {
+      // CLI not available or model not found — show gray "no history"
+      if (err instanceof RockyCliError) {
+        const channel = getOutputChannel();
+        channel.appendLine(
+          `[runDecorations] history lookup failed for ${modelName}: ${err.message}`,
+        );
+      }
+      editor.setDecorations(noHistoryDecorationType, [
+        {
+          range,
+          renderOptions: {
+            after: { contentText: "○  no run history" },
+          },
         },
-      },
-    ]);
-    return;
+      ]);
+      return;
+    }
   }
 
   const executions = result.executions ?? [];
@@ -208,6 +244,9 @@ export const onRunDecorationsRefreshRequested = refreshEmitter.event;
 
 /** Request a decoration refresh on all visible editors. */
 export function refreshRunDecorations(): void {
+  // A run just completed — the cached history is now stale for every model, so
+  // drop it before re-decorating or the fresh run wouldn't show until the TTL.
+  historyCache.clear();
   refreshEmitter.fire();
 }
 
@@ -227,11 +266,20 @@ export function refreshRunDecorations(): void {
 export function registerRunDecorations(
   context: vscode.ExtensionContext,
 ): void {
-  // Decorate when an editor becomes active
+  // Decorate when an editor becomes active, debounced (250ms, matching the
+  // Inspector's auto-follow) so rapid tab-flipping doesn't spawn a
+  // `rocky history` per switch — only the editor the user settles on is queried.
+  let activeEditorTimer: ReturnType<typeof setTimeout> | undefined;
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTextEditor((editor) => {
-      if (editor) applyRunDecoration(editor);
+      if (!editor) return;
+      if (activeEditorTimer) clearTimeout(activeEditorTimer);
+      activeEditorTimer = setTimeout(() => {
+        activeEditorTimer = undefined;
+        applyRunDecoration(editor);
+      }, 250);
     }),
+    { dispose: () => activeEditorTimer && clearTimeout(activeEditorTimer) },
   );
 
   // Refresh on file save — the model may have been re-run
