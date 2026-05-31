@@ -82,9 +82,9 @@ If a referenced variable is not set, Rocky returns a parse error listing the mis
 
 The same substitution runs over every TOML config Rocky loads, not just `rocky.toml`:
 
-- **Per-model sidecars** (`models/<name>.toml`) — useful for orchestrator-injected `[target]` overrides.
-- **`models/_defaults.toml`** — directory-level defaults applied to every sibling sidecar.
-- **Inline `---toml` frontmatter** in `.sql` / `.rocky` files — only the frontmatter block is substituted; the SQL body below the closing `---` is left untouched, so `${VAR}` in SQL stays literal.
+- **Per-model sidecars** (`models/<name>.toml`): useful for orchestrator-injected `[target]` overrides.
+- **`models/_defaults.toml`**: directory-level defaults applied to every sibling sidecar.
+- **Inline `---toml` frontmatter** in `.sql` / `.rocky` files: only the frontmatter block is substituted. The SQL body below the closing `---` is left untouched, so `${VAR}` in SQL stays literal.
 
 ```toml
 # models/customer_facts.toml — sidecar example
@@ -112,7 +112,7 @@ If `ROCKY_STATE_BACKEND` is not set, it defaults to `"local"`. If `ROCKY_STATE_B
 
 ## `[adapter.NAME]`
 
-Each `[adapter.NAME]` block defines one adapter instance. The `name` is arbitrary — pipelines reference adapters by this name. The `type` field selects which adapter implementation handles the connection.
+Each `[adapter.NAME]` block defines one adapter instance. The `name` is arbitrary; pipelines reference adapters by this name. The `type` field selects which adapter implementation handles the connection.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -122,7 +122,7 @@ Each `[adapter.NAME]` block defines one adapter instance. The `name` is arbitrar
 
 The remaining fields depend on the adapter type.
 
-The top-level adapter fields are strictly validated — an unrecognized key (a typo like `tooken`) is rejected rather than silently ignored. Keys that a custom or process adapter consumes but Rocky doesn't model go under a nested `[adapter.NAME.extra]` table, which passes through untouched:
+The top-level adapter fields are strictly validated: an unrecognized key (a typo like `tooken`) is rejected rather than silently ignored. Keys that a custom or process adapter consumes but Rocky doesn't model go under a nested `[adapter.NAME.extra]` table, which passes through untouched:
 
 ```toml
 [adapter.my_warehouse]
@@ -135,7 +135,7 @@ x_custom_header = "service-account"
 
 ### `type = "duckdb"`
 
-Local in-process execution adapter. Use as a warehouse, source, or both — the same adapter instance can handle discovery and execution because they share the same database.
+Local in-process execution adapter. Use as a warehouse, source, or both: the same adapter instance can handle discovery and execution because they share the same database.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -199,7 +199,7 @@ Snowflake warehouse adapter. Supports Programmatic Access Token (PAT), OAuth, ke
 | `password` | string | No | Password for password auth. |
 | `private_key_path` | string | No | Path to PKCS#8 PEM private key for key-pair JWT auth. |
 | `oauth_token` | string | No | Pre-supplied OAuth token from an IdP. |
-| `pat` | string | No | Programmatic Access Token (issued via Snowsight User Profile). Sent as a Bearer token with the `PROGRAMMATIC_ACCESS_TOKEN` token-type header — distinct from `oauth_token`. |
+| `pat` | string | No | Programmatic Access Token (issued via Snowsight User Profile). Sent as a Bearer token with the `PROGRAMMATIC_ACCESS_TOKEN` token-type header, distinct from `oauth_token`. |
 
 Authentication priority: PAT (highest) > OAuth > Key-pair JWT > Password (lowest).
 
@@ -231,7 +231,7 @@ password = "${SNOWFLAKE_PASSWORD}"
 
 ### `type = "fivetran"`
 
-Fivetran source adapter. Calls the Fivetran REST API to discover connectors and tables. **Metadata only** — Rocky never moves data through this adapter.
+Fivetran source adapter. Calls the Fivetran REST API to discover connectors and tables. **Metadata only**: Rocky never moves data through this adapter.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -280,11 +280,11 @@ When the breaker trips, Rocky emits a `circuit_breaker_tripped` pipeline event; 
 
 ## `[pipeline.NAME]`
 
-Each `[pipeline.NAME]` block defines a pipeline. The `name` is arbitrary — Rocky CLI commands accept `--pipeline NAME` to select one when multiple are defined.
+Each `[pipeline.NAME]` block defines a pipeline. The `name` is arbitrary; Rocky CLI commands accept `--pipeline NAME` to select one when multiple are defined.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `type` | string | No | `"replication"` | Pipeline type. One of `"replication"`, `"transformation"`, `"quality"`, `"snapshot"`, `"load"`. The remaining fields depend on the type — the fields below apply to `"replication"` (the default). |
+| `type` | string | No | `"replication"` | Pipeline type. One of `"replication"`, `"transformation"`, `"quality"`, `"snapshot"`, `"load"`. The remaining fields depend on the type; the fields below apply to `"replication"` (the default). |
 | `strategy` | string | No | `"incremental"` | Replication strategy: `"incremental"` or `"full_refresh"`. |
 | `timestamp_column` | string | No | `"_fivetran_synced"` | Watermark column for incremental strategy. |
 | `metadata_columns` | list | No | `[]` | Extra columns to add to copied data (see below). |
@@ -373,10 +373,10 @@ Given `source=shopify`:
 
 | Template | Result |
 |----------|--------|
-| `warehouse` | `warehouse` (static — no substitution) |
+| `warehouse` | `warehouse` (static, no substitution) |
 | `stage__{source}` | `stage__shopify` |
 
-For multi-tenant setups with per-tenant catalogs, use `{component}` placeholders in `catalog_template` — see [Schema Patterns](/concepts/schema-patterns/) for the full pattern reference (e.g. `catalog_template = "{tenant}_warehouse"` with `components = ["tenant", "regions...", "source"]`).
+For multi-tenant setups with per-tenant catalogs, use `{component}` placeholders in `catalog_template`. See [Schema Patterns](/concepts/schema-patterns/) for the full pattern reference (e.g. `catalog_template = "{tenant}_warehouse"` with `components = ["tenant", "regions...", "source"]`).
 
 ### `[pipeline.NAME.target.governance]`
 
@@ -385,7 +385,7 @@ Catalog/schema lifecycle, tagging, grants, and isolation. Tagging, grants, and w
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `auto_create_catalogs` | bool | `false` | Create target catalogs if they do not exist. |
-| `auto_create_schemas` | bool | `false` | Create target schemas if they do not exist. Honored on **both** replication and transformation pipeline targets (transformation parity landed in engine v1.29.0 — prior versions silently no-op'd on transformation pipelines, surfacing as a "Schema with name X does not exist" execute-time error). |
+| `auto_create_schemas` | bool | `false` | Create target schemas if they do not exist. Honored on **both** replication and transformation pipeline targets (transformation parity landed in engine v1.29.0; prior versions silently no-op'd on transformation pipelines, surfacing as a "Schema with name X does not exist" execute-time error). |
 | `tags` | table | `{}` | Tags applied to managed catalogs, schemas, and tables. |
 | `grants` | list | `[]` | Catalog-level grants. Each entry has `principal` (string) and `permissions` (list of strings). |
 | `schema_grants` | list | `[]` | Schema-level grants. Same format as `grants`. |
@@ -416,7 +416,7 @@ Workspace isolation for Databricks Unity Catalog. Binds managed catalogs to spec
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Set catalog isolation mode to `ISOLATED`. |
-| `workspace_ids` | list of tables | `[]` | Workspace bindings — see below. |
+| `workspace_ids` | list of tables | `[]` | Workspace bindings; see below. |
 
 Each entry in `workspace_ids` is a table with two fields:
 
@@ -556,7 +556,7 @@ table_retries = 1
 
 ## `[state]`
 
-Global state persistence — where Rocky stores watermarks, run history, and checkpoint progress.
+Global state persistence: where Rocky stores watermarks, run history, and checkpoint progress.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -567,7 +567,7 @@ Global state persistence — where Rocky stores watermarks, run history, and che
 | `gcs_prefix` | string | `"rocky/state/"` | GCS object prefix for state files. |
 | `valkey_url` | string | | Valkey/Redis connection URL. Required when `backend` is `"valkey"` or `"tiered"`. |
 | `valkey_prefix` | string | `"rocky:state:"` | Valkey key prefix for state entries. |
-| `transfer_timeout_seconds` | int | `300` | Wall-clock budget for each transfer (upload *or* download). Retries share this budget rather than extending it — raise for large state or slow networks. |
+| `transfer_timeout_seconds` | int | `300` | Wall-clock budget for each transfer (upload *or* download). Retries share this budget rather than extending it; raise for large state or slow networks. |
 | `on_upload_failure` | string | `"skip"` | What to do when upload exhausts retries + circuit-breaker. `"skip"` logs a warning and continues (state goes stale, next run re-derives); `"fail"` propagates the error. |
 
 **Local (default):**
@@ -607,7 +607,7 @@ Tiered downloads from Valkey first (fast), falls back to S3 (durable). Uploads t
 
 ### `[state.retry]`
 
-Retry policy applied to transient state-transfer failures (network hiccups, transient 5xx, hung endpoints that hit the per-request HTTP timeout). Same shape as [`[adapter.NAME.retry]`](#adapternameretry) so both layers share one mental model. Retries share the outer `transfer_timeout_seconds` budget — the total wall-clock ceiling is unchanged.
+Retry policy applied to transient state-transfer failures (network hiccups, transient 5xx, hung endpoints that hit the per-request HTTP timeout). Same shape as [`[adapter.NAME.retry]`](#adapternameretry) so both layers share one mental model. Retries share the outer `transfer_timeout_seconds` budget; the total wall-clock ceiling is unchanged.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -632,7 +632,7 @@ circuit_breaker_threshold = 3
 circuit_breaker_recovery_timeout_secs = 30
 ```
 
-Terminal outcomes surface as structured `outcome` fields on `state.upload` / `state.download` events — `ok`, `absent`, `timeout`, `error_then_fresh`, `skipped_after_failure`, `transient_exhausted`, `circuit_open`, `budget_exhausted`. Grep those instead of the free-form log message when building alerts.
+Terminal outcomes surface as structured `outcome` fields on `state.upload` / `state.download` events: `ok`, `absent`, `timeout`, `error_then_fresh`, `skipped_after_failure`, `transient_exhausted`, `circuit_open`, `budget_exhausted`. Grep those instead of the free-form log message when building alerts.
 
 ### `[state.idempotency]`
 
@@ -640,7 +640,7 @@ Tuning knobs for `rocky plan --idempotency-key <KEY>` dedup (also accepted on th
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `retention_days` | integer | `30` | Lifetime of a terminal idempotency stamp before garbage collection. GC runs during the state upload sweep — no separate cron. |
+| `retention_days` | integer | `30` | Lifetime of a terminal idempotency stamp before garbage collection. GC runs during the state upload sweep; no separate cron. |
 | `dedup_on` | string | `"success"` | Which terminal statuses count as "already processed". `"success"` only stamps successful runs (failures stay claimable for retries); `"any"` stamps every terminal status. |
 | `in_flight_ttl_hours` | integer | `24` | Hours after which an `InFlight` claim is treated as a crashed-pod corpse and adopted by a fresh caller. Informational on Valkey/tiered backends, which set the TTL server-side via `SET NX EX`. |
 
@@ -657,9 +657,9 @@ Stamps live in the `IDEMPOTENCY_KEYS` redb table and replicate on tiered backend
 
 Rocky's built-in sweep deletes idempotency stamps from `state.redb` after `retention_days`. On `s3` / `gcs` / `tiered` backends, the sweep is correct but pays a per-key delete during state upload. For projects that emit thousands of stamps per day, configuring a bucket-native lifecycle rule is faster, cheaper, and keeps GC running even when no Rocky process is active.
 
-Both rules below match the default `state.s3_prefix` / `state.gcs_prefix` of `rocky/state/`. Adjust the prefix if you've overridden it. The retention window should match — or be larger than — `[state.idempotency] retention_days` so Rocky's own sweep doesn't try to delete an object the bucket has already removed.
+Both rules below match the default `state.s3_prefix` / `state.gcs_prefix` of `rocky/state/`. Adjust the prefix if you've overridden it. The retention window should match `[state.idempotency] retention_days`, or be larger, so Rocky's own sweep doesn't try to delete an object the bucket has already removed.
 
-**S3 — `s3api put-bucket-lifecycle-configuration` payload:**
+**S3, `s3api put-bucket-lifecycle-configuration` payload:**
 
 ```json
 {
@@ -682,7 +682,7 @@ aws s3api put-bucket-lifecycle-configuration \
 
 The same rule works for any object Rocky writes under `rocky/state/`, including state-store snapshots. If you want to retain snapshots longer than stamps, namespace them under separate prefixes via `state.s3_prefix` and configure two rules.
 
-**GCS — `gcloud storage buckets update` lifecycle JSON:**
+**GCS, `gcloud storage buckets update` lifecycle JSON:**
 
 ```json
 {
@@ -740,7 +740,7 @@ resource "google_storage_bucket" "rocky_state" {
 
 - **Bucket lifecycle does not replace `[state.idempotency] retention_days`.** The local redb mirror on each pod still has its own copy of the stamp; Rocky's sweep is what evicts that. Bucket lifecycle handles the durable copy.
 - **In-flight claims (`InFlight`) are TTL-bounded by `in_flight_ttl_hours`, not by the lifecycle rule.** Don't set the lifecycle window shorter than `in_flight_ttl_hours` (default 24) or you risk reaping a live claim.
-- **Tiered backends already serve hits from Valkey first.** A bucket lifecycle that's slightly behind `retention_days` is harmless — Valkey's own TTL evicts the hot copy long before the cold S3/GCS copy expires.
+- **Tiered backends already serve hits from Valkey first.** A bucket lifecycle that's slightly behind `retention_days` is harmless; Valkey's own TTL evicts the hot copy long before the cold S3/GCS copy expires.
 
 ---
 
@@ -757,14 +757,14 @@ Configuration for the AI intent layer (`rocky ai`, `rocky ai-explain`, `rocky ai
 max_tokens = 8192
 ```
 
-The `[ai]` block is read by every `rocky ai*` command. The API key itself is **not** read from `rocky.toml` — it must come from the `ANTHROPIC_API_KEY` environment variable so it never lands on disk in a project file.
+The `[ai]` block is read by every `rocky ai*` command. The API key itself is **not** read from `rocky.toml`; it must come from the `ANTHROPIC_API_KEY` environment variable so it never lands on disk in a project file.
 
 ---
 
 ## `[cache]`
 
 Project-level cache configuration. Today this is the schema cache
-(Arc 7 wave 2 wave-2) — a persisted cache of `DESCRIBE TABLE` results that
+a persisted cache of `DESCRIBE TABLE` results that
 lets `rocky compile` / `rocky lsp` typecheck leaf models against real
 warehouse column types without paying a live round-trip on every call.
 
@@ -776,7 +776,7 @@ Controls the schema cache.
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable schema cache reads + writes. Set to `false` for strict CI where every typecheck should resolve against the current warehouse. |
 | `ttl_seconds` | integer | `86400` | TTL for cache entries in seconds (default 24h). Lower for high-DDL-churn teams. |
-| `replicate` | bool | `false` | Replicate the schema cache via `[state]` sync. Default is off — a fresh clone should warm its cache from its own `rocky apply`, not inherit another machine's stale types. |
+| `replicate` | bool | `false` | Replicate the schema cache via `[state]` sync. Default is off; a fresh clone should warm its cache from its own `rocky apply`, not inherit another machine's stale types. |
 
 ```toml
 [cache.schemas]
@@ -819,7 +819,7 @@ Declarative run-level cost, duration, and scan-volume limits. When a run exceeds
 |-------|------|---------|-------------|
 | `max_usd` | float | | Maximum allowed run cost in USD. Cost is computed from per-materialization `cost_usd` values on `RunOutput.cost_summary`. `None` on runs where no adapter produced cost data (e.g. a BigQuery job with no bytes billed). |
 | `max_duration_ms` | integer | | Maximum allowed run wall time in milliseconds. |
-| `max_bytes_scanned` | integer | | Maximum allowed total bytes scanned across every materialization in the run. Useful for CI gates on scan volume even when the dollar cost stays inside `max_usd` (e.g. a BigQuery query that stops pruning partitions). Aggregated from the per-model `bytes_scanned` figures the adapter reports — today that's BigQuery's `totalBytesBilled`; Databricks / Snowflake / DuckDB still inherit `None` and skip the dimension rather than treating "no data" as zero. |
+| `max_bytes_scanned` | integer | | Maximum allowed total bytes scanned across every materialization in the run. Useful for CI gates on scan volume even when the dollar cost stays inside `max_usd` (e.g. a BigQuery query that stops pruning partitions). Aggregated from the per-model `bytes_scanned` figures the adapter reports. Today that's BigQuery's `totalBytesBilled`; Databricks / Snowflake / DuckDB still inherit `None` and skip the dimension rather than treating "no data" as zero. |
 | `on_breach` | string | `"warn"` | Either `"warn"` (fire the event, keep the run successful) or `"error"` (also fail the run). |
 
 ```toml
@@ -830,9 +830,9 @@ max_bytes_scanned = 1099511627776 # 1 TiB
 on_breach = "error"
 ```
 
-All three limits are independent and composed with all-OR — any single dimension breach trips the `budget_breach` event (and, with `on_breach = "error"`, fails the run). They evaluate once per run against observed totals; per-model budgets are a follow-up. Subscribe to `on_budget_breach` under `[hook.*]` to route breaches into a notification system.
+All three limits are independent and composed with all-OR: any single dimension breach trips the `budget_breach` event (and, with `on_breach = "error"`, fails the run). They evaluate once per run against observed totals; per-model budgets are a follow-up. Subscribe to `on_budget_breach` under `[hook.*]` to route breaches into a notification system.
 
-Each [`BudgetBreachOutput`](./json-output) carries a `limit_type` tag — `"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"` — so consumers can branch on the breached dimension without string-matching the human message.
+Each [`BudgetBreachOutput`](./json-output) carries a `limit_type` tag (`"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"`) so consumers can branch on the breached dimension without string-matching the human message.
 
 ---
 
@@ -855,7 +855,7 @@ Precedence for the effective target dialect:
 
 1. `rocky compile --target-dialect <DIALECT>` flag (wins if set).
 2. `[portability] target_dialect`.
-3. Unset — no lint.
+3. Unset: no lint.
 
 See [Linters](/features/linters/) for the full list of covered constructs and the per-model pragma syntax.
 
@@ -863,7 +863,7 @@ See [Linters](/features/linters/) for the full list of covered constructs and th
 
 ## `[retry]`
 
-Optional top-level cross-adapter retry budget. When set, `AdapterRegistry` builds one shared `Arc<AtomicI64>` budget and wires it through every adapter for this run — once exhausted, no adapter retries further. Prevents one failing endpoint from burning the whole budget pool that other adapters could have used.
+Optional top-level cross-adapter retry budget. When set, `AdapterRegistry` builds one shared `Arc<AtomicI64>` budget and wires it through every adapter for this run; once exhausted, no adapter retries further. Prevents one failing endpoint from burning the whole budget pool that other adapters could have used.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -885,7 +885,7 @@ Workspace-default column-masking strategies keyed by classification tag. Each va
 | `"hash"` | SHA-256 hex digest of the column value. Deterministic, one-way. |
 | `"redact"` | Replace the value with the literal string `'***'`. |
 | `"partial"` | Keep the first and last two characters; replace the middle with `***`. Values shorter than 5 chars are fully replaced with `'***'`. |
-| `"none"` | Explicit identity — no masking applied. Useful as a per-env override to unmask a column that defaults to masked at the workspace level. |
+| `"none"` | Explicit identity; no masking applied. Useful as a per-env override to unmask a column that defaults to masked at the workspace level. |
 
 ```toml
 # models/customers.toml tags email + ssn with these classifications
@@ -894,10 +894,10 @@ pii = "hash"
 confidential = "redact"
 ```
 
-Unknown strategies (e.g. `"mask"`) hard-fail at config load — Rocky never silently accepts a spelling it can't emit SQL for.
+Unknown strategies (e.g. `"mask"`) hard-fail at config load; Rocky never silently accepts a spelling it can't emit SQL for.
 
 :::note[Adapter support]
-Masking is implemented today against **Databricks** Unity Catalog via column tags + `CREATE MASK` / `SET MASKING POLICY` (one statement per column — UC rejects multi-column masking DDL). Snowflake, BigQuery, and DuckDB default-unsupported until demand. Masks are applied after a successful DAG run, best-effort — failures emit `warn!` and don't abort the pipeline (same semantics as grants).
+Masking is implemented today against **Databricks** Unity Catalog via column tags + `CREATE MASK` / `SET MASKING POLICY` (one statement per column; UC rejects multi-column masking DDL). Snowflake, BigQuery, and DuckDB default-unsupported until demand. Masks are applied after a successful DAG run, best-effort: failures emit `warn!` and don't abort the pipeline (same semantics as grants).
 :::
 
 ### `[mask.<env>]`
@@ -921,7 +921,7 @@ Resolution precedence:
 
 1. `[mask.<env>]` entry for the active env (when supplied to `rocky plan --env <env>`).
 2. `[mask]` workspace default.
-3. Unmatched tag — W004 warning unless the tag is listed in [`[classifications] allow_unmasked`](#classifications).
+3. Unmatched tag: W004 warning unless the tag is listed in [`[classifications] allow_unmasked`](#classifications).
 
 ---
 
@@ -938,11 +938,11 @@ Advisory settings for the column-classification feature. Distinct from the per-m
 allow_unmasked = ["internal", "lineage_only"]
 ```
 
-Use this escape hatch for tags that exist only for discovery or lineage tracking — Rocky still surfaces them on `rocky compliance` reports, just without enforcing a masking strategy.
+Use this escape hatch for tags that exist only for discovery or lineage tracking; Rocky still surfaces them on `rocky compliance` reports, just without enforcing a masking strategy.
 
 ### `[classifications.allow_unmasked]` on the compliance resolver
 
-`rocky compliance` suppresses exceptions for every tag in `allow_unmasked`. The flag is advisory — it doesn't pretend those columns are enforced, it just keeps them off the exception list. See [`rocky compliance`](/reference/cli/#rocky-compliance).
+`rocky compliance` suppresses exceptions for every tag in `allow_unmasked`. The flag is advisory; it doesn't pretend those columns are enforced, it just keeps them off the exception list. See [`rocky compliance`](/reference/cli/#rocky-compliance).
 
 ---
 
@@ -953,7 +953,7 @@ Hierarchical role declarations reconciled against the warehouse's native role/gr
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `inherits` | list of strings | `[]` | Immediate parent role names. Rocky unions permissions transitively across every ancestor. Cycles and unknown parents are rejected at config-load time. |
-| `permissions` | list of strings | `[]` | Permissions this role grants. Canonical uppercase spellings (e.g. `"SELECT"`, `"USE CATALOG"`, `"USE SCHEMA"`, `"MODIFY"`, `"MANAGE"`). Empty lists are legal — pure grouping roles exist only to aggregate children. |
+| `permissions` | list of strings | `[]` | Permissions this role grants. Canonical uppercase spellings (e.g. `"SELECT"`, `"USE CATALOG"`, `"USE SCHEMA"`, `"MODIFY"`, `"MANAGE"`). Empty lists are legal; pure grouping roles exist only to aggregate children. |
 
 ```toml
 [role.reader]
@@ -971,7 +971,7 @@ permissions = ["MANAGE"]
 Rocky flattens the graph into `admin → {SELECT, USE CATALOG, USE SCHEMA, MODIFY, MANAGE}` and forwards the resolved set to `GovernanceAdapter::reconcile_role_graph` after a successful DAG.
 
 :::caution[v1 is log-only]
-The v1 Databricks implementation validates each `rocky_role_<name>` principal against the identifier grammar and emits a `debug!` trace. SCIM group creation and per-catalog GRANT emission are deferred as a follow-up. The resolver still catches cycles and unknown parents at config-load regardless of adapter capability — so invalid graphs fail fast even before reconcile runs.
+The v1 Databricks implementation validates each `rocky_role_<name>` principal against the identifier grammar and emits a `debug!` trace. SCIM group creation and per-catalog GRANT emission are deferred as a follow-up. The resolver still catches cycles and unknown parents at config-load regardless of adapter capability, so invalid graphs fail fast even before reconcile runs.
 :::
 
 ---
