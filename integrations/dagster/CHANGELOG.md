@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Raised the minimum `dagster` version from `>=1.13.2` to `>=1.13.6` to match the version CI resolves and tests. The `RockyComponent` path relies on `dagster.components.*` APIs from preview namespaces; advertising the tested floor is more honest than an older lower bound that CI never exercises. This is a hygiene change — the previous floor was not broken (those symbols import on earlier releases), so no behaviour changes.
+- Raised the minimum `dagster` version from `>=1.13.2` to `>=1.13.7` (the current latest) to match the version CI resolves and tests. The `RockyComponent` path relies on `dagster.components.*` APIs from preview namespaces; advertising the tested floor is more honest than an older lower bound that CI never exercises. This is a hygiene change — the previous floor was not broken (those symbols import on earlier releases), so no behaviour changes. The full suite passes against 1.13.7.
 
 ## [1.43.0] — 2026-05-30
 
