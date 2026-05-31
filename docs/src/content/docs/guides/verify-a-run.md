@@ -155,27 +155,31 @@ On the content-addressed write path (S3-backed lakehouse materialization), Rocky
 
 The hash is computed on the Parquet bytes before the object-store upload, by the writer's `build_parquet` step. That step pins its Parquet settings (writer version, SNAPPY compression, page size, dictionary encoding off) precisely so the same Rocky version on the same input produces byte-identical output. The engine's own `build_parquet_is_byte_stable_across_runs` test (in `engine/crates/rocky-iceberg/src/uniform_writer/parquet_builder.rs`) pins that determinism, which is what makes the filename a stable content address rather than a coincidence.
 
+This repository ships a real sample of one such file so you can run the check yourself, not just read about it: `examples/audit-sample/736713a2611f762af09ee4445c09157bcfdbf6e07145dd8edf2cfd203d8d5bf0.parquet`. It is a genuine, identity-free Parquet produced by the engine's content-addressed `build_parquet` path, and its filename is the BLAKE3 hash of its bytes.
+
 Given a content-addressed output file named `<hash>.parquet`, verify it in two steps:
 
 ```bash
 # 1. Hash the bytes yourself.
-b3sum <hash>.parquet
+b3sum 736713a2611f762af09ee4445c09157bcfdbf6e07145dd8edf2cfd203d8d5bf0.parquet
 
 # 2. Confirm the hash your tool prints equals the filename
 #    (the part before .parquet) and the ledger row's blake3_hash.
 #    All three agreeing means the bytes are exactly what was recorded.
 ```
 
-The matching `output_artifacts` ledger row carries the same hash plus the join keys back to the run:
+Run against the shipped sample, `b3sum` prints `736713a2611f762af09ee4445c09157bcfdbf6e07145dd8edf2cfd203d8d5bf0`, which is exactly the filename. That equality is the whole guarantee.
+
+The matching `output_artifacts` ledger row carries the same hash plus the join keys back to the run. For the shipped sample, that row reads (the `run_id`, `file_path` prefix, and timestamp are illustrative; the `blake3_hash` and `size_bytes` are the sample's real values):
 
 ```json
 {
-  "blake3_hash": "<the filename, without .parquet>",
+  "blake3_hash": "736713a2611f762af09ee4445c09157bcfdbf6e07145dd8edf2cfd203d8d5bf0",
   "run_id": "run_2026-05-30T11-04-22Z_8f1a",
   "model_name": "fct_revenue",
-  "file_path": "s3://bucket/analytics_prod/fct_revenue/<hash>.parquet",
+  "file_path": "s3://bucket/analytics_prod/fct_revenue/736713a2611f762af09ee4445c09157bcfdbf6e07145dd8edf2cfd203d8d5bf0.parquet",
   "commit_version": 7,
-  "size_bytes": 312,
+  "size_bytes": 806,
   "written_at": "2026-05-30T11:04:25Z"
 }
 ```
