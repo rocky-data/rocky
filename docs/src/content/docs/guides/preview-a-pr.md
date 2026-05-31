@@ -1,15 +1,15 @@
 ---
 title: Preview a PR Before Merging
-description: Use rocky preview to run only the models a PR changed, diff them against base, and surface the cost delta — locally today, in CI as a follow-up
+description: Use rocky preview to run only the models a PR changed, diff them against base, and surface the cost delta. Locally today, in CI as a follow-up.
 sidebar:
   order: 8
 ---
 
 `rocky preview` runs the models a PR's diff actually changes against a per-PR branch, leaves everything else untouched (copied from the base ref), and produces a structural + sampled row-level diff and a cost delta vs. base. This guide walks you through running it locally on a feature branch.
 
-For the design — how Rocky picks the prune set, why CTAS today and clones tomorrow, how the sampling window works — see the [How Preview Works](/concepts/preview-internals/) concept page. For the full output schemas, see the [`rocky preview` CLI reference](/reference/commands/modeling/#rocky-preview).
+For the design (how Rocky picks the prune set, why CTAS today and clones tomorrow, how the sampling window works), see the [How Preview Works](/concepts/preview-internals/) concept page. For the full output schemas, see the [`rocky preview` CLI reference](/reference/commands/modeling/#rocky-preview).
 
-Preview surfaces the data and cost shape of a PR. For typed schema-level breaking-change detection on the same PR, pair preview with [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff) — and rely on the hard semantic gate that fires when the branch is promoted via `rocky plan promote` + `rocky apply` (or the legacy `rocky branch promote` alias). The full flow (PR-time detection → promote-time gate → audited override) is documented in the [CI/CD integration guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate).
+Preview surfaces the data and cost shape of a PR. For typed schema-level breaking-change detection on the same PR, pair preview with [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff), and rely on the hard semantic gate that fires when the branch is promoted via `rocky plan promote` + `rocky apply` (or the legacy `rocky branch promote` alias). The full flow (PR-time detection → promote-time gate → audited override) is documented in the [CI/CD integration guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate).
 
 ## Prerequisites
 
@@ -18,7 +18,7 @@ You'll need:
 - Rocky installed and on `$PATH` (the [Getting Started guide](/getting-started/introduction/) has install instructions).
 - A repo with a `rocky.toml` and a `models/` directory.
 - A git working tree on a feature branch with at least one model change vs. the base ref.
-- The base schema's tables already materialized — `preview create` copies them into the per-PR branch schema, so they need to exist. Running `rocky plan` + `rocky apply` once on `main` is enough.
+- The base schema's tables already materialized: `preview create` copies them into the per-PR branch schema, so they need to exist. Running `rocky plan` + `rocky apply` once on `main` is enough.
 
 The walkthrough below uses `--base main`, but any git ref works.
 
@@ -31,8 +31,8 @@ rocky preview create --base main
 What this does:
 
 1. Runs `git diff --name-only main HEAD` against the models directory to find changed model files.
-2. Loads the working tree into the compiler and computes the **prune set** — every changed model plus everything that depends on a changed column.
-3. Computes the **copy set** — every working-DAG model not in the prune set.
+2. Loads the working tree into the compiler and computes the **prune set**: every changed model plus everything that depends on a changed column.
+3. Computes the **copy set**: every working-DAG model not in the prune set.
 4. Registers a branch in the state store (mirrors `rocky branch create`).
 5. Issues `CREATE TABLE <branch_schema>.<model> AS SELECT * FROM <base_schema>.<model>` for each copy-set model.
 6. Calls `rocky plan --branch <name>` followed by `rocky apply <plan-id>` (or the single-step `rocky run --branch <name>` alias) with a model selector limited to the prune set.
@@ -72,10 +72,10 @@ rocky preview diff --name preview-fix-price --output markdown
 
 This combines two layers into one report:
 
-- **Structural diff** — column-level added/removed/type-changed, the same shape `rocky ci-diff` produces.
-- **Row-level diff** — per-model row delta surfaced through one of two algorithms (a discriminator on the JSON output picks which):
-  - `kind: "sampled"` (default) — `LIMIT N` rows ordered by primary key (default `--sample-size 1000`); fast, but miss rows outside the window. Carries a `coverage_warning` when the sample doesn't cover the full table.
-  - `kind: "bisection"` — exhaustive checksum-bisection over a single-column integer / numeric `unique_key`. Walks the chunk lattice, recurses into mismatched chunks, surfaces every row-level diff. See the [How Preview Works](/concepts/preview-internals/) page for the algorithm. Runs only on Merge-strategy models with a single integer PK; other models stay on sampled (logged via `tracing::warn` with the skip reason).
+- **Structural diff**: column-level added/removed/type-changed, the same shape `rocky ci-diff` produces.
+- **Row-level diff**: per-model row delta surfaced through one of two algorithms (a discriminator on the JSON output picks which):
+  - `kind: "sampled"` (default): `LIMIT N` rows ordered by primary key (default `--sample-size 1000`); fast, but misses rows outside the window. Carries a `coverage_warning` when the sample doesn't cover the full table.
+  - `kind: "bisection"`: exhaustive checksum-bisection over a single-column integer / numeric `unique_key`. Walks the chunk lattice, recurses into mismatched chunks, surfaces every row-level diff. See the [How Preview Works](/concepts/preview-internals/) page for the algorithm. Runs only on Merge-strategy models with a single integer PK; other models stay on sampled (logged via `tracing::warn` with the skip reason).
 
 `--output markdown` writes a PR-comment-ready snippet to stdout. Use `--output json` for the full `PreviewDiffOutput` shape (the JSON output also includes the rendered Markdown in a top-level `markdown` field, so you can pipe it through `jq -r .markdown` for the same effect).
 
@@ -122,10 +122,10 @@ This is a diff layer over [`rocky cost latest`](/reference/commands/administrati
 
 The summary fields tell you:
 
-- `delta_usd` — total branch cost minus base cost. Positive means the PR will cost more to run on `main` after merge.
-- `total_branch_duration_ms` and `total_branch_bytes_scanned` — run-level totals used for budget projection (see below).
-- `savings_from_copy_usd` — what the preview itself saved by copying instead of re-running. This is the empirical evidence that the prune-and-copy substrate is doing work.
-- `models_skipped_via_copy` — count of models that didn't run on the branch because they were copy-set.
+- `delta_usd`: total branch cost minus base cost. Positive means the PR will cost more to run on `main` after merge.
+- `total_branch_duration_ms` and `total_branch_bytes_scanned`: run-level totals used for budget projection (see below).
+- `savings_from_copy_usd`: what the preview itself saved by copying instead of re-running. This is the empirical evidence that the prune-and-copy substrate is doing work.
+- `models_skipped_via_copy`: count of models that didn't run on the branch because they were copy-set.
 
 ### Pre-merge budget projection
 
@@ -146,10 +146,10 @@ The Markdown rendering surfaces a "Budget projection" section only when breaches
 
 The prune set is the set of models that re-execute against the branch. Two reasons can put a model in the prune set:
 
-- `reason: "changed"` — the model file itself changed in the diff (`changed_columns` lists which columns).
-- `reason: "downstream_of_changed"` — the model didn't change but transitively depends on a column that did.
+- `reason: "changed"`: the model file itself changed in the diff (`changed_columns` lists which columns).
+- `reason: "downstream_of_changed"`: the model didn't change but transitively depends on a column that did.
 
-Models in neither bucket are either in the **copy set** (logically identical to base — they get CTAS'd over) or the **skipped set** (the column-level pruner determined they're unaffected and not depended on). The skipped set is the empty-cost residue: nothing copies them, nothing runs them.
+Models in neither bucket are either in the **copy set** (logically identical to base, so they get CTAS'd over) or the **skipped set** (the column-level pruner determined they're unaffected and not depended on). The skipped set is the empty-cost residue: nothing copies them, nothing runs them.
 
 If the prune set is empty, your PR doesn't change any model output (e.g. a whitespace-only edit). The branch run is a no-op and `preview cost` reports a zero delta.
 
@@ -174,7 +174,7 @@ The aggregate `summary.any_coverage_warning` widens to fire on either condition:
 
 When you see the warning on a sampled diff, your options are:
 
-- **Re-run with `--algorithm bisection`** — covers the whole table exhaustively. Works for any model with a single-column integer / numeric `unique_key`.
+- **Re-run with `--algorithm bisection`**: covers the whole table exhaustively. Works for any model with a single-column integer / numeric `unique_key`.
 - Re-run with a larger `--sample-size` if a bounded sample of N more rows is enough confidence for this PR.
 - Inspect the changed columns directly via `rocky compile --model <name>` and reason about the change manually.
 
@@ -188,9 +188,9 @@ A clean sample with `coverage_warning: true` is **not** evidence the PR is no-op
 
 **`preview cost` reports `null` for the branch.** The cost rollup uses the same adapter telemetry as [`rocky cost`](/reference/commands/administration/#rocky-cost). DuckDB and unconfigured adapters report `null` USD by design; duration and bytes still surface. Configure `[cost]` in `rocky.toml` to get dollar amounts on Databricks / Snowflake.
 
-**Copy step is slow.** The copy substrate dispatches per adapter via `WarehouseAdapter::clone_table_for_branch`. Databricks (`SHALLOW CLONE`) and BigQuery (`CREATE TABLE … COPY`) both ship metadata-only overrides as of `engine-v1.19.1` — the per-PR branch table is effectively zero-cost at create time. DuckDB and Snowflake fall through to the portable CTAS default, which physically copies bytes; on large tables this is the dominant cost of `preview create`. Snowflake's native zero-copy `CLONE` will land once a Snowflake consumer drives the integration test against a workspace.
+**Copy step is slow.** The copy substrate dispatches per adapter via `WarehouseAdapter::clone_table_for_branch`. Databricks (`SHALLOW CLONE`) and BigQuery (`CREATE TABLE … COPY`) both ship metadata-only overrides as of `engine-v1.19.1`; the per-PR branch table is effectively zero-cost at create time. DuckDB and Snowflake fall through to the portable CTAS default, which physically copies bytes; on large tables this is the dominant cost of `preview create`. Snowflake's native zero-copy `CLONE` will land once a Snowflake consumer drives the integration test against a workspace.
 
-**The diff finds no changes but the model definitely changed.** Check `summary.any_coverage_warning` in the JSON output. If it's `true`, the sampling window missed the changed rows — see the section above.
+**The diff finds no changes but the model definitely changed.** Check `summary.any_coverage_warning` in the JSON output. If it's `true`, the sampling window missed the changed rows; see the section above.
 
 ## Posting to a PR
 
@@ -229,7 +229,7 @@ jobs:
           # rocky_version: latest            # or 1.17.4 / engine-v1.17.4
 ```
 
-The first PR after wiring this in will install Rocky and post a comment with the plan, the diff, and the cost delta. Subsequent pushes update that same comment in place via the `<!-- rocky-preview -->` marker — no PR-comment spam.
+The first PR after wiring this in will install Rocky and post a comment with the plan, the diff, and the cost delta. Subsequent pushes update that same comment in place via the `<!-- rocky-preview -->` marker, with no PR-comment spam.
 
 ### Action inputs
 
@@ -241,7 +241,7 @@ The first PR after wiring this in will install Rocky and post a comment with the
 | `working_directory` | `.` | Directory containing `rocky.toml`. The action `cd`s here before each subcommand. |
 | `rocky_version` | `latest` | Engine version. `latest` resolves the highest `engine-v*` tag; otherwise pass `1.17.4` or `engine-v1.17.4`. |
 | `comment_marker` | `<!-- rocky-preview -->` | Magic-string marker used for comment upsert. Override only if you run multiple preview workflows on the same PR. |
-| `fail_on_preview_error` | `false` | When `true`, fail the PR check if any `rocky preview` subcommand errors. The default keeps preview advisory — failures still post a section in the comment. |
+| `fail_on_preview_error` | `false` | When `true`, fail the PR check if any `rocky preview` subcommand errors. The default keeps preview advisory: failures still post a section in the comment. |
 | `github_token` | (required) | Token used to read the PR and upsert the comment. Pass `${{ github.token }}` from the workflow (or a PAT for cross-repo permissions). Required because composite actions cannot reference `${{ github.token }}` in input defaults. |
 
 ### Action outputs

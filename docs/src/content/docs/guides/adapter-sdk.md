@@ -1,13 +1,13 @@
 ---
 title: Building a Custom Adapter
-description: Build a Rust-native warehouse adapter against the Rocky adapter SDK — trait surface, worked ClickHouse-shaped skeleton, auth, testing, distribution.
+description: Build a Rust-native warehouse adapter against the Rocky adapter SDK. Trait surface, worked ClickHouse-shaped skeleton, auth, testing, distribution.
 sidebar:
   order: 9
 ---
 
-Rocky talks to warehouses through a small set of traits in the `rocky-adapter-sdk` crate. Implementing those traits gives you a working warehouse adapter — the same way `rocky-databricks`, `rocky-snowflake`, `rocky-bigquery`, `rocky-trino`, and `rocky-duckdb` are wired today.
+Rocky talks to warehouses through a small set of traits in the `rocky-adapter-sdk` crate. Implementing those traits gives you a working warehouse adapter, the same way `rocky-databricks`, `rocky-snowflake`, `rocky-bigquery`, `rocky-trino`, and `rocky-duckdb` are wired today.
 
-This guide walks a Rust developer from "I want a ClickHouse adapter" to a compiling skeleton with passing tests in roughly fifteen minutes. The runnable skeleton lives at [`examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton) and is shaped after ClickHouse, but the same shape works for Redshift, StarRocks, MotherDuck, or any SQL warehouse Rocky doesn't ship in-tree. (Trino is in-tree as of engine v1.28.0 — see the [`rocky-trino` crate](/concepts/architecture/#rocky-trino).)
+This guide walks a Rust developer from "I want a ClickHouse adapter" to a compiling skeleton with passing tests in roughly fifteen minutes. The runnable skeleton lives at [`examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton) and is shaped after ClickHouse, but the same shape works for Redshift, StarRocks, MotherDuck, or any SQL warehouse Rocky doesn't ship in-tree. (Trino is in-tree as of engine v1.28.0; see the [`rocky-trino` crate](/concepts/architecture/#rocky-trino).)
 
 ## When to reach for the SDK
 
@@ -17,7 +17,7 @@ The adapter SDK is the right tool when:
 - You need a forked variant of an existing adapter (e.g. Databricks Serverless on top of `rocky-databricks`).
 - You want to embed Rocky in a tool that owns its own warehouse client and would rather wrap it than spawn `rocky` as a subprocess.
 
-If your warehouse already ships in-tree, use it directly via `[adapter]` in `rocky.toml`. If you want adapters in a non-Rust language (Python, Go, Node), see the [process adapter protocol](/concepts/adapters/#process-adapter-protocol) — JSON-RPC over stdio. The POC at `pocs/07-adapters/04-custom-process-adapter/` walks that pattern.
+If your warehouse already ships in-tree, use it directly via `[adapter]` in `rocky.toml`. If you want adapters in a non-Rust language (Python, Go, Node), see the [process adapter protocol](/concepts/adapters/#process-adapter-protocol): JSON-RPC over stdio. The POC at `pocs/07-adapters/04-custom-process-adapter/` walks that pattern.
 
 ## The trait surface
 
@@ -37,11 +37,11 @@ Each opt-in trait is gated by a flag in `AdapterCapabilities`. Set the flag, imp
 
 ### When each method is called
 
-- `execute_statement` — every DDL / DML Rocky generates: `CREATE TABLE`, `INSERT INTO`, `MERGE INTO`, `ALTER TABLE`, `DROP TABLE`, partition replace.
-- `execute_query` — `EXPLAIN`, `DESCRIBE`, row-count assertions, the `rocky compile`-time `SELECT 1` connectivity check.
-- `describe_table` — drift detection (`rocky drift`), contract validation, the column-list step before generating an incremental insert.
-- `table_exists` — full-refresh-vs-create branching at the start of a materialization.
-- `dialect()` methods — every SQL string Rocky emits is composed by a dialect call. Identifier validation lives here.
+- `execute_statement`: every DDL / DML Rocky generates: `CREATE TABLE`, `INSERT INTO`, `MERGE INTO`, `ALTER TABLE`, `DROP TABLE`, partition replace.
+- `execute_query`: `EXPLAIN`, `DESCRIBE`, row-count assertions, the `rocky compile`-time `SELECT 1` connectivity check.
+- `describe_table`: drift detection (`rocky drift`), contract validation, the column-list step before generating an incremental insert.
+- `table_exists`: full-refresh-vs-create branching at the start of a materialization.
+- `dialect()` methods: every SQL string Rocky emits is composed by a dialect call. Identifier validation lives here.
 
 ## Worked example: a ClickHouse-shaped skeleton
 
@@ -97,7 +97,7 @@ impl SkeletonAdapter {
 }
 ```
 
-Capability flags are not cosmetic — they gate behavior. `merge: false` makes Rocky's planner refuse `strategy = "merge"` configs against this adapter at validate time rather than failing mid-run. `create_catalog: false` makes `auto_create_catalogs = true` surface a clear "warehouse doesn't support catalogs" error instead of emitting broken SQL.
+Capability flags are not cosmetic; they gate behavior. `merge: false` makes Rocky's planner refuse `strategy = "merge"` configs against this adapter at validate time rather than failing mid-run. `create_catalog: false` makes `auto_create_catalogs = true` surface a clear "warehouse doesn't support catalogs" error instead of emitting broken SQL.
 
 ### Backend abstraction
 
@@ -113,7 +113,7 @@ pub trait Backend: Send + Sync {
 }
 ```
 
-The production impl wraps `clickhouse::Client` (or `reqwest::Client` for warehouses without a typed driver). The test impl is `MockBackend` — a `HashMap` plus a statement log so tests can assert on the SQL the dialect produced.
+The production impl wraps `clickhouse::Client` (or `reqwest::Client` for warehouses without a typed driver). The test impl is `MockBackend`: a `HashMap` plus a statement log so tests can assert on the SQL the dialect produced.
 
 ### Dialect implementation
 
@@ -134,22 +134,22 @@ fn format_table_ref(
 
 Methods worth thinking carefully about:
 
-- **`merge_into`** — return `AdapterError::not_supported("merge_into")` if your warehouse has no `MERGE`. Rocky's planner sees the capability flag and won't generate merge plans, but a defensive impl still helps if someone bypasses the planner.
-- **`insert_overwrite_partition`** — returns `Vec<String>` because some warehouses need a multi-statement transaction (Snowflake's `BEGIN; DELETE; INSERT; COMMIT`). The runtime executes them in order and rolls back on partial failure.
-- **`row_hash_expr`** — used for change detection. ClickHouse uses `sipHash128(tuple(...))`; if you want cross-warehouse comparable hashes, look at how `rocky-bigquery` and `rocky-snowflake` agree on a stable encoding.
-- **`watermark_where`** — the standard incremental filter (`col > (SELECT max(col) FROM target)`). Validate `timestamp_col` before splicing.
+- **`merge_into`**: return `AdapterError::not_supported("merge_into")` if your warehouse has no `MERGE`. Rocky's planner sees the capability flag and won't generate merge plans, but a defensive impl still helps if someone bypasses the planner.
+- **`insert_overwrite_partition`**: returns `Vec<String>` because some warehouses need a multi-statement transaction (Snowflake's `BEGIN; DELETE; INSERT; COMMIT`). The runtime executes them in order and rolls back on partial failure.
+- **`row_hash_expr`**: used for change detection. ClickHouse uses `sipHash128(tuple(...))`; if you want cross-warehouse comparable hashes, look at how `rocky-bigquery` and `rocky-snowflake` agree on a stable encoding.
+- **`watermark_where`**: the standard incremental filter (`col > (SELECT max(col) FROM target)`). Validate `timestamp_col` before splicing.
 
 ## Auth and connection management
 
 The SDK ships an optional `AuthProvider` trait that composes the `Authorization` header with any extra mandatory headers your warehouse requires, such as a user-identity header alongside a bearer token. A `StaticAuthProvider` covers the fixed-credential case. Adapters with bespoke needs can still wire their own; the two patterns worth copying are in-tree:
 
-- **`engine/crates/rocky-databricks/src/auth.rs`** — PAT-first, OAuth M2M fallback. Reads `${DATABRICKS_TOKEN}`; if absent, falls through to the `client_credentials` flow with `${DATABRICKS_CLIENT_ID}` / `${DATABRICKS_CLIENT_SECRET}`. The auto-detection logic is roughly twenty lines.
-- **`engine/crates/rocky-snowflake/src/auth.rs`** — multi-method priority: pre-supplied OAuth bearer wins, then RS256 key-pair JWT, then password. Each method reads from a distinct `${SNOWFLAKE_*}` variable so config files never carry secrets.
+- **`engine/crates/rocky-databricks/src/auth.rs`**: PAT-first, OAuth M2M fallback. Reads `${DATABRICKS_TOKEN}`; if absent, falls through to the `client_credentials` flow with `${DATABRICKS_CLIENT_ID}` / `${DATABRICKS_CLIENT_SECRET}`. The auto-detection logic is roughly twenty lines.
+- **`engine/crates/rocky-snowflake/src/auth.rs`**: multi-method priority: pre-supplied OAuth bearer wins, then RS256 key-pair JWT, then password. Each method reads from a distinct `${SNOWFLAKE_*}` variable so config files never carry secrets.
 
 Two rules that apply to every adapter regardless of method:
 
 1. **Read credentials at config-parse time, not at adapter-construct time.** Rocky substitutes `${VAR}` references when parsing `rocky.toml`. Pull the resolved string out of `SkeletonConfig`; do not re-read env vars from the adapter constructor or tests will collide on shared state.
-2. **Pool HTTP clients in the adapter struct.** `reqwest::Client` is internally `Arc`-counted and cheap to clone — construct it once in `SkeletonAdapter::new` and clone the handle into every request. Don't construct a new client per call.
+2. **Pool HTTP clients in the adapter struct.** `reqwest::Client` is internally `Arc`-counted and cheap to clone; construct it once in `SkeletonAdapter::new` and clone the handle into every request. Don't construct a new client per call.
 
 For retry and rate-limiting, look at `rocky-adapter-sdk/src/throttle.rs` (the AIMD adaptive concurrency helper) and `rocky-databricks/src/connector.rs` for an `is_transient` / `is_rate_limit` retry loop.
 
@@ -181,40 +181,40 @@ This style covers everything except real network behavior.
 
 ### Wiremock for HTTP-backed adapters
 
-For adapters that talk to a REST API, the in-tree pattern is `wiremock`-based — see how `rocky-fivetran/src/client.rs` is tested. You stand up a `MockServer` per test, register expected `Match::path("/v1/connectors")` handlers, and assert your adapter sends the right verbs against the right paths. CI runs without a real Fivetran account.
+For adapters that talk to a REST API, the in-tree pattern is `wiremock`-based; see how `rocky-fivetran/src/client.rs` is tested. You stand up a `MockServer` per test, register expected `Match::path("/v1/connectors")` handlers, and assert your adapter sends the right verbs against the right paths. CI runs without a real Fivetran account.
 
 ### The conformance harness
 
-`rocky-adapter-sdk::conformance::run_conformance(&manifest, Some(adapter.dialect()))` returns a `ConformanceResult` describing which tests apply (based on declared capabilities) and which were skipped. When a live dialect is supplied, the harness exercises one real trait call, `SqlDialect::format_table_ref`, as the first incremental step toward live execution. Pass `None` when no live adapter is available — for example, `rocky test-adapter --builtin <name>`, which validates the test plan without a warehouse — and dialect-category checks are reported as skipped rather than run against a stub. The remaining checks are still plan entries rather than warehouse calls, so treat the result as a checklist of behaviors your unit tests should cover while broader trait execution lands in future SDK releases.
+`rocky-adapter-sdk::conformance::run_conformance(&manifest, Some(adapter.dialect()))` returns a `ConformanceResult` describing which tests apply (based on declared capabilities) and which were skipped. When a live dialect is supplied, the harness exercises one real trait call, `SqlDialect::format_table_ref`, as the first incremental step toward live execution. Pass `None` when no live adapter is available (for example, `rocky test-adapter --builtin <name>`, which validates the test plan without a warehouse), and dialect-category checks are reported as skipped rather than run against a stub. The remaining checks are still plan entries rather than warehouse calls, so treat the result as a checklist of behaviors your unit tests should cover while broader trait execution lands in future SDK releases.
 
 ## Distributing your adapter
 
-The honest answer for now: **fork and merge**. The adapter registry is statically registered at compile time — there is no dynamic plugin system today. To ship a new adapter:
+The honest answer for now: **fork and merge**. The adapter registry is statically registered at compile time; there is no dynamic plugin system today. To ship a new adapter:
 
 1. Fork `rocky-data/rocky`.
 2. Drop your crate into `engine/crates/rocky-<name>/`.
 3. Add it to `engine/Cargo.toml` workspace `members` and the CLI's adapter dispatch.
-4. Open a PR upstream. The SDK pins the trait shape so the diff stays small — usually a few hundred lines of crate plus one wiring line in the CLI.
+4. Open a PR upstream. The SDK pins the trait shape so the diff stays small, usually a few hundred lines of crate plus one wiring line in the CLI.
 
 Two looser paths if upstreaming isn't an option yet:
 
-- **Vendor the crate.** Keep your fork private, ship Rocky internally with your adapter linked in. The in-tree adapters use this same model — they're just upstreamed.
-- **Process adapter (any language).** If you want to escape Rust entirely, the JSON-RPC stdio protocol in `rocky-adapter-sdk/src/process.rs` works today — see [`pocs/07-adapters/04-custom-process-adapter/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/04-custom-process-adapter) for a working Python adapter against SQLite.
+- **Vendor the crate.** Keep your fork private, ship Rocky internally with your adapter linked in. The in-tree adapters use this same model; they're just upstreamed.
+- **Process adapter (any language).** If you want to escape Rust entirely, the JSON-RPC stdio protocol in `rocky-adapter-sdk/src/process.rs` works today; see [`pocs/07-adapters/04-custom-process-adapter/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/04-custom-process-adapter) for a working Python adapter against SQLite.
 
 A dynamic registration path (declarative config + crates.io discovery) is on the roadmap but unscheduled. Until it lands, the SDK's job is to keep the trait surface stable enough that your fork is forward-compatible.
 
 ## Gotchas worth knowing about
 
-These are real and surface during implementation — flagging them up front so you don't lose half a day debugging.
+These are real and surface during implementation. Flagging them up front so you don't lose half a day debugging.
 
-- **The SDK trait surface now mirrors most of the in-tree one.** `rocky-adapter-sdk/src/traits.rs` is the public, marketed contract; `rocky-core/src/traits.rs` is what the in-tree adapters use. The SDK gained default-impl methods for `execute_statement_with_stats` (and `ExecutionStats`), `ping`, `explain` (and `ExplainResult`), `is_experimental`, `warehouse_name`, and `list_tables`, so out-of-tree adapters get the same shape in-tree adapters use. A few methods still differ pending cross-crate type unification — `fetch_arrow_batch`, `clone_table_for_branch`, and the `merge_into` signature, plus a handful of duplicated types (`TableRef`, `ColumnInfo`, `Grant`, `MetadataColumn`). Target the SDK surface and treat those as not-yet-stable.
-- **Identifier validation is not optional.** Anything you splice into SQL must pass `[A-Za-z0-9_]+` (or your warehouse's equivalent). The skeleton's `validate_ident` shows the pattern. SQL-injection-bearing string literals were the subject of [a real CVE-class fix](https://github.com/rocky-data/rocky/pull/293) — don't reinvent that hole.
+- **The SDK trait surface now mirrors most of the in-tree one.** `rocky-adapter-sdk/src/traits.rs` is the public, marketed contract; `rocky-core/src/traits.rs` is what the in-tree adapters use. The SDK gained default-impl methods for `execute_statement_with_stats` (and `ExecutionStats`), `ping`, `explain` (and `ExplainResult`), `is_experimental`, `warehouse_name`, and `list_tables`, so out-of-tree adapters get the same shape in-tree adapters use. A few methods still differ pending cross-crate type unification (`fetch_arrow_batch`, `clone_table_for_branch`, and the `merge_into` signature), plus a handful of duplicated types (`TableRef`, `ColumnInfo`, `Grant`, `MetadataColumn`). Target the SDK surface and treat those as not-yet-stable.
+- **Identifier validation is not optional.** Anything you splice into SQL must pass `[A-Za-z0-9_]+` (or your warehouse's equivalent). The skeleton's `validate_ident` shows the pattern. SQL-injection-bearing string literals were the subject of [a real CVE-class fix](https://github.com/rocky-data/rocky/pull/293); don't reinvent that hole.
 - **The `catalog` field in `TableRef` is always present.** Warehouses without catalogs (ClickHouse, Postgres, MySQL) get an empty string. Your dialect's `format_table_ref` is responsible for dropping it.
-- **`AdapterError` is intentionally type-erased.** Use `AdapterError::msg(...)` for ad-hoc errors, `AdapterError::new(my_err)` to wrap an `std::error::Error`, and `AdapterError::not_supported("method_name")` for capabilities your warehouse doesn't have. Don't reach for `thiserror` inside the trait impl — the SDK boxes everything.
+- **`AdapterError` is intentionally type-erased.** Use `AdapterError::msg(...)` for ad-hoc errors, `AdapterError::new(my_err)` to wrap an `std::error::Error`, and `AdapterError::not_supported("method_name")` for capabilities your warehouse doesn't have. Don't reach for `thiserror` inside the trait impl; the SDK boxes everything.
 
 ## Next steps
 
-- Browse the [skeleton POC source](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton) — `adapter/src/lib.rs` is meant to be read top-to-bottom.
+- Browse the [skeleton POC source](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton); `adapter/src/lib.rs` is meant to be read top-to-bottom.
 - Read the [adapter concepts page](/concepts/adapters/) for the architecture overview.
 - Look at the in-tree adapters in `engine/crates/rocky-{databricks,snowflake,bigquery,duckdb,fivetran}/` for production patterns.
-- File an issue on [github.com/rocky-data/rocky](https://github.com/rocky-data/rocky/issues) if a trait method is missing what you need — the SDK is still young and feedback shapes the roadmap.
+- File an issue on [github.com/rocky-data/rocky](https://github.com/rocky-data/rocky/issues) if a trait method is missing what you need; the SDK is still young and feedback shapes the roadmap.

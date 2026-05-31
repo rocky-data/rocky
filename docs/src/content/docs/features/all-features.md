@@ -5,17 +5,17 @@ sidebar:
   order: 11
 ---
 
-Rocky organizes its capabilities around **seven trust dimensions** — the failure modes that quietly cost data teams the most. Each dimension below maps to specific commands, diagnostic codes, and configuration knobs.
+Rocky organizes its capabilities around **seven trust dimensions**: the failure modes that quietly cost data teams the most. Each dimension below maps to specific commands, diagnostic codes, and configuration knobs.
 
-1. **Typed compiler** — `rocky compile`, 35+ diagnostics
-2. **Column-level lineage** — `rocky lineage`, `rocky lineage-diff`
-3. **Branches + replay** — `rocky branch`, `rocky replay`
-4. **Cost attribution** — `RunOutput.cost_summary`, `[budget]`, `rocky cost`
-5. **AI gated through the compiler** — `rocky ai`, `rocky ai-sync`
-6. **Dialect-divergence lint** — `P001` portability lint
-7. **Declarative governance** — RBAC diff, masking, classification, `rocky compliance`
+1. **Typed compiler**: `rocky compile`, 35+ diagnostics
+2. **Column-level lineage**: `rocky lineage`, `rocky lineage-diff`
+3. **Branches + replay**: `rocky branch`, `rocky replay`
+4. **Cost attribution**: `RunOutput.cost_summary`, `[budget]`, `rocky cost`
+5. **AI gated through the compiler**: `rocky ai`, `rocky ai-sync`
+6. **Dialect-divergence lint**: `P001` portability lint
+7. **Declarative governance**: RBAC diff, masking, classification, `rocky compliance`
 
-The capability detail follows. For positioning vs other tools, see [Comparison](/features/comparison/). For honest scope (Databricks-first, Snowflake/BigQuery Beta, Iceberg writes via Delta UniForm shipped, first-class Iceberg-native writes on the roadmap), see [Where Rocky is today](/getting-started/introduction/#where-rocky-is-today).
+The capability detail follows. For positioning vs other tools, see [Comparison](/features/comparison/). For honest scope (Databricks-first, Snowflake/BigQuery Beta, Iceberg writes via Delta UniForm shipped, first-class Iceberg-native writes on the roadmap), see the [Roadmap](/getting-started/roadmap/).
 
 ## Warehouse Support
 
@@ -45,12 +45,12 @@ Separately, the top-level `format` key on a model selects warehouse-managed tabl
 ### Time Interval Materialization
 
 Partition-keyed materialization with:
-- `--partition KEY` — run a single partition
-- `--from / --to` — run a date range
-- `--latest` — run the partition containing now()
-- `--missing` — discover and fill gaps from state store
-- `--lookback N` — recompute N previous partitions for late-arriving data
-- `--parallel N` — concurrent partition processing
+- `--partition KEY`: run a single partition
+- `--from / --to`: run a date range
+- `--latest`: run the partition containing now()
+- `--missing`: discover and fill gaps from state store
+- `--lookback N`: recompute N previous partitions for late-arriving data
+- `--parallel N`: concurrent partition processing
 - Per-partition state tracking (Computed / Failed / InProgress)
 - Atomic writes: Databricks uses `INSERT INTO ... REPLACE WHERE`; Snowflake/DuckDB use transactional DELETE + INSERT
 
@@ -59,7 +59,7 @@ Partition-keyed materialization with:
 - **Static type inference** across the full DAG at compile time
 - **Column type tracking** through JOINs, GROUP BYs, window functions
 - **35+ diagnostic codes** (E001-E026, W001-W003, W010-W011, E010-E013, V001-V020) with actionable fix suggestions
-- **Safe type widening detection**: INT → BIGINT, FLOAT → DOUBLE, VARCHAR expansion — handled via zero-copy ALTER TABLE
+- **Safe type widening detection**: INT → BIGINT, FLOAT → DOUBLE, VARCHAR expansion, handled via zero-copy ALTER TABLE
 - **NULL-safe equality**: `!=` compiles to `IS DISTINCT FROM`
 - **SELECT * expansion** with deduplication
 - **Parallel type checking** via rayon across DAG execution layers
@@ -68,8 +68,8 @@ Partition-keyed materialization with:
 
 ## Linters
 
-- **P001 dialect portability** — opt-in lint rejecting SQL that won't run on the chosen target (`databricks` / `snowflake` / `bigquery` / `duckdb`). Catches `NVL`, `DATEADD`, `QUALIFY`, `ILIKE`, `FLATTEN`, and friends.
-- **P002 blast-radius `SELECT *`** — always-on warning when a model uses `SELECT *` AND a downstream model references specific columns of its output. Leaf-model `SELECT *` is intentionally not flagged.
+- **P001 dialect portability**: opt-in lint rejecting SQL that won't run on the chosen target (`databricks` / `snowflake` / `bigquery` / `duckdb`). Catches `NVL`, `DATEADD`, `QUALIFY`, `ILIKE`, `FLATTEN`, and friends.
+- **P002 blast-radius `SELECT *`**: always-on warning when a model uses `SELECT *` AND a downstream model references specific columns of its output. Leaf-model `SELECT *` is intentionally not flagged.
 - **Project-wide allow list** (`[portability] allow = [...]`) for blanket exemptions.
 - **Per-model `-- rocky-allow: CONSTRUCT, OTHER` pragma** for targeted opt-outs.
 
@@ -77,7 +77,7 @@ Full reference: [Linters](/features/linters/).
 
 ## Column-Level Lineage
 
-- Computed at **compile time** — no warehouse query, no catalog rebuild
+- Computed at **compile time**: no warehouse query, no catalog rebuild
 - Per-column trace through SQL and Rocky DSL transformations
 - Transform tracking: Direct, Cast, Aggregation, Expression
 - Output formats: **JSON**, **Graphviz DOT**, human-readable text
@@ -166,19 +166,19 @@ Plus: window functions with PARTITION BY / ORDER BY / frame specs, `match` expre
 
 ## Observability
 
-- **15-event hook lifecycle** — pipeline / discover / compile / per-model / per-table / checks / drift / anomaly / state-sync events fire through the hook registry. See [Hooks](/concepts/hooks/).
-- **`rocky trace <run_id|latest>`** — Gantt-style timeline of a completed run with concurrency lanes, rendered from the state-store `RunRecord`.
-- **`rocky replay <run_id|latest>`** — flat per-model dump of SQL hashes, row counts, bytes, and timings captured at execution time.
-- **Timed half-open circuit breaker** — three-state (`Closed` / `Open` / `HalfOpen`) breaker shared across Databricks + Snowflake adapters. Fires `circuit_breaker_tripped` / `circuit_breaker_recovered` events.
-- **OTLP metrics export** (feature-gated via `--features otel`) — `rocky apply` exports in-process counters and histograms to any OTLP-compatible collector.
-- **Run-level budgets** — `[budget] max_usd` + `max_duration_ms` + `max_bytes_scanned` with `on_breach = "warn" | "error"`; any single dimension breach fires the `budget_breach` event. See [`[budget]`](/reference/configuration/#budget).
-- **Pre-merge budget projection** — `rocky preview cost` projects budget breaches against the branch totals before merge, so reviewers see "this PR would breach `max_usd` if merged" in the PR comment. Output field `projected_budget_breaches` mirrors `RunOutput.budget_breaches`; the Markdown flips between advisory and "would fail the run" based on `[budget].on_breach`.
-- **Rolling stats + model health score** — `rocky history --model <name> --rolling-stats [--window N]` augments `ModelHistoryOutput` with rolling z-score on `rows_affected` + `duration_ms` over the most recent N successful runs (default 20), plus a composite `health_score` (`1.0 − clamp((max(|z|) − 2) / 4, 0, 1)`).
-- **State-store retention sweep** — `[state.retention] {max_age_days, min_runs_kept, applies_to}` config knob + `rocky state retention sweep [--dry-run]` subcommand. Sweeps history (`runs`), lineage (`dag_snapshots`), and audit (`quality_history`); explicitly leaves operational state (schema cache, watermarks, partitions) untouched.
-- **Exhaustive checksum-bisection diff** — `rocky preview diff --algorithm bisection` walks the chunk lattice over a single-column integer / numeric primary key for exhaustive row-level coverage at bounded scan cost (`O(K · log_K(N))` chunks examined for a single-row change). Per-adapter native row-hashes — DuckDB `hash`, BigQuery `FARM_FINGERPRINT`, Databricks Spark `xxhash64`. Snowflake stays on the sampled fallback until a consumer drives the override.
-- **Per-run cost attribution** — `RunOutput.cost_summary` carries per-run total cost; per-materialization `cost_usd` flows through `MaterializationMetadata`.
-- **`rocky cost <run_id|latest>`** — historical rollup over stored runs. Reads the same `RunRecord` as `replay` / `trace`; recomputes per-model cost via the adapter-appropriate formula (duration × DBU for Databricks/Snowflake; bytes × $/TB for BigQuery; zero for DuckDB).
-- See the combo in action — POC #17 (trace + cost + replay against the same run_id): [examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo)
+- **15-event hook lifecycle**: pipeline / discover / compile / per-model / per-table / checks / drift / anomaly / state-sync events fire through the hook registry. See [Hooks](/concepts/hooks/).
+- **`rocky trace <run_id|latest>`**: Gantt-style timeline of a completed run with concurrency lanes, rendered from the state-store `RunRecord`.
+- **`rocky replay <run_id|latest>`**: flat per-model dump of SQL hashes, row counts, bytes, and timings captured at execution time.
+- **Timed half-open circuit breaker**: three-state (`Closed` / `Open` / `HalfOpen`) breaker shared across Databricks + Snowflake adapters. Fires `circuit_breaker_tripped` / `circuit_breaker_recovered` events.
+- **OTLP metrics export** (feature-gated via `--features otel`): `rocky apply` exports in-process counters and histograms to any OTLP-compatible collector.
+- **Run-level budgets**: `[budget] max_usd` + `max_duration_ms` + `max_bytes_scanned` with `on_breach = "warn" | "error"`; any single dimension breach fires the `budget_breach` event. See [`[budget]`](/reference/configuration/#budget).
+- **Pre-merge budget projection**: `rocky preview cost` projects budget breaches against the branch totals before merge, so reviewers see "this PR would breach `max_usd` if merged" in the PR comment. Output field `projected_budget_breaches` mirrors `RunOutput.budget_breaches`; the Markdown flips between advisory and "would fail the run" based on `[budget].on_breach`.
+- **Rolling stats + model health score**: `rocky history --model <name> --rolling-stats [--window N]` augments `ModelHistoryOutput` with rolling z-score on `rows_affected` + `duration_ms` over the most recent N successful runs (default 20), plus a composite `health_score` (`1.0 − clamp((max(|z|) − 2) / 4, 0, 1)`).
+- **State-store retention sweep**: `[state.retention] {max_age_days, min_runs_kept, applies_to}` config knob + `rocky state retention sweep [--dry-run]` subcommand. Sweeps history (`runs`), lineage (`dag_snapshots`), and audit (`quality_history`); explicitly leaves operational state (schema cache, watermarks, partitions) untouched.
+- **Exhaustive checksum-bisection diff**: `rocky preview diff --algorithm bisection` walks the chunk lattice over a single-column integer / numeric primary key for exhaustive row-level coverage at bounded scan cost (`O(K · log_K(N))` chunks examined for a single-row change). Per-adapter native row-hashes: DuckDB `hash`, BigQuery `FARM_FINGERPRINT`, Databricks Spark `xxhash64`. Snowflake stays on the sampled fallback until a consumer drives the override.
+- **Per-run cost attribution**: `RunOutput.cost_summary` carries per-run total cost; per-materialization `cost_usd` flows through `MaterializationMetadata`.
+- **`rocky cost <run_id|latest>`**: historical rollup over stored runs. Reads the same `RunRecord` as `replay` / `trace`; recomputes per-model cost via the adapter-appropriate formula (duration × DBU for Databricks/Snowflake; bytes × $/TB for BigQuery; zero for DuckDB).
+- See the combo in action in POC #17 (trace + cost + replay against the same run_id): [examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo)
 
 ## IDE / Language Server (11 capabilities)
 
@@ -202,7 +202,7 @@ Published VS Code extension with TextMate grammar + semantic tokens.
 
 - **dagster-rocky** package with `RockyResource` and `RockyComponent`
 - **Auto-discovery**: Rocky discover → Dagster asset definitions
-- **Dagster Pipes protocol**: Hand-rolled emitter (no external dependency) — reports materializations, check results, drift observations, anomaly alerts
+- **Dagster Pipes protocol**: hand-rolled emitter (no external dependency) that reports materializations, check results, drift observations, and anomaly alerts
 - **55 typed JSON output schemas** with auto-generated Pydantic v2 models and TypeScript interfaces via `rocky export-schemas`
 - **Freshness policies** auto-attached from `[checks.freshness]` config
 - **Column lineage** attached to derived model asset metadata
