@@ -591,10 +591,14 @@ pub struct ModelIr {
     ///
     /// # Runtime wiring
     ///
-    /// TODO(D-2): wire into `propagate_costs` once the
-    /// `CatalogClient::table_stats` provider spike (D-2) reaches a
-    /// go-decision. The field is populated today; the enforcement check is
-    /// not yet called.
+    /// Enforcement is wired: `rocky compile` runs
+    /// `cost_check::check_cost_ceilings` against the DAG-propagated
+    /// estimates from `propagate_costs`, and `rocky plan` runs
+    /// `check_cost_ceilings_plan`. Both compare each model's declared
+    /// ceiling against the estimated cost and emit a diagnostic on breach.
+    /// What remains pending is *real* warehouse statistics: today the
+    /// estimates come from offline heuristics, not live
+    /// `CatalogClient::table_stats` lookups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_ceiling: Option<CostBudget>,
 }
