@@ -1,0 +1,78 @@
+---
+title: Examples & POC catalog
+description: A catalog of small, runnable POCs, each demonstrating one Rocky capability end-to-end.
+sidebar:
+  order: 5
+---
+
+import pocCounts from "../../../data/poc-counts.json";
+
+The playground ships **{pocCounts.total} self-contained POCs** across {pocCounts.categoryCount} categories. Each is a small project with its own `rocky.toml`, `models/`, and a single `run.sh` that takes it end-to-end. Most run on local DuckDB with no credentials, so you can read the code and run it in one step.
+
+These complement the [Quickstart](/getting-started/quickstart/) and [Playground](/guides/playground/) walkthroughs: those teach the workflow, and the POCs show one capability each, in isolation.
+
+## Run one
+
+```bash
+git clone https://github.com/rocky-data/rocky.git
+cd rocky/examples/playground
+
+# Run any POC end-to-end (DuckDB, no credentials)
+./pocs/02-performance/01-incremental-watermark/run.sh
+```
+
+## Start with these
+
+The demos from the [README](https://github.com/rocky-data/rocky#readme), each a single `run.sh`:
+
+| What it shows | POC |
+|---|---|
+| Schema drift detected and recovered on the next run | [`02-performance/06-schema-drift-recover`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/02-performance/06-schema-drift-recover) |
+| Data contracts enforced at compile time (`E010` / `E013`) | [`01-quality/01-data-contracts-strict`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/01-quality/01-data-contracts-strict) |
+| Named branches, deterministic replay, and column lineage | [`00-foundations/06-branches-replay-lineage`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations/06-branches-replay-lineage) |
+| Column-level lineage on a branching DAG | [`06-developer-experience/01-lineage-column-level`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/01-lineage-column-level) |
+| AI model generation with the compile-verify loop | [`03-ai/01-model-generation`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/03-ai/01-model-generation) |
+| PR-time blast radius with `rocky lineage-diff` | [`06-developer-experience/11-lineage-diff`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/11-lineage-diff) |
+| Classify columns, mask by environment, gate CI | [`04-governance/05-classification-masking-compliance`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/04-governance/05-classification-masking-compliance) |
+| Incremental loads with persistent watermark state | [`02-performance/01-incremental-watermark`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/02-performance/01-incremental-watermark) |
+| One run, three views: `trace` + `cost` + `replay` | [`06-developer-experience/17-trace-replay-cost-combo`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo) |
+
+## Browse by category
+
+Each link opens the category folder on GitHub, where every POC has a README that states what it shows, the exact command, and the expected output.
+
+### [Foundations](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations) ({pocCounts.perCategory["00-foundations"]} POCs)
+
+DSL syntax, materialization basics, branches and replay, file ingest, per-tenant routing, and the plan/apply deployment workflow. Credential-free (DuckDB).
+
+### [Quality](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/01-quality) ({pocCounts.perCategory["01-quality"]} POCs)
+
+Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, the standalone quality pipeline, and freshness SLAs. Credential-free (DuckDB).
+
+### [Performance](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/02-performance) ({pocCounts.perCategory["02-performance"]} POCs)
+
+Incremental, merge, partition checksums, drift recovery, ephemeral CTEs, delete+insert, adaptive concurrency, cost and budgets, and `EXPLAIN`-based estimation. Credential-free (DuckDB).
+
+### [AI](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/03-ai) ({pocCounts.perCategory["03-ai"]} POCs)
+
+Model generation, intent extraction, schema-change sync, test generation, schema-grounded validation, and MCP data-grounding. Most need an `ANTHROPIC_API_KEY`.
+
+### [Governance](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/04-governance) ({pocCounts.perCategory["04-governance"]} POCs)
+
+Unity Catalog grants, schema patterns, workspace isolation, tagging, classification and masking, retention, and cross-team contracts. Some need a Databricks workspace; classification/masking and retention run on DuckDB.
+
+### [Orchestration](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/05-orchestration) ({pocCounts.perCategory["05-orchestration"]} POCs)
+
+Shell hooks, webhook presets, remote state, checkpoint/resume, the Valkey cache, Dagster DAG mode, the circuit breaker, and idempotency keys. DuckDB, with a few using Docker.
+
+### [Developer Experience](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience) ({pocCounts.perCategory["06-developer-experience"]} POCs)
+
+Column lineage, the HTTP API, dbt import, shadow mode, CI, trace Gantt views, portability lint, PR preview and data diff, and `lineage-diff`. Credential-free (DuckDB).
+
+### [Adapters](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters) ({pocCounts.perCategory["07-adapters"]} POCs)
+
+Snowflake dynamic tables, Databricks materialized views, Fivetran discovery, a custom process adapter, BigQuery, a Rust-native adapter skeleton, and Trino via Docker. Most need the matching warehouse; the process-adapter and Rust-skeleton POCs are credential-free.
+
+## The full catalog
+
+The complete, always-current list with a one-line description per POC lives in [`examples/playground/README.md`](https://github.com/rocky-data/rocky/tree/main/examples/playground#readme). It also documents the [benchmark suite](https://github.com/rocky-data/rocky/tree/main/examples/playground/benchmarks) comparing Rocky against dbt Core, dbt Fusion, and PySpark.
