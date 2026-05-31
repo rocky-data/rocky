@@ -1,0 +1,16 @@
+# Consumer project. It imports the producer's published `orders` snapshot.
+# `rocky compile` diffs the import's baseline against its current snapshot and
+# fails (E030) if a column this project reads was dropped by the producer.
+[adapter]
+type = "duckdb"
+path = "consumer.duckdb"
+
+# The cross-team contract. `path` is the vendored snapshot directory;
+# `baseline` is the prior published snapshot, `snapshot` the current one.
+# pin = "*" trusts whatever hash is vendored (a concrete recipe-hash would
+# gate on E033 instead).
+[imports.orders]
+path = "vendor/orders"
+snapshot = "current.json"
+baseline = "baseline.json"
+pin = "*"

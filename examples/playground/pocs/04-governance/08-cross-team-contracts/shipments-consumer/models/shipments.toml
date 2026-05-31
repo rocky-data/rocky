@@ -1,0 +1,14 @@
+name = "shipments"
+
+[target]
+catalog = "ship"
+schema = "core"
+table = "shipments"
+
+# Declares the producer table this model reads. The full name
+# (shop.core.orders) is the link key: it matches the producer's target, which
+# is how the import check attributes a dropped column to this consumer.
+[[sources]]
+catalog = "shop"
+schema = "core"
+table = "orders"

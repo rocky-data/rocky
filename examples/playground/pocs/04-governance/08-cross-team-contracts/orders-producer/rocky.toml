@@ -1,0 +1,10 @@
+# Producer project. `rocky publish-ir --with-seed` compiles the models
+# (seeding source schemas from data/seed.sql) and writes the typed ProjectIr
+# snapshot consumers vendor. The snapshot carries concrete column types only
+# because of --with-seed.
+#
+# publish-ir reads models + the seed directly (it does not consume this
+# config), so the producer config is just the adapter declaration.
+[adapter]
+type = "duckdb"
+path = "producer.duckdb"
