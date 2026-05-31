@@ -11,6 +11,7 @@ import { registerFormattingProvider } from "./formattingProvider";
 import { startLspClient, stopLspClient } from "./lspClient";
 import { registerRockyMcpProvider } from "./mcpServer";
 import { disposeOutputChannel } from "./output";
+import { registerRockyCacheInvalidation } from "./rockyCli";
 import { registerRunDecorations } from "./runDecorations";
 import { registerTaskProvider } from "./taskProvider";
 import { registerTestExplorer } from "./testExplorer";
@@ -27,6 +28,7 @@ export function activate(context: vscode.ExtensionContext): void {
     context.extensionMode === vscode.ExtensionMode.Development,
   );
   startLspClient(context);
+  registerRockyCacheInvalidation(context);
   registerCommands(context);
   registerChatParticipant(context);
   registerRockyMcpProvider(context);
