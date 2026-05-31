@@ -5,10 +5,10 @@ sidebar:
   order: 2
 ---
 
-The bronze layer is Rocky's config-driven replication within the warehouse. No SQL files needed — Rocky discovers what tables are available, generates the SQL, and copies data from the ingestion catalog into structured target catalogs/schemas.
+The bronze layer is Rocky's config-driven replication within the warehouse. No SQL files needed. Rocky discovers what tables are available, generates the SQL, and copies data from the ingestion catalog into structured target catalogs and schemas.
 
 :::note
-Rocky does not extract data from external systems. It operates on data that has already been landed in your warehouse by an ingestion tool (Fivetran, Airbyte, manual loads, etc.). The "discover" step finds what is available — it does not move data.
+Rocky does not extract data from external systems. It operates on data that has already been landed in your warehouse by an ingestion tool (Fivetran, Airbyte, manual loads, etc.). The "discover" step finds what is available; it does not move data.
 :::
 
 ## The flow
@@ -17,9 +17,9 @@ Rocky does not extract data from external systems. It operates on data that has 
 rocky discover  →  rocky plan  →  rocky apply
 ```
 
-1. **Discover** — Finds what schemas and tables are available for processing. For `fivetran` adapters, calls the Fivetran REST API to list connectors and enabled tables. For `duckdb` adapters, queries `information_schema`. For `manual` adapters, reads inline schema/table definitions. Discovery is metadata-only — it identifies what exists, it does not extract data.
-2. **Plan** — Parses source schema names, resolves target catalogs/schemas, generates SQL statements. Records a deterministic plan keyed by `plan_id`.
-3. **Apply** — Executes the plan by id: creates catalogs/schemas, copies data, runs quality checks, updates watermarks. The `rocky run` alias collapses plan + apply into a single invocation, for local iteration and automation.
+1. **Discover.** Finds what schemas and tables are available for processing. For `fivetran` adapters, it calls the Fivetran REST API to list connectors and enabled tables. For `duckdb` adapters, it queries `information_schema`. For `manual` adapters, it reads inline schema and table definitions. Discovery is metadata-only: it identifies what exists, it does not extract data.
+2. **Plan.** Parses source schema names, resolves target catalogs and schemas, and generates SQL statements. Records a deterministic plan keyed by `plan_id`.
+3. **Apply.** Executes the plan by id: creates catalogs and schemas, copies data, runs quality checks, updates watermarks. The `rocky run` alias collapses plan and apply into a single invocation for local iteration and automation.
 
 ## Schema pattern parsing
 

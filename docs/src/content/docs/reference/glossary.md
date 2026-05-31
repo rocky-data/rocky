@@ -1,0 +1,92 @@
+---
+title: Glossary
+description: Plain definitions of the terms Rocky uses.
+sidebar:
+  order: 7
+---
+
+Short definitions of the terms that show up across Rocky's docs, CLI output, and config. Each links to the page that covers it in depth.
+
+### Adapter
+
+A plugin that connects Rocky to a system. Source adapters (Fivetran, Airbyte, DuckDB, Iceberg, manual) discover what tables exist. Warehouse adapters (Databricks, Snowflake, BigQuery, Trino, DuckDB) run the SQL. The core engine stays warehouse-agnostic. See [Adapters](/concepts/adapters/).
+
+### Apply
+
+The execution half of the plan/apply workflow. `rocky apply <plan_id>` runs a plan that was already built and reviewed: it creates schemas, applies drift, copies or materializes data, and runs checks. See [Plan](#plan) and the [core pipeline commands](/reference/commands/core-pipeline/).
+
+### Branch
+
+A named, isolated copy of your pipeline's output, written to its own schema. You develop and run against a branch, inspect the result, then promote it or drop it. Nothing touches production until you promote. See [Branches and replay](/getting-started/roadmap/) and the `06-branches-replay-lineage` POC.
+
+### Bronze layer
+
+The raw replication layer: a config-driven 1:1 copy of source tables into the warehouse, with no SQL to write. Defined by a `[pipeline]` of `type = "replication"`. See [Bronze layer](/concepts/bronze-layer/).
+
+### Check
+
+A data-quality assertion that runs inline during a run (row counts, column match, freshness, custom SQL), not as a separate test step. See [Data quality checks](/features/data-quality-checks/).
+
+### Compile-time contract
+
+A schema agreement Rocky enforces before any row is written. A missing required column or an unsafe type change becomes a compile error (`E010`, `E013`) that blocks the PR. See [Testing and contracts](/concepts/testing/).
+
+### Content-addressed
+
+Identified by the hash of its contents rather than a name or timestamp. Rocky records each run's inputs, code, and outputs this way, which is what makes [replay](#replay) exact. See [Content-addressed writes](/concepts/content-addressed/).
+
+### Diagnostic code
+
+A stable identifier for a compiler finding: errors (`E001`–`E026`), warnings (`W001`–`W011`), and portability lints (`P001`–`P002`). Codes are searchable and map to a fix. See the [compiler](/concepts/compiler/).
+
+### Drift
+
+A mismatch between what your code expects and what the warehouse actually has, usually because a source column changed type or was added or dropped. Rocky detects it on every run and either recreates the target or blocks the PR. See [Schema drift](/features/schema-drift/).
+
+### IR (intermediate representation)
+
+The typed graph the compiler builds from your models before it generates SQL. Every transformation in Rocky runs through one IR, which is where types, lineage, and drift checks live. See [Architecture](/concepts/architecture/).
+
+### Lineage
+
+The map of which columns feed which, traced through every transformation at compile time. `rocky lineage-diff` reports the per-column downstream blast radius of a change for PR review. See the [compiler](/concepts/compiler/).
+
+### Materialization strategy
+
+How a model's output lands in the warehouse: `view`, `table`, `incremental`, `merge`, and others. Set per model. See [Model format](/reference/model-format/).
+
+### Model
+
+A single transformation: a `.sql` file (plus an optional `.toml` sidecar) or a `.rocky` DSL file that produces one table or view. See [Silver layer](/concepts/silver-layer/).
+
+### Pipeline
+
+A unit of work declared in `rocky.toml`. Rocky has four types: `replication` (bronze copy), `transformation` (SQL models), `quality` (standalone checks), and `snapshot` (SCD2 history). See [Configuration](/reference/configuration/).
+
+### Plan
+
+A deterministic, reviewable record of what a run will do: compiled SQL, drift actions, and checks, keyed by a `plan_id`. Build it with `rocky plan`, inspect it, then `rocky apply` it. The two steps are the auditable path for production and PR gating; `rocky run` does both at once for local work. See the [core pipeline commands](/reference/commands/core-pipeline/).
+
+### Replay
+
+Rebuilding a past run exactly from its [content-addressed](#content-addressed) record. `rocky replay <run_id>` reconstructs the inputs, code, and outputs bit-for-bit. See [Roadmap](/getting-started/roadmap/).
+
+### Shadow mode
+
+Running a changed model alongside the current one and comparing the output, so you see what a change does to the data before you ship it. See [Shadow mode](/concepts/shadow-mode/).
+
+### Silver layer
+
+The transformation layer: SQL (or `.rocky` DSL) models that build on the bronze copy. Defined by a `[pipeline]` of `type = "transformation"`. See [Silver layer](/concepts/silver-layer/).
+
+### State store
+
+The embedded database (`redb`) where Rocky keeps run records, watermarks, and plans, with optional S3 or Valkey sync. There is no `manifest.json`. See [State management](/concepts/state-management/).
+
+### Trust plane
+
+Rocky's role in your stack: the layer that owns the graph between your code and your data (types, lineage, drift, cost, contracts, governance) while storage and compute stay in your warehouse.
+
+### Watermark
+
+The high-water mark an incremental load stores so the next run only reads new rows (`INSERT … WHERE timestamp > watermark`). Kept in the [state store](#state-store). See [Incremental loads](/concepts/incremental/).
