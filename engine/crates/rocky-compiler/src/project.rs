@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use rayon::prelude::*;
 use rocky_core::models::{self, Model, ModelConfig, TargetConfig};
 use rocky_core::unified_dag::UnifiedDag;
 use rocky_ir::dag::{self, DagNode};
@@ -242,11 +241,11 @@ fn load_rocky_models_with_db(
     Ok(models)
 }
 
-/// Salsa-driven sibling of [`load_single_rocky_model`]. Uses
+/// Salsa-driven loader for a single `.rocky` file. Uses
 /// [`crate::salsa_compile::read_source`] +
 /// [`crate::salsa_compile::file_typecheck`] to get the lowered SQL
 /// through the database cache; the surrounding sidecar / defaults
-/// logic is identical.
+/// logic mirrors the `.sql` model loader.
 fn load_single_rocky_model_with_db(
     path: &Path,
     defaults: Option<&models::DirDefaults>,
@@ -341,143 +340,6 @@ fn load_single_rocky_model_with_db(
         }
     };
 
-    let contract_file = path.with_extension("contract.toml");
-    let contract_path = if contract_file.exists() {
-        Some(contract_file)
-    } else {
-        None
-    };
-
-    Ok(Model {
-        config,
-        sql,
-        file_path: path.display().to_string(),
-        contract_path,
-    })
-}
-
-/// Legacy non-salsa loader for `.rocky` files.
-///
-/// Kept for back-compat with call sites that construct projects
-/// without a salsa database — internally, [`Project::load`] now spins
-/// up a transient db and routes through [`load_rocky_models_with_db`].
-/// This function remains as a fallback used by tests that exercise
-/// the no-database path directly.
-#[allow(dead_code)]
-fn load_rocky_models(dir: &Path) -> Result<Vec<Model>, ProjectError> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    // Load optional directory defaults (shared with .sql model loader)
-    let defaults_path = dir.join("_defaults.toml");
-    let defaults = if defaults_path.exists() {
-        Some(models::load_dir_defaults(&defaults_path)?)
-    } else {
-        None
-    };
-
-    // 1. Collect .rocky file paths (lightweight sequential scan)
-    let rocky_paths: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(models::ModelError::ReadFile)?
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            if path.extension().is_some_and(|ext| ext == "rocky") {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if rocky_paths.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // 2. Parse + lower in parallel (CPU-bound per file)
-    let mut models: Vec<Model> = rocky_paths
-        .par_iter()
-        .map(|path| load_single_rocky_model(path, defaults.as_ref()))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Sort by name for deterministic ordering
-    models.sort_by(|a, b| a.config.name.cmp(&b.config.name));
-    Ok(models)
-}
-
-/// Parse, lower, and configure a single `.rocky` file into a `Model`.
-fn load_single_rocky_model(
-    path: &Path,
-    defaults: Option<&models::DirDefaults>,
-) -> Result<Model, ProjectError> {
-    let name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let content = std::fs::read_to_string(path).map_err(models::ModelError::ReadFile)?;
-
-    // Parse the .rocky file
-    let rocky_file = rocky_lang::parse(&content).map_err(|e| ProjectError::RockyParse {
-        path: path.display().to_string(),
-        reason: e.to_string(),
-    })?;
-
-    // Lower to SQL
-    let sql =
-        rocky_lang::lower::lower_to_sql(&rocky_file).map_err(|e| ProjectError::RockyLower {
-            path: path.display().to_string(),
-            reason: e,
-        })?;
-
-    // Check for sidecar .toml config
-    let toml_path = path.with_extension("toml");
-    let config = if toml_path.exists() {
-        // Use the sidecar loader which handles inference + defaults
-        models::load_model_pair(path, &toml_path, defaults)?.config
-    } else {
-        // No sidecar — use defaults or hardcoded fallback
-        let catalog = defaults
-            .as_ref()
-            .and_then(|d| d.target.as_ref())
-            .and_then(|t| t.catalog.clone())
-            .unwrap_or_else(|| "warehouse".to_string());
-        let schema = defaults
-            .as_ref()
-            .and_then(|d| d.target.as_ref())
-            .and_then(|t| t.schema.clone())
-            .unwrap_or_else(|| "default".to_string());
-        let strategy = defaults
-            .as_ref()
-            .and_then(|d| d.strategy.clone())
-            .unwrap_or_default();
-
-        ModelConfig {
-            name: name.clone(),
-            depends_on: vec![],
-            strategy,
-            target: TargetConfig {
-                catalog,
-                schema,
-                table: name.clone(),
-            },
-            sources: vec![],
-            adapter: None,
-            intent: defaults.as_ref().and_then(|d| d.intent.clone()),
-            freshness: defaults.as_ref().and_then(|d| d.freshness.clone()),
-            tests: vec![],
-            format: None,
-            format_options: None,
-            classification: Default::default(),
-            retention: None,
-            budget: None,
-            name_declared: String::new(),
-            target_table_declared: String::new(),
-        }
-    };
-
-    // Check for sibling contract file
     let contract_file = path.with_extension("contract.toml");
     let contract_path = if contract_file.exists() {
         Some(contract_file)
