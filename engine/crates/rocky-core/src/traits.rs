@@ -906,6 +906,40 @@ pub trait SqlDialect: Send + Sync {
         "VARCHAR"
     }
 
+    /// Build a validated, dialect-correct table reference for the
+    /// data-grounding tools from an already-split list of name segments.
+    ///
+    /// `parts` is 2 (`schema.table`) or 3 (`catalog.schema.table`)
+    /// segments. The result is interpolated directly into
+    /// `SELECT * FROM <ref> ...`, so it must be both injection-safe
+    /// (every segment validated) and syntactically correct for the
+    /// dialect.
+    ///
+    /// Default: validate each segment with the strict SQL-identifier rule
+    /// and join with dots, unquoted. This matches the behavior the
+    /// grounding path has always had on DuckDB, Snowflake, and Databricks
+    /// — unquoted, so Snowflake folds the segments to its default
+    /// uppercase casing rather than locking in a case-sensitive quoted
+    /// name. BigQuery overrides this because its project (catalog) segment
+    /// allows hyphens (which the strict rule rejects) and a hyphenated ref
+    /// parses as subtraction unless backtick-quoted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `parts` is not 2 or 3 segments, or if any
+    /// segment fails identifier validation.
+    fn ground_table_ref(&self, parts: &[&str]) -> AdapterResult<String> {
+        if !(2..=3).contains(&parts.len()) {
+            return Err(AdapterError::msg(
+                "table reference must be `schema.table` or `catalog.schema.table`",
+            ));
+        }
+        for part in parts {
+            rocky_sql::validation::validate_identifier(part).map_err(AdapterError::new)?;
+        }
+        Ok(parts.join("."))
+    }
+
     /// Build a NULL-safe inequality predicate: `lhs` differs from `rhs`,
     /// treating two NULLs as equal and a single NULL as a real difference.
     /// Used by SCD2 change detection on the watermark / check columns —

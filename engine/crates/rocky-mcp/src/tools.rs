@@ -1114,22 +1114,17 @@ impl RockyMcpServer {
             .warehouse_adapter()?
             .ok_or_else(|| anyhow::anyhow!("could not resolve the target warehouse adapter"))?;
 
+        let dialect = adapter.dialect();
         let table_ref = if target.contains('.') {
-            // Qualified raw reference — validate each segment and use it as-is.
-            // No compile required: this is how an agent grounds a source before
-            // (or without) authoring any model.
+            // Qualified raw reference — validate each segment and quote it
+            // dialect-correctly. No compile required: this is how an agent
+            // grounds a source before (or without) authoring any model. The
+            // dialect decides validation + quoting (e.g. BigQuery allows a
+            // hyphenated project segment and backtick-quotes the ref).
             let parts: Vec<&str> = target.split('.').collect();
-            if !(2..=3).contains(&parts.len()) {
-                return Err(anyhow::anyhow!(
-                    "table reference '{target}' must be `schema.table` or \
-                     `catalog.schema.table`"
-                ));
-            }
-            for part in &parts {
-                rocky_sql::validation::validate_identifier(part)
-                    .map_err(|e| anyhow::anyhow!("invalid identifier '{part}': {e}"))?;
-            }
-            parts.join(".")
+            dialect
+                .ground_table_ref(&parts)
+                .map_err(|e| anyhow::anyhow!("invalid table reference '{target}': {e}"))?
         } else {
             // Bare name — resolve the model's target coordinates by compiling
             // the models dir. Emit `catalog.schema.table` when the target
@@ -1143,7 +1138,14 @@ impl RockyMcpServer {
                 .find(|m| m.config.name == target)
                 .ok_or_else(|| anyhow::anyhow!("model '{target}' not found in project"))?;
             let t = &model.config.target;
-            qualify_table_ref(&t.catalog, &t.schema, &t.table)?
+            let parts: Vec<&str> = if t.catalog.is_empty() {
+                vec![&t.schema, &t.table]
+            } else {
+                vec![&t.catalog, &t.schema, &t.table]
+            };
+            dialect
+                .ground_table_ref(&parts)
+                .map_err(|e| anyhow::anyhow!("invalid model target reference: {e}"))?
         };
 
         Ok(Prepared { adapter, table_ref })
@@ -1253,24 +1255,6 @@ struct Prepared {
 impl Prepared {
     fn dialect_tablesample(&self, percent: u32) -> Option<String> {
         self.adapter.dialect().tablesample_clause(percent)
-    }
-}
-
-/// Build a validated, dialect-agnostic table reference from a model's target
-/// coordinates. Emits `catalog.schema.table` when a catalog is set
-/// (Snowflake/BigQuery/Databricks), or `schema.table` otherwise (DuckDB has no
-/// catalog level). Each segment is validated as a SQL identifier.
-fn qualify_table_ref(catalog: &str, schema: &str, table: &str) -> anyhow::Result<String> {
-    let schema = rocky_sql::validation::validate_identifier(schema)
-        .map_err(|e| anyhow::anyhow!("invalid schema identifier: {e}"))?;
-    let table = rocky_sql::validation::validate_identifier(table)
-        .map_err(|e| anyhow::anyhow!("invalid table identifier: {e}"))?;
-    if catalog.is_empty() {
-        Ok(format!("{schema}.{table}"))
-    } else {
-        let catalog = rocky_sql::validation::validate_identifier(catalog)
-            .map_err(|e| anyhow::anyhow!("invalid catalog identifier: {e}"))?;
-        Ok(format!("{catalog}.{schema}.{table}"))
     }
 }
 
@@ -1653,23 +1637,40 @@ mod tests {
     }
 
     #[test]
-    fn qualify_table_ref_emits_catalog_when_present() {
-        // Catalog set (Snowflake/BigQuery/Databricks) → three-part name.
+    fn ground_table_ref_default_emits_unquoted_segments() {
+        use rocky_core::traits::SqlDialect;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        // The grounding path routes a parsed table ref through the target
+        // dialect's `ground_table_ref`. The default (DuckDB/Snowflake/
+        // Databricks) joins validated segments unquoted — Snowflake relies on
+        // this to fold to its default uppercase casing rather than locking in
+        // a case-sensitive quoted name.
+        let d = DuckDbSqlDialect;
+        // Three-part name (catalog.schema.table).
         assert_eq!(
-            qualify_table_ref("analytics", "raw", "orders").unwrap(),
+            d.ground_table_ref(&["analytics", "raw", "orders"]).unwrap(),
             "analytics.raw.orders"
         );
-        // No catalog (DuckDB) → two-part name.
+        // Two-part name (schema.table).
         assert_eq!(
-            qualify_table_ref("", "raw", "orders").unwrap(),
+            d.ground_table_ref(&["raw", "orders"]).unwrap(),
             "raw.orders"
         );
     }
 
     #[test]
-    fn qualify_table_ref_rejects_bad_identifier() {
-        assert!(qualify_table_ref("", "raw", "orders; DROP TABLE x").is_err());
-        assert!(qualify_table_ref("a.b", "raw", "orders").is_err());
+    fn ground_table_ref_default_rejects_bad_identifier_and_arity() {
+        use rocky_core::traits::SqlDialect;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+        let d = DuckDbSqlDialect;
+        // Injection in any segment is rejected.
+        assert!(
+            d.ground_table_ref(&["raw", "orders; DROP TABLE x"])
+                .is_err()
+        );
+        // A four-part ref (or a single bare name) is out of range.
+        assert!(d.ground_table_ref(&["a", "b", "c", "d"]).is_err());
+        assert!(d.ground_table_ref(&["orders"]).is_err());
     }
 
     #[test]

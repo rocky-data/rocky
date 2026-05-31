@@ -274,6 +274,14 @@ mod tests {
     }
 
     #[test]
+    fn string_type_name_is_varchar() {
+        // DuckDB accepts `CAST(... AS VARCHAR)`, so the data-grounding cast
+        // uses the trait default.
+        let d = dialect();
+        assert_eq!(d.string_type_name(), "VARCHAR");
+    }
+
+    #[test]
     fn test_create_table_as() {
         let d = dialect();
         let sql = d.create_table_as("sch.tbl", "SELECT * FROM src");
