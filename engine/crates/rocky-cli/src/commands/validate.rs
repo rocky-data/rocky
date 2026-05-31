@@ -999,18 +999,27 @@ fn lint_config(
     }
 }
 
+/// Line prefix for a message severity in human-readable validate output.
+///
+/// Errors render with a distinct ` ERR ` prefix (matching `rocky doctor`)
+/// so a failed validation is visually distinguishable from a warning —
+/// both previously shared the `  !! ` prefix, hiding the difference
+/// between a hard failure and an advisory.
+fn severity_prefix(severity: &str) -> &'static str {
+    match severity {
+        "ok" => "  ok ",
+        "warn" => "  !! ",
+        "error" => " ERR ",
+        "lint" => " note",
+        _ => "     ",
+    }
+}
+
 /// Render the structured output as human-readable text (matching today's
 /// format for backward compatibility).
 fn render_text(output: &ValidateOutput) {
     for msg in &output.messages {
-        let prefix = match msg.severity.as_str() {
-            "ok" => "  ok ",
-            "warn" => "  !! ",
-            "error" => "  !! ",
-            "lint" => " note",
-            _ => "     ",
-        };
-        println!("{prefix} {}", msg.message);
+        println!("{} {}", severity_prefix(&msg.severity), msg.message);
     }
     println!();
     println!("Validation complete.");
@@ -1672,5 +1681,16 @@ backend = "local"
             lint_codes.contains(&"L007"),
             "expected L007 (adapter repetition)"
         );
+    }
+
+    #[test]
+    fn test_error_and_warning_render_with_distinct_prefixes() {
+        // Errors must be visually distinguishable from warnings in the
+        // human-readable output — they previously shared `  !! `.
+        assert_eq!(severity_prefix("error"), " ERR ");
+        assert_eq!(severity_prefix("warn"), "  !! ");
+        assert_ne!(severity_prefix("error"), severity_prefix("warn"));
+        assert_eq!(severity_prefix("ok"), "  ok ");
+        assert_eq!(severity_prefix("lint"), " note");
     }
 }
