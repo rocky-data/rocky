@@ -95,7 +95,7 @@ rocky history --model fct_revenue --since 2026-03-01
 }
 ```
 
-`sql_hash` is stable across runs where the compiled SQL is identical — useful for detecting model body changes across runs.
+`sql_hash` is stable across runs where the compiled SQL is identical; useful for detecting model body changes across runs.
 
 Show history with table output:
 
@@ -117,7 +117,7 @@ run_20260401_080015      | 2026-04-01T08:00:15Z  | 52.1s     | 19     | 1      |
 | Field | Description |
 |-------|-------------|
 | `triggering_identity` | Principal that initiated the run (OS user, CI service account, etc.). |
-| `session_source` | One of `cli`, `dagster`, `lsp`, `http_api` — auto-detected at run start. |
+| `session_source` | One of `cli`, `dagster`, `lsp`, `http_api`, auto-detected at run start. |
 | `git_commit` | Commit SHA at the project root (`None` when not a git repo). |
 | `git_branch` | Branch name at the project root (`None` when not a git repo). |
 | `idempotency_key` | Echoed value of `--idempotency-key` (`None` when the flag wasn't used). |
@@ -361,7 +361,7 @@ Exactly one scope is required: a fully-qualified `<model>`, `--catalog <name>`, 
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--catalog <NAME>` | `string` | | Aggregate per-table OPTIMIZE/VACUUM SQL across every Rocky-managed table in the catalog. The managed-table set is resolved from the pipeline config (replication discovery or transformation model files) — no warehouse round trip. Mutually exclusive with `<model>` and `--measure-dedup`. Errors with the available catalogs listed if no managed tables match. |
+| `--catalog <NAME>` | `string` | | Aggregate per-table OPTIMIZE/VACUUM SQL across every Rocky-managed table in the catalog. The managed-table set is resolved from the pipeline config (replication discovery or transformation model files); no warehouse round trip. Mutually exclusive with `<model>` and `--measure-dedup`. Errors with the available catalogs listed if no managed tables match. |
 | `--target-size <SIZE>` | `string` | | Target file size (e.g., `256MB`, `512MB`, `1GB`). |
 | `--dry-run` | `bool` | `false` | Show SQL without executing. |
 | `--measure-dedup` | `bool` | `false` | Experimental. Measure the cross-table dedup ratio across all Rocky-managed tables in the project (Layer 0 storage experiment). Project-wide; does not take a model argument. |
@@ -371,7 +371,7 @@ Exactly one scope is required: a fully-qualified `<model>`, `--catalog <name>`, 
 
 ### Examples
 
-`rocky compact` generates SQL — it doesn't execute. Pipe the output of `rocky -o table compact ... --dry-run` to your warehouse once you're happy with the plan, or drop `--dry-run` and let Rocky run the statements in sequence.
+`rocky compact` generates SQL; it doesn't execute. Pipe the output of `rocky -o table compact ... --dry-run` to your warehouse once you're happy with the plan, or drop `--dry-run` and let Rocky run the statements in sequence.
 
 Compact a table (dry run):
 
@@ -403,7 +403,7 @@ The generated SQL uses the Delta `ZORDER` / file-size hints; `target_size_mb` ec
 
 #### Catalog-scoped compaction
 
-`--catalog <name>` resolves every Rocky-managed table in the named catalog and emits a single envelope keyed by FQN. The flat `statements` list still carries every SQL statement across all tables in iteration order — consumers that just want to execute the plan don't need to walk `tables`.
+`--catalog <name>` resolves every Rocky-managed table in the named catalog and emits a single envelope keyed by FQN. The flat `statements` list still carries every SQL statement across all tables in iteration order; consumers that just want to execute the plan don't need to walk `tables`.
 
 ```bash
 rocky compact --catalog acme_warehouse --target-size 256MB --dry-run
@@ -441,11 +441,11 @@ rocky compact --catalog acme_warehouse --target-size 256MB --dry-run
 }
 ```
 
-The single-model envelope is byte-stable — `catalog`, `scope`, `tables`, and `totals` are all `skip_serializing_if = "Option::is_none"`. The catalog identifier is normalized to lowercase to match the managed-table resolver.
+The single-model envelope is byte-stable: `catalog`, `scope`, `tables`, and `totals` are all `skip_serializing_if = "Option::is_none"`. The catalog identifier is normalized to lowercase to match the managed-table resolver.
 
 #### Layer 0 dedup measurement (experimental)
 
-`--measure-dedup` runs a project-wide analysis that hashes each row on its semantic columns and reports the fraction of duplicate content across Rocky-managed tables. It is a research tool for Rocky's Layer 0 storage work — the output is a measurement, not a plan, and no SQL is issued against the target tables.
+`--measure-dedup` runs a project-wide analysis that hashes each row on its semantic columns and reports the fraction of duplicate content across Rocky-managed tables. It is a research tool for Rocky's Layer 0 storage work; the output is a measurement, not a plan, and no SQL is issued against the target tables.
 
 ```bash
 # Cheap partition-level estimate across all Rocky-managed tables
@@ -518,7 +518,7 @@ rocky profile-storage acme_warehouse.staging__us_west__shopify.orders
 }
 ```
 
-`rocky profile-storage` is advisory — it does not run the profile SQL for you. Pipe `profile_sql` into `rocky shell` (or any SQL client) to collect the actual cardinality numbers.
+`rocky profile-storage` is advisory; it does not run the profile SQL for you. Pipe `profile_sql` into `rocky shell` (or any SQL client) to collect the actual cardinality numbers.
 
 ### Related Commands
 
@@ -548,7 +548,7 @@ rocky archive --catalog <name> [flags]   # every Rocky-managed table in the cata
 
 ### Examples
 
-Like `compact`, `archive` is SQL-generating — it builds `DELETE ... WHERE partition_key < cutoff` (or `COPY TO` for cold-storage workflows) and either prints them (`--dry-run`) or executes them in order.
+Like `compact`, `archive` is SQL-generating: it builds `DELETE ... WHERE partition_key < cutoff` (or `COPY TO` for cold-storage workflows) and either prints them (`--dry-run`) or executes them in order.
 
 Preview archival for data older than 90 days:
 
@@ -582,7 +582,7 @@ Archive a specific model's old data (omitting `--dry-run` executes the statement
 rocky archive --older-than 6m --model acme_warehouse.staging__us_west__shopify.events
 ```
 
-Same output shape — `model` is set when `--model` filters the run. `older_than_days` is the parsed duration (`6m` → `180`), which lets orchestrators compute retention windows without re-parsing the string.
+Same output shape: `model` is set when `--model` filters the run. `older_than_days` is the parsed duration (`6m` → `180`), which lets orchestrators compute retention windows without re-parsing the string.
 
 #### Catalog-scoped archival
 
@@ -621,7 +621,7 @@ rocky archive --older-than 90d --catalog acme_warehouse --dry-run
 }
 ```
 
-The single-model envelope is byte-stable — `catalog`, `scope`, `tables`, and `totals` are absent on the existing `rocky archive` and `rocky archive --model` paths.
+The single-model envelope is byte-stable: `catalog`, `scope`, `tables`, and `totals` are absent on the existing `rocky archive` and `rocky archive --model` paths.
 
 ### Related Commands
 
@@ -633,7 +633,7 @@ The single-model envelope is byte-stable — `catalog`, `scope`, `tables`, and `
 
 ## `rocky replay`
 
-Inspect a recorded run from the state store. Surfaces the per-model SQL hashes, row counts, bytes, and timings captured by `RunRecord` at execution time — the concrete artefact behind the reproducibility claim. Inspection-only today; re-execution with pinned inputs is an Arc 1 follow-up.
+Inspect a recorded run from the state store. Surfaces the per-model SQL hashes, row counts, bytes, and timings captured by `RunRecord` at execution time: the concrete artefact behind the reproducibility claim. Inspection-only today; re-execution with pinned inputs is a follow-up.
 
 ```bash
 rocky replay <target> [flags]
@@ -714,7 +714,7 @@ rocky replay run_20260420_143022 --model fct_revenue
 
 ## `rocky trace`
 
-Render a completed run as a Gantt-style timeline. Sibling to `rocky replay` — reads the same `RunRecord`, but lays out models by start offset and assigns them to concurrency lanes so overlapping models show up on separate rows.
+Render a completed run as a Gantt-style timeline. Sibling to `rocky replay`: it reads the same `RunRecord`, but lays out models by start offset and assigns them to concurrency lanes so overlapping models show up on separate rows.
 
 ```bash
 rocky trace <target> [flags]
@@ -814,7 +814,7 @@ parallelism: 2 lanes
 
 ## `rocky cost`
 
-Historical cost rollup for a completed run. Reads the same `RunRecord` as [`rocky replay`](#rocky-replay) and [`rocky trace`](#rocky-trace), then recomputes per-model cost via the adapter-appropriate formula (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero). Sibling commands — replay shows what ran, trace shows when, `cost` shows what it cost.
+Historical cost rollup for a completed run. Reads the same `RunRecord` as [`rocky replay`](#rocky-replay) and [`rocky trace`](#rocky-trace), then recomputes per-model cost via the adapter-appropriate formula (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero). The three are siblings: replay shows what ran, trace shows when, `cost` shows what it cost.
 
 ```bash
 rocky cost <target> [flags]
@@ -896,10 +896,10 @@ status: success   adapter: databricks   total: $0.101
 
 ### Adapter coverage
 
-- **Databricks / Snowflake** — cost computed from recorded duration × DBU rate × `$/DBU`. Configure via `[cost]` in `rocky.toml` (see [configuration reference](/reference/configuration/#cost)).
-- **BigQuery** — computed from recorded `bytes_scanned` × `$6.25/TB`. `rocky cost` surfaces real dollars here even when the live `rocky apply` still reports `None` for BQ bytes on its own `RunOutput.cost_summary`, because the state-store record is written before that plumbing completes.
-- **DuckDB / local** — `$0.00` by definition (no billed compute).
-- **Discovery adapters (Fivetran, Airbyte, etc.)** — skipped; cost is `None`.
+- **Databricks / Snowflake**: cost computed from recorded duration × DBU rate × `$/DBU`. Configure via `[cost]` in `rocky.toml` (see [configuration reference](/reference/configuration/#cost)).
+- **BigQuery**: computed from recorded `bytes_scanned` × `$6.25/TB`. `rocky cost` surfaces real dollars here even when the live `rocky apply` still reports `None` for BQ bytes on its own `RunOutput.cost_summary`, because the state-store record is written before that plumbing completes.
+- **DuckDB / local**: `$0.00` by definition (no billed compute).
+- **Discovery adapters (Fivetran, Airbyte, etc.)**: skipped; cost is `None`.
 
 Missing `adapter_type` or unconfigured `[cost]` degrades cleanly: the command still emits duration + bytes totals but leaves `cost_usd` as `null`.
 
@@ -926,22 +926,22 @@ rocky state clear-schema-cache [--dry-run] # flush the DESCRIBE cache
 
 | Subcommand | Description |
 |------------|-------------|
-| `show` (default) | Display stored watermarks. Same output as bare `rocky state` — the named form is provided so scripts can be explicit. |
+| `show` (default) | Display stored watermarks. Same output as bare `rocky state`; the named form is provided so scripts can be explicit. |
 | `clear-schema-cache` | Flush the `DESCRIBE TABLE` schema cache. See [`rocky state clear-schema-cache`](#rocky-state-clear-schema-cache). |
 
 ### State-path resolution
 
 When `--state-path` is omitted, Rocky resolves the state file via `rocky_core::state::resolve_state_path`:
 
-1. `<models>/.rocky-state.redb` — canonical location for new projects; matches the LSP convention so inlay hints observe the same file `rocky apply` writes.
-2. Legacy CWD `.rocky-state.redb` — still works; emits a one-time deprecation warning on stderr.
-3. Both present — CWD wins (preserves existing watermarks, branches, and partition bookkeeping); a louder warning asks you to reconcile. Merge is lossy — delete one copy to silence the warning.
-4. Neither present — fresh project lands on `<models>/.rocky-state.redb` when a `models/` directory exists; otherwise falls back to CWD (keeps replication-only pipelines working without inventing a `models/` directory just to hold state).
+1. `<models>/.rocky-state.redb`: canonical location for new projects; matches the LSP convention so inlay hints observe the same file `rocky apply` writes.
+2. Legacy CWD `.rocky-state.redb`: still works; emits a one-time deprecation warning on stderr.
+3. Both present: CWD wins (preserves existing watermarks, branches, and partition bookkeeping); a louder warning asks you to reconcile. Merge is lossy, so delete one copy to silence the warning.
+4. Neither present: fresh project lands on `<models>/.rocky-state.redb` when a `models/` directory exists; otherwise it falls back to CWD (keeps replication-only pipelines working without inventing a `models/` directory just to hold state).
 
 Explicit `--state-path <PATH>` always wins; no resolver logic is applied.
 
 :::note[Upgrading to v1.16.0 state paths]
-Fresh projects land on `<models>/.rocky-state.redb`. Existing users with a CWD `.rocky-state.redb` will see a one-time deprecation warning on stderr and can either move the file into `models/` to silence the warning, or keep using the CWD location (it continues to work). If both files exist, CWD wins on collision — delete one to silence the louder reconcile warning. Passing `--state-path` explicitly bypasses the resolver.
+Fresh projects land on `<models>/.rocky-state.redb`. Existing users with a CWD `.rocky-state.redb` will see a one-time deprecation warning on stderr and can either move the file into `models/` to silence the warning, or keep using the CWD location (it continues to work). If both files exist, CWD wins on collision; delete one to silence the louder reconcile warning. Passing `--state-path` explicitly bypasses the resolver.
 :::
 
 ### Related Commands
@@ -954,7 +954,7 @@ Fresh projects land on `<models>/.rocky-state.redb`. Existing users with a CWD `
 
 ## `rocky state clear-schema-cache`
 
-Flush the Arc 7 wave-2 `DESCRIBE TABLE` schema cache. Complement to the TTL-driven eviction on the read path — use this when the project needs a fresh typecheck *now* (e.g., after a manual warehouse DDL change, before a strict-CI run, while debugging a suspected stale-cache mismatch).
+Flush the `DESCRIBE TABLE` schema cache. Complement to the TTL-driven eviction on the read path; use this when the project needs a fresh typecheck *now* (e.g., after a manual warehouse DDL change, before a strict-CI run, while debugging a suspected stale-cache mismatch).
 
 ```bash
 rocky state clear-schema-cache
@@ -969,7 +969,7 @@ rocky state clear-schema-cache --dry-run
 
 ### Behavior
 
-- Removes every row from the `SCHEMA_CACHE` redb table. The cache is cheap to rebuild — the next `rocky apply` (write tap) or `rocky discover --with-schemas` warms it back up.
+- Removes every row from the `SCHEMA_CACHE` redb table. The cache is cheap to rebuild; the next `rocky apply` (write tap) or `rocky discover --with-schemas` warms it back up.
 - **No prompt.** Entries are disposable; explicit opt-in by running the command is sufficient.
 - **Missing state store is a no-op.** A fresh CI runner with no `.rocky-state.redb` yet exits zero with `entries_deleted: 0`. This keeps "flush before build" safe to run unconditionally on ephemeral runners.
 - Uninitialised cache tables return `entries_deleted: 0` without touching redb.
@@ -1010,7 +1010,7 @@ rocky compliance [--env NAME] [--exceptions-only] [--fail-on exception]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--env <NAME>` | `string` | | Scope the report to a single environment. When unset, the report expands across the defaults plus every `[mask.<env>]` override block declared in `rocky.toml`. A named env that has no matching `[mask.<env>]` block still reports under that label — the resolver falls back to the `[mask]` defaults. |
+| `--env <NAME>` | `string` | | Scope the report to a single environment. When unset, the report expands across the defaults plus every `[mask.<env>]` override block declared in `rocky.toml`. A named env that has no matching `[mask.<env>]` block still reports under that label; the resolver falls back to the `[mask]` defaults. |
 | `--exceptions-only` | `bool` | `false` | Filter `per_column` to rows that produced at least one exception. The `exceptions` list is unaffected; allow-listed tags are suppressed from `per_column` under this flag. |
 | `--fail-on <CONDITION>` | `exception` | | Gate condition. Only `exception` is supported in v1. When set, exits `1` when one or more exceptions are emitted. Useful as a CI gate that blocks merges that leave classified columns unmasked. |
 | `--models <PATH>` | `string` | `models` | Models directory to scan for `[classification]` sidecars. |
@@ -1019,9 +1019,9 @@ rocky compliance [--env NAME] [--exceptions-only] [--fail-on exception]
 
 - Loads `rocky.toml` and every model sidecar with a non-empty `[classification]` block. Each `(model, column, env)` triple is evaluated against the resolved masking strategy.
 - `MaskStrategy::None` ("explicit identity") counts as masked: the project has deliberately opted out, which is a conscious policy decision, not an enforcement gap.
-- Tags listed on `[classifications] allow_unmasked` suppress exception emission but still report `enforced = false` in the per-column breakdown — the allow list doesn't pretend the column is masked.
+- Tags listed on `[classifications] allow_unmasked` suppress exception emission but still report `enforced = false` in the per-column breakdown; the allow list doesn't pretend the column is masked.
 - Exit `1` with `--fail-on exception` when any exception is emitted; otherwise exit `0` regardless of exception count (the JSON payload still reports them).
-- **Static rollup — no warehouse calls.** Fast enough to run in every PR.
+- **Static rollup, no warehouse calls.** Fast enough to run in every PR.
 - JSON output is `ComplianceOutput` (`summary`, `per_column`, `exceptions`).
 
 ### Example
@@ -1089,7 +1089,7 @@ rocky retention-status [--model NAME] [--drift]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--model <NAME>` | `string` | | Scope the report to a single model by name. |
-| `--drift` | `bool` | `false` | **v2 stretch — deferred.** v1 filters output to models with a declared policy and leaves `warehouse_days` `null`. In v2, Rocky will probe the warehouse via `SHOW TBLPROPERTIES` (Databricks) / `SHOW PARAMETERS ... FOR TABLE` (Snowflake) and populate `warehouse_days`. The JSON schema is already stable so v2 fills the field without a shape break. Text output prints a `note: --drift probe is deferred to v2` on stderr. |
+| `--drift` | `bool` | `false` | **v2 stretch, deferred.** v1 filters output to models with a declared policy and leaves `warehouse_days` `null`. In v2, Rocky will probe the warehouse via `SHOW TBLPROPERTIES` (Databricks) / `SHOW PARAMETERS ... FOR TABLE` (Snowflake) and populate `warehouse_days`. The JSON schema is already stable so v2 fills the field without a shape break. Text output prints a `note: --drift probe is deferred to v2` on stderr. |
 | `--models <PATH>` | `string` | `models` | Models directory. |
 
 ### Behavior

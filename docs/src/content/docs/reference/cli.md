@@ -121,7 +121,7 @@ rocky discover [--pipeline NAME] [--with-schemas]
 **Behavior:**
 
 - For `fivetran` adapters, calls the Fivetran REST API to list connectors and their enabled tables. For `duckdb` adapters, queries `information_schema.{schemata,tables}`. For `manual` adapters, reads inline schema/table definitions.
-- This is a **metadata-only operation** — it identifies what schemas and tables exist, it does not extract or move data.
+- This is a **metadata-only operation**: it identifies what schemas and tables exist, it does not extract or move data.
 - Parses each source schema name using the pipeline's `schema_pattern` to extract structured components (tenant, regions, source, etc.).
 - Returns structured data about every discovered source and its tables.
 
@@ -216,11 +216,11 @@ rocky run --filter <key=value> [flags]
 | `--shadow-suffix <SUFFIX>` | | Suffix appended to table names in shadow mode (default `_rocky_shadow`). |
 | `--shadow-schema <NAME>` | | Override schema for shadow tables (mutually exclusive with `--shadow-suffix`). |
 | `--branch <NAME>` | | Execute against a named branch created with `rocky branch create`. Mutually exclusive with `--shadow` / `--shadow-schema`. See [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch). |
-| `--idempotency-key <KEY>` | | Caller-supplied opaque key used to dedup this run against prior runs with the same key. Three outcomes: a prior run succeeded (or reached a terminal state under `dedup_on = "any"`) → exit 0 with `status = "skipped_idempotent"` and the prior `skipped_by_run_id`; another caller currently holds the claim within `in_flight_ttl_hours` → exit 0 with `status = "skipped_in_flight"`; otherwise proceed normally. Rejected when combined with `--resume` / `--resume-latest` (resume is an explicit override). Stamps are stored verbatim — do not put secrets in the key. See [`[state.idempotency]`](/reference/configuration/) for tuning. |
+| `--idempotency-key <KEY>` | | Caller-supplied opaque key used to dedup this run against prior runs with the same key. Three outcomes: a prior run succeeded (or reached a terminal state under `dedup_on = "any"`) → exit 0 with `status = "skipped_idempotent"` and the prior `skipped_by_run_id`; another caller currently holds the claim within `in_flight_ttl_hours` → exit 0 with `status = "skipped_in_flight"`; otherwise proceed normally. Rejected when combined with `--resume` / `--resume-latest` (resume is an explicit override). Stamps are stored verbatim; do not put secrets in the key. See [`[state.idempotency]`](/reference/configuration/) for tuning. |
 
 **Pipeline stages (in order):**
 
-1. **Discover** — enumerate sources and tables from the configured source adapter.
+1. **Discover.** Enumerate sources and tables from the configured source adapter.
 2. **Governance setup** (sequential, per matching catalog/schema):
    - Create catalog (if `auto_create_catalogs = true`)
    - Apply catalog tags (`ALTER CATALOG SET TAGS`)
@@ -229,13 +229,13 @@ rocky run --filter <key=value> [flags]
    - Create schema (if `auto_create_schemas = true`)
    - Apply schema tags (`ALTER SCHEMA SET TAGS`)
    - Apply schema-level grants (`GRANT ... ON SCHEMA`)
-3. **Parallel table processing** — for each table concurrently (up to `execution.concurrency`):
+3. **Parallel table processing.** For each table concurrently (up to `execution.concurrency`):
    - Drift detection (compare column types between source and target)
    - Copy data (incremental or full refresh SQL)
    - Apply table tags
    - Update watermark in state store
-4. **Batched checks** — row count, column match, freshness (batched with UNION ALL for efficiency)
-5. **Retry** — failed tables retried sequentially (configurable via `execution.table_retries`)
+4. **Batched checks.** Row count, column match, freshness (batched with UNION ALL for efficiency)
+5. **Retry.** Failed tables retried sequentially (configurable via `execution.table_retries`)
 
 :::note
 Governance (tags, workspace bindings, permissions) is NOT a separate CLI command. It runs inline during `rocky apply` (or the `rocky run` alias) as catalogs and schemas are created. The governance features are Databricks Unity Catalog specific.
@@ -326,7 +326,7 @@ rocky doctor --check state_rw   # live round-trip probe against the remote state
 rocky doctor --verbose
 ```
 
-Prints extra per-check context (config path, state file size, adapter type + credential signal, pipeline kind, state backend) under each check in human-readable output. The JSON output is unchanged unless `--verbose` is passed — each `checks[]` entry then carries a `details` array of `[key, value]` string pairs (omitted entirely when empty). Credential signal values: `token`, `oauth_client`, `oauth_token`, `key_pair`, `password`, `service_account`, `adc`, `env`, `none`.
+Prints extra per-check context (config path, state file size, adapter type + credential signal, pipeline kind, state backend) under each check in human-readable output. The JSON output is unchanged unless `--verbose` is passed; each `checks[]` entry then carries a `details` array of `[key, value]` string pairs (omitted entirely when empty). Credential signal values: `token`, `oauth_client`, `oauth_token`, `key_pair`, `password`, `service_account`, `adc`, `env`, `none`.
 
 ---
 
@@ -489,10 +489,10 @@ rocky state clear-schema-cache [--dry-run] # flush the DESCRIBE cache
 
 When `--state-path` is not passed, Rocky resolves the state file via `rocky_core::state::resolve_state_path`:
 
-1. `<models>/.rocky-state.redb` — canonical location for new projects; matches the LSP convention so inlay hints observe the same file `rocky apply` writes.
-2. Legacy `.rocky-state.redb` in CWD — still works; emits a one-time deprecation warning on stderr.
-3. Both present — CWD wins (to preserve existing watermarks / branches / partitions); a louder warning asks you to reconcile. Merge is lossy.
-4. Neither present — fresh project lands on `<models>/.rocky-state.redb` when a `models/` directory exists, otherwise CWD.
+1. `<models>/.rocky-state.redb`: canonical location for new projects; matches the LSP convention so inlay hints observe the same file `rocky apply` writes.
+2. Legacy `.rocky-state.redb` in CWD: still works; emits a one-time deprecation warning on stderr.
+3. Both present: CWD wins (to preserve existing watermarks / branches / partitions); a louder warning asks you to reconcile. Merge is lossy.
+4. Neither present: fresh project lands on `<models>/.rocky-state.redb` when a `models/` directory exists, otherwise CWD.
 
 Explicit `--state-path <PATH>` always overrides the resolver.
 
@@ -569,15 +569,15 @@ table = "customers_history"
 
 **Strategies:**
 
-- **Timestamp** — detects changes by comparing the `updated_at` column between source and target. Efficient when the source maintains a reliable last-modified timestamp.
-- **Check** — detects changes by comparing specified columns between source and target. Used when there is no reliable timestamp.
+- **Timestamp.** Detects changes by comparing the `updated_at` column between source and target. Efficient when the source maintains a reliable last-modified timestamp.
+- **Check.** Detects changes by comparing specified columns between source and target. Used when there is no reliable timestamp.
 
 **Generated SQL steps:**
 
-1. **Initial load** — `CREATE TABLE IF NOT EXISTS` with SCD2 columns added
-2. **Close changed rows** — MERGE that sets `valid_to` and `is_current = FALSE`
-3. **Insert new versions** — INSERT for rows that were just closed
-4. **Invalidate hard deletes** (optional) — UPDATE rows missing from source
+1. **Initial load.** `CREATE TABLE IF NOT EXISTS` with SCD2 columns added
+2. **Close changed rows.** MERGE that sets `valid_to` and `is_current = FALSE`
+3. **Insert new versions.** INSERT for rows that were just closed
+4. **Invalidate hard deletes** (optional). UPDATE rows missing from source
 
 **JSON output:**
 
@@ -622,7 +622,7 @@ rocky docs --models models/ --output site/api.html  # Custom paths
 - Loads all `.sql` and `.rocky` model files with their TOML sidecars.
 - Extracts: name, description (from `intent`), target table, strategy, dependencies, tests.
 - Renders a self-contained HTML page with dark theme, search, and model cards.
-- No external dependencies — the HTML is fully self-contained.
+- No external dependencies; the HTML is fully self-contained.
 
 **JSON output:**
 
@@ -662,7 +662,7 @@ rocky shell --pipeline prod    # Use a specific pipeline's adapter
 | `.schema <table>` | Describe columns for a table. |
 | `.quit` / `.exit` | Exit the shell. |
 
-Multi-line queries are supported — end a statement with `;` to execute.
+Multi-line queries are supported; end a statement with `;` to execute.
 
 ---
 
@@ -705,7 +705,7 @@ rocky fmt --check            # Check mode: exit non-zero if any file needs forma
 
 | Flag | Description |
 |------|-------------|
-| `--check` | Check mode for CI — exits non-zero if any file would be reformatted. |
+| `--check` | Check mode for CI; exits non-zero if any file would be reformatted. |
 
 **Arguments:**
 
@@ -717,7 +717,7 @@ rocky fmt --check            # Check mode: exit non-zero if any file needs forma
 
 ### `rocky compliance`
 
-Governance rollup over classification sidecars plus the project `[mask]` policy. Answers: "are all classified columns masked wherever policy says they should be?" Static resolver — no warehouse calls.
+Governance rollup over classification sidecars plus the project `[mask]` policy. Answers: "are all classified columns masked wherever policy says they should be?" Static resolver, no warehouse calls.
 
 ```bash
 rocky compliance [--env NAME] [--exceptions-only] [--fail-on exception]
@@ -729,13 +729,13 @@ rocky compliance [--env NAME] [--exceptions-only] [--fail-on exception]
 |------|---------|-------------|
 | `--env <NAME>` | (expand all) | Scope the report to a single environment (e.g. `prod`). When unset, the report expands across the defaults plus every `[mask.<env>]` override block. |
 | `--exceptions-only` | `false` | Filter `per_column` to rows that produced at least one exception. The `exceptions` list is unaffected. |
-| `--fail-on <CONDITION>` | | Gate condition. The only supported value is `exception` — exits `1` when any exception is emitted. Useful as a CI gate to block merges that leave classified columns unmasked. |
+| `--fail-on <CONDITION>` | | Gate condition. The only supported value is `exception`; it exits `1` when any exception is emitted. Useful as a CI gate to block merges that leave classified columns unmasked. |
 | `--models <PATH>` | `models` | Models directory to scan for `[classification]` sidecars. |
 
 **Behavior:**
 
 - Walks every model's `[classification]` sidecar block and, for each `(model, column, env)` triple, resolves the masking strategy from `[mask]` / `[mask.<env>]`.
-- `MaskStrategy::None` counts as masked — an explicit-identity policy is a conscious decision, not an enforcement gap.
+- `MaskStrategy::None` counts as masked; an explicit-identity policy is a conscious decision, not an enforcement gap.
 - Tags listed under `[classifications] allow_unmasked` suppress exception emission but still report `enforced = false` in the per-column breakdown.
 - JSON output is [`ComplianceOutput`](/reference/json-output/) (`summary` / `per_column` / `exceptions`).
 
@@ -754,7 +754,7 @@ rocky retention-status [--model NAME] [--drift]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--model <NAME>` | (all) | Scope the report to a single model. |
-| `--drift` | `false` | Stretch goal reserved for v2 — today this filters output to models with a declared policy and leaves `warehouse_days` null. The warehouse probe (`SHOW TBLPROPERTIES` / `SHOW PARAMETERS`) is deferred. |
+| `--drift` | `false` | Stretch goal reserved for v2; today this filters output to models with a declared policy and leaves `warehouse_days` null. The warehouse probe (`SHOW TBLPROPERTIES` / `SHOW PARAMETERS`) is deferred. |
 | `--models <PATH>` | `models` (via `rocky.toml`) | Models directory. |
 
 **Behavior:**
