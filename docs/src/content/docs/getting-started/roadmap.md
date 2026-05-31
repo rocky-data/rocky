@@ -10,7 +10,7 @@ We are explicit about the line between what Rocky ships and what's still coming.
 ## Shipped and production-grade
 
 - **Databricks** is the production target for 2026: SQL Statement API, Unity Catalog, OAuth M2M, adaptive concurrency, and `SHALLOW CLONE` for branches.
-- **The compiler** — typed column-level inference, the diagnostic codes, the LSP — runs the same in CI and in your editor.
+- **The compiler.** Typed column-level inference, the diagnostic codes, and the LSP all run the same in CI and in your editor.
 - **Branches and replay.** Named branches as isolated schemas, and content-addressed replay that rebuilds a past run exactly.
 - **Cost attribution.** Per-model cost on every run record, with `[budget]` blocks that fail a run on overspend.
 - **The AI compile-validate loop.** `rocky ai` generates a model, compiles it, and auto-fixes parse errors before it lands.

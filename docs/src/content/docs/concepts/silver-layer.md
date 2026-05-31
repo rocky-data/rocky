@@ -19,7 +19,7 @@ Each model is two files with the same base name:
 
 ```
 models/
-├── fct_orders.sql    # Pure SQL — opens cleanly in any SQL editor
+├── fct_orders.sql    # Pure SQL; opens cleanly in any SQL editor
 └── fct_orders.toml   # Configuration
 ```
 
