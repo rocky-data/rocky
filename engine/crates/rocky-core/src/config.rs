@@ -1905,6 +1905,46 @@ fn format_env_var_hint(substitutions: &[EnvVarSubstitution]) -> String {
 // Config v2: Named adapters + named pipelines
 // ===========================================================================
 
+/// A single imported producer-project snapshot.
+///
+/// Declared as `[imports.<name>]` in `rocky.toml`. A producer project
+/// publishes a serialized snapshot of its compiled project (via
+/// `rocky publish-ir`); a consumer project vendors that snapshot file and
+/// references it here so `rocky compile` can verify that the columns the
+/// consumer reads still exist in the producer's output.
+///
+/// ```toml
+/// [imports.orders]
+/// path = "vendor/orders"        # directory holding the vendored snapshots
+/// snapshot = "current.json"     # the producer's current published snapshot
+/// baseline = "baseline.json"    # optional prior snapshot used for diffing
+/// pin = "*"                     # optional recipe-hash pin ("*" = trust any)
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImportEntry {
+    /// Directory (relative to `rocky.toml`) holding the vendored snapshot
+    /// files.
+    pub path: String,
+
+    /// Filename of the producer's current published snapshot, relative to
+    /// `path`.
+    pub snapshot: String,
+
+    /// Optional filename of a prior/pinned snapshot used as the diff
+    /// baseline, relative to `path`. When set, `rocky compile` diffs
+    /// `baseline` against `snapshot` to detect columns the producer
+    /// dropped.
+    #[serde(default)]
+    pub baseline: Option<String>,
+
+    /// Optional recipe-hash pin (hex). When set to a concrete hash, the
+    /// snapshot's recipe hash must match or compilation fails. `"*"` (or
+    /// absent) trusts whatever snapshot is vendored.
+    #[serde(default)]
+    pub pin: Option<String>,
+}
+
 /// Top-level Rocky configuration (v2 format).
 ///
 /// Uses named adapters and named pipelines:
@@ -2044,6 +2084,18 @@ pub struct RockyConfig {
     /// `expected_lag_seconds` value (the required field).
     #[serde(default)]
     pub freshness: ProjectFreshnessConfig,
+
+    /// Imported producer-project snapshots, keyed by import name.
+    ///
+    /// Each `[imports.<name>]` block points at a vendored snapshot of a
+    /// producer project's compiled IR. During `rocky compile`, the
+    /// consumer's column references are checked against the producer's
+    /// published schema: a column the producer dropped but the consumer
+    /// still reads surfaces as an error (E030), and a recipe-hash mismatch
+    /// against a configured `pin` surfaces as E033. Empty by default — a
+    /// project with no imports incurs no extra work.
+    #[serde(default)]
+    pub imports: IndexMap<String, ImportEntry>,
 }
 
 impl RockyConfig {
@@ -4611,6 +4663,43 @@ impl ReplicationPipelineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_imports_block_parses() {
+        let toml_str = r#"
+[imports.orders]
+path = "vendor/orders"
+snapshot = "current.json"
+baseline = "baseline.json"
+pin = "*"
+"#;
+        let config: RockyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.imports.len(), 1);
+        let entry = &config.imports["orders"];
+        assert_eq!(entry.path, "vendor/orders");
+        assert_eq!(entry.snapshot, "current.json");
+        assert_eq!(entry.baseline.as_deref(), Some("baseline.json"));
+        assert_eq!(entry.pin.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn test_imports_block_absent_is_empty() {
+        let config: RockyConfig = toml::from_str("").unwrap();
+        assert!(config.imports.is_empty());
+    }
+
+    #[test]
+    fn test_imports_minimal_entry() {
+        let toml_str = r#"
+[imports.shipments]
+path = "vendor/shipments"
+snapshot = "snap.json"
+"#;
+        let config: RockyConfig = toml::from_str(toml_str).unwrap();
+        let entry = &config.imports["shipments"];
+        assert!(entry.baseline.is_none());
+        assert!(entry.pin.is_none());
+    }
 
     #[test]
     fn test_env_var_substitution() {

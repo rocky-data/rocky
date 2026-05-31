@@ -56,6 +56,25 @@ pub const E026: &str = "E026";
 /// when available, falling back to conservative stub statistics.
 pub const E027: &str = "E027";
 
+// Errors — imported producer contracts
+/// Consumer references a column that an imported producer snapshot dropped.
+///
+/// Emitted by `rocky compile` when a project declares an `[imports.<name>]`
+/// block and one of its models reads a column that the producer's published
+/// snapshot no longer outputs (detected by diffing the import's `baseline`
+/// against its current `snapshot`). This is the cross-team-contracts gate:
+/// a producer's breaking change fails the consumer's compile before the
+/// consumer ships SQL that reads a column that no longer exists.
+pub const E030: &str = "E030";
+
+/// Imported snapshot's recipe hash does not match the configured `pin`.
+///
+/// Emitted by `rocky compile` when an `[imports.<name>]` block sets a
+/// concrete `pin` (recipe-hash hex) and the vendored snapshot's recipe hash
+/// differs. Signals the consumer is compiling against a producer snapshot it
+/// has not pinned to — the vendored file drifted from the agreed contract.
+pub const E033: &str = "E033";
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";
@@ -77,6 +96,11 @@ pub const W005: &str = "W005";
 pub const W010: &str = "W010";
 /// Contract exists for a model not found in the project.
 pub const W011: &str = "W011";
+/// An `[imports.<name>]` snapshot (or its baseline) could not be loaded, so
+/// the import's cross-team-contract checks (E030/E033) were skipped. Not an
+/// error — the consumer compiles, it just isn't verified against that
+/// producer this run.
+pub const W012: &str = "W012";
 
 // Info
 /// Model dependency inferred from SQL.

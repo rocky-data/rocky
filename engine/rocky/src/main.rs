@@ -732,6 +732,31 @@ enum Command {
         with_seed: bool,
     },
 
+    /// Publish a snapshot of this project's compiled IR for consumers to
+    /// vendor (cross-team contracts).
+    ///
+    /// Compiles the project and writes its typed `ProjectIr` as JSON. A
+    /// consumer project vendors that file and references it via an
+    /// `[imports.<name>]` block; the consumer's `rocky compile` then fails
+    /// (E030) if this project drops a column the consumer still reads. Use
+    /// `--with-seed` so the snapshot carries concrete column types — without
+    /// it, the contract has nothing to check against.
+    PublishIr {
+        /// Models directory
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
+        /// Contracts directory
+        #[arg(long)]
+        contracts: Option<PathBuf>,
+        /// Output path for the snapshot JSON file
+        #[arg(long, default_value = "project-ir.json")]
+        out: PathBuf,
+        /// Run `data/seed.sql` against an in-memory DuckDB before compiling
+        /// so leaf models resolve concrete column types in the snapshot.
+        #[arg(long)]
+        with_seed: bool,
+    },
+
     /// Show the full unified DAG (all pipeline stages and dependencies)
     Dag {
         /// Models directory
@@ -2388,6 +2413,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             with_seed,
             cli.cache_ttl,
         ),
+        Command::PublishIr {
+            models,
+            contracts,
+            out,
+            with_seed,
+        } => rocky_cli::commands::run_publish_ir(&models, contracts.as_deref(), &out, with_seed),
         Command::Dag {
             models,
             seeds,
