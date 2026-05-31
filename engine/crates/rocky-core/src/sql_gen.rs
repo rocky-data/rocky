@@ -985,6 +985,17 @@ mod tests {
     struct TestDialect;
 
     impl SqlDialect for TestDialect {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        // The lakehouse integration tests below exercise the
+        // Databricks-flavoured `USING <format>` path, so this stand-in
+        // advertises support for it.
+        fn supports_lakehouse_format_ddl(&self) -> bool {
+            true
+        }
+
         fn format_table_ref(
             &self,
             catalog: &str,

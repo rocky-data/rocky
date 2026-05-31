@@ -32,19 +32,36 @@ pub use rocky_ir::lakehouse::{LakehouseError, LakehouseFormat, LakehouseOptions}
 /// * `target` — Fully-qualified target name (already formatted via `dialect.format_table_ref`).
 /// * `select_sql` — The body `SELECT` statement (or full query for views/MVs).
 /// * `options` — Format-specific options (partitioning, clustering, properties).
-/// * `dialect` — The warehouse SQL dialect (used for `format_table_ref` validation).
+/// * `dialect` — The warehouse SQL dialect. Used both for `format_table_ref`
+///   validation and to gate the Spark/Databricks-only `USING <format>` DDL:
+///   dialects that don't advertise `supports_lakehouse_format_ddl()` fail
+///   fast rather than emitting SQL their warehouse rejects.
 ///
 /// # Errors
 ///
-/// Returns [`LakehouseError`] if an identifier fails validation or the
-/// format is unsupported for the given dialect context.
+/// Returns [`LakehouseError::DialectUnsupported`] when the target dialect
+/// cannot render the `format = X` DDL (every dialect except Databricks
+/// today), or [`LakehouseError`] if an identifier fails validation.
 pub fn generate_lakehouse_ddl(
     format: &LakehouseFormat,
     target: &str,
     select_sql: &str,
     options: &LakehouseOptions,
-    _dialect: &dyn SqlDialect,
+    dialect: &dyn SqlDialect,
 ) -> Result<Vec<String>, LakehouseError> {
+    // Fail fast on dialects that can't render the lakehouse `format = X`
+    // DDL. The generator below emits the Spark/Databricks `USING DELTA |
+    // ICEBERG … TBLPROPERTIES(…)` grammar, which Snowflake / BigQuery /
+    // Trino / DuckDB reject at parse time. Refusing here surfaces a clear
+    // known-limitation error at plan/compile time instead of a raw
+    // warehouse syntax error at apply time.
+    if !dialect.supports_lakehouse_format_ddl() {
+        return Err(LakehouseError::DialectUnsupported {
+            format: format.to_string(),
+            dialect: dialect.name().to_string(),
+        });
+    }
+
     // Validate option identifiers up front.
     validate_options(options)?;
 
@@ -246,6 +263,17 @@ mod tests {
     struct TestDialect;
 
     impl SqlDialect for TestDialect {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        // This stand-in represents the Databricks-flavoured dialect that
+        // the lakehouse DDL generator targets, so it advertises support
+        // for the `USING <format>` grammar exercised by these tests.
+        fn supports_lakehouse_format_ddl(&self) -> bool {
+            true
+        }
+
         fn format_table_ref(
             &self,
             catalog: &str,
@@ -848,6 +876,151 @@ mod tests {
     // -----------------------------------------------------------------------
     // Clause ordering (ensure clauses appear in the right order)
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Dialect gating (D1)
+    // -----------------------------------------------------------------------
+
+    /// A dialect that does NOT advertise `supports_lakehouse_format_ddl`
+    /// — stands in for Snowflake / BigQuery / Trino / DuckDB, which
+    /// can't render the Spark `USING <format>` grammar.
+    struct NonSparkDialect;
+
+    impl SqlDialect for NonSparkDialect {
+        fn name(&self) -> &'static str {
+            "non_spark"
+        }
+
+        fn format_table_ref(
+            &self,
+            catalog: &str,
+            schema: &str,
+            table: &str,
+        ) -> AdapterResult<String> {
+            rocky_sql::validation::format_table_ref(catalog, schema, table)
+                .map_err(AdapterError::new)
+        }
+
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            format!("CREATE OR REPLACE TABLE {target} AS\n{select_sql}")
+        }
+
+        fn insert_into(&self, target: &str, select_sql: &str) -> String {
+            format!("INSERT INTO {target}\n{select_sql}")
+        }
+
+        fn merge_into(
+            &self,
+            _target: &str,
+            _source_sql: &str,
+            _keys: &[std::sync::Arc<str>],
+            _update_cols: &ColumnSelection,
+        ) -> AdapterResult<String> {
+            unimplemented!("not needed for lakehouse gating tests")
+        }
+
+        fn select_clause(
+            &self,
+            _columns: &ColumnSelection,
+            _metadata: &[rocky_ir::MetadataColumn],
+        ) -> AdapterResult<String> {
+            unimplemented!("not needed for lakehouse gating tests")
+        }
+
+        fn watermark_where(
+            &self,
+            _timestamp_col: &str,
+            _last_watermark: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
+            unimplemented!("not needed for lakehouse gating tests")
+        }
+
+        fn describe_table_sql(&self, table_ref: &str) -> String {
+            format!("DESCRIBE TABLE {table_ref}")
+        }
+
+        fn drop_table_sql(&self, table_ref: &str) -> String {
+            format!("DROP TABLE IF EXISTS {table_ref}")
+        }
+
+        fn create_catalog_sql(&self, _name: &str) -> Option<AdapterResult<String>> {
+            None
+        }
+
+        fn create_schema_sql(
+            &self,
+            _catalog: &str,
+            _schema: &str,
+        ) -> Option<AdapterResult<String>> {
+            None
+        }
+
+        fn tablesample_clause(&self, _percent: u32) -> Option<String> {
+            None
+        }
+
+        fn insert_overwrite_partition(
+            &self,
+            _target: &str,
+            _partition_filter: &str,
+            _select_sql: &str,
+        ) -> AdapterResult<Vec<String>> {
+            unimplemented!("not needed for lakehouse gating tests")
+        }
+    }
+
+    #[test]
+    fn test_lakehouse_format_rejected_on_non_spark_dialect() {
+        // `format = "iceberg"` on a dialect that can't render the
+        // `USING <format>` grammar must fail fast with the known-limitation
+        // error — naming both the format and the dialect — rather than
+        // emitting Spark SQL the warehouse would reject at apply time.
+        let err = generate_lakehouse_ddl(
+            &LakehouseFormat::IcebergTable,
+            "cat.sch.events",
+            "SELECT * FROM cat.raw.events",
+            &default_opts(),
+            &NonSparkDialect,
+        )
+        .expect_err("non-Spark dialect must refuse lakehouse format DDL");
+
+        match err {
+            LakehouseError::DialectUnsupported { format, dialect } => {
+                assert_eq!(format, "iceberg_table");
+                assert_eq!(dialect, "non_spark");
+            }
+            other => panic!("expected DialectUnsupported, got {other:?}"),
+        }
+
+        // The error message must name the limitation clearly and must NOT
+        // contain emitted Spark SQL.
+        let msg = generate_lakehouse_ddl(
+            &LakehouseFormat::DeltaTable,
+            "cat.sch.events",
+            "SELECT 1",
+            &default_opts(),
+            &NonSparkDialect,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("is not implemented for adapter/dialect 'non_spark'"));
+        assert!(!msg.contains("USING DELTA"));
+    }
+
+    #[test]
+    fn test_lakehouse_format_still_emitted_on_spark_dialect() {
+        // The Databricks/Spark happy path is preserved: a supporting
+        // dialect still emits the `USING <format>` DDL.
+        let stmts = generate_lakehouse_ddl(
+            &LakehouseFormat::IcebergTable,
+            "cat.sch.events",
+            "SELECT * FROM cat.raw.events",
+            &default_opts(),
+            &dialect(),
+        )
+        .expect("supporting dialect emits lakehouse DDL");
+        assert!(stmts[0].contains("USING ICEBERG"));
+    }
 
     #[test]
     fn test_delta_clause_ordering() {

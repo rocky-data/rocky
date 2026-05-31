@@ -684,10 +684,64 @@ fn parse_i128(v: &serde_json::Value) -> AdapterResult<i128> {
 /// Each warehouse adapter provides a dialect implementation. rocky-core's
 /// SQL generation functions use this trait instead of hardcoding SQL patterns.
 pub trait SqlDialect: Send + Sync {
+    /// Human-readable dialect name, used in diagnostics and
+    /// known-limitation errors (e.g. `"snowflake"`, `"bigquery"`,
+    /// `"trino"`, `"databricks"`).
+    ///
+    /// The default is intentionally generic so the trait stays
+    /// object-safe and existing test dialects keep compiling; every
+    /// shipping adapter overrides it.
+    fn name(&self) -> &'static str {
+        "unknown"
+    }
+
     /// Format a fully qualified table reference.
     /// Databricks: `catalog.schema.table` (three-part)
     /// DuckDB/Postgres: `schema.table` (two-part)
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String>;
+
+    /// Whether this dialect can render lakehouse-native `format = X` DDL
+    /// (the Spark/Databricks `CREATE OR REPLACE TABLE … USING DELTA |
+    /// ICEBERG … TBLPROPERTIES(…)` shape, plus `STREAMING TABLE` and the
+    /// MV variant).
+    ///
+    /// Only the Databricks dialect emits this grammar today, so the
+    /// default is `false`. `generate_lakehouse_ddl` consults this and
+    /// fails fast with a clear known-limitation error rather than
+    /// emitting Spark-only SQL that the target warehouse rejects.
+    ///
+    /// This is a capability flag, not a vendor flag: a future Trino
+    /// (Iceberg-native) lakehouse path would override it to `true` once
+    /// the generator learns Trino's `WITH (format = 'ICEBERG')` shape.
+    fn supports_lakehouse_format_ddl(&self) -> bool {
+        false
+    }
+
+    /// Whether this dialect can render Delta-Lake maintenance operations
+    /// (`OPTIMIZE` / `VACUUM` / `ZORDER`). Only the Databricks dialect
+    /// today; the default is `false`.
+    ///
+    /// `compact` / `archive` consult this and fail fast with a clear
+    /// known-limitation error rather than emitting `OPTIMIZE` / `VACUUM`
+    /// (and the Databricks-only `DATEADD` form) that the target
+    /// warehouse rejects at parse time.
+    fn supports_delta_maintenance(&self) -> bool {
+        false
+    }
+
+    /// Whether a full-refresh write must be preceded by an explicit
+    /// `DROP TABLE IF EXISTS` to be idempotent.
+    ///
+    /// Most warehouses (`Databricks`, `Snowflake`, `BigQuery`, `DuckDB`)
+    /// implement `create_table_as` as an atomic `CREATE OR REPLACE
+    /// TABLE`, so re-running a full refresh is a no-op-safe overwrite —
+    /// the default is `false`. Trino's portable `CREATE TABLE … AS` has
+    /// no `OR REPLACE` across all connectors (Hive pre-414), so a second
+    /// run hits "table already exists"; Trino overrides this to `true`
+    /// and the runtime issues a leading `DROP TABLE IF EXISTS`.
+    fn full_refresh_needs_predrop(&self) -> bool {
+        false
+    }
 
     /// CREATE TABLE AS SELECT (full refresh).
     /// Databricks: `CREATE OR REPLACE TABLE {target} AS {select}`

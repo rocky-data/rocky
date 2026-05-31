@@ -18,6 +18,21 @@ use rocky_sql::validation;
 pub struct DatabricksSqlDialect;
 
 impl SqlDialect for DatabricksSqlDialect {
+    fn name(&self) -> &'static str {
+        "databricks"
+    }
+
+    // Databricks (Spark) is the only dialect that renders the lakehouse
+    // `USING DELTA | ICEBERG … TBLPROPERTIES(…)` DDL and the Delta-Lake
+    // maintenance grammar (`OPTIMIZE` / `VACUUM`).
+    fn supports_lakehouse_format_ddl(&self) -> bool {
+        true
+    }
+
+    fn supports_delta_maintenance(&self) -> bool {
+        true
+    }
+
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
         validation::format_table_ref(catalog, schema, table).map_err(AdapterError::new)
     }

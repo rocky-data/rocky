@@ -24,6 +24,15 @@ pub enum LakehouseError {
     #[error("unsupported format for dialect: {0}")]
     UnsupportedFormat(String),
 
+    /// The target dialect cannot render the lakehouse `format = X` DDL.
+    /// Raised by `generate_lakehouse_ddl` when the dialect does not
+    /// advertise `supports_lakehouse_format_ddl()` — today every dialect
+    /// except Databricks. This is a known limitation of the generator,
+    /// not a property of the format itself (Trino does Iceberg
+    /// natively); the message names both the format and the dialect.
+    #[error("lakehouse format '{format}' DDL is not implemented for adapter/dialect '{dialect}'")]
+    DialectUnsupported { format: String, dialect: String },
+
     #[error("invalid option: {0}")]
     InvalidOption(String),
 }

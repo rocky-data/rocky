@@ -23,6 +23,10 @@ impl TrinoDialect {
 }
 
 impl SqlDialect for TrinoDialect {
+    fn name(&self) -> &'static str {
+        "trino"
+    }
+
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
         // Trino is always three-part: <catalog>.<schema>.<table>. Each
         // component is double-quoted (Trino's standard identifier

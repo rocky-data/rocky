@@ -9,6 +9,10 @@ use rocky_sql::validation;
 pub struct BigQueryDialect;
 
 impl SqlDialect for BigQueryDialect {
+    fn name(&self) -> &'static str {
+        "bigquery"
+    }
+
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
         // BigQuery uses project.dataset.table (three-part). The project
         // (catalog) component allows hyphens; dataset + table stay on
