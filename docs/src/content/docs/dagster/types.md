@@ -8,7 +8,7 @@ sidebar:
 All data returned by `RockyResource` methods is parsed into Pydantic v2 models. These models provide type safety, validation, and IDE autocompletion.
 
 :::tip[Source of truth]
-Most types are generated from the engine's JSON schemas via `just codegen` — see [JSON Output](/reference/json-output/) for the pipeline. The hand-written aliases in `dagster_rocky.types` (documented below) re-export the generated classes with Python-flavored names. If a field is missing from this page, consult the generated module (`dagster_rocky.types_generated`) as the canonical definition.
+Most types are generated from the engine's JSON schemas via `just codegen`; see [JSON Output](/reference/json-output/) for the pipeline. The hand-written aliases in `dagster_rocky.types` (documented below) re-export the generated classes with Python-flavored names. If a field is missing from this page, consult the generated module (`dagster_rocky.types_generated`) as the canonical definition.
 :::
 
 ## Discover types

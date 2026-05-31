@@ -28,7 +28,7 @@ attributes:
 
 ## Opt-in surfaces
 
-Five fields toggle additional behaviour on top of the basic discover/compile cache. All default to off — existing components see no behaviour change unless you flip them on.
+Five fields toggle additional behaviour on top of the basic discover/compile cache. All default to off; existing components see no behaviour change unless you flip them on.
 
 | Field | Since | YAML | What it does |
 |---|---|---|---|
@@ -36,7 +36,7 @@ Five fields toggle additional behaviour on top of the basic discover/compile cac
 | `surface_retention_status` | 1.13.0 | yes | Calls `rocky retention-status` once per materialization batch and emits one `AssetObservation` per model row, keyed by model. |
 | `discover_on_missing_state` | 1.14.0 | yes | If the local state file is absent at code-server load, `build_defs` runs `write_state_to_path()` synchronously instead of returning an empty `Definitions`. Skipped under `dg dev` (which relies on the CLI workflow) and only applies when state management is local-filesystem. |
 | `surface_column_lineage` | 1.14.0 | yes | At code-server load, walks `models_dir/*.toml` (skipping `_*.toml` and `*.contract.toml`), calls `rocky lineage` per model, and merges the resulting `dagster.TableColumnLineage` into each matching `AssetSpec`'s `metadata["dagster/column_lineage"]`. |
-| `post_state_write_hook` | 1.14.0 | **no — Python only** | Callable invoked with the state-file path immediately after every successful `write_state_to_path()`. Typical use: push the freshly-written state to a durable store (S3, Valkey) so the next ephemeral pod boots with the cache pre-warmed. |
+| `post_state_write_hook` | 1.14.0 | **no, Python only** | Callable invoked with the state-file path immediately after every successful `write_state_to_path()`. Typical use: push the freshly-written state to a durable store (S3, Valkey) so the next ephemeral pod boots with the cache pre-warmed. |
 
 ```yaml
 type: dagster_rocky.RockyComponent
@@ -50,7 +50,7 @@ attributes:
   discover_on_missing_state: true
 ```
 
-`post_state_write_hook` cannot be set from YAML — arbitrary Python callables are not YAML-resolvable, and a non-null YAML value raises `ResolutionException` at component load. Set it programmatically in a subclass instead:
+`post_state_write_hook` cannot be set from YAML; arbitrary Python callables are not YAML-resolvable, and a non-null YAML value raises `ResolutionException` at component load. Set it programmatically in a subclass instead:
 
 ```python
 from pathlib import Path
@@ -79,7 +79,7 @@ By default, the component stores its state on the local filesystem. This is conf
 
 ## DAG mode
 
-When `dag_mode: true` is set, the component calls `rocky dag` to build a fully connected asset graph where every pipeline stage — source, load, transformation, seed, quality, snapshot — becomes a Dagster asset with resolved upstream dependencies. This replaces the separate `discover` + `surface_derived_models` paths with a single unified DAG.
+When `dag_mode: true` is set, the component calls `rocky dag` to build a fully connected asset graph where every pipeline stage (source, load, transformation, seed, quality, snapshot) becomes a Dagster asset with resolved upstream dependencies. This replaces the separate `discover` + `surface_derived_models` paths with a single unified DAG.
 
 ```yaml
 type: dagster_rocky.RockyComponent

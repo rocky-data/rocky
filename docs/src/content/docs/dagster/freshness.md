@@ -129,13 +129,13 @@ policies = per_model_freshness_policies(compile_result)
 
 `dagster-rocky` uses Dagster 1.12+'s
 [`FreshnessPolicy.time_window(fail_window=...)`](https://docs.dagster.io/api/dagster/assets#dagster.FreshnessPolicy.time_window)
-constructor — **not** the legacy `FreshnessPolicy(maximum_lag_minutes=...)`
+constructor, **not** the legacy `FreshnessPolicy(maximum_lag_minutes=...)`
 which is deprecated.
 
 This means:
 
 - Comparisons in tests need
-  `policy.fail_window.to_timedelta().total_seconds()` — Dagster wraps the
+  `policy.fail_window.to_timedelta().total_seconds()`; Dagster wraps the
   `timedelta` in a `SerializableTimeDelta` that doesn't compare-equal to a
   plain `timedelta`.
 - The check shows up under "Freshness" in the asset detail page with the

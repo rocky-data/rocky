@@ -6,7 +6,7 @@ sidebar:
 ---
 
 When a pull request opens against a Dagster+ project, the platform spins
-up a *branch deployment* — an isolated code location that mirrors
+up a *branch deployment*: an isolated code location that mirrors
 production but writes to a separate dev environment. The canonical
 Rocky-side response is to **shadow-run** every materialization against a
 sandboxed schema instead of production tables, so PR diffs are visible
@@ -14,11 +14,11 @@ side-by-side without touching production data.
 
 `dagster-rocky` ships three small primitives to make this trivial:
 
-- **`is_branch_deployment()`** — boolean check for the standard Dagster+
+- **`is_branch_deployment()`:** boolean check for the standard Dagster+
   env vars.
-- **`branch_deployment_info()`** — structured snapshot of the deployment
+- **`branch_deployment_info()`:** structured snapshot of the deployment
   context (deployment name, PR number, Git SHA).
-- **`branch_deploy_shadow_suffix()`** — derives a stable Rocky shadow
+- **`branch_deploy_shadow_suffix()`:** derives a stable Rocky shadow
   suffix suitable for `rocky plan --shadow --shadow-suffix <value>` + `rocky apply <plan-id>`
   (the single-step `rocky run --shadow --shadow-suffix <value>` alias does the same in one invocation).
 
@@ -60,7 +60,7 @@ The helpers read these env vars (set automatically by Dagster+):
 | `DAGSTER_CLOUD_PULL_REQUEST_ID` | Originating PR number, when known |
 | `DAGSTER_CLOUD_GIT_SHA` | Build commit SHA |
 
-The PR number and Git SHA are optional — branch deployments created via
+The PR number and Git SHA are optional; branch deployments created via
 the Dagster+ API (rather than from a PR) won't have them.
 
 ## Shadow suffix derivation
@@ -81,7 +81,7 @@ rejects most punctuation, so this keeps the suffix usable as part of a
 table name.
 
 The function returns `None` outside branch deployments so callers can
-unconditionally pass the result through to `rocky.run()` — the resource
+unconditionally pass the result through to `rocky.run()`; the resource
 accepts `shadow_suffix: str | None`, and passing `None` is a no-op:
 
 ```python

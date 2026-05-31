@@ -67,9 +67,9 @@ After deployment, every model with a contract file shows up to three new
 contract checks in the asset detail page (depending on which rule kinds
 are declared in the contract):
 
-- `contract_required_columns` — passes when no E010 diagnostics
-- `contract_protected_columns` — passes when no E013 diagnostics
-- `contract_column_constraints` — passes when no E011/E012/W010 diagnostics
+- `contract_required_columns`: passes when no E010 diagnostics
+- `contract_protected_columns`: passes when no E013 diagnostics
+- `contract_column_constraints`: passes when no E011/E012/W010 diagnostics
 
 ## Diagnostic code mapping
 
@@ -88,8 +88,8 @@ When a check fails, the `AssetCheckResult` includes:
 
 - `passed=False`
 - `severity=ERROR` (or `WARN` if every failing diagnostic is W010)
-- `rocky/violation_count` — number of contract violations for this check
-- `rocky/violation_<i>` — text of each violation in the form `[<code>] <message>`
+- `rocky/violation_count`: number of contract violations for this check
+- `rocky/violation_<i>`: text of each violation in the form `[<code>] <message>`
 
 ## Standalone helpers
 
@@ -129,7 +129,7 @@ results = list(
 Pre-declaring `AssetCheckSpec` instances at load time means the Dagster
 UI shows contract slots **before any compile or run**. Users see at a
 glance which models have contracts and which contract kinds are
-expected — even on a fresh deployment.
+expected, even on a fresh deployment.
 
 The alternative (emitting check results without pre-declared specs)
 would be hidden until the first materialization completes, which
@@ -137,7 +137,7 @@ defeats the purpose of contracts as a documentation surface.
 
 ## When does the wiring fire?
 
-`RockyComponent` matches contracts to assets by **table name** — a
+`RockyComponent` matches contracts to assets by **table name**: a
 contract file `orders.contract.toml` attaches to any asset whose key
 ends with `orders`. Today this means:
 
@@ -149,16 +149,16 @@ ends with `orders`. Today this means:
 
 This is a known limitation: dagster-rocky's RockyComponent surfaces
 source replication tables but not derived models. The contract wiring
-is correct for both cases — it just doesn't have many derived-model
+is correct for both cases; it just doesn't have many derived-model
 assets to attach to today.
 
 ## Defensive parsing
 
 `discover_contract_rules` is defensive against:
 
-- **Missing directory** — returns empty dict, no error.
-- **Empty contract files** — silently skipped (no specs declared).
-- **Malformed TOML** — raises `ContractParseError` with the offending
+- **Missing directory:** returns empty dict, no error.
+- **Empty contract files:** silently skipped (no specs declared).
+- **Malformed TOML:** raises `ContractParseError` with the offending
   file path in the message, so users can find and fix the file.
 
 This means you can pass `contracts_dir="contracts"` unconditionally

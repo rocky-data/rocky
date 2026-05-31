@@ -7,7 +7,7 @@ sidebar:
 
 Rocky's `time_interval` materialization strategy declares a model is
 partitioned by a time column with a fixed granularity (`hour`, `day`, `month`,
-or `year`). `dagster-rocky` ships `partitions.py` — a translation layer
+or `year`). `dagster-rocky` ships `partitions.py`, a translation layer
 that converts these strategies into Dagster's
 [`PartitionsDefinition`](https://docs.dagster.io/api/dagster/partitions#dagster.PartitionsDefinition)
 variants.
@@ -15,7 +15,7 @@ variants.
 These are **standalone helpers** today. The `RockyComponent`-side wiring
 (group splitting by partitioning shape, threading partition keys through
 `rocky plan --partition` + `rocky apply`) is a follow-up that depends on
-derived-model surfacing — currently the component emits source-replication
+derived-model surfacing; currently the component emits source-replication
 tables only, none of which use `time_interval`.
 
 ## Strategy mapping

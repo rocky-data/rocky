@@ -7,10 +7,10 @@ sidebar:
 
 `dagster-rocky` ships two ways to bootstrap a new project:
 
-1. **`dg scaffold defs dagster_rocky.RockyComponent <name>`** — uses Dagster's
+1. **`dg scaffold defs dagster_rocky.RockyComponent <name>`**: uses Dagster's
    built-in scaffolder via the registered entry point. Writes a bare
    `defs.yaml`.
-2. **`init_rocky_project(target_dir)`** — Python helper that writes a complete
+2. **`init_rocky_project(target_dir)`**: Python helper that writes a complete
    skeleton with `defs.yaml`, `rocky.toml`, `models/`, and a `README.md`.
 
 ## `dg scaffold` (canonical)
@@ -59,7 +59,7 @@ Dagster assets immediately.
 
 ## Overwrite protection
 
-`init_rocky_project` refuses to overwrite existing files by default — pass
+`init_rocky_project` refuses to overwrite existing files by default; pass
 `overwrite=True` to force:
 
 ```python

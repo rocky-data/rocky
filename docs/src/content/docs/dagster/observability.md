@@ -1,5 +1,5 @@
 ---
-title: Observability — Drift, Anomalies, Optimize
+title: "Observability: Drift, Anomalies, Optimize"
 description: Surface Rocky's drift, anomaly, and optimization signals as native Dagster events
 sidebar:
   order: 12
@@ -13,7 +13,7 @@ warnings to first-class Dagster primitives:
 - **Optimization recommendations** → `AssetSpec.metadata` (load-time)
 - **Plan artifact trail** → `.rocky/plans/<plan-id>.json` per materialization
 
-Drift and anomaly emission is **automatic** when using `RockyComponent` —
+Drift and anomaly emission is **automatic** when using `RockyComponent`;
 nothing to wire up. Standalone helpers are also exported for users with
 hand-rolled multi_assets.
 
@@ -25,11 +25,11 @@ chains `rocky plan` + `rocky apply <plan-id>` under the hood (as of
 `.rocky/plans/<plan-id>.json` before the apply phase runs. That file is
 the audit record of *exactly what Rocky tried to apply*: the materialization
 list, governance plan, drift actions, and (for compact / archive plans)
-the typed IR that the apply path regenerates SQL from — see
+the typed IR that the apply path regenerates SQL from; see
 [Plan store v1 to v2 migration guide](/concepts/plan-store-v1-to-v2/).
 
 For `run_pipes`, the plan id is also attached as `extras={"plan_id":
-plan_id}` so Dagster surfaces it as run metadata in the run viewer — one
+plan_id}` so Dagster surfaces it as run metadata in the run viewer; one
 click from a failed materialization back to the plan that produced it.
 
 Replication-only projects (no `models/` directory) fall back to the
@@ -51,7 +51,7 @@ metadata describing the action taken:
 | `rocky/drift_tables_drifted` | int | Total tables that drifted this run |
 
 Why `AssetObservation` and not `AssetCheckResult`? Drift is a *change*, not a
-pass/fail — observation is the right primitive. It shows up on the asset
+pass/fail; observation is the right primitive. It shows up on the asset
 timeline as a discrete event without affecting check status.
 
 ## Anomalies as `AssetCheckResult` (severity WARN)
@@ -71,7 +71,7 @@ The check spec is **pre-declared** at load time, so the Dagster UI shows the
 anomalies, a placeholder check result is emitted automatically.
 
 Severity is `WARN` (not `ERROR`) because Rocky's anomaly detection is a
-heuristic — a row-count deviation may be legitimate business behavior.
+heuristic; a row-count deviation may be legitimate business behavior.
 Callers who want to treat anomalies as hard failures can post-process the
 check evaluation events.
 

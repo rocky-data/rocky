@@ -37,7 +37,7 @@ Handles every Rocky check type, both pipeline-level and model-level:
 **Model-level assertions (DQX parity):**
 `not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`. Each carries a `severity` (`error` / `warning`) and an optional `filter` predicate; row-level assertions also surface `quarantined = true/false` when `[quarantine]` is configured on the pipeline.
 
-Severity maps to Dagster's `AssetCheckSeverity` (`ERROR` / `WARN`). Warnings never fail the asset check, even when the underlying assertion returned `passed = false`. All check metadata — SQL fingerprint, failing row count, quarantine state, filter used — is propagated to the Dagster event for full observability.
+Severity maps to Dagster's `AssetCheckSeverity` (`ERROR` / `WARN`). Warnings never fail the asset check, even when the underlying assertion returned `passed = false`. All check metadata (SQL fingerprint, failing row count, quarantine state, filter used) is propagated to the Dagster event for full observability.
 
 ## Example
 
