@@ -109,9 +109,9 @@ JOIN dbt_fivetran.stg_facebook_ads__ad_history f
 
 See [Using Rocky with dbt Packages](/guides/using-dbt-packages/) for a full guide on this pattern.
 
-## How it differs from dbt
+## How it differs from dbt Core
 
-dbt uses Jinja's `{{ ref('model_name') }}` macro inside SQL to create implicit dependencies. The dependency graph is extracted by parsing Jinja templates:
+dbt Core uses Jinja's `{{ ref('model_name') }}` macro inside SQL to create implicit dependencies. The dependency graph is extracted by parsing Jinja templates:
 
 ```sql
 -- dbt model
@@ -128,7 +128,7 @@ depends_on = ["stg_orders", "dim_customers"]
 
 The differences:
 
-| | dbt | Rocky |
+| | dbt Core | Rocky |
 |---|---|---|
 | Declaration | Implicit via `{{ ref() }}` in SQL | Explicit `depends_on` in TOML |
 | When validated | During parsing/compilation | At `rocky validate` time |

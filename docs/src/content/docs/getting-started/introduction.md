@@ -73,7 +73,7 @@ See the [Roadmap](/getting-started/roadmap/) for the full breakdown of what's sh
 
 **Coming from dbt?** dbt is the incumbent, not the competitor. Rocky's path is import-compatibility plus an order of magnitude on the failure modes that bite production teams: schema drift, lineage at PR time, cost attribution, and contracts as compile errors. Start with `rocky import-dbt` (see the [migration guide](/guides/migrate-from-dbt/)).
 
-| | dbt | Rocky |
+| | dbt Core | Rocky |
 |---|---|---|
 | Templating | Jinja | None (pure SQL) |
 | Staging models | One `.sql` per source table | Config-driven bronze (zero SQL) |

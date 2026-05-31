@@ -123,9 +123,9 @@ rocky apply "$plan_id"
 
 This processes only schemas where the parsed tenant component matches `acme`.
 
-## Comparison to dbt
+## Comparison to dbt Core
 
-In dbt, you write one staging model per source table:
+In dbt Core, you write one staging model per source table:
 
 ```sql
 -- models/staging/shopify/stg_orders.sql
