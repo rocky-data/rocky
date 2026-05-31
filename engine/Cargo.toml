@@ -76,7 +76,7 @@ sqlparser = { version = "0.62", features = ["visitor"] }
 # State store
 redb = "2"
 # Advisory file lock for single-writer enforcement on state DB
-fs4 = "1.0"
+fs4 = "1.1"
 
 # Logging
 tracing = "0.1"
