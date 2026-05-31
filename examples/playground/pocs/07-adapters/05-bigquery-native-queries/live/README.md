@@ -32,11 +32,6 @@ Each driver:
   auto-rollback). The script-as-transaction shape proves the happy
   path; rollback semantics are a separate property worth its own test.
 - MERGE without explicit `update_columns` (see finding 5).
-- Drift detection on **added** columns (see finding 7).
-- Safe type-widening drift action (`alter_column_types`) — the
-  detection branch exists in `drift::detect_drift` but the runtime at
-  `run.rs:4137` only wires `drop_and_recreate`; safe widenings fall
-  through to the next `INSERT` and may fail.
 
 ## Run
 

@@ -1,18 +1,21 @@
-# 05-bigquery-native-queries — BigQuery Adapter
+# 05-bigquery-native-queries — BigQuery Adapter (live demo)
 
 > **Category:** 07-adapters
-> **Credentials:** GCP Service Account JSON or ADC (`GOOGLE_APPLICATION_CREDENTIALS` or `BIGQUERY_TOKEN`). Optional — the compile smoke runs without them.
-> **Runtime:** seconds (compile smoke) or ~3–5 minutes (full live tour) against the EU sandbox
+> **Status:** Live demo. The full BigQuery surface tour runs against a real GCP project; a credential-free compile smoke is the no-creds fallback.
+> **Credentials:** GCP Service Account JSON or ADC (`GOOGLE_APPLICATION_CREDENTIALS` or `BIGQUERY_TOKEN`) for the live tour. The compile smoke runs without them.
+> **Runtime:** seconds (compile smoke) or ~3–5 minutes (full live tour) against an EU-region GCP project
 > **Rocky features:** BigQuery adapter, backtick quoting, region-qualified `INFORMATION_SCHEMA`, time-interval DML transactions, MERGE bootstrap, drift evolution (add / type-change / safe-widen), cost cross-check
 
 ## What it shows
 
-Rocky's BigQuery adapter end-to-end against a real GCP project. The top-level `./run.sh` operates in two modes:
+Rocky's BigQuery adapter end-to-end against a real GCP project. This is a **live demo**: six independent drivers under `live/` materialize against BigQuery and assert the resulting warehouse state, covering every BigQuery-specific surface Rocky exercises in production. A credential-free compile smoke is the no-creds fallback.
+
+The top-level `./run.sh` operates in two modes:
 
 1. **Compile smoke** (always). Type-checks the BigQuery model frontmatter against the current `rocky` binary. Runs without credentials, so the credential-free POC sweep (`scripts/run-all-duckdb.sh`) covers it.
-2. **Live demo** (when BigQuery credentials are present). Materializes a full-refresh transformation against the sandbox, captures the `rocky run` receipt to `expected/run.json`, and queries the target table back to prove the row landed.
+2. **Live demo** (when BigQuery credentials are present). Materializes a full-refresh transformation against the project, captures the `rocky run` receipt to `expected/run.json`, and queries the target table back to prove the row landed.
 
-Six independent live drivers under `live/` cover every BigQuery-specific surface Rocky exercises in production. The top-level script runs the full-refresh demo as the primary receipt; the others are runnable individually.
+The full-refresh run is the primary receipt the top-level script captures; the other five drivers are runnable individually for the complete surface tour. The live tour is run by a maintainer with GCP credentials; the compile smoke is what everyone else (and CI) runs. **To record the live demo, follow [`RECORDING.md`](./RECORDING.md).**
 
 ## Why it's distinctive
 
@@ -96,6 +99,18 @@ Full BigQuery surface tour — one scenario at a time:
 ```
 
 Each driver creates its own `hc_phase*_*` dataset, runs end-to-end, and cleans up on exit.
+
+## Recording
+
+The live tour is a recorded demo. [`RECORDING.md`](./RECORDING.md) is the standalone shooting script: a seven-shot order (compile smoke → full-refresh → discover → merge → time-interval → drift → cost cross-check), each with the command, what it proves, and a caption, plus the pre-flight env vars and binary setup.
+
+The recording is recorder-agnostic on purpose — the repo's `cli-recording/` vhs tapes are local-DuckDB and no-creds, and vhs's fixed `Sleep` pacing can't track multi-minute live BigQuery jobs — so capture with asciinema, a screen recorder, or whatever you prefer. The env vars are the same as the live run:
+
+```bash
+export GCP_PROJECT_ID="<your-gcp-project-id>"          # BIGQUERY_TEST_PROJECT also accepted
+export GOOGLE_APPLICATION_CREDENTIALS="<path-to-service-account-json>"   # or BIGQUERY_TOKEN
+export BQ_LOCATION="EU"                                # optional; default EU
+```
 
 ## Expected output
 
