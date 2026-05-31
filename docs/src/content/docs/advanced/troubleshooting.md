@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-This page is a **symptom-first** reference: paste an error message into your search and find the fix. For the inverse view — categories of failure with a recovery playbook per category — see [Failure modes](./failure-modes).
+This page is a **symptom-first** reference: paste an error message into your search and find the fix. For the inverse view (categories of failure with a recovery playbook per category), see [Failure modes](./failure-modes).
 
 ## Compilation Errors
 
@@ -18,7 +18,7 @@ A model references another model that doesn't exist in the project.
 - The `name` field in the `.toml` sidecar doesn't match the file name
 - The model is in a subdirectory that Rocky isn't scanning
 
-**Fix:** Check that the referenced model exists in `models/` and its `name` field matches. Rocky auto-discovers dependencies from SQL table references — bare names matching model file names become DAG edges.
+**Fix:** Check that the referenced model exists in `models/` and its `name` field matches. Rocky auto-discovers dependencies from SQL table references; bare names matching model file names become DAG edges.
 
 ### "Type mismatch on column 'X'"
 
