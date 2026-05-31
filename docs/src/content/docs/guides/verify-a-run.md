@@ -151,16 +151,17 @@ Compare the live row count to `rows_affected` from step 3 and the live schema to
 
 On the content-addressed write path (S3-backed lakehouse materialization), Rocky goes further than recording a row count: it names each output Parquet file by the BLAKE3 hash of its bytes, and records that hash in the `output_artifacts` ledger table. This lets an auditor prove the output bytes are exactly what Rocky recorded, with no trust in the ledger at all.
 
-This repository ships a real, deterministic sample artifact under `examples/audit-sample/`. It was produced by Rocky's actual `build_parquet` writer — the same code path an S3 content-addressed write uses to compute the hash before the upload — so its filename is its real content hash.
+The hash is computed on the Parquet bytes before the object-store upload, by the writer's `build_parquet` step. That step pins its Parquet settings (writer version, SNAPPY compression, page size, dictionary encoding off) precisely so the same Rocky version on the same input produces byte-identical output. The engine's own `build_parquet_is_byte_stable_across_runs` test (in `engine/crates/rocky-iceberg/src/uniform_writer/parquet_builder.rs`) pins that determinism, which is what makes the filename a stable content address rather than a coincidence.
 
-Verify it in two steps:
+Given a content-addressed output file named `<hash>.parquet`, verify it in two steps:
 
 ```bash
 # 1. Hash the bytes yourself.
-b3sum examples/audit-sample/*.parquet
+b3sum <hash>.parquet
 
-# 2. Confirm the hash equals the filename.
-#    filename == <hash>.parquet  →  the bytes are exactly what was recorded.
+# 2. Confirm the hash your tool prints equals the filename
+#    (the part before .parquet) and the ledger row's blake3_hash.
+#    All three agreeing means the bytes are exactly what was recorded.
 ```
 
 The matching `output_artifacts` ledger row carries the same hash plus the join keys back to the run:
