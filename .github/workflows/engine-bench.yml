@@ -40,7 +40,9 @@ jobs:
           sudo swapon /swapfile
 
       - name: Run benchmarks
-        run: cargo bench --bench compile -p rocky-cli -- --output-format bencher | tee bench-output.txt
+        run: |
+          cargo bench --bench compile -p rocky-cli -- --output-format bencher | tee bench-output.txt
+          cargo bench --bench state_store -p rocky-core -- --output-format bencher | tee -a bench-output.txt
 
       - name: Store benchmark results
         uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1

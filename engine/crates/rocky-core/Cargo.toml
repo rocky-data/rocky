@@ -57,5 +57,9 @@ wiremock = { workspace = true }
 name = "dag_execute"
 harness = false
 
+[[bench]]
+name = "state_store"
+harness = false
+
 [lints]
 workspace = true

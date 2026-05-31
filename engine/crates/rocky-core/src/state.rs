@@ -13,7 +13,29 @@ const CHECK_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("check_
 const RUN_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("run_history");
 const QUALITY_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("quality_history");
 const DAG_SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("dag_snapshots");
+/// Per-run progress *header* (run_id / started_at / total_tables).
+///
+/// Key: `run_id`. Value: serialized [`RunProgress`] whose `tables` vector is
+/// left empty by the current write path — the per-table entries live in
+/// [`RUN_PROGRESS_ENTRIES`] so each completed table is an O(1) blind insert
+/// rather than a read-modify-write of one growing blob. Reads
+/// ([`StateStore::get_run_progress`] / [`StateStore::get_latest_run_progress`])
+/// stitch the header together with its entries. Databases written by a
+/// pre-v8 binary still carry their `tables` inline; the readers fall back to
+/// that blob when the per-entry scan is empty, so old runs keep resuming.
 const RUN_PROGRESS: TableDefinition<&str, &[u8]> = TableDefinition::new("run_progress");
+/// Per-table progress entries for a run.
+///
+/// Key format: `"{run_id}|{table_key}"` where `table_key` is the
+/// fully-qualified `catalog.schema.table` — the same identity the resume
+/// logic dedups on, so it is unique per (run, table). Value: serialized
+/// [`TableProgress`]. Written as a blind insert (no read-modify-write), which
+/// makes [`StateStore::record_table_progress`] O(1) per completed table and
+/// removes the lost-update race the old whole-blob rewrite carried under
+/// concurrent table tasks. Reads prefix-scan `"{run_id}|"` and sort the
+/// recovered entries by [`TableProgress::index`] to restore execution order.
+const RUN_PROGRESS_ENTRIES: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("run_progress_entries");
 /// Per-partition state for `time_interval` materialization.
 ///
 /// Key format: `"{model_name}|{partition_key}"` (e.g.
@@ -126,7 +148,17 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   schema change: v6 databases auto-create the empty table on next
 ///   open and stamp themselves as v7. No blob migration needed; existing
 ///   tables are untouched.
-const CURRENT_SCHEMA_VERSION: u32 = 7;
+/// - **v8** — adds the [`RUN_PROGRESS_ENTRIES`] table so each completed
+///   table's progress is an O(1) blind insert under a per-entry key
+///   instead of a read-modify-write of one growing blob. The legacy
+///   [`RUN_PROGRESS`] table is retained as the per-run header (run_id /
+///   started_at / total_tables); reads stitch the header together with
+///   the per-entry rows. Pure additive schema change: v7 databases
+///   auto-create the empty table on next open and stamp themselves as v8.
+///   A v7-recorded run with entries still in the header blob continues to
+///   resume — the readers fall back to the header's `tables` when the
+///   per-entry scan is empty.
+const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -314,6 +346,7 @@ impl StateStore {
             let _table = txn.open_table(QUALITY_HISTORY)?;
             let _table = txn.open_table(DAG_SNAPSHOTS)?;
             let _table = txn.open_table(RUN_PROGRESS)?;
+            let _table = txn.open_table(RUN_PROGRESS_ENTRIES)?;
             let _table = txn.open_table(PARTITIONS)?;
             let _table = txn.open_table(GRACE_PERIODS)?;
             let _table = txn.open_table(LOADED_FILES)?;
@@ -1098,47 +1131,91 @@ impl StateStore {
     }
 
     /// Record progress for a single table within a run.
+    ///
+    /// O(1) per call: serializes exactly this one [`TableProgress`] and blind-
+    /// inserts it under the per-entry key `"{run_id}|{table_key}"` in
+    /// [`RUN_PROGRESS_ENTRIES`]. No read-modify-write of a growing blob, so an
+    /// N-table run does O(N) cumulative work instead of the old O(N²). The
+    /// blind insert is also race-free under the concurrent table tasks that
+    /// drive `rocky run`: there is no read-then-write window for a lost update.
+    ///
+    /// `table_key` is the same fully-qualified identity the resume logic dedups
+    /// on, so distinct real tables never collide; re-recording the same table
+    /// (e.g. an interrupted-then-final write) is last-write-wins, which matches
+    /// resume semantics. One write transaction = one fsync per completed table,
+    /// preserving per-table crash durability for `--resume-latest`.
     pub fn record_table_progress(
         &self,
         run_id: &str,
         progress: &TableProgress,
     ) -> Result<(), StateError> {
-        let mut run_progress = self
-            .get_run_progress(run_id)?
-            .unwrap_or_else(|| RunProgress {
-                run_id: run_id.to_string(),
-                started_at: chrono::Utc::now(),
-                total_tables: 0,
-                tables: Vec::new(),
-            });
-        run_progress.tables.push(progress.clone());
-
-        let bytes = serde_json::to_vec(&run_progress)?;
+        let key = run_progress_entry_key(run_id, &progress.table_key);
+        let bytes = serde_json::to_vec(progress)?;
         let txn = self.db.begin_write()?;
         {
-            let mut table = txn.open_table(RUN_PROGRESS)?;
-            table.insert(run_id, bytes.as_slice())?;
+            let mut table = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+            table.insert(key.as_str(), bytes.as_slice())?;
         }
         txn.commit()?;
         Ok(())
     }
 
-    /// Get the progress for a run.
-    pub fn get_run_progress(&self, run_id: &str) -> Result<Option<RunProgress>, StateError> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(RUN_PROGRESS)?;
-        match table.get(run_id)? {
-            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
-            None => Ok(None),
+    /// Read every per-table entry recorded for `run_id`, sorted by execution
+    /// [`TableProgress::index`].
+    ///
+    /// Prefix-scans `"{run_id}|"` over [`RUN_PROGRESS_ENTRIES`]. The trailing
+    /// `|` separator means `"run-1"` and `"run-12"` do not bleed into each
+    /// other — `"run-12|..."` does not start with `"run-1|"`.
+    fn read_progress_entries(
+        table: &impl ReadableTable<&'static str, &'static [u8]>,
+        run_id: &str,
+    ) -> Result<Vec<TableProgress>, StateError> {
+        let prefix = format!("{run_id}|");
+        let mut entries = Vec::new();
+        for entry in table.range(prefix.as_str()..)? {
+            let (key, value) = entry?;
+            if !key.value().starts_with(&prefix) {
+                break;
+            }
+            entries.push(serde_json::from_slice(value.value())?);
         }
+        entries.sort_by_key(|t: &TableProgress| t.index);
+        Ok(entries)
     }
 
-    /// Get the most recent run progress (for --resume-latest).
+    /// Get the progress for a run (header stitched with its per-table entries).
+    ///
+    /// The `tables` vector is reconstructed from [`RUN_PROGRESS_ENTRIES`]. For a
+    /// run recorded by a pre-v8 binary (entries inline in the header blob) the
+    /// per-entry scan is empty, so the header's own `tables` are kept — old
+    /// runs continue to resume.
+    pub fn get_run_progress(&self, run_id: &str) -> Result<Option<RunProgress>, StateError> {
+        let txn = self.db.begin_read()?;
+        let header_table = txn.open_table(RUN_PROGRESS)?;
+        let Some(value) = header_table.get(run_id)? else {
+            return Ok(None);
+        };
+        let mut progress: RunProgress = serde_json::from_slice(value.value())?;
+
+        let entries_table = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+        let entries = Self::read_progress_entries(&entries_table, run_id)?;
+        if !entries.is_empty() {
+            progress.tables = entries;
+        }
+        Ok(Some(progress))
+    }
+
+    /// Get the most recent run progress (for `--resume-latest`).
+    ///
+    /// Picks the header with the latest `started_at`, then stitches in that
+    /// run's per-table entries (with the same pre-v8 fallback as
+    /// [`Self::get_run_progress`]) so the resume caller sees a populated
+    /// `tables` vector.
     pub fn get_latest_run_progress(&self) -> Result<Option<RunProgress>, StateError> {
         let txn = self.db.begin_read()?;
-        let table = txn.open_table(RUN_PROGRESS)?;
+        let header_table = txn.open_table(RUN_PROGRESS)?;
         let mut latest: Option<RunProgress> = None;
-        for entry in table.iter()? {
+        for entry in header_table.iter()? {
             let (_, value) = entry?;
             let progress: RunProgress = serde_json::from_slice(value.value())?;
             if latest
@@ -1148,7 +1225,16 @@ impl StateStore {
                 latest = Some(progress);
             }
         }
-        Ok(latest)
+
+        let Some(mut progress) = latest else {
+            return Ok(None);
+        };
+        let entries_table = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+        let entries = Self::read_progress_entries(&entries_table, &progress.run_id)?;
+        if !entries.is_empty() {
+            progress.tables = entries;
+        }
+        Ok(Some(progress))
     }
 }
 
@@ -2147,6 +2233,38 @@ impl StateStore {
         Ok(())
     }
 
+    /// Write multiple schema cache entries in a single write transaction.
+    ///
+    /// Mirrors [`Self::batch_set_watermarks`]: one `begin_write` / `commit`
+    /// cycle covers every entry instead of one fsync per entry. The hot caller
+    /// is `rocky discover --with-schemas`, which describes a whole source
+    /// schema at a time — collapsing N per-entry commits into one transaction
+    /// turns N fsyncs into one.
+    ///
+    /// Returns the number of entries written. If any entry fails to serialize
+    /// or insert, the whole transaction is rolled back — partial cache writes
+    /// are not observable to subsequent reads. (This is all-or-nothing, unlike
+    /// the per-entry loop's partial-success posture; callers that want
+    /// per-schema isolation should batch one schema at a time.)
+    pub fn batch_write_schema_cache_entries(
+        &self,
+        entries: &[(&str, &SchemaCacheEntry)],
+    ) -> Result<usize, StateError> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SCHEMA_CACHE)?;
+            for (key, entry) in entries {
+                let bytes = serde_json::to_vec(*entry)?;
+                table.insert(*key, bytes.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(entries.len())
+    }
+
     /// Delete a single schema cache entry. Returns `true` when a row was
     /// actually removed, `false` when the key was already absent.
     ///
@@ -2217,6 +2335,17 @@ pub struct BranchRecord {
 /// Builds the key for the LOADED_FILES table.
 fn loaded_file_key(pipeline: &str, file_path: &str) -> String {
     format!("{pipeline}|{file_path}")
+}
+
+/// Builds the key for the [`RUN_PROGRESS_ENTRIES`] table.
+///
+/// Composition: `"{run_id}|{table_key}"`. The `table_key` is the
+/// fully-qualified `catalog.schema.table`, which is unique per (run, table) —
+/// the same identity the resume logic dedups on. The trailing `|` separator
+/// keeps prefix scans for "all entries in run X" unambiguous (`"run-1"` and
+/// `"run-12"` do not collide).
+fn run_progress_entry_key(run_id: &str, table_key: &str) -> String {
+    format!("{run_id}|{table_key}")
 }
 
 /// Builds the key for the [`OUTPUT_ARTIFACTS`] table.
@@ -3318,6 +3447,218 @@ mod tests {
         assert!(!completed.contains("cat.sch.tbl_e"));
     }
 
+    fn progress_entry(index: usize, table_key: &str, status: TableStatus) -> TableProgress {
+        TableProgress {
+            index,
+            table_key: table_key.to_string(),
+            asset_key: vec![],
+            status,
+            error: None,
+            duration_ms: 100,
+            completed_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_record_table_progress_is_o1_blind_insert() {
+        // Each recorded table is a single per-entry row; the header blob's
+        // `tables` vector is NOT grown. Reads stitch the two together.
+        let (store, _dir) = temp_store();
+        store.init_run_progress("run-001", 3).unwrap();
+
+        // Header still has no inline entries.
+        {
+            let txn = store.db.begin_read().unwrap();
+            let header = txn.open_table(RUN_PROGRESS).unwrap();
+            let raw: RunProgress =
+                serde_json::from_slice(header.get("run-001").unwrap().unwrap().value()).unwrap();
+            assert!(raw.tables.is_empty());
+        }
+
+        store
+            .record_table_progress(
+                "run-001",
+                &progress_entry(0, "cat.sch.a", TableStatus::Success),
+            )
+            .unwrap();
+        store
+            .record_table_progress(
+                "run-001",
+                &progress_entry(1, "cat.sch.b", TableStatus::Failed),
+            )
+            .unwrap();
+
+        // The header blob is still empty — entries live in the entries table.
+        {
+            let txn = store.db.begin_read().unwrap();
+            let header = txn.open_table(RUN_PROGRESS).unwrap();
+            let raw: RunProgress =
+                serde_json::from_slice(header.get("run-001").unwrap().unwrap().value()).unwrap();
+            assert!(
+                raw.tables.is_empty(),
+                "record_table_progress must not grow the header blob"
+            );
+        }
+
+        // But the stitched read returns both, in index order.
+        let progress = store.get_run_progress("run-001").unwrap().unwrap();
+        assert_eq!(progress.total_tables, 3);
+        assert_eq!(progress.tables.len(), 2);
+        assert_eq!(progress.tables[0].table_key, "cat.sch.a");
+        assert_eq!(progress.tables[1].table_key, "cat.sch.b");
+    }
+
+    #[test]
+    fn test_record_table_progress_preserves_index_order_on_read() {
+        // Insert out of index order; read must sort by execution index, not
+        // by the lexical entry key.
+        let (store, _dir) = temp_store();
+        store.init_run_progress("run-001", 3).unwrap();
+        store
+            .record_table_progress(
+                "run-001",
+                &progress_entry(2, "cat.sch.c", TableStatus::Success),
+            )
+            .unwrap();
+        store
+            .record_table_progress(
+                "run-001",
+                &progress_entry(0, "cat.sch.a", TableStatus::Success),
+            )
+            .unwrap();
+        store
+            .record_table_progress(
+                "run-001",
+                &progress_entry(1, "cat.sch.b", TableStatus::Success),
+            )
+            .unwrap();
+
+        let progress = store.get_run_progress("run-001").unwrap().unwrap();
+        let order: Vec<&str> = progress
+            .tables
+            .iter()
+            .map(|t| t.table_key.as_str())
+            .collect();
+        assert_eq!(order, vec!["cat.sch.a", "cat.sch.b", "cat.sch.c"]);
+    }
+
+    #[test]
+    fn test_record_table_progress_same_table_key_is_last_write_wins() {
+        // Re-recording the same table (interrupted -> final) overwrites the
+        // one row rather than appending a duplicate.
+        let (store, _dir) = temp_store();
+        store.init_run_progress("run-001", 1).unwrap();
+        store
+            .record_table_progress(
+                "run-001",
+                &progress_entry(0, "cat.sch.a", TableStatus::Interrupted),
+            )
+            .unwrap();
+        store
+            .record_table_progress(
+                "run-001",
+                &progress_entry(0, "cat.sch.a", TableStatus::Success),
+            )
+            .unwrap();
+
+        let progress = store.get_run_progress("run-001").unwrap().unwrap();
+        assert_eq!(progress.tables.len(), 1);
+        assert_eq!(progress.tables[0].status, TableStatus::Success);
+    }
+
+    #[test]
+    fn test_run_progress_entries_do_not_bleed_across_run_ids() {
+        // "run-1" and "run-12" share a "run-1" lexical prefix but the trailing
+        // "|" separator keeps their entries isolated.
+        let (store, _dir) = temp_store();
+        store.init_run_progress("run-1", 1).unwrap();
+        store.init_run_progress("run-12", 1).unwrap();
+        store
+            .record_table_progress(
+                "run-1",
+                &progress_entry(0, "cat.sch.one", TableStatus::Success),
+            )
+            .unwrap();
+        store
+            .record_table_progress(
+                "run-12",
+                &progress_entry(0, "cat.sch.twelve", TableStatus::Success),
+            )
+            .unwrap();
+
+        let p1 = store.get_run_progress("run-1").unwrap().unwrap();
+        assert_eq!(p1.tables.len(), 1);
+        assert_eq!(p1.tables[0].table_key, "cat.sch.one");
+
+        let p12 = store.get_run_progress("run-12").unwrap().unwrap();
+        assert_eq!(p12.tables.len(), 1);
+        assert_eq!(p12.tables[0].table_key, "cat.sch.twelve");
+    }
+
+    #[test]
+    fn test_get_latest_run_progress_stitches_entries() {
+        // --resume-latest reads `.tables` off the latest run; the latest header
+        // must come back with its per-entry rows stitched in.
+        let (store, _dir) = temp_store();
+        store.init_run_progress("run-001", 2).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.init_run_progress("run-002", 2).unwrap();
+
+        store
+            .record_table_progress(
+                "run-001",
+                &progress_entry(0, "cat.sch.old", TableStatus::Success),
+            )
+            .unwrap();
+        store
+            .record_table_progress(
+                "run-002",
+                &progress_entry(0, "cat.sch.new", TableStatus::Success),
+            )
+            .unwrap();
+
+        let latest = store.get_latest_run_progress().unwrap().unwrap();
+        assert_eq!(latest.run_id, "run-002");
+        assert_eq!(latest.tables.len(), 1);
+        assert_eq!(latest.tables[0].table_key, "cat.sch.new");
+    }
+
+    #[test]
+    fn test_get_run_progress_falls_back_to_inline_header_tables() {
+        // A run recorded by a pre-v8 binary carries its entries inline in the
+        // header blob with an empty entries table. The reader must keep the
+        // inline `tables` so the old run still resumes.
+        let (store, _dir) = temp_store();
+        let legacy = RunProgress {
+            run_id: "legacy-run".to_string(),
+            started_at: Utc::now(),
+            total_tables: 2,
+            tables: vec![
+                progress_entry(0, "cat.sch.x", TableStatus::Success),
+                progress_entry(1, "cat.sch.y", TableStatus::Failed),
+            ],
+        };
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut header = txn.open_table(RUN_PROGRESS).unwrap();
+                header.insert("legacy-run", bytes.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let progress = store.get_run_progress("legacy-run").unwrap().unwrap();
+        assert_eq!(progress.tables.len(), 2);
+        assert_eq!(progress.tables[0].table_key, "cat.sch.x");
+        assert_eq!(progress.tables[1].table_key, "cat.sch.y");
+
+        // get_latest_run_progress applies the same fallback.
+        let latest = store.get_latest_run_progress().unwrap().unwrap();
+        assert_eq!(latest.run_id, "legacy-run");
+        assert_eq!(latest.tables.len(), 2);
+    }
+
     // ----- time_interval partition state tests (Phase 2A) -----
 
     use crate::incremental::{PartitionRecord, PartitionStatus};
@@ -3773,6 +4114,59 @@ mod tests {
     fn test_schema_cache_list_empty() {
         let (store, _dir) = temp_store();
         assert!(store.list_schema_cache().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_batch_write_schema_cache_entries_writes_all() {
+        let (store, _dir) = temp_store();
+        let k_a = schema_cache_key("c", "s", "a");
+        let k_b = schema_cache_key("c", "s", "b");
+        let k_c = schema_cache_key("other", "s", "c");
+        let e_a = make_schema_cache_entry(vec![("id", "BIGINT", false)]);
+        let e_b = make_schema_cache_entry(vec![("id", "BIGINT", false), ("v", "STRING", true)]);
+        let e_c = make_schema_cache_entry(vec![("id", "INT", false)]);
+
+        let count = store
+            .batch_write_schema_cache_entries(&[
+                (k_a.as_str(), &e_a),
+                (k_b.as_str(), &e_b),
+                (k_c.as_str(), &e_c),
+            ])
+            .unwrap();
+        assert_eq!(count, 3);
+
+        let all = store.list_schema_cache().unwrap();
+        assert_eq!(all.len(), 3);
+        // Round-trips: the b entry kept both its columns.
+        let fetched_b = store.read_schema_cache_entry(&k_b).unwrap().unwrap();
+        assert_eq!(fetched_b.columns.len(), 2);
+    }
+
+    #[test]
+    fn test_batch_write_schema_cache_entries_empty_is_noop() {
+        let (store, _dir) = temp_store();
+        let count = store.batch_write_schema_cache_entries(&[]).unwrap();
+        assert_eq!(count, 0);
+        assert!(store.list_schema_cache().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_batch_write_schema_cache_entries_overwrites_existing() {
+        let (store, _dir) = temp_store();
+        let key = schema_cache_key("c", "s", "t");
+        store
+            .write_schema_cache_entry(&key, &make_schema_cache_entry(vec![("id", "INT", false)]))
+            .unwrap();
+
+        let updated = make_schema_cache_entry(vec![("id", "BIGINT", false), ("n", "STRING", true)]);
+        let count = store
+            .batch_write_schema_cache_entries(&[(key.as_str(), &updated)])
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let fetched = store.read_schema_cache_entry(&key).unwrap().unwrap();
+        assert_eq!(fetched.columns.len(), 2);
+        assert_eq!(fetched.columns[0].data_type, "BIGINT");
     }
 
     #[test]
@@ -4803,12 +5197,13 @@ mod tests {
 
     #[test]
     fn artifact_table_auto_created_on_v6_reopen() {
-        // v6→v7 upgrade contract: opening a state DB previously stamped
-        // at v6 must (a) succeed, (b) auto-create the OUTPUT_ARTIFACTS
-        // table on the existing open path, and (c) stamp the DB as v7
-        // so a subsequent open by an older binary fails loudly rather
-        // than silently misreading. We simulate "v6 on disk" by opening
-        // the DB at the current binary version, then rewriting the
+        // Older-version upgrade contract: opening a state DB previously
+        // stamped at v6 must (a) succeed, (b) auto-create the tables added
+        // since v6 (OUTPUT_ARTIFACTS in v7, RUN_PROGRESS_ENTRIES in v8) on
+        // the existing open path, and (c) re-stamp the DB at the current
+        // version so a subsequent open by an older binary fails loudly
+        // rather than silently misreading. We simulate "v6 on disk" by
+        // opening the DB at the current binary version, then rewriting the
         // schema_version blob to "6" via a raw redb transaction.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.redb");
@@ -4823,15 +5218,15 @@ mod tests {
             }
             txn.commit().unwrap();
         }
-        // Reopening the v6 DB should bump the stamp to v7 and not fail
-        // even though the OUTPUT_ARTIFACTS table was created.
+        // Reopening the v6 DB should bump the stamp to the current version
+        // and not fail even though newer tables were created.
         let store = StateStore::open(&path).unwrap();
         // The artifact table is usable.
         let art = make_artifact("r", "m", "h", "s3://b/p/x.parquet", 1);
         store.record_artifact(&art).unwrap();
         assert_eq!(store.count_artifacts().unwrap(), 1);
 
-        // The version stamp is now v7.
+        // The version stamp is now the current schema version.
         let txn = store.db.begin_read().unwrap();
         let metadata = txn.open_table(METADATA).unwrap();
         let stored = metadata
@@ -4839,7 +5234,7 @@ mod tests {
             .unwrap()
             .map(|g| g.value().to_string())
             .unwrap();
-        assert_eq!(stored, "7");
+        assert_eq!(stored, CURRENT_SCHEMA_VERSION.to_string());
     }
 
     // -----------------------------------------------------------------------
