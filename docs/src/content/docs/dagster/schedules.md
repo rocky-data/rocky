@@ -61,16 +61,16 @@ Every schedule built via `build_rocky_schedule` automatically adds a
 history view by Rocky-driven schedules.
 
 User-supplied tags merge on top of the namespace tag, so a user explicitly
-setting `rocky/schedule=<other>` wins. This is intentional — advanced users may
+setting `rocky/schedule=<other>` wins. This is intentional; advanced users may
 want different schedule-tag values for grouping.
 
 ## Pairing with sensors
 
 Schedules and sensors complement each other:
 
-- **Schedules** fire at fixed times regardless of upstream state — useful for
+- **Schedules** fire at fixed times regardless of upstream state, useful for
   reports that should run every morning.
-- **Sensors** fire when upstream state changes — useful for pipelines that
+- **Sensors** fire when upstream state changes, useful for pipelines that
   should kick off as soon as Fivetran completes a sync.
 
 Both can target the same asset selection. Dagster will deduplicate

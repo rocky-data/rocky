@@ -5,7 +5,7 @@ sidebar:
   order: 15
 ---
 
-`dagster-rocky` ships `rocky_healthcheck()` — a wrapper around
+`dagster-rocky` ships `rocky_healthcheck()`, a wrapper around
 `rocky doctor` suitable for Dagster+ code-location startup probes, custom
 asset checks, and custom ops.
 
@@ -84,7 +84,7 @@ location as unhealthy and routes traffic away from it.
 ## Why a wrapper, not a method on `RockyResource`?
 
 `rocky_healthcheck` lives outside `RockyResource` because the resource is a
-frozen Pydantic model — extending it with new methods on every iteration
+frozen Pydantic model; extending it with new methods on every iteration
 churns the resource module. The standalone wrapper pattern keeps health
 probes decoupled from the core resource shape and can be promoted to a
 method later if it stabilizes.

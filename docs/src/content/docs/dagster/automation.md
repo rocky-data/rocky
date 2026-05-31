@@ -13,7 +13,7 @@ through Dagster docs.
 
 ## `rocky_eager_automation()`
 
-Returns `dg.AutomationCondition.eager()` — the modern 1.12+ replacement for
+Returns `dg.AutomationCondition.eager()`, the modern 1.12+ replacement for
 the deprecated `AutoMaterializePolicy.eager()`. The asset materializes
 whenever any upstream dependency updates, waiting for all upstream deps to
 finish first.
@@ -43,7 +43,7 @@ defs = dg.Definitions(assets=eager_specs, resources={"rocky": rocky})
 
 ## `rocky_cron_automation(cron_schedule, timezone="UTC")`
 
-Returns `dg.AutomationCondition.on_cron(cron_schedule, timezone)` — fires on
+Returns `dg.AutomationCondition.on_cron(cron_schedule, timezone)`, which fires on
 the cron schedule, but only after upstream dependencies have updated since
 the previous tick.
 
@@ -61,7 +61,7 @@ spec = dg.AssetSpec(
 
 ## Why dedicated helpers?
 
-The helpers are intentionally tiny — they exist to:
+The helpers are intentionally tiny; they exist to:
 
 1. **Document the canonical mapping** in one place, so users don't need to
    know which Dagster condition variant is canonical for Rocky-managed assets.
@@ -78,7 +78,7 @@ The helpers are intentionally tiny — they exist to:
 |---|---|
 | `rocky_source_sensor` | You want to react to specific Fivetran sync events with custom polling logic. |
 | `build_rocky_schedule` | You want fixed time-based execution regardless of upstream state. |
-| `rocky_eager_automation` | You want Dagster to auto-materialize whenever upstreams update — least imperative, most declarative. |
+| `rocky_eager_automation` | You want Dagster to auto-materialize whenever upstreams update; least imperative, most declarative. |
 | `rocky_cron_automation` | You want scheduled execution gated on upstream freshness. |
 
 The four can coexist on the same asset graph. Dagster will deduplicate

@@ -5,7 +5,7 @@ sidebar:
   order: 20
 ---
 
-`dagster-rocky` ships **`RockyResource.run_streaming()`** — a
+`dagster-rocky` ships **`RockyResource.run_streaming()`**, a
 Pipes-style alternative to `RockyResource.run()` that spawns the binary
 via `subprocess.Popen`, forwards rocky's stderr (where the engine's
 Rust `tracing` layer writes `info!()` / `warn!()` macros) to
@@ -44,7 +44,7 @@ When materialized, the Dagster run viewer shows lines like:
 [INFO] rocky: INFO run complete in 18000ms
 ```
 
-— each line forwarded as the engine emits it, not at the end.
+Each line is forwarded as the engine emits it, not at the end.
 
 ## API parity with `run()`
 
@@ -70,7 +70,7 @@ from a `@op`). All the partition selection flags from the
 ## Automatic wiring in `RockyComponent`
 
 When you use `RockyComponent`, the component already calls
-`run_streaming` by default — every multi-asset materialization gets
+`run_streaming` by default; every multi-asset materialization gets
 live log streaming for free. No configuration needed:
 
 ```python
@@ -97,7 +97,7 @@ viewer as the materialization runs.
 | Subprocess timeout | Kills the process, joins the reader thread, raises `dg.Failure` with the configured timeout in the message and the stderr tail |
 
 The `stderr_tail` metadata on failures captures the actual progress
-lines the engine emitted before crashing — much more useful for
+lines the engine emitted before crashing, much more useful for
 debugging than a bare exit code.
 
 ## How it works under the hood
@@ -143,7 +143,7 @@ debugging than a bare exit code.
 | Needs Dagster context | no | yes | yes |
 | Engine Pipes support required | no | no | yes (shipped in v0.4) |
 
-### `run()` — buffered (non-Dagster callers)
+### `run()`: buffered (non-Dagster callers)
 
 ```python
 result = rocky.run(filter="tenant=acme")
@@ -152,7 +152,7 @@ result = rocky.run(filter="tenant=acme")
 For scripts, tests, notebooks, or any code that just wants the typed
 result without a Dagster context. Buffered via `subprocess.run`.
 
-### `run_streaming()` — Pipes-style (live progress, batch result)
+### `run_streaming()`: Pipes-style (live progress, batch result)
 
 ```python
 @dg.asset
@@ -164,9 +164,9 @@ def my_asset(context, rocky: RockyResource):
 Spawns rocky via `subprocess.Popen`, forwards stderr line-by-line to
 `context.log.info` for live progress, parses the final stdout JSON into
 a `RunResult` after the subprocess exits. Doesn't depend on Pipes
-message emission — works against any rocky binary.
+message emission; works against any rocky binary.
 
-### `run_pipes()` — full Dagster Pipes (structured events)
+### `run_pipes()`: full Dagster Pipes (structured events)
 
 ```python
 @dg.asset
@@ -186,11 +186,11 @@ artifact that produced it.
 The rocky engine (v0.4+) detects the Pipes env vars and emits structured
 Pipes messages on the messages channel:
 
-* `report_asset_materialization` per copied table — appears as a
+* `report_asset_materialization` per copied table: appears as a
   `MaterializationEvent` in the run viewer with structured metadata
   (strategy, duration_ms, rows_copied, target_table_full_name,
   sql_hash, partition_key)
-* `report_asset_check` per Rocky check — appears as
+* `report_asset_check` per Rocky check: appears as
   `AssetCheckEvaluation` in the run viewer
 * `log` events for run start, completion, and drift actions
 
@@ -221,7 +221,7 @@ Dagster Pipes protocol module at
    - `report_asset_check` per `output.check_results` entry
    - `log` at WARN level per `output.drift.actions_taken` entry
    - `closed` at run end
-4. When env vars are not set, the entire path is a no-op — zero
+4. When env vars are not set, the entire path is a no-op; zero
    overhead for non-Dagster callers.
 
 The current engine emission is **batch at end of run** (events emit
@@ -233,7 +233,7 @@ wire-protocol or consumer changes.
 
 ## RockyComponent default
 
-`RockyComponent` users get `run_streaming` automatically — no decision
+`RockyComponent` users get `run_streaming` automatically; no decision
 needed. To get full Pipes integration with structured events, switch
 to a hand-rolled `@dg.asset` that calls `rocky.run_pipes()` directly.
 A future RockyComponent flag (`pipes_mode=True`) can flip the default

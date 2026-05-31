@@ -5,13 +5,13 @@ sidebar:
   order: 1
 ---
 
-`dagster-rocky` bridges Rocky's Rust binary with Dagster orchestration. Rocky is the **trust plane** — typed compiler, compile-time contracts, column-level lineage, schema drift detection, branches + replay, per-model cost. Dagster is the orchestrator — scheduling, retries, alerts, the asset-centric UI. The guarantees Rocky enforces at compile time surface as native Dagster events (asset checks, materializations, metadata) so the asset graph reflects the same trust contract.
+`dagster-rocky` bridges Rocky's Rust binary with Dagster orchestration. Rocky is the **trust plane**: typed compiler, compile-time contracts, column-level lineage, schema drift detection, branches + replay, per-model cost. Dagster is the orchestrator: scheduling, retries, alerts, the asset-centric UI. The guarantees Rocky enforces at compile time surface as native Dagster events (asset checks, materializations, metadata) so the asset graph reflects the same trust contract.
 
 ## Quick start
 
-Two ways to wire Rocky into Dagster. Start with the component — it auto-discovers your tables.
+Two ways to wire Rocky into Dagster. Start with the component; it auto-discovers your tables.
 
-**Option A — component** (`defs.yaml`):
+**Option A: component** (`defs.yaml`):
 
 ```yaml
 type: dagster_rocky.RockyComponent
@@ -21,7 +21,7 @@ attributes:
   models_dir: models
 ```
 
-**Option B — resource + asset**:
+**Option B: resource + asset**:
 
 ```python
 import dagster as dg
@@ -71,12 +71,12 @@ Rocky handles the SQL transformation layer: DAG resolution, incremental logic, S
 
 `RockyResource` exposes one Python method per Rocky CLI command. The full set includes:
 
-- **Core Pipeline** — `discover`, `plan`, `run`, `run_model`, `run_streaming`, `run_pipes`, `state`, `resume_run`
-- **DAG** — `dag` (full unified DAG with enriched metadata)
-- **Modeling** — `compile`, `lineage`, `test`, `ci`
-- **AI** — `ai`, `ai_sync`, `ai_explain`, `ai_test`
-- **Observability** — `history`, `metrics`, `optimize`
-- **Diagnostics** — `doctor`, `validate_migration`, `test_adapter`
-- **Hooks** — `hooks_list`, `hooks_test`
+- **Core Pipeline:** `discover`, `plan`, `run`, `run_model`, `run_streaming`, `run_pipes`, `state`, `resume_run`
+- **DAG:** `dag` (full unified DAG with enriched metadata)
+- **Modeling:** `compile`, `lineage`, `test`, `ci`
+- **AI:** `ai`, `ai_sync`, `ai_explain`, `ai_test`
+- **Observability:** `history`, `metrics`, `optimize`
+- **Diagnostics:** `doctor`, `validate_migration`, `test_adapter`
+- **Hooks:** `hooks_list`, `hooks_test`
 
 See the [RockyResource](/dagster/resource/) page for full method signatures and details.

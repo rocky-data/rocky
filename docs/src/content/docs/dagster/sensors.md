@@ -5,7 +5,7 @@ sidebar:
   order: 10
 ---
 
-`dagster-rocky` ships `rocky_source_sensor()` — a factory that builds a
+`dagster-rocky` ships `rocky_source_sensor()`, a factory that builds a
 Dagster [`SensorDefinition`](https://docs.dagster.io/api/dagster/sensors#dagster.SensorDefinition)
 that polls `rocky discover` and emits a `RunRequest` for any source whose
 upstream connector has produced new data since the previous tick.
@@ -49,15 +49,15 @@ The sensor:
 2. Compares each source's `last_sync_at` timestamp to a per-source cursor.
 3. Emits a `RunRequest` for any source whose latest sync is newer than the cursor.
 4. Advances the cursor for the sources it processed.
-5. Logs a warning naming any ids the engine reported in `failed_sources`, and **does not** advance their cursor — so the next tick re-evaluates them.
+5. Logs a warning naming any ids the engine reported in `failed_sources`, and **does not** advance their cursor, so the next tick re-evaluates them.
 
 ## Transient discover failures
 
-Source adapters can partially fail — a Fivetran 5xx or rate-limit window on a single connector, an Iceberg `list_tables` error on one namespace. From engine `1.17.4` onward, `rocky discover` surfaces these as `failed_sources` rather than silently dropping the connector from the output.
+Source adapters can partially fail: a Fivetran 5xx or rate-limit window on a single connector, an Iceberg `list_tables` error on one namespace. From engine `1.17.4` onward, `rocky discover` surfaces these as `failed_sources` rather than silently dropping the connector from the output.
 
 The sensor relies on this signal to avoid the asset-graph-shrinkage failure mode where a transient adapter error looks indistinguishable from "removed upstream" to a diff-based reconciler. By skipping cursor advance for failed ids, the sensor guarantees that a flapping connector keeps reappearing for evaluation until it either succeeds (cursor advances normally) or is genuinely removed upstream (drops out of both `sources` and `failed_sources`).
 
-Healthy sources in the same tick still produce `RunRequest`s — partial failure does not block the run.
+Healthy sources in the same tick still produce `RunRequest`s; partial failure does not block the run.
 
 Requires engine `≥ 1.17.4`. Older engines omit the field; the sensor treats absence as "no failures reported".
 
@@ -108,7 +108,7 @@ correctly.
 Every `RunRequest` is tagged with:
 
 - `rocky/source_id` (per_source) or `rocky/group` (per_group)
-- `rocky/sync_at` — the ISO timestamp that triggered the run
+- `rocky/sync_at`: the ISO timestamp that triggered the run
 
 These show up in the Dagster run history view so you can audit which Fivetran
 sync triggered which materialization.
@@ -117,8 +117,8 @@ sync triggered which materialization.
 
 `rocky_resource` accepts either form:
 
-- **String key** (default `"rocky"`) — Dagster resolves the resource from `context.resources` at evaluation time. Per-deployment overrides apply, mock substitution via `dg.build_sensor_context(resources={...})` works without wrapping, and the resource doesn't need to exist before the sensor is built.
-- **`RockyResource` instance** — the legacy form, closure-captured at sensor-build time. Still supported indefinitely so existing call sites don't break, but the keyed form is recommended for new code.
+- **String key** (default `"rocky"`): Dagster resolves the resource from `context.resources` at evaluation time. Per-deployment overrides apply, mock substitution via `dg.build_sensor_context(resources={...})` works without wrapping, and the resource doesn't need to exist before the sensor is built.
+- **`RockyResource` instance**: the legacy form, closure-captured at sensor-build time. Still supported indefinitely so existing call sites don't break, but the keyed form is recommended for new code.
 
 ```python
 # String-key form (recommended) — resolves "rocky" from context.resources
@@ -133,7 +133,7 @@ sensor = rocky_source_sensor(rocky_resource=rocky, target=...)
 
 ## Backlog cap
 
-Pass `backlog_cap=BacklogCap(...)` to suppress emits when too many in-flight Dagster runs already share a tag value. Useful when a hung downstream amplifies into a runaway queue — without back-pressure, a stuck run can pile up dozens of fresh `RunRequest`s tagged for the same client/tenant before anyone notices.
+Pass `backlog_cap=BacklogCap(...)` to suppress emits when too many in-flight Dagster runs already share a tag value. Useful when a hung downstream amplifies into a runaway queue; without back-pressure, a stuck run can pile up dozens of fresh `RunRequest`s tagged for the same client/tenant before anyone notices.
 
 ```python
 from dagster_rocky import BacklogCap, rocky_source_sensor
@@ -147,9 +147,9 @@ sensor = rocky_source_sensor(
 )
 ```
 
-Before each emit, the sensor counts in-flight runs matching `tag_key=<value>` in the non-terminal statuses (`QUEUED`, `NOT_STARTED`, `STARTING`, `STARTED` by default — override via `BacklogCap.statuses`). If the count is at or above `max_in_flight`, the `RunRequest` is suppressed.
+Before each emit, the sensor counts in-flight runs matching `tag_key=<value>` in the non-terminal statuses (`QUEUED`, `NOT_STARTED`, `STARTING`, `STARTED` by default; override via `BacklogCap.statuses`). If the count is at or above `max_in_flight`, the `RunRequest` is suppressed.
 
-**The cursor still advances on suppression** — the in-flight run picks up the latest data via Rocky's per-source state. Freezing the cursor would compound the failure: the next tick would re-detect the same sync, retry the same suppressed emit, and never recover until the queue drains below cap.
+**The cursor still advances on suppression**: the in-flight run picks up the latest data via Rocky's per-source state. Freezing the cursor would compound the failure: the next tick would re-detect the same sync, retry the same suppressed emit, and never recover until the queue drains below cap.
 
 `BacklogCap` is opt-in. Default behavior (no cap) is unchanged.
 
@@ -193,8 +193,8 @@ Hook contract:
 
 ## Defaults
 
-- `minimum_interval_seconds=300` — 5-minute polling
-- `default_status=DefaultSensorStatus.STOPPED` — sensor ships disabled, users opt in
+- `minimum_interval_seconds=300`: 5-minute polling
+- `default_status=DefaultSensorStatus.STOPPED`: sensor ships disabled, users opt in
   via the Dagster UI
 
 ## Custom translators
