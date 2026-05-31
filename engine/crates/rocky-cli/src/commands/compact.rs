@@ -21,7 +21,6 @@ use chrono::{DateTime, Utc};
 use rocky_core::dedup_analysis::{DedupStats, compute_dedup_stats};
 use rocky_core::incremental::{PartitionChecksum, generate_whole_table_checksum_sql};
 use rocky_core::traits::{QueryResult, WarehouseAdapter};
-use rocky_databricks::dialect::DatabricksSqlDialect;
 use rocky_ir::{CompactPlanIr, TableRef};
 use rocky_sql::validation::validate_identifier;
 
@@ -71,7 +70,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// typed-IR v2 envelope (`CompactPlanIr`); the stdout JSON shape always
 /// carries SQL for human + CI consumers.
 pub fn run_compact(
-    _config_path: &Path,
+    config_path: &Path,
     model: &str,
     target_size: Option<&str>,
     dry_run: bool,
@@ -87,7 +86,12 @@ pub fn run_compact(
         .map_err(|e| anyhow::anyhow!("invalid --target-size: {e}"))?
         .unwrap_or(256);
 
-    let statements = generate_compact_sql(model, target_mb)?;
+    // Resolve the configured target dialect (config-only, no credentials) and
+    // generate through the gated `compact_from_ir`, so `rocky compact` fails
+    // fast off Databricks at plan time instead of printing OPTIMIZE/VACUUM SQL
+    // the warehouse rejects at apply time.
+    let dialect = crate::commands::plan::resolve_configured_dialect(config_path)?;
+    let statements = generate_compact_sql(model, target_mb, dialect.as_ref())?;
     let typed_statements: Vec<NamedStatement> = statements
         .iter()
         .map(|(purpose, sql)| NamedStatement {
@@ -186,13 +190,17 @@ pub async fn run_compact_catalog(
 
     let scope = resolve_managed_tables_in_catalog(config_path, catalog).await?;
 
+    // Resolve the configured target dialect once for the whole catalog so the
+    // gated generator fails fast off Databricks before templating any SQL.
+    let dialect = crate::commands::plan::resolve_configured_dialect(config_path)?;
+
     let mut flat_statements: Vec<NamedStatement> = Vec::new();
     let mut per_table: std::collections::BTreeMap<String, CompactTableEntry> =
         std::collections::BTreeMap::new();
     let mut ir_payloads: Vec<CompactPlanIr> = Vec::with_capacity(scope.tables.len());
 
     for fqn in &scope.tables {
-        let stmts = generate_compact_sql(fqn, target_mb)?;
+        let stmts = generate_compact_sql(fqn, target_mb, dialect.as_ref())?;
         let typed: Vec<NamedStatement> = stmts
             .into_iter()
             .map(|(purpose, sql)| NamedStatement {
@@ -1240,32 +1248,32 @@ fn pick_sample_tables(stats: &DedupStats, max: usize) -> Vec<String> {
     tables
 }
 
-/// Generates OPTIMIZE and VACUUM SQL for a given model.
+/// Generates OPTIMIZE and VACUUM SQL for a given model via the gated
+/// `sql_gen::compact_from_ir` chokepoint.
 ///
 /// For Delta Lake (Databricks):
 /// - `OPTIMIZE` compacts small files into larger ones
 /// - `VACUUM` removes old data files no longer referenced
 ///
+/// `dialect` is the configured target dialect: `compact_from_ir` refuses
+/// to emit `OPTIMIZE`/`VACUUM` for any dialect that doesn't advertise
+/// `supports_delta_maintenance()`, so this returns a clear
+/// known-limitation error off Databricks instead of templating Delta-only
+/// SQL the warehouse rejects.
+///
 /// Every dot-separated segment of `model` is validated as a SQL
-/// identifier before interpolation — the model name reaches us from
-/// CLI args and config files (via `--catalog` scope resolution),
-/// both of which are untrusted from the engine's perspective. See
-/// the validation rules in `engine/CLAUDE.md`.
-fn generate_compact_sql(model: &str, target_size_mb: u64) -> Result<Vec<(String, String)>> {
-    for part in model.split('.') {
-        validate_identifier(part).with_context(|| format!("invalid model identifier '{model}'"))?;
-    }
-
-    Ok(vec![
-        (
-            "compact small files".to_string(),
-            format!("OPTIMIZE {model} WHERE true\n  -- target file size: {target_size_mb}MB"),
-        ),
-        (
-            "remove stale data files".to_string(),
-            format!("VACUUM {model} RETAIN 168 HOURS"),
-        ),
-    ])
+/// identifier (inside `compact_from_ir`) — the model name reaches us from
+/// CLI args and config files (via `--catalog` scope resolution), both of
+/// which are untrusted from the engine's perspective. See the validation
+/// rules in `engine/CLAUDE.md`.
+fn generate_compact_sql(
+    model: &str,
+    target_size_mb: u64,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+) -> Result<Vec<(String, String)>> {
+    let ir = CompactPlanIr::for_table(model, target_size_mb);
+    rocky_core::sql_gen::compact_from_ir(&ir, dialect)
+        .with_context(|| format!("failed to generate compaction SQL for '{model}'"))
 }
 
 /// Regenerate `Vec<NamedStatement>` from a v2 (typed-IR) persisted compact
@@ -1279,13 +1287,15 @@ fn generate_compact_sql(model: &str, target_size_mb: u64) -> Result<Vec<(String,
 /// byte-for-byte for the today's-emission inputs covered by the C-2
 /// equivalence tests.
 ///
-/// `dialect` is hardcoded to [`DatabricksSqlDialect`] because today's
-/// OPTIMIZE/VACUUM grammar is Delta-on-Databricks flavoured; the
-/// `compact_from_ir` helper accepts the dialect for forward
-/// compatibility but currently ignores it.
+/// `dialect` is the configured target dialect (resolved from the
+/// `rocky.toml` at apply time). `compact_from_ir` refuses to regenerate
+/// OPTIMIZE/VACUUM SQL for any dialect that doesn't advertise
+/// `supports_delta_maintenance()`, so applying a compact plan against a
+/// non-Databricks adapter fails fast with a clear known-limitation error.
 fn regenerate_v2_compact_statements(
     plan_id: &str,
     payload: &serde_json::Value,
+    dialect: &dyn rocky_core::traits::SqlDialect,
 ) -> Result<Vec<NamedStatement>> {
     let plans_value = payload.get("plans").ok_or_else(|| {
         anyhow::anyhow!(
@@ -1299,10 +1309,9 @@ fn regenerate_v2_compact_statements(
             "compact plan '{plan_id}' (v2) `plans` field failed to deserialize as Vec<CompactPlanIr>"
         ))?;
 
-    let dialect = DatabricksSqlDialect;
     let mut statements = Vec::new();
     for ir in &ir_plans {
-        let pairs = rocky_core::sql_gen::compact_from_ir(ir, &dialect).with_context(|| {
+        let pairs = rocky_core::sql_gen::compact_from_ir(ir, dialect).with_context(|| {
             format!(
                 "compact plan '{plan_id}' (v2): failed to regenerate SQL for target \
                      '{target}'",
@@ -1361,6 +1370,11 @@ pub(crate) async fn run_compact_apply_in(
         );
     }
 
+    // Resolve the configured target dialect (config-only) so SQL
+    // regeneration is gated on the real warehouse: applying a compact plan
+    // against a non-Databricks adapter fails fast with the limitation error.
+    let dialect = crate::commands::plan::resolve_configured_dialect(config_path)?;
+
     // Phase C — "SQL as `.o` files" — v2 plans carry a `CompactPlanIr`
     // envelope and SQL is regenerated here via `sql_gen::compact_from_ir`.
     // The v1 inline-SQL envelope was retired in C-7; v1-shaped compact
@@ -1375,7 +1389,7 @@ pub(crate) async fn run_compact_apply_in(
              for the migration guide.",
             plan_id,
         ),
-        2 => regenerate_v2_compact_statements(plan_id, &plan.payload)?,
+        2 => regenerate_v2_compact_statements(plan_id, &plan.payload, dialect.as_ref())?,
         other => bail!(
             "compact plan '{}' has unknown format_version {}. \
              This binary supports v2 (typed CompactPlanIr) persisted plans; \
@@ -1500,7 +1514,8 @@ mod tests {
 
     #[test]
     fn test_generate_compact_sql() {
-        let stmts = generate_compact_sql("catalog.schema.orders", 256).unwrap();
+        let d = rocky_databricks::dialect::DatabricksSqlDialect;
+        let stmts = generate_compact_sql("catalog.schema.orders", 256, &d).unwrap();
         assert_eq!(stmts.len(), 2);
         assert!(stmts[0].1.contains("OPTIMIZE"));
         assert!(stmts[0].1.contains("catalog.schema.orders"));
@@ -1510,17 +1525,19 @@ mod tests {
 
     #[test]
     fn test_generate_compact_sql_custom_size() {
-        let stmts = generate_compact_sql("my_table", 512).unwrap();
+        let d = rocky_databricks::dialect::DatabricksSqlDialect;
+        let stmts = generate_compact_sql("my_table", 512, &d).unwrap();
         assert!(stmts[0].1.contains("512MB"));
     }
 
     #[test]
     fn test_generate_compact_sql_rejects_injection() {
-        assert!(generate_compact_sql("orders; DROP TABLE admin; --", 256).is_err());
-        assert!(generate_compact_sql("catalog.schema; DROP TABLE x", 256).is_err());
-        assert!(generate_compact_sql("'; DROP TABLE users; --", 256).is_err());
-        assert!(generate_compact_sql("", 256).is_err());
-        assert!(generate_compact_sql("catalog..table", 256).is_err());
+        let d = &rocky_databricks::dialect::DatabricksSqlDialect;
+        assert!(generate_compact_sql("orders; DROP TABLE admin; --", 256, d).is_err());
+        assert!(generate_compact_sql("catalog.schema; DROP TABLE x", 256, d).is_err());
+        assert!(generate_compact_sql("'; DROP TABLE users; --", 256, d).is_err());
+        assert!(generate_compact_sql("", 256, d).is_err());
+        assert!(generate_compact_sql("catalog..table", 256, d).is_err());
     }
 
     /// Cluster 3 C — C-2 equivalence proof.
@@ -1545,7 +1562,7 @@ mod tests {
 
         fn assert_equivalent(model: &str, target_mb: u64) {
             let dialect = DatabricksSqlDialect;
-            let inline = generate_compact_sql(model, target_mb)
+            let inline = generate_compact_sql(model, target_mb, &dialect)
                 .expect("inline generation must succeed for a valid identifier");
             let ir_pairs = compact_from_ir(&CompactPlanIr::for_table(model, target_mb), &dialect)
                 .expect("ir generation must succeed for a valid identifier");
@@ -1553,6 +1570,23 @@ mod tests {
                 inline, ir_pairs,
                 "compact_from_ir must produce byte-identical SQL to the inline path \
                  for model={model} target_mb={target_mb}",
+            );
+        }
+
+        /// `generate_compact_sql` routes through the gated `compact_from_ir`,
+        /// so a non-Databricks dialect must yield the known-limitation error
+        /// rather than templating `OPTIMIZE`/`VACUUM`.
+        #[test]
+        fn non_databricks_dialect_is_refused() {
+            let dialect = rocky_snowflake::dialect::SnowflakeSqlDialect;
+            let err = generate_compact_sql("catalog.schema.orders", 256, &dialect)
+                .expect_err("Snowflake must be refused for compaction");
+            // The limitation lives in the error chain (the helper adds a
+            // context frame), so assert on the full alternate-formatted chain.
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("OPTIMIZE") && msg.contains("snowflake"),
+                "expected an OPTIMIZE/snowflake limitation message, got: {msg}"
             );
         }
 
@@ -2351,6 +2385,7 @@ schema_template = "staging__{{source}}"
     /// and the envelope-shape contract.
     mod v2_regeneration {
         use super::*;
+        use rocky_databricks::dialect::DatabricksSqlDialect;
 
         fn build_v2_payload(model: &str, target_mb: u64) -> serde_json::Value {
             serde_json::json!({
@@ -2364,8 +2399,9 @@ schema_template = "staging__{{source}}"
         #[test]
         fn v2_regenerates_single_model_compact_statements() {
             let payload = build_v2_payload("catalog.schema.orders", 256);
-            let stmts = regenerate_v2_compact_statements("test-plan", &payload).unwrap();
-            let baseline = generate_compact_sql("catalog.schema.orders", 256).unwrap();
+            let d = DatabricksSqlDialect;
+            let stmts = regenerate_v2_compact_statements("test-plan", &payload, &d).unwrap();
+            let baseline = generate_compact_sql("catalog.schema.orders", 256, &d).unwrap();
             assert_eq!(stmts.len(), baseline.len());
             for (s, (purpose, sql)) in stmts.iter().zip(baseline.iter()) {
                 assert_eq!(s.purpose, *purpose);
@@ -2391,10 +2427,11 @@ schema_template = "staging__{{source}}"
                 "target_size_mb": 256,
                 "plans": irs,
             });
-            let stmts = regenerate_v2_compact_statements("test-plan", &payload).unwrap();
+            let d = DatabricksSqlDialect;
+            let stmts = regenerate_v2_compact_statements("test-plan", &payload, &d).unwrap();
             let mut expected: Vec<(String, String)> = Vec::new();
             for t in tables {
-                expected.extend(generate_compact_sql(t, 256).unwrap());
+                expected.extend(generate_compact_sql(t, 256, &d).unwrap());
             }
             assert_eq!(stmts.len(), expected.len());
             for (s, (purpose, sql)) in stmts.iter().zip(expected.iter()) {
@@ -2411,7 +2448,8 @@ schema_template = "staging__{{source}}"
                 "target_size_mb": 256,
                 // no `plans` field
             });
-            let err = regenerate_v2_compact_statements("test-plan", &payload).unwrap_err();
+            let d = DatabricksSqlDialect;
+            let err = regenerate_v2_compact_statements("test-plan", &payload, &d).unwrap_err();
             let msg = format!("{err:#}");
             assert!(
                 msg.contains("plans") && msg.contains("v2"),

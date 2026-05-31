@@ -13,9 +13,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use rocky_databricks::dialect::DatabricksSqlDialect;
 use rocky_ir::ArchivePlanIr;
-use rocky_sql::validation::validate_identifier;
 
 use crate::output::{
     ArchiveApplyOutput, ArchiveOutput, ArchiveTableEntry, ArchiveTotals, NamedStatement,
@@ -75,7 +73,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// typed-IR v2 envelope (`ArchivePlanIr`); the stdout JSON shape always
 /// carries SQL for human + CI consumers.
 pub fn run_archive(
-    _config_path: &Path,
+    config_path: &Path,
     model: Option<&str>,
     older_than: &str,
     dry_run: bool,
@@ -83,7 +81,11 @@ pub fn run_archive(
 ) -> Result<()> {
     // Parse the older_than duration (e.g., "90d", "6m", "1y")
     let days = parse_duration_days(older_than)?;
-    let statements = generate_archive_sql(model, days)?;
+    // Resolve the configured target dialect (config-only, no credentials) so
+    // the gated generator fails fast off Databricks at plan time instead of
+    // printing DELETE/VACUUM SQL the warehouse rejects at apply time.
+    let dialect = crate::commands::plan::resolve_configured_dialect(config_path)?;
+    let statements = generate_archive_sql(model, days, dialect.as_ref())?;
 
     let typed_statements: Vec<NamedStatement> = statements
         .iter()
@@ -169,12 +171,16 @@ pub async fn run_archive_catalog(
     let days = parse_duration_days(older_than)?;
     let scope = resolve_managed_tables_in_catalog(config_path, catalog).await?;
 
+    // Resolve the configured target dialect once for the whole catalog so the
+    // gated generator fails fast off Databricks before templating any SQL.
+    let dialect = crate::commands::plan::resolve_configured_dialect(config_path)?;
+
     let mut flat_statements: Vec<NamedStatement> = Vec::new();
     let mut per_table: BTreeMap<String, ArchiveTableEntry> = BTreeMap::new();
     let mut ir_payloads: Vec<ArchivePlanIr> = Vec::with_capacity(scope.tables.len());
 
     for fqn in &scope.tables {
-        let stmts = generate_archive_sql(Some(fqn), days)?;
+        let stmts = generate_archive_sql(Some(fqn), days, dialect.as_ref())?;
         let typed: Vec<NamedStatement> = stmts
             .into_iter()
             .map(|(purpose, sql)| NamedStatement {
@@ -285,37 +291,32 @@ fn parse_duration_days(s: &str) -> Result<u64> {
     }
 }
 
-/// Generates archive SQL (DELETE + VACUUM) for old data.
+/// Generates archive SQL (DELETE + VACUUM) for old data via the gated
+/// `sql_gen::archive_from_ir` chokepoint.
+///
+/// `dialect` is the configured target dialect: `archive_from_ir` refuses
+/// to emit the Delta-flavoured DELETE/VACUUM bundle (`DATEADD` +
+/// `RETAIN N HOURS`) for any dialect that doesn't advertise
+/// `supports_delta_maintenance()`, so this returns a clear
+/// known-limitation error off Databricks rather than templating SQL the
+/// warehouse rejects.
 ///
 /// When `model` is `Some`, every dot-separated segment is validated as
-/// a SQL identifier before interpolation — the model name reaches us
-/// from CLI args and config files, both of which are untrusted from
+/// a SQL identifier (inside `archive_from_ir`) — the model name reaches
+/// us from CLI args and config files, both of which are untrusted from
 /// the engine's perspective. See the validation rules in `engine/CLAUDE.md`.
-fn generate_archive_sql(model: Option<&str>, days: u64) -> Result<Vec<(String, String)>> {
-    let target = match model {
-        Some(m) => {
-            for part in m.split('.') {
-                validate_identifier(part)
-                    .with_context(|| format!("invalid model identifier '{m}'"))?;
-            }
-            m.to_string()
-        }
-        None => "*".to_string(),
-    };
-
-    Ok(vec![
-        (
-            format!("delete rows older than {days} days"),
-            format!(
-                "DELETE FROM {target}\n\
-                 WHERE _fivetran_synced < DATEADD(DAY, -{days}, CURRENT_TIMESTAMP())"
-            ),
-        ),
-        (
-            "reclaim storage after deletion".to_string(),
-            format!("VACUUM {target} RETAIN 0 HOURS"),
-        ),
-    ])
+fn generate_archive_sql(
+    model: Option<&str>,
+    days: u64,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+) -> Result<Vec<(String, String)>> {
+    let ir = build_archive_ir(model, days);
+    rocky_core::sql_gen::archive_from_ir(&ir, dialect).with_context(|| {
+        format!(
+            "failed to generate archive SQL for '{}'",
+            model.unwrap_or("*")
+        )
+    })
 }
 
 /// Regenerate `Vec<NamedStatement>` from a v2 (typed-IR) persisted
@@ -331,6 +332,7 @@ fn generate_archive_sql(model: Option<&str>, days: u64) -> Result<Vec<(String, S
 fn regenerate_v2_archive_statements(
     plan_id: &str,
     payload: &serde_json::Value,
+    dialect: &dyn rocky_core::traits::SqlDialect,
 ) -> Result<Vec<NamedStatement>> {
     let plans_value = payload
         .get("plans")
@@ -344,10 +346,9 @@ fn regenerate_v2_archive_statements(
             "archive plan '{plan_id}' (v2) `plans` field failed to deserialize as Vec<ArchivePlanIr>"
         ))?;
 
-    let dialect = DatabricksSqlDialect;
     let mut statements = Vec::new();
     for ir in &ir_plans {
-        let pairs = rocky_core::sql_gen::archive_from_ir(ir, &dialect).with_context(|| {
+        let pairs = rocky_core::sql_gen::archive_from_ir(ir, dialect).with_context(|| {
             format!(
                 "archive plan '{plan_id}' (v2): failed to regenerate SQL for target {target}",
                 target = ir.target_table.as_deref().unwrap_or("<wildcard>"),
@@ -400,6 +401,11 @@ pub(crate) async fn run_archive_apply_in(
         );
     }
 
+    // Resolve the configured target dialect (config-only) so SQL
+    // regeneration is gated on the real warehouse: applying an archive plan
+    // against a non-Databricks adapter fails fast with the limitation error.
+    let dialect = crate::commands::plan::resolve_configured_dialect(config_path)?;
+
     // Phase C — "SQL as `.o` files" — v2 plans carry an `ArchivePlanIr`
     // envelope and SQL is regenerated here via `sql_gen::archive_from_ir`.
     // The v1 inline-SQL envelope was retired in C-7; v1-shaped archive
@@ -414,7 +420,7 @@ pub(crate) async fn run_archive_apply_in(
              for the migration guide.",
             plan_id,
         ),
-        2 => regenerate_v2_archive_statements(plan_id, &plan.payload)?,
+        2 => regenerate_v2_archive_statements(plan_id, &plan.payload, dialect.as_ref())?,
         other => bail!(
             "archive plan '{}' has unknown format_version {}. \
              This binary supports v2 (typed ArchivePlanIr) persisted plans; \
@@ -552,7 +558,8 @@ mod tests {
 
     #[test]
     fn test_generate_archive_sql() {
-        let stmts = generate_archive_sql(Some("catalog.schema.orders"), 90).unwrap();
+        let dialect = rocky_databricks::dialect::DatabricksSqlDialect;
+        let stmts = generate_archive_sql(Some("catalog.schema.orders"), 90, &dialect).unwrap();
         assert_eq!(stmts.len(), 2);
         assert!(stmts[0].1.contains("DELETE FROM"));
         assert!(stmts[0].1.contains("-90"));
@@ -561,17 +568,36 @@ mod tests {
 
     #[test]
     fn test_generate_archive_sql_wildcard() {
-        let stmts = generate_archive_sql(None, 30).unwrap();
+        let dialect = rocky_databricks::dialect::DatabricksSqlDialect;
+        let stmts = generate_archive_sql(None, 30, &dialect).unwrap();
         assert!(stmts[0].1.contains("DELETE FROM *"));
     }
 
     #[test]
     fn test_generate_archive_sql_rejects_injection() {
-        assert!(generate_archive_sql(Some("orders; DROP TABLE admin; --"), 30).is_err());
-        assert!(generate_archive_sql(Some("catalog.schema; DROP TABLE x"), 30).is_err());
-        assert!(generate_archive_sql(Some("'; DROP TABLE users; --"), 30).is_err());
-        assert!(generate_archive_sql(Some(""), 30).is_err());
-        assert!(generate_archive_sql(Some("catalog..table"), 30).is_err());
+        let d = &rocky_databricks::dialect::DatabricksSqlDialect;
+        assert!(generate_archive_sql(Some("orders; DROP TABLE admin; --"), 30, d).is_err());
+        assert!(generate_archive_sql(Some("catalog.schema; DROP TABLE x"), 30, d).is_err());
+        assert!(generate_archive_sql(Some("'; DROP TABLE users; --"), 30, d).is_err());
+        assert!(generate_archive_sql(Some(""), 30, d).is_err());
+        assert!(generate_archive_sql(Some("catalog..table"), 30, d).is_err());
+    }
+
+    /// `generate_archive_sql` routes through the gated `archive_from_ir`,
+    /// so a non-Databricks dialect must yield the known-limitation error
+    /// rather than templating the Delta DELETE/VACUUM bundle.
+    #[test]
+    fn test_generate_archive_sql_refuses_non_databricks() {
+        let dialect = rocky_snowflake::dialect::SnowflakeSqlDialect;
+        let err = generate_archive_sql(Some("db.schema.orders"), 90, &dialect)
+            .expect_err("Snowflake must be refused for archive");
+        // The limitation lives in the error chain (the helper adds a context
+        // frame), so assert on the full alternate-formatted chain.
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("VACUUM") && msg.contains("snowflake"),
+            "expected a VACUUM/snowflake limitation message, got: {msg}"
+        );
     }
 
     /// Integration test for `rocky archive apply` against a real DuckDB.
@@ -763,7 +789,7 @@ schema_template = "staging__{{source}}"
 
         fn assert_equivalent(model: Option<&str>, days: u64) {
             let dialect = DatabricksSqlDialect;
-            let inline = generate_archive_sql(model, days)
+            let inline = generate_archive_sql(model, days, &dialect)
                 .expect("inline generation must succeed for valid inputs");
 
             // Mirror today's IR construction: `for_table` for named
@@ -846,6 +872,7 @@ schema_template = "staging__{{source}}"
     ///   `(purpose, sql)` pairs for the same input.
     mod v2_regeneration {
         use super::*;
+        use rocky_databricks::dialect::DatabricksSqlDialect;
 
         fn build_v2_payload(model: Option<&str>, days: u64) -> serde_json::Value {
             let ir = build_archive_ir(model, days);
@@ -861,9 +888,11 @@ schema_template = "staging__{{source}}"
         #[test]
         fn v2_regenerates_named_model_archive_statements() {
             let payload = build_v2_payload(Some("catalog.schema.events"), 90);
-            let stmts = regenerate_v2_archive_statements("test-plan", &payload).unwrap();
+            let dialect = DatabricksSqlDialect;
+            let stmts = regenerate_v2_archive_statements("test-plan", &payload, &dialect).unwrap();
             // Inline path baseline — must be byte-identical.
-            let baseline = generate_archive_sql(Some("catalog.schema.events"), 90).unwrap();
+            let baseline =
+                generate_archive_sql(Some("catalog.schema.events"), 90, &dialect).unwrap();
             assert_eq!(stmts.len(), baseline.len());
             for (s, (purpose, sql)) in stmts.iter().zip(baseline.iter()) {
                 assert_eq!(s.purpose, *purpose);
@@ -888,10 +917,11 @@ schema_template = "staging__{{source}}"
                 "dry_run": false,
                 "plans": irs,
             });
-            let stmts = regenerate_v2_archive_statements("test-plan", &payload).unwrap();
+            let dialect = DatabricksSqlDialect;
+            let stmts = regenerate_v2_archive_statements("test-plan", &payload, &dialect).unwrap();
             let mut expected: Vec<(String, String)> = Vec::new();
             for t in tables {
-                expected.extend(generate_archive_sql(Some(t), 90).unwrap());
+                expected.extend(generate_archive_sql(Some(t), 90, &dialect).unwrap());
             }
             assert_eq!(stmts.len(), expected.len());
             for (s, (purpose, sql)) in stmts.iter().zip(expected.iter()) {
@@ -909,7 +939,9 @@ schema_template = "staging__{{source}}"
                 "dry_run": false,
                 // no `plans` field
             });
-            let err = regenerate_v2_archive_statements("test-plan", &payload).unwrap_err();
+            let dialect = DatabricksSqlDialect;
+            let err =
+                regenerate_v2_archive_statements("test-plan", &payload, &dialect).unwrap_err();
             let msg = format!("{err:#}");
             assert!(
                 msg.contains("plans") && msg.contains("v2"),

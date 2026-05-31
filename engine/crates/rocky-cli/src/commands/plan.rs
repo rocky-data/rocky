@@ -435,7 +435,13 @@ pub async fn plan(
 /// when the `duckdb` feature is enabled (the default); without it, and for any
 /// unknown / missing adapter type, we fall back to the Databricks dialect and
 /// log a `tracing::warn!` so the preview still produces SQL.
-fn dialect_for_adapter_type(adapter_type: &str) -> Box<dyn rocky_core::traits::SqlDialect> {
+///
+/// Shared with `compact` / `archive`, which resolve the configured adapter's
+/// dialect at plan time so the maintenance generators can fail fast off
+/// Databricks instead of templating Delta-only SQL.
+pub(crate) fn dialect_for_adapter_type(
+    adapter_type: &str,
+) -> Box<dyn rocky_core::traits::SqlDialect> {
     match adapter_type {
         "databricks" => Box::new(rocky_databricks::dialect::DatabricksSqlDialect),
         "snowflake" => Box::new(rocky_snowflake::dialect::SnowflakeSqlDialect),
@@ -452,6 +458,32 @@ fn dialect_for_adapter_type(adapter_type: &str) -> Box<dyn rocky_core::traits::S
             Box::new(rocky_databricks::dialect::DatabricksSqlDialect)
         }
     }
+}
+
+/// Resolve the configured target adapter's standalone [`SqlDialect`] from a
+/// `rocky.toml` path, without building a live adapter (no credentials needed).
+///
+/// Loads the config, resolves the (single or named) pipeline's target adapter,
+/// and maps its `adapter_type` to a pure-formatter dialect via
+/// [`dialect_for_adapter_type`]. Used by `compact` / `archive` so their
+/// maintenance generators see the real dialect and can fail fast off
+/// Databricks at plan time.
+pub(crate) fn resolve_configured_dialect(
+    config_path: &Path,
+) -> Result<Box<dyn rocky_core::traits::SqlDialect>> {
+    let rocky_cfg = rocky_core::config::load_rocky_config(config_path)
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    let (_name, pipeline) = registry::resolve_pipeline(&rocky_cfg, None)
+        .context("failed to resolve pipeline to determine the target dialect")?;
+    let adapter_name = pipeline.target_adapter();
+    let adapter_type = rocky_cfg
+        .adapters
+        .get(adapter_name)
+        .map(|a| a.adapter_type.as_str())
+        .with_context(|| {
+            format!("pipeline target adapter '{adapter_name}' is not defined in [adapters]")
+        })?;
+    Ok(dialect_for_adapter_type(adapter_type))
 }
 
 /// Map a transformation [`MaterializationStrategy`] to the `purpose` label used
