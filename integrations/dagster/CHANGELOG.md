@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Raised the minimum `dagster` version from `>=1.13.2` to `>=1.13.6` to match the version CI resolves and tests. The `RockyComponent` path relies on `dagster.components.*` APIs from preview namespaces; advertising the tested floor is more honest than an older lower bound that CI never exercises. This is a hygiene change — the previous floor was not broken (those symbols import on earlier releases), so no behaviour changes.
+
 ## [1.43.0] — 2026-05-30
 
 Companion to engine `v1.47.0`. Codegen-driven — regenerated Pydantic bindings for the engine's `rocky profile` output (the new `profile_schema`) and updated `rocky test` results, plus documentation examples on the public health helpers and a dependency refresh. No new resource wiring or behaviour.

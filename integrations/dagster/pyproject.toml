@@ -19,7 +19,10 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
 dependencies = [
-    "dagster>=1.13.2",
+    # Floor matches the version CI actually resolves and tests (uv.lock). The
+    # RockyComponent path uses dagster.components.* APIs from preview namespaces,
+    # so we advertise a tested floor rather than an older, never-exercised one.
+    "dagster>=1.13.6",
     "pydantic>=2.0",
     "pygments>=2.20.0",
 ]
