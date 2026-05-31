@@ -41,39 +41,12 @@ def _empty_run_json() -> str:
     )
 
 
-def _plan_json() -> str:
-    """Minimal ``rocky plan`` JSON with a persisted plan_id (Phase 5)."""
-    return json.dumps(
-        {
-            "version": "0.1.0",
-            "command": "plan",
-            "filter": "tenant=acme",
-            "statements": [],
-            "plan_id": "a" * 64,
-            "plan_kind": "run",
-            "created_at": "2026-05-17T00:00:00Z",
-            "models": [],
-            "execution_layers": [],
-        }
-    )
-
-
-def _apply_envelope_json() -> str:
-    """``rocky apply`` envelope JSON wrapping an empty run result (Phase 5)."""
-    return json.dumps(
-        {
-            "version": "0.3.0",
-            "command": "apply",
-            "plan_id": "a" * 64,
-            "plan_kind": "run",
-            "success": True,
-            "result": json.loads(_empty_run_json()),
-        }
-    )
-
-
 def _plan_json(plan_id: str = "a" * 64) -> str:
-    """Phase 5b: ``rocky plan`` always emits a plan_id, replication or not."""
+    """Minimal ``rocky plan`` JSON with a persisted plan_id.
+
+    Used by the ``run_pipes`` resolver tests, which keep the two-step
+    ``rocky plan`` + ``rocky apply`` shape.
+    """
     return json.dumps(
         {
             "version": "0.1.0",
@@ -81,26 +54,23 @@ def _plan_json(plan_id: str = "a" * 64) -> str:
             "filter": "tenant=acme",
             "statements": [],
             "plan_id": plan_id,
-            "plan_kind": "replication",
+            "plan_kind": "run",
             "created_at": "2026-05-18T00:00:00Z",
+            "models": [],
+            "execution_layers": [],
         }
     )
 
 
 def _capture_run_args() -> tuple[list[list[str]], Any]:
-    """Phase 5b: ``rocky.run()`` invokes ``plan`` then ``apply``. Return the
-    plan JSON on the first call and the empty run JSON on the second.
+    """Captor for ``rocky.run()``'s single fused ``rocky run`` spawn.
 
-    Resolver tests assert against ``captured[0]`` (the plan argv) since
-    every flag emitted by ``_build_run_args`` also lands on the plan
-    argv via ``_build_plan_args`` (engine flag-surface parity, Phase 4).
+    Resolver tests assert against ``captured[0]`` (the run argv).
     """
     captured: list[list[str]] = []
 
     def fake_run(self, args, allow_partial=False):
         captured.append(args)
-        if args[0] == "plan":
-            return _plan_json()
         return _empty_run_json()
 
     return captured, fake_run
@@ -339,18 +309,12 @@ def test_run_streaming_passes_context_to_resolver():
 
     rocky = RockyResource(shadow_suffix_fn=fn)
     context = _captured_log_context()
-    # Phase 5: run_streaming spawns two subprocesses — plan (buffered)
-    # then apply (streamed). Both go through subprocess.Popen.
-    plan_proc = _streaming_popen_mock(_plan_json())
-    apply_proc = _streaming_popen_mock(_apply_envelope_json())
-    procs = iter([plan_proc, apply_proc])
-
-    def fake_popen(*_args: Any, **_kwargs: Any) -> Any:
-        return next(procs)
+    # run_streaming spawns a single fused `rocky run` subprocess.
+    run_proc = _streaming_popen_mock(_empty_run_json())
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", side_effect=fake_popen),
+        patch("dagster_rocky.resource.subprocess.Popen", return_value=run_proc),
     ):
         rocky.run_streaming(context, filter="tenant=acme")
 
