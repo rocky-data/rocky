@@ -6,8 +6,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::Instant;
-use tracing::{Instrument, Span, debug, field, info_span};
+use tracing::{Instrument, Span, debug, field, info_span, warn};
 
+use rocky_core::config::RetryConfig;
+use rocky_core::retry::compute_backoff;
+use rocky_core::retry_budget::RetryBudget;
 use rocky_core::traits::{
     AdapterError, AdapterResult, ChunkChecksum, ExecutionStats, PkRange, QueryResult, SqlDialect,
     WarehouseAdapter,
@@ -28,11 +31,33 @@ pub enum BigQueryError {
     #[error("BigQuery API error: {message} (status: {status})")]
     ApiError { status: String, message: String },
 
+    /// A query job that BigQuery accepted (HTTP 200, `jobComplete=true`)
+    /// but which then *failed at the job level* — the response carries a
+    /// top-level `errors[]` array (an `ErrorProto`) and no result rows.
+    ///
+    /// Before this variant existed, `run_query` returned `Ok` on any
+    /// `jobComplete=true` response, so an async job failure was silently
+    /// swallowed and the caller saw an empty result set instead of an
+    /// error. This mirrors how the Databricks adapter maps a
+    /// `state == FAILED` statement to `ConnectorError::StatementFailed`
+    /// and the Snowflake adapter maps a non-success `statusCode`. It is
+    /// classified **non-transient** — a rejected query won't pass on
+    /// retry.
+    #[error("BigQuery job failed: {message} (reason: {reason})")]
+    JobError { reason: String, message: String },
+
     #[error("authentication error: {0}")]
     Auth(#[from] crate::auth::AuthError),
 
     #[error("query timed out after {timeout_secs}s")]
     Timeout { timeout_secs: u64 },
+
+    /// The run-level retry budget was exhausted before this statement's
+    /// transient error could be retried. Mirrors the sibling adapters'
+    /// `RetryBudgetExhausted` so one rate-limited statement can't drain
+    /// the whole run's quota and the failure stays attributable.
+    #[error("run-level retry budget exhausted (limit {limit}); aborting remaining retries")]
+    RetryBudgetExhausted { limit: u32 },
 
     #[error("Storage Read API error: {0}")]
     StorageRead(#[from] StorageReadError),
@@ -46,6 +71,20 @@ pub struct BigQueryAdapter {
     location: String,
     dialect: BigQueryDialect,
     timeout_secs: u64,
+    /// Retry policy for transient REST failures (429 / 502 / 503 / 504 +
+    /// connection/timeout). Mirrors the Snowflake and Databricks adapters,
+    /// which both carry a [`RetryConfig`] and retry transient errors with
+    /// exponential backoff. Defaults to [`RetryConfig::default`]
+    /// (`max_retries = 3`) so the bare `new()` constructor gains retry
+    /// without a signature change; the registry threads the pipeline's
+    /// `[retry]` config in via [`BigQueryAdapter::with_retry`].
+    retry: RetryConfig,
+    /// Shared run-level retry budget. Unbounded by default — set via
+    /// [`BigQueryAdapter::with_retry_budget`] from the top-level
+    /// `[retry] max_retries_per_run` so one rate-limited statement can't
+    /// drain the whole run's quota. Mirrors the sibling adapters' §P2.7
+    /// budget.
+    retry_budget: RetryBudget,
     /// Override for the REST API base URL (used by tests to point at a
     /// wiremock server instead of `bigquery.googleapis.com`). Always
     /// `None` in production builds — the field only exists under `test`
@@ -132,9 +171,30 @@ impl BigQueryAdapter {
             location: location.into(),
             dialect: BigQueryDialect,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            retry: RetryConfig::default(),
+            retry_budget: RetryBudget::unbounded(),
             #[cfg(any(test, feature = "test-support"))]
             base_url_override: None,
         }
+    }
+
+    /// Set the retry policy for transient REST failures. The registry
+    /// threads the pipeline's `[retry]` config in here so a BigQuery
+    /// adapter honours the same `max_retries` / backoff knobs as the
+    /// Snowflake and Databricks adapters.
+    #[must_use]
+    pub fn with_retry(mut self, retry: RetryConfig) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// Override the run-level [`RetryBudget`]. The registry passes the
+    /// shared cross-adapter budget built from the top-level `[retry]
+    /// max_retries_per_run` so all adapters in a run draw from one quota.
+    #[must_use]
+    pub fn with_retry_budget(mut self, budget: RetryBudget) -> Self {
+        self.retry_budget = budget;
+        self
     }
 
     /// Point this adapter at a custom REST API base URL (for testing with
@@ -226,65 +286,125 @@ impl BigQueryAdapter {
             "rocky.warehouse.name" = %self.project_id,
             "rocky.warehouse.query_id" = field::Empty,
             "rocky.warehouse.bytes_scanned" = field::Empty,
+            "rocky.retry.attempt" = field::Empty,
         );
-        async move {
-            let token = self.auth.get_token(&self.client).await?;
-            let url = format!(
-                "{}/bigquery/v2/projects/{}/queries",
-                self.base_url(),
-                self.project_id
-            );
+        self.run_query_with_retry(sql).instrument(span).await
+    }
 
-            let request = QueryRequest {
-                query: sql.to_string(),
-                use_legacy_sql: false,
-                location: self.location.clone(),
-                timeout_ms: self.timeout_secs * 1000,
-                max_results: MAX_RESULTS_PER_PAGE,
-            };
-
-            debug!(sql = sql, project = %self.project_id, "executing BigQuery query");
-
-            let resp = self
-                .client
-                .post(&url)
-                .bearer_auth(&token)
-                .json(&request)
-                .send()
-                .await?;
-
-            if !resp.status().is_success() {
-                let status = resp.status().to_string();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(BigQueryError::ApiError {
-                    status,
-                    message: body,
-                });
+    /// Submit `sql` with bounded retry-with-backoff for transient REST
+    /// failures (429 / 502 / 503 / 504 + connection/timeout), mirroring the
+    /// Snowflake and Databricks adapters. Non-transient failures (auth
+    /// 401/403, a 400 syntax rejection, a job-level `errors[]`, or a poll
+    /// timeout) return on the first attempt — retrying them only burns
+    /// quota. The run-level [`RetryBudget`] caps total retries so one
+    /// rate-limited statement can't drain the whole run's quota.
+    async fn run_query_with_retry(&self, sql: &str) -> Result<BigQueryResponse, BigQueryError> {
+        for attempt in 0..=self.retry.max_retries {
+            match self.run_query_once(sql).await {
+                Ok(resp) => {
+                    if attempt > 0 {
+                        rocky_observe::metrics::METRICS.inc_retries_succeeded();
+                    }
+                    Span::current().record(span_attrs::RETRY_ATTEMPT, u64::from(attempt + 1));
+                    return Ok(resp);
+                }
+                Err(err) => {
+                    if attempt < self.retry.max_retries && is_transient(&err) {
+                        // Run-level retry budget: if exhausted, abort
+                        // remaining retries so one rate-limited statement
+                        // can't drain the run's quota. Unbounded budgets
+                        // always consume successfully.
+                        if !self.retry_budget.try_consume() {
+                            let limit = self.retry_budget.total().unwrap_or(0);
+                            warn!(
+                                attempt = attempt + 1,
+                                max_retries = self.retry.max_retries,
+                                budget_limit = limit,
+                                error = %err,
+                                "retry budget exhausted for this run; aborting further retries",
+                            );
+                            return Err(BigQueryError::RetryBudgetExhausted { limit });
+                        }
+                        rocky_observe::metrics::METRICS.inc_retries_attempted();
+                        let backoff_ms = compute_backoff(&self.retry, attempt);
+                        warn!(
+                            attempt = attempt + 1,
+                            max_retries = self.retry.max_retries,
+                            backoff_ms = backoff_ms,
+                            error = %err,
+                            "transient BigQuery error, retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
             }
-
-            let response: BigQueryResponse = resp.json().await?;
-
-            if response.job_complete {
-                record_warehouse_attrs_on_current_span(&response);
-                return Ok(response);
-            }
-
-            // Async job: BigQuery deferred the result. Poll jobs.getQueryResults
-            // until it reports `job_complete=true` or `timeout_secs` elapses.
-            // Without this, the previous behaviour silently returned an empty
-            // rows array for any query slower than BigQuery's sync window.
-            let job_ref = response
-                .job_reference
-                .ok_or_else(|| BigQueryError::ApiError {
-                    status: "missing jobReference".into(),
-                    message:
-                        "BigQuery returned job_complete=false with no job_reference; cannot poll"
-                            .into(),
-                })?;
-            self.poll_query_results(&job_ref).await
         }
-        .instrument(span)
-        .await
+        unreachable!("retry loop should always return")
+    }
+
+    /// One BigQuery `jobs.query` submission + poll, with no retry. The
+    /// retry/backoff loop lives in [`Self::run_query_with_retry`].
+    async fn run_query_once(&self, sql: &str) -> Result<BigQueryResponse, BigQueryError> {
+        let token = self.auth.get_token(&self.client).await?;
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/queries",
+            self.base_url(),
+            self.project_id
+        );
+
+        let request = QueryRequest {
+            query: sql.to_string(),
+            use_legacy_sql: false,
+            location: self.location.clone(),
+            timeout_ms: self.timeout_secs * 1000,
+            max_results: MAX_RESULTS_PER_PAGE,
+        };
+
+        debug!(sql = sql, project = %self.project_id, "executing BigQuery query");
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&request)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().to_string();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(BigQueryError::ApiError {
+                status,
+                message: body,
+            });
+        }
+
+        let response: BigQueryResponse = resp.json().await?;
+
+        if response.job_complete {
+            // Surface an async job-level failure as an error instead of
+            // swallowing it as an empty result set. BigQuery accepts the
+            // job (HTTP 200, `jobComplete=true`) but reports the failure
+            // via a top-level `errors[]` array with no rows.
+            response.check_job_error()?;
+            record_warehouse_attrs_on_current_span(&response);
+            return Ok(response);
+        }
+
+        // Async job: BigQuery deferred the result. Poll jobs.getQueryResults
+        // until it reports `job_complete=true` or `timeout_secs` elapses.
+        // Without this, the previous behaviour silently returned an empty
+        // rows array for any query slower than BigQuery's sync window.
+        let job_ref = response
+            .job_reference
+            .ok_or_else(|| BigQueryError::ApiError {
+                status: "missing jobReference".into(),
+                message: "BigQuery returned job_complete=false with no job_reference; cannot poll"
+                    .into(),
+            })?;
+        self.poll_query_results(&job_ref).await
     }
 
     /// Poll `jobs.getQueryResults` until the job finishes or the configured
@@ -343,6 +463,10 @@ impl BigQueryAdapter {
 
             let response: BigQueryResponse = resp.json().await?;
             if response.job_complete {
+                // Same async-failure guard as the sync path: a job that
+                // finished with a top-level `errors[]` is surfaced as a
+                // `JobError`, not swallowed as an empty result set.
+                response.check_job_error()?;
                 debug!(
                     job_id = %job_ref.job_id,
                     attempts = attempt + 1,
@@ -994,6 +1118,88 @@ struct BigQueryResponse {
     /// stays `Option` for forward compatibility with `jobs.get` paths.
     #[serde(default)]
     statistics: Option<BigQueryStatistics>,
+    /// Top-level `errors[]` array on the `jobs.query` `QueryResponse` /
+    /// `jobs.getQueryResults` `GetQueryResultsResponse`. When a query job
+    /// BigQuery *accepted* (HTTP 200, `jobComplete=true`) then *failed*,
+    /// the failure surfaces here as an `ErrorProto` array — there is no
+    /// top-level `status` block on these endpoints (that nesting belongs
+    /// to the `jobs.get` `Job` resource). Before this field existed, an
+    /// accepted-but-failed job was silently returned as `Ok` with an
+    /// empty result set. `check_job_error` maps a non-empty `errors[]` to
+    /// [`BigQueryError::JobError`].
+    ///
+    /// Note: BigQuery documents that `errors[]` can also carry *warnings*
+    /// on a successful job, in which case result rows are still present.
+    /// `check_job_error` keys on the first `ErrorProto` regardless; in
+    /// practice the synchronous query endpoint returns warnings rarely and
+    /// a true failure always carries no rows. Sync rejections at job
+    /// creation arrive as a non-2xx Google API `error` envelope instead
+    /// and are handled by the `!resp.status().is_success()` branch.
+    #[serde(default)]
+    errors: Option<Vec<ErrorProto>>,
+}
+
+impl BigQueryResponse {
+    /// Map a top-level `errors[]` on a completed job to a
+    /// [`BigQueryError::JobError`], so an async job failure surfaces as an
+    /// error instead of an empty result set. No-op when `errors` is absent
+    /// or empty (the common success case).
+    fn check_job_error(&self) -> Result<(), BigQueryError> {
+        let Some(first) = self.errors.as_ref().and_then(|e| e.first()) else {
+            return Ok(());
+        };
+        Err(BigQueryError::JobError {
+            reason: first.reason.clone().unwrap_or_else(|| "unknown".into()),
+            message: first.message.clone().unwrap_or_default(),
+        })
+    }
+}
+
+/// A single BigQuery `ErrorProto` entry from a job-level `errors[]` array.
+/// Only `reason` + `message` are read; the other documented fields
+/// (`location`, `locationType`, `debugInfo`) are ignored.
+#[derive(Debug, Deserialize)]
+struct ErrorProto {
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Classifies whether a [`BigQueryError`] is transient and worth retrying.
+///
+/// Transient (retried with backoff):
+/// - HTTP 429 (Too Many Requests), 502/503/504 (server errors)
+/// - Network connection or HTTP-request timeout errors
+///
+/// **Not** transient (returned on the first attempt):
+/// - Auth failures (401/403) and a 400 query rejection — retrying a bad
+///   token or a syntax error only burns quota. (Unlike the Databricks
+///   adapter, this connector does not refresh a cached token on 401/403;
+///   `BigQueryAuth::ServiceAccount` mints fresh JWTs per-exchange and a
+///   true bad-credential 401 would re-fail every attempt anyway.)
+/// - A job-level [`BigQueryError::JobError`] — a rejected query won't pass
+///   on retry.
+/// - A poll-loop [`BigQueryError::Timeout`] — the job already ran to the
+///   deadline; re-submitting it is a fresh statement's concern.
+fn is_transient(err: &BigQueryError) -> bool {
+    match err {
+        BigQueryError::ApiError { status, .. } => {
+            // `status` is the reqwest `StatusCode` `Display` form, e.g.
+            // "429 Too Many Requests". Match on the leading code.
+            let code = status
+                .split_whitespace()
+                .next()
+                .and_then(|c| c.parse::<u16>().ok());
+            matches!(code, Some(429 | 502 | 503 | 504))
+        }
+        BigQueryError::Http(e) => e.is_connect() || e.is_timeout(),
+        BigQueryError::JobError { .. }
+        | BigQueryError::Auth(_)
+        | BigQueryError::Timeout { .. }
+        | BigQueryError::RetryBudgetExhausted { .. }
+        | BigQueryError::StorageRead(_) => false,
+    }
 }
 
 /// Top-level `statistics` block on a BigQuery job response. Only the
@@ -1313,5 +1519,103 @@ mod tests {
         let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
         let stats = stats_from_response(&resp);
         assert_eq!(stats.bytes_scanned, Some(10_485_760));
+    }
+
+    #[test]
+    fn job_errors_array_real_shape_deserializes_and_maps_to_job_error() {
+        // The real top-level `errors[]` ErrorProto shape captured from a
+        // live BigQuery sandbox probe — `{message, reason, domain,
+        // location, locationType}` at the response top level. (The live
+        // `jobs.query` runtime-failure probe returned this wrapped in a
+        // 400 `error.errors[]` envelope; the same ErrorProto is the
+        // top-level `errors[]` on a `jobComplete=true` async-failure
+        // response.) `check_job_error` maps the first entry to a
+        // `JobError` carrying `reason` + `message`.
+        let json = r#"{
+            "jobComplete": true,
+            "jobReference": {"projectId": "p", "jobId": "job-x"},
+            "errors": [
+                {
+                    "message": "division by zero: 1 / 0",
+                    "domain": "global",
+                    "reason": "invalidQuery",
+                    "location": "q",
+                    "locationType": "parameter"
+                }
+            ]
+        }"#;
+        let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
+        let err = resp
+            .check_job_error()
+            .expect_err("a top-level errors[] must map to a JobError");
+        match err {
+            BigQueryError::JobError { reason, message } => {
+                assert_eq!(reason, "invalidQuery");
+                assert_eq!(message, "division by zero: 1 / 0");
+            }
+            other => panic!("expected JobError, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_job_error_is_noop_without_errors() {
+        // A normal completed response (no `errors` field) — the happy
+        // path captured live had no `errors` key at all. Must stay Ok so
+        // empty-result / DDL responses aren't mistaken for failures.
+        let json = r#"{
+            "jobComplete": true,
+            "jobReference": {"projectId": "p", "jobId": "job-ok"},
+            "rows": [{"f": [{"v": "1"}]}]
+        }"#;
+        let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.errors.is_none());
+        assert!(resp.check_job_error().is_ok());
+    }
+
+    #[test]
+    fn check_job_error_is_noop_for_empty_errors_array() {
+        // Defensive: an empty `errors[]` array (not `null`) must not be
+        // treated as a failure.
+        let json = r#"{
+            "jobComplete": true,
+            "errors": []
+        }"#;
+        let resp: BigQueryResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.check_job_error().is_ok());
+    }
+
+    #[test]
+    fn is_transient_classifies_retryable_vs_terminal() {
+        // Retryable: 429 / 502 / 503 / 504 (status is the reqwest
+        // StatusCode Display form, e.g. "429 Too Many Requests").
+        for code in ["429 Too Many Requests", "502 Bad Gateway", "503", "504"] {
+            assert!(
+                is_transient(&BigQueryError::ApiError {
+                    status: code.into(),
+                    message: "x".into(),
+                }),
+                "{code} should be transient"
+            );
+        }
+        // Terminal: auth 401/403 and a 400 rejection are NOT retried.
+        for code in ["400 Bad Request", "401 Unauthorized", "403 Forbidden"] {
+            assert!(
+                !is_transient(&BigQueryError::ApiError {
+                    status: code.into(),
+                    message: "x".into(),
+                }),
+                "{code} should be terminal"
+            );
+        }
+        // Terminal: a job-level rejection and a poll timeout don't pass
+        // on retry.
+        assert!(!is_transient(&BigQueryError::JobError {
+            reason: "invalidQuery".into(),
+            message: "bad".into(),
+        }));
+        assert!(!is_transient(&BigQueryError::Timeout { timeout_secs: 1 }));
+        assert!(!is_transient(&BigQueryError::RetryBudgetExhausted {
+            limit: 1
+        }));
     }
 }

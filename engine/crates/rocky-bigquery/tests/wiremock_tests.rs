@@ -9,19 +9,32 @@
 //! worst structural-bug history of the adapters, every bug in the
 //! HTTP/parse path, so this closes a high-risk gap.
 //!
-//! ## Characterization, not aspiration
+//! ## Behavior these tests pin
 //!
-//! Snowflake and Databricks classify 429/503 as transient and **retry**,
-//! and map a job-level error (`status.error` / `status.errorResult`) to a
-//! typed "statement failed" / "query rejected" variant. **BigQuery's
-//! connector does neither today**: `run_query` / `poll_query_results`
-//! make a single request and return `BigQueryError::ApiError` on any
-//! non-2xx, and `BigQueryResponse` doesn't parse `status.errorResult` at
-//! all. These tests therefore *pin current behavior* (429/503 →
-//! `ApiError` on the first hit, no retry; a 200-with-`errorResult` body
-//! is silently ignored and yields empty rows) rather than asserting a
-//! retry/error-mapping feature that doesn't exist. Closing those gaps is
-//! a follow-up feature PR, deliberately kept out of this test-only change.
+//! Like the Snowflake and Databricks adapters, BigQuery now classifies
+//! 429/502/503/504 as transient and **retries** with bounded
+//! exponential backoff, and maps an accepted-but-failed job (a top-level
+//! `errors[]` array on a `jobComplete=true` 200 response) to a typed
+//! [`BigQueryError::JobError`] instead of swallowing it as an empty
+//! result set. The three tests that previously *characterized the gap*
+//! (429/503 → `ApiError` on the first hit; a 200-with-error body ignored)
+//! now assert the fixed behavior.
+//!
+//! ### Job-failure shape (captured live, not guessed)
+//!
+//! The `jobs.query` `QueryResponse` and `jobs.getQueryResults`
+//! `GetQueryResultsResponse` surface a *job-level* failure as a
+//! **top-level `errors[]`** array of `ErrorProto`
+//! (`{reason, message, location, ...}`) — there is **no** top-level
+//! `status.errorResult` block on these endpoints (that nesting belongs to
+//! the `jobs.get` `Job` resource). A live sandbox probe confirmed that a
+//! runtime failure submitted through `jobs.query` (`SELECT ERROR(col)`,
+//! div-by-zero on a real table) is in fact rejected *synchronously* with
+//! an HTTP 400 Google API `error` envelope, which the non-2xx branch
+//! already maps to `ApiError`. The 200-with-`errors[]` path is the
+//! documented async-failure surface on `getQueryResults`; these tests pin
+//! the `errors[]` parsing using that real `ErrorProto` shape so the
+//! connector is correct regardless of which path a given job takes.
 //!
 //! ## Test seam
 //!
@@ -36,6 +49,8 @@
 use rocky_bigquery::BigQueryAdapter;
 use rocky_bigquery::auth::BigQueryAuth;
 use rocky_bigquery::connector::BigQueryError;
+use rocky_core::config::RetryConfig;
+use rocky_core::retry_budget::RetryBudget;
 use rocky_core::traits::{AdapterError, WarehouseAdapter};
 use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path, query_param};
@@ -48,11 +63,52 @@ const QUERIES_PATH: &str = "/bigquery/v2/projects/test-project/queries";
 /// `with_timeout` defaults to the production 300 s so the poll deadline
 /// doesn't bite on the happy paths; individual tests shrink it where the
 /// timeout itself is under test.
+///
+/// **Retries disabled** (`max_retries = 0`) by default so the single-
+/// request error-mapping tests (auth 401/403, the 400 rejection, the
+/// job-error path) assert exactly one request without a retry layer
+/// interfering. The retry tests opt in via [`retrying_adapter`].
 fn test_adapter(server: &MockServer) -> BigQueryAdapter {
     let auth = BigQueryAuth::Bearer(rocky_core::redacted::RedactedString::new(
         "test-bq-token".into(),
     ));
-    BigQueryAdapter::new("test-project", "EU", auth).with_base_url(server.uri())
+    BigQueryAdapter::new("test-project", "EU", auth)
+        .with_base_url(server.uri())
+        .with_retry(no_retry())
+}
+
+/// `RetryConfig` with retries disabled — the error-mapping characterization
+/// tests want exactly one request.
+fn no_retry() -> RetryConfig {
+    RetryConfig {
+        max_retries: 0,
+        ..Default::default()
+    }
+}
+
+/// A fast `RetryConfig` for the retry tests: `max_retries` retries with a
+/// 1 ms base backoff and no jitter so the test doesn't sleep on the
+/// production 1000 ms ladder. Assertions on request count use the mock's
+/// `.expect(N)` / `server.verify()`.
+fn fast_retry(max_retries: u32) -> RetryConfig {
+    RetryConfig {
+        max_retries,
+        initial_backoff_ms: 1,
+        max_backoff_ms: 5,
+        backoff_multiplier: 2.0,
+        jitter: false,
+        ..Default::default()
+    }
+}
+
+/// Adapter that retries transient errors with the fast backoff above.
+fn retrying_adapter(server: &MockServer, max_retries: u32) -> BigQueryAdapter {
+    let auth = BigQueryAuth::Bearer(rocky_core::redacted::RedactedString::new(
+        "test-bq-token".into(),
+    ));
+    BigQueryAdapter::new("test-project", "EU", auth)
+        .with_base_url(server.uri())
+        .with_retry(fast_retry(max_retries))
 }
 
 /// Downcast an [`AdapterError`] to the concrete [`BigQueryError`] so tests
@@ -244,38 +300,32 @@ async fn deferred_job_without_reference_errors_cleanly() {
 }
 
 // ---------------------------------------------------------------------------
-// (c) 429 / 503 — CHARACTERIZATION: current connector does NOT retry.
+// (c) 429 / 503 — transient: the connector classifies these as transient
+// and retries with bounded backoff, mirroring the SF/DBX adapters.
 // ---------------------------------------------------------------------------
-//
-// SF/DBX classify these as transient and retry. BigQuery's connector has
-// no retry layer (`new` takes no RetryConfig; `run_query` makes one
-// request), so a 429 or 503 maps straight to `ApiError` on the first hit.
-// These tests pin that: the error mock is `.expect(1)` and a "would only
-// be hit on retry" success mock is `.expect(0)`, with `server.verify()`
-// proving no second attempt fired. The BQ analog of "gives up after the
-// budget" is the poll-loop `Timeout` path, covered separately below.
 
-/// 429 (rate limited) is surfaced as `ApiError` on the first request, with
-/// no retry. The mock is `.expect(1)`: had the connector retried, the
-/// call count would be ≥2 and `verify()` would fail — proving the absence
-/// of a retry layer. (SF/DBX classify 429 as transient and retry to a
-/// success; BigQuery does not yet.)
+/// 429 (rate limited) is transient: the connector retries. Here every
+/// attempt returns 429, so after the budget is exhausted the call surfaces
+/// the final `ApiError(429)`. `.expect(max_retries + 1)` pins that all
+/// attempts fired — proving the retry layer engaged (the pre-fix
+/// connector would have made exactly one request).
 #[tokio::test]
-async fn rate_limit_429_maps_to_api_error_without_retry() {
+async fn rate_limit_429_is_retried_then_surfaces_after_budget() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path(QUERIES_PATH))
         .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
-        .expect(1)
+        // 2 retries → 3 total attempts.
+        .expect(3)
         .mount(&server)
         .await;
 
-    let adapter = test_adapter(&server);
+    let adapter = retrying_adapter(&server, 2);
     let err = adapter
         .execute_query("SELECT 1")
         .await
-        .expect_err("429 should surface as an error");
+        .expect_err("429 on every attempt should surface as an error after retries");
     match as_bq_error(&err) {
         BigQueryError::ApiError { status, message } => {
             assert!(
@@ -284,31 +334,32 @@ async fn rate_limit_429_maps_to_api_error_without_retry() {
             );
             assert!(message.contains("rate limited"));
         }
-        other => panic!("expected ApiError(429), got: {other:?}"),
+        other => panic!("expected ApiError(429) after exhausting retries, got: {other:?}"),
     }
-    // Exactly one request — `.expect(1)` fires on drop if the connector
-    // retried (would be 2+) or never called (would be 0).
+    // 3 requests total (1 + 2 retries) — `.expect(3)` fails on drop if the
+    // connector made fewer (no retry) or more.
     server.verify().await;
 }
 
-/// 503 (service unavailable) likewise maps to `ApiError` on the first hit
-/// with no retry. Pins that BigQuery does not yet treat 503 as transient.
+/// 503 (service unavailable) is likewise transient and retried. Same
+/// shape: every attempt 503s, the final error is `ApiError(503)`, and the
+/// request count proves the retries fired.
 #[tokio::test]
-async fn service_unavailable_503_maps_to_api_error_without_retry() {
+async fn service_unavailable_503_is_retried_then_surfaces_after_budget() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path(QUERIES_PATH))
         .respond_with(ResponseTemplate::new(503).set_body_string("service unavailable"))
-        .expect(1)
+        .expect(3)
         .mount(&server)
         .await;
 
-    let adapter = test_adapter(&server);
+    let adapter = retrying_adapter(&server, 2);
     let err = adapter
         .execute_query("SELECT 1")
         .await
-        .expect_err("503 should surface as an error");
+        .expect_err("503 on every attempt should surface as an error after retries");
     match as_bq_error(&err) {
         BigQueryError::ApiError { status, message } => {
             assert!(
@@ -317,8 +368,93 @@ async fn service_unavailable_503_maps_to_api_error_without_retry() {
             );
             assert!(message.contains("service unavailable"));
         }
-        other => panic!("expected ApiError(503), got: {other:?}"),
+        other => panic!("expected ApiError(503) after exhausting retries, got: {other:?}"),
     }
+    server.verify().await;
+}
+
+/// Retry **succeeds** after N transient 429s then a 200: the connector
+/// retries through the rate-limit responses and returns the eventual
+/// result. Two scoped mocks with priorities — the 429 mock answers the
+/// first two requests (`up_to_n_times(2)`), the success mock answers the
+/// third — let `server.verify()` assert the exact attempt counts.
+#[tokio::test]
+async fn retry_succeeds_after_two_429s_then_200() {
+    let server = MockServer::start().await;
+
+    // First two attempts: 429. Higher priority so it wins while it still
+    // has responses left.
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    // Third attempt: success with a row.
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "jobReference": {"projectId": "test-project", "jobId": "job-retry-ok"},
+            "schema": {"fields": [{"name": "n", "type": "INTEGER"}]},
+            "rows": [{"f": [{"v": "7"}]}],
+            "totalRows": "1"
+        })))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // 3 retries available; only 2 are needed.
+    let adapter = retrying_adapter(&server, 3);
+    let result = adapter
+        .execute_query("SELECT 7 AS n")
+        .await
+        .expect("connector should retry through the 429s and return the eventual result");
+
+    assert_eq!(result.columns, vec!["n"]);
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], json!("7"));
+
+    // 2 × 429 then 1 × 200 = exactly 3 requests.
+    server.verify().await;
+}
+
+/// Retry **exhausts the run-level budget**: with `max_retries` high enough
+/// to keep retrying but a `RetryBudget` of 1, the second transient failure
+/// can't consume a retry slot, so the call aborts with
+/// `RetryBudgetExhausted` rather than continuing to burn the warehouse's
+/// rate-limit quota. Exactly 2 requests fire (initial + the single budgeted
+/// retry).
+#[tokio::test]
+async fn retry_exhausts_budget_after_repeated_503() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        // initial attempt + 1 budgeted retry.
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    // max_retries = 5 would otherwise allow 5 retries, but the shared
+    // budget caps total retries at 1.
+    let adapter = retrying_adapter(&server, 5).with_retry_budget(RetryBudget::new(1));
+    let err = adapter
+        .execute_query("SELECT 1")
+        .await
+        .expect_err("budget exhaustion should abort remaining retries with an error");
+    match as_bq_error(&err) {
+        BigQueryError::RetryBudgetExhausted { limit } => {
+            assert_eq!(*limit, 1, "budget limit should be reported");
+        }
+        other => panic!("expected RetryBudgetExhausted, got: {other:?}"),
+    }
+    // initial + 1 retry = 2 requests; the budget blocks any further retry.
     server.verify().await;
 }
 
@@ -374,9 +510,11 @@ async fn never_completing_job_times_out() {
 // ---------------------------------------------------------------------------
 
 /// A 401 from BigQuery (expired/invalid token) maps to `ApiError` with the
-/// status and the error body preserved.
+/// status and the error body preserved, and is **not retried** — even with
+/// a retrying adapter, `.expect(1)` proves the classifier treats 401 as
+/// terminal (retrying a bad token only burns quota).
 #[tokio::test]
-async fn auth_failure_401_maps_to_api_error() {
+async fn auth_failure_401_maps_to_api_error_without_retry() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -392,7 +530,8 @@ async fn auth_failure_401_maps_to_api_error() {
         .mount(&server)
         .await;
 
-    let adapter = test_adapter(&server);
+    // Retrying adapter — a 401 must still surface on the first attempt.
+    let adapter = retrying_adapter(&server, 3);
     let err = adapter
         .execute_query("SELECT 1")
         .await
@@ -410,12 +549,13 @@ async fn auth_failure_401_maps_to_api_error() {
         }
         other => panic!("expected ApiError(401), got: {other:?}"),
     }
+    server.verify().await;
 }
 
 /// A 403 (e.g. `accessDenied` / quota or IAM denial) likewise maps to
-/// `ApiError` with the status and body preserved.
+/// `ApiError` with the status and body preserved, and is **not retried**.
 #[tokio::test]
-async fn auth_failure_403_maps_to_api_error() {
+async fn auth_failure_403_maps_to_api_error_without_retry() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -431,7 +571,7 @@ async fn auth_failure_403_maps_to_api_error() {
         .mount(&server)
         .await;
 
-    let adapter = test_adapter(&server);
+    let adapter = retrying_adapter(&server, 3);
     let err = adapter
         .execute_query("SELECT 1")
         .await
@@ -449,6 +589,7 @@ async fn auth_failure_403_maps_to_api_error() {
         }
         other => panic!("expected ApiError(403), got: {other:?}"),
     }
+    server.verify().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -511,11 +652,13 @@ async fn truncated_json_body_maps_to_http_error() {
 // ---------------------------------------------------------------------------
 
 /// A SQL/job error returned as HTTP **400** with a BigQuery error envelope
-/// is the path the connector actually treats as a rejection today: any
-/// non-2xx → `ApiError` carrying the message. Mirrors how `jobs.query`
-/// returns syntax errors and invalid-query failures synchronously.
+/// maps to `ApiError` carrying the message, and is **not retried** — a
+/// retrying adapter with `.expect(1)` proves the 400 rejection is terminal.
+/// This is the path the connector takes for a synchronously-rejected query;
+/// the live sandbox probe confirmed `jobs.query` returns a runtime failure
+/// (`SELECT ERROR(col)`, div-by-zero) as exactly this 400 envelope.
 #[tokio::test]
-async fn job_error_http_400_maps_to_api_error() {
+async fn job_error_http_400_maps_to_api_error_without_retry() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -531,7 +674,7 @@ async fn job_error_http_400_maps_to_api_error() {
         .mount(&server)
         .await;
 
-    let adapter = test_adapter(&server);
+    let adapter = retrying_adapter(&server, 3);
     let err = adapter
         .execute_query("SELCT 1")
         .await
@@ -549,19 +692,23 @@ async fn job_error_http_400_maps_to_api_error() {
         }
         other => panic!("expected ApiError(400), got: {other:?}"),
     }
+    server.verify().await;
 }
 
-/// CHARACTERIZATION (documented gap): a 200 response carrying a job-level
-/// `status.errorResult` — BigQuery's async failure shape — is currently
-/// **ignored** by the connector. `BigQueryResponse` doesn't parse
-/// `status`, and `run_query` returns `Ok` whenever `jobComplete=true`, so
-/// the failure is swallowed and the caller sees an empty result set rather
-/// than a query-rejected error. SF/DBX map their equivalent to a typed
-/// "statement failed". This test pins the current (incorrect) behavior so
-/// a future fix that maps `errorResult` to an error is an intentional,
-/// visible change. See the module header.
+/// FIXED (was `job_error_result_in_200_body_is_currently_ignored`): a 200
+/// response on a *completed* job (`jobComplete=true`) that carries a
+/// top-level `errors[]` array — BigQuery's async job-failure shape on the
+/// `jobs.query` / `jobs.getQueryResults` endpoints — now maps to a typed
+/// [`BigQueryError::JobError`] instead of being swallowed as an empty
+/// result set.
+///
+/// The body uses the **real** `ErrorProto` shape captured live
+/// (`{reason, message, location, locationType, domain}` at the response
+/// top level — there is no `status.errorResult` nesting on these
+/// endpoints; that belongs to the `jobs.get` `Job` resource). The first
+/// `ErrorProto`'s `reason` / `message` flow into the typed error.
 #[tokio::test]
-async fn job_error_result_in_200_body_is_currently_ignored() {
+async fn job_error_in_200_body_maps_to_job_error() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -569,33 +716,89 @@ async fn job_error_result_in_200_body_is_currently_ignored() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jobComplete": true,
             "jobReference": {"projectId": "test-project", "jobId": "job-errresult"},
-            "status": {
-                "state": "DONE",
-                "errorResult": {
+            // Real top-level `errors[]` ErrorProto shape (captured live).
+            "errors": [
+                {
                     "reason": "invalidQuery",
-                    "message": "Table not found: missing_table"
-                },
-                "errors": [
-                    {"reason": "invalidQuery", "message": "Table not found: missing_table"}
-                ]
-            }
+                    "message": "Table not found: missing_table",
+                    "domain": "global",
+                    "location": "q",
+                    "locationType": "parameter"
+                }
+            ]
         })))
         .expect(1)
         .mount(&server)
         .await;
 
     let adapter = test_adapter(&server);
-    // GAP: this resolves to Ok with no rows instead of a query-rejected
-    // error. Asserting Ok pins the current behavior; flip this assertion
-    // when the connector learns to map `status.errorResult`.
-    let result = adapter
+    let err = adapter
         .execute_query("SELECT * FROM missing_table")
         .await
-        .expect("connector currently ignores status.errorResult and returns Ok");
-    assert!(
-        result.rows.is_empty(),
-        "errorResult body carries no rows; current behavior yields an empty result set"
-    );
+        .expect_err("a job-level errors[] must surface as an error, not empty rows");
+    match as_bq_error(&err) {
+        BigQueryError::JobError { reason, message } => {
+            assert_eq!(reason, "invalidQuery");
+            assert!(
+                message.contains("Table not found"),
+                "job error message should be preserved, got: {message}"
+            );
+        }
+        other => panic!("expected JobError, got: {other:?}"),
+    }
+    server.verify().await;
+}
+
+/// The same async job-failure shape on the **poll path**: the initial
+/// `jobs.query` defers (`jobComplete=false` + `jobReference`), and the
+/// eventual `getQueryResults` poll returns `jobComplete=true` with a
+/// top-level `errors[]`. The connector applies the same `check_job_error`
+/// guard at the poll completion point, so a job that fails *after* being
+/// deferred also surfaces as `JobError`.
+#[tokio::test]
+async fn job_error_in_poll_result_maps_to_job_error() {
+    let server = MockServer::start().await;
+
+    // Submit defers.
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": false,
+            "jobReference": {"projectId": "test-project", "jobId": "job-poll-fail"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Poll completes — but with a job-level error and no rows.
+    Mock::given(method("GET"))
+        .and(path(
+            "/bigquery/v2/projects/test-project/queries/job-poll-fail",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "jobReference": {"projectId": "test-project", "jobId": "job-poll-fail"},
+            "errors": [
+                {"reason": "resourcesExceeded", "message": "Query exceeded resource limits"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let adapter = test_adapter(&server);
+    let err = adapter
+        .execute_query("SELECT heavy()")
+        .await
+        .expect_err("a deferred job that fails on poll must surface as an error");
+    match as_bq_error(&err) {
+        BigQueryError::JobError { reason, message } => {
+            assert_eq!(reason, "resourcesExceeded");
+            assert!(message.contains("resource limits"));
+        }
+        other => panic!("expected JobError from poll path, got: {other:?}"),
+    }
+    server.verify().await;
 }
 
 // ---------------------------------------------------------------------------

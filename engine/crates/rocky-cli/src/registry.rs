@@ -430,10 +430,13 @@ impl AdapterRegistry {
                     let bq_auth = rocky_bigquery::auth::BigQueryAuth::from_env()
                         .context(format!("adapters.{name}: auth configuration error"))?;
 
-                    let adapter = Arc::new(
-                        BigQueryAdapter::new(project_id, location, bq_auth)
-                            .with_timeout(adapter_cfg.timeout_secs.unwrap_or(300)),
-                    );
+                    let mut bq_adapter = BigQueryAdapter::new(project_id, location, bq_auth)
+                        .with_timeout(adapter_cfg.timeout_secs.unwrap_or(300))
+                        .with_retry(adapter_cfg.retry.clone());
+                    if let Some(ref budget) = shared_retry_budget {
+                        bq_adapter = bq_adapter.with_retry_budget(budget.clone());
+                    }
+                    let adapter = Arc::new(bq_adapter);
                     bigquery_adapters.insert(name.clone(), adapter.clone());
                     let discovery_adapter = Arc::new(
                         rocky_bigquery::BigQueryDiscoveryAdapter::new(adapter.clone()),
@@ -699,7 +702,8 @@ impl AdapterRegistry {
 
         let adapter =
             rocky_bigquery::connector::BigQueryAdapter::new(project_id, location, bq_auth)
-                .with_timeout(adapter_cfg.timeout_secs.unwrap_or(300));
+                .with_timeout(adapter_cfg.timeout_secs.unwrap_or(300))
+                .with_retry(adapter_cfg.retry.clone());
         Ok(Box::new(rocky_bigquery::BigQueryLoaderAdapter::new(
             Arc::new(adapter),
         )))
