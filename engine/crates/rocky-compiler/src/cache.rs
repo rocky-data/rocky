@@ -1,10 +1,63 @@
 //! Compile cache for incremental compilation.
 //!
 //! Hashes source files (`.sql`, `.rocky`, `.toml` sidecars) and stores
-//! the fingerprints. On recompile, unchanged files can be skipped.
+//! the fingerprints so a recompile can ask "did this file change?".
 //!
 //! The cache is stored alongside the redb state store as a simple
 //! JSON file (`rocky_compile_cache.json`) — no extra dependencies.
+//!
+//! ## Status: unwired — and intentionally so
+//!
+//! `CompileCache` has no production caller. It is kept as scaffolding,
+//! not because wiring it would speed up compilation today. The compile
+//! path builds a fresh result on every CLI invocation; this cache is not
+//! plugged into it. The reasons are measured, not assumed.
+//!
+//! A cold compile of a synthetic project splits across phases as
+//! (`phase_breakdown` group in `rocky-cli/benches/compile.rs`):
+//!
+//! | models | total  | project_load (read+parse+lower) | cross-model (semantic graph + typecheck + contracts) |
+//! |--------|--------|---------------------------------|------------------------------------------------------|
+//! | 1,000  |  55 ms | 37 ms (67%)                     | 18 ms (33%)                                          |
+//! | 10,000 | 616 ms | 383 ms (62%)                    | 233 ms (38%)                                         |
+//!
+//! `project_load` — re-reading and re-parsing files — is the single
+//! largest phase, so the usual "the skippable part is too small to
+//! bother" argument does *not* apply here. Wiring is unjustified for two
+//! deeper reasons:
+//!
+//! 1. **This cache stores no substitutable artifact.** A [`CacheEntry`]
+//!    holds only content hashes — no parsed model, no lowered IR, no
+//!    compile result. A cache *hit* answers "this file is unchanged" and
+//!    nothing more. The compiler still has no parsed model to feed the
+//!    semantic graph, so it must read + parse + lower every file anyway.
+//!    Consulting the cache during `project_load` therefore adds a
+//!    file-hash read on top of the parse that still has to run — it makes
+//!    that phase slower, not faster. Skipping `project_load` would need a
+//!    cache that *persists the lowered IR*, which this is not.
+//!
+//! 2. **File hashes alone cannot invalidate the result soundly.** The
+//!    one thing the `needs_recompile` bool could gate is a whole-project
+//!    "nothing changed → reuse the previous result" early-exit. That is
+//!    unsound here: a model's typed schema depends on its upstreams'
+//!    schemas and on warehouse source schemas (`DESCRIBE` state), neither
+//!    of which is a file this cache hashes. Byte-identical model files
+//!    can produce a different compile result when an upstream model's
+//!    column set shifts or a source table gains a column, so "all files
+//!    unchanged" does not imply "result unchanged". A stale-but-confident
+//!    cache that returns a wrong typecheck is far worse than a slow
+//!    compile. The dependency-aware reflow this would require already
+//!    lives in `compile::compile_incremental` (transitive-dependent
+//!    fixed-point + a documented "source-schema shift → full recompile"
+//!    fall-through), which a per-file hash map cannot replicate.
+//!
+//! Cross-invocation incremental compile is already covered without this
+//! type: the in-process salsa database memoizes per-file `parse_file` /
+//! `file_typecheck` for the LSP/watch path, `compile_incremental` serves
+//! per-keystroke edits, and the CLI's cold compile is sub-second even at
+//! 10k models. `CompileCache` sits orphaned between those — wire it only
+//! if a future design persists lowered IR *and* carries dependency-aware
+//! invalidation. Until then it stays unwired by choice.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
