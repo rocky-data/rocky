@@ -11,6 +11,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use tempfile::TempDir;
 
 use rocky_compiler::compile::{CompilerConfig, compile};
+use rocky_compiler::project::Project;
 use rocky_core::sql_gen;
 use rocky_duckdb::dialect::DuckDbSqlDialect;
 use rocky_ir::dag::{DagNode, execution_layers, topological_sort};
@@ -187,6 +188,99 @@ fn bench_cold_compile(c: &mut Criterion) {
                 compile(config).unwrap();
             });
         });
+    }
+    group.finish();
+}
+
+/// Phase-breakdown of a cold compile: how `total_ms` splits across
+/// `project_load` (read + parse + lower every model file) versus the
+/// cross-model `semantic_graph` + `typecheck` + `contracts` passes.
+///
+/// `project_load` is the only phase a per-file content-fingerprint cache
+/// (`rocky_compiler::cache::CompileCache`) could ever skip — it gates
+/// re-reading unchanged files. The cross-model passes run end-to-end on
+/// every invocation regardless of which files changed, because a model's
+/// inferred schema depends on its upstreams' schemas, not just its own
+/// bytes. This bench quantifies the *ceiling* of any such cache: the
+/// `project_load` fraction is the most it could ever remove.
+///
+/// The phase numbers come from the compiler's own `PhaseTimings`
+/// instrumentation (`CompileResult.timings`), not from criterion's timer
+/// — criterion times an opaque closure and can't see internal fractions.
+/// We print the breakdown once per size, then register one criterion
+/// timing per phase so a regression in any single phase is independently
+/// tracked by the perf-label CI.
+fn bench_phase_breakdown(c: &mut Criterion) {
+    let mut group = c.benchmark_group("phase_breakdown");
+    group.sample_size(10);
+
+    // 1k always runs; 10k is release-only (a debug full-compile of 10k
+    // models takes tens of seconds and would dominate CI), matching the
+    // `cold_compile` gating.
+    let mut sizes: Vec<usize> = vec![1_000];
+    if !cfg!(debug_assertions) {
+        sizes.push(10_000);
+    }
+
+    for size in sizes {
+        let dir = TempDir::new().unwrap();
+        generate_synthetic_project(size, dir.path());
+
+        let config = CompilerConfig {
+            models_dir: dir.path().join("models"),
+            contracts_dir: None,
+            source_schemas: HashMap::new(),
+            source_column_info: HashMap::new(),
+            ..Default::default()
+        };
+
+        // Print the phase breakdown once. This is the load-bearing output:
+        // it pins the share of compile time that a file-hash cache could
+        // skip (project_load) versus the share it cannot (the rest).
+        let result = compile(&config).expect("phase-breakdown compile must succeed");
+        let t = &result.timings;
+        let cacheable = t.project_load_ms;
+        let uncacheable = t.total_ms.saturating_sub(t.project_load_ms);
+        let pct = |part: u64| {
+            if t.total_ms == 0 {
+                0.0
+            } else {
+                100.0 * part as f64 / t.total_ms as f64
+            }
+        };
+        eprintln!(
+            "\n[phase_breakdown] {size} models | total={total}ms \
+             project_load={load}ms ({load_pct:.1}%) \
+             semantic_graph={sg}ms ({sg_pct:.1}%) \
+             typecheck={tc}ms ({tc_pct:.1}%) \
+             contracts={ct}ms ({ct_pct:.1}%) \
+             | CompileCache-skippable (project_load) = {load_pct:.1}%, \
+             not-skippable (cross-model) = {un_pct:.1}%",
+            total = t.total_ms,
+            load = t.project_load_ms,
+            load_pct = pct(cacheable),
+            sg = t.semantic_graph_ms,
+            sg_pct = pct(t.semantic_graph_ms),
+            tc = t.typecheck_ms,
+            tc_pct = pct(t.typecheck_ms),
+            ct = t.contracts_ms,
+            ct_pct = pct(t.contracts_ms),
+            un_pct = pct(uncacheable),
+        );
+
+        // Track the cacheable phase (read + parse + lower every file) in
+        // isolation, so a regression in the only phase a file-hash cache
+        // could ever touch is independently visible on perf-label CI.
+        let models_dir = config.models_dir.clone();
+        group.bench_with_input(
+            BenchmarkId::new("project_load", size),
+            &models_dir,
+            |b, models_dir| {
+                b.iter(|| {
+                    Project::load(models_dir).unwrap();
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -563,6 +657,7 @@ fn bench_single_file_change(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_cold_compile,
+    bench_phase_breakdown,
     bench_dag_resolution,
     bench_sql_generation,
     bench_sub_second_compile,
