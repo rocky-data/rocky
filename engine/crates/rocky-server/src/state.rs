@@ -117,7 +117,6 @@ impl ServerState {
             mask,
             allow_unmasked,
             project_freshness_default,
-            ..Default::default()
         };
 
         // The compile pass walks the model directory, parses every

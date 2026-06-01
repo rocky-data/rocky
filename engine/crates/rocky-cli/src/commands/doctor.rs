@@ -226,52 +226,52 @@ async fn collect_health_checks(
         match rocky_core::config::load_rocky_config(config_path) {
             Err(e) => checks.push(config_load_failed("adapters", &e, start, &mut suggestions)),
             Ok(cfg) => {
-            let mut adapter_ok = true;
-            let mut details = Vec::new();
-            for (name, adapter) in &cfg.adapters {
-                if verbose {
-                    details.push((format!("{name}.type"), adapter.adapter_type.clone()));
-                    details.push((
-                        format!("{name}.credential"),
-                        credential_kind(adapter).into(),
-                    ));
-                }
-                match adapter.adapter_type.as_str() {
-                    "databricks" => {
-                        if adapter.host.is_none() || adapter.host.as_deref() == Some("") {
-                            suggestions.push(format!("adapters.{name}: host not configured"));
-                            adapter_ok = false;
-                        }
-                        if adapter.token.is_none() && adapter.client_id.is_none() {
-                            suggestions.push(format!(
-                                "adapters.{name}: no auth configured \
+                let mut adapter_ok = true;
+                let mut details = Vec::new();
+                for (name, adapter) in &cfg.adapters {
+                    if verbose {
+                        details.push((format!("{name}.type"), adapter.adapter_type.clone()));
+                        details.push((
+                            format!("{name}.credential"),
+                            credential_kind(adapter).into(),
+                        ));
+                    }
+                    match adapter.adapter_type.as_str() {
+                        "databricks" => {
+                            if adapter.host.is_none() || adapter.host.as_deref() == Some("") {
+                                suggestions.push(format!("adapters.{name}: host not configured"));
+                                adapter_ok = false;
+                            }
+                            if adapter.token.is_none() && adapter.client_id.is_none() {
+                                suggestions.push(format!(
+                                    "adapters.{name}: no auth configured \
                                  (set DATABRICKS_TOKEN or DATABRICKS_CLIENT_ID/SECRET)"
-                            ));
+                                ));
+                                adapter_ok = false;
+                            }
+                        }
+                        "fivetran" if adapter.api_key.is_none() => {
+                            suggestions.push(format!("adapters.{name}: FIVETRAN_API_KEY not set"));
                             adapter_ok = false;
                         }
+                        _ => {}
                     }
-                    "fivetran" if adapter.api_key.is_none() => {
-                        suggestions.push(format!("adapters.{name}: FIVETRAN_API_KEY not set"));
-                        adapter_ok = false;
-                    }
-                    _ => {}
                 }
-            }
-            checks.push(HealthCheck {
-                name: "adapters".into(),
-                status: if adapter_ok {
-                    HealthStatus::Healthy
-                } else {
-                    HealthStatus::Warning
-                },
-                message: if adapter_ok {
-                    format!("{} adapter(s) configured", cfg.adapters.len())
-                } else {
-                    "Some adapters have missing configuration".into()
-                },
-                duration_ms: start.elapsed().as_millis() as u64,
-                details,
-            });
+                checks.push(HealthCheck {
+                    name: "adapters".into(),
+                    status: if adapter_ok {
+                        HealthStatus::Healthy
+                    } else {
+                        HealthStatus::Warning
+                    },
+                    message: if adapter_ok {
+                        format!("{} adapter(s) configured", cfg.adapters.len())
+                    } else {
+                        "Some adapters have missing configuration".into()
+                    },
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    details,
+                });
             }
         }
     }
@@ -282,39 +282,39 @@ async fn collect_health_checks(
         match rocky_core::config::load_rocky_config(config_path) {
             Err(e) => checks.push(config_load_failed("pipelines", &e, start, &mut suggestions)),
             Ok(cfg) => {
-            let mut issues = Vec::new();
-            let mut details = Vec::new();
-            for (name, pipeline) in &cfg.pipelines {
-                if verbose {
-                    details.push((
-                        format!("pipeline.{name}"),
-                        pipeline.pipeline_type_str().into(),
-                    ));
+                let mut issues = Vec::new();
+                let mut details = Vec::new();
+                for (name, pipeline) in &cfg.pipelines {
+                    if verbose {
+                        details.push((
+                            format!("pipeline.{name}"),
+                            pipeline.pipeline_type_str().into(),
+                        ));
+                    }
+                    // Check schema pattern is parseable (replication pipelines only)
+                    if let Some(repl) = pipeline.as_replication()
+                        && let Err(e) = repl.schema_pattern()
+                    {
+                        issues.push(format!("pipeline '{name}': invalid schema pattern: {e}"));
+                    }
                 }
-                // Check schema pattern is parseable (replication pipelines only)
-                if let Some(repl) = pipeline.as_replication()
-                    && let Err(e) = repl.schema_pattern()
-                {
-                    issues.push(format!("pipeline '{name}': invalid schema pattern: {e}"));
-                }
-            }
-            let pipeline_count = cfg.pipelines.len();
-            checks.push(HealthCheck {
-                name: "pipelines".into(),
-                status: if issues.is_empty() {
-                    HealthStatus::Healthy
-                } else {
-                    HealthStatus::Warning
-                },
-                message: if issues.is_empty() {
-                    format!("{pipeline_count} pipeline(s) valid")
-                } else {
-                    format!("{} issue(s) found", issues.len())
-                },
-                duration_ms: start.elapsed().as_millis() as u64,
-                details,
-            });
-            suggestions.extend(issues);
+                let pipeline_count = cfg.pipelines.len();
+                checks.push(HealthCheck {
+                    name: "pipelines".into(),
+                    status: if issues.is_empty() {
+                        HealthStatus::Healthy
+                    } else {
+                        HealthStatus::Warning
+                    },
+                    message: if issues.is_empty() {
+                        format!("{pipeline_count} pipeline(s) valid")
+                    } else {
+                        format!("{} issue(s) found", issues.len())
+                    },
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    details,
+                });
+                suggestions.extend(issues);
             }
         }
     }
@@ -323,26 +323,31 @@ async fn collect_health_checks(
     if should_run("state_sync", check_filter) {
         let start = Instant::now();
         match rocky_core::config::load_rocky_config(config_path) {
-            Err(e) => checks.push(config_load_failed("state_sync", &e, start, &mut suggestions)),
+            Err(e) => checks.push(config_load_failed(
+                "state_sync",
+                &e,
+                start,
+                &mut suggestions,
+            )),
             Ok(cfg) => {
-            let backend = &cfg.state.backend;
-            let details = if verbose {
-                vec![("backend".into(), backend.to_string())]
-            } else {
-                Vec::new()
-            };
-            // A `local` state backend is the healthy default for a single-node
-            // project (it mirrors the `state_rw` check, which already treats
-            // local as Healthy — no remote probe needed). `Warning` is
-            // reserved for a misconfigured remote backend, surfaced by the
-            // `state_rw` RW probe below.
-            checks.push(HealthCheck {
-                name: "state_sync".into(),
-                status: HealthStatus::Healthy,
-                message: format!("State backend: {backend}"),
-                duration_ms: start.elapsed().as_millis() as u64,
-                details,
-            });
+                let backend = &cfg.state.backend;
+                let details = if verbose {
+                    vec![("backend".into(), backend.to_string())]
+                } else {
+                    Vec::new()
+                };
+                // A `local` state backend is the healthy default for a single-node
+                // project (it mirrors the `state_rw` check, which already treats
+                // local as Healthy — no remote probe needed). `Warning` is
+                // reserved for a misconfigured remote backend, surfaced by the
+                // `state_rw` RW probe below.
+                checks.push(HealthCheck {
+                    name: "state_sync".into(),
+                    status: HealthStatus::Healthy,
+                    message: format!("State backend: {backend}"),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    details,
+                });
             }
         }
     }
@@ -357,47 +362,47 @@ async fn collect_health_checks(
         match rocky_core::config::load_rocky_config(config_path) {
             Err(e) => checks.push(config_load_failed("state_rw", &e, start, &mut suggestions)),
             Ok(cfg) => {
-            let backend = &cfg.state.backend;
-            let details = if verbose {
-                vec![("backend".into(), backend.to_string())]
-            } else {
-                Vec::new()
-            };
-            if *backend == rocky_core::config::StateBackend::Local {
-                checks.push(HealthCheck {
-                    name: "state_rw".into(),
-                    status: HealthStatus::Healthy,
-                    message: "Local backend — no remote probe needed".into(),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    details,
-                });
-            } else {
-                match rocky_core::state_sync::probe_state_backend(&cfg.state).await {
-                    Ok(()) => {
-                        checks.push(HealthCheck {
-                            name: "state_rw".into(),
-                            status: HealthStatus::Healthy,
-                            message: format!("State backend RW probe succeeded ({backend})"),
-                            duration_ms: start.elapsed().as_millis() as u64,
-                            details,
-                        });
-                    }
-                    Err(e) => {
-                        checks.push(HealthCheck {
-                            name: "state_rw".into(),
-                            status: HealthStatus::Critical,
-                            message: format!("State backend RW probe failed: {e}"),
-                            duration_ms: start.elapsed().as_millis() as u64,
-                            details,
-                        });
-                        suggestions.push(format!(
-                            "state_rw: verify the '{backend}' backend has read+write access \
+                let backend = &cfg.state.backend;
+                let details = if verbose {
+                    vec![("backend".into(), backend.to_string())]
+                } else {
+                    Vec::new()
+                };
+                if *backend == rocky_core::config::StateBackend::Local {
+                    checks.push(HealthCheck {
+                        name: "state_rw".into(),
+                        status: HealthStatus::Healthy,
+                        message: "Local backend — no remote probe needed".into(),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        details,
+                    });
+                } else {
+                    match rocky_core::state_sync::probe_state_backend(&cfg.state).await {
+                        Ok(()) => {
+                            checks.push(HealthCheck {
+                                name: "state_rw".into(),
+                                status: HealthStatus::Healthy,
+                                message: format!("State backend RW probe succeeded ({backend})"),
+                                duration_ms: start.elapsed().as_millis() as u64,
+                                details,
+                            });
+                        }
+                        Err(e) => {
+                            checks.push(HealthCheck {
+                                name: "state_rw".into(),
+                                status: HealthStatus::Critical,
+                                message: format!("State backend RW probe failed: {e}"),
+                                duration_ms: start.elapsed().as_millis() as u64,
+                                details,
+                            });
+                            suggestions.push(format!(
+                                "state_rw: verify the '{backend}' backend has read+write access \
                              to the configured bucket / prefix (tried put/get/delete of a \
                              short-lived marker object)"
-                        ));
+                            ));
+                        }
                     }
                 }
-            }
             }
         }
     }
@@ -564,9 +569,7 @@ fn config_load_failed(
     HealthCheck {
         name: check_name.into(),
         status: HealthStatus::Critical,
-        message: format!(
-            "could not load config: {err} — run `rocky doctor --check config`"
-        ),
+        message: format!("could not load config: {err} — run `rocky doctor --check config`"),
         duration_ms: start.elapsed().as_millis() as u64,
         details: Vec::new(),
     }

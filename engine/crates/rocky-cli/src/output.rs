@@ -6306,10 +6306,8 @@ mod failure_kind_tests {
         let e403: anyhow::Error = db_adapter_err(db_api(403)).into();
         let e401: anyhow::Error = db_adapter_err(db_api(401)).into();
 
-        let m403 = frame_warehouse_anyhow_error(&e403, "cat.sch.tbl")
-            .expect("403 must frame");
-        let m401 = frame_warehouse_anyhow_error(&e401, "cat.sch.tbl")
-            .expect("401 must frame");
+        let m403 = frame_warehouse_anyhow_error(&e403, "cat.sch.tbl").expect("403 must frame");
+        let m401 = frame_warehouse_anyhow_error(&e401, "cat.sch.tbl").expect("401 must frame");
 
         // The whole point of keying on status (not FailureKind, which
         // collapses both to AuthFailed): the two messages differ.
@@ -6335,8 +6333,7 @@ mod failure_kind_tests {
         assert!(framed.contains("permission denied"));
 
         let e_sf = rocky_core::traits::AdapterError::new(sn_api(401));
-        let framed_sf =
-            frame_warehouse_adapter_error(&e_sf, "warehouse_b").expect("401 frames");
+        let framed_sf = frame_warehouse_adapter_error(&e_sf, "warehouse_b").expect("401 frames");
         assert!(framed_sf.contains("authentication rejected"));
     }
 }

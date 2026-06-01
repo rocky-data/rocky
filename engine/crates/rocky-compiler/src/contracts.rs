@@ -321,8 +321,7 @@ mod tests {
         let diags = validate_contract("test_model", &schema, &contract);
         let e011 = diags.iter().find(|d| &*d.code == "E011").expect("E011");
         assert!(
-            e011
-                .suggestion
+            e011.suggestion
                 .as_deref()
                 .is_some_and(|s| s.contains("CAST")),
             "E011 must suggest a CAST: {e011:?}"
@@ -366,8 +365,7 @@ mod tests {
         let diags = validate_contract("test_model", &schema, &contract);
         let e013 = diags.iter().find(|d| &*d.code == "E013").expect("E013");
         assert!(
-            e013
-                .suggestion
+            e013.suggestion
                 .as_deref()
                 .is_some_and(|s| s.contains("restore") || s.contains("protected")),
             "E013 must suggest restoring the column or relaxing the rule: {e013:?}"

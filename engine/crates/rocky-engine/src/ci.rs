@@ -134,9 +134,7 @@ mod tests {
             tests_passed: 1,
             tests_failed: 0,
             diagnostics: vec![rocky_compiler::diagnostic::Diagnostic::warning(
-                "W001",
-                "m",
-                "advisory",
+                "W001", "m", "advisory",
             )],
             failures: vec![],
         };
