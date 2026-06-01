@@ -630,6 +630,83 @@ pub fn classify_anyhow_error_with_cooldown(err: &anyhow::Error) -> (FailureKind,
     (FailureKind::Unknown, None)
 }
 
+/// Recover the HTTP status from a single error link if it is a Databricks
+/// or Snowflake `ConnectorError::ApiError`.
+fn api_status_from_cause(cause: &(dyn std::error::Error + 'static)) -> Option<u16> {
+    use rocky_databricks::connector::ConnectorError as Dbx;
+    use rocky_snowflake::connector::ConnectorError as Sf;
+    if let Some(Dbx::ApiError { status, .. }) = cause.downcast_ref::<Dbx>() {
+        return Some(*status);
+    }
+    if let Some(Sf::ApiError { status, .. }) = cause.downcast_ref::<Sf>() {
+        return Some(*status);
+    }
+    None
+}
+
+/// Frame a warehouse error into an actionable, user-facing message when
+/// it carries a recognised HTTP auth status.
+///
+/// Maps `403` and `401` (Databricks / Snowflake `ApiError`) to a concise
+/// remediation hint, keeping the raw status + body out of the headline.
+/// Returns `None` for any other failure (including BigQuery, which has no
+/// typed `ApiError` status path) so the caller falls back to the raw
+/// error string.
+///
+/// `target` is a human label for what was being accessed (a table ref or
+/// adapter name), interpolated into the framed message.
+fn frame_status(status: u16, target: &str) -> Option<String> {
+    match status {
+        403 => Some(format!(
+            "permission denied on `{target}` (HTTP 403) — verify the adapter principal \
+             has the required grants"
+        )),
+        401 => Some(
+            "authentication rejected (HTTP 401) — the token or credential may be \
+             expired or invalid"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// Walk an `anyhow` error chain (including any `rocky_adapter_sdk::
+/// AdapterError` inner) for a recognised warehouse auth status and frame
+/// it. See [`frame_status`].
+pub fn frame_warehouse_anyhow_error(err: &anyhow::Error, target: &str) -> Option<String> {
+    for cause in err.chain() {
+        if let Some(status) = api_status_from_cause(cause) {
+            return frame_status(status, target);
+        }
+        if let Some(adapter_err) = cause.downcast_ref::<rocky_adapter_sdk::AdapterError>()
+            && let Some(status) = api_status_from_cause(adapter_err.inner())
+        {
+            return frame_status(status, target);
+        }
+    }
+    None
+}
+
+/// Frame a `rocky_core::traits::AdapterError` (the type returned by
+/// `WarehouseAdapter::ping`) for a recognised warehouse auth status.
+///
+/// Probes the boxed `inner` error and its `source()` chain for a
+/// Databricks / Snowflake `ConnectorError::ApiError`. See
+/// [`frame_status`].
+pub fn frame_warehouse_adapter_error(
+    err: &rocky_core::traits::AdapterError,
+    target: &str,
+) -> Option<String> {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err.inner());
+    while let Some(c) = cause {
+        if let Some(status) = api_status_from_cause(c) {
+            return frame_status(status, target);
+        }
+        cause = c.source();
+    }
+    None
+}
+
 /// Error from a table that failed during parallel processing.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct TableErrorOutput {
@@ -6218,5 +6295,45 @@ mod failure_kind_tests {
         });
         let err = anyhow::anyhow!("{adapter_err}");
         assert_eq!(classify_anyhow_error(&err), FailureKind::Unknown);
+    }
+
+    // ---- EF8: user-facing framing of 403 / 401 ----------------------------
+
+    #[test]
+    fn frame_403_and_401_produce_distinct_actionable_messages() {
+        // anyhow path (run.rs table errors): wrap the typed ConnectorError
+        // through the SDK AdapterError, as the real run path does.
+        let e403: anyhow::Error = db_adapter_err(db_api(403)).into();
+        let e401: anyhow::Error = db_adapter_err(db_api(401)).into();
+
+        let m403 = frame_warehouse_anyhow_error(&e403, "cat.sch.tbl").expect("403 must frame");
+        let m401 = frame_warehouse_anyhow_error(&e401, "cat.sch.tbl").expect("401 must frame");
+
+        // The whole point of keying on status (not FailureKind, which
+        // collapses both to AuthFailed): the two messages differ.
+        assert_ne!(m403, m401);
+        assert!(m403.contains("permission denied"));
+        assert!(m403.contains("cat.sch.tbl"));
+        assert!(m401.contains("authentication rejected"));
+    }
+
+    #[test]
+    fn frame_non_auth_status_falls_back_to_none() {
+        // A 500 is not an auth failure — keep the raw error, don't frame.
+        let e: anyhow::Error = db_adapter_err(db_api(500)).into();
+        assert!(frame_warehouse_anyhow_error(&e, "t").is_none());
+    }
+
+    #[test]
+    fn frame_adapter_error_path_for_doctor_ping() {
+        // doctor pings return rocky_core::traits::AdapterError, whose inner
+        // is reached via the new inner() accessor.
+        let e = rocky_core::traits::AdapterError::new(db_api(403));
+        let framed = frame_warehouse_adapter_error(&e, "warehouse_a").expect("403 frames");
+        assert!(framed.contains("permission denied"));
+
+        let e_sf = rocky_core::traits::AdapterError::new(sn_api(401));
+        let framed_sf = frame_warehouse_adapter_error(&e_sf, "warehouse_b").expect("401 frames");
+        assert!(framed_sf.contains("authentication rejected"));
     }
 }

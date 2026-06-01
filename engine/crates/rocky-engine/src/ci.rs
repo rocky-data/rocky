@@ -34,7 +34,14 @@ impl CiResult {
         self.compile_ok && self.tests_ok
     }
 
-    /// Exit code: 0 if pass, 1 if errors, 2 if warnings-only.
+    /// Exit code: 0 if pass, 1 if errors, 4 if warnings-only.
+    ///
+    /// The warnings-only code is deliberately `4`, not `2`: exit `2` is
+    /// reserved for `rocky run` partial-success (Dagster keys on it via
+    /// `allow_partial=True`). A `rocky ci` run that compiled and tested
+    /// clean but emitted advisory warnings is a different condition, so
+    /// it must not collide with that code. See the exit-code convention
+    /// in `rocky/src/main.rs`.
     pub fn exit_code(&self) -> i32 {
         if !self.compile_ok || !self.tests_ok {
             1
@@ -43,7 +50,7 @@ impl CiResult {
             .iter()
             .any(|d| d.severity == rocky_compiler::diagnostic::Severity::Warning)
         {
-            2
+            4
         } else {
             0
         }
@@ -117,5 +124,21 @@ mod tests {
         };
         assert_eq!(fail.exit_code(), 1);
         assert!(!fail.passed());
+
+        // Warnings-only: compile + tests pass, but a warning diagnostic is
+        // present. Distinct from run's partial-success exit 2.
+        let warn = CiResult {
+            compile_ok: true,
+            tests_ok: true,
+            models_compiled: 1,
+            tests_passed: 1,
+            tests_failed: 0,
+            diagnostics: vec![rocky_compiler::diagnostic::Diagnostic::warning(
+                "W001", "m", "advisory",
+            )],
+            failures: vec![],
+        };
+        assert_eq!(warn.exit_code(), 4);
+        assert!(warn.passed());
     }
 }

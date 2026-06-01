@@ -2286,26 +2286,40 @@ pub async fn run(
                 // the optional engine-supplied cooldown hint
                 // (warehouse-side breaker trip) is captured.
                 let (failure_kind, cooldown_seconds) = classify_anyhow_error_with_cooldown(&e);
-                let msg = format!("{e:#}");
-                if msg.contains("TABLE_OR_VIEW_NOT_FOUND") {
+                let raw = format!("{e:#}");
+                if raw.contains("TABLE_OR_VIEW_NOT_FOUND") {
                     warn!(
                         table_index = idx,
-                        error = msg.as_str(),
+                        error = raw.as_str(),
                         "source table not found, skipping"
                     );
                     continue;
                 }
+                // Frame common warehouse auth failures (403/401) into an
+                // actionable message for the user-facing `error` field.
+                // The raw status + body stays in the `warn!` below and in
+                // the structured `failure_kind`. Falls back to the raw
+                // chain for anything we don't recognise.
+                let target = tables_to_process
+                    .get(idx)
+                    .map(|t| format!("{}.{}.{}", t.target_catalog, t.target_schema, t.table_name))
+                    .unwrap_or_default();
+                let msg = crate::output::frame_warehouse_anyhow_error(&e, &target)
+                    .unwrap_or_else(|| raw.clone());
 
                 // Signal the adaptive throttle: rate limits reduce concurrency,
                 // other errors are treated as successes (they're permanent
-                // failures, not a signal to slow down).
+                // failures, not a signal to slow down). Detect on the raw
+                // chain — the framed `msg` only covers auth (403/401).
                 if let Some(t) = &throttle
-                    && is_rate_limit_error(&msg) {
+                    && is_rate_limit_error(&raw) {
                         t.on_rate_limit();
                         adjust_semaphore(t, &semaphore, &mut semaphore_capacity);
                     }
 
-                warn!(error = msg, "table processing failed");
+                // Log the raw status + body for debugging; `msg` (framed)
+                // is what surfaces to the user on `TableErrorOutput.error`.
+                warn!(error = raw.as_str(), framed = msg.as_str(), "table processing failed");
                 rocky_observe::metrics::METRICS.inc_tables_failed();
 
                 // Checkpoint: record failed table progress

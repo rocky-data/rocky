@@ -34,7 +34,20 @@ pub struct DoctorOutput {
     pub suggestions: Vec<String>,
 }
 
-/// Execute `rocky doctor` — aggregate health checks.
+/// Exit code returned when `rocky doctor` finds at least one Critical
+/// health check.
+///
+/// Deliberately distinct from `2`: that code is reserved for `rocky run`
+/// partial-success (one or more tables materialized, one or more failed),
+/// which Dagster keys on via `allow_partial=True`. A doctor failure and a
+/// partial run are different conditions, so they must not share an exit
+/// code. See the exit-code convention in `rocky/src/main.rs`.
+const DOCTOR_CRITICAL_EXIT_CODE: i32 = 3;
+
+/// Execute `rocky doctor` — aggregate health checks, render, and exit.
+///
+/// Health-check collection is delegated to [`collect_health_checks`] so it
+/// can be unit-tested without the `process::exit` in this wrapper.
 pub async fn doctor(
     config_path: &Path,
     state_path: &Path,
@@ -42,6 +55,81 @@ pub async fn doctor(
     check_filter: Option<&str>,
     verbose: bool,
 ) -> Result<()> {
+    let (checks, suggestions) =
+        collect_health_checks(config_path, state_path, check_filter, verbose).await;
+
+    // Determine overall status
+    let has_critical = checks
+        .iter()
+        .any(|c| matches!(c.status, HealthStatus::Critical));
+    let has_warning = checks
+        .iter()
+        .any(|c| matches!(c.status, HealthStatus::Warning));
+    let overall = if has_critical {
+        "critical"
+    } else if has_warning {
+        "warning"
+    } else {
+        "healthy"
+    };
+
+    let doctor_output = DoctorOutput {
+        command: "doctor".into(),
+        overall: overall.into(),
+        checks,
+        suggestions,
+    };
+
+    if output_json {
+        println!("{}", serde_json::to_string_pretty(&doctor_output)?);
+    } else {
+        // Human-readable output
+        println!("\nRocky Doctor\n");
+        for check in &doctor_output.checks {
+            let icon = match check.status {
+                HealthStatus::Healthy => "  ok ",
+                HealthStatus::Warning => "  !! ",
+                HealthStatus::Critical => " ERR ",
+            };
+            println!(
+                "{} {} — {} ({}ms)",
+                icon, check.name, check.message, check.duration_ms
+            );
+            if !check.details.is_empty() {
+                for (label, value) in &check.details {
+                    println!("        {label}: {value}");
+                }
+            }
+        }
+        println!("\nOverall: {}\n", doctor_output.overall);
+        if !doctor_output.suggestions.is_empty() {
+            println!("Suggestions:");
+            for s in &doctor_output.suggestions {
+                println!("  - {s}");
+            }
+            println!();
+        }
+    }
+
+    if has_critical {
+        std::process::exit(DOCTOR_CRITICAL_EXIT_CODE);
+    }
+
+    Ok(())
+}
+
+/// Run every requested health check and return the results plus
+/// remediation suggestions.
+///
+/// Split out of [`doctor`] so tests can assert check outcomes (e.g. a
+/// broken `rocky.toml` under `--check adapters` produces a Critical)
+/// without the `process::exit` the wrapper performs.
+async fn collect_health_checks(
+    config_path: &Path,
+    state_path: &Path,
+    check_filter: Option<&str>,
+    verbose: bool,
+) -> (Vec<HealthCheck>, Vec<String>) {
     let mut checks: Vec<HealthCheck> = Vec::new();
     let mut suggestions: Vec<String> = Vec::new();
 
@@ -135,118 +223,132 @@ pub async fn doctor(
     // 3. Adapter configuration checks (without actual connectivity)
     if should_run("adapters", check_filter) {
         let start = Instant::now();
-        if let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) {
-            let mut adapter_ok = true;
-            let mut details = Vec::new();
-            for (name, adapter) in &cfg.adapters {
-                if verbose {
-                    details.push((format!("{name}.type"), adapter.adapter_type.clone()));
-                    details.push((
-                        format!("{name}.credential"),
-                        credential_kind(adapter).into(),
-                    ));
-                }
-                match adapter.adapter_type.as_str() {
-                    "databricks" => {
-                        if adapter.host.is_none() || adapter.host.as_deref() == Some("") {
-                            suggestions.push(format!("adapters.{name}: host not configured"));
-                            adapter_ok = false;
-                        }
-                        if adapter.token.is_none() && adapter.client_id.is_none() {
-                            suggestions.push(format!(
-                                "adapters.{name}: no auth configured \
+        match rocky_core::config::load_rocky_config(config_path) {
+            Err(e) => checks.push(config_load_failed("adapters", &e, start, &mut suggestions)),
+            Ok(cfg) => {
+                let mut adapter_ok = true;
+                let mut details = Vec::new();
+                for (name, adapter) in &cfg.adapters {
+                    if verbose {
+                        details.push((format!("{name}.type"), adapter.adapter_type.clone()));
+                        details.push((
+                            format!("{name}.credential"),
+                            credential_kind(adapter).into(),
+                        ));
+                    }
+                    match adapter.adapter_type.as_str() {
+                        "databricks" => {
+                            if adapter.host.is_none() || adapter.host.as_deref() == Some("") {
+                                suggestions.push(format!("adapters.{name}: host not configured"));
+                                adapter_ok = false;
+                            }
+                            if adapter.token.is_none() && adapter.client_id.is_none() {
+                                suggestions.push(format!(
+                                    "adapters.{name}: no auth configured \
                                  (set DATABRICKS_TOKEN or DATABRICKS_CLIENT_ID/SECRET)"
-                            ));
+                                ));
+                                adapter_ok = false;
+                            }
+                        }
+                        "fivetran" if adapter.api_key.is_none() => {
+                            suggestions.push(format!("adapters.{name}: FIVETRAN_API_KEY not set"));
                             adapter_ok = false;
                         }
+                        _ => {}
                     }
-                    "fivetran" if adapter.api_key.is_none() => {
-                        suggestions.push(format!("adapters.{name}: FIVETRAN_API_KEY not set"));
-                        adapter_ok = false;
-                    }
-                    _ => {}
                 }
+                checks.push(HealthCheck {
+                    name: "adapters".into(),
+                    status: if adapter_ok {
+                        HealthStatus::Healthy
+                    } else {
+                        HealthStatus::Warning
+                    },
+                    message: if adapter_ok {
+                        format!("{} adapter(s) configured", cfg.adapters.len())
+                    } else {
+                        "Some adapters have missing configuration".into()
+                    },
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    details,
+                });
             }
-            checks.push(HealthCheck {
-                name: "adapters".into(),
-                status: if adapter_ok {
-                    HealthStatus::Healthy
-                } else {
-                    HealthStatus::Warning
-                },
-                message: if adapter_ok {
-                    format!("{} adapter(s) configured", cfg.adapters.len())
-                } else {
-                    "Some adapters have missing configuration".into()
-                },
-                duration_ms: start.elapsed().as_millis() as u64,
-                details,
-            });
         }
     }
 
     // 4. Pipeline validation
     if should_run("pipelines", check_filter) {
         let start = Instant::now();
-        if let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) {
-            let mut issues = Vec::new();
-            let mut details = Vec::new();
-            for (name, pipeline) in &cfg.pipelines {
-                if verbose {
-                    details.push((
-                        format!("pipeline.{name}"),
-                        pipeline.pipeline_type_str().into(),
-                    ));
+        match rocky_core::config::load_rocky_config(config_path) {
+            Err(e) => checks.push(config_load_failed("pipelines", &e, start, &mut suggestions)),
+            Ok(cfg) => {
+                let mut issues = Vec::new();
+                let mut details = Vec::new();
+                for (name, pipeline) in &cfg.pipelines {
+                    if verbose {
+                        details.push((
+                            format!("pipeline.{name}"),
+                            pipeline.pipeline_type_str().into(),
+                        ));
+                    }
+                    // Check schema pattern is parseable (replication pipelines only)
+                    if let Some(repl) = pipeline.as_replication()
+                        && let Err(e) = repl.schema_pattern()
+                    {
+                        issues.push(format!("pipeline '{name}': invalid schema pattern: {e}"));
+                    }
                 }
-                // Check schema pattern is parseable (replication pipelines only)
-                if let Some(repl) = pipeline.as_replication()
-                    && let Err(e) = repl.schema_pattern()
-                {
-                    issues.push(format!("pipeline '{name}': invalid schema pattern: {e}"));
-                }
+                let pipeline_count = cfg.pipelines.len();
+                checks.push(HealthCheck {
+                    name: "pipelines".into(),
+                    status: if issues.is_empty() {
+                        HealthStatus::Healthy
+                    } else {
+                        HealthStatus::Warning
+                    },
+                    message: if issues.is_empty() {
+                        format!("{pipeline_count} pipeline(s) valid")
+                    } else {
+                        format!("{} issue(s) found", issues.len())
+                    },
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    details,
+                });
+                suggestions.extend(issues);
             }
-            let pipeline_count = cfg.pipelines.len();
-            checks.push(HealthCheck {
-                name: "pipelines".into(),
-                status: if issues.is_empty() {
-                    HealthStatus::Healthy
-                } else {
-                    HealthStatus::Warning
-                },
-                message: if issues.is_empty() {
-                    format!("{pipeline_count} pipeline(s) valid")
-                } else {
-                    format!("{} issue(s) found", issues.len())
-                },
-                duration_ms: start.elapsed().as_millis() as u64,
-                details,
-            });
-            suggestions.extend(issues);
         }
     }
 
     // 5. State sync configuration
     if should_run("state_sync", check_filter) {
         let start = Instant::now();
-        if let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) {
-            let backend = &cfg.state.backend;
-            let details = if verbose {
-                vec![("backend".into(), backend.to_string())]
-            } else {
-                Vec::new()
-            };
-            // A `local` state backend is the healthy default for a single-node
-            // project (it mirrors the `state_rw` check, which already treats
-            // local as Healthy — no remote probe needed). `Warning` is
-            // reserved for a misconfigured remote backend, surfaced by the
-            // `state_rw` RW probe below.
-            checks.push(HealthCheck {
-                name: "state_sync".into(),
-                status: HealthStatus::Healthy,
-                message: format!("State backend: {backend}"),
-                duration_ms: start.elapsed().as_millis() as u64,
-                details,
-            });
+        match rocky_core::config::load_rocky_config(config_path) {
+            Err(e) => checks.push(config_load_failed(
+                "state_sync",
+                &e,
+                start,
+                &mut suggestions,
+            )),
+            Ok(cfg) => {
+                let backend = &cfg.state.backend;
+                let details = if verbose {
+                    vec![("backend".into(), backend.to_string())]
+                } else {
+                    Vec::new()
+                };
+                // A `local` state backend is the healthy default for a single-node
+                // project (it mirrors the `state_rw` check, which already treats
+                // local as Healthy — no remote probe needed). `Warning` is
+                // reserved for a misconfigured remote backend, surfaced by the
+                // `state_rw` RW probe below.
+                checks.push(HealthCheck {
+                    name: "state_sync".into(),
+                    status: HealthStatus::Healthy,
+                    message: format!("State backend: {backend}"),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    details,
+                });
+            }
         }
     }
 
@@ -257,45 +359,48 @@ pub async fn doctor(
     //    end-of-run upload time.
     if should_run("state_rw", check_filter) {
         let start = Instant::now();
-        if let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) {
-            let backend = &cfg.state.backend;
-            let details = if verbose {
-                vec![("backend".into(), backend.to_string())]
-            } else {
-                Vec::new()
-            };
-            if *backend == rocky_core::config::StateBackend::Local {
-                checks.push(HealthCheck {
-                    name: "state_rw".into(),
-                    status: HealthStatus::Healthy,
-                    message: "Local backend — no remote probe needed".into(),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    details,
-                });
-            } else {
-                match rocky_core::state_sync::probe_state_backend(&cfg.state).await {
-                    Ok(()) => {
-                        checks.push(HealthCheck {
-                            name: "state_rw".into(),
-                            status: HealthStatus::Healthy,
-                            message: format!("State backend RW probe succeeded ({backend})"),
-                            duration_ms: start.elapsed().as_millis() as u64,
-                            details,
-                        });
-                    }
-                    Err(e) => {
-                        checks.push(HealthCheck {
-                            name: "state_rw".into(),
-                            status: HealthStatus::Critical,
-                            message: format!("State backend RW probe failed: {e}"),
-                            duration_ms: start.elapsed().as_millis() as u64,
-                            details,
-                        });
-                        suggestions.push(format!(
-                            "state_rw: verify the '{backend}' backend has read+write access \
+        match rocky_core::config::load_rocky_config(config_path) {
+            Err(e) => checks.push(config_load_failed("state_rw", &e, start, &mut suggestions)),
+            Ok(cfg) => {
+                let backend = &cfg.state.backend;
+                let details = if verbose {
+                    vec![("backend".into(), backend.to_string())]
+                } else {
+                    Vec::new()
+                };
+                if *backend == rocky_core::config::StateBackend::Local {
+                    checks.push(HealthCheck {
+                        name: "state_rw".into(),
+                        status: HealthStatus::Healthy,
+                        message: "Local backend — no remote probe needed".into(),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        details,
+                    });
+                } else {
+                    match rocky_core::state_sync::probe_state_backend(&cfg.state).await {
+                        Ok(()) => {
+                            checks.push(HealthCheck {
+                                name: "state_rw".into(),
+                                status: HealthStatus::Healthy,
+                                message: format!("State backend RW probe succeeded ({backend})"),
+                                duration_ms: start.elapsed().as_millis() as u64,
+                                details,
+                            });
+                        }
+                        Err(e) => {
+                            checks.push(HealthCheck {
+                                name: "state_rw".into(),
+                                status: HealthStatus::Critical,
+                                message: format!("State backend RW probe failed: {e}"),
+                                duration_ms: start.elapsed().as_millis() as u64,
+                                details,
+                            });
+                            suggestions.push(format!(
+                                "state_rw: verify the '{backend}' backend has read+write access \
                              to the configured bucket / prefix (tried put/get/delete of a \
                              short-lived marker object)"
-                        ));
+                            ));
+                        }
                     }
                 }
             }
@@ -335,12 +440,26 @@ pub async fn doctor(
                                     }
                                     Err(e) => {
                                         all_ok = false;
+                                        // Frame common auth failures (403/401)
+                                        // into an actionable message; stash the
+                                        // raw error in verbose `details`.
+                                        let framed =
+                                            crate::output::frame_warehouse_adapter_error(&e, name);
+                                        let message = match &framed {
+                                            Some(m) => format!("Ping failed: {m}"),
+                                            None => format!("Ping failed: {e}"),
+                                        };
+                                        let details = if verbose || framed.is_some() {
+                                            vec![("raw".into(), format!("{e}"))]
+                                        } else {
+                                            Vec::new()
+                                        };
                                         checks.push(HealthCheck {
                                             name: format!("auth/{name}"),
                                             status: HealthStatus::Critical,
-                                            message: format!("Ping failed: {e}"),
+                                            message,
                                             duration_ms: ping_start.elapsed().as_millis() as u64,
-                                            details: Vec::new(),
+                                            details,
                                         });
                                         suggestions.push(format!(
                                             "Adapter '{name}': verify credentials and network access"
@@ -423,68 +542,37 @@ pub async fn doctor(
         }
     }
 
-    // Determine overall status
-    let has_critical = checks
-        .iter()
-        .any(|c| matches!(c.status, HealthStatus::Critical));
-    let has_warning = checks
-        .iter()
-        .any(|c| matches!(c.status, HealthStatus::Warning));
-    let overall = if has_critical {
-        "critical"
-    } else if has_warning {
-        "warning"
-    } else {
-        "healthy"
-    };
-
-    let doctor_output = DoctorOutput {
-        command: "doctor".into(),
-        overall: overall.into(),
-        checks,
-        suggestions,
-    };
-
-    if output_json {
-        println!("{}", serde_json::to_string_pretty(&doctor_output)?);
-    } else {
-        // Human-readable output
-        println!("\nRocky Doctor\n");
-        for check in &doctor_output.checks {
-            let icon = match check.status {
-                HealthStatus::Healthy => "  ok ",
-                HealthStatus::Warning => "  !! ",
-                HealthStatus::Critical => " ERR ",
-            };
-            println!(
-                "{} {} — {} ({}ms)",
-                icon, check.name, check.message, check.duration_ms
-            );
-            if !check.details.is_empty() {
-                for (label, value) in &check.details {
-                    println!("        {label}: {value}");
-                }
-            }
-        }
-        println!("\nOverall: {}\n", doctor_output.overall);
-        if !doctor_output.suggestions.is_empty() {
-            println!("Suggestions:");
-            for s in &doctor_output.suggestions {
-                println!("  - {s}");
-            }
-            println!();
-        }
-    }
-
-    if has_critical {
-        std::process::exit(2);
-    }
-
-    Ok(())
+    (checks, suggestions)
 }
 
 fn should_run(name: &str, filter: Option<&str>) -> bool {
     filter.is_none_or(|f| f == name)
+}
+
+/// Build a Critical `HealthCheck` for a check whose config could not be
+/// loaded, and record a remediation suggestion.
+///
+/// Checks that need `rocky.toml` (`adapters`, `pipelines`, `state_sync`,
+/// `state_rw`) previously swallowed a load error and emitted no check at
+/// all, so `rocky doctor --check adapters` on a broken config reported
+/// "healthy" with exit 0. Surfacing the failure as Critical makes those
+/// scoped checks fail loudly and exit non-zero.
+fn config_load_failed(
+    check_name: &str,
+    err: &impl std::fmt::Display,
+    start: Instant,
+    suggestions: &mut Vec<String>,
+) -> HealthCheck {
+    suggestions.push(format!(
+        "{check_name}: could not load config — run `rocky doctor --check config` to diagnose"
+    ));
+    HealthCheck {
+        name: check_name.into(),
+        status: HealthStatus::Critical,
+        message: format!("could not load config: {err} — run `rocky doctor --check config`"),
+        duration_ms: start.elapsed().as_millis() as u64,
+        details: Vec::new(),
+    }
 }
 
 /// Best-effort label for the credential shape an adapter is configured to use.
@@ -534,6 +622,53 @@ mod tests {
     fn should_run_mismatch() {
         assert!(!should_run("auth", Some("config")));
         assert!(!should_run("config", Some("auth")));
+    }
+
+    // -----------------------------------------------------------------------
+    // A broken rocky.toml under a config-dependent check must surface as
+    // Critical, not silently report healthy (EF2).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn broken_config_under_adapters_check_is_critical() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        // Syntactically invalid TOML (unterminated string).
+        let mut f = std::fs::File::create(&config_path).unwrap();
+        write!(f, "[adapter.x]\ntype = \"duckdb\nbroken").unwrap();
+        drop(f);
+        let state_path = dir.path().join("state.redb");
+
+        let (checks, _suggestions) =
+            collect_health_checks(&config_path, &state_path, Some("adapters"), false).await;
+
+        // The check ran and reported Critical (rather than emitting nothing
+        // and letting the overall status default to healthy).
+        let adapters = checks
+            .iter()
+            .find(|c| c.name == "adapters")
+            .expect("adapters check must be emitted even when config fails to load");
+        assert!(
+            matches!(adapters.status, HealthStatus::Critical),
+            "broken config must yield a Critical adapters check, got {:?}",
+            adapters.status
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|c| matches!(c.status, HealthStatus::Critical)),
+            "doctor must report at least one Critical so it exits non-zero"
+        );
+    }
+
+    #[test]
+    fn doctor_critical_exit_code_is_not_run_partial_success() {
+        // Doctor-critical and run-partial-success are different conditions
+        // and must not share exit code 2.
+        assert_eq!(DOCTOR_CRITICAL_EXIT_CODE, 3);
+        assert_ne!(DOCTOR_CRITICAL_EXIT_CODE, 2);
     }
 
     // -----------------------------------------------------------------------
