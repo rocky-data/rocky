@@ -27,6 +27,14 @@ impl SqlDialect for TrinoDialect {
         "trino"
     }
 
+    /// Trino's portable `CREATE TABLE ... AS` has no `OR REPLACE` across
+    /// all connectors (Hive pre-414), so a second full refresh hits
+    /// "table already exists". The runtime issues a leading
+    /// `DROP TABLE IF EXISTS` to make full refresh idempotent.
+    fn full_refresh_needs_predrop(&self) -> bool {
+        true
+    }
+
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
         // Trino is always three-part: <catalog>.<schema>.<table>. Each
         // component is double-quoted (Trino's standard identifier
@@ -39,12 +47,15 @@ impl SqlDialect for TrinoDialect {
 
     fn create_table_as(&self, target: &str, select_sql: &str) -> String {
         // Trino's `CREATE OR REPLACE TABLE ... AS` lands behind connector
-        // capability flags (Iceberg supports it; Hive does not pre-414).
-        // The portable form is `DROP TABLE IF EXISTS` + `CREATE TABLE AS`,
-        // but the planner already issues a DROP via `drop_table_sql` for
-        // full-refresh strategies, so a plain `CREATE TABLE AS` keeps the
-        // dialect surface narrow. Connectors that don't support CTAS
-        // surface a clear error from the coordinator.
+        // capability flags (Iceberg supports it; Hive does not pre-414),
+        // so this emits the portable plain `CREATE TABLE ... AS` that every
+        // connector accepts. On its own that's NOT idempotent — a second
+        // full refresh hits "table already exists". Idempotency is provided
+        // by the runtime, which precedes the CTAS with a separate
+        // `DROP TABLE IF EXISTS` whenever `full_refresh_needs_predrop()` is
+        // true (Trino). Kept as a single statement here because Trino's
+        // REST `/v1/statement` runs one statement per request — the DROP is
+        // issued as its own statement, never `;`-joined onto the CTAS.
         format!("CREATE TABLE {target} AS\n{select_sql}")
     }
 
@@ -214,6 +225,20 @@ mod tests {
         let sql = d.create_table_as("\"c\".\"s\".\"t\"", "SELECT 1");
         assert!(sql.starts_with("CREATE TABLE"));
         assert!(sql.contains("AS\nSELECT 1"));
+        // Plain CTAS is intentionally NOT `OR REPLACE` and NOT idempotent on
+        // its own — the runtime pre-drops. The CTAS must stay a single
+        // statement (Trino's REST API runs one statement per request).
+        assert!(!sql.contains("OR REPLACE"));
+        assert!(!sql.contains("DROP TABLE"));
+        assert!(!sql.contains(';'));
+    }
+
+    #[test]
+    fn full_refresh_needs_predrop_is_true() {
+        // Trino's portable CTAS has no `OR REPLACE`, so full refresh must be
+        // made idempotent by a leading DROP issued by the runtime.
+        let d = TrinoDialect::new();
+        assert!(d.full_refresh_needs_predrop());
     }
 
     #[test]

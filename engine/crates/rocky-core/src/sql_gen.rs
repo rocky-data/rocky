@@ -309,7 +309,17 @@ pub fn generate_transformation_sql_with_warehouse(
 
     match &model_ir.materialization {
         MaterializationStrategy::FullRefresh => {
-            Ok(vec![dialect.create_table_as(&target, &model_ir.sql)])
+            // Dialects whose CTAS isn't an atomic `CREATE OR REPLACE` (Trino)
+            // need a leading `DROP TABLE IF EXISTS` so a re-run doesn't hit
+            // "table already exists". Emitted as a separate statement — the
+            // runtime executes each element of this Vec individually, and
+            // Trino's REST API runs one statement per request.
+            let mut stmts = Vec::with_capacity(2);
+            if dialect.full_refresh_needs_predrop() {
+                stmts.push(dialect.drop_table_sql(&target));
+            }
+            stmts.push(dialect.create_table_as(&target, &model_ir.sql));
+            Ok(stmts)
         }
         MaterializationStrategy::Incremental { .. } => {
             Ok(vec![dialect.insert_into(&target, &model_ir.sql)])
@@ -2496,5 +2506,138 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             .expect("maintenance dialect emits archive SQL");
         assert!(archive[0].1.contains("DELETE FROM"));
         assert!(archive[1].1.contains("VACUUM"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Idempotent full-refresh pre-drop (D2 — Trino)
+    // -----------------------------------------------------------------------
+
+    /// A dialect that advertises `full_refresh_needs_predrop` (stands in for
+    /// Trino, whose portable CTAS isn't `CREATE OR REPLACE`).
+    struct PredropDialect(TestDialect);
+
+    impl SqlDialect for PredropDialect {
+        fn name(&self) -> &'static str {
+            "predrop"
+        }
+        fn full_refresh_needs_predrop(&self) -> bool {
+            true
+        }
+        fn format_table_ref(
+            &self,
+            catalog: &str,
+            schema: &str,
+            table: &str,
+        ) -> AdapterResult<String> {
+            self.0.format_table_ref(catalog, schema, table)
+        }
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            // Mirror Trino's plain (non-OR-REPLACE) CTAS.
+            format!("CREATE TABLE {target} AS\n{select_sql}")
+        }
+        fn insert_into(&self, target: &str, select_sql: &str) -> String {
+            self.0.insert_into(target, select_sql)
+        }
+        fn merge_into(
+            &self,
+            target: &str,
+            source_sql: &str,
+            keys: &[std::sync::Arc<str>],
+            update_cols: &rocky_ir::ColumnSelection,
+        ) -> AdapterResult<String> {
+            self.0.merge_into(target, source_sql, keys, update_cols)
+        }
+        fn select_clause(
+            &self,
+            columns: &rocky_ir::ColumnSelection,
+            metadata: &[rocky_ir::MetadataColumn],
+        ) -> AdapterResult<String> {
+            self.0.select_clause(columns, metadata)
+        }
+        fn watermark_where(
+            &self,
+            ts: &str,
+            wm: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
+            self.0.watermark_where(ts, wm)
+        }
+        fn describe_table_sql(&self, table_ref: &str) -> String {
+            self.0.describe_table_sql(table_ref)
+        }
+        fn drop_table_sql(&self, table_ref: &str) -> String {
+            self.0.drop_table_sql(table_ref)
+        }
+        fn create_catalog_sql(&self, name: &str) -> Option<AdapterResult<String>> {
+            self.0.create_catalog_sql(name)
+        }
+        fn create_schema_sql(&self, catalog: &str, schema: &str) -> Option<AdapterResult<String>> {
+            self.0.create_schema_sql(catalog, schema)
+        }
+        fn tablesample_clause(&self, percent: u32) -> Option<String> {
+            self.0.tablesample_clause(percent)
+        }
+        fn insert_overwrite_partition(
+            &self,
+            target: &str,
+            partition_filter: &str,
+            select_sql: &str,
+        ) -> AdapterResult<Vec<String>> {
+            self.0
+                .insert_overwrite_partition(target, partition_filter, select_sql)
+        }
+    }
+
+    fn full_refresh_transformation_ir() -> ModelIr {
+        ModelIr::transformation(
+            TargetRef {
+                catalog: "cat".into(),
+                schema: "silver".into(),
+                table: "dim_accounts".into(),
+            },
+            MaterializationStrategy::FullRefresh,
+            vec![SourceRef {
+                catalog: "cat".into(),
+                schema: "sch".into(),
+                table: "src".into(),
+            }],
+            "SELECT id FROM cat.sch.src".into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn full_refresh_prepends_drop_for_predrop_dialect() {
+        let ir = full_refresh_transformation_ir();
+        let stmts = generate_transformation_sql(&ir, &PredropDialect(TestDialect)).unwrap();
+        assert_eq!(stmts.len(), 2, "predrop dialect emits DROP + CTAS");
+        assert!(
+            stmts[0].starts_with("DROP TABLE IF EXISTS cat.silver.dim_accounts"),
+            "first statement must be the idempotent DROP, got: {}",
+            stmts[0]
+        );
+        assert!(
+            stmts[1].starts_with("CREATE TABLE cat.silver.dim_accounts AS"),
+            "second statement must be the CTAS, got: {}",
+            stmts[1]
+        );
+        // The DROP must be a SEPARATE statement, never `;`-joined onto the
+        // CTAS (Trino's REST API runs one statement per request).
+        assert!(!stmts[0].contains("CREATE TABLE"));
+        assert!(!stmts[1].contains("DROP TABLE"));
+    }
+
+    #[test]
+    fn full_refresh_skips_drop_for_atomic_dialect() {
+        // The default dialect's CTAS is `CREATE OR REPLACE`, so no pre-drop.
+        let ir = full_refresh_transformation_ir();
+        let stmts = generate_transformation_sql(&ir, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1, "atomic dialect emits CTAS only");
+        assert!(stmts[0].starts_with("CREATE OR REPLACE TABLE"));
     }
 }
