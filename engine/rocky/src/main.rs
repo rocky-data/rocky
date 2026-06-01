@@ -555,8 +555,12 @@ enum Command {
         /// for late-arriving data.
         #[arg(long)]
         lookback: Option<u32>,
-        /// Run N partitions concurrently (default 1). Warehouse-query
-        /// parallelism only — state writes serialize through redb.
+        /// Concurrency for warehouse-bound work (default 1, fully serial).
+        /// Drives both per-partition execution for `time_interval` models
+        /// and intra-layer concurrency for transformation models: models in
+        /// the same dependency layer run up to N at a time, with a barrier
+        /// at each layer boundary. Warehouse-query parallelism only — state
+        /// writes serialize through redb, and DuckDB always runs serial.
         #[arg(long, default_value = "1")]
         parallel: u32,
 

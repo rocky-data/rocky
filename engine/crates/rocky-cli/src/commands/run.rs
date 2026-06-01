@@ -3842,18 +3842,143 @@ pub(crate) async fn execute_models(
         model_timings: &compile_result.model_timings,
     };
 
+    // Intra-layer concurrency is strictly opt-in via `--parallel N`.
+    // Kahn's layering guarantees no dependencies within a layer, so every
+    // model in a layer can run concurrently; the per-layer barrier (await
+    // the whole layer before the next) preserves cross-layer dependency
+    // ordering. DuckDB and any adapter that reports
+    // `supports_concurrent_execution() == false` is forced serial because
+    // its single connection just serializes the work anyway.
+    let requested_parallel = (partition_opts.parallel as usize).max(1);
+    let adapter_supports_concurrency = warehouse.supports_concurrent_execution();
+
     for layer in &compile_result.project.layers {
-        for model_name in layer {
-            // When a model name filter is active, skip models that don't match.
-            if let Some(target) = model_name_filter
-                && model_name != target
-            {
-                continue;
+        // Collect this layer's matched models (honouring the name filter),
+        // tagged with their stable within-layer index so concurrent results
+        // can be re-ordered to match serial output exactly.
+        let matched: Vec<(usize, &String, &rocky_core::models::Model)> = layer
+            .iter()
+            .filter(|name| model_name_filter.is_none_or(|target| target == name.as_str()))
+            .filter_map(|name| compile_result.project.model(name).map(|m| (name, m)))
+            .enumerate()
+            .map(|(idx, (name, model))| (idx, name, model))
+            .collect();
+
+        // Eligible for concurrent execution only when the user opted in,
+        // the adapter supports it, and every matched model is a "plain"
+        // single-statement strategy. The two special paths
+        // (`content_addressed`, `time_interval`) stay serial — they push to
+        // `output` inline and `time_interval` already self-parallelizes
+        // per-partition. A layer mixing strategies runs entirely serially.
+        let can_parallelize = requested_parallel > 1
+            && adapter_supports_concurrency
+            && !matched.is_empty()
+            && matched.iter().all(|(_, _, model)| is_plain_strategy(model));
+
+        if can_parallelize {
+            // Fire before_model_run for every model up front, in index
+            // order, so subscribers see the same announce ordering the
+            // serial loop emits.
+            if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                for (_, name, _) in &matched {
+                    let _ = reg
+                        .fire(&HookContext::before_model_run(run_id, pipe, name))
+                        .await;
+                }
             }
 
-            let Some(model) = compile_result.project.model(model_name) else {
-                continue;
-            };
+            // Fan out the plain models, bounded by `--parallel`. We use
+            // `futures::stream::buffer_unordered` (not `JoinSet`/`spawn`) so
+            // the per-model futures don't need to be `Send + 'static` — they
+            // borrow `warehouse` / `dialect` / `exec_ctx` and are polled in
+            // this same task, exactly like the time_interval per-partition
+            // path. Each result carries its within-layer index for ordering.
+            use futures::stream::StreamExt;
+            let concurrency = requested_parallel.min(matched.len());
+            // Drive the stream over owned `usize` indices and index back
+            // into `matched` inside the closure. Carrying borrows (`&Model`)
+            // as stream *items* (rather than closure captures) trips
+            // `buffer_unordered`'s higher-ranked `Send` bound and breaks the
+            // boxed `run()` future — mirror the time_interval path, whose
+            // stream items are owned.
+            let matched_ref = &matched;
+            let mut layer_results: Vec<(usize, &String, Result<MaterializationOutput>)> =
+                futures::stream::iter(0..matched.len())
+                    .map(|idx| async move {
+                        let (_, name, model) = matched_ref[idx];
+                        let model_start = Instant::now();
+                        let r = execute_one_plain_model(
+                            model,
+                            warehouse,
+                            dialect,
+                            name,
+                            model_start,
+                            exec_ctx,
+                        )
+                        .await;
+                        (idx, name, r)
+                    })
+                    .buffer_unordered(concurrency)
+                    .collect()
+                    .await;
+
+            // Re-order by within-layer index so the JSON output and
+            // per-model result vectors are deterministic regardless of which
+            // future completed first under the concurrent scheduler.
+            layer_results.sort_by_key(|(idx, _, _)| *idx);
+
+            // Apply results in deterministic order: push successes to
+            // `output`, fire after_model_run, and surface the first failure.
+            // We collect ALL results before bailing so in-flight models in
+            // this layer complete cleanly rather than being cancelled — the
+            // same tradeoff the time_interval per-partition path makes. The
+            // per-layer barrier means a failure here stops the run before
+            // any later (dependent) layer starts, preserving the serial
+            // path's fail-fast-no-downstream behavior.
+            let mut first_error: Option<anyhow::Error> = None;
+            for (_, name, result) in layer_results {
+                match result {
+                    Ok(materialization) => {
+                        let model_duration_ms = materialization.duration_ms;
+                        output.materializations.push(materialization);
+                        if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                            let _ = reg
+                                .fire(&HookContext::after_model_run(
+                                    run_id,
+                                    pipe,
+                                    name,
+                                    model_duration_ms,
+                                ))
+                                .await;
+                        }
+                        models_executed += 1;
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                                let _ = reg
+                                    .fire(&HookContext::model_error(
+                                        run_id,
+                                        pipe,
+                                        name,
+                                        &format!("{e:#}"),
+                                    ))
+                                    .await;
+                            }
+                            first_error = Some(e);
+                        }
+                    }
+                }
+            }
+
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+            continue;
+        }
+
+        for &(_, model_name, model) in &matched {
+            let model_name: &str = model_name.as_str();
 
             // §P2.6 per-model emit: before_model_run. Duration is
             // reserved for after_model_run — here we just announce
@@ -3921,7 +4046,7 @@ pub(crate) async fn execute_models(
                             job_ids: vec![],
                         });
                         info!(
-                            model = model_name.as_str(),
+                            model = model_name,
                             target = target_table_full_name.as_str(),
                             num_rows = summary.num_rows,
                             commit_version = summary.commit_version,
@@ -3956,7 +4081,7 @@ pub(crate) async fn execute_models(
                             if let Err(e) = store.record_artifact(&artifact) {
                                 warn!(
                                     error = %e,
-                                    model = model_name.as_str(),
+                                    model = model_name,
                                     blake3 = summary.blake3_hash.as_str(),
                                     "failed to persist content-addressed artifact record \
                                      (run still successful; Phase 6 refcount may be incomplete)"
@@ -4034,162 +4159,53 @@ pub(crate) async fn execute_models(
                 continue;
             }
 
-            let model_ir = model.to_model_ir();
-            let target_ref = dialect
-                .format_table_ref(
-                    &model_ir.target.catalog,
-                    &model_ir.target.schema,
-                    &model_ir.target.table,
-                )
-                .map_err(anyhow::Error::from)?;
-
-            // MERGE requires the target to exist before the statement runs.
-            // sql_gen exposes `generate_transformation_initial_ddl` for
-            // exactly this purpose but no call site has been wiring it up,
-            // so MERGE on a fresh target failed with "table not found".
-            // Mirror the time_interval bootstrap pattern: probe via
-            // describe_table().is_ok() and run the initial DDL if missing.
-            // (Adds one describe_table round-trip per MERGE model per run;
-            // matches the cost the time_interval path already pays at
-            // run.rs:3707.) Narrow to Merge for now — Incremental /
-            // DeleteInsert / Microbatch likely have the same gap, but each
-            // gets bootstrapped only when a live smoke test for that
-            // strategy lands and verifies the fix end-to-end.
-            if matches!(
-                model_ir.materialization,
-                rocky_ir::MaterializationStrategy::Merge { .. }
-            ) {
-                let target_table_struct = rocky_ir::TableRef {
-                    catalog: model_ir.target.catalog.clone(),
-                    schema: model_ir.target.schema.clone(),
-                    table: model_ir.target.table.clone(),
-                };
-                if warehouse
-                    .describe_table(&target_table_struct)
-                    .await
-                    .is_err()
-                {
-                    let initial_ddls = rocky_core::sql_gen::generate_transformation_initial_ddl(
-                        &model_ir, dialect,
-                    )?;
-                    info!(
-                        model = model_name.as_str(),
-                        target = target_ref.as_str(),
-                        statements = initial_ddls.len(),
-                        "merge target does not exist — bootstrapping empty table from model schema"
-                    );
-                    for ddl in &initial_ddls {
-                        warehouse.execute_statement(ddl).await.map_err(|e| {
-                            anyhow::Error::from(e).context(format!(
-                                "bootstrap of '{target_ref}' for model '{model_name}' failed"
-                            ))
-                        })?;
-                    }
-                }
-            }
-
-            // Thread the Snowflake compute warehouse (when applicable) so
-            // `DynamicTable` strategies can emit `WAREHOUSE = …`. Other
-            // adapters return `None` and the helper short-circuits.
-            let exec_stmts = rocky_core::sql_gen::generate_transformation_sql_with_warehouse(
-                &model_ir,
+            // Plain single-statement strategy: delegate to the shared
+            // helper so the serial and intra-layer concurrent paths produce
+            // identical output by construction.
+            match execute_one_plain_model(
+                model,
+                warehouse,
                 dialect,
-                warehouse.warehouse_name(),
-            )?;
-
-            info!(
-                model = model_name.as_str(),
-                target = target_ref.as_str(),
-                statements = exec_stmts.len(),
-                "executing model"
-            );
-            // Capture per-statement stats so derived models report the
-            // same `bytes_scanned` / `bytes_written` shape that replication
-            // tables already have (plain transformation models were
-            // calling `execute_statement` and dropping the
-            // `ExecutionStats` reported by stats-aware adapters like
-            // BigQuery).
-            let model_started_at = Utc::now();
-            let mut exec_error: Option<anyhow::Error> = None;
-            let mut bytes_scanned_acc: Option<u64> = None;
-            let mut bytes_written_acc: Option<u64> = None;
-            let mut job_ids_acc: Vec<String> = Vec::new();
-            for exec_sql in &exec_stmts {
-                match warehouse.execute_statement_with_stats(exec_sql).await {
-                    Ok(stats) => {
-                        bytes_scanned_acc =
-                            accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
-                        bytes_written_acc =
-                            accumulate_bytes(bytes_written_acc, stats.bytes_written);
-                        if let Some(jid) = stats.job_id {
-                            job_ids_acc.push(jid);
-                        }
+                model_name,
+                model_start,
+                exec_ctx,
+            )
+            .await
+            {
+                Ok(materialization) => {
+                    let model_duration_ms = materialization.duration_ms;
+                    // Push a MaterializationOutput so `rocky cost` and
+                    // downstream consumers see derived models in the run
+                    // output instead of having to infer them from check /
+                    // drift records. Mirrors the time_interval and
+                    // replication paths.
+                    output.materializations.push(materialization);
+                    if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                        let _ = reg
+                            .fire(&HookContext::after_model_run(
+                                run_id,
+                                pipe,
+                                model_name,
+                                model_duration_ms,
+                            ))
+                            .await;
                     }
-                    Err(e) => {
-                        exec_error = Some(
-                            anyhow::Error::from(e).context(format!("model '{model_name}' failed")),
-                        );
-                        break;
+                    models_executed += 1;
+                }
+                Err(e) => {
+                    if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                        let _ = reg
+                            .fire(&HookContext::model_error(
+                                run_id,
+                                pipe,
+                                model_name,
+                                &format!("{e:#}"),
+                            ))
+                            .await;
                     }
+                    return Err(e);
                 }
             }
-            if let Some(e) = exec_error {
-                if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
-                    let _ = reg
-                        .fire(&HookContext::model_error(
-                            run_id,
-                            pipe,
-                            model_name,
-                            &format!("{e:#}"),
-                        ))
-                        .await;
-                }
-                return Err(e);
-            }
-            // Push a MaterializationOutput so `rocky cost` and downstream
-            // consumers see derived models in the run output instead of
-            // having to infer them from check / drift records. Mirrors
-            // the time_interval and replication paths.
-            let model_duration_ms = model_start.elapsed().as_millis() as u64;
-            let target_table_full_name = format!(
-                "{}.{}.{}",
-                model_ir.target.catalog, model_ir.target.schema, model_ir.target.table
-            );
-            let asset_key = vec![
-                model_ir.target.catalog.clone(),
-                model_ir.target.schema.clone(),
-                model_ir.target.table.clone(),
-            ];
-            output.materializations.push(MaterializationOutput {
-                asset_key,
-                rows_copied: None,
-                duration_ms: model_duration_ms,
-                started_at: model_started_at,
-                metadata: MaterializationMetadata {
-                    strategy: transformation_strategy_name(&model_ir.materialization).to_string(),
-                    watermark: None,
-                    target_table_full_name: Some(target_table_full_name),
-                    sql_hash: Some(crate::output::sql_fingerprint(&exec_stmts)),
-                    column_count: exec_ctx.column_count_for(model_name),
-                    compile_time_ms: exec_ctx.compile_time_ms_for(model_name),
-                },
-                partition: None,
-                cost_usd: None,
-                bytes_scanned: bytes_scanned_acc,
-                bytes_written: bytes_written_acc,
-                job_ids: job_ids_acc,
-            });
-            if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
-                let _ = reg
-                    .fire(&HookContext::after_model_run(
-                        run_id,
-                        pipe,
-                        model_name,
-                        model_duration_ms,
-                    ))
-                    .await;
-            }
-            models_executed += 1;
         }
     }
 
@@ -4214,6 +4230,159 @@ fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static 
         MaterializationStrategy::Microbatch { .. } => "microbatch",
         MaterializationStrategy::ContentAddressed { .. } => "content_addressed",
     }
+}
+
+/// True when `model` uses a "plain" single-statement transformation
+/// strategy — i.e. anything except the two special paths
+/// (`content_addressed`, `time_interval`) that the serial loop handles
+/// inline. Only plain models are eligible for intra-layer concurrent
+/// execution via [`execute_one_plain_model`].
+fn is_plain_strategy(model: &rocky_core::models::Model) -> bool {
+    !matches!(
+        model.config.strategy,
+        rocky_core::models::StrategyConfig::ContentAddressed { .. }
+            | rocky_core::models::StrategyConfig::TimeInterval { .. }
+    )
+}
+
+/// Execute exactly one "plain" single-statement transformation model:
+/// bootstrap a MERGE target if missing, generate SQL, run the statements
+/// in order, and build the resulting [`MaterializationOutput`].
+///
+/// Pure with respect to outer state — touches only the warehouse, never
+/// `RunOutput` or hooks directly. Both the serial loop and the
+/// intra-layer concurrent path in [`execute_models`] call this, so the
+/// success output is identical by construction regardless of which path
+/// ran the model. Pulled out (mirroring [`run_one_partition`]) so it can
+/// be driven by `futures::stream::buffer_unordered` for `--parallel N`.
+///
+/// The returned error is already `.context("model '<name>' failed")`-
+/// wrapped, matching the serial path's error shape.
+async fn execute_one_plain_model(
+    model: &rocky_core::models::Model,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    model_name: &str,
+    model_start: Instant,
+    // Taken by value (`ExecutionContext` is `Copy`) rather than by
+    // reference so the concurrent-path closure can capture it without a
+    // higher-ranked `for<'a> &'a ExecutionContext: Send` borrow that
+    // breaks the `Send` bound on the boxed `run()` future.
+    exec_ctx: ExecutionContext<'_>,
+) -> Result<MaterializationOutput> {
+    let model_ir = model.to_model_ir();
+    let target_ref = dialect
+        .format_table_ref(
+            &model_ir.target.catalog,
+            &model_ir.target.schema,
+            &model_ir.target.table,
+        )
+        .map_err(anyhow::Error::from)?;
+
+    // MERGE requires the target to exist before the statement runs.
+    // sql_gen exposes `generate_transformation_initial_ddl` for
+    // exactly this purpose but no call site has been wiring it up,
+    // so MERGE on a fresh target failed with "table not found".
+    // Mirror the time_interval bootstrap pattern: probe via
+    // describe_table().is_ok() and run the initial DDL if missing.
+    if matches!(
+        model_ir.materialization,
+        rocky_ir::MaterializationStrategy::Merge { .. }
+    ) {
+        let target_table_struct = rocky_ir::TableRef {
+            catalog: model_ir.target.catalog.clone(),
+            schema: model_ir.target.schema.clone(),
+            table: model_ir.target.table.clone(),
+        };
+        if warehouse
+            .describe_table(&target_table_struct)
+            .await
+            .is_err()
+        {
+            let initial_ddls =
+                rocky_core::sql_gen::generate_transformation_initial_ddl(&model_ir, dialect)?;
+            info!(
+                model = model_name,
+                target = target_ref.as_str(),
+                statements = initial_ddls.len(),
+                "merge target does not exist — bootstrapping empty table from model schema"
+            );
+            for ddl in &initial_ddls {
+                warehouse.execute_statement(ddl).await.map_err(|e| {
+                    anyhow::Error::from(e).context(format!(
+                        "bootstrap of '{target_ref}' for model '{model_name}' failed"
+                    ))
+                })?;
+            }
+        }
+    }
+
+    // Thread the Snowflake compute warehouse (when applicable) so
+    // `DynamicTable` strategies can emit `WAREHOUSE = …`. Other
+    // adapters return `None` and the helper short-circuits.
+    let exec_stmts = rocky_core::sql_gen::generate_transformation_sql_with_warehouse(
+        &model_ir,
+        dialect,
+        warehouse.warehouse_name(),
+    )?;
+
+    info!(
+        model = model_name,
+        target = target_ref.as_str(),
+        statements = exec_stmts.len(),
+        "executing model"
+    );
+    // Capture per-statement stats so derived models report the
+    // same `bytes_scanned` / `bytes_written` shape that replication
+    // tables already have.
+    let model_started_at = Utc::now();
+    let mut bytes_scanned_acc: Option<u64> = None;
+    let mut bytes_written_acc: Option<u64> = None;
+    let mut job_ids_acc: Vec<String> = Vec::new();
+    for exec_sql in &exec_stmts {
+        match warehouse.execute_statement_with_stats(exec_sql).await {
+            Ok(stats) => {
+                bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
+                bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                if let Some(jid) = stats.job_id {
+                    job_ids_acc.push(jid);
+                }
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!("model '{model_name}' failed")));
+            }
+        }
+    }
+
+    let model_duration_ms = model_start.elapsed().as_millis() as u64;
+    let target_table_full_name = format!(
+        "{}.{}.{}",
+        model_ir.target.catalog, model_ir.target.schema, model_ir.target.table
+    );
+    let asset_key = vec![
+        model_ir.target.catalog.clone(),
+        model_ir.target.schema.clone(),
+        model_ir.target.table.clone(),
+    ];
+    Ok(MaterializationOutput {
+        asset_key,
+        rows_copied: None,
+        duration_ms: model_duration_ms,
+        started_at: model_started_at,
+        metadata: MaterializationMetadata {
+            strategy: transformation_strategy_name(&model_ir.materialization).to_string(),
+            watermark: None,
+            target_table_full_name: Some(target_table_full_name),
+            sql_hash: Some(crate::output::sql_fingerprint(&exec_stmts)),
+            column_count: exec_ctx.column_count_for(model_name),
+            compile_time_ms: exec_ctx.compile_time_ms_for(model_name),
+        },
+        partition: None,
+        cost_usd: None,
+        bytes_scanned: bytes_scanned_acc,
+        bytes_written: bytes_written_acc,
+        job_ids: job_ids_acc,
+    })
 }
 
 /// Execute a `time_interval` model: plan partitions, execute each, record
@@ -7417,6 +7586,232 @@ merge_keys = ["id"]
         assert!(
             watermark.is_none(),
             "unsafe timestamp_column must be rejected before the SQL is built"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Intra-layer transformation concurrency (`--parallel N`)
+    //
+    // These exercise the concurrent execution path added in
+    // `execute_models`. DuckDB is forced serial in production, so the
+    // concurrency tests opt the adapter into concurrency via the
+    // `#[doc(hidden)]` test-only builder — the single Mutex connection still
+    // serializes the actual DB work (now off the reactor via
+    // spawn_blocking), but the concurrent control-flow (fan-out, per-layer
+    // barrier, ordered collect) runs for real against DuckDB storage.
+    // -----------------------------------------------------------------------
+
+    /// Write `name.sql` + `name.toml` (full_refresh into `main`) to `dir`.
+    #[cfg(feature = "duckdb")]
+    fn write_plain_model(dir: &std::path::Path, name: &str, sql: &str) {
+        std::fs::write(dir.join(format!("{name}.sql")), format!("{sql}\n"))
+            .expect("write model sql");
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .expect("write model toml");
+    }
+
+    /// Materialize all models in `models_dir` against a fresh DuckDB file,
+    /// returning the resulting `RunOutput` and the `execute_models` result.
+    /// `concurrent_adapter` flips the test-only concurrency flag so the
+    /// parallel path engages; `parallel` is the `--parallel N` value.
+    #[cfg(feature = "duckdb")]
+    async fn run_models_against_duckdb(
+        models_dir: &std::path::Path,
+        db_path: &std::path::Path,
+        concurrent_adapter: bool,
+        parallel: u32,
+    ) -> (RunOutput, Result<()>) {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::open(db_path)
+            .expect("open duckdb")
+            .with_concurrent_for_test(concurrent_adapter);
+        let opts = PartitionRunOptions {
+            parallel,
+            ..Default::default()
+        };
+        let mut output = RunOutput::new(String::new(), 0, parallel.max(1) as usize);
+        let result = super::execute_models(
+            models_dir,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &opts,
+            "test-run",
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+        )
+        .await;
+        (output, result)
+    }
+
+    /// (a) A wide single-layer project (four dependency-free models) runs
+    /// correctly under `--parallel 4` and produces *identical*
+    /// materialization results and ordering to the serial run.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_wide_layer_matches_serial_output() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        // Four independent models — no refs between them, so they all land
+        // in execution layer 0 (one wide layer).
+        for (i, name) in ["alpha", "bravo", "charlie", "delta"].iter().enumerate() {
+            write_plain_model(&models_dir, name, &format!("SELECT {i} AS v"));
+        }
+
+        let serial_db = tmp.path().join("serial.duckdb");
+        let parallel_db = tmp.path().join("parallel.duckdb");
+
+        let (serial_out, serial_res) =
+            run_models_against_duckdb(&models_dir, &serial_db, false, 1).await;
+        serial_res.expect("serial run must succeed");
+
+        let (parallel_out, parallel_res) =
+            run_models_against_duckdb(&models_dir, &parallel_db, true, 4).await;
+        parallel_res.expect("parallel run must succeed");
+
+        // Same number of materializations.
+        assert_eq!(
+            serial_out.materializations.len(),
+            4,
+            "all four models must materialize"
+        );
+        assert_eq!(
+            parallel_out.materializations.len(),
+            serial_out.materializations.len(),
+            "parallel run must materialize the same model count as serial"
+        );
+
+        // Identical ordering: asset_key sequence must match exactly. The
+        // parallel path sorts collected results by within-layer index, so
+        // this is the deterministic-ordering guarantee.
+        let serial_keys: Vec<&Vec<String>> = serial_out
+            .materializations
+            .iter()
+            .map(|m| &m.asset_key)
+            .collect();
+        let parallel_keys: Vec<&Vec<String>> = parallel_out
+            .materializations
+            .iter()
+            .map(|m| &m.asset_key)
+            .collect();
+        assert_eq!(
+            parallel_keys, serial_keys,
+            "parallel materialization ordering must be identical to serial"
+        );
+
+        // Pin the absolute order too (not just serial == parallel) so a
+        // broken within-layer sort can't pass by being consistently wrong
+        // across both runs. Models load name-sorted and sit in one layer,
+        // so the deterministic order is alphabetical.
+        let expected: Vec<Vec<String>> = ["alpha", "bravo", "charlie", "delta"]
+            .iter()
+            .map(|n| vec![String::new(), "main".to_string(), n.to_string()])
+            .collect();
+        let expected_refs: Vec<&Vec<String>> = expected.iter().collect();
+        assert_eq!(
+            parallel_keys, expected_refs,
+            "concurrent results must be re-ordered to the deterministic \
+             (name-sorted, within-layer) sequence"
+        );
+
+        // Every model's table actually exists in the parallel DB.
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        let verify = DuckDbWarehouseAdapter::open(&parallel_db).expect("reopen");
+        for name in ["alpha", "bravo", "charlie", "delta"] {
+            let r = verify
+                .execute_query(&format!("SELECT COUNT(*) FROM main.{name}"))
+                .await
+                .unwrap_or_else(|e| panic!("table main.{name} must exist after parallel run: {e}"));
+            assert_eq!(r.rows.len(), 1);
+        }
+    }
+
+    /// (b) A mid-DAG failure under `--parallel` stops downstream layers and
+    /// yields the same fail-fast `Err` the serial path returns: a failing
+    /// layer-0 model means the layer-1 dependent never materializes.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_mid_layer_failure_skips_downstream() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+
+        // Layer 0: `good` succeeds, `bad` fails (selects from a table that
+        // does not exist). Layer 1: `downstream` depends on `good` AND `bad`
+        // via SQL refs, so it sits in a later layer and must never run once
+        // layer 0 reports a failure.
+        write_plain_model(&models_dir, "good", "SELECT 1 AS v");
+        write_plain_model(&models_dir, "bad", "SELECT * FROM main.does_not_exist_xyz");
+        write_plain_model(
+            &models_dir,
+            "downstream",
+            "SELECT g.v FROM good g CROSS JOIN bad b",
+        );
+
+        let parallel_db = tmp.path().join("parallel.duckdb");
+        let (_out, result) = run_models_against_duckdb(&models_dir, &parallel_db, true, 4).await;
+
+        // Fail-fast: the run returns Err (same as the serial path).
+        let err = result.expect_err("a failing model must surface as Err");
+        assert!(
+            format!("{err:#}").contains("bad"),
+            "error should name the failing model: {err:#}"
+        );
+
+        // Downstream dependent must NOT have been materialized — the
+        // per-layer barrier stopped the run after the failing layer.
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        let verify = DuckDbWarehouseAdapter::open(&parallel_db).expect("reopen");
+        let exists = verify
+            .execute_query(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'main' AND table_name = 'downstream'",
+            )
+            .await
+            .ok()
+            .and_then(|r| r.rows.first()?.first()?.as_str().map(|s| s != "0"))
+            .unwrap_or(false);
+        assert!(
+            !exists,
+            "downstream model in a later layer must not run after an upstream-layer failure"
+        );
+    }
+
+    /// (c) A normal DuckDB adapter (concurrency unsupported) stays
+    /// effectively serial even when `--parallel 4` is requested, and still
+    /// materializes correctly — the opt-in concurrency must never break the
+    /// default DuckDB path.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn duckdb_stays_serial_with_parallel_flag() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        for (i, name) in ["one", "two", "three"].iter().enumerate() {
+            write_plain_model(&models_dir, name, &format!("SELECT {i} AS v"));
+        }
+
+        // Adapter reports `supports_concurrent_execution() == false` (the
+        // production default for DuckDB), so even with `--parallel 4` the
+        // serial branch runs.
+        let db = tmp.path().join("serial.duckdb");
+        let (out, result) = run_models_against_duckdb(&models_dir, &db, false, 4).await;
+        result.expect("run must succeed with parallel flag on serial DuckDB");
+
+        assert_eq!(
+            out.materializations.len(),
+            3,
+            "all three models must materialize on the forced-serial DuckDB path"
         );
     }
 }
