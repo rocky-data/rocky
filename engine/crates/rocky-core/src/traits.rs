@@ -379,6 +379,21 @@ pub trait WarehouseAdapter: Send + Sync {
         None
     }
 
+    /// Whether this adapter can safely execute statements concurrently.
+    ///
+    /// Remote warehouses (Databricks, Snowflake, BigQuery, Trino) open a
+    /// fresh REST/connection per statement and can run many in parallel, so
+    /// they return `true` (the default). DuckDB shares a single in-process
+    /// connection behind one mutex — concurrent calls just serialize through
+    /// it — so it returns `false`.
+    ///
+    /// The transformation runner consults this to cap intra-layer model
+    /// concurrency: adapters returning `false` always run serially regardless
+    /// of the `--parallel` flag.
+    fn supports_concurrent_execution(&self) -> bool {
+        true
+    }
+
     /// List table names in a given catalog + schema.
     ///
     /// Used by `rocky discover` to verify which tables actually exist
