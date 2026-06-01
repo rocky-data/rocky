@@ -10,7 +10,7 @@
       "message": "required column 'customer_id' missing from model output",
       "span": null,
       "model": "broken_metrics",
-      "suggestion": null
+      "suggestion": "add `customer_id` to the SELECT, or remove it from `[rules] required`"
     },
     {
       "severity": "Error",
@@ -18,7 +18,7 @@
       "message": "protected column 'customer_id' has been removed",
       "span": null,
       "model": "broken_metrics",
-      "suggestion": null
+      "suggestion": "restore `customer_id` in the SELECT, or remove it from `[rules] protected`"
     }
   ],
   "has_errors": true,
