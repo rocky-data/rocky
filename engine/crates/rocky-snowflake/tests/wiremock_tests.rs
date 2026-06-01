@@ -1223,6 +1223,114 @@ async fn rate_limit_below_threshold_does_not_trip_breaker() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Batched schema-describe (BatchCheckAdapter)
+// ---------------------------------------------------------------------------
+
+/// One batched `INFORMATION_SCHEMA.COLUMNS` query replaces N per-table
+/// `DESCRIBE TABLE` round trips. Mounts a mock that only matches the batched
+/// query (scoped to `<db>.information_schema.columns`), returns a 4-column
+/// rowset covering two tables, and asserts: the query fires exactly once, the
+/// result groups by lowercase table name, column names are lowercased, and
+/// `is_nullable` (YES/NO) parses into the right `nullable` flag.
+#[tokio::test]
+async fn test_batch_describe_single_query_groups_by_table() {
+    use rocky_core::traits::BatchCheckAdapter;
+    use rocky_snowflake::batch::SnowflakeBatchCheckAdapter;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        // The batched describe targets the database-scoped information_schema.
+        .and(body_string_contains("information_schema.columns"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-batch-describe",
+            "code": "00000",
+            "message": "Statement executed successfully.",
+            "statementStatusUrl": "",
+            "resultSetMetaData": {
+                "numRows": 4,
+                "rowType": [
+                    {"name": "LOWER(TABLE_NAME)", "type": "TEXT", "nullable": false},
+                    {"name": "LOWER(COLUMN_NAME)", "type": "TEXT", "nullable": false},
+                    {"name": "DATA_TYPE", "type": "TEXT", "nullable": false},
+                    {"name": "IS_NULLABLE", "type": "TEXT", "nullable": false}
+                ]
+            },
+            // Snowflake returns INFORMATION_SCHEMA values as JSON strings.
+            "data": [
+                ["orders", "id", "NUMBER", "NO"],
+                ["orders", "customer", "TEXT", "YES"],
+                ["events", "event_id", "NUMBER", "YES"],
+                ["events", "created_at", "TIMESTAMP_NTZ", "NO"]
+            ]
+        })))
+        // Exactly one batched query — not one DESCRIBE per table.
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = std::sync::Arc::new(test_connector(&server));
+    let batch = SnowflakeBatchCheckAdapter::new(connector);
+
+    let map = batch
+        .batch_describe_schema("TEST_DB", "analytics")
+        .await
+        .expect("batch describe should succeed");
+
+    // Grouped by lowercase table name.
+    assert_eq!(map.len(), 2, "two tables in the schema");
+
+    let orders = map.get("orders").expect("orders table present");
+    assert_eq!(orders.len(), 2);
+    assert_eq!(orders[0].name, "id");
+    assert_eq!(orders[0].data_type, "NUMBER");
+    assert!(!orders[0].nullable, "id is_nullable=NO -> not nullable");
+    assert_eq!(orders[1].name, "customer");
+    assert!(orders[1].nullable, "customer is_nullable=YES -> nullable");
+
+    let events = map.get("events").expect("events table present");
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().any(|c| c.name == "event_id" && c.nullable));
+    assert!(events.iter().any(|c| c.name == "created_at" && !c.nullable));
+}
+
+/// An empty `INFORMATION_SCHEMA.COLUMNS` result (schema with no tables, or a
+/// missing schema) yields an empty map rather than an error — the run loop
+/// treats a prefetch miss the same as a per-table describe miss.
+#[tokio::test]
+async fn test_batch_describe_empty_schema_yields_empty_map() {
+    use rocky_core::traits::BatchCheckAdapter;
+    use rocky_snowflake::batch::SnowflakeBatchCheckAdapter;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("information_schema.columns"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-batch-empty",
+            "code": "00000",
+            "message": "Statement executed successfully.",
+            "statementStatusUrl": "",
+            "resultSetMetaData": { "numRows": 0, "rowType": [] },
+            "data": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = std::sync::Arc::new(test_connector(&server));
+    let batch = SnowflakeBatchCheckAdapter::new(connector);
+
+    let map = batch
+        .batch_describe_schema("TEST_DB", "empty_schema")
+        .await
+        .expect("empty result should not error");
+    assert!(map.is_empty());
+}
+
 #[tokio::test]
 async fn breaker_trip_without_recovery_timeout_emits_none_cooldown() {
     let server = MockServer::start().await;
