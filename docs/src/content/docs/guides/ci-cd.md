@@ -79,7 +79,7 @@ plan_id=$(rocky plan promote fix-price --base main --allow-breaking --output jso
 rocky apply "$plan_id"
 ```
 
-The bare `rocky branch promote <name>` form continues to work as an alias for the two-step flow above. See [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) for the full flag list and the audit-event reference under [`rocky branch promote` in the JSON output reference](/reference/json-output/#rocky-branch-promote).
+The bare `rocky branch promote <name>` form continues to work as an alias for the two-step flow above. See [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) for the full flag list, and the [`branch_promote` schema](https://github.com/rocky-data/rocky/blob/main/schemas/branch_promote.schema.json) for the audit-event reference.
 
 ## 2. GitHub Actions
 
