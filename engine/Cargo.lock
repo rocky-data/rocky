@@ -3882,6 +3882,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
