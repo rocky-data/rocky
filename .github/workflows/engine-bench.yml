@@ -49,13 +49,15 @@ jobs:
           cargo bench --bench compile -p rocky-cli -- --output-format bencher | tee bench-output.txt
           cargo bench --bench state_store -p rocky-core -- --output-format bencher | tee -a bench-output.txt
 
-      - name: Store benchmark results
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1
+      # This workflow runs only on perf-labeled PRs (no push trigger), so there
+      # is no main-branch baseline to compare against — github-action-benchmark
+      # requires a `gh-pages` history branch and fails without one. Instead we
+      # surface the raw bencher output as a downloadable artifact. Maintaining a
+      # benchmark history would mean running these expensive builds on every main
+      # push, which this workflow deliberately avoids.
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          tool: 'cargo'
-          output-file-path: engine/bench-output.txt
-          alert-threshold: '120%'
-          comment-on-alert: true
-          fail-on-alert: false
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          name: bench-output
+          path: engine/bench-output.txt
+          if-no-files-found: error
