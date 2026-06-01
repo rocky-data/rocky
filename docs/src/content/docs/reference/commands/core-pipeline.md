@@ -9,13 +9,7 @@ The core pipeline commands cover the full lifecycle of a Rocky pipeline: project
 
 ## Global Flags
 
-These flags apply to all commands and are documented in the [CLI Reference](/reference/cli/).
-
-| Flag | Short | Type | Default | Description |
-|------|-------|------|---------|-------------|
-| `--config <PATH>` | `-c` | `PathBuf` | `rocky.toml` | Path to the pipeline configuration file. |
-| `--output <FORMAT>` | `-o` | `string` | `json` | Output format: `json` or `table`. |
-| `--state-path <PATH>` | | `PathBuf` | `.rocky-state.redb` | Path to the embedded state store for watermarks. |
+The global flags (`--config`, `--output`, `--state-path`, `--cache-ttl`) apply to every command. See [Global Flags in the CLI Reference](/reference/cli/#global-flags) for the canonical list, defaults, and the `--state-path` resolution order.
 
 ---
 

@@ -15,7 +15,7 @@ Rocky provides a single binary with subcommands for the full pipeline lifecycle.
 - **Administration**: `history`, `replay`, `trace`, `metrics`, `optimize`, `compact`, `profile-storage`, `archive`, `compliance`, `retention-status`
 - **Diagnostics**: `doctor`, `compare`
 
-See the dedicated command reference pages for detailed documentation of each category.
+This page is the complete reference: every command and flag, with examples and JSON output. The pages under **Reference → Commands** cover the same commands grouped by category.
 
 ## Global Flags
 
