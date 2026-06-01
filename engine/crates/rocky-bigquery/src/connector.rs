@@ -46,6 +46,13 @@ pub struct BigQueryAdapter {
     location: String,
     dialect: BigQueryDialect,
     timeout_secs: u64,
+    /// Override for the REST API base URL (used by tests to point at a
+    /// wiremock server instead of `bigquery.googleapis.com`). Always
+    /// `None` in production builds — the field only exists under `test`
+    /// or the `test-support` feature, so the production binary is byte
+    /// identical.
+    #[cfg(any(test, feature = "test-support"))]
+    base_url_override: Option<String>,
 }
 
 impl std::fmt::Debug for BigQueryAdapter {
@@ -70,6 +77,37 @@ const POLL_DELAY_STEPS_MS: [u64; 5] = [100, 200, 500, 1000, 2000];
 /// Maximum polling delay after exponential growth.
 const MAX_POLL_DELAY_MS: u64 = 5000;
 
+/// Build the production reqwest client for talking to
+/// `bigquery.googleapis.com`. Extracted so `new()` and (eventually) any
+/// other constructor share one definition; the test seam
+/// (`with_base_url`) builds its own h2-less client instead.
+fn build_production_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .tcp_nodelay(true)
+        // Keep connections alive on the wire so GCP load balancers
+        // don't silently sever idle sockets mid-query. Matches the
+        // cadence reqwest uses internally for HTTP/2 ping frames.
+        .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(std::time::Duration::from_secs(300))
+        // Separate HTTP request timeout from the BigQuery query
+        // timeout (which is encoded in the request body as
+        // `timeout_ms`). Post-P2.3 we poll `jobs.getQueryResults` for
+        // anything longer; 120 s bounds individual HTTP roundtrips.
+        // Matches the Databricks adapter.
+        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        // GCP endpoints (bigquery.googleapis.com, oauth2.googleapis.com)
+        // support HTTP/2 natively; skipping the Upgrade dance shaves
+        // one RTT off the first request. Safe only because this
+        // adapter never hits HTTP/1-only endpoints (metadata server,
+        // corporate proxies, etc. — see auth.rs which only talks to
+        // oauth2.googleapis.com).
+        .http2_prior_knowledge()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 fn poll_delay(attempt: usize) -> Duration {
     let delay_ms = if attempt < POLL_DELAY_STEPS_MS.len() {
         POLL_DELAY_STEPS_MS[attempt]
@@ -88,36 +126,49 @@ impl BigQueryAdapter {
         auth: BigQueryAuth,
     ) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .tcp_nodelay(true)
-                // Keep connections alive on the wire so GCP load balancers
-                // don't silently sever idle sockets mid-query. Matches the
-                // cadence reqwest uses internally for HTTP/2 ping frames.
-                .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
-                .pool_max_idle_per_host(32)
-                .pool_idle_timeout(std::time::Duration::from_secs(300))
-                // Separate HTTP request timeout from the BigQuery query
-                // timeout (which is encoded in the request body as
-                // `timeout_ms`). Post-P2.3 we poll `jobs.getQueryResults` for
-                // anything longer; 120 s bounds individual HTTP roundtrips.
-                // Matches the Databricks adapter.
-                .timeout(std::time::Duration::from_secs(120))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                // GCP endpoints (bigquery.googleapis.com, oauth2.googleapis.com)
-                // support HTTP/2 natively; skipping the Upgrade dance shaves
-                // one RTT off the first request. Safe only because this
-                // adapter never hits HTTP/1-only endpoints (metadata server,
-                // corporate proxies, etc. — see auth.rs which only talks to
-                // oauth2.googleapis.com).
-                .http2_prior_knowledge()
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client: build_production_client(),
             auth,
             project_id: project_id.into(),
             location: location.into(),
             dialect: BigQueryDialect,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            #[cfg(any(test, feature = "test-support"))]
+            base_url_override: None,
         }
+    }
+
+    /// Point this adapter at a custom REST API base URL (for testing with
+    /// wiremock). Rebuilds the HTTP client **without**
+    /// `http2_prior_knowledge` because wiremock serves HTTP/1.1; the
+    /// production client negotiates HTTP/2 directly and so cannot connect
+    /// to an HTTP/1.1 mock server. The base URL should have no trailing
+    /// slash (e.g. `http://127.0.0.1:1234`). Production code never calls
+    /// this — the method and its h2-less client only exist under `test`
+    /// or the `test-support` feature.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.client = reqwest::Client::builder()
+            .tcp_nodelay(true)
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        self.base_url_override = Some(base_url.into());
+        self
+    }
+
+    /// Base URL for the BigQuery REST API. In `test` / `test-support`
+    /// builds this returns the wiremock override when set; otherwise (and
+    /// always in production) it returns the real `bigquery.googleapis.com`
+    /// host. Every REST URL the connector builds routes through here so a
+    /// stray call can never leak to Google during a mocked test.
+    fn base_url(&self) -> &str {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(url) = &self.base_url_override {
+            return url;
+        }
+        "https://bigquery.googleapis.com"
     }
 
     /// Set the query timeout.
@@ -179,7 +230,8 @@ impl BigQueryAdapter {
         async move {
             let token = self.auth.get_token(&self.client).await?;
             let url = format!(
-                "https://bigquery.googleapis.com/bigquery/v2/projects/{}/queries",
+                "{}/bigquery/v2/projects/{}/queries",
+                self.base_url(),
                 self.project_id
             );
 
@@ -250,8 +302,10 @@ impl BigQueryAdapter {
         let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
         let token = self.auth.get_token(&self.client).await?;
         let url = format!(
-            "https://bigquery.googleapis.com/bigquery/v2/projects/{}/queries/{}",
-            self.project_id, job_ref.job_id
+            "{}/bigquery/v2/projects/{}/queries/{}",
+            self.base_url(),
+            self.project_id,
+            job_ref.job_id
         );
 
         for attempt in 0..usize::MAX {
@@ -322,8 +376,10 @@ impl BigQueryAdapter {
     ) -> Result<JobDestinationTable, BigQueryError> {
         let token = self.auth.get_token(&self.client).await?;
         let url = format!(
-            "https://bigquery.googleapis.com/bigquery/v2/projects/{}/jobs/{}",
-            self.project_id, job_ref.job_id
+            "{}/bigquery/v2/projects/{}/jobs/{}",
+            self.base_url(),
+            self.project_id,
+            job_ref.job_id
         );
 
         let resp = self
@@ -435,8 +491,10 @@ impl BigQueryAdapter {
     ) -> Result<BigQueryStatistics, BigQueryError> {
         let token = self.auth.get_token(&self.client).await?;
         let url = format!(
-            "https://bigquery.googleapis.com/bigquery/v2/projects/{}/jobs/{}",
-            self.project_id, job_ref.job_id
+            "{}/bigquery/v2/projects/{}/jobs/{}",
+            self.base_url(),
+            self.project_id,
+            job_ref.job_id
         );
 
         let resp = self

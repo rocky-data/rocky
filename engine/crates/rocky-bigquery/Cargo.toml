@@ -35,8 +35,27 @@ prost = { workspace = true }
 tonic = { workspace = true }
 googleapis-tonic-google-cloud-bigquery-storage-v1 = { workspace = true }
 
+[features]
+# Exposes the `with_base_url` test seam on `BigQueryAdapter` so the
+# wiremock suite can point the connector at a local mock server. Enabled
+# automatically under `cfg(test)`; the feature flag lets the integration
+# test target (a separate compilation unit) opt in. Production builds
+# never enable it, so the seam compiles out entirely.
+test-support = []
+
 [dev-dependencies]
 tokio = { workspace = true }
+wiremock = { workspace = true }
+serde_json = { workspace = true }
+
+# HTTP-level mock coverage for the REST connector (execute / poll / error
+# mapping / parse paths) without live credentials. Mirrors the
+# rocky-snowflake and rocky-databricks wiremock suites. Gated on
+# `test-support` so the `with_base_url` seam is available; CI runs it via
+# `cargo test --all-features`.
+[[test]]
+name = "wiremock_tests"
+required-features = ["test-support"]
 
 [lints]
 workspace = true
