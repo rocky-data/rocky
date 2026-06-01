@@ -435,12 +435,26 @@ async fn collect_health_checks(
                                     }
                                     Err(e) => {
                                         all_ok = false;
+                                        // Frame common auth failures (403/401)
+                                        // into an actionable message; stash the
+                                        // raw error in verbose `details`.
+                                        let framed =
+                                            crate::output::frame_warehouse_adapter_error(&e, name);
+                                        let message = match &framed {
+                                            Some(m) => format!("Ping failed: {m}"),
+                                            None => format!("Ping failed: {e}"),
+                                        };
+                                        let details = if verbose || framed.is_some() {
+                                            vec![("raw".into(), format!("{e}"))]
+                                        } else {
+                                            Vec::new()
+                                        };
                                         checks.push(HealthCheck {
                                             name: format!("auth/{name}"),
                                             status: HealthStatus::Critical,
-                                            message: format!("Ping failed: {e}"),
+                                            message,
                                             duration_ms: ping_start.elapsed().as_millis() as u64,
-                                            details: Vec::new(),
+                                            details,
                                         });
                                         suggestions.push(format!(
                                             "Adapter '{name}': verify credentials and network access"

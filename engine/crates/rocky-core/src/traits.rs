@@ -47,6 +47,18 @@ impl AdapterError {
             inner: msg.into().into(),
         }
     }
+
+    /// The boxed underlying error.
+    ///
+    /// Exposed so callers can `downcast_ref` to a concrete adapter error
+    /// type (e.g. a warehouse `ConnectorError`) to recover typed details
+    /// such as an HTTP status. `source()` is insufficient here: it returns
+    /// `inner.source()`, which skips `inner` itself, so a leaf error
+    /// variant with no nested source (like `ApiError { status, body }`)
+    /// would be unreachable.
+    pub fn inner(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self.inner.as_ref()
+    }
 }
 
 impl std::fmt::Display for AdapterError {
