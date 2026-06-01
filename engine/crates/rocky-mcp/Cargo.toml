@@ -38,6 +38,9 @@ schemars = "1"
 
 [dev-dependencies]
 rocky-duckdb = { path = "../rocky-duckdb" }
+# Live Snowflake grounding verification (grounding_snowflake_live.rs) builds the
+# adapter directly to set up / tear down its fixture table.
+rocky-snowflake = { path = "../rocky-snowflake" }
 rocky-ai = { path = "../rocky-ai" }
 tempfile = "3"
 serde_json = { workspace = true }
