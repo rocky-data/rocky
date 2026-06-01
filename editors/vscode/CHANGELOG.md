@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.31.2] — 2026-06-02
+
+### Changed
+
+- **Fewer redundant CLI spawns.** The extension now caches `rocky catalog` / `rocky compile` output and debounces high-frequency CLI invocations, so editing and switching models no longer re-shells out to `rocky` on every keystroke. (#785)
+- Bumped dependencies to their latest minor versions. (#772)
+
+### Fixed
+
+- **First-use onboarding for users without the CLI installed.** A fresh install with no `rocky` on `$PATH` now guides the user to install it instead of failing silently. (#760)
+- **Scoped `rocky.server.path` and `rocky.server.extraArgs` to machine-level settings**, so a workspace can't point the language server at an arbitrary binary or inject arbitrary arguments.
+- **Allowlisted the command URIs the doctor webview is permitted to invoke.**
+
 ## [1.31.1] — 2026-05-30
 
 ### Changed

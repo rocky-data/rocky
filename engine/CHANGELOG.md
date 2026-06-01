@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.48.0] — 2026-06-02
+
+### Added
+
+- **`rocky mcp` grounds AI suggestions in live warehouse data.** The MCP server's data-grounding tools (`inspect_schema`, `sample_rows`, `profile_column`) now query the configured warehouse directly — sampling real rows, profiling a column's distribution and top values, and discovering raw source tables — across DuckDB, Snowflake, BigQuery, and Databricks. A new `suggest_freshness_block` tool drafts a `[freshness]` block from a source's observed load pattern. (#775)
+- **Cross-team contracts via imported producer IR snapshots.** A consumer project can import an upstream producer's compiled IR snapshot and type-check its own models against the producer's published output schema, so a breaking change upstream surfaces at compile time downstream. (#774)
+
+### Changed
+
+- **`rocky run` is a first-class single-step alias again** — no longer deprecated. `run` is the fused plan+apply path for everyday use; `plan` + `apply` remain the canonical auditable two-step flow. (#763)
+- **Non-blocking DuckDB execution and opt-in intra-layer transformation concurrency.** DuckDB queries now run on a blocking-safe thread, and independent models within a layer can be transformed in parallel with the new `--parallel` flag. (#790)
+- **State-store writes are batched.** Per-run progress writes dropped from O(N²) to O(N), and the schema cache now fsyncs once per run instead of once per model. (#787)
+- Bumped workspace dependencies to their latest minor versions. (#776)
+
+### Fixed
+
+- **Live data grounding emits correct SQL for BigQuery and Databricks.** BigQuery table references are backtick-quoted with hyphen-allowing project-id validation, and Databricks profile casts use Spark's `STRING` type instead of `VARCHAR` (which Spark rejects with `DATATYPE_MISSING_SIZE`). (#778)
+- **Dialect adapter-gating and identifier quoting corrected across adapters**, verified against live warehouses. (#789)
+- **BigQuery async job failures now surface instead of hanging**, with automatic retries on HTTP 429/503. (#796)
+- **`rocky doctor` and logging no longer warn on a healthy default setup** — a clean local project reports clean.
+- **The playground DuckDB is auto-seeded** so the first-run quickstart works without a manual seed step.
+- CLI UX, diagnostics, and cross-platform fixes, plus dead-code cleanup. (#788)
+
+### Security
+
+- Addressed security and data-integrity findings from an internal audit. (#764)
+
 ## [1.47.1] — 2026-05-30
 
 ### Fixed
