@@ -177,12 +177,15 @@ impl SqlDialect for SnowflakeSqlDialect {
         let literal = last_watermark
             .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
             .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
-        // Double-quote the column to match the `format_table_ref` /
-        // `merge_into` path, which create + reference columns quoted
-        // (case-sensitive, lowercase-preserving). An *unquoted* reference
-        // here folds to UPPER and raises `invalid identifier` against a
-        // column stored lowercase (as the quoted-create / bisection-seed
-        // path produces). Quoting resolves it regardless of fold defaults.
+        // Double-quote the column to match Rocky's quoted-identifier
+        // convention (`format_table_ref` / `merge_into`), which reference
+        // columns quoted (case-sensitive, lowercase-preserving). An
+        // *unquoted* reference here folds to UPPER and raises `invalid
+        // identifier` against a column stored lowercase — which the
+        // quoted-create / bisection-seed path produces. Quoting fixes that
+        // case. (Trade-off: this is a fixed-case reference, so it will not
+        // match a column stored UPPER from an unquoted create — Rocky's own
+        // tables are quoted lowercase, so that's the case we target.)
         let col_q = self.quote_identifier(timestamp_col);
         Ok(format!("WHERE {col_q} > '{literal}'::TIMESTAMP_NTZ"))
     }
