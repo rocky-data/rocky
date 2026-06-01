@@ -312,8 +312,15 @@ pub async fn run_ai_sync(
     let mut proposals = Vec::new();
 
     for model in &models_with_intent {
-        // Get upstream changes for this model
-        let upstream_changes = Vec::new(); // TODO: compare against previous compilation from state store
+        // Upstream schema-change detection is not wired yet: it would
+        // require diffing the current compilation against a *persisted
+        // previous* one (see `rocky_ai::sync::detect_schema_changes`), but
+        // the state store does not yet snapshot prior `CompileResult`s.
+        // Until that snapshot store exists, sync proposals are driven by
+        // the model's declared intent alone, with no upstream diff. This
+        // is surfaced to the user below (TODO: persist compile snapshots
+        // so `detect_schema_changes` can feed this).
+        let upstream_changes = Vec::new();
 
         let proposal = rocky_ai::sync::sync_model(model, &upstream_changes, &client, &result)
             .await
@@ -339,6 +346,11 @@ pub async fn run_ai_sync(
         };
         print_json(&output)?;
     } else {
+        println!(
+            "Note: proposals are based on declared model intent only — \
+             upstream schema-change detection is not yet wired."
+        );
+        println!();
         for proposal in &proposals {
             println!(
                 "Model: {} (intent: \"{}\")",
