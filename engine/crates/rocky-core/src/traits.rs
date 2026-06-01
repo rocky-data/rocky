@@ -47,6 +47,18 @@ impl AdapterError {
             inner: msg.into().into(),
         }
     }
+
+    /// The boxed underlying error.
+    ///
+    /// Exposed so callers can `downcast_ref` to a concrete adapter error
+    /// type (e.g. a warehouse `ConnectorError`) to recover typed details
+    /// such as an HTTP status. `source()` is insufficient here: it returns
+    /// `inner.source()`, which skips `inner` itself, so a leaf error
+    /// variant with no nested source (like `ApiError { status, body }`)
+    /// would be unreachable.
+    pub fn inner(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self.inner.as_ref()
+    }
 }
 
 impl std::fmt::Display for AdapterError {
@@ -377,6 +389,21 @@ pub trait WarehouseAdapter: Send + Sync {
     /// DuckDB is in-process).
     fn warehouse_name(&self) -> Option<&str> {
         None
+    }
+
+    /// Whether this adapter can safely execute statements concurrently.
+    ///
+    /// Remote warehouses (Databricks, Snowflake, BigQuery, Trino) open a
+    /// fresh REST/connection per statement and can run many in parallel, so
+    /// they return `true` (the default). DuckDB shares a single in-process
+    /// connection behind one mutex — concurrent calls just serialize through
+    /// it — so it returns `false`.
+    ///
+    /// The transformation runner consults this to cap intra-layer model
+    /// concurrency: adapters returning `false` always run serially regardless
+    /// of the `--parallel` flag.
+    fn supports_concurrent_execution(&self) -> bool {
+        true
     }
 
     /// List table names in a given catalog + schema.

@@ -3,6 +3,7 @@ import { resolveProjectRoot } from "../config";
 import {
   RockyCliError,
   runRockyJson,
+  runRockyJsonCached,
   runRockyJsonWithProgress,
   showRockyError,
 } from "../rockyCli";
@@ -38,11 +39,14 @@ import { runAiExplain, runAiGenerate, runAiTest } from "./ai";
  */
 export async function buildGraph(): Promise<GraphData> {
   const cwd = resolveProjectRoot();
+  // catalog + compile are idempotent between edits, so route them through the
+  // shared cache: the Inspector's `graph` and `model` requests fire together on
+  // open, and this coalesces them into one spawn each (see runRockyJsonCached).
   const [catalog, compile] = await Promise.all([
-    runRockyJson<CatalogOutput>(["catalog", "--output", "json"], { cwd }),
-    runRockyJson<CompileOutput>(["compile", "--output", "json"], { cwd }).catch(
-      () => null,
-    ),
+    runRockyJsonCached<CatalogOutput>(["catalog", "--output", "json"], { cwd }),
+    runRockyJsonCached<CompileOutput>(["compile", "--output", "json"], {
+      cwd,
+    }).catch(() => null),
   ]);
 
   const details = new Map<string, ModelDetail>();

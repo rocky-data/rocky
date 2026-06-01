@@ -35,8 +35,10 @@ import {
   RockyCliError,
   clearCliVersionCache,
   getCliVersion,
+  invalidateRockyCache,
   runRocky,
   runRockyJson,
+  runRockyJsonCached,
 } from "../rockyCli";
 
 type ExecCallback = (
@@ -441,5 +443,81 @@ describe("runRocky (unbounded subcommands → spawn)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runRockyJsonCached — catalog/compile result cache + in-flight coalescing.
+// `compile` is a bounded subcommand, so it routes through execFileMock.
+// ---------------------------------------------------------------------------
+
+describe("runRockyJsonCached", () => {
+  beforeEach(() => {
+    execFileMock.mockReset();
+    invalidateRockyCache();
+  });
+
+  it("returns the cached result on the second call without re-spawning", async () => {
+    mockSuccess('{"models_detail":[]}');
+    const first = await runRockyJsonCached(["compile", "--output", "json"]);
+    const second = await runRockyJsonCached(["compile", "--output", "json"]);
+
+    expect(first).toEqual({ models_detail: [] });
+    expect(second).toEqual({ models_detail: [] });
+    // Only the first call shelled out; the second was served from the cache.
+    expect(execFileMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces two concurrent identical calls into one spawn", async () => {
+    mockSuccess('{"ok":true}');
+    const [a, b] = await Promise.all([
+      runRockyJsonCached(["compile", "--output", "json"]),
+      runRockyJsonCached(["compile", "--output", "json"]),
+    ]);
+    expect(a).toEqual({ ok: true });
+    expect(b).toEqual({ ok: true });
+    expect(execFileMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keys on the full argument vector — compile and compile --model differ", async () => {
+    mockSuccess('{"scope":"all"}');
+    mockSuccess('{"scope":"model"}');
+    const all = await runRockyJsonCached(["compile", "--output", "json"]);
+    const one = await runRockyJsonCached([
+      "compile",
+      "--model",
+      "orders",
+      "--output",
+      "json",
+    ]);
+    expect(all).toEqual({ scope: "all" });
+    expect(one).toEqual({ scope: "model" });
+    expect(execFileMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-spawns after invalidateRockyCache()", async () => {
+    mockSuccess('{"gen":1}');
+    expect(await runRockyJsonCached(["compile", "--output", "json"])).toEqual({
+      gen: 1,
+    });
+    invalidateRockyCache();
+    mockSuccess('{"gen":2}');
+    expect(await runRockyJsonCached(["compile", "--output", "json"])).toEqual({
+      gen: 2,
+    });
+    expect(execFileMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not cache a rejection — a later call re-spawns and can succeed", async () => {
+    mockFailure("boom", "compile failed", 1);
+    await expect(
+      runRockyJsonCached(["compile", "--output", "json"]),
+    ).rejects.toBeInstanceOf(RockyCliError);
+
+    mockSuccess('{"recovered":true}');
+    expect(await runRockyJsonCached(["compile", "--output", "json"])).toEqual({
+      recovered: true,
+    });
+    expect(execFileMock).toHaveBeenCalledTimes(2);
   });
 });

@@ -237,11 +237,18 @@ export function registerDriftDiagnostics(
     );
   }
 
-  // Refresh on file open.
+  // Refresh on file open. The compile spawn (model files) is debounced through
+  // the same per-URI 500ms timer as save, so opening a burst of model files —
+  // or VS Code re-opening a session's tabs on startup — doesn't fire a
+  // `rocky compile --model` per file at once. Non-model files spawn nothing, so
+  // they clear any stale diagnostics eagerly (no point debouncing a cheap delete).
   context.subscriptions.push(
     vscode.workspace.onDidOpenTextDocument((document) => {
-      if (!shouldRunCli()) return;
-      void refreshDiagnostics(document, collection);
+      if (!modelNameFromFile(document.fileName)) {
+        collection.delete(document.uri);
+        return;
+      }
+      scheduleRefresh(document);
     }),
   );
 

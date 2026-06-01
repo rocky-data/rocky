@@ -1,6 +1,7 @@
 import * as path from "path";
 import * as vscode from "vscode";
-import { RockyCliError, runRockyJson } from "../rockyCli";
+import { resolveProjectRoot } from "../config";
+import { RockyCliError, runRockyJson, runRockyJsonCached } from "../rockyCli";
 import type { CatalogOutput } from "../types/generated/catalog";
 import type { CompileOutput } from "../types/generated/compile";
 import type { PreviewRowsOutput } from "../types/generated/preview_rows";
@@ -118,9 +119,14 @@ export async function showLineage(arg?: unknown): Promise<void> {
 
 /** Fan-in `rocky catalog` + `rocky compile` into one model-scoped summary. */
 async function loadModelData(model: string): Promise<InspectorModelData> {
+  // Pass an explicit project root so this shares a cache key with buildGraph()
+  // (which keys on resolveProjectRoot()). Both then dedup to one catalog + one
+  // compile spawn on Inspector open, and every node-click is a cache hit rather
+  // than another project-wide pair of spawns just to .find() one model.
+  const cwd = resolveProjectRoot();
   const [catalog, compile] = await Promise.all([
-    runRockyJson<CatalogOutput>(["catalog", "--output", "json"]),
-    runRockyJson<CompileOutput>(["compile", "--output", "json"]),
+    runRockyJsonCached<CatalogOutput>(["catalog", "--output", "json"], { cwd }),
+    runRockyJsonCached<CompileOutput>(["compile", "--output", "json"], { cwd }),
   ]);
   const asset = catalog.assets.find((a) => a.model_name === model);
   if (!asset) {

@@ -555,8 +555,12 @@ enum Command {
         /// for late-arriving data.
         #[arg(long)]
         lookback: Option<u32>,
-        /// Run N partitions concurrently (default 1). Warehouse-query
-        /// parallelism only — state writes serialize through redb.
+        /// Concurrency for warehouse-bound work (default 1, fully serial).
+        /// Drives both per-partition execution for `time_interval` models
+        /// and intra-layer concurrency for transformation models: models in
+        /// the same dependency layer run up to N at a time, with a barrier
+        /// at each layer boundary. Warehouse-query parallelism only — state
+        /// writes serialize through redb, and DuckDB always runs serial.
         #[arg(long, default_value = "1")]
         parallel: u32,
 
@@ -1998,6 +2002,23 @@ fn parse_governance_override(
     Ok(Some(parsed))
 }
 
+/// Process exit-code convention for the `rocky` CLI.
+///
+/// Each non-zero code means a distinct condition so wrappers
+/// (Dagster, CI, shell scripts) can branch without parsing output:
+///
+/// | code | meaning |
+/// |------|---------|
+/// | `0`  | success |
+/// | `1`  | total / generic failure (e.g. `rocky run` with no tables copied, config error) |
+/// | `2`  | `rocky run` partial success — some tables materialized, some failed (Dagster `allow_partial=True` keys on this) |
+/// | `3`  | `rocky doctor` found a Critical health check |
+/// | `4`  | `rocky ci` passed compile + tests but emitted advisory warnings |
+/// | `130`| interrupted by SIGINT / SIGTERM |
+///
+/// `2` is reserved exclusively for run partial-success; doctor-critical
+/// and ci-warnings were split off to `3` / `4` so they no longer collide
+/// with it.
 async fn run_async(cli: Cli, json: bool) -> Result<()> {
     // Install miette's fancy handler for rich error rendering in text mode.
     // In JSON mode we skip it — errors are serialized as structured data.

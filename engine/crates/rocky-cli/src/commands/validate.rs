@@ -435,11 +435,24 @@ fn validate_adapter(
                     field: None,
                 });
             } else {
+                // Unknown adapter types are a hard error, not a cosmetic
+                // warning: `rocky run` rejects them outright (registry.rs
+                // `from_config` bails), so `rocky validate` must agree and
+                // set `valid = false`. Reuse the same supported-types list
+                // and `did_you_mean` suggestion the runtime error uses.
+                use crate::error_reporter::{self, KNOWN_ADAPTER_TYPES};
+                let mut message = format!(
+                    "adapter.{name}: unknown type '{other}'. Supported: {}",
+                    KNOWN_ADAPTER_TYPES.join(", "),
+                );
+                if let Some(suggestion) = error_reporter::did_you_mean(other, KNOWN_ADAPTER_TYPES) {
+                    message.push_str(&format!(". Did you mean '{suggestion}'?"));
+                }
                 ok = false;
                 msgs.push(ValidateMessage {
-                    severity: "warn".into(),
+                    severity: "error".into(),
                     code: "V017".into(),
-                    message: format!("adapter.{name}: unknown type '{other}'"),
+                    message,
                     file: None,
                     field: Some(format!("adapter.{name}.type")),
                 });
@@ -986,18 +999,27 @@ fn lint_config(
     }
 }
 
+/// Line prefix for a message severity in human-readable validate output.
+///
+/// Errors render with a distinct ` ERR ` prefix (matching `rocky doctor`)
+/// so a failed validation is visually distinguishable from a warning —
+/// both previously shared the `  !! ` prefix, hiding the difference
+/// between a hard failure and an advisory.
+fn severity_prefix(severity: &str) -> &'static str {
+    match severity {
+        "ok" => "  ok ",
+        "warn" => "  !! ",
+        "error" => " ERR ",
+        "lint" => " note",
+        _ => "     ",
+    }
+}
+
 /// Render the structured output as human-readable text (matching today's
 /// format for backward compatibility).
 fn render_text(output: &ValidateOutput) {
     for msg in &output.messages {
-        let prefix = match msg.severity.as_str() {
-            "ok" => "  ok ",
-            "warn" => "  !! ",
-            "error" => "  !! ",
-            "lint" => " note",
-            _ => "     ",
-        };
-        println!("{prefix} {}", msg.message);
+        println!("{} {}", severity_prefix(&msg.severity), msg.message);
     }
     println!();
     println!("Validation complete.");
@@ -1439,6 +1461,50 @@ schema_template = "demo"
         let unknown: Vec<_> = out.messages.iter().filter(|m| m.code == "V017").collect();
         assert_eq!(unknown.len(), 1);
         assert!(unknown[0].message.contains("postgres"));
+        // An unknown adapter type is a hard error: `rocky run` rejects it,
+        // so `rocky validate` must report `valid = false` (non-zero exit),
+        // not a cosmetic warning.
+        assert_eq!(unknown[0].severity, "error");
+        assert!(!out.valid, "unknown adapter type must invalidate config");
+        // No close match for "postgres" — message lists supported types
+        // but offers no suggestion.
+        assert!(unknown[0].message.contains("Supported:"));
+        assert!(!unknown[0].message.contains("Did you mean"));
+    }
+
+    #[test]
+    fn test_unknown_adapter_type_suggests_near_miss() {
+        let out = validate_toml(
+            r#"
+[adapter.wh]
+type = "databrick"
+
+[pipeline.poc]
+type = "replication"
+
+[pipeline.poc.source]
+adapter = "wh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "wh"
+catalog_template = "poc"
+schema_template = "demo"
+"#,
+        );
+        let v017: Vec<_> = out.messages.iter().filter(|m| m.code == "V017").collect();
+        assert_eq!(v017.len(), 1);
+        assert_eq!(v017[0].severity, "error");
+        assert!(!out.valid);
+        assert!(
+            v017[0].message.contains("Did you mean 'databricks'?"),
+            "expected a near-miss suggestion, got: {}",
+            v017[0].message
+        );
     }
 
     /// L002 must NOT fire when `target.table` is declared as a
@@ -1615,5 +1681,16 @@ backend = "local"
             lint_codes.contains(&"L007"),
             "expected L007 (adapter repetition)"
         );
+    }
+
+    #[test]
+    fn test_error_and_warning_render_with_distinct_prefixes() {
+        // Errors must be visually distinguishable from warnings in the
+        // human-readable output — they previously shared `  !! `.
+        assert_eq!(severity_prefix("error"), " ERR ");
+        assert_eq!(severity_prefix("warn"), "  !! ");
+        assert_ne!(severity_prefix("error"), severity_prefix("warn"));
+        assert_eq!(severity_prefix("ok"), "  ok ");
+        assert_eq!(severity_prefix("lint"), " note");
     }
 }

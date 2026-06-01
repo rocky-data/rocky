@@ -119,11 +119,16 @@ pub fn validate_contract(
     // Check required columns exist
     for required in &contract.rules.required {
         if !col_names.contains(&required.as_str()) {
-            diagnostics.push(Diagnostic::error(
-                E010,
-                model_name,
-                format!("required column '{required}' missing from model output"),
-            ));
+            diagnostics.push(
+                Diagnostic::error(
+                    E010,
+                    model_name,
+                    format!("required column '{required}' missing from model output"),
+                )
+                .with_suggestion(format!(
+                    "add `{required}` to the SELECT, or remove it from `[rules] required`"
+                )),
+            );
         }
     }
 
@@ -137,14 +142,20 @@ pub fn validate_contract(
                 if let Some(ref expected_type) = contract_col.type_name {
                     let matches = type_name_matches(&col.data_type, expected_type);
                     if !matches && col.data_type != RockyType::Unknown {
-                        diagnostics.push(Diagnostic::error(
-                            E011,
-                            model_name,
-                            format!(
-                                "column '{}' type mismatch: contract expects {}, got {:?}",
-                                contract_col.name, expected_type, col.data_type
-                            ),
-                        ));
+                        diagnostics.push(
+                            Diagnostic::error(
+                                E011,
+                                model_name,
+                                format!(
+                                    "column '{}' type mismatch: contract expects {}, got {:?}",
+                                    contract_col.name, expected_type, col.data_type
+                                ),
+                            )
+                            .with_suggestion(format!(
+                                "CAST `{}` to {} in the SELECT, or update the contract's expected type",
+                                contract_col.name, expected_type
+                            )),
+                        );
                     }
                 }
 
@@ -153,14 +164,21 @@ pub fn validate_contract(
                     && !nullable
                     && col.nullable
                 {
-                    diagnostics.push(Diagnostic::error(
-                        E012,
-                        model_name,
-                        format!(
-                            "column '{}' must be non-nullable per contract, but is nullable",
+                    diagnostics.push(
+                        Diagnostic::error(
+                            E012,
+                            model_name,
+                            format!(
+                                "column '{}' must be non-nullable per contract, but is nullable",
+                                contract_col.name
+                            ),
+                        )
+                        .with_suggestion(format!(
+                            "filter out NULLs (e.g. `WHERE {0} IS NOT NULL`) or COALESCE `{0}` to a default, \
+                             or relax `nullable = true` in the contract",
                             contract_col.name
-                        ),
-                    ));
+                        )),
+                    );
                 }
             }
             None => {
@@ -184,11 +202,16 @@ pub fn validate_contract(
     // Check protected columns
     for protected in &contract.rules.protected {
         if !col_names.contains(&protected.as_str()) {
-            diagnostics.push(Diagnostic::error(
-                E013,
-                model_name,
-                format!("protected column '{protected}' has been removed"),
-            ));
+            diagnostics.push(
+                Diagnostic::error(
+                    E013,
+                    model_name,
+                    format!("protected column '{protected}' has been removed"),
+                )
+                .with_suggestion(format!(
+                    "restore `{protected}` in the SELECT, or remove it from `[rules] protected`"
+                )),
+            );
         }
     }
 
@@ -274,7 +297,11 @@ mod tests {
         };
 
         let diags = validate_contract("test_model", &schema, &contract);
-        assert!(diags.iter().any(|d| &*d.code == "E010"));
+        let e010 = diags.iter().find(|d| &*d.code == "E010").expect("E010");
+        assert!(
+            e010.suggestion.as_deref().is_some_and(|s| s.contains("id")),
+            "E010 must carry an actionable suggestion: {e010:?}"
+        );
     }
 
     #[test]
@@ -292,7 +319,13 @@ mod tests {
         };
 
         let diags = validate_contract("test_model", &schema, &contract);
-        assert!(diags.iter().any(|d| &*d.code == "E011"));
+        let e011 = diags.iter().find(|d| &*d.code == "E011").expect("E011");
+        assert!(
+            e011.suggestion
+                .as_deref()
+                .is_some_and(|s| s.contains("CAST")),
+            "E011 must suggest a CAST: {e011:?}"
+        );
     }
 
     #[test]
@@ -310,7 +343,11 @@ mod tests {
         };
 
         let diags = validate_contract("test_model", &schema, &contract);
-        assert!(diags.iter().any(|d| &*d.code == "E012"));
+        let e012 = diags.iter().find(|d| &*d.code == "E012").expect("E012");
+        assert!(
+            e012.suggestion.is_some(),
+            "E012 must carry a nullability hint: {e012:?}"
+        );
     }
 
     #[test]
@@ -326,7 +363,13 @@ mod tests {
         };
 
         let diags = validate_contract("test_model", &schema, &contract);
-        assert!(diags.iter().any(|d| &*d.code == "E013"));
+        let e013 = diags.iter().find(|d| &*d.code == "E013").expect("E013");
+        assert!(
+            e013.suggestion
+                .as_deref()
+                .is_some_and(|s| s.contains("restore") || s.contains("protected")),
+            "E013 must suggest restoring the column or relaxing the rule: {e013:?}"
+        );
     }
 
     #[test]

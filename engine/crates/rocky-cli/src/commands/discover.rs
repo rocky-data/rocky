@@ -283,17 +283,20 @@ async fn build_source_table_sets(
 ///
 /// For each unique `(catalog, schema)` pair reachable via the source's
 /// warehouse `BatchCheckAdapter`, issues a single `batch_describe_schema`
-/// round-trip and persists one `SchemaCacheEntry` per returned table via
-/// [`StateStore::write_schema_cache_entry`]. Returns the count of entries
-/// actually written (partial successes roll in — one failing schema does not
-/// invalidate writes from another).
+/// round-trip, collects one `SchemaCacheEntry` per returned table, and
+/// persists them all in a single
+/// [`StateStore::batch_write_schema_cache_entries`] transaction (one fsync for
+/// the whole warm-up). Returns the count of entries written.
 ///
 /// Error-to-warn rules:
 /// - missing `source.catalog` → warn once, return 0 (no keys possible).
 /// - `batch_check_adapter` returns `None` (adapter is DuckDB/etc.) →
 ///   warn once, return 0.
-/// - per-schema `batch_describe_schema` failure → warn and continue.
-/// - per-entry `write_schema_cache_entry` failure → warn and continue.
+/// - per-schema `batch_describe_schema` failure → warn and continue (the
+///   failing schema contributes no entries before any write happens, so one
+///   bad source still does not abort the warm-up).
+/// - batched cache write failure → warn and return 0 (the batch is
+///   all-or-nothing across schemas).
 /// - state store won't open → bail (the user asked for writes; a broken
 ///   state dir is a hard fail, not a silent no-op).
 async fn warm_schema_cache(
@@ -354,10 +357,14 @@ fn dedup_schemas(connectors: &[rocky_core::source::DiscoveredConnector]) -> Vec<
 /// Inner warm-up loop — split out so unit tests can drive it with a stub
 /// [`rocky_core::traits::BatchCheckAdapter`].
 ///
-/// Per-schema `batch_describe_schema` errors log a warn and are counted as
-/// zero writes; per-entry `write_schema_cache_entry` errors also warn and
-/// skip. Both paths preserve the "one bad source shouldn't abort warm-up"
-/// contract the design doc §4.2 gives.
+/// Per-schema `batch_describe_schema` errors log a warn and are skipped, so
+/// one bad source still does not abort warm-up (design doc §4.2): the failing
+/// schema simply contributes no entries before any write happens. Every
+/// successfully-described entry is collected and persisted in a single
+/// [`StateStore::batch_write_schema_cache_entries`] transaction — one fsync
+/// for the whole `discover --with-schemas`, not one per entry. The write is
+/// therefore all-or-nothing across schemas; a serialization/insert failure
+/// rolls the batch back and is reported as zero entries written.
 async fn warm_schema_cache_inner(
     batch_adapter: &dyn rocky_core::traits::BatchCheckAdapter,
     store: &StateStore,
@@ -365,7 +372,7 @@ async fn warm_schema_cache_inner(
     schemas: &[String],
 ) -> Result<usize> {
     let cached_at = Utc::now();
-    let mut written: usize = 0;
+    let mut collected: Vec<(String, SchemaCacheEntry)> = Vec::new();
 
     for schema in schemas {
         let describe = batch_adapter
@@ -398,24 +405,30 @@ async fn warm_schema_cache_inner(
                     .collect(),
                 cached_at,
             };
-            match store.write_schema_cache_entry(&key, &entry) {
-                Ok(()) => {
-                    debug!(
-                        key = key.as_str(),
-                        "discover --with-schemas: wrote cache entry"
-                    );
-                    written += 1;
-                }
-                Err(e) => {
-                    warn!(
-                        key = key.as_str(),
-                        error = %e,
-                        "discover --with-schemas: failed to write cache entry, skipping"
-                    );
-                }
-            }
+            debug!(
+                key = key.as_str(),
+                "discover --with-schemas: collected cache entry"
+            );
+            collected.push((key, entry));
         }
     }
+
+    // One transaction, one fsync for every described entry.
+    let batch: Vec<(&str, &SchemaCacheEntry)> = collected
+        .iter()
+        .map(|(key, entry)| (key.as_str(), entry))
+        .collect();
+    let written = match store.batch_write_schema_cache_entries(&batch) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(
+                entries = batch.len(),
+                error = %e,
+                "discover --with-schemas: failed to write schema cache batch, skipping"
+            );
+            0
+        }
+    };
 
     info!(
         schemas = schemas.len(),

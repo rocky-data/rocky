@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use tokio::task::spawn_blocking;
 
 use rocky_core::traits::{
     AdapterError, AdapterResult, ExplainResult, QueryResult, SqlDialect, WarehouseAdapter,
@@ -27,12 +28,24 @@ use crate::dialect::DuckDbSqlDialect;
 ///
 /// Uses `Arc<Mutex<>>` so the same connector can be shared with a
 /// [`crate::discovery::DuckDbDiscoveryAdapter`]. `duckdb::Connection` is
-/// `Send` but not `Sync`, so the mutex is required. All DuckDB operations
-/// are synchronous and fast, so holding the mutex in an async context is
-/// acceptable.
+/// `Send` but not `Sync`, so the mutex is required.
+///
+/// The synchronous DuckDB C++ driver is CPU/IO-bound and would block a
+/// tokio worker thread for the full duration of every query if called
+/// inline. Each adapter method instead clones the `Arc<Mutex<…>>` into a
+/// [`tokio::task::spawn_blocking`] closure that takes the lock and runs the
+/// driver call on the blocking thread pool, keeping the async reactor free.
+/// `Mutex<DuckDbConnector>` is `Send + Sync` (the inner `Connection` is
+/// `Send`), so moving the handle into the closure is sound; the
+/// `MutexGuard` itself never crosses an `.await`.
 pub struct DuckDbWarehouseAdapter {
     connector: Arc<Mutex<DuckDbConnector>>,
     dialect: DuckDbSqlDialect,
+    /// Test-only override that makes [`Self::supports_concurrent_execution`]
+    /// report `true` so the CLI's intra-layer concurrent execution path can
+    /// be exercised against real DuckDB storage in unit tests. Always `false`
+    /// in production: the single `Mutex` connection just serializes work.
+    concurrent_for_test: bool,
 }
 
 impl DuckDbWarehouseAdapter {
@@ -42,6 +55,7 @@ impl DuckDbWarehouseAdapter {
         Ok(Self {
             connector: Arc::new(Mutex::new(connector)),
             dialect: DuckDbSqlDialect,
+            concurrent_for_test: false,
         })
     }
 
@@ -51,6 +65,7 @@ impl DuckDbWarehouseAdapter {
         Ok(Self {
             connector: Arc::new(Mutex::new(connector)),
             dialect: DuckDbSqlDialect,
+            concurrent_for_test: false,
         })
     }
 
@@ -59,6 +74,7 @@ impl DuckDbWarehouseAdapter {
         Self {
             connector: Arc::new(Mutex::new(connector)),
             dialect: DuckDbSqlDialect,
+            concurrent_for_test: false,
         }
     }
 
@@ -69,7 +85,22 @@ impl DuckDbWarehouseAdapter {
         Self {
             connector,
             dialect: DuckDbSqlDialect,
+            concurrent_for_test: false,
         }
+    }
+
+    /// Test-only: flip [`Self::supports_concurrent_execution`] to `true`.
+    ///
+    /// Production DuckDB always runs serial (one blocking `Mutex`
+    /// connection). This builder lets concurrency tests drive the CLI's
+    /// intra-layer concurrent execution path against real DuckDB storage —
+    /// the `Mutex` still serializes the actual driver calls, so it stays
+    /// correct, but the concurrent control-flow (fan-out, barrier, ordered
+    /// collect) is genuinely exercised.
+    #[doc(hidden)]
+    pub fn with_concurrent_for_test(mut self, concurrent: bool) -> Self {
+        self.concurrent_for_test = concurrent;
+        self
     }
 
     /// Returns a clone of the underlying connector handle for sharing
@@ -86,23 +117,33 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
     }
 
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
-        let conn = self
-            .connector
-            .lock()
-            .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
-        conn.execute_statement(sql).map_err(AdapterError::new)
+        let conn = Arc::clone(&self.connector);
+        let sql = sql.to_string();
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            conn.execute_statement(&sql).map_err(AdapterError::new)
+        })
+        .await
+        .map_err(|e| join_error(&e))?
     }
 
     async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
-        let conn = self
-            .connector
-            .lock()
-            .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
-        let result = conn.execute_sql(sql).map_err(AdapterError::new)?;
-        Ok(QueryResult {
-            columns: result.columns,
-            rows: result.rows,
+        let conn = Arc::clone(&self.connector);
+        let sql = sql.to_string();
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            let result = conn.execute_sql(&sql).map_err(AdapterError::new)?;
+            Ok(QueryResult {
+                columns: result.columns,
+                rows: result.rows,
+            })
         })
+        .await
+        .map_err(|e| join_error(&e))?
     }
 
     async fn fetch_arrow_batch(&self, sql: &str) -> AdapterResult<RecordBatch> {
@@ -110,11 +151,16 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         // returns batches directly type-compatible with the trait's
         // `arrow::record_batch::RecordBatch`. No IPC bridge required —
         // the connector concatenates multi-batch result sets in place.
-        let conn = self
-            .connector
-            .lock()
-            .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
-        conn.query_arrow_batch(sql).map_err(AdapterError::new)
+        let conn = Arc::clone(&self.connector);
+        let sql = sql.to_string();
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            conn.query_arrow_batch(&sql).map_err(AdapterError::new)
+        })
+        .await
+        .map_err(|e| join_error(&e))?
     }
 
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
@@ -124,61 +170,79 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
             format!("{}.{}.{}", table.catalog, table.schema, table.table)
         };
 
-        let conn = self
-            .connector
-            .lock()
-            .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+        let conn = Arc::clone(&self.connector);
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
 
-        let result = conn
-            .execute_sql(&format!("DESCRIBE {table_ref}"))
-            .map_err(AdapterError::new)?;
+            let result = conn
+                .execute_sql(&format!("DESCRIBE {table_ref}"))
+                .map_err(AdapterError::new)?;
 
-        // DuckDB DESCRIBE returns: column_name, column_type, null, key, default, extra
-        let columns = result
-            .rows
-            .iter()
-            .filter_map(|row| {
-                let name = row.first()?.as_str()?.to_string();
-                let data_type = row.get(1)?.as_str()?.to_string();
-                let nullable = row
-                    .get(2)
-                    .and_then(|v| v.as_str())
-                    .map(|v| v == "YES")
-                    .unwrap_or(true);
-                Some(ColumnInfo {
-                    name,
-                    data_type,
-                    nullable,
+            // DuckDB DESCRIBE returns: column_name, column_type, null, key, default, extra
+            let columns = result
+                .rows
+                .iter()
+                .filter_map(|row| {
+                    let name = row.first()?.as_str()?.to_string();
+                    let data_type = row.get(1)?.as_str()?.to_string();
+                    let nullable = row
+                        .get(2)
+                        .and_then(|v| v.as_str())
+                        .map(|v| v == "YES")
+                        .unwrap_or(true);
+                    Some(ColumnInfo {
+                        name,
+                        data_type,
+                        nullable,
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        Ok(columns)
+            Ok(columns)
+        })
+        .await
+        .map_err(|e| join_error(&e))?
     }
 
     async fn explain(&self, sql: &str) -> AdapterResult<ExplainResult> {
         let explain_sql = format!("EXPLAIN {sql}");
-        let conn = self
-            .connector
-            .lock()
-            .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
-        let result = conn.execute_sql(&explain_sql).map_err(AdapterError::new)?;
+        let conn = Arc::clone(&self.connector);
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            let result = conn.execute_sql(&explain_sql).map_err(AdapterError::new)?;
 
-        // DuckDB EXPLAIN returns a two-column result: explain_key, explain_value.
-        // Concatenate all values into the raw explain string.
-        let raw_explain = result
-            .rows
-            .iter()
-            .filter_map(|row| row.get(1).and_then(|v| v.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n");
+            // DuckDB EXPLAIN returns a two-column result: explain_key, explain_value.
+            // Concatenate all values into the raw explain string.
+            let raw_explain = result
+                .rows
+                .iter()
+                .filter_map(|row| row.get(1).and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
 
-        Ok(ExplainResult {
-            estimated_bytes_scanned: None,
-            estimated_rows: None,
-            estimated_compute_units: None,
-            raw_explain,
+            Ok(ExplainResult {
+                estimated_bytes_scanned: None,
+                estimated_rows: None,
+                estimated_compute_units: None,
+                raw_explain,
+            })
         })
+        .await
+        .map_err(|e| join_error(&e))?
+    }
+
+    fn supports_concurrent_execution(&self) -> bool {
+        // Production DuckDB shares a single blocking `Arc<Mutex>` connection,
+        // so concurrent execution just serializes through the mutex (and
+        // would thrash the blocking pool). The CLI forces serial execution
+        // for adapters that report `false`. The test-only override flips this
+        // so the concurrent execution path can be exercised against real
+        // DuckDB storage.
+        self.concurrent_for_test
     }
 
     async fn list_tables(&self, _catalog: &str, schema: &str) -> AdapterResult<Vec<String>> {
@@ -186,18 +250,29 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         let sql = format!(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema}'"
         );
-        let conn = self
-            .connector
-            .lock()
-            .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
-        let result = conn.execute_sql(&sql).map_err(AdapterError::new)?;
-        let tables = result
-            .rows
-            .iter()
-            .filter_map(|row| row.first().and_then(|v| v.as_str()).map(str::to_lowercase))
-            .collect();
-        Ok(tables)
+        let conn = Arc::clone(&self.connector);
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            let result = conn.execute_sql(&sql).map_err(AdapterError::new)?;
+            let tables = result
+                .rows
+                .iter()
+                .filter_map(|row| row.first().and_then(|v| v.as_str()).map(str::to_lowercase))
+                .collect();
+            Ok(tables)
+        })
+        .await
+        .map_err(|e| join_error(&e))?
     }
+}
+
+/// Convert a [`tokio::task::JoinError`] (panic or cancellation of the
+/// `spawn_blocking` task) into an [`AdapterError`]. A panic inside the
+/// blocking closure surfaces here rather than aborting the worker.
+fn join_error(e: &tokio::task::JoinError) -> AdapterError {
+    AdapterError::msg(format!("duckdb blocking task failed: {e}"))
 }
 
 #[cfg(test)]

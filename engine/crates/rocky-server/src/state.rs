@@ -89,17 +89,34 @@ impl ServerState {
         // `rocky-cli::source_schemas` for the CLI equivalent.
         let source_schemas = self.load_cached_source_schemas().await;
 
+        // Load `[mask]` + `[classifications.allow_unmasked]` (W004) and the
+        // `[freshness]` default bit (W005) from rocky.toml, mirroring the
+        // CLI compile path. Without a config_path (or on a parse error) both
+        // come through empty and the checks stay silent — matching standalone
+        // `rocky compile --models models/`.
+        let (mask, allow_unmasked, project_freshness_default) = match &self.config_path {
+            Some(path) => match rocky_core::config::load_rocky_config(path) {
+                Ok(cfg) => (
+                    cfg.mask.clone(),
+                    cfg.classifications.allow_unmasked.clone(),
+                    cfg.freshness.has_default(),
+                ),
+                Err(e) => {
+                    debug!(error = %e, "rocky.toml load failed; W004/W005 will be silent");
+                    (Default::default(), Vec::new(), false)
+                }
+            },
+            None => (Default::default(), Vec::new(), false),
+        };
+
         let config = CompilerConfig {
             models_dir: self.models_dir.clone(),
             contracts_dir: self.contracts_dir.clone(),
             source_schemas,
             source_column_info: HashMap::new(),
-            // TODO: wire `[mask]` + `[classifications.allow_unmasked]`
-            // from the loaded `RockyConfig` so W004 surfaces in
-            // `rocky-server`'s HTTP compile path too. Today the server
-            // compile happens without a rocky.toml load step in scope,
-            // so the check is a no-op here.
-            ..Default::default()
+            mask,
+            allow_unmasked,
+            project_freshness_default,
         };
 
         // The compile pass walks the model directory, parses every
@@ -217,5 +234,81 @@ impl ServerState {
         }
 
         map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write a one-model project whose only column carries a `pii`
+    /// classification tag. Returns the temp dir (kept alive by the caller)
+    /// and the models dir + rocky.toml path.
+    fn pii_project(rocky_toml: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+
+        let mut sql = std::fs::File::create(models_dir.join("users.sql")).unwrap();
+        write!(sql, "SELECT 'a@b.com' AS email").unwrap();
+
+        let mut toml = std::fs::File::create(models_dir.join("users.toml")).unwrap();
+        write!(
+            toml,
+            "name = \"users\"\n\n[target]\ncatalog = \"demo\"\nschema = \"main\"\ntable = \"users\"\n\n[classification]\nemail = \"pii\"\n"
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("rocky.toml");
+        let mut cfg = std::fs::File::create(&config_path).unwrap();
+        write!(cfg, "{rocky_toml}").unwrap();
+
+        (dir, models_dir, config_path)
+    }
+
+    fn w004_count(result: &CompileResult) -> usize {
+        result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "W004")
+            .count()
+    }
+
+    /// The server compile path must consult rocky.toml: an
+    /// `allow_unmasked = ["pii"]` entry suppresses W004, which only
+    /// happens if `[classifications]` was actually loaded (previously the
+    /// server passed `..Default::default()` and the check was a no-op).
+    #[tokio::test]
+    async fn server_compile_honours_allow_unmasked_from_config() {
+        // No mask, but pii is explicitly allowed unmasked → W004 suppressed.
+        let (_dir, models_dir, config_path) =
+            pii_project("[classifications]\nallow_unmasked = [\"pii\"]\n");
+        let state = ServerState::new(models_dir, None, Some(config_path));
+        state.recompile().await;
+        let guard = state.compile_result.read().await;
+        let result = guard.as_ref().expect("compile result");
+        assert_eq!(
+            w004_count(result),
+            0,
+            "allow_unmasked must suppress W004 in the server compile path"
+        );
+    }
+
+    /// Conversely, with a config that does not mask or allow the `pii`
+    /// tag, W004 fires — confirming the check is live (not just always
+    /// silent) once the config is wired.
+    #[tokio::test]
+    async fn server_compile_fires_w004_when_tag_unmasked() {
+        let (_dir, models_dir, config_path) = pii_project("# empty config\n");
+        let state = ServerState::new(models_dir, None, Some(config_path));
+        state.recompile().await;
+        let guard = state.compile_result.read().await;
+        let result = guard.as_ref().expect("compile result");
+        assert_eq!(
+            w004_count(result),
+            1,
+            "an unmasked, unallowed classification tag must raise W004"
+        );
     }
 }
