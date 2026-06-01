@@ -51,6 +51,53 @@ fn generate_batch_describe_sql(catalog: &str, schema: &str) -> String {
     )
 }
 
+/// Parse the four-column `INFORMATION_SCHEMA.COLUMNS` result
+/// (`table_name`, `column_name`, `data_type`, `is_nullable`) into a map of
+/// table name → columns. Rows are expected pre-grouped by table + ordinal
+/// (the query's `ORDER BY`); blank table/column rows are skipped.
+///
+/// Pure (rows in, map out) so the casing + `is_nullable` parsing can be
+/// unit-tested without an HTTP round trip — the BigQuery connector has no
+/// base-URL override for wiremock, unlike the Snowflake connector.
+fn parse_describe_rows(rows: &[Vec<serde_json::Value>]) -> HashMap<String, Vec<ColumnInfo>> {
+    let mut map: HashMap<String, Vec<ColumnInfo>> = HashMap::new();
+
+    for row in rows {
+        let table = row
+            .first()
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let col_name = row
+            .get(1)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let data_type = row
+            .get(2)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let nullable = row
+            .get(3)
+            .and_then(|v| v.as_str())
+            .map(|s| s.eq_ignore_ascii_case("YES"))
+            .unwrap_or(true);
+
+        if table.is_empty() || col_name.is_empty() {
+            continue;
+        }
+
+        map.entry(table).or_default().push(ColumnInfo {
+            name: col_name,
+            data_type,
+            nullable,
+        });
+    }
+
+    map
+}
+
 #[async_trait]
 impl BatchCheckAdapter for BigQueryBatchCheckAdapter {
     async fn batch_row_counts(&self, _tables: &[TableRef]) -> AdapterResult<Vec<RowCountResult>> {
@@ -76,43 +123,7 @@ impl BatchCheckAdapter for BigQueryBatchCheckAdapter {
     ) -> AdapterResult<HashMap<String, Vec<ColumnInfo>>> {
         let sql = generate_batch_describe_sql(catalog, schema);
         let result = self.adapter.execute_query(&sql).await?;
-
-        let mut map: HashMap<String, Vec<ColumnInfo>> = HashMap::new();
-
-        for row in &result.rows {
-            let table = row
-                .first()
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let col_name = row
-                .get(1)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let data_type = row
-                .get(2)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let nullable = row
-                .get(3)
-                .and_then(|v| v.as_str())
-                .map(|s| s.eq_ignore_ascii_case("YES"))
-                .unwrap_or(true);
-
-            if table.is_empty() || col_name.is_empty() {
-                continue;
-            }
-
-            map.entry(table).or_default().push(ColumnInfo {
-                name: col_name,
-                data_type,
-                nullable,
-            });
-        }
-
-        Ok(map)
+        Ok(parse_describe_rows(&result.rows))
     }
 }
 
@@ -132,5 +143,53 @@ mod tests {
         let sql = generate_batch_describe_sql("p", "s");
         assert!(sql.contains("is_nullable"));
         assert!(sql.contains("data_type"));
+    }
+
+    fn row(table: &str, col: &str, ty: &str, nullable: &str) -> Vec<serde_json::Value> {
+        vec![table.into(), col.into(), ty.into(), nullable.into()]
+    }
+
+    #[test]
+    fn parse_groups_columns_by_table_and_parses_nullability() {
+        let rows = vec![
+            row("orders", "id", "INT64", "NO"),
+            row("orders", "customer", "STRING", "YES"),
+            row("events", "event_id", "INT64", "YES"),
+        ];
+        let map = parse_describe_rows(&rows);
+
+        assert_eq!(map.len(), 2);
+        let orders = &map["orders"];
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0].name, "id");
+        assert_eq!(orders[0].data_type, "INT64");
+        assert!(!orders[0].nullable, "is_nullable=NO -> not nullable");
+        assert_eq!(orders[1].name, "customer");
+        assert!(orders[1].nullable, "is_nullable=YES -> nullable");
+        assert_eq!(map["events"].len(), 1);
+    }
+
+    #[test]
+    fn parse_is_nullable_is_case_insensitive() {
+        let rows = vec![row("t", "c", "STRING", "yes")];
+        let map = parse_describe_rows(&rows);
+        assert!(map["t"][0].nullable);
+    }
+
+    #[test]
+    fn parse_skips_blank_table_or_column_rows() {
+        let rows = vec![
+            row("", "c", "STRING", "YES"),
+            row("t", "", "STRING", "YES"),
+            row("t", "c", "STRING", "YES"),
+        ];
+        let map = parse_describe_rows(&rows);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["t"].len(), 1);
+    }
+
+    #[test]
+    fn parse_empty_rows_yields_empty_map() {
+        assert!(parse_describe_rows(&[]).is_empty());
     }
 }
