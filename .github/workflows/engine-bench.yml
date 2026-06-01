@@ -31,10 +31,15 @@ jobs:
           workspaces: engine
           key: bench
 
-      # DuckDB C++ compilation needs swap on CI
+      # DuckDB C++ compilation needs swap on CI. ubuntu-latest runners ship with
+      # an active /swapfile, so disable and remove it before reallocating —
+      # otherwise `fallocate` fails with "Text file busy". `dd` is a fallback for
+      # filesystems where fallocate is unsupported.
       - name: Configure swap
         run: |
-          sudo fallocate -l 4G /swapfile
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 4G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
