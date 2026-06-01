@@ -2,7 +2,7 @@
 title: SQL Generation
 description: The full SQL surface Rocky emits across warehouses
 sidebar:
-  order: 5
+  order: 7.5
 ---
 
 Rocky generates all SQL from its internal IR (Intermediate Representation). No Jinja templates, no string concatenation with untrusted input. Every identifier is validated before it reaches a SQL statement.

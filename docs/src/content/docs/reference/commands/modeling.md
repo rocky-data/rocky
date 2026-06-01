@@ -25,7 +25,7 @@ rocky compile [flags]
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
 | `--model <NAME>` | `string` | | Filter compilation to a single model by name. |
 | `--expand-macros` | `bool` | `false` | Expand macros from `macros/` and include the expanded SQL in the output. |
-| `--target-dialect <DIALECT>` | `dbx` \| `sf` \| `bq` \| `duckdb` | | Run the **P001 dialect-portability lint** against the chosen target. Non-portable constructs emit `error`-severity diagnostics. Precedence: flag > `[portability] target_dialect` in `rocky.toml` > unset. See [Portability linting](/features/linters/). |
+| `--target-dialect <DIALECT>` | `dbx` \| `sf` \| `bq` \| `duckdb` | | Run the **P001 dialect-portability lint** against the chosen target. Non-portable constructs emit `error`-severity diagnostics. Precedence: flag > `[portability] target_dialect` in `rocky.toml` > unset. See [Portability linting](/concepts/linters/). |
 | `--with-seed` | `bool` | `false` | Execute `data/seed.sql` against an in-memory DuckDB and use its `information_schema` as the source-of-truth for raw source schemas. Turns leaf `.sql` models from `Unknown` columns into concrete types. Requires the `duckdb` feature (enabled by default in the shipped binary). |
 
 ### Examples
@@ -108,7 +108,7 @@ rocky compile --target-dialect bq
 }
 ```
 
-Both the `--target-dialect` flag and the `[portability]` config block (see [Configuration](/reference/configuration/)) drive the same check; the flag wins when both are set. Project-wide allow-lists and per-model `-- rocky-allow: …` pragmas exempt specific constructs — see [Portability linting](/features/linters/#p001--dialect-portability).
+Both the `--target-dialect` flag and the `[portability]` config block (see [Configuration](/reference/configuration/)) drive the same check; the flag wins when both are set. Project-wide allow-lists and per-model `-- rocky-allow: …` pragmas exempt specific constructs — see [Portability linting](/concepts/linters/#p001--dialect-portability).
 
 Compile with seeded source schemas so leaf `.sql` models pick up real types:
 

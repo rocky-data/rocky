@@ -2,7 +2,7 @@
 title: Performance Benchmarks
 description: Rocky vs dbt-core vs dbt-fusion — compilation speed, memory usage, and cost analysis
 sidebar:
-  order: 10
+  order: 4.6
 ---
 
 Rocky compiles 10,000 models in **1.00 second** — **34x faster** than dbt-core and **38x faster** than dbt-fusion, while using **4-7x less memory**.

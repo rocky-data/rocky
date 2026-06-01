@@ -2,7 +2,7 @@
 title: Authentication
 description: PAT and OAuth M2M authentication for Databricks
 sidebar:
-  order: 4
+  order: 9
 ---
 
 Rocky supports two authentication methods for connecting to **Databricks** warehouses. They are auto-detected based on which credentials are available. These apply to all Databricks API calls — SQL Statement Execution, Unity Catalog operations, and workspace bindings.

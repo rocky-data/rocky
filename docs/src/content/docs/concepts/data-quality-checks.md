@@ -2,7 +2,7 @@
 title: Data Quality Checks
 description: Inline data quality checks that run during replication, plus per-model declarative assertions
 sidebar:
-  order: 1
+  order: 11.5
 ---
 
 Rocky ships two complementary quality surfaces, both executed inline against the warehouse — there is no separate testing step like `dbt test`:

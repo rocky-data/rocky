@@ -2,7 +2,7 @@
 title: Linters
 description: P001 dialect-portability lint and P002 blast-radius SELECT * lint, plus the -- rocky-allow pragma for targeted exemptions.
 sidebar:
-  order: 7
+  order: 7.6
 ---
 
 Rocky ships two built-in lints that catch the two most common silent-breakage classes in SQL projects: SQL that only runs on one warehouse dialect, and `SELECT *` expressions whose schema is actually consumed downstream. Both lints run as part of `rocky compile` (and surface as LSP diagnostics in the VS Code extension).
@@ -163,4 +163,4 @@ P001 diagnostics are errors — they fail `rocky compile` and `rocky ci`. P002 d
 
 - [`rocky compile`](/reference/commands/modeling/#rocky-compile) — where the lints run
 - [`[portability]` config](/reference/configuration/#portability) — project-level target-dialect + allow list
-- [SQL generation](/features/sql-generation/) — the transpiler that feeds the P001 catalog
+- [SQL generation](/concepts/sql-generation/) — the transpiler that feeds the P001 catalog

@@ -25,7 +25,7 @@ The raw replication layer: a config-driven 1:1 copy of source tables into the wa
 
 ### Check
 
-A data-quality assertion that runs inline during a run (row counts, column match, freshness, custom SQL), not as a separate test step. See [Data quality checks](/features/data-quality-checks/).
+A data-quality assertion that runs inline during a run (row counts, column match, freshness, custom SQL), not as a separate test step. See [Data quality checks](/concepts/data-quality-checks/).
 
 ### Compile-time contract
 
@@ -41,7 +41,7 @@ A stable identifier for a compiler finding: errors (`E001`–`E026`), warnings (
 
 ### Drift
 
-A mismatch between what your code expects and what the warehouse actually has, usually because a source column changed type or was added or dropped. Rocky detects it on every run and either recreates the target or blocks the PR. See [Schema drift](/features/schema-drift/).
+A mismatch between what your code expects and what the warehouse actually has, usually because a source column changed type or was added or dropped. Rocky detects it on every run and either recreates the target or blocks the PR. See [Schema drift](/concepts/schema-drift/).
 
 ### IR (intermediate representation)
 
