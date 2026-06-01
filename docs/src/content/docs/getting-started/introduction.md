@@ -63,7 +63,7 @@ See the [Roadmap](/getting-started/roadmap/) for the full breakdown of what's sh
 
 ## Practical differentiators
 
-- **Fast.** Single binary, starts in under 100ms. Compiles 10k models in ~1 s with ~150 MB peak memory. See [benchmarks](/features/benchmarks/).
+- **Fast.** Single binary, starts in under 100ms. Compiles 10k models in ~1 s with ~150 MB peak memory. See [benchmarks](/getting-started/benchmarks/).
 - **Type-safe.** Column-level type inference catches schema errors at compile time, before a row is written.
 - **Pure SQL.** No Jinja; business logic stays in SQL. An optional Rocky DSL exists for the cases SQL doesn't handle well.
 - **Config-first bronze.** Source replication is driven by `rocky.toml`, with zero SQL files for 1:1 copies.
@@ -88,7 +88,7 @@ See the [Roadmap](/getting-started/roadmap/) for the full breakdown of what's sh
 
 **Evaluating SQLMesh?** SQLMesh moved correctness to the planner. Rocky moved it to the compiler. SQLMesh's checks are runtime-ish; Rocky's are compile-time. SQLMesh is Python-first; Rocky keeps SQL as the default and reaches for a DSL only when SQL doesn't fit. SQLMesh has virtual environments, a genuinely good idea that Rocky's branches express differently. SQLMesh is more mature in years and funding; Rocky is further along on Rust-native compile-time enforcement, the LSP and IDE experience, column-level lineage at compile time, and cost attribution as a first-class citizen.
 
-Full side-by-side comparison: [features/comparison](/features/comparison/).
+Full side-by-side comparison: [features/comparison](/getting-started/comparison/).
 
 ## Design principles
 

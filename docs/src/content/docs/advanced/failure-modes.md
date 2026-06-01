@@ -79,7 +79,7 @@ The categories are **independent**: a single pipeline can hit several at once, a
 
 ## 3. Schema drift
 
-**Definition.** The source schema differs from the target table's current schema. Rocky's [graduated drift handling](../../features/schema-drift) tries to handle the divergence in place (`ALTER COLUMN TYPE` for safe widenings, `ALTER TABLE ADD COLUMN` for new columns) and falls back to drop-and-recreate only when it can't.
+**Definition.** The source schema differs from the target table's current schema. Rocky's [graduated drift handling](../../concepts/schema-drift) tries to handle the divergence in place (`ALTER COLUMN TYPE` for safe widenings, `ALTER TABLE ADD COLUMN` for new columns) and falls back to drop-and-recreate only when it can't.
 
 **Detection signal.** The `DriftResult` struct on `rocky drift` / `rocky apply --output json` carries `action: DriftAction`. Three possible actions:
 
@@ -104,7 +104,7 @@ The `drifted_columns` array names which columns changed and what the divergence 
 
 ## 4. Quality check failures
 
-**Definition.** An [inline data quality check](../../features/data-quality-checks) declared in `rocky.toml` (`[checks.<name>]`) failed against the materialised data. Checks run after each model materialises; a failed check does not abort the run by default but is surfaced in the run output and dagster Pipes events.
+**Definition.** An [inline data quality check](../../concepts/data-quality-checks) declared in `rocky.toml` (`[checks.<name>]`) failed against the materialised data. Checks run after each model materialises; a failed check does not abort the run by default but is surfaced in the run output and dagster Pipes events.
 
 **Detection signal.** `RunOutput.check_results[]` contains a `CheckResult` per declared check, each with `status: "Passed" | "Failed" | "Skipped"`, `failure_count: u64`, and `failed_sample` rows.
 
@@ -140,7 +140,7 @@ The dispatched adapter classifies its own failures:
 
 1. Run `rocky doctor --output json` first. The `adapters[]` block tells you which adapter Rocky thinks should work and which it currently can't reach. Treat doctor as a credentials / connectivity smoke test.
 2. For **transient** failures (entries with `failure_kind: "transient"` or `"connection-failed"` on `errors[*]`), use `rocky plan --resume-latest && rocky apply <plan-id>` (or the single-step `rocky run --resume-latest` alias) to pick up where the failed run left off rather than restarting from scratch.
-3. For **auth** failures, walk the adapter's auth chain (e.g. Snowflake: OAuth → JWT → password) and verify the env-vars / config in `rocky.toml`. The [authentication guide](../../features/authentication) has the per-adapter checklist.
+3. For **auth** failures, walk the adapter's auth chain (e.g. Snowflake: OAuth → JWT → password) and verify the env-vars / config in `rocky.toml`. The [authentication guide](../../reference/authentication) has the per-adapter checklist.
 4. For **quota** failures, check the warehouse-side quota dashboard. Rocky's adaptive concurrency (Databricks AIMD throttle) automatically backs off, but a hard quota reset is a warehouse-side action.
 5. For **statement timeouts**, increase `timeout_secs` on the adapter, or better, re-evaluate whether the model's materialization strategy is right (a multi-hour `FullRefresh` is often a missed `Merge` or `Incremental` opportunity; `rocky optimize` will surface the recommendation).
 
@@ -239,6 +239,6 @@ The dispatched adapter classifies its own failures:
 - [Troubleshooting](./troubleshooting): symptom-first lookup ("I got error X")
 - [`rocky doctor`](../../reference/cli#doctor): aggregate health check across config, state, adapters, pipelines
 - [`rocky plan --resume-latest`](../../reference/cli#run): resume a failed run from its checkpoint (canonical, auditable form; the single-step `rocky run --resume-latest` alias does the same in one invocation)
-- [Schema drift](../../features/schema-drift): graduated drift handling deep dive
-- [Data quality checks](../../features/data-quality-checks): inline check authoring + result shape
+- [Schema drift](../../concepts/schema-drift): graduated drift handling deep dive
+- [Data quality checks](../../concepts/data-quality-checks): inline check authoring + result shape
 - [Governance guide](../../guides/governance): permissions, classification, masking, retention

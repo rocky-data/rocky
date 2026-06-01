@@ -2,7 +2,7 @@
 title: Fivetran state cache
 description: Pluggable persistent cache for Rocky's Fivetran state envelope — share one fetcher per org across processes.
 sidebar:
-  order: 9
+  order: 11
 ---
 
 Rocky's Fivetran adapter can be configured with a persistent state cache so concurrent `rocky` processes against a single Fivetran org share their discover fetches. The first process pays the API cost; every subsequent process within the cache window reads the canonical envelope from the cache layer.

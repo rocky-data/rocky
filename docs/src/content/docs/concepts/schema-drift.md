@@ -2,7 +2,7 @@
 title: Schema Drift
 description: Automatic detection and graduated resolution of schema changes
 sidebar:
-  order: 2
+  order: 10.7
 ---
 
 Rocky automatically detects schema drift between source and target tables and resolves it using **graduated evolution** -- safe type widenings are handled with `ALTER TABLE` (preserving data), while unsafe changes trigger a full refresh.

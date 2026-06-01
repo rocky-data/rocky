@@ -158,7 +158,7 @@ WHEN NOT MATCHED THEN INSERT *
 | [`full_refresh`](#full_refresh-default) | Small tables, complex transforms, guaranteed consistency | All |
 | [`incremental`](#incremental) | Large append-mostly tables, timestamped events | All |
 | [`merge`](#merge) | SCDs, upserts by key | All |
-| [`time_interval`](/features/time-interval/) | Partition-keyed reprocessing with `@start_date` / `@end_date` | All |
+| [`time_interval`](/concepts/time-interval/) | Partition-keyed reprocessing with `@start_date` / `@end_date` | All |
 | `materialized_view` | Warehouse-managed view refresh | Databricks |
 | `dynamic_table` | Target-lag managed tables | Snowflake |
 

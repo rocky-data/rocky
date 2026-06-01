@@ -442,7 +442,7 @@ The binding type maps to the Databricks API values `BINDING_TYPE_READ_WRITE` and
 
 ### `[pipeline.NAME.checks]`
 
-Rocky runs quality checks inline during replication. Two surfaces share this section: pipeline-level switches (row count, column match, freshness, null rate, custom SQL, anomaly detection) and model-level `[[assertions]]` blocks covering the DQX parity surface (`not_null`, `unique`, `in_range`, `regex_match`, etc.). Full semantic reference: [Data Quality Checks](/features/data-quality-checks/).
+Rocky runs quality checks inline during replication. Two surfaces share this section: pipeline-level switches (row count, column match, freshness, null rate, custom SQL, anomaly detection) and model-level `[[assertions]]` blocks covering the DQX parity surface (`not_null`, `unique`, `in_range`, `regex_match`, etc.). Full semantic reference: [Data Quality Checks](/concepts/data-quality-checks/).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -857,7 +857,7 @@ Precedence for the effective target dialect:
 2. `[portability] target_dialect`.
 3. Unset: no lint.
 
-See [Linters](/features/linters/) for the full list of covered constructs and the per-model pragma syntax.
+See [Linters](/concepts/linters/) for the full list of covered constructs and the per-model pragma syntax.
 
 ---
 

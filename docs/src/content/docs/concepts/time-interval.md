@@ -2,7 +2,7 @@
 title: Time Interval Materialization
 description: Partition-keyed materialization with idempotent re-runs and late-arriving data correction
 sidebar:
-  order: 6
+  order: 10.5
 ---
 
 The `time_interval` materialization strategy lets you partition a model by a

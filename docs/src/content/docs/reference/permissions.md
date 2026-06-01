@@ -2,7 +2,7 @@
 title: Permissions
 description: Declarative RBAC with automatic GRANT/REVOKE reconciliation for Databricks Unity Catalog
 sidebar:
-  order: 3
+  order: 10
 ---
 
 Rocky manages **Databricks Unity Catalog** permissions declaratively. Define grants inline in `rocky.toml` and Rocky reconciles them during each `rocky apply` — there is no separate permissions command. Permissions are applied as part of the governance setup phase, before parallel table processing begins.
