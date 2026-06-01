@@ -5495,6 +5495,30 @@ async fn process_table(
         strategy = strategy_name,
         "copying data"
     );
+
+    // Idempotent full refresh on dialects whose CTAS isn't `CREATE OR
+    // REPLACE` (Trino): drop the target first so a re-run doesn't fail with
+    // "table already exists". Issued as a separate statement because Trino's
+    // REST API runs one statement per request. Other dialects skip this —
+    // their CTAS already replaces atomically.
+    if strategy_name == "full_refresh" && dialect.full_refresh_needs_predrop() {
+        let target_ref = dialect.format_table_ref(
+            &target_table.catalog,
+            &target_table.schema,
+            &target_table.table,
+        )?;
+        let drop_sql = dialect.drop_table_sql(&target_ref);
+        debug!(
+            table = target_table.full_name(),
+            sql = drop_sql.as_str(),
+            "pre-drop for idempotent full refresh"
+        );
+        warehouse
+            .execute_statement(&drop_sql)
+            .await
+            .map_err(anyhow::Error::from)?;
+    }
+
     let exec_stats = warehouse
         .execute_statement_with_stats(&sql)
         .await

@@ -103,6 +103,14 @@ impl DialectKind {
     /// Warehouses that natively support `DYNAMIC TABLE`. Snowflake only.
     const SNOWFLAKE_ONLY: &'static [DialectKind] = &[DialectKind::Snowflake];
 
+    /// Warehouses that render the Spark/Databricks lakehouse `USING
+    /// <format>` DDL. Only Databricks today — `generate_lakehouse_ddl`
+    /// fails fast on every other dialect (the format-DDL generator is
+    /// Spark-only; Trino does Iceberg natively but via a different
+    /// grammar that isn't wired up yet). The lakehouse fixture is pinned
+    /// against Databricks only so the gate is honoured.
+    const LAKEHOUSE_SUPPORTED: &'static [DialectKind] = &[DialectKind::Databricks];
+
     fn name(self) -> &'static str {
         match self {
             DialectKind::DuckDb => "duckdb",
@@ -303,7 +311,10 @@ const FIXTURES: &[Fixture] = &[
         name: "10-transformation-lakehouse-delta",
         builder: build_10_transformation_lakehouse_delta,
         entry: Entry::Transformation,
-        dialects: DialectKind::ALL,
+        // Lakehouse `format = X` DDL is Spark/Databricks-only; the
+        // generator fails fast on the other dialects (see D1), so the
+        // snapshot is pinned against Databricks alone.
+        dialects: DialectKind::LAKEHOUSE_SUPPORTED,
         recipe_hash: "7ca110c89134a8750898db55c60d24bd7692ba98d0a434fa24937c117f5bed5b",
     },
     Fixture {

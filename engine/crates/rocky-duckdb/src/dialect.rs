@@ -18,6 +18,10 @@ use rocky_sql::validation;
 pub struct DuckDbSqlDialect;
 
 impl SqlDialect for DuckDbSqlDialect {
+    fn name(&self) -> &'static str {
+        "duckdb"
+    }
+
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
         // DuckDB supports three-part names; use two-part if catalog is empty
         if catalog.is_empty() {

@@ -9,6 +9,10 @@ use rocky_sql::validation;
 pub struct BigQueryDialect;
 
 impl SqlDialect for BigQueryDialect {
+    fn name(&self) -> &'static str {
+        "bigquery"
+    }
+
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
         // BigQuery uses project.dataset.table (three-part). The project
         // (catalog) component allows hyphens; dataset + table stay on
@@ -633,5 +637,34 @@ mod tests {
         assert!(!d.is_safe_type_widening("INT64", "NUMERIC"));
         // Unrelated type families fall through.
         assert!(!d.is_safe_type_widening("DATE", "TIMESTAMP"));
+    }
+
+    /// Arg-order pin: `is_safe_type_widening(source_type, target_type)`
+    /// answers "can the EXISTING target column be ALTERed to the new
+    /// source type?" — i.e. the conversion direction is `target → source`.
+    ///
+    /// The call site (`rocky_core::drift`) invokes
+    /// `is_safe_type_widening(&drifted.source_type, &drifted.target_type)`,
+    /// so `source_type` is the new (source-side) type and `target_type` is
+    /// the current target column type. A real INT64-column → NUMERIC
+    /// widening is therefore `(source="NUMERIC", target="INT64")` and MUST
+    /// be safe; the reverse `(source="INT64", target="NUMERIC")` is a
+    /// narrowing and MUST NOT be. This pins the convention against the
+    /// internal `(tgt, src)` match order — the match arm `("INT64",
+    /// "NUMERIC")` is `(target=INT64, source=NUMERIC)`, which is the
+    /// correct, non-inverted encoding of INT64 → NUMERIC.
+    #[test]
+    fn is_safe_type_widening_arg_order_matches_call_site() {
+        let d = BigQueryDialect;
+        // INT64 target column, NUMERIC source: a real widening → safe.
+        assert!(
+            d.is_safe_type_widening("NUMERIC", "INT64"),
+            "INT64 column widening to NUMERIC source must be safe"
+        );
+        // The reverse is a narrowing → never safe.
+        assert!(
+            !d.is_safe_type_widening("INT64", "NUMERIC"),
+            "NUMERIC column narrowing to INT64 source must NOT be safe"
+        );
     }
 }

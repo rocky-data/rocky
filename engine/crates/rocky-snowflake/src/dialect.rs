@@ -19,6 +19,10 @@ use rocky_sql::validation;
 pub struct SnowflakeSqlDialect;
 
 impl SqlDialect for SnowflakeSqlDialect {
+    fn name(&self) -> &'static str {
+        "snowflake"
+    }
+
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
         // Snowflake folds *unquoted* identifiers to UPPERCASE at parse time, so
         // case-preserving (lowercase or mixed-case) names need explicit
@@ -137,20 +141,24 @@ impl SqlDialect for SnowflakeSqlDialect {
                     if i > 0 {
                         sql.push_str(", ");
                     }
-                    sql.push_str(col);
+                    // Double-quote so the reference resolves against a
+                    // column stored lowercase — matching the
+                    // `format_table_ref` / `merge_into` quoted path. An
+                    // unquoted reference folds to UPPER and breaks on a
+                    // lowercase-stored column.
+                    sql.push_str(&self.quote_identifier(col));
                 }
             }
         }
 
         for mc in metadata {
             validation::validate_identifier(&mc.name).map_err(AdapterError::new)?;
-            // Snowflake uses :: for casting: value::TYPE
-            write!(
-                sql,
-                ", CAST({} AS {}) AS {}",
-                mc.value, mc.data_type, mc.name
-            )
-            .unwrap();
+            // Snowflake uses :: for casting: value::TYPE. Quote the output
+            // alias so the materialized metadata column is stored
+            // lowercase-preserving, consistent with the quoted column path
+            // (and so a later quoted reference to it resolves).
+            let alias_q = self.quote_identifier(&mc.name);
+            write!(sql, ", CAST({} AS {}) AS {alias_q}", mc.value, mc.data_type).unwrap();
         }
 
         Ok(sql)
@@ -169,9 +177,17 @@ impl SqlDialect for SnowflakeSqlDialect {
         let literal = last_watermark
             .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
             .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
-        Ok(format!(
-            "WHERE {timestamp_col} > '{literal}'::TIMESTAMP_NTZ"
-        ))
+        // Double-quote the column to match Rocky's quoted-identifier
+        // convention (`format_table_ref` / `merge_into`), which reference
+        // columns quoted (case-sensitive, lowercase-preserving). An
+        // *unquoted* reference here folds to UPPER and raises `invalid
+        // identifier` against a column stored lowercase — which the
+        // quoted-create / bisection-seed path produces. Quoting fixes that
+        // case. (Trade-off: this is a fixed-case reference, so it will not
+        // match a column stored UPPER from an unquoted create — Rocky's own
+        // tables are quoted lowercase, so that's the case we target.)
+        let col_q = self.quote_identifier(timestamp_col);
+        Ok(format!("WHERE {col_q} > '{literal}'::TIMESTAMP_NTZ"))
     }
 
     fn describe_table_sql(&self, table_ref: &str) -> String {
@@ -554,9 +570,12 @@ mod tests {
     fn test_watermark_no_prior_uses_sentinel_timestamp_ntz() {
         let d = dialect();
         let sql = d.watermark_where("_fivetran_synced", None).unwrap();
+        // The column is double-quoted so it resolves against a
+        // lowercase-stored column (matching the merge/format_table_ref path)
+        // rather than folding to UPPER.
         assert_eq!(
             sql,
-            "WHERE _fivetran_synced > '1970-01-01 00:00:00'::TIMESTAMP_NTZ"
+            "WHERE \"_fivetran_synced\" > '1970-01-01 00:00:00'::TIMESTAMP_NTZ"
         );
     }
 
@@ -569,7 +588,26 @@ mod tests {
         // Source-side semantics: literal substitution, no correlated subquery.
         assert_eq!(
             sql,
-            "WHERE _fivetran_synced > '2026-04-17 09:30:00'::TIMESTAMP_NTZ"
+            "WHERE \"_fivetran_synced\" > '2026-04-17 09:30:00'::TIMESTAMP_NTZ"
+        );
+    }
+
+    #[test]
+    fn test_select_clause_double_quotes_columns_and_metadata_alias() {
+        use rocky_ir::MetadataColumn;
+        let d = dialect();
+        let cols = ColumnSelection::Explicit(vec!["id".into(), "ts".into()]);
+        let meta = vec![MetadataColumn {
+            name: "_loaded_by".to_string(),
+            data_type: "VARCHAR".to_string(),
+            value: "'rocky'".to_string(),
+        }];
+        let sql = d.select_clause(&cols, &meta).unwrap();
+        // Data columns and the metadata alias are double-quoted so they
+        // resolve / materialize lowercase, matching the quoted merge path.
+        assert_eq!(
+            sql,
+            "SELECT \"id\", \"ts\", CAST('rocky' AS VARCHAR) AS \"_loaded_by\""
         );
     }
 

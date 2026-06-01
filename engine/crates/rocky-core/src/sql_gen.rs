@@ -52,6 +52,17 @@ pub enum SqlGenError {
     /// from `UnsafeFragment`, which reports bad SQL content.
     #[error("invalid SQL generation request: {0}")]
     InvalidRequest(String),
+
+    /// A Delta-Lake maintenance operation (`OPTIMIZE` / `VACUUM`) was
+    /// requested against a dialect that doesn't render it. Raised by
+    /// `compact_from_ir` / `archive_from_ir` so `rocky compact` /
+    /// `rocky archive` fail fast with a clear known-limitation message
+    /// rather than emitting Databricks-only SQL the warehouse rejects.
+    #[error("maintenance operation '{operation}' is not supported for dialect '{dialect}'")]
+    UnsupportedMaintenance {
+        operation: &'static str,
+        dialect: String,
+    },
 }
 
 /// Generates the SELECT SQL for a replication model using the given dialect.
@@ -298,7 +309,17 @@ pub fn generate_transformation_sql_with_warehouse(
 
     match &model_ir.materialization {
         MaterializationStrategy::FullRefresh => {
-            Ok(vec![dialect.create_table_as(&target, &model_ir.sql)])
+            // Dialects whose CTAS isn't an atomic `CREATE OR REPLACE` (Trino)
+            // need a leading `DROP TABLE IF EXISTS` so a re-run doesn't hit
+            // "table already exists". Emitted as a separate statement — the
+            // runtime executes each element of this Vec individually, and
+            // Trino's REST API runs one statement per request.
+            let mut stmts = Vec::with_capacity(2);
+            if dialect.full_refresh_needs_predrop() {
+                stmts.push(dialect.drop_table_sql(&target));
+            }
+            stmts.push(dialect.create_table_as(&target, &model_ir.sql));
+            Ok(stmts)
         }
         MaterializationStrategy::Incremental { .. } => {
             Ok(vec![dialect.insert_into(&target, &model_ir.sql)])
@@ -641,25 +662,39 @@ pub fn generate_dynamic_table_sql(
 /// C — C-5), the same SQL will be regenerated at apply time from the
 /// persisted [`CompactPlanIr`].
 ///
-/// The `dialect` parameter is currently unused: the OPTIMIZE/VACUUM
-/// grammar Rocky emits today is Delta-Lake-on-Databricks-flavoured and
-/// hand-interpolates the table identifier (validating each dot-separated
-/// segment up-front rather than going through `format_table_ref`). The
-/// parameter is plumbed so future dialect-specific variants (Snowflake /
-/// BigQuery / Iceberg have different OPTIMIZE / VACUUM equivalents) can
-/// be wired in without breaking the helper's call sites.
+/// The `dialect` gates emission: the OPTIMIZE/VACUUM grammar Rocky emits
+/// today is Delta-Lake-on-Databricks-flavoured, so dialects that don't
+/// advertise `supports_delta_maintenance()` are refused with
+/// [`SqlGenError::UnsupportedMaintenance`] rather than receiving SQL their
+/// warehouse rejects. When future dialect-specific variants land
+/// (Snowflake / BigQuery / Iceberg have different OPTIMIZE / VACUUM
+/// equivalents) the generator branches here on the dialect.
 ///
 /// Returns the same `(purpose, sql)` shape the CLI's inline path uses, so
 /// the equivalence test can assert byte-for-byte parity.
 ///
 /// # Errors
 ///
-/// Returns [`SqlGenError::Validation`] when `ir.target_table` contains a
-/// dot-separated segment that fails SQL-identifier validation.
+/// Returns [`SqlGenError::UnsupportedMaintenance`] when the dialect can't
+/// render `OPTIMIZE` / `VACUUM`, or [`SqlGenError::Validation`] when
+/// `ir.target_table` contains a dot-separated segment that fails
+/// SQL-identifier validation.
 pub fn compact_from_ir(
     ir: &CompactPlanIr,
-    _dialect: &dyn SqlDialect,
+    dialect: &dyn SqlDialect,
 ) -> Result<Vec<(String, String)>, SqlGenError> {
+    // OPTIMIZE / VACUUM are Delta-Lake-on-Databricks grammar. On any other
+    // dialect they're rejected at parse time (Snowflake: `unexpected
+    // 'OPTIMIZE'`; BigQuery has no equivalent), so refuse up front with a
+    // clear known-limitation error instead of emitting SQL that fails at
+    // the warehouse.
+    if !dialect.supports_delta_maintenance() {
+        return Err(SqlGenError::UnsupportedMaintenance {
+            operation: "OPTIMIZE",
+            dialect: dialect.name().to_string(),
+        });
+    }
+
     for part in ir.target_table.split('.') {
         validation::validate_identifier(part)?;
     }
@@ -708,13 +743,14 @@ pub fn compact_from_ir(
 /// (Cluster 3 C — C-5), the same SQL will be regenerated at apply
 /// time from the persisted [`ArchivePlanIr`].
 ///
-/// The `dialect` parameter is currently unused: the DELETE/VACUUM
-/// grammar Rocky emits today is Delta-Lake-on-Databricks-flavoured
-/// (`DATEADD` + `RETAIN N HOURS`) and hand-interpolates both the
-/// table identifier and the watermark column (validating each up-front
-/// rather than going through `format_table_ref`). The parameter is
-/// plumbed so future dialect-specific variants can be wired in
-/// without breaking the helper's call sites.
+/// The `dialect` gates emission: the DELETE/VACUUM grammar Rocky emits
+/// today is Delta-Lake-on-Databricks-flavoured (`DATEADD` +
+/// `RETAIN N HOURS`), so dialects that don't advertise
+/// `supports_delta_maintenance()` are refused with
+/// [`SqlGenError::UnsupportedMaintenance`] rather than receiving a
+/// partially-executable bundle (the trailing VACUUM is Databricks-only
+/// everywhere, and `DATEADD` is not a BigQuery function). Future
+/// dialect-specific variants branch here on the dialect.
 ///
 /// Returns the same `(purpose, sql)` shape the CLI's inline path
 /// uses, so the equivalence test can assert byte-for-byte parity.
@@ -730,14 +766,30 @@ pub fn compact_from_ir(
 ///
 /// # Errors
 ///
-/// Returns [`SqlGenError::Validation`] when `ir.target_table` (when
-/// present) contains a dot-separated segment that fails SQL-identifier
-/// validation, or when `ir.partition_column` fails SQL-identifier
-/// validation.
+/// Returns [`SqlGenError::UnsupportedMaintenance`] when the dialect can't
+/// render the archive (`DELETE`/`VACUUM`) bundle, or
+/// [`SqlGenError::Validation`] when `ir.target_table` (when present)
+/// contains a dot-separated segment that fails SQL-identifier validation,
+/// or when `ir.partition_column` fails SQL-identifier validation.
 pub fn archive_from_ir(
     ir: &ArchivePlanIr,
-    _dialect: &dyn SqlDialect,
+    dialect: &dyn SqlDialect,
 ) -> Result<Vec<(String, String)>, SqlGenError> {
+    // The archive bundle is Delta-Lake-on-Databricks grammar: the trailing
+    // VACUUM is Databricks-only on every dialect, and the DELETE filter's
+    // `DATEADD(...)` is not a BigQuery function. Even where one half runs
+    // (Snowflake executes the native `DATEADD` DELETE), the bundle can't
+    // complete, so refuse up front with a clear known-limitation error
+    // rather than emitting a partially-executable bundle. `VACUUM` is the
+    // operation that's universally unsupported off Databricks, so it names
+    // the limitation.
+    if !dialect.supports_delta_maintenance() {
+        return Err(SqlGenError::UnsupportedMaintenance {
+            operation: "VACUUM",
+            dialect: dialect.name().to_string(),
+        });
+    }
+
     // Resolve the SQL target. `None` reproduces today's degenerate
     // `*` wildcard emission — the inline CLI path emits the same
     // string when neither `--model` nor `--catalog` is supplied.
@@ -985,6 +1037,17 @@ mod tests {
     struct TestDialect;
 
     impl SqlDialect for TestDialect {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        // The lakehouse integration tests below exercise the
+        // Databricks-flavoured `USING <format>` path, so this stand-in
+        // advertises support for it.
+        fn supports_lakehouse_format_ddl(&self) -> bool {
+            true
+        }
+
         fn format_table_ref(
             &self,
             catalog: &str,
@@ -2323,5 +2386,258 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             !merge.contains("source.updated_at != target.updated_at"),
             "bare SQL `!=` is NULL-unsafe and must not appear in MERGE, got: {merge}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Maintenance (compact / archive) dialect gating (D3)
+    // -----------------------------------------------------------------------
+
+    /// A dialect that advertises Delta-Lake maintenance support (stands in
+    /// for Databricks; `TestDialect` defaults to `false`).
+    struct MaintenanceDialect(TestDialect);
+
+    impl SqlDialect for MaintenanceDialect {
+        fn name(&self) -> &'static str {
+            "maintenance"
+        }
+        fn supports_delta_maintenance(&self) -> bool {
+            true
+        }
+        fn format_table_ref(
+            &self,
+            catalog: &str,
+            schema: &str,
+            table: &str,
+        ) -> AdapterResult<String> {
+            self.0.format_table_ref(catalog, schema, table)
+        }
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            self.0.create_table_as(target, select_sql)
+        }
+        fn insert_into(&self, target: &str, select_sql: &str) -> String {
+            self.0.insert_into(target, select_sql)
+        }
+        fn merge_into(
+            &self,
+            target: &str,
+            source_sql: &str,
+            keys: &[std::sync::Arc<str>],
+            update_cols: &rocky_ir::ColumnSelection,
+        ) -> AdapterResult<String> {
+            self.0.merge_into(target, source_sql, keys, update_cols)
+        }
+        fn select_clause(
+            &self,
+            columns: &rocky_ir::ColumnSelection,
+            metadata: &[rocky_ir::MetadataColumn],
+        ) -> AdapterResult<String> {
+            self.0.select_clause(columns, metadata)
+        }
+        fn watermark_where(
+            &self,
+            ts: &str,
+            wm: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
+            self.0.watermark_where(ts, wm)
+        }
+        fn describe_table_sql(&self, table_ref: &str) -> String {
+            self.0.describe_table_sql(table_ref)
+        }
+        fn drop_table_sql(&self, table_ref: &str) -> String {
+            self.0.drop_table_sql(table_ref)
+        }
+        fn create_catalog_sql(&self, name: &str) -> Option<AdapterResult<String>> {
+            self.0.create_catalog_sql(name)
+        }
+        fn create_schema_sql(&self, catalog: &str, schema: &str) -> Option<AdapterResult<String>> {
+            self.0.create_schema_sql(catalog, schema)
+        }
+        fn tablesample_clause(&self, percent: u32) -> Option<String> {
+            self.0.tablesample_clause(percent)
+        }
+        fn insert_overwrite_partition(
+            &self,
+            target: &str,
+            partition_filter: &str,
+            select_sql: &str,
+        ) -> AdapterResult<Vec<String>> {
+            self.0
+                .insert_overwrite_partition(target, partition_filter, select_sql)
+        }
+    }
+
+    #[test]
+    fn compact_from_ir_refused_without_delta_maintenance() {
+        let ir = CompactPlanIr::for_table("cat.sch.orders", 256);
+        let err = compact_from_ir(&ir, &dialect())
+            .expect_err("a non-maintenance dialect must refuse compaction");
+        match err {
+            SqlGenError::UnsupportedMaintenance { operation, dialect } => {
+                assert_eq!(operation, "OPTIMIZE");
+                assert_eq!(dialect, "test");
+            }
+            other => panic!("expected UnsupportedMaintenance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_from_ir_refused_without_delta_maintenance() {
+        let ir = ArchivePlanIr::for_table("cat.sch.orders", 90);
+        let err = archive_from_ir(&ir, &dialect())
+            .expect_err("a non-maintenance dialect must refuse archive");
+        match err {
+            SqlGenError::UnsupportedMaintenance { operation, dialect } => {
+                assert_eq!(operation, "VACUUM");
+                assert_eq!(dialect, "test");
+            }
+            other => panic!("expected UnsupportedMaintenance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_and_archive_emit_on_maintenance_dialect() {
+        let d = MaintenanceDialect(TestDialect);
+        let compact = compact_from_ir(&CompactPlanIr::for_table("cat.sch.orders", 256), &d)
+            .expect("maintenance dialect emits compaction SQL");
+        assert!(compact[0].1.contains("OPTIMIZE"));
+        assert!(compact[1].1.contains("VACUUM"));
+
+        let archive = archive_from_ir(&ArchivePlanIr::for_table("cat.sch.orders", 90), &d)
+            .expect("maintenance dialect emits archive SQL");
+        assert!(archive[0].1.contains("DELETE FROM"));
+        assert!(archive[1].1.contains("VACUUM"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Idempotent full-refresh pre-drop (D2 — Trino)
+    // -----------------------------------------------------------------------
+
+    /// A dialect that advertises `full_refresh_needs_predrop` (stands in for
+    /// Trino, whose portable CTAS isn't `CREATE OR REPLACE`).
+    struct PredropDialect(TestDialect);
+
+    impl SqlDialect for PredropDialect {
+        fn name(&self) -> &'static str {
+            "predrop"
+        }
+        fn full_refresh_needs_predrop(&self) -> bool {
+            true
+        }
+        fn format_table_ref(
+            &self,
+            catalog: &str,
+            schema: &str,
+            table: &str,
+        ) -> AdapterResult<String> {
+            self.0.format_table_ref(catalog, schema, table)
+        }
+        fn create_table_as(&self, target: &str, select_sql: &str) -> String {
+            // Mirror Trino's plain (non-OR-REPLACE) CTAS.
+            format!("CREATE TABLE {target} AS\n{select_sql}")
+        }
+        fn insert_into(&self, target: &str, select_sql: &str) -> String {
+            self.0.insert_into(target, select_sql)
+        }
+        fn merge_into(
+            &self,
+            target: &str,
+            source_sql: &str,
+            keys: &[std::sync::Arc<str>],
+            update_cols: &rocky_ir::ColumnSelection,
+        ) -> AdapterResult<String> {
+            self.0.merge_into(target, source_sql, keys, update_cols)
+        }
+        fn select_clause(
+            &self,
+            columns: &rocky_ir::ColumnSelection,
+            metadata: &[rocky_ir::MetadataColumn],
+        ) -> AdapterResult<String> {
+            self.0.select_clause(columns, metadata)
+        }
+        fn watermark_where(
+            &self,
+            ts: &str,
+            wm: Option<&chrono::DateTime<chrono::Utc>>,
+        ) -> AdapterResult<String> {
+            self.0.watermark_where(ts, wm)
+        }
+        fn describe_table_sql(&self, table_ref: &str) -> String {
+            self.0.describe_table_sql(table_ref)
+        }
+        fn drop_table_sql(&self, table_ref: &str) -> String {
+            self.0.drop_table_sql(table_ref)
+        }
+        fn create_catalog_sql(&self, name: &str) -> Option<AdapterResult<String>> {
+            self.0.create_catalog_sql(name)
+        }
+        fn create_schema_sql(&self, catalog: &str, schema: &str) -> Option<AdapterResult<String>> {
+            self.0.create_schema_sql(catalog, schema)
+        }
+        fn tablesample_clause(&self, percent: u32) -> Option<String> {
+            self.0.tablesample_clause(percent)
+        }
+        fn insert_overwrite_partition(
+            &self,
+            target: &str,
+            partition_filter: &str,
+            select_sql: &str,
+        ) -> AdapterResult<Vec<String>> {
+            self.0
+                .insert_overwrite_partition(target, partition_filter, select_sql)
+        }
+    }
+
+    fn full_refresh_transformation_ir() -> ModelIr {
+        ModelIr::transformation(
+            TargetRef {
+                catalog: "cat".into(),
+                schema: "silver".into(),
+                table: "dim_accounts".into(),
+            },
+            MaterializationStrategy::FullRefresh,
+            vec![SourceRef {
+                catalog: "cat".into(),
+                schema: "sch".into(),
+                table: "src".into(),
+            }],
+            "SELECT id FROM cat.sch.src".into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn full_refresh_prepends_drop_for_predrop_dialect() {
+        let ir = full_refresh_transformation_ir();
+        let stmts = generate_transformation_sql(&ir, &PredropDialect(TestDialect)).unwrap();
+        assert_eq!(stmts.len(), 2, "predrop dialect emits DROP + CTAS");
+        assert!(
+            stmts[0].starts_with("DROP TABLE IF EXISTS cat.silver.dim_accounts"),
+            "first statement must be the idempotent DROP, got: {}",
+            stmts[0]
+        );
+        assert!(
+            stmts[1].starts_with("CREATE TABLE cat.silver.dim_accounts AS"),
+            "second statement must be the CTAS, got: {}",
+            stmts[1]
+        );
+        // The DROP must be a SEPARATE statement, never `;`-joined onto the
+        // CTAS (Trino's REST API runs one statement per request).
+        assert!(!stmts[0].contains("CREATE TABLE"));
+        assert!(!stmts[1].contains("DROP TABLE"));
+    }
+
+    #[test]
+    fn full_refresh_skips_drop_for_atomic_dialect() {
+        // The default dialect's CTAS is `CREATE OR REPLACE`, so no pre-drop.
+        let ir = full_refresh_transformation_ir();
+        let stmts = generate_transformation_sql(&ir, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1, "atomic dialect emits CTAS only");
+        assert!(stmts[0].starts_with("CREATE OR REPLACE TABLE"));
     }
 }

@@ -1,4 +1,4 @@
 INSERT INTO "tgtwarehouse"."raw__demo"."events"
-SELECT id, event_type, payload, _synced_at, CAST('rocky' AS STRING) AS _loaded_by
+SELECT "id", "event_type", "payload", "_synced_at", CAST('rocky' AS STRING) AS "_loaded_by"
 FROM "srcwarehouse"."src__demo"."events"
-WHERE _synced_at > '1970-01-01 00:00:00'::TIMESTAMP_NTZ
+WHERE "_synced_at" > '1970-01-01 00:00:00'::TIMESTAMP_NTZ
