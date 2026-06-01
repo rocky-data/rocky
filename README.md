@@ -130,6 +130,16 @@ Tag PII columns in the model sidecar, and bind tags to mask strategies in `[mask
 
 [POC: `02-performance/01-incremental-watermark`](examples/playground/pocs/02-performance/01-incremental-watermark/)
 
+### Native BigQuery: materialize live, cost to the byte
+
+Swap the adapter to BigQuery and the same project materializes a full-refresh `CREATE TABLE AS` against the live warehouse. Rocky's run receipt reports `bytes_scanned` and `cost_usd`, and a cross-check confirms that `bytes_scanned` matches BigQuery's own `totalBytesBilled` for the job, to the byte. The same models run against Snowflake or Databricks by changing only the adapter.
+
+<p align="center">
+  <img src="docs/public/demo-bigquery.gif" alt="rocky run materializes a full-refresh table in BigQuery with a cost receipt, then a cross-check shows bytes_scanned equals BigQuery's totalBytesBilled" width="900" />
+</p>
+
+[POC: `07-adapters/05-bigquery-native-queries`](examples/playground/pocs/07-adapters/05-bigquery-native-queries/) — the live path requires BigQuery credentials
+
 ## In your editor
 
 The same compiler runs as a language server inside VS Code, so you catch drift, type errors, and contract violations where you write the code, not just in CI.
