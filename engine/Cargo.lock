@@ -3787,7 +3787,7 @@ dependencies = [
 
 [[package]]
 name = "rocky"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3808,7 +3808,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-adapter-sdk"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3821,7 +3821,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-ai"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "indexmap",
  "reqwest 0.12.28",
@@ -3842,7 +3842,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-airbyte"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3859,7 +3859,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-bigquery"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3887,7 +3887,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-cache"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "redis",
  "serde",
@@ -3899,7 +3899,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-catalog-core"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -3910,7 +3910,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-cli"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -3963,7 +3963,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-compiler"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -3990,7 +3990,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-core"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4030,7 +4030,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-databricks"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4055,7 +4055,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-duckdb"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4074,7 +4074,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-engine"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4092,7 +4092,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-fivetran"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4123,7 +4123,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-iceberg"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4148,7 +4148,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-ir"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -4161,7 +4161,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-lang"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "logos",
  "miette",
@@ -4173,7 +4173,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-lsp"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "rocky-server",
  "rustls",
@@ -4182,7 +4182,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-mcp"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4206,7 +4206,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-observe"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "chrono",
  "opentelemetry",
@@ -4224,7 +4224,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-server"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4254,7 +4254,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-snowflake"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -4280,7 +4280,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-sql"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "miette",
  "regex",
@@ -4293,7 +4293,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-trino"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4316,7 +4316,7 @@ dependencies = [
 
 [[package]]
 name = "rocky-wasm"
-version = "1.47.1"
+version = "1.48.0"
 dependencies = [
  "rocky-lang",
  "rocky-sql",
