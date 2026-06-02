@@ -26,6 +26,8 @@ Benchmarked on Apple Silicon (12-core, 36 GB RAM) with a synthetic 4-layer medal
 
 Rocky doesn't make the warehouse faster — it makes everything *around* the warehouse faster. The actual SQL execution time is the same. What's different is the compile-plan-execute overhead.
 
+A note on which dbt: the per-tool numbers below compare against **dbt Core 1.x** (Python). dbt-fusion — the Rust runtime now open-sourced as dbt Core v2.0 — closes the startup gap (it is in the table above at ~12 ms), but at 10k models it still trails Rocky on compile (~38×) and memory (~7×). The Python-specific overheads called out below (interpreter load, GC, dict duplication) are dbt Core 1.x; the remaining gap to the Rust fusion engine comes from Rocky's own design — parallel-by-layer compilation, string interning, and no on-disk manifest.
+
 **No Jinja, no manifest, no parse step.** dbt's core loop is: parse Jinja templates, build a manifest JSON (often 50MB+), resolve the DAG, generate SQL. Rocky replaces all of that with a single compiled Rust binary that goes straight from TOML + SQL to an execution plan. There's no templating engine sitting between you and your SQL. This is why startup is 64x faster and config validation is 146x faster.
 
 **Parallel compilation by execution layer.** Rocky groups models into DAG layers (models within a layer have no interdependencies) and type-checks each layer in parallel across all CPU cores via [rayon](https://github.com/rayon-rs/rayon). dbt's graph traversal is single-threaded Python. This drives the 34x compile speedup.
@@ -63,7 +65,7 @@ SQLMesh is architecturally closer to Rocky than dbt — it uses [SQLGlot](https:
 - **Snapshot state.** SQLMesh maintains "snapshots" (similar to dbt's manifest) that track environment state and grow with project size. Rocky keeps the project graph in-memory with no serialization step, and persists only incremental watermarks in an embedded redb database.
 - **Runtime overhead.** SQLMesh loads the Python interpreter, SQLGlot, and its dependency tree on every invocation. Rocky's static binary starts in 14ms.
 
-The result: at 10k models, Rocky compiles in ~1 second using ~147 MB. Python-based tools — whether they use Jinja (dbt) or SQLGlot (SQLMesh) — operate in the 30-40 second range with 4-7x the memory footprint.
+The result: at 10k models, Rocky compiles in ~1 second using ~147 MB. dbt Core 1.x (Jinja) and SQLMesh (Python + SQLGlot) operate in the 30-40 second range with 4-7x the memory footprint; dbt-fusion, though Rust, still lands around 38× the compile time and 7× the memory in this suite.
 
 ## What These Numbers Mean
 

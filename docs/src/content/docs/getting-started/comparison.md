@@ -5,13 +5,17 @@ sidebar:
   order: 4.5
 ---
 
-A factual feature-by-feature comparison of the major SQL transformation tools in the modern data stack. Features verified against official documentation and source code as of May 2026.
+A factual feature-by-feature comparison of the major SQL transformation tools in the modern data stack. Features verified against official documentation and source code as of June 2026.
+
+:::note[A note on "dbt"]
+In these tables, **dbt-core** is the dbt Core 1.x Python line, still the dominant deployment. On 2026-06-01 dbt Labs open-sourced the Fusion runtime as **dbt Core v2.0** (Rust, Apache 2.0, currently alpha); the **dbt-fusion** column tracks that v2.0 runtime plus Fusion's SQL-comprehension layer. SQL type-checking, column-level lineage, and the SQL linter live in that Fusion layer — the Apache-licensed dbt Core CLI itself does not ship them. In Fusion, column-level lineage and data-type checking require opting into the `strict` static-analysis mode; the default `baseline` mode does lighter, warn-only analysis.
+:::
 
 Quick positioning before the tables:
 
 - **vs dbt Core.** dbt Core is the incumbent migration funnel, not the head-to-head competitor. Rocky's path is import-compatibility (`rocky import-dbt`) plus a step-change on failure modes dbt Core structurally can't catch: silent schema drift, compile-time contracts, column-level lineage at PR time, per-model cost. dbt Core remains the right choice for moderate-scale, low-blast-radius pipelines where Jinja templating is enough.
-- **vs dbt Fusion.** dbt Fusion is dbt Labs' Rust rewrite of dbt Core (public beta since 2025-05-28). It ships SQL parsing, multi-dialect compilation, real LSP, column-level lineage in editor, ADBC drivers. Rocky's differentiation against Fusion: named branches with warehouse-native clones (Fusion's `dbt clone` is "coming soon"); content-addressed deterministic replay (not in Fusion); per-model cost attribution as a first-class column (not in Fusion); dialect-portability lint across warehouses (not in Fusion); declarative governance + masking + classification (in Fusion only as "coming soon" gated behind dbt platform paid tiers — Apache 2.0 across the whole surface in Rocky); the `.rocky` DSL as a Jinja-free typed alternative (Fusion's `dbt-jinja` confirms Fusion still uses Jinja); cross-team contracts (Fusion's contracts are model-level within a project, not cross-project).
-- **vs SQLMesh.** SQLMesh moved correctness to the planner. **dbt Fusion moved it to the compiler. Rocky owns the trust dimensions all of them leave open** — branches, replay, cost, governance, dialect portability, cross-team contracts. SQLMesh's checks are runtime-ish; Rocky's are compile-time, expressed as diagnostic codes (`E001`–`E026`) you can grep in CI logs. SQLMesh is Python-first; Rocky keeps SQL as the default surface and reaches for a DSL only when SQL doesn't fit. SQLMesh's virtual environments are a genuinely good idea — Rocky's named branches express the same workflow with column-level lineage attached. SQLMesh is more mature in years and funding; Rocky is further along on Rust-native enforcement, LSP / IDE polish, compile-time column lineage, and cost as a first-class citizen.
+- **vs dbt Fusion.** The Fusion runtime is now open source as dbt Core v2.0 (Rust, Apache 2.0, alpha); the precompiled **Fusion** binary — the distribution dbt recommends — extends that baseline with SQL comprehension: type-checking and column-level lineage (in its opt-in `strict` static-analysis mode; the default `baseline` mode is lighter and warn-only), a SQL linter, multi-dialect compilation, a real LSP, and ADBC drivers. Rocky does not claim those as differentiators. Where Rocky differs is the enforcement plane Fusion leaves open: a first-class named-branch primitive (`dbt clone` exists in both dbt engines, but dbt gives you the raw command, not a branch object); a content-addressed run record (not in Fusion); per-model cost on every run in the free CLI (warehouse-billed bytes on BigQuery, a duration × DBU-rate estimate on Databricks and Snowflake, zero on DuckDB), plus `[budget]` blocks that fail the build — no dbt distribution fails a run on overspend (dbt's Cost Insights does per-model cost but is paid-tier and visibility-only); a cross-warehouse dialect-portability lint (Fusion validates against one configured dialect); declarative governance — RBAC GRANT/REVOKE diffing plus masking bound to classification tags (deepest on Databricks), Apache 2.0 (dbt's native PII/PHI-tracking governance is "coming soon" and paid-platform-only; `grants` in OSS dbt is apply-only); and the `.rocky` DSL as a Jinja-free typed surface (Fusion still templates with Jinja). On contracts, both engines enforce per-model contracts in OSS; dbt additionally ships cross-project contracts via dbt Mesh (the seamless cross-project `ref` is Enterprise-gated). Rocky's contracts are intra-project today, so cross-team contracts are not a Rocky differentiator.
+- **vs SQLMesh.** SQLMesh is the tool Rocky most resembles: it also analyzes SQL statically (via SQLGlot, no Jinja), and it pioneered several primitives Rocky shares — virtual data environments (the reference design for branch-style isolation), plan/apply with breaking-change classification, and column-level lineage. Rocky does not claim those as differentiators. Where Rocky differs is a narrower enforcement plane: declarative OSS governance (RBAC / masking / classification, deepest on Databricks) and `[budget]` blocks that fail the build — neither of which SQLMesh ships in OSS — plus source-schema-drift detection (the out-of-band case a code-diff plan doesn't catch: a column type changing in the warehouse under a materialized model) and a dialect-portability lint (`P001`) that flags warehouse-specific constructs at PR time, where SQLMesh instead transpiles across dialects via SQLGlot (a different bet). All of it surfaces as greppable diagnostic codes in CI logs. SQLMesh is more mature in years, funding, and adoption, ships native Python models and an OSS CI/CD bot, and its virtual environments are more battle-tested than Rocky's schema-prefix branches. Rocky keeps SQL as the default surface; SQLMesh leans Python-first.
 - **vs warehouse-native pipelines (Databricks LakeFlow, Snowflake Dynamic Tables).** Those are warehouse-coupled and free with the platform. Rocky stays warehouse-neutral and ships a real compiler. If portability and serious tooling matter to you, Rocky wins; if they don't, the warehouse-native option may be "good enough."
 - **vs observability tools (Datafold, Monte Carlo, Anomalo).** Not competitors. Rocky prevents what these detect; they remain useful for the failure modes Rocky doesn't model. Integrate, don't replace.
 
@@ -19,11 +23,11 @@ Quick positioning before the tables:
 
 | Feature | Rocky | dbt-core | dbt-fusion | SQLMesh | Coalesce | Dataform |
 |---|---|---|---|---|---|---|
-| **Language** | Rust | Python | Rust (SDF) | Python (SQLGlot) | TypeScript | TypeScript |
-| **Open source** | Apache 2.0 | Apache 2.0 | Partial (preview) | Apache 2.0 (LF) | No (SaaS) | Partial |
+| **Language** | Rust | Python | Rust (Fusion) | Python (SQLGlot) | TypeScript | TypeScript |
+| **Open source** | Apache 2.0 | Apache 2.0 | Apache 2.0 runtime; binary free (partly closed) | Apache 2.0 (LF) | No (SaaS) | Partial |
 | **Distribution** | Binary | pip | Binary | pip | Cloud SaaS | GCP managed |
 | **Config format** | TOML | YAML | YAML | YAML + Python | GUI | SQLX |
-| **Manifest** | None (in-memory) | JSON (can be 100+ MB) | In-memory | Snapshots | Cloud | Cloud |
+| **Manifest** | None (in-memory) | JSON (can be 100+ MB) | Parquet + JSON (v2.0) | Snapshots | Cloud | Cloud |
 
 ## Warehouse Support
 
@@ -58,23 +62,23 @@ Quick positioning before the tables:
 
 | Feature | Rocky | dbt-core | dbt-fusion | SQLMesh |
 |---|:---:|:---:|:---:|:---:|
-| Static type inference | **Yes** | No | Yes | Yes |
-| Column type tracking | **Yes** | No | Yes | Yes |
+| Static type inference | **Yes** | No | Yes (strict) | Yes |
+| Column type tracking | **Yes** | No | Yes (strict) | Yes |
 | Compile-time diagnostics | **35+** | No | Yes | Partial |
 | Safe type widening | **Yes** | No | No | No |
 | NULL-safe equality | **Yes** | No | No | No |
 | Data contracts | **Yes** | Yes | Yes | Yes |
-| SELECT * expansion | **Yes** | No | Yes | Yes |
+| SELECT * expansion | **Yes** | No | Yes (strict) | Yes |
 | Parallel type checking | **Yes** | No | Unknown | No |
 
 ## Column-Level Lineage
 
 | Feature | Rocky | dbt-core | dbt-fusion | SQLMesh |
 |---|:---:|:---:|:---:|:---:|
-| Column-level lineage | **Yes** | Yes | Yes | Yes |
-| CLI-accessible | **Yes** | No (UI only) | No | Yes |
+| Column-level lineage | **Yes** | No | Yes (strict mode) | Yes |
+| CLI-accessible | **Yes** | No | No | Yes |
 | Graphviz export | **Yes** | No | No | No |
-| Compile-time | **Yes** | No (runtime) | Yes | Yes |
+| Compile-time | **Yes** | No | Yes | Yes |
 
 ## Schema Drift Detection
 
@@ -105,7 +109,7 @@ Quick positioning before the tables:
 
 | Feature | Rocky | dbt-core | dbt-fusion | SQLMesh |
 |---|:---:|:---:|:---:|:---:|
-| Dagster | **Native** | Yes | Via dbt | No |
+| Dagster | **Native** | Yes | Via dbt | Community (dagster-sqlmesh) |
 | Airflow | Via CLI | Yes | Via dbt | Yes |
 | Dagster Pipes protocol | **Yes** | No | No | No |
 | Typed output models | **Yes** (63 schemas) | No | No | No |
@@ -181,7 +185,7 @@ See [benchmarks](/getting-started/benchmarks/) for full cost analysis and method
 |---|---|
 | **Rocky** | Production-critical, multi-tenant pipelines where silent failures cost real money. Databricks-first; Snowflake/BigQuery Beta. Compile-time contracts, column-level lineage at PR time, branches + replay, per-model cost attribution. |
 | **dbt-core** | Industry standard with the largest community and adapter ecosystem. Best for moderate scale (<5k models) with Jinja templating and where post-hoc lineage is acceptable. |
-| **dbt-fusion** | Teams staying in the dbt ecosystem who want a Rust compiler with multi-dialect SQL validation and a real LSP. Snowflake GA; Databricks/BigQuery/Redshift in preview. Best fit when Jinja templating is acceptable and named branches, deterministic replay, per-model cost, and Apache-2.0 governance aren't load-bearing. |
-| **SQLMesh** | Teams that want correctness checks at the planner level, Python-first ergonomics, and virtual environments. Closest competitor to Rocky on intent — Rocky differs by enforcing correctness at the compiler, defaulting to SQL, and attaching column-level lineage to the compile output. |
+| **dbt-fusion** | Teams staying in the dbt ecosystem who want a Rust compiler with multi-dialect SQL validation and a real LSP. Snowflake GA; BigQuery and Redshift in preview; Databricks in private preview. Best fit when Jinja templating is acceptable and named branches, a content-addressed run record, per-model cost budgets, and Apache-2.0 governance aren't load-bearing. |
+| **SQLMesh** | Teams that want correctness checks at the planner level, Python-first ergonomics, and virtual environments. The closest tool to Rocky on intent — both analyze SQL statically and ship column-level lineage and branch-style environments. Rocky differs on the enforcement plane: cost budgets that fail the build, declarative OSS governance, and schema-drift handling, defaulting to SQL. |
 | **Coalesce** | Visual, low-code transformation for Snowflake-first organizations with less technical analysts. Different buyer than Rocky. |
 | **Dataform** | BigQuery-only shops wanting tight GCP integration with minimal tooling. |

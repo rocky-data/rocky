@@ -1,7 +1,9 @@
 # Feature Comparison: Rocky vs dbt-core vs dbt-fusion vs SQLMesh vs Coalesce vs Dataform
 
-**Date:** 2026-04-10
+**Date:** 2026-04-10 (snapshot)
 **Rocky version:** 0.3.0 (post-optimization)
+
+> **Partial refresh, 2026-06-01:** This is an April 2026 snapshot. Only a handful of cells have been refreshed against current sources — e.g. the open-source license, the Fusion runtime rename, column-level lineage, manifest/artifacts, and the orchestration row (including a current `dagster-sqlmesh` correction); the remaining cells still reflect the April snapshot and have not been re-verified. The canonical, current comparison lives at [docs: Feature Comparison](../../../docs/src/content/docs/getting-started/comparison.md). In these tables, **dbt-core** is the dbt Core 1.x Python line; **dbt-fusion** tracks the Rust dbt Core v2.0 runtime plus Fusion's SQL-comprehension layer.
 
 This document provides a factual feature-by-feature comparison of the major SQL transformation tools in the modern data stack. Features are verified against official documentation and source code as of April 2026.
 
@@ -11,13 +13,13 @@ This document provides a factual feature-by-feature comparison of the major SQL 
 
 | Feature | Rocky | dbt-core | dbt-fusion | SQLMesh | Coalesce | Dataform |
 |---|---|---|---|---|---|---|
-| **Implementation language** | Rust | Python | Rust (SDF engine) | Python (SQLGlot) | TypeScript (cloud) | TypeScript (cloud) |
-| **Open source** | Yes (Apache 2.0) | Yes (Apache 2.0) | Partial (preview) | Yes (Apache 2.0, LF) | No (SaaS) | Partial (core on GitHub) |
+| **Implementation language** | Rust | Python | Rust (Fusion) | Python (SQLGlot) | TypeScript (cloud) | TypeScript (cloud) |
+| **Open source** | Yes (Apache 2.0) | Yes (Apache 2.0) | Apache 2.0 runtime; binary free (partly closed) | Yes (Apache 2.0, LF) | No (SaaS) | Partial (core on GitHub) |
 | **Distribution** | Binary (cross-compiled) | pip (PyPI) | Binary (installer) | pip (PyPI) | Cloud SaaS | GCP managed service |
 | **Plugin / adapter system** | Built-in + custom adapter SDK | Community adapters (pip) | Built-in (SDF) | Built-in (SQLGlot dialects) | Built-in node types | BigQuery only |
 | **Architecture** | Compiled binary, no runtime | Python interpreter | Compiled binary | Python interpreter | Cloud-native GUI | Cloud-native IDE |
 | **Config format** | TOML (rocky.toml + sidecars) | YAML (dbt_project.yml) | YAML (dbt_project.yml) | YAML + Python | GUI config | SQLX annotations |
-| **Manifest / artifact** | None (in-memory IR) | manifest.json (can be 100+ MB) | In-memory | State snapshots | Cloud-managed | Cloud-managed |
+| **Manifest / artifact** | None (in-memory IR) | manifest.json (can be 100+ MB) | Parquet + JSON (v2.0) | State snapshots | Cloud-managed | Cloud-managed |
 
 ---
 
@@ -83,11 +85,11 @@ This document provides a factual feature-by-feature comparison of the major SQL 
 
 | Feature | Rocky | dbt-core | dbt-fusion | SQLMesh | Coalesce | Dataform |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Column-level lineage** | Yes (compile-time) | Yes (dbt Explorer) | Yes | Yes (built-in) | Yes | No |
-| **Per-column trace** | Yes (`rocky lineage model.col`) | Partial (UI only) | Partial | Yes | Yes | No |
-| **CLI-accessible** | Yes (JSON, dot output) | No (UI only) | No | Yes (CLI) | No (GUI) | No |
+| **Column-level lineage** | Yes (compile-time) | No (paid Catalog only) | Yes (strict static analysis) | Yes (built-in) | Yes | No |
+| **Per-column trace** | Yes (`rocky lineage model.col`) | No | Partial | Yes | Yes | No |
+| **CLI-accessible** | Yes (JSON, dot output) | No | No | Yes (CLI) | No (GUI) | No |
 | **Graphviz export** | Yes (`--format dot`) | No | No | No | No | No |
-| **Compile-time computation** | Yes | No (runtime catalog) | Yes | Yes | No (runtime) | No |
+| **Compile-time computation** | Yes | No | Yes | Yes | No (runtime) | No |
 
 **Rocky's lineage advantage:** Column-level lineage computed at compile time, accessible via CLI with JSON or Graphviz dot output. No warehouse query needed. Traces through SQL and Rocky DSL transformations uniformly.
 
@@ -137,7 +139,7 @@ This document provides a factual feature-by-feature comparison of the major SQL 
 
 | Feature | Rocky | dbt-core | dbt-fusion | SQLMesh | Coalesce | Dataform |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Dagster** | Yes (native resource + Pipes) | Yes (dagster-dbt) | Via dbt | No native | No | No |
+| **Dagster** | Yes (native resource + Pipes) | Yes (dagster-dbt) | Via dbt | Community (dagster-sqlmesh) | No | No |
 | **Airflow** | Via CLI (subprocess) | Yes (dbt Provider) | Via dbt | Yes (native) | No | No |
 | **Prefect** | Via CLI | Yes (prefect-dbt) | Via dbt | No native | No | No |
 | **Dagster Pipes protocol** | Yes (typed events) | No | No | No | No | No |
@@ -339,7 +341,7 @@ take 100
 |---|---|
 | **Rocky** | High-scale (10k-50k+ models) Databricks/Snowflake/BigQuery pipelines in containerized environments. Teams that need compile-time safety (35+ diagnostics), schema drift handling, governance automation, and sub-second iteration speed. The only tool with a custom DSL, AI-powered model generation, hand-rolled Dagster Pipes protocol, and full lifecycle hook system. 38+ CLI commands, 10 materialization strategies, 28 typed JSON output schemas. |
 | **dbt-core** | The industry standard with the largest community and adapter ecosystem. Best for teams already invested in the dbt ecosystem with moderate scale (<5k models) and Jinja-based templating needs. Most mature documentation and third-party tooling. |
-| **dbt-fusion** | Teams on Snowflake wanting faster parse times while staying in the dbt ecosystem. The Rust rewrite delivers on parse performance but compile is still slower than dbt-core. Best adopted once it reaches GA and broader adapter support. |
+| **dbt-fusion** | Teams on Snowflake wanting a faster Rust engine while staying in the dbt ecosystem. As of June 2026 dbt recommends Fusion as the free CLI for local and production use; its runtime is open source as dbt Core v2.0 (Apache 2.0, alpha). SQL comprehension (type-checking, column-level lineage, linter) is the Fusion layer on top of that baseline. |
 | **SQLMesh** | Teams wanting a dbt alternative with SQL transpilation (write once, deploy anywhere), virtual environments for safe development, and column-level lineage without warehouse queries. Good middle ground between dbt and Rocky. |
 | **Coalesce** | Teams preferring a visual, low-code approach to data transformation. Best for Snowflake-first organizations with less technical analysts building pipelines. |
 | **Dataform** | Teams 100% on BigQuery wanting tight GCP integration with minimal tooling overhead. The simplest option for BigQuery-only shops. |
@@ -350,7 +352,7 @@ take 100
 
 - **Rocky:** Features verified against source code at `engine/` (v0.3.0, post-optimization) and CLI `--help` output
 - **dbt-core:** [docs.getdbt.com](https://docs.getdbt.com), v1.11.8 release notes
-- **dbt-fusion:** [dbt Fusion docs](https://docs.getdbt.com/docs/fusion), v2.0.0-preview release notes
+- **dbt-fusion:** [dbt Fusion docs](https://docs.getdbt.com/docs/fusion); [dbt Core v2.0 is here](https://docs.getdbt.com/blog/dbt-core-v2-is-here) (runtime open-sourced as dbt Core v2.0, Apache 2.0, alpha, 2026-06-01)
 - **SQLMesh:** [sqlmesh.readthedocs.io](https://sqlmesh.readthedocs.io), Tobiko Data benchmarks
 - **Coalesce:** [coalesce.io/product](https://coalesce.io/product), March 2026 Quality launch
 - **Dataform:** [cloud.google.com/dataform](https://cloud.google.com/dataform/docs)

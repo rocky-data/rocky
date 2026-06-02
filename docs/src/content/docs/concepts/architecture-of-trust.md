@@ -56,9 +56,9 @@ The branch isolation you get today is schema-prefix isolation, not a warehouse-n
 
 ### Per-model cost
 
-Rocky persists `bytes_scanned` on run records, which makes cost a property of a model rather than a line on an invoice. On BigQuery, where bytes-scanned maps directly to billing, you can compute per-model cost today. On the other warehouses the adapter-reported bytes-scanned plumbing is still being filled in, so cost attribution is BigQuery-only in practice right now.
+Rocky records per-model cost on every run, which makes cost a property of a model rather than a line on an invoice. On BigQuery, bytes-scanned maps directly to billing, so the figure is billing-exact. On Databricks and Snowflake it is a duration × DBU-rate estimate (warehouse-reported bytes plumbing is a follow-up); on DuckDB it is zero.
 
-**Partial.** Per-model cost is real and computable on BigQuery; the live cost path on other adapters is a pending follow-up.
+**Partial.** Per-model cost populates on every run; it is billing-exact on BigQuery and a duration-based estimate on Databricks/Snowflake until their bytes plumbing lands.
 
 ### Compile-time contracts
 
@@ -101,7 +101,7 @@ The first is deterministic recording with ledger verification. Rocky records eac
 
 The second is re-execution from the pinned record: replaying a past run by feeding the recorded inputs back through the engine to reproduce its outputs from scratch. That is the follow-up. It arrives on top of the content-addressed write path, and it is not what `rocky replay` does now.
 
-So when you read "deterministic replay," read it as: deterministic recording and content-addressed verification today, re-execution from the record next.
+In short: deterministic recording and content-addressed verification today, re-execution from the record next.
 
 **Partial.** Recording and ledger verification ship; re-execution from the record is the follow-up.
 
@@ -137,7 +137,7 @@ Every load-bearing claim, in one table. Read the partial and not-yet rows carefu
 | Branches | Partial | Schema-prefix isolation with signed approval/promotion; no warehouse-native zero-copy clones yet. |
 | Replay | Partial | Deterministic recording + ledger verification today; re-execution from the pinned record is the follow-up. |
 | Content-addressed writes | Partial | Single-writer Delta/UniForm; no multi-writer, broad schema evolution, or deletion vectors yet. |
-| Per-model cost | Partial | Computable on BigQuery today; the live cost path on other adapters is pending. |
+| Per-model cost | Partial | Billing-exact on BigQuery; a duration × DBU-rate estimate on Databricks and Snowflake; zero on DuckDB. Warehouse-reported-bytes plumbing on the non-BigQuery adapters is the follow-up. |
 | Declarative governance | Partial | Full on Databricks (Unity Catalog); `GRANT`/`REVOKE` only on Snowflake and BigQuery; no-op on DuckDB. |
 | Cross-team / cross-project contract enforcement | Not yet | Contracts are intra-project today; cross-boundary enforcement is the shape Rocky is built toward, not a current capability. |
 
@@ -160,9 +160,9 @@ A sophisticated reader will already be holding Rocky up against a few specific t
 
 ### dbt Fusion (head-to-head)
 
-dbt Fusion is dbt Labs' Rust rewrite of dbt Core, in public beta since 2025-05-28. It is a genuine compiler with multi-dialect SQL validation, a real LSP, and column-level lineage in the editor, and it is the closest thing in the dbt ecosystem to what Rocky does. The differentiation is in the trust dimensions: named branches, deterministic recording and replay, per-model cost as a first-class property, dialect-portability lint, and declarative governance and masking under Apache 2.0 rather than gated behind a paid platform tier. Fusion still uses Jinja templating; Rocky keeps SQL first-class and offers an optional typed DSL only where SQL does not fit.
+In June 2026 dbt Labs open-sourced the Fusion runtime as dbt Core v2.0 (Rust, Apache 2.0, alpha); the recommended Fusion distribution is a genuine compiler with multi-dialect SQL validation, a real LSP, and column-level lineage in the editor, and it is the closest thing in the dbt ecosystem to what Rocky does. The differentiation is in the enforcement plane: named branches, content-addressed recording and ledger verification, per-model cost budgets that fail the build, a dialect-portability lint, and declarative governance and masking under Apache 2.0 rather than gated behind a paid platform tier. Fusion still uses Jinja templating, so its strictest, build-failing analysis is opt-in; Rocky keeps SQL first-class with no Jinja, and offers an optional typed DSL only where SQL does not fit.
 
-Always read "dbt" with the qualifier. dbt Core is a templating engine and cannot catch the failures above at compile time by design. dbt Fusion can catch some of them and is the actual head-to-head. They are structurally different tools.
+Always read "dbt" with the qualifier. dbt Core 1.x is a templating engine and cannot catch the failures above at compile time by design. dbt Core v2.0 is a faster Rust binary but still renders Jinja; the SQL comprehension that catches some of these — type-checking and column-level lineage — lives in the Fusion extension and requires opting into its `strict` mode (the default `baseline` mode is lighter and warn-only). Fusion is the actual head-to-head. They are structurally different tools.
 
 ### Databricks LakeFlow (head-to-head, with a caveat)
 

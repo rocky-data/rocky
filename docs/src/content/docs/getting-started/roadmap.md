@@ -5,13 +5,13 @@ sidebar:
   order: 4
 ---
 
-We are explicit about the line between what Rocky ships and what's still coming. The trust primitives (compiler, branches, replay, lineage, contracts, cost attribution) are production-grade on Databricks. Here is the honest state of everything else.
+We are explicit about the line between what Rocky ships and what's still coming. The trust primitives (compiler, branches, run records, lineage, contracts, cost attribution) are production-grade on Databricks. Here is the honest state of everything else.
 
 ## Shipped and production-grade
 
-- **Databricks** is the production target for 2026: SQL Statement API, Unity Catalog, OAuth M2M, adaptive concurrency, and `SHALLOW CLONE` for branches.
+- **Databricks** is the production target for 2026: SQL Statement API, Unity Catalog, OAuth M2M, adaptive concurrency, and schema-prefix branches (warehouse-native `SHALLOW CLONE` is a follow-up).
 - **The compiler.** Typed column-level inference, the diagnostic codes, and the LSP all run the same in CI and in your editor.
-- **Branches and replay.** Named branches as isolated schemas, and content-addressed replay that rebuilds a past run exactly.
+- **Branches and run records.** Named branches as isolated schemas, and a content-addressed record of each run that you inspect and verify against the ledger with `rocky replay`. (Re-execution from the pinned record is on the 2026 roadmap.)
 - **Cost attribution.** Per-model cost on every run record, with `[budget]` blocks that fail a run on overspend.
 - **The AI compile-validate loop.** `rocky ai` generates a model, compiles it, and auto-fixes parse errors before it lands.
 
