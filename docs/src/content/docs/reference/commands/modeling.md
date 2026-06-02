@@ -76,7 +76,7 @@ rocky compile --model fct_revenue --contracts contracts/
 }
 ```
 
-Every diagnostic carries a severity (`"error"`, `"warning"`, `"info"`), a code (`E001`–`E026`, `W001`–`W011`, `V001`–`V020`), the owning model, and — when the compiler can locate it — a `span` and `suggestion`.
+Every diagnostic carries a severity (`"error"`, `"warning"`, `"info"`), a code (`E###` errors, `W###` warnings, `P###` portability lints, or `V###` validation), the owning model, and — when the compiler can locate it — a `span` and `suggestion`.
 
 Compile models from a non-default directory:
 

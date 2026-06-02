@@ -32,7 +32,7 @@ dbt Core 1.x is a templating engine with no compile-time type checker; contracts
 
 ## The seven trust dimensions
 
-1. **SQL as a typed, compiled language.** Real type inference, diagnostic codes (`E001`–`E026`, `W001`–`W011`, `P001`–`P002`), and a real LSP, not text macros or runtime checks.
+1. **SQL as a typed, compiled language.** Real type inference, diagnostic codes (`E###` errors, `W###` warnings, `P###` portability lints), and a real LSP, not text macros or runtime checks.
 2. **Compile-time column-level lineage.** Rocky knows every column's lineage before a row is written, so `rocky lineage-diff main` can block a PR when a downstream contract breaks.
 3. **Branches and an inspectable run ledger.** `rocky branch create`, `rocky run --branch`, and `rocky replay <run_id>`: branches are isolated schemas, and every run is recorded in an auditable ledger (who ran it, the commit, the per-model SQL hash, and row counts). On the content-addressed materialization path, output files are named by the hash of their bytes, so an auditor can confirm the recorded output is exactly what shipped.
 4. **Per-model cost attribution.** Cost is a column on every run record. `[budget]` blocks fail the run, `budget_breach` fires a hook, and `rocky preview cost` projects spend at PR time.

@@ -13,7 +13,7 @@ For symptom-first lookup ("I got error X, what do I do?"), see [Troubleshooting]
 
 | Category | Detection signal | Surface |
 |---|---|---|
-| [Compile-time](#1-compile-time-failures) | `severity: Error` diagnostic with code `E001`, `E020`–`E026` | `rocky compile`, `rocky ci`, LSP red squiggles |
+| [Compile-time](#1-compile-time-failures) | `severity: Error` diagnostic with code `E001`, `E020`–`E028` | `rocky compile`, `rocky ci`, LSP red squiggles |
 | [Contract violations](#2-contract-violations) | Diagnostic codes `E010`–`E013` | `rocky compile`, `rocky ci`, `rocky apply` (pre-flight) |
 | [Schema drift](#3-schema-drift) | `DriftAction` enum on `rocky drift` / `rocky apply` output | `rocky drift`, `rocky apply` materialisation block |
 | [Quality check failures](#4-quality-check-failures) | `check_results[].status == "Failed"` | `rocky apply --output json` |

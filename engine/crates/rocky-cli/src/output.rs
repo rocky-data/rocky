@@ -2651,8 +2651,8 @@ pub struct ArchiveApplyOutput {
 /// produced this plan — `rocky apply` re-derives the `ProjectIr` by
 /// re-compiling with the same flags. The trade-off: apply always re-compiles
 /// (fast, CPU-only, no network) rather than deserialising a potentially
-/// large IR snapshot. Phase 3 can sharpen this if deterministic replay
-/// without re-compile becomes a requirement.
+/// large IR snapshot. Phase 3 can sharpen this if re-execution from the
+/// pinned record without re-compile becomes a requirement.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunPlan {
     /// Optional filter that was passed to `rocky plan` (e.g. `"client=acme"`).

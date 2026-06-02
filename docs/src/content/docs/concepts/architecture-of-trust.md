@@ -128,7 +128,7 @@ Every load-bearing claim, in one table. Read the partial and not-yet rows carefu
 
 | Claim | Grade | What that means |
 |---|---|---|
-| Compile-time column-level types and diagnostics (`E001`–`E027`) | Shipped | Compilation fails on any error-level diagnostic. |
+| Compile-time column-level types and diagnostics (`E###` errors) | Shipped | Compilation fails on any error-level diagnostic. |
 | Compile-time column-level lineage + `lineage-diff` blast radius | Shipped | Intra-project; computed at compile time. |
 | Compile-time contracts (`E010`–`E013`) | Shipped | Intra-project contract validation against inferred schema. |
 | Schema drift handling (ignore / safe widen / drop-and-recreate) | Shipped | Explicit graded response with a grace period. |
