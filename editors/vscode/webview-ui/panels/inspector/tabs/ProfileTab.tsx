@@ -53,7 +53,7 @@ export function ProfileTab({ profile }: { profile: ProfileOutput | null }) {
   // Label it so the numbers aren't mistaken for the materialized model.
   const fallback =
     profile.fell_back_from != null ? (
-      <p className="mb-3 rounded border border-vscode-border px-3 py-2 text-xs text-vscode-desc">
+      <p className="mb-3 rounded-sm border border-vscode-border px-3 py-2 text-xs text-vscode-desc">
         Showing source{" "}
         <span className="font-mono text-vscode-fg">{profile.profiled_table}</span> —
         the model target{" "}

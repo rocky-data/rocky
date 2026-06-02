@@ -50,7 +50,7 @@ function BlastRadiusValue({ downstream }: { downstream: string[] }) {
           {downstream.map((m) => (
             <li
               key={m}
-              className="truncate rounded px-2 py-1 font-mono text-xs text-vscode-fg"
+              className="truncate rounded-sm px-2 py-1 font-mono text-xs text-vscode-fg"
             >
               {m}
             </li>

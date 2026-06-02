@@ -969,7 +969,7 @@
     "watch": "tsc -watch -p ./",
     "typecheck:webview": "tsc -p webview-ui/tsconfig.webview.json",
     "lint": "eslint src/ webview-ui/",
-    "tailwind": "tailwindcss -c webview-ui/tailwind.config.js -i webview-ui/styles/base.css -o webview-ui/styles/tailwind.generated.css",
+    "tailwind": "tailwindcss -i webview-ui/styles/base.css -o webview-ui/styles/tailwind.generated.css",
     "tailwind:watch": "npm run tailwind -- --watch",
     "prebundle": "npm run tailwind",
     "bundle": "node esbuild.mjs",
@@ -990,6 +990,7 @@
   },
   "devDependencies": {
     "@dagrejs/dagre": "^3.0.0",
+    "@tailwindcss/cli": "^4.3.0",
     "@tailwindplus/elements": "^1.0.22",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
@@ -1009,7 +1010,7 @@
     "mocha": "^11.7.6",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
-    "tailwindcss": "^3.4.19",
+    "tailwindcss": "^4.3.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.60.0",
     "vitest": "^4.1.7"

@@ -79,7 +79,7 @@ export function Skeleton({
   return (
     <div
       aria-hidden
-      className={`animate-pulse rounded ${className}`}
+      className={`animate-pulse rounded-sm ${className}`}
       style={{ backgroundColor: "rgba(127,127,127,0.18)", ...style }}
     />
   );
@@ -139,7 +139,7 @@ export function StatusBadge({ status }: { status: ColumnTestStatus }) {
   if (status === "none") return <span className="text-vscode-desc">—</span>;
   return (
     <span
-      className="rounded px-1.5 py-0.5 text-[11px] font-medium"
+      className="rounded-sm px-1.5 py-0.5 text-[11px] font-medium"
       style={{
         backgroundColor: STATUS_COLOR[status],
         color: "var(--vscode-editor-background)",
