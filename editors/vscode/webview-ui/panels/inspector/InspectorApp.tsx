@@ -36,7 +36,7 @@ const TABS: ReadonlyArray<{ id: TabId; label: string }> = [
 /** Pill toggle (graph ⇄ columns) inside the Lineage tab. */
 function subTab(on: boolean): string {
   return (
-    "rounded px-2 py-0.5 " +
+    "rounded-sm px-2 py-0.5 " +
     (on
       ? "bg-vscode-button-bg text-vscode-button-fg"
       : "text-vscode-desc hover:text-vscode-fg")

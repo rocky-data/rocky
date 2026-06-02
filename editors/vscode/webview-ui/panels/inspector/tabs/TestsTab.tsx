@@ -62,7 +62,7 @@ export function TestsTab({ tests }: { tests: InspectorTestsData | null }) {
   return (
     <div>
       {exec && (
-        <div className="mb-3 flex items-center gap-2 rounded border border-vscode-border px-3 py-2 text-sm">
+        <div className="mb-3 flex items-center gap-2 rounded-sm border border-vscode-border px-3 py-2 text-sm">
           <StatusBadge status={execStatus} />
           <span className="text-vscode-fg">Model executes</span>
           <span className="text-vscode-desc">

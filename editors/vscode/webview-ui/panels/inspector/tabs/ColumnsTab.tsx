@@ -25,7 +25,7 @@ function nullability(nullable: boolean | null | undefined): string {
 }
 
 function sortButton(active: boolean, enabled = true): string {
-  const base = "rounded px-2 py-0.5 ";
+  const base = "rounded-sm px-2 py-0.5 ";
   if (!enabled) return base + "text-vscode-desc opacity-40";
   return (
     base +

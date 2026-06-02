@@ -40,7 +40,7 @@ export function ContextMenu({
   return (
     <div
       ref={ref}
-      className="fixed z-50 min-w-[168px] rounded border py-1 text-sm shadow-lg"
+      className="fixed z-50 min-w-[168px] rounded-sm border py-1 text-sm shadow-lg"
       style={{
         left: x,
         top: y,

@@ -164,7 +164,7 @@ export function Canvas({
         <button
           type="button"
           onClick={() => setFocusFilter(null)}
-          className="absolute left-3 top-3 z-10 rounded border border-vscode-border px-2 py-1 text-xs text-vscode-button-fg shadow"
+          className="absolute left-3 top-3 z-10 rounded-sm border border-vscode-border px-2 py-1 text-xs text-vscode-button-fg shadow-sm"
           style={{ background: "var(--vscode-button-background)" }}
         >
           Show all {data.nodes.length} models

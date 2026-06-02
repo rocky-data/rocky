@@ -58,7 +58,7 @@ export function Toolbar({
         value={draft}
         onChange={(e) => onChange(e.target.value)}
         placeholder="Filter models (substring or /regex/)…"
-        className="w-56 rounded border border-vscode-border bg-transparent px-2 py-1 text-sm text-vscode-fg outline-none focus:border-vscode-focus"
+        className="w-56 rounded-sm border border-vscode-border bg-transparent px-2 py-1 text-sm text-vscode-fg outline-hidden focus:border-vscode-focus"
       />
       <span className="flex-1" />
       <span className="text-xs text-vscode-desc">Overlays</span>
@@ -68,14 +68,14 @@ export function Toolbar({
             key={kind}
             type="button"
             onClick={() => onToggleOverlay(kind)}
-            className={"rounded border border-vscode-border " + segment(activeOverlays.has(kind))}
+            className={"rounded-sm border border-vscode-border " + segment(activeOverlays.has(kind))}
           >
             {OVERLAY_LABELS[kind]}
           </button>
         ))}
       </div>
       <span className="text-xs text-vscode-desc">Color by</span>
-      <div className="flex overflow-hidden rounded border border-vscode-border text-xs">
+      <div className="flex overflow-hidden rounded-sm border border-vscode-border text-xs">
         <button
           type="button"
           onClick={() => onColorMode("kind")}

@@ -32,7 +32,7 @@ function Hop({
       <span className="text-vscode-desc">{arrow}</span>
       <span className="font-mono text-vscode-fg">{label}</span>
       <span
-        className="rounded px-1 text-vscode-desc"
+        className="rounded-sm px-1 text-vscode-desc"
         style={{ background: "var(--vscode-editorWidget-background)" }}
       >
         {transform}
@@ -59,7 +59,7 @@ export function LineageTab({ data }: { data: InspectorModelData }) {
   return (
     <div className="flex flex-col gap-3">
       {lineage.map((col) => (
-        <div key={col.column} className="rounded border border-vscode-border p-3">
+        <div key={col.column} className="rounded-sm border border-vscode-border p-3">
           <div className="font-mono text-sm text-vscode-fg">{col.column}</div>
           <div className="mt-2 flex flex-col gap-1 text-xs">
             {col.upstream.map((edge, i) => (

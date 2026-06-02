@@ -1,55 +1,91 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/*
+ * Tailwind v4 entry for Rocky's React webviews.
+ *
+ * Preflight is intentionally NOT imported — VS Code's theme owns the document.
+ * We pull in only the `theme` and `utilities` layers and supply the minimal
+ * reset ourselves in `@layer base` below. Keeping that reset inside a cascade
+ * layer is load-bearing under v4: an unlayered universal rule outranks the
+ * layered `border-*` utilities (unlayered always beats layered), so the border
+ * utilities would silently stop applying if the reset lived outside a layer.
+ */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+/* Scope the content scan to the webviews (mirrors the old v3 `content` glob). */
+@source "../**/*.{ts,tsx}";
 
 /*
- * Preflight is disabled (see tailwind.config.js), so VS Code's theme owns the
- * document. We re-apply only the slice of a reset we actually need: border-box
- * sizing, plus a zero-width solid border default so Tailwind `border-*`
- * utilities render at all (preflight normally supplies the border-style).
+ * Colors alias to `--vscode-*` so utilities like `text-vscode-fg` / `bg-vscode-bg`
+ * track the user's active theme. `inline` makes each utility reference the
+ * VS Code variable directly (e.g. `color: var(--vscode-foreground)`) instead of
+ * an intermediate token — matching the v3 behaviour exactly.
  */
-*,
-*::before,
-*::after {
-  box-sizing: border-box;
-  border-width: 0;
-  border-style: solid;
+@theme inline {
+  --color-vscode-fg: var(--vscode-foreground);
+  --color-vscode-bg: var(--vscode-editor-background);
+  --color-vscode-widget-bg: var(--vscode-editorWidget-background);
+  --color-vscode-border: var(--vscode-panel-border);
+  --color-vscode-focus: var(--vscode-focusBorder);
+  --color-vscode-desc: var(--vscode-descriptionForeground);
+  --color-vscode-error: var(--vscode-errorForeground);
+  --color-vscode-button-bg: var(--vscode-button-background);
+  --color-vscode-button-fg: var(--vscode-button-foreground);
+  --color-vscode-button-hover: var(--vscode-button-hoverBackground);
+  --color-vscode-badge-bg: var(--vscode-badge-background);
+  --color-vscode-badge-fg: var(--vscode-badge-foreground);
+  --color-vscode-link: var(--vscode-textLink-foreground);
 }
 
-html,
-body,
-#root {
-  margin: 0;
-  height: 100%;
-}
+@layer base {
+  /*
+   * Preflight is off, so re-apply only the slice of a reset we need: border-box
+   * sizing, plus a zero-width solid border default so Tailwind `border-*`
+   * utilities render at all (preflight normally supplies the border-style).
+   */
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+    border-width: 0;
+    border-style: solid;
+  }
 
-body {
-  color: var(--vscode-foreground);
-  background: var(--vscode-editor-background);
-  font-family: var(--vscode-font-family);
-  font-size: var(--vscode-font-size, 13px);
-}
+  html,
+  body,
+  #root {
+    margin: 0;
+    height: 100%;
+  }
 
-/*
- * Without preflight, <button> keeps the browser's light chrome — a white box
- * with a grey border — which is jarring in a dark workbench (it was painting
- * the Inspector tabs as white boxes). Strip the UA surface and inherit the
- * editor's type; buttons that want a fill re-add it with a `bg-*` utility.
- */
-button {
-  background: none;
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
+  body {
+    color: var(--vscode-foreground);
+    background: var(--vscode-editor-background);
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size, 13px);
+  }
+
+  /*
+   * Without preflight, <button> keeps the browser's light chrome — a white box
+   * with a grey border — which is jarring in a dark workbench (it was painting
+   * the Inspector tabs as white boxes). Strip the UA surface and inherit the
+   * editor's type; buttons that want a fill re-add it with a `bg-*` utility.
+   */
+  button {
+    background: none;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+  }
 }
 
 /*
  * ReactFlow ships a light-themed MiniMap + Controls. Map its theming custom
  * properties onto VS Code's so the canvas matches the active editor theme
- * instead of punching a white panel into a dark workbench. These cascade at
- * ReactFlow's point-of-use, so they win regardless of stylesheet order. Both
- * the public (`--xy-*`) and fallback (`--xy-*-default`) names are set since the
- * resolved one varies across @xyflow/react minor versions.
+ * instead of punching a white panel into a dark workbench. Left unlayered so
+ * these custom properties always win at ReactFlow's point-of-use regardless of
+ * stylesheet order. Both the public (`--xy-*`) and fallback (`--xy-*-default`)
+ * names are set since the resolved one varies across @xyflow/react minor versions.
  */
 .react-flow {
   --xy-minimap-background-color: var(--vscode-editorWidget-background);

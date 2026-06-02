@@ -37,7 +37,7 @@ export function DevtoolsApp() {
         <h1 className="text-base font-semibold text-vscode-fg">
           Rocky webview devtools
         </h1>
-        <span className="rounded bg-vscode-badge-bg px-2 py-0.5 text-xs text-vscode-badge-fg">
+        <span className="rounded-sm bg-vscode-badge-bg px-2 py-0.5 text-xs text-vscode-badge-fg">
           theme: {theme}
         </span>
       </header>
@@ -50,13 +50,13 @@ export function DevtoolsApp() {
         <button
           type="button"
           onClick={() => void ping()}
-          className="rounded bg-vscode-button-bg px-3 py-1 text-sm text-vscode-button-fg hover:bg-vscode-button-hover"
+          className="rounded-sm bg-vscode-button-bg px-3 py-1 text-sm text-vscode-button-fg hover:bg-vscode-button-hover"
         >
           Ping host (echo RPC)
         </button>
         <span className="text-sm text-vscode-fg">→ {echo}</span>
       </div>
-      <div className="min-h-0 flex-1 rounded border border-vscode-border">
+      <div className="min-h-0 flex-1 rounded-sm border border-vscode-border">
         <ReactFlow nodes={NODES} edges={EDGES} fitView>
           <Background />
           <MiniMap />

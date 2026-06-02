@@ -16,7 +16,7 @@ export function ModelNode({ id, data, selected }: NodeProps<ModelFlowNode>) {
 
   return (
     <div
-      className="relative flex items-center gap-2 rounded-md border px-2.5 py-2 shadow-sm"
+      className="relative flex items-center gap-2 rounded-md border px-2.5 py-2 shadow-xs"
       style={{
         width: 184,
         background: "var(--vscode-editorWidget-background)",
@@ -31,7 +31,7 @@ export function ModelNode({ id, data, selected }: NodeProps<ModelFlowNode>) {
         style={{ background: "var(--vscode-panel-border)" }}
       />
       <span
-        className="rounded px-1 py-0.5 text-[9px] font-bold leading-none"
+        className="rounded-sm px-1 py-0.5 text-[9px] font-bold leading-none"
         style={{ background: accent, color: "var(--vscode-editor-background)" }}
       >
         {kindGlyph(data.kind)}
@@ -47,7 +47,7 @@ export function ModelNode({ id, data, selected }: NodeProps<ModelFlowNode>) {
           {badges.map((badge, i) => (
             <span
               key={i}
-              className="whitespace-nowrap rounded px-1 text-[9px] leading-tight"
+              className="whitespace-nowrap rounded-sm px-1 text-[9px] leading-tight"
               style={{
                 background: badge.color ?? "var(--vscode-badge-background)",
                 color: "var(--vscode-editor-background)",
