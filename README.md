@@ -185,7 +185,7 @@ If those gaps are blockers for your team, [open a discussion](https://github.com
 
 Each row is a real failure mode and a Rocky command that turns it into a non-event. The same primitives back every row: typed compiler, content-addressed state, column-level lineage, per-model cost.
 
-dbt Core defined this category, and `rocky import-dbt` converts a vanilla dbt project to Rocky in one command. dbt Fusion (dbt Labs' Rust rewrite of dbt Core, in public beta) closes part of the compile-time gap by type-checking SQL, though it still templates with Jinja. Neither open-source engine ships named branches, content-addressed replay, per-model cost as a first-class column, cross-warehouse dialect lint, or declarative RBAC and masking. Some governance features live in dbt's paid platform; Rocky's are open source under Apache 2.0.
+dbt Core defined this category, and `rocky import-dbt` converts a vanilla dbt project to Rocky in one command. In June 2026 dbt Labs open-sourced the Fusion runtime as dbt Core v2.0 (Rust, Apache 2.0, alpha); the recommended **Fusion** distribution adds SQL type-checking and column-level lineage on top, though it still templates with Jinja and its static analysis is opt-in. Neither dbt Core v2.0 nor Fusion ships named branches, a content-addressed run record, per-model cost as a first-class column, a cross-warehouse dialect lint, or declarative RBAC and masking; dbt's governance and cost features live in its paid platform, while Rocky's are open source under Apache 2.0.
 
 ## Subprojects
 

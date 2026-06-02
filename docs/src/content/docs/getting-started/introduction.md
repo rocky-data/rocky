@@ -18,7 +18,7 @@ The expensive failures in modern data platforms aren't slow queries. They're tru
 - Warehouse spend doubles in a month and nobody can attribute which model caused it.
 - An auditor asks who changed `fct_revenue.amount`, when, and why, and the honest answer is `git blame` and screenshots.
 
-dbt Core is a templating engine by design, so it can't catch any of these at compile time. dbt Fusion (dbt Labs' Rust rewrite of dbt Core, in public beta since 2025-05-28) catches some compile-time issues, but it still templates with Jinja. It doesn't ship named branches, content-addressed replay, per-model cost attribution, dialect-portability lint, or declarative governance and masking outside dbt platform's paid tiers. SQLMesh moved correctness to the planner. **Rocky owns the trust dimensions all of them leave open.** Each failure above maps to a diagnostic code, a CI gate, or a content-addressed replay artifact.
+dbt Core 1.x is a templating engine by design, so it can't catch any of these at compile time. In June 2026 dbt Labs open-sourced the Fusion runtime as dbt Core v2.0 (Rust, Apache 2.0, alpha); the recommended Fusion distribution adds SQL type-checking and column-level lineage, though it still templates with Jinja and that analysis is opt-in. Neither dbt Core v2.0 nor Fusion ships named branches, a content-addressed run record, per-model cost attribution, a dialect-portability lint, or declarative governance and masking outside dbt platform's paid tiers. SQLMesh analyzes statically in the planner via SQLGlot. **Rocky's answer is to make each of these failures a compile error or a CI gate** — a diagnostic code, a blocked PR, or a content-addressed run record.
 
 ## Who Rocky is for
 
@@ -49,7 +49,7 @@ A typed compiler that drives your warehouse. Storage and compute stay where they
 
 1. **SQL as a typed, compiled language.** Column-level type inference across the full DAG. 35+ diagnostic codes (`E001`–`E026`, `W001`–`W011`, `P001`–`P002`) with actionable suggestions. Not text macros, but a real compiler with a real LSP.
 2. **Compile-time column-level lineage.** Every column traced through every transformation, before execution. `rocky lineage-diff main` lists per-column downstream blast radius for PR review. That CI gate is impossible without a compiled engine.
-3. **Branches + deterministic replay.** Named branches as isolated schemas. `rocky branch create` / `rocky run --branch` / `rocky replay <run_id>`. Replay is content-addressed: inputs and code map to outputs as a pure function, recorded.
+3. **Branches + a content-addressed run record.** Named branches as isolated schemas. `rocky branch create` / `rocky run --branch` / `rocky replay <run_id>`. Each run records per-model SQL hashes, row counts, and bytes, and content-addresses the written artifacts; `rocky replay` inspects and verifies that record against the ledger. (Re-execution from the pinned record is on the roadmap.)
 4. **Per-model cost attribution.** Cost is a column on every run record, not an afterthought dashboard. `[budget]` blocks fail the run on overspend; `budget_breach` fires the hook; `rocky preview cost` projects spend at PR time.
 5. **AI gated through the compiler.** Every AI suggestion type-checks before it lands. `rocky ai` generates, compiles, auto-fixes, and ships; the `Attempts: 2` retry loop is the signature feature. (The broader AI surface, like mass refactor or auto-migration on a column-type change, is on the [Roadmap](/getting-started/roadmap/).)
 6. **Dialect-divergence lint.** `P001` catches Snowflake-only constructs in a Databricks project, and the reverse. Useful the day you start a migration, essential the day you finish one.
@@ -81,12 +81,12 @@ See the [Roadmap](/getting-started/roadmap/) for the full breakdown of what's sh
 | Tests | `schema.yml` + `dbt test` | Inline checks + assertions in `rocky run` |
 | State | `manifest.json` + `target/` | Embedded `redb` database |
 | Branches | — | `rocky branch create`, `rocky run --branch <name>` |
-| Column-level lineage | Post-hoc (`dbt docs`) | Compile-time output, queryable per column |
+| Column-level lineage | Table-level (`dbt docs`); column-level needs Fusion or paid Catalog | Compile-time output, queryable per column |
 | Schema drift | Silent | `E013` at compile, blocks the PR |
 | Cost attribution | — | Per-model, every run |
-| Replay | — | Content-addressed, deterministic |
+| Replay | — | Content-addressed run record (re-execution on the roadmap) |
 
-**Evaluating SQLMesh?** SQLMesh moved correctness to the planner. Rocky moved it to the compiler. SQLMesh's checks are runtime-ish; Rocky's are compile-time. SQLMesh is Python-first; Rocky keeps SQL as the default and reaches for a DSL only when SQL doesn't fit. SQLMesh has virtual environments, a genuinely good idea that Rocky's branches express differently. SQLMesh is more mature in years and funding; Rocky is further along on Rust-native compile-time enforcement, the LSP and IDE experience, column-level lineage at compile time, and cost attribution as a first-class citizen.
+**Evaluating SQLMesh?** SQLMesh is the tool Rocky most resembles — it also analyzes SQL statically (via SQLGlot, no Jinja), and its virtual environments, plan/apply, and column-level lineage are mature primitives Rocky shares rather than beats. Rocky keeps SQL as the default (SQLMesh leans Python-first) and differentiates on the enforcement plane: schema-drift detection, a dialect-divergence lint, declarative OSS governance, and `[budget]` blocks that fail the build. SQLMesh is more mature in years, funding, and adoption, and ships native Python models and an OSS CI/CD bot.
 
 Full side-by-side comparison: [features/comparison](/getting-started/comparison/).
 
