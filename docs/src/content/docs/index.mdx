@@ -24,7 +24,7 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 Rocky exists because the most expensive failures in modern data platforms aren't slow queries. They're trust failures. A column type changes upstream and a revenue dashboard quietly diverges for three days. A `SELECT *` pulls a new column nobody designed for. A Snowflake-only function lands in a Databricks-targeted project and only fails in prod. Warehouse spend doubles and nobody can attribute which model caused it. An auditor asks who changed `fct_revenue.amount` and when.
 
-dbt Core is a templating engine; it can't catch any of these at compile time. SQLMesh moved correctness to the planner. **Rocky moved it to the compiler.** The disasters above become `E013` diagnostics, blocked PRs, `rocky lineage-diff` comments, and content-addressed replay artifacts.
+dbt Core 1.x is a templating engine; it can't catch any of these at compile time. SQLMesh moved correctness to the planner. **Rocky moved it to the compiler.** The disasters above become `E013` diagnostics, blocked PRs, `rocky lineage-diff` comments, and content-addressed run records.
 
 <CardGrid>
   <Card title="Typed compiler, not a templating engine" icon="approve-check">
@@ -33,8 +33,8 @@ dbt Core is a templating engine; it can't catch any of these at compile time. SQ
   <Card title="Column-level lineage at compile time" icon="seti:graphql">
     Every column traced through every transformation, before execution. `rocky lineage-diff main` lists per-column downstream blast radius for PR review.
   </Card>
-  <Card title="Branches + deterministic replay" icon="random">
-    Named branches as isolated schemas. `rocky replay <run_id>` reconstructs a run bit-for-bit: inputs, code, and outputs as a content-addressed artifact.
+  <Card title="Branches + content-addressed run records" icon="random">
+    Named branches as isolated schemas. `rocky replay <run_id>` inspects and verifies a run against its content-addressed record — per-model SQL hashes, row counts, and bytes. (Re-execution from the pinned record is on the roadmap.)
   </Card>
   <Card title="Per-model cost attribution" icon="rocket">
     Cost is a column on every run, not a dashboard. `[budget]` blocks fail the run on overspend. `rocky preview cost` projects spend at PR time.

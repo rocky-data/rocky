@@ -33,7 +33,7 @@ A schema agreement Rocky enforces before any row is written. A missing required 
 
 ### Content-addressed
 
-Identified by the hash of its contents rather than a name or timestamp. Rocky records each run's inputs, code, and outputs this way, which is what makes [replay](#replay) exact. See [Content-addressed writes](/concepts/content-addressed/).
+Identified by the hash of its contents rather than a name or timestamp. Rocky records each run's inputs, code, and outputs this way, which is what lets [replay](#replay) verify a past run against its record. See [Content-addressed writes](/concepts/content-addressed/).
 
 ### Diagnostic code
 
@@ -69,7 +69,7 @@ A deterministic, reviewable record of what a run will do: compiled SQL, drift ac
 
 ### Replay
 
-Rebuilding a past run exactly from its [content-addressed](#content-addressed) record. `rocky replay <run_id>` reconstructs the inputs, code, and outputs bit-for-bit. See [Roadmap](/getting-started/roadmap/).
+Inspecting and verifying a past run against its [content-addressed](#content-addressed) record — per-model SQL hashes, row counts, and bytes. `rocky replay <run_id>` checks the record against the ledger; re-executing a run bit-for-bit from the pinned record is on the roadmap. See [Roadmap](/getting-started/roadmap/).
 
 ### Shadow mode
 

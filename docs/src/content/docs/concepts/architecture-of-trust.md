@@ -56,9 +56,9 @@ The branch isolation you get today is schema-prefix isolation, not a warehouse-n
 
 ### Per-model cost
 
-Rocky persists `bytes_scanned` on run records, which makes cost a property of a model rather than a line on an invoice. On BigQuery, where bytes-scanned maps directly to billing, you can compute per-model cost today. On the other warehouses the adapter-reported bytes-scanned plumbing is still being filled in, so cost attribution is BigQuery-only in practice right now.
+Rocky records per-model cost on every run, which makes cost a property of a model rather than a line on an invoice. On BigQuery, bytes-scanned maps directly to billing, so the figure is billing-exact. On Databricks and Snowflake it is a duration × DBU-rate estimate (warehouse-reported bytes plumbing is a follow-up); on DuckDB it is zero.
 
-**Partial.** Per-model cost is real and computable on BigQuery; the live cost path on other adapters is a pending follow-up.
+**Partial.** Per-model cost populates on every run; it is billing-exact on BigQuery and a duration-based estimate on Databricks/Snowflake until their bytes plumbing lands.
 
 ### Compile-time contracts
 
@@ -162,7 +162,7 @@ A sophisticated reader will already be holding Rocky up against a few specific t
 
 In June 2026 dbt Labs open-sourced the Fusion runtime as dbt Core v2.0 (Rust, Apache 2.0, alpha); the recommended Fusion distribution is a genuine compiler with multi-dialect SQL validation, a real LSP, and column-level lineage in the editor, and it is the closest thing in the dbt ecosystem to what Rocky does. The differentiation is in the enforcement plane: named branches, content-addressed recording and ledger verification, per-model cost budgets that fail the build, a dialect-portability lint, and declarative governance and masking under Apache 2.0 rather than gated behind a paid platform tier. Fusion still uses Jinja templating, so its strictest, build-failing analysis is opt-in; Rocky keeps SQL first-class with no Jinja, and offers an optional typed DSL only where SQL does not fit.
 
-Always read "dbt" with the qualifier. dbt Core 1.x is a templating engine and cannot catch the failures above at compile time by design. dbt Core v2.0 is a faster Rust binary but still renders Jinja; the SQL comprehension that catches some of these lives in the Fusion extension, where it runs by default but enforces (fails the build) only in opt-in strict mode. Fusion is the actual head-to-head. They are structurally different tools.
+Always read "dbt" with the qualifier. dbt Core 1.x is a templating engine and cannot catch the failures above at compile time by design. dbt Core v2.0 is a faster Rust binary but still renders Jinja; the SQL comprehension that catches some of these — type-checking and column-level lineage — lives in the Fusion extension and requires opting into its `strict` mode (the default `baseline` mode is lighter and warn-only). Fusion is the actual head-to-head. They are structurally different tools.
 
 ### Databricks LakeFlow (head-to-head, with a caveat)
 
