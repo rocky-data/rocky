@@ -19,8 +19,8 @@
 //! model list, execution layers) rather than a full `ProjectIr` snapshot.
 //! `rocky apply` re-derives `ProjectIr` by calling `commands::run::run` with
 //! the same flags — a fast, CPU-only recompile step. Full IR persistence is
-//! deferred to a future phase if deterministic replay without recompile
-//! becomes a hard requirement.
+//! deferred to a future phase if re-execution from the pinned record without
+//! recompile becomes a hard requirement.
 //!
 //! ## Plan payload for Replication kind (Phase 5b)
 //!

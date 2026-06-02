@@ -47,7 +47,7 @@ A typed compiler that drives your warehouse. Storage and compute stay where they
 
 ## The seven trust dimensions
 
-1. **SQL as a typed, compiled language.** Column-level type inference across the full DAG. 35+ diagnostic codes (`E001`–`E026`, `W001`–`W011`, `P001`–`P002`) with actionable suggestions. Not text macros, but a real compiler with a real LSP.
+1. **SQL as a typed, compiled language.** Column-level type inference across the full DAG. 35+ diagnostic codes (`E###` errors, `W###` warnings, `P###` portability lints) with actionable suggestions. Not text macros, but a real compiler with a real LSP.
 2. **Compile-time column-level lineage.** Every column traced through every transformation, before execution. `rocky lineage-diff main` lists per-column downstream blast radius for PR review. That CI gate is impossible without a compiled engine.
 3. **Branches + a content-addressed run record.** Named branches as isolated schemas. `rocky branch create` / `rocky run --branch` / `rocky replay <run_id>`. Each run records per-model SQL hashes, row counts, and bytes, and content-addresses the written artifacts; `rocky replay` inspects and verifies that record against the ledger. (Re-execution from the pinned record is on the roadmap.)
 4. **Per-model cost attribution.** Cost is a column on every run record, not an afterthought dashboard. `[budget]` blocks fail the run on overspend; `budget_breach` fires the hook; `rocky preview cost` projects spend at PR time.

@@ -77,7 +77,7 @@ This document provides a factual feature-by-feature comparison of the major SQL 
 | **Error suggestions** | Yes (fix hints per diagnostic) | No | Partial | No | No | No |
 | **Parallel type checking** | Yes (rayon, per-layer) | No | Unknown | No | N/A | N/A |
 
-**Rocky's compiler advantage:** 35+ diagnostic codes (E001-E026, W001-W003, W010-W011, E010-E013, V001-V020) with actionable suggestions. Parallel type checking across DAG execution layers via rayon. Safe type widening allowlist prevents accidental data loss from ALTER TABLE operations.
+**Rocky's compiler advantage:** 35+ diagnostic codes (`E###` errors, `W###` warnings, `P###` portability lints, `V###` validation) with actionable suggestions. Parallel type checking across DAG execution layers via rayon. Safe type widening allowlist prevents accidental data loss from ALTER TABLE operations.
 
 ---
 

@@ -37,7 +37,7 @@ Identified by the hash of its contents rather than a name or timestamp. Rocky re
 
 ### Diagnostic code
 
-A stable identifier for a compiler finding: errors (`E001`–`E026`), warnings (`W001`–`W011`), and portability lints (`P001`–`P002`). Codes are searchable and map to a fix. See the [compiler](/concepts/compiler/).
+A stable identifier for a compiler finding: errors (`E###`), warnings (`W###`), portability lints (`P###`), and validation diagnostics (`V###`). Codes are searchable and map to a fix. See the [compiler](/concepts/compiler/).
 
 ### Drift
 
