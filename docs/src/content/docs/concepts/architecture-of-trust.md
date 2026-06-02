@@ -101,7 +101,7 @@ The first is deterministic recording with ledger verification. Rocky records eac
 
 The second is re-execution from the pinned record: replaying a past run by feeding the recorded inputs back through the engine to reproduce its outputs from scratch. That is the follow-up. It arrives on top of the content-addressed write path, and it is not what `rocky replay` does now.
 
-So when you read "deterministic replay," read it as: deterministic recording and content-addressed verification today, re-execution from the record next.
+In short: deterministic recording and content-addressed verification today, re-execution from the record next.
 
 **Partial.** Recording and ledger verification ship; re-execution from the record is the follow-up.
 
@@ -137,7 +137,7 @@ Every load-bearing claim, in one table. Read the partial and not-yet rows carefu
 | Branches | Partial | Schema-prefix isolation with signed approval/promotion; no warehouse-native zero-copy clones yet. |
 | Replay | Partial | Deterministic recording + ledger verification today; re-execution from the pinned record is the follow-up. |
 | Content-addressed writes | Partial | Single-writer Delta/UniForm; no multi-writer, broad schema evolution, or deletion vectors yet. |
-| Per-model cost | Partial | Computable on BigQuery today; the live cost path on other adapters is pending. |
+| Per-model cost | Partial | Billing-exact on BigQuery; a duration × DBU-rate estimate on Databricks and Snowflake; zero on DuckDB. Warehouse-reported-bytes plumbing on the non-BigQuery adapters is the follow-up. |
 | Declarative governance | Partial | Full on Databricks (Unity Catalog); `GRANT`/`REVOKE` only on Snowflake and BigQuery; no-op on DuckDB. |
 | Cross-team / cross-project contract enforcement | Not yet | Contracts are intra-project today; cross-boundary enforcement is the shape Rocky is built toward, not a current capability. |
 

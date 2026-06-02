@@ -203,7 +203,7 @@ Each subproject has its own README with detailed usage. The [`engine/README.md`]
 | Role | Adapter | Status | Notes |
 |------|---------|--------|-------|
 | Warehouse | Databricks | Production | SQL Statement API · Unity Catalog · schema-prefix branches (`SHALLOW CLONE` is a follow-up) |
-| Warehouse | Snowflake | Beta | REST connector · masking policies · schema-prefix branches (zero-copy `CLONE` is a follow-up) |
+| Warehouse | Snowflake | Beta | REST connector · GRANT/REVOKE reconciliation · schema-prefix branches (zero-copy `CLONE` is a follow-up) |
 | Warehouse | BigQuery | Beta | REST connector · schema-prefix branches |
 | Warehouse | DuckDB | Local / Testing | Embedded · powers `rocky playground` (no credentials needed) |
 | Warehouse | Trino | Beta | REST `/v1/statement` polling client · Basic + JWT auth · Docker conformance harness behind `trino-conformance` feature |
