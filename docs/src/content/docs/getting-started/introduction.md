@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-**Rocky is the typed graph between your code and whichever warehouse, table format, or query engine you've chosen.** A typed compiler that owns the graph between your code and your data: branches, deterministic replay, column-level lineage, compile-time contracts, dialect-portability lint, and per-model cost attribution. Storage and compute stay with your warehouse (Databricks, Snowflake, BigQuery, or DuckDB); Rocky owns everything else.
+**Rocky is the typed graph between your code and whichever warehouse, table format, or query engine you've chosen.** A typed compiler that owns the graph between your code and your data: branches, content-addressed replay, column-level lineage, compile-time contracts, dialect-portability lint, and per-model cost attribution. Storage and compute stay with your warehouse (Databricks, Snowflake, BigQuery, or DuckDB); Rocky owns everything else.
 
 ## Why Rocky exists
 

@@ -1,6 +1,6 @@
 # Rocky
 
-**Rocky is the typed graph between your code and whichever warehouse, table format, or query engine you've chosen.** It is a typed compiler that sits above Databricks, Snowflake, BigQuery, or DuckDB and owns the graph between your code and your data: named branches, deterministic replay, column-level lineage, compile-time contracts, and per-model cost attribution. It ships as a single static Rust binary, and storage and compute stay where they are.
+**Rocky is the typed graph between your code and whichever warehouse, table format, or query engine you've chosen.** It is a typed compiler that sits above Databricks, Snowflake, BigQuery, or DuckDB and owns the graph between your code and your data: named branches, content-addressed replay, column-level lineage, compile-time contracts, and per-model cost attribution. It ships as a single static Rust binary, and storage and compute stay where they are.
 
 **Rocky is a real compiler** with type inference, diagnostic codes, and an IDE, not a warehouse, table format, query engine, or templating layer. The failures that quietly cost data teams the most (silent schema drift, column-rename blast radius, dialect divergence, cost spikes nobody can attribute) become compile errors and blocked PRs.
 

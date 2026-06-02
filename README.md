@@ -12,7 +12,7 @@
 
 **Rocky is the typed graph between your code and whichever warehouse, table format, or query engine you've chosen.**
 
-It is a typed compiler that runs over your existing Databricks, Snowflake, BigQuery, or DuckDB and owns the graph between your code and your data: named branches, deterministic replay, column-level lineage, compile-time contracts, and per-model cost. Storage and compute stay where they are, and Rocky works on the SQL you already have. The `.rocky` DSL is there when you want it. Apache 2.0.
+It is a typed compiler that runs over your existing Databricks, Snowflake, BigQuery, or DuckDB and owns the graph between your code and your data: named branches, content-addressed replay, column-level lineage, compile-time contracts, and per-model cost. Storage and compute stay where they are, and Rocky works on the SQL you already have. The `.rocky` DSL is there when you want it. Apache 2.0.
 
 The failures that cost data teams the most are invisible to the warehouse and out of scope for the templating layer above it: schema drift, column-rename blast radius, dialect divergence, cost spikes nobody can attribute. Rocky turns them into compile errors and blocked PRs.
 
