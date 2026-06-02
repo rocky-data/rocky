@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-**Rocky is the typed graph between your code and whichever warehouse, table format, or query engine you've chosen.** A typed compiler that owns the graph between your code and your data: branches, content-addressed replay, column-level lineage, compile-time contracts, dialect-portability lint, and per-model cost attribution. Storage and compute stay with your warehouse (Databricks, Snowflake, BigQuery, or DuckDB); Rocky owns everything else.
+**Rocky is the typed graph between your code and whichever warehouse, table format, or query engine you've chosen.** A typed compiler that owns the graph between your code and your data: branches, content-addressed run records, column-level lineage, compile-time contracts, dialect-portability lint, and per-model cost attribution. Storage and compute stay with your warehouse (Databricks, Snowflake, BigQuery, or DuckDB); Rocky owns everything else.
 
 ## Why Rocky exists
 
@@ -18,7 +18,7 @@ The expensive failures in modern data platforms aren't slow queries. They're tru
 - Warehouse spend doubles in a month and nobody can attribute which model caused it.
 - An auditor asks who changed `fct_revenue.amount`, when, and why, and the honest answer is `git blame` and screenshots.
 
-dbt Core 1.x is a templating engine by design, so it can't catch any of these at compile time. In June 2026 dbt Labs open-sourced the Fusion runtime as dbt Core v2.0 (Rust, Apache 2.0, alpha); the recommended Fusion distribution adds SQL type-checking and column-level lineage, though it still templates with Jinja and that analysis is opt-in. Neither dbt Core v2.0 nor Fusion ships named branches, a content-addressed run record, per-model cost attribution, a dialect-portability lint, or declarative governance and masking outside dbt platform's paid tiers. SQLMesh analyzes statically in the planner via SQLGlot. **Rocky's answer is to make each of these failures a compile error or a CI gate** — a diagnostic code, a blocked PR, or a content-addressed run record.
+dbt Core 1.x is a templating engine by design, so it can't catch any of these at compile time. In June 2026 dbt Labs open-sourced the Fusion runtime as dbt Core v2.0 (Rust, Apache 2.0, alpha); the recommended Fusion distribution adds SQL type-checking and column-level lineage; that analysis runs by default but only warns unless you opt into its build-failing strict mode, and it still templates with Jinja. Neither dbt Core v2.0 nor Fusion ships named branches, a content-addressed run record, per-model cost attribution, a dialect-portability lint, or declarative governance and masking outside dbt platform's paid tiers. SQLMesh analyzes statically in the planner via SQLGlot. **Rocky's answer is to make each of these failures a compile error or a CI gate** — a diagnostic code, a blocked PR, or a content-addressed run record.
 
 ## Who Rocky is for
 
@@ -86,7 +86,7 @@ See the [Roadmap](/getting-started/roadmap/) for the full breakdown of what's sh
 | Cost attribution | — | Per-model, every run |
 | Replay | — | Content-addressed run record (re-execution on the roadmap) |
 
-**Evaluating SQLMesh?** SQLMesh is the tool Rocky most resembles — it also analyzes SQL statically (via SQLGlot, no Jinja), and its virtual environments, plan/apply, and column-level lineage are mature primitives Rocky shares rather than beats. Rocky keeps SQL as the default (SQLMesh leans Python-first) and differentiates on the enforcement plane: schema-drift detection, a dialect-divergence lint, declarative OSS governance, and `[budget]` blocks that fail the build. SQLMesh is more mature in years, funding, and adoption, and ships native Python models and an OSS CI/CD bot.
+**Evaluating SQLMesh?** SQLMesh is the tool Rocky most resembles — it also analyzes SQL statically (via SQLGlot, no Jinja), and its virtual environments, plan/apply, and column-level lineage are mature primitives Rocky shares rather than beats. Rocky keeps SQL as the default (SQLMesh leans Python-first) and differentiates on the enforcement plane: declarative OSS governance and `[budget]` blocks that fail the build (neither in SQLMesh OSS), plus source-schema-drift detection and a dialect-portability lint at PR time (where SQLMesh instead transpiles dialects via SQLGlot). SQLMesh is more mature in years, funding, and adoption, and ships native Python models and an OSS CI/CD bot.
 
 Full side-by-side comparison: [features/comparison](/getting-started/comparison/).
 

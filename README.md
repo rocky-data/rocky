@@ -12,7 +12,7 @@
 
 **Rocky is the typed graph between your code and whichever warehouse, table format, or query engine you've chosen.**
 
-It is a typed compiler that runs over your existing Databricks, Snowflake, BigQuery, or DuckDB and owns the graph between your code and your data: named branches, content-addressed replay, column-level lineage, compile-time contracts, and per-model cost. Storage and compute stay where they are, and Rocky works on the SQL you already have. The `.rocky` DSL is there when you want it. Apache 2.0.
+It is a typed compiler that runs over your existing Databricks, Snowflake, BigQuery, or DuckDB and owns the graph between your code and your data: named branches, content-addressed run records, column-level lineage, compile-time contracts, and per-model cost. Storage and compute stay where they are, and Rocky works on the SQL you already have. The `.rocky` DSL is there when you want it. Apache 2.0.
 
 The failures that cost data teams the most are invisible to the warehouse and out of scope for the templating layer above it: schema drift, column-rename blast radius, dialect divergence, cost spikes nobody can attribute. Rocky turns them into compile errors and blocked PRs.
 
@@ -185,7 +185,7 @@ If those gaps are blockers for your team, [open a discussion](https://github.com
 
 Each row is a real failure mode and a Rocky command that turns it into a non-event. The same primitives back every row: typed compiler, content-addressed state, column-level lineage, per-model cost.
 
-dbt Core defined this category, and `rocky import-dbt` converts a vanilla dbt project to Rocky in one command. In June 2026 dbt Labs open-sourced the Fusion runtime as dbt Core v2.0 (Rust, Apache 2.0, alpha); the recommended **Fusion** distribution adds SQL type-checking and column-level lineage on top, though it still templates with Jinja and its static analysis is opt-in. Neither dbt Core v2.0 nor Fusion ships named branches, a content-addressed run record, per-model cost as a first-class column, a cross-warehouse dialect lint, or declarative RBAC and masking; dbt's governance and cost features live in its paid platform, while Rocky's are open source under Apache 2.0.
+dbt Core defined this category, and `rocky import-dbt` converts a vanilla dbt project to Rocky in one command. In June 2026 dbt Labs open-sourced the Fusion runtime as dbt Core v2.0 (Rust, Apache 2.0, alpha); the recommended **Fusion** distribution adds SQL type-checking and column-level lineage on top, though it still templates with Jinja and its build-failing strict checks are opt-in. Neither dbt Core v2.0 nor Fusion ships named branches, a content-addressed run record, per-model cost as a first-class column, a cross-warehouse dialect lint, or declarative RBAC and masking; dbt's governance and cost features live in its paid platform, while Rocky's are open source under Apache 2.0.
 
 ## Subprojects
 
@@ -202,9 +202,9 @@ Each subproject has its own README with detailed usage. The [`engine/README.md`]
 
 | Role | Adapter | Status | Notes |
 |------|---------|--------|-------|
-| Warehouse | Databricks | Production | SQL Statement API · Unity Catalog · `SHALLOW CLONE` for branches |
-| Warehouse | Snowflake | Beta | REST connector · zero-copy `CLONE` for branches · masking policies |
-| Warehouse | BigQuery | Beta | REST connector · `CREATE TABLE … COPY` for branches |
+| Warehouse | Databricks | Production | SQL Statement API · Unity Catalog · schema-prefix branches (`SHALLOW CLONE` is a follow-up) |
+| Warehouse | Snowflake | Beta | REST connector · masking policies · schema-prefix branches (zero-copy `CLONE` is a follow-up) |
+| Warehouse | BigQuery | Beta | REST connector · schema-prefix branches |
 | Warehouse | DuckDB | Local / Testing | Embedded · powers `rocky playground` (no credentials needed) |
 | Warehouse | Trino | Beta | REST `/v1/statement` polling client · Basic + JWT auth · Docker conformance harness behind `trino-conformance` feature |
 | Source | Fivetran | Production | REST connector + table discovery |
