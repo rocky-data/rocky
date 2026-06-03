@@ -848,7 +848,127 @@ impl DatabricksConnector {
 
         Ok(())
     }
+
+    /// Upload bytes to a Unity Catalog Volume path via the Files API.
+    ///
+    /// Issues `PUT /api/2.0/fs/files/<volume_path>?overwrite=true` with the
+    /// file contents as the raw request body. `volume_path` is an absolute
+    /// Volume path (`/Volumes/<catalog>/<schema>/<volume>/<file>`); the loader
+    /// builds it from validated identifiers via
+    /// [`crate::volume::StagingVolume`], so it never carries an unvalidated
+    /// component.
+    ///
+    /// Like [`Self::cancel_statement`], this is a direct authenticated request
+    /// — it does **not** flow through the SQL submit/poll/retry path or the
+    /// circuit breaker (those are SQL-statement concerns). `overwrite=true`
+    /// guards against the astronomically-unlikely case of a UUID-name
+    /// collision on the shared volume.
+    ///
+    /// # Errors
+    ///
+    /// - [`ConnectorError::Auth`] when the token mint fails.
+    /// - [`ConnectorError::Http`] on transport failure.
+    /// - [`ConnectorError::ApiError`] on any non-2xx response (e.g. 404 when
+    ///   the volume doesn't exist, 403 on missing write privilege).
+    pub async fn upload_file(
+        &self,
+        volume_path: &str,
+        contents: Vec<u8>,
+    ) -> Result<(), ConnectorError> {
+        let token = self.auth.get_token().await?;
+        let url = format!(
+            "{}/api/2.0/fs/files{}",
+            self.api_base_url(),
+            encode_volume_path(volume_path),
+        );
+
+        debug!(
+            volume_path = volume_path,
+            bytes = contents.len(),
+            "Files API upload"
+        );
+
+        let resp = self
+            .client
+            .put(&url)
+            .bearer_auth(&token)
+            .query(&[("overwrite", "true")])
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(contents)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ConnectorError::ApiError { status, body });
+        }
+        Ok(())
+    }
+
+    /// Delete a file from a Unity Catalog Volume path via the Files API.
+    ///
+    /// Issues `DELETE /api/2.0/fs/files/<volume_path>`. Used to clean up a
+    /// staged file after `COPY INTO` (success or failure). `volume_path` is the
+    /// same validated absolute path passed to [`Self::upload_file`].
+    ///
+    /// A `404 Not Found` is treated as success (the file is already gone — the
+    /// post-condition "file no longer staged" holds), so a double-cleanup or a
+    /// cleanup after a failed upload is a no-op rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// - [`ConnectorError::Auth`] when the token mint fails.
+    /// - [`ConnectorError::Http`] on transport failure.
+    /// - [`ConnectorError::ApiError`] on any non-2xx response other than 404.
+    pub async fn delete_file(&self, volume_path: &str) -> Result<(), ConnectorError> {
+        let token = self.auth.get_token().await?;
+        let url = format!(
+            "{}/api/2.0/fs/files{}",
+            self.api_base_url(),
+            encode_volume_path(volume_path),
+        );
+
+        debug!(volume_path = volume_path, "Files API delete");
+
+        let resp = self.client.delete(&url).bearer_auth(&token).send().await?;
+
+        let status = resp.status();
+        if status.is_success() || status.as_u16() == 404 {
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        Err(ConnectorError::ApiError {
+            status: status.as_u16(),
+            body,
+        })
+    }
 }
+
+/// Percent-encode each path segment of an absolute Volume path while keeping
+/// the `/` separators literal.
+///
+/// The loader only ever passes paths whose components were validated to
+/// `[A-Za-z0-9._-]` (none of which require encoding), but encoding defensively
+/// means a future caller can't smuggle a reserved character into the REST URL.
+/// Splitting on `/` and re-joining preserves the path structure that
+/// `format!("{base}/api/2.0/fs/files{path}")` depends on.
+fn encode_volume_path(path: &str) -> String {
+    path.split('/')
+        .map(|seg| percent_encoding::utf8_percent_encode(seg, FILES_PATH_SEGMENT).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Byte set for percent-encoding one Files-API path segment: RFC 3986
+/// unreserved characters (`-`, `.`, `_`, `~`, alphanumerics) pass through;
+/// everything else (including `/`) is encoded. The separator `/` is handled by
+/// [`encode_volume_path`] splitting before this is applied per-segment.
+const FILES_PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 /// Fetch one chunk's Arrow IPC stream bytes from its pre-signed
 /// external URL. The URL is a cloud-storage pre-signed GET (S3 /

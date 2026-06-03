@@ -25,6 +25,7 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 percent-encoding = { workspace = true }
+uuid = { workspace = true }
 
 [features]
 test-support = []

@@ -12,7 +12,7 @@ use rocky_core::config::RetryConfig;
 use rocky_databricks::auth::{Auth, AuthConfig};
 use rocky_databricks::connector::{ConnectorConfig, ConnectorError, DatabricksConnector};
 use rocky_databricks::loader::DatabricksLoaderAdapter;
-use wiremock::matchers::{body_string_contains, header, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Creates a PAT-authenticated connector pointing at the given wiremock server.
@@ -625,6 +625,344 @@ async fn test_loader_missing_num_affected_rows() {
         .unwrap();
 
     assert_eq!(result.rows_loaded, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Local-file staging (Unity Catalog Volume + Files API)
+// ---------------------------------------------------------------------------
+//
+// For a LOCAL file the loader can't hand Databricks a cloud URI — the file
+// isn't visible to the warehouse. Instead it:
+//   1. CREATE VOLUME IF NOT EXISTS <catalog>.<schema>.<volume>   (SQL)
+//   2. PUT  /api/2.0/fs/files/<volume-path>?overwrite=true       (Files API)
+//   3. COPY INTO ... FROM '/Volumes/.../<file>'                  (SQL)
+//   4. DELETE /api/2.0/fs/files/<volume-path>                    (Files API)
+// These tests pin that wire sequence: the upload request, the COPY-INTO-from-
+// Volume SQL, and the post-load file cleanup.
+
+/// Write `contents` to a uniquely-named file under the OS temp dir and return
+/// its path. Avoids a `tempfile` dev-dep; caller removes it when done.
+fn write_temp_file(contents: &[u8], ext: &str) -> std::path::PathBuf {
+    use std::io::Write;
+    let unique = format!(
+        "rocky_db_loader_test_{}_{}.{ext}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let path = std::env::temp_dir().join(unique);
+    let mut f = std::fs::File::create(&path).expect("create temp file");
+    f.write_all(contents).expect("write temp file");
+    path
+}
+
+/// Happy path: a local CSV is staged to a UC Volume and loaded.
+///
+/// Asserts the full sequence: CREATE VOLUME → Files API PUT (with the file
+/// bytes in the body) → COPY INTO from the `/Volumes/...` path → Files API
+/// DELETE cleanup. Each mock carries `.expect(1)`, so a missed or extra call
+/// fails the test.
+#[tokio::test]
+async fn test_loader_local_file_stages_to_volume() {
+    let server = MockServer::start().await;
+    let file = write_temp_file(b"id,name\n1,alice\n2,bob\n", "csv");
+
+    // 1. CREATE VOLUME IF NOT EXISTS main.raw.rocky_staging
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains(
+            "CREATE VOLUME IF NOT EXISTS main.raw.rocky_staging",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-create-vol",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": null,
+            "result": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // 2. Files API upload — PUT under /Volumes/main/raw/rocky_staging/ with the
+    //    file bytes as the body and overwrite=true.
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/api/2\.0/fs/files/Volumes/main/raw/rocky_staging/rocky_load_[0-9a-f]+\.csv$",
+        ))
+        .and(header("Authorization", "Bearer test-token"))
+        .and(query_param("overwrite", "true"))
+        .and(body_string_contains("alice"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // 3. COPY INTO ... FROM '/Volumes/.../<file>'
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("COPY INTO main.raw.orders"))
+        .and(body_string_contains(
+            "FROM '/Volumes/main/raw/rocky_staging/rocky_load_",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-copy-local",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "schema": {
+                    "columns": [
+                        {"name": "num_affected_rows", "type_name": "LONG", "position": 0}
+                    ]
+                },
+                "total_row_count": 1
+            },
+            "result": { "data_array": [["2"]] }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // 4. Files API cleanup — DELETE the staged file.
+    Mock::given(method("DELETE"))
+        .and(path_regex(
+            r"^/api/2\.0/fs/files/Volumes/main/raw/rocky_staging/rocky_load_[0-9a-f]+\.csv$",
+        ))
+        .and(header("Authorization", "Bearer test-token"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let loader = DatabricksLoaderAdapter::new(connector);
+
+    let source = LoadSource::LocalFile(file.clone());
+    let target = TableRef {
+        catalog: "main".into(),
+        schema: "raw".into(),
+        table: "orders".into(),
+    };
+
+    let result = loader
+        .load(&source, &target, &LoadOptions::default())
+        .await
+        .expect("local-file load should succeed");
+
+    let _ = std::fs::remove_file(&file);
+
+    assert_eq!(result.rows_loaded, 2, "should surface num_affected_rows");
+    assert!(
+        result.bytes_read > 0,
+        "local-file load should report the on-disk byte count"
+    );
+    // `.expect(1)` on every mock asserts the full CREATE→PUT→COPY→DELETE sequence.
+    server.verify().await;
+}
+
+/// A configured staging-volume name flows into both the CREATE VOLUME DDL and
+/// the `/Volumes/.../` upload + COPY paths.
+#[tokio::test]
+async fn test_loader_local_file_custom_volume_name() {
+    let server = MockServer::start().await;
+    let file = write_temp_file(b"col\nv\n", "csv");
+
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains(
+            "CREATE VOLUME IF NOT EXISTS main.raw.hc_custom_stage",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-create-vol",
+            "status": { "state": "SUCCEEDED" }, "manifest": null, "result": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/api/2\.0/fs/files/Volumes/main/raw/hc_custom_stage/rocky_load_[0-9a-f]+\.csv$",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains(
+            "FROM '/Volumes/main/raw/hc_custom_stage/rocky_load_",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-copy", "status": { "state": "SUCCEEDED" },
+            "manifest": { "schema": { "columns": [
+                {"name": "num_affected_rows", "type_name": "LONG", "position": 0}
+            ]}, "total_row_count": 1 },
+            "result": { "data_array": [["1"]] }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path_regex(
+            r"^/api/2\.0/fs/files/Volumes/main/raw/hc_custom_stage/rocky_load_[0-9a-f]+\.csv$",
+        ))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let loader = DatabricksLoaderAdapter::new(connector).with_staging_volume("hc_custom_stage");
+
+    let target = TableRef {
+        catalog: "main".into(),
+        schema: "raw".into(),
+        table: "orders".into(),
+    };
+    let result = loader
+        .load(
+            &LoadSource::LocalFile(file.clone()),
+            &target,
+            &LoadOptions::default(),
+        )
+        .await
+        .expect("custom-volume local load should succeed");
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(result.rows_loaded, 1);
+    server.verify().await;
+}
+
+/// COPY INTO failure still cleans up the staged file — the DELETE fires even
+/// when the COPY errors, and the load surfaces the error.
+#[tokio::test]
+async fn test_loader_local_file_cleans_up_on_copy_failure() {
+    let server = MockServer::start().await;
+    let file = write_temp_file(b"id\n1\n", "csv");
+
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("CREATE VOLUME IF NOT EXISTS"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-create-vol",
+            "status": { "state": "SUCCEEDED" }, "manifest": null, "result": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/api/2\.0/fs/files/Volumes/.*"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // COPY INTO fails.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("COPY INTO"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-copy-fail",
+            "status": {
+                "state": "FAILED",
+                "error": { "error_code": "COPY_INTO_SOURCE_FILE_FORMAT_ERROR", "message": "bad data" }
+            },
+            "manifest": null, "result": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Cleanup DELETE must still fire after the failed COPY.
+    Mock::given(method("DELETE"))
+        .and(path_regex(r"^/api/2\.0/fs/files/Volumes/.*"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = Arc::new(test_connector(&server));
+    let loader = DatabricksLoaderAdapter::new(connector);
+    let target = TableRef {
+        catalog: "main".into(),
+        schema: "raw".into(),
+        table: "orders".into(),
+    };
+
+    let err = loader
+        .load(
+            &LoadSource::LocalFile(file.clone()),
+            &target,
+            &LoadOptions::default(),
+        )
+        .await
+        .expect_err("COPY INTO failure should surface as Err");
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        err.to_string().to_lowercase().contains("bad data")
+            || err.to_string().to_lowercase().contains("copy"),
+        "error should carry COPY context, got: {err}"
+    );
+    // `.expect(1)` on the DELETE mock proves cleanup ran despite the failure.
+    server.verify().await;
+}
+
+/// Upload (Files API PUT) failure aborts before COPY INTO, still attempts a
+/// best-effort cleanup DELETE, and surfaces the upload error.
+#[tokio::test]
+async fn test_loader_local_file_upload_failure_aborts_before_copy() {
+    let server = MockServer::start().await;
+    let file = write_temp_file(b"id\n1\n", "csv");
+
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("CREATE VOLUME IF NOT EXISTS"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-create-vol",
+            "status": { "state": "SUCCEEDED" }, "manifest": null, "result": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Upload returns 403 (e.g. no write privilege on the volume).
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/api/2\.0/fs/files/Volumes/.*"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("PERMISSION_DENIED"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Best-effort cleanup DELETE after the failed upload — 404 (nothing was
+    // written) is treated as success by the connector.
+    Mock::given(method("DELETE"))
+        .and(path_regex(r"^/api/2\.0/fs/files/Volumes/.*"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("NOT_FOUND"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // No COPY INTO mock mounted — a COPY call would surface as an unmatched
+    // request and fail the test, proving the upload failure aborts first.
+
+    let connector = Arc::new(test_connector(&server));
+    let loader = DatabricksLoaderAdapter::new(connector);
+    let target = TableRef {
+        catalog: "main".into(),
+        schema: "raw".into(),
+        table: "orders".into(),
+    };
+
+    let err = loader
+        .load(
+            &LoadSource::LocalFile(file.clone()),
+            &target,
+            &LoadOptions::default(),
+        )
+        .await
+        .expect_err("upload failure should surface as Err");
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        err.to_string().to_lowercase().contains("upload")
+            || err.to_string().contains("403")
+            || err.to_string().contains("PERMISSION_DENIED"),
+        "error should carry upload context, got: {err}"
+    );
+    server.verify().await;
 }
 
 /// Bearer token is sent correctly in the Authorization header.
