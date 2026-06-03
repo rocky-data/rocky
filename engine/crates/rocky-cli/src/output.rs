@@ -3415,6 +3415,11 @@ pub struct LoadFileOutput {
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Result of the data-contract gate, when the load pipeline declares a
+    /// contract. `None` for ungated loads. On a failed gate the data was not
+    /// promoted to the target; the violations explain why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract: Option<rocky_core::contracts::ContractResult>,
 }
 
 // --- Snapshot output ---

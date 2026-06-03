@@ -104,6 +104,15 @@ class AiSection(BaseModel):
     """
 
 
+class AllowedTypeChange(BaseModel):
+    """
+    A permitted type widening (e.g., INT to BIGINT) that won't trigger a violation.
+    """
+
+    from_: str = Field(..., alias="from")
+    to: str
+
+
 class BindingType(StrEnum):
     """
     Workspace binding access level.
@@ -930,6 +939,19 @@ class QuarantineMode3(StrEnum):
     drop = "drop"
 
 
+class RequiredColumn(BaseModel):
+    """
+    A column that must exist in the source with a specific type.
+    """
+
+    name: str
+    nullable: bool | None = True
+    type: str
+    """
+    Expected type, written in warehouse vocabulary (e.g. `BIGINT`, `VARCHAR`, `NUMBER(38,0)`). It is normalized to a portable Rocky type before comparison, so the same contract ports across warehouses (DuckDB `VARCHAR` and Snowflake `STRING` both match). A type the normalizer doesn't recognize is treated as unknown and never fails the type check — presence and nullability still apply.
+    """
+
+
 class RetryConfig(BaseModel):
     """
     Retry policy for transient warehouse errors (HTTP 429/503, rate limits, timeouts).
@@ -1499,6 +1521,27 @@ class CacheConfig(BaseModel):
     )
     """
     Schema cache. Stores `DESCRIBE TABLE` results in `state.redb` so leaf models typecheck against real warehouse types without a live round-trip on every compile.
+    """
+
+
+class ContractConfig(BaseModel):
+    """
+    Data contract configuration — enforced at copy/load time.
+    """
+
+    allowed_type_changes: list[AllowedTypeChange] | None = Field(
+        [], validate_default=True
+    )
+    """
+    Type changes that are allowed (widening only).
+    """
+    protected_columns: list[str] | None = []
+    """
+    Column names that must never be removed from the target.
+    """
+    required_columns: list[RequiredColumn] | None = Field([], validate_default=True)
+    """
+    Columns that must exist with specific types.
     """
 
 
@@ -2664,6 +2707,10 @@ class LoadPipelineConfig(BaseModel):
     )
     """
     Data quality checks run after loading.
+    """
+    contract: ContractConfig | None = None
+    """
+    Optional data contract that gates the load. When set, each file is loaded into a staging table, validated against the contract, and promoted to the target only if validation passes. On failure the staging table is dropped and the target is left untouched.
     """
     depends_on: list[str] | None = []
     """

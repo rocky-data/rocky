@@ -1532,6 +1532,10 @@ export interface LoadPipelineConfig {
    */
   checks?: ChecksConfig;
   /**
+   * Optional data contract that gates the load. When set, each file is loaded into a staging table, validated against the contract, and promoted to the target only if validation passes. On failure the staging table is dropped and the target is left untouched.
+   */
+  contract?: ContractConfig | null;
+  /**
    * Pipeline dependencies for chaining.
    */
   depends_on?: string[];
@@ -1555,6 +1559,44 @@ export interface LoadPipelineConfig {
    * Target table location.
    */
   target: LoadTargetConfig;
+  [k: string]: unknown;
+}
+/**
+ * Data contract configuration — enforced at copy/load time.
+ */
+export interface ContractConfig {
+  /**
+   * Type changes that are allowed (widening only).
+   */
+  allowed_type_changes?: AllowedTypeChange[];
+  /**
+   * Column names that must never be removed from the target.
+   */
+  protected_columns?: string[];
+  /**
+   * Columns that must exist with specific types.
+   */
+  required_columns?: RequiredColumn[];
+  [k: string]: unknown;
+}
+/**
+ * A permitted type widening (e.g., INT to BIGINT) that won't trigger a violation.
+ */
+export interface AllowedTypeChange {
+  from: string;
+  to: string;
+  [k: string]: unknown;
+}
+/**
+ * A column that must exist in the source with a specific type.
+ */
+export interface RequiredColumn {
+  name: string;
+  nullable?: boolean;
+  /**
+   * Expected type, written in warehouse vocabulary (e.g. `BIGINT`, `VARCHAR`, `NUMBER(38,0)`). It is normalized to a portable Rocky type before comparison, so the same contract ports across warehouses (DuckDB `VARCHAR` and Snowflake `STRING` both match). A type the normalizer doesn't recognize is treated as unknown and never fails the type check — presence and nullability still apply.
+   */
+  type: string;
   [k: string]: unknown;
 }
 /**

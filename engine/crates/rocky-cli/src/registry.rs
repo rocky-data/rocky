@@ -92,6 +92,13 @@ pub struct AdapterRegistry {
     /// `IcebergDiscoveryAdapter` wrapper (which owns the underlying
     /// `IcebergCatalogClient` and does not expose it).
     iceberg_clients: HashMap<String, Arc<IcebergCatalogClientAdapter>>,
+    /// Shared DuckDB connectors keyed by adapter name. The warehouse adapter,
+    /// discovery adapter, and (for `rocky load`) the loader all share one
+    /// `Arc<Mutex<DuckDbConnector>>` so a staging table written by the loader
+    /// is visible to `describe_table` / promote SQL through the same in-memory
+    /// or on-disk database — load's staging-promote gate depends on this.
+    #[cfg(feature = "duckdb")]
+    duckdb_connectors: HashMap<String, Arc<std::sync::Mutex<rocky_duckdb::DuckDbConnector>>>,
     adapter_configs: HashMap<String, AdapterConfig>,
 }
 
@@ -121,6 +128,11 @@ impl AdapterRegistry {
         let mut snowflake_connectors: HashMap<String, Arc<SnowflakeConnector>> = HashMap::new();
         let mut bigquery_adapters: HashMap<String, Arc<BigQueryAdapter>> = HashMap::new();
         let mut iceberg_clients: HashMap<String, Arc<IcebergCatalogClientAdapter>> = HashMap::new();
+        #[cfg(feature = "duckdb")]
+        let mut duckdb_connectors: HashMap<
+            String,
+            Arc<std::sync::Mutex<rocky_duckdb::DuckDbConnector>>,
+        > = HashMap::new();
         let mut adapter_configs = HashMap::new();
 
         // Cross-adapter run-level retry budget (follow-up to §P2.7). When
@@ -221,6 +233,11 @@ impl AdapterRegistry {
                     let shared = warehouse_adapter.shared_connector();
                     let warehouse_arc = Arc::new(warehouse_adapter);
                     warehouse.insert(name.clone(), warehouse_arc as Arc<dyn WarehouseAdapter>);
+
+                    // Keep the shared connector so `rocky load` can build a
+                    // loader against the same database the warehouse adapter
+                    // describes/promotes through (staging-promote gate).
+                    duckdb_connectors.insert(name.clone(), Arc::clone(&shared));
 
                     // Always register a discovery adapter for DuckDB so the same
                     // local database can act as a source for `rocky discover`.
@@ -513,6 +530,8 @@ impl AdapterRegistry {
             snowflake_connectors,
             bigquery_adapters,
             iceberg_clients,
+            #[cfg(feature = "duckdb")]
+            duckdb_connectors,
             adapter_configs,
         })
     }
@@ -770,6 +789,25 @@ impl AdapterRegistry {
         Ok(Box::new(
             rocky_snowflake::loader::SnowflakeLoaderAdapter::new(Arc::new(sf_connector)),
         ))
+    }
+
+    /// Build a DuckDB `LoaderAdapter` that shares the same connector as the
+    /// registered DuckDB warehouse adapter.
+    ///
+    /// Sharing the connector is what makes `rocky load`'s staging-promote gate
+    /// work on DuckDB: the loader writes the staging table and the warehouse
+    /// adapter's `describe_table` / promote SQL read it back through the *same*
+    /// in-memory or on-disk database. Building a fresh `in_memory()` loader
+    /// (as the standalone path does) would land the staging table in a
+    /// different database the warehouse adapter can't see.
+    #[cfg(feature = "duckdb")]
+    pub fn duckdb_loader(&self, name: &str) -> Result<Box<dyn LoaderAdapter>> {
+        let shared = self.duckdb_connectors.get(name).context(format!(
+            "no DuckDB connector registered for adapter '{name}'"
+        ))?;
+        Ok(Box::new(rocky_duckdb::loader::DuckDbLoaderAdapter::new(
+            Arc::clone(shared),
+        )))
     }
 }
 
