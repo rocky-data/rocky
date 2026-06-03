@@ -1,10 +1,11 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::column_map;
-use rocky_ir::ColumnInfo;
+use rocky_ir::{ColumnInfo, RockyType};
 
-/// Data contract configuration — enforced at copy time.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Data contract configuration — enforced at copy/load time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ContractConfig {
     /// Columns that must exist with specific types.
     #[serde(default)]
@@ -20,9 +21,15 @@ pub struct ContractConfig {
 }
 
 /// A column that must exist in the source with a specific type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RequiredColumn {
     pub name: String,
+    /// Expected type, written in warehouse vocabulary (e.g. `BIGINT`,
+    /// `VARCHAR`, `NUMBER(38,0)`). It is normalized to a portable Rocky type
+    /// before comparison, so the same contract ports across warehouses
+    /// (DuckDB `VARCHAR` and Snowflake `STRING` both match). A type the
+    /// normalizer doesn't recognize is treated as unknown and never fails the
+    /// type check — presence and nullability still apply.
     #[serde(rename = "type")]
     pub data_type: String,
     #[serde(default = "default_true")]
@@ -34,21 +41,25 @@ fn default_true() -> bool {
 }
 
 /// A permitted type widening (e.g., INT to BIGINT) that won't trigger a violation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AllowedTypeChange {
     pub from: String,
     pub to: String,
 }
 
 /// Result of contract validation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ContractResult {
     pub passed: bool,
     pub violations: Vec<ContractViolation>,
+    /// Non-fatal warnings — e.g. a contract clause that can't be
+    /// meaningfully enforced in this context. Does not affect `passed`.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// A single contract rule violation with the rule name, affected column, and message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ContractViolation {
     pub rule: String,
     pub column: String,
@@ -143,7 +154,168 @@ pub fn validate_contract(
     ContractResult {
         passed: violations.is_empty(),
         violations,
+        warnings: Vec::new(),
     }
+}
+
+/// Validate freshly-landed warehouse columns against a data contract,
+/// comparing types in Rocky's portable type vocabulary.
+///
+/// This is the contract gate for `rocky load`: `landed_columns` come from a
+/// live `DESCRIBE` of the staging table (raw warehouse type strings such as
+/// DuckDB `VARCHAR` or Snowflake `NUMBER(38,0)`), so type comparison can't
+/// be raw string equality if contracts are to port across warehouses.
+///
+/// Checks performed:
+/// - **Presence** (fully portable): every `required_columns` entry must
+///   exist in the landed data.
+/// - **Nullability** (fully portable): a required column declared
+///   `nullable = false` whose landed column is nullable is a violation.
+/// - **Type match** (best-effort): both the landed raw type and the
+///   contract's expected type string are normalized to [`RockyType`]; a
+///   violation is emitted only when both normalize to a *known* type and
+///   those types differ. If either side normalizes to [`RockyType::Unknown`],
+///   the match is skipped (never a false failure) — mirroring the compiler's
+///   contract type-checking.
+///
+/// `protected_columns` and `allowed_type_changes` describe source-vs-target
+/// *evolution*, which a single-table load can't meaningfully evaluate (there
+/// is no prior target snapshot in scope). When declared, they are surfaced
+/// as warnings rather than silently ignored.
+pub fn validate_contract_typed(
+    contract: &ContractConfig,
+    landed_columns: &[ColumnInfo],
+) -> ContractResult {
+    let mut violations = Vec::new();
+    let mut warnings = Vec::new();
+
+    let landed_map = column_map::build_column_map(landed_columns);
+
+    for req in &contract.required_columns {
+        let key = column_map::CiStr::new(&req.name);
+        let Some(col) = landed_map.get(key) else {
+            violations.push(ContractViolation {
+                rule: "required_column".to_string(),
+                column: req.name.clone(),
+                message: format!("required column '{}' not found in loaded data", req.name),
+            });
+            continue;
+        };
+
+        // Nullability — fully portable.
+        if !req.nullable && col.nullable {
+            violations.push(ContractViolation {
+                rule: "required_column_nullability".to_string(),
+                column: req.name.clone(),
+                message: format!(
+                    "column '{}' is nullable but the contract requires it to be non-nullable",
+                    req.name
+                ),
+            });
+        }
+
+        // Type match — best-effort in Rocky's type vocabulary.
+        let landed_ty = warehouse_type_to_rocky(&col.data_type);
+        let expected_ty = warehouse_type_to_rocky(&req.data_type);
+        if !rocky_types_match(&landed_ty, &expected_ty) {
+            violations.push(ContractViolation {
+                rule: "required_column_type".to_string(),
+                column: req.name.clone(),
+                message: format!(
+                    "column '{}' has type '{}' ({landed_ty}), expected '{}' ({expected_ty})",
+                    req.name, col.data_type, req.data_type
+                ),
+            });
+        }
+    }
+
+    if !contract.protected_columns.is_empty() {
+        warnings.push(
+            "`protected_columns` is declared but cannot be enforced on a load contract: \
+             it compares source columns against a prior target snapshot, which is not \
+             available when loading files. Ignored for this load."
+                .to_string(),
+        );
+    }
+    if !contract.allowed_type_changes.is_empty() {
+        warnings.push(
+            "`allowed_type_changes` is declared but cannot be enforced on a load contract: \
+             it gates type evolution against a prior target snapshot, which is not available \
+             when loading files. Ignored for this load."
+                .to_string(),
+        );
+    }
+
+    ContractResult {
+        passed: violations.is_empty(),
+        violations,
+        warnings,
+    }
+}
+
+/// Normalize a raw warehouse type string into a [`RockyType`].
+///
+/// Mirrors the compiler's `default_type_mapper` so the load gate compares
+/// types in the same vocabulary the rest of Rocky uses. Lives in rocky-core
+/// (not rocky-compiler) so the runtime load path can reach it without a
+/// dependency cycle; [`RockyType`] is shared via rocky-ir.
+///
+/// Unrecognized types map to [`RockyType::Unknown`] (which matches anything),
+/// so a type the map doesn't cover never produces a false failure.
+pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
+    let upper = warehouse_type.trim().to_uppercase();
+    match upper.as_str() {
+        "BOOLEAN" | "BOOL" => RockyType::Boolean,
+        "TINYINT" | "BYTE" | "SMALLINT" | "SHORT" | "INT" | "INTEGER" => RockyType::Int32,
+        "BIGINT" | "LONG" => RockyType::Int64,
+        "FLOAT" | "REAL" => RockyType::Float32,
+        "DOUBLE" | "DOUBLE PRECISION" => RockyType::Float64,
+        "STRING" | "VARCHAR" | "TEXT" => RockyType::String,
+        "BINARY" => RockyType::Binary,
+        "DATE" => RockyType::Date,
+        "TIMESTAMP" => RockyType::Timestamp,
+        "TIMESTAMP_NTZ" => RockyType::TimestampNtz,
+        "VARIANT" => RockyType::Variant,
+        // DECIMAL / NUMERIC (ANSI, Databricks, BigQuery) and NUMBER
+        // (Snowflake's fixed-point name). Snowflake's `DESCRIBE` returns
+        // `NUMBER(38,0)`, so it must normalize to the same RockyType as a
+        // contract written `DECIMAL(38,0)` for the contract to port.
+        _ if upper.starts_with("DECIMAL")
+            || upper.starts_with("NUMERIC")
+            || upper.starts_with("NUMBER") =>
+        {
+            if let Some(params) = upper
+                .strip_prefix("DECIMAL(")
+                .or_else(|| upper.strip_prefix("NUMERIC("))
+                .or_else(|| upper.strip_prefix("NUMBER("))
+                .and_then(|s| s.strip_suffix(')'))
+            {
+                let parts: Vec<&str> = params.split(',').collect();
+                if parts.len() == 2
+                    && let (Ok(p), Ok(s)) = (parts[0].trim().parse(), parts[1].trim().parse())
+                {
+                    return RockyType::Decimal {
+                        precision: p,
+                        scale: s,
+                    };
+                }
+            }
+            RockyType::Decimal {
+                precision: 38,
+                scale: 0,
+            }
+        }
+        _ => RockyType::Unknown,
+    }
+}
+
+/// Compare two normalized [`RockyType`]s for contract purposes.
+///
+/// Returns `true` (a match, so no violation) when either side is
+/// [`RockyType::Unknown`] — an un-normalizable type is never a false
+/// failure. Otherwise compares by equality.
+fn rocky_types_match(a: &RockyType, b: &RockyType) -> bool {
+    *a == RockyType::Unknown || *b == RockyType::Unknown || a == b
 }
 
 #[cfg(test)]
@@ -327,6 +499,170 @@ mod tests {
         let result = validate_contract(&contract, &[col("name", "STRING")], &[]);
         assert!(!result.passed);
         assert_eq!(result.violations.len(), 2);
+    }
+
+    // --- Typed (load-gate) validation path ---
+
+    fn col_n(name: &str, data_type: &str, nullable: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            nullable,
+        }
+    }
+
+    #[test]
+    fn test_warehouse_type_to_rocky() {
+        assert_eq!(warehouse_type_to_rocky("VARCHAR"), RockyType::String);
+        assert_eq!(warehouse_type_to_rocky("varchar"), RockyType::String);
+        assert_eq!(warehouse_type_to_rocky("BIGINT"), RockyType::Int64);
+        assert_eq!(warehouse_type_to_rocky("BOOLEAN"), RockyType::Boolean);
+        assert_eq!(
+            warehouse_type_to_rocky("NUMBER(38,0)"),
+            RockyType::Decimal {
+                precision: 38,
+                scale: 0
+            }
+        );
+        assert_eq!(
+            warehouse_type_to_rocky("SOMETHING_WEIRD"),
+            RockyType::Unknown
+        );
+    }
+
+    #[test]
+    fn test_typed_required_present_and_type_matches() {
+        // Landed types mirror DuckDB DESCRIBE output (BIGINT, VARCHAR).
+        let contract = ContractConfig {
+            required_columns: vec![
+                RequiredColumn {
+                    name: "id".into(),
+                    data_type: "BIGINT".into(),
+                    nullable: true,
+                },
+                RequiredColumn {
+                    name: "name".into(),
+                    data_type: "VARCHAR".into(),
+                    nullable: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let landed = vec![col_n("id", "BIGINT", true), col_n("name", "VARCHAR", true)];
+        let result = validate_contract_typed(&contract, &landed);
+        assert!(result.passed, "violations: {:?}", result.violations);
+    }
+
+    #[test]
+    fn test_typed_required_missing() {
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "id".into(),
+                data_type: "BIGINT".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let landed = vec![col_n("name", "VARCHAR", true)];
+        let result = validate_contract_typed(&contract, &landed);
+        assert!(!result.passed);
+        assert_eq!(result.violations[0].rule, "required_column");
+    }
+
+    #[test]
+    fn test_typed_wrong_type_both_known() {
+        // Landed BIGINT (Int64) vs contract VARCHAR (String) — both known, differ.
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "id".into(),
+                data_type: "VARCHAR".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let landed = vec![col_n("id", "BIGINT", true)];
+        let result = validate_contract_typed(&contract, &landed);
+        assert!(!result.passed);
+        assert_eq!(result.violations[0].rule, "required_column_type");
+    }
+
+    #[test]
+    fn test_typed_portable_aliases_match() {
+        // Contract written as Rocky-ish "STRING" must match DuckDB's "VARCHAR"
+        // because both normalize to RockyType::String — the portability point.
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "name".into(),
+                data_type: "STRING".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let landed = vec![col_n("name", "VARCHAR", true)];
+        let result = validate_contract_typed(&contract, &landed);
+        assert!(result.passed, "violations: {:?}", result.violations);
+    }
+
+    #[test]
+    fn test_typed_unknown_type_never_fails() {
+        // An un-normalizable landed type must not produce a type violation.
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "geo".into(),
+                data_type: "BIGINT".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let landed = vec![col_n("geo", "GEOMETRY", true)];
+        let result = validate_contract_typed(&contract, &landed);
+        assert!(result.passed, "violations: {:?}", result.violations);
+    }
+
+    #[test]
+    fn test_typed_nullability_violation() {
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "id".into(),
+                data_type: "BIGINT".into(),
+                nullable: false,
+            }],
+            ..Default::default()
+        };
+        let landed = vec![col_n("id", "BIGINT", true)]; // landed nullable
+        let result = validate_contract_typed(&contract, &landed);
+        assert!(!result.passed);
+        assert_eq!(result.violations[0].rule, "required_column_nullability");
+    }
+
+    #[test]
+    fn test_typed_protected_and_type_changes_warn() {
+        let contract = ContractConfig {
+            required_columns: vec![],
+            protected_columns: vec!["id".into()],
+            allowed_type_changes: vec![AllowedTypeChange {
+                from: "INT".into(),
+                to: "BIGINT".into(),
+            }],
+        };
+        let landed = vec![col_n("id", "BIGINT", true)];
+        let result = validate_contract_typed(&contract, &landed);
+        // Unenforceable clauses must surface as warnings, not silently no-op,
+        // and must not fail the contract.
+        assert!(result.passed);
+        assert_eq!(result.warnings.len(), 2);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("protected_columns"))
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("allowed_type_changes"))
+        );
     }
 
     #[test]

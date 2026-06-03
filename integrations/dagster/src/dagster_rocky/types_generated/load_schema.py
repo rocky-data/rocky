@@ -6,12 +6,39 @@ from __future__ import annotations
 from pydantic import BaseModel, conint
 
 
+class ContractViolation(BaseModel):
+    """
+    A single contract rule violation with the rule name, affected column, and message.
+    """
+
+    column: str
+    message: str
+    rule: str
+
+
+class ContractResult(BaseModel):
+    """
+    Result of contract validation.
+    """
+
+    passed: bool
+    violations: list[ContractViolation]
+    warnings: list[str] | None = []
+    """
+    Non-fatal warnings — e.g. a contract clause that can't be meaningfully enforced in this context. Does not affect `passed`.
+    """
+
+
 class LoadFileOutput(BaseModel):
     """
     A single file result within `LoadOutput`.
     """
 
     bytes_read: conint(ge=0)
+    contract: ContractResult | None = None
+    """
+    Result of the data-contract gate, when the load pipeline declares a contract. `None` for ungated loads. On a failed gate the data was not promoted to the target; the violations explain why.
+    """
     duration_ms: conint(ge=0)
     error: str | None = None
     file: str

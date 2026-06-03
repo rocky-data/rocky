@@ -3937,6 +3937,13 @@ pub struct LoadPipelineConfig {
     #[serde(default)]
     pub options: LoadOptionsConfig,
 
+    /// Optional data contract that gates the load. When set, each file is
+    /// loaded into a staging table, validated against the contract, and
+    /// promoted to the target only if validation passes. On failure the
+    /// staging table is dropped and the target is left untouched.
+    #[serde(default)]
+    pub contract: Option<crate::contracts::ContractConfig>,
+
     /// Data quality checks run after loading.
     #[serde(default)]
     pub checks: ChecksConfig,

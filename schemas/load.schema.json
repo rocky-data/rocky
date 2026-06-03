@@ -1,6 +1,53 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "ContractResult": {
+      "description": "Result of contract validation.",
+      "properties": {
+        "passed": {
+          "type": "boolean"
+        },
+        "violations": {
+          "items": {
+            "$ref": "#/definitions/ContractViolation"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "default": [],
+          "description": "Non-fatal warnings — e.g. a contract clause that can't be meaningfully enforced in this context. Does not affect `passed`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "passed",
+        "violations"
+      ],
+      "type": "object"
+    },
+    "ContractViolation": {
+      "description": "A single contract rule violation with the rule name, affected column, and message.",
+      "properties": {
+        "column": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "rule": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "column",
+        "message",
+        "rule"
+      ],
+      "type": "object"
+    },
     "LoadFileOutput": {
       "description": "A single file result within `LoadOutput`.",
       "properties": {
@@ -8,6 +55,17 @@
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "contract": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ContractResult"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Result of the data-contract gate, when the load pipeline declares a contract. `None` for ungated loads. On a failed gate the data was not promoted to the target; the violations explain why."
         },
         "duration_ms": {
           "format": "uint64",

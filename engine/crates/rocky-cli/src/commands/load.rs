@@ -8,18 +8,24 @@
 //! [`CsvBatchReader`]: rocky_core::arrow_loader::CsvBatchReader
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use tracing::info;
 
 use rocky_adapter_sdk::{FileFormat, LoadOptions, LoadSource, LoaderAdapter, TableRef};
+use rocky_core::contracts::{ContractConfig, ContractResult, validate_contract_typed};
 use rocky_core::state::{LoadedFileRecord, StateStore};
+use rocky_core::traits::WarehouseAdapter;
 
 use crate::output::{LoadFileOutput, LoadOutput, print_json};
 use crate::registry::{AdapterRegistry, resolve_pipeline};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Suffix appended to a target table name to form its per-load staging table.
+const STAGING_SUFFIX: &str = "__rocky_stg";
 
 /// Execute `rocky load`: discover files, load them into the target table(s).
 ///
@@ -102,12 +108,29 @@ pub async fn run_load(
 
     let adapter_name = pipeline_cfg.target_adapter();
 
-    // Build a DuckDB loader adapter if the adapter type is DuckDB.
     let adapter_cfg = registry
         .adapter_config(adapter_name)
         .context(format!("no adapter config for '{adapter_name}'"))?;
 
+    // Optional data contract that gates the load (staging-promote semantics).
+    let contract: Option<&ContractConfig> = load_cfg.as_ref().and_then(|lc| lc.contract.as_ref());
+
+    // Build the loader. When a contract is present we route through the
+    // warehouse adapter's *shared* connector so the staging table the loader
+    // writes is visible to `describe_table`/promote SQL (critical on DuckDB,
+    // where a fresh in-memory loader would land staging in a separate DB).
     let loader: Box<dyn LoaderAdapter> = build_loader(adapter_name, adapter_cfg, &registry)?;
+
+    // The warehouse adapter is only needed for the staging-promote gate.
+    let warehouse: Option<Arc<dyn WarehouseAdapter>> = if contract.is_some() {
+        Some(
+            registry
+                .warehouse_adapter(adapter_name)
+                .context("failed to resolve warehouse adapter for contract-gated load")?,
+        )
+    } else {
+        None
+    };
 
     // Discover files in the source directory.
     let files = discover_files(source_dir, requested_format)?;
@@ -179,24 +202,46 @@ pub async fn run_load(
         );
 
         let load_source = LoadSource::LocalFile(file_path.clone());
-        match loader.load(&load_source, &target, &options).await {
-            Ok(result) => {
+
+        // Two paths: a contract-gated staging-promote, or the direct load.
+        let outcome = match (contract, warehouse.as_deref()) {
+            (Some(contract), Some(warehouse)) => {
+                load_with_contract_gate(
+                    loader.as_ref(),
+                    warehouse,
+                    &load_source,
+                    &target,
+                    &options,
+                    contract,
+                )
+                .await
+            }
+            _ => loader
+                .load(&load_source, &target, &options)
+                .await
+                .map(|r| (r.rows_loaded, r.bytes_read, None))
+                .map_err(|e| anyhow::anyhow!("{e}")),
+        };
+
+        match outcome {
+            Ok((rows_loaded, bytes_read, contract_result)) => {
                 let duration = file_start.elapsed().as_millis() as u64;
                 info!(
                     file = %file_path.display(),
-                    rows = result.rows_loaded,
-                    bytes = result.bytes_read,
+                    rows = rows_loaded,
+                    bytes = bytes_read,
                     duration_ms = duration,
                     "file loaded"
                 );
-                total_rows += result.rows_loaded;
-                total_bytes += result.bytes_read;
+                total_rows += rows_loaded;
+                total_bytes += bytes_read;
 
-                // Record the loaded file in the state store for incremental tracking.
+                // Record the loaded file only after a successful load (and, for
+                // contract-gated loads, a successful promote).
                 let record = LoadedFileRecord {
                     loaded_at: chrono::Utc::now(),
-                    rows_loaded: result.rows_loaded,
-                    bytes_read: result.bytes_read,
+                    rows_loaded,
+                    bytes_read,
                     duration_ms: duration,
                     file_hash: None,
                 };
@@ -215,21 +260,25 @@ pub async fn run_load(
                 file_results.push(LoadFileOutput {
                     file: file_path.display().to_string(),
                     target: target_display,
-                    rows_loaded: result.rows_loaded,
-                    bytes_read: result.bytes_read,
+                    rows_loaded,
+                    bytes_read,
                     duration_ms: duration,
                     error: None,
+                    contract: contract_result,
                 });
                 files_loaded += 1;
             }
             Err(e) => {
                 let duration = file_start.elapsed().as_millis() as u64;
-                let err_msg = format!("{e}");
+                let err_msg = format!("{e:#}");
                 tracing::error!(
                     file = %file_path.display(),
                     error = %err_msg,
                     "file load failed"
                 );
+                // Surface the contract result on a gate failure when available,
+                // so JSON consumers see the specific violations.
+                let contract_result = e.downcast_ref::<ContractGateError>().map(|g| g.0.clone());
                 file_results.push(LoadFileOutput {
                     file: file_path.display().to_string(),
                     target: target_display,
@@ -237,6 +286,7 @@ pub async fn run_load(
                     bytes_read: 0,
                     duration_ms: duration,
                     error: Some(err_msg),
+                    contract: contract_result,
                 });
                 files_failed += 1;
             }
@@ -329,18 +379,11 @@ fn build_loader(
     match adapter_cfg.adapter_type.as_str() {
         #[cfg(feature = "duckdb")]
         "duckdb" => {
-            use rocky_duckdb::loader::DuckDbLoaderAdapter;
-
-            let db_adapter = if let Some(p) = adapter_cfg.path.as_deref() {
-                DuckDbLoaderAdapter::new(
-                    rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(std::path::Path::new(p))
-                        .context(format!("failed to open DuckDB at '{p}'"))?
-                        .shared_connector(),
-                )
-            } else {
-                DuckDbLoaderAdapter::in_memory().context("failed to create in-memory DuckDB")?
-            };
-            Ok(Box::new(db_adapter))
+            // Share the registry's DuckDB connector so a loaded (staging)
+            // table is visible to the same warehouse adapter's `describe_table`
+            // and promote SQL. This matters for in-memory DuckDB, where a
+            // freshly-opened loader would otherwise use a separate database.
+            registry.duckdb_loader(adapter_name)
         }
         #[cfg(not(feature = "duckdb"))]
         "duckdb" => {
@@ -384,6 +427,178 @@ fn discover_files(
 
     files.sort();
     Ok(files)
+}
+
+/// Error carrying the [`ContractResult`] of a failed contract gate so the
+/// caller can surface the specific violations in JSON output.
+#[derive(Debug)]
+struct ContractGateError(ContractResult);
+
+impl std::fmt::Display for ContractGateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msgs: Vec<String> = self
+            .0
+            .violations
+            .iter()
+            .map(|v| format!("{} [{}]: {}", v.column, v.rule, v.message))
+            .collect();
+        write!(
+            f,
+            "contract validation failed ({} violation(s)): {}",
+            self.0.violations.len(),
+            msgs.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for ContractGateError {}
+
+/// Load one file into a staging table, validate it against `contract`, and
+/// promote to `target` only if validation passes (true staging-promote gate).
+///
+/// On a contract failure the staging table is dropped and the function returns
+/// a [`ContractGateError`] — the target is never created or modified, so
+/// non-conforming data never lands. The staging table is also dropped on the
+/// happy path after a successful promote.
+///
+/// Returns `(rows_loaded, bytes_read, Some(contract_result))` on success.
+async fn load_with_contract_gate(
+    loader: &dyn LoaderAdapter,
+    warehouse: &dyn WarehouseAdapter,
+    source: &LoadSource,
+    target: &TableRef,
+    options: &LoadOptions,
+    contract: &ContractConfig,
+) -> Result<(u64, u64, Option<ContractResult>)> {
+    // Validate every identifier before it touches SQL. The staging name is
+    // `<table>__rocky_stg`; the suffix keeps it a valid SQL identifier.
+    let staging_name = format!("{}{STAGING_SUFFIX}", target.table);
+    rocky_sql::validation::validate_identifier(&target.table)
+        .with_context(|| format!("invalid target table name '{}'", target.table))?;
+    rocky_sql::validation::validate_identifier(&target.schema)
+        .with_context(|| format!("invalid target schema '{}'", target.schema))?;
+    if !target.catalog.is_empty() {
+        rocky_sql::validation::validate_identifier(&target.catalog)
+            .with_context(|| format!("invalid target catalog '{}'", target.catalog))?;
+    }
+    // staging_name is derived from the already-validated table name + a static
+    // suffix, so it's guaranteed valid; validate anyway as a belt-and-braces.
+    rocky_sql::validation::validate_identifier(&staging_name)
+        .with_context(|| format!("invalid staging table name '{staging_name}'"))?;
+
+    let staging = TableRef {
+        catalog: target.catalog.clone(),
+        schema: target.schema.clone(),
+        table: staging_name.clone(),
+    };
+    let staging_ir = to_ir_table_ref(&staging);
+    let target_ir = to_ir_table_ref(target);
+
+    let dialect = warehouse.dialect();
+    let staging_ref = dialect
+        .format_table_ref(&staging.catalog, &staging.schema, &staging.table)
+        .map_err(|e| anyhow::anyhow!("failed to format staging table ref: {e}"))?;
+    let target_ref = dialect
+        .format_table_ref(&target.catalog, &target.schema, &target.table)
+        .map_err(|e| anyhow::anyhow!("failed to format target table ref: {e}"))?;
+
+    // Start from a clean staging table so a prior aborted run can't leak rows.
+    let drop_staging_sql = dialect.drop_table_sql(&staging_ref);
+    warehouse
+        .execute_statement(&drop_staging_sql)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to drop pre-existing staging table: {e}"))?;
+
+    // Load the file into staging (always create it fresh).
+    let staging_options = LoadOptions {
+        create_table: true,
+        truncate_first: false,
+        ..options.clone()
+    };
+    let load_result = match loader.load(source, &staging, &staging_options).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Best-effort cleanup; don't mask the original load error.
+            let _ = warehouse.execute_statement(&drop_staging_sql).await;
+            return Err(anyhow::anyhow!("staging load failed: {e}"));
+        }
+    };
+
+    // Validate the landed staging schema against the contract.
+    let landed = match warehouse.describe_table(&staging_ir).await {
+        Ok(cols) => cols,
+        Err(e) => {
+            let _ = warehouse.execute_statement(&drop_staging_sql).await;
+            return Err(anyhow::anyhow!(
+                "failed to describe staging table for contract validation: {e}"
+            ));
+        }
+    };
+    let result = validate_contract_typed(contract, &landed);
+
+    for warning in &result.warnings {
+        tracing::warn!(table = %target, "{warning}");
+    }
+
+    if !result.passed {
+        // Gate closed: drop staging, leave the target untouched.
+        if let Err(e) = warehouse.execute_statement(&drop_staging_sql).await {
+            tracing::warn!(error = %e, "failed to drop staging table after contract failure");
+        }
+        return Err(ContractGateError(result).into());
+    }
+
+    // Gate open: promote staging into the target, mirroring the loader's
+    // create/truncate semantics but sourced from the staging table.
+    let select_from_staging = format!("SELECT * FROM {staging_ref}");
+    let target_exists = warehouse
+        .describe_table(&target_ir)
+        .await
+        .map(|cols| !cols.is_empty())
+        .unwrap_or(false);
+
+    let promote_stmts: Vec<String> = if !target_exists && options.create_table {
+        vec![dialect.create_table_as(&target_ref, &select_from_staging)]
+    } else {
+        let mut stmts = Vec::new();
+        if options.truncate_first {
+            // `DELETE FROM <t> WHERE TRUE` (via the dialect) instead of a bare
+            // `DELETE FROM <t>`: BigQuery rejects an unqualified DELETE, and the
+            // `WHERE TRUE` form is portable across DuckDB/Snowflake/Databricks/BQ.
+            stmts.push(dialect.delete_where(&target_ref, "TRUE"));
+        }
+        stmts.push(dialect.insert_into(&target_ref, &select_from_staging));
+        stmts
+    };
+
+    for stmt in &promote_stmts {
+        if let Err(e) = warehouse.execute_statement(stmt).await {
+            // Promote failed mid-flight; clean up staging and surface the error.
+            let _ = warehouse.execute_statement(&drop_staging_sql).await;
+            return Err(anyhow::anyhow!("failed to promote staging to target: {e}"));
+        }
+    }
+
+    // Promote done — drop staging.
+    if let Err(e) = warehouse.execute_statement(&drop_staging_sql).await {
+        tracing::warn!(error = %e, "failed to drop staging table after promote");
+    }
+
+    Ok((
+        load_result.rows_loaded,
+        load_result.bytes_read,
+        Some(result),
+    ))
+}
+
+/// Convert an adapter-SDK [`TableRef`] into the rocky-ir `TableRef` that the
+/// `WarehouseAdapter` trait consumes.
+fn to_ir_table_ref(t: &TableRef) -> rocky_ir::TableRef {
+    rocky_ir::TableRef {
+        catalog: t.catalog.clone(),
+        schema: t.schema.clone(),
+        table: t.table.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -616,5 +831,236 @@ create_table = true
         // Confirm listing works.
         let files = state_store.list_loaded_files("ingest").unwrap();
         assert_eq!(files.len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Contract gate (staging-promote) — DuckDB-backed, no credentials
+    // ------------------------------------------------------------------
+
+    /// Open a file-backed DuckDB and return whether `main.<table>` exists and
+    /// its row count. Uses a fresh adapter so we observe committed on-disk
+    /// state after `run_load` has dropped its registry (and thus its
+    /// connection).
+    #[cfg(feature = "duckdb")]
+    fn table_row_count(db_path: &Path, table: &str) -> Option<usize> {
+        use rocky_duckdb::DuckDbConnector;
+        let conn = DuckDbConnector::open(db_path).unwrap();
+        let exists = conn
+            .execute_sql(&format!(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = 'main' AND table_name = '{table}'"
+            ))
+            .map(|r| !r.rows.is_empty())
+            .unwrap_or(false);
+        if !exists {
+            return None;
+        }
+        let r = conn
+            .execute_sql(&format!("SELECT COUNT(*) FROM main.{table}"))
+            .unwrap();
+        Some(
+            r.rows[0][0]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        )
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn write_contract_config(dir: &Path, db_path: &Path) -> std::path::PathBuf {
+        let toml_content = format!(
+            r#"
+[adapter.default]
+type = "duckdb"
+path = "{}"
+
+[pipeline.ingest]
+type = "load"
+source_dir = "data/"
+format = "csv"
+
+[pipeline.ingest.target]
+adapter = "default"
+catalog = ""
+schema = "main"
+table = "orders"
+
+[pipeline.ingest.options]
+create_table = true
+
+[pipeline.ingest.contract]
+required_columns = [
+    {{ name = "id", type = "BIGINT" }},
+    {{ name = "product", type = "VARCHAR" }},
+]
+"#,
+            db_path.display()
+        );
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(&config_path, toml_content).unwrap();
+        config_path
+    }
+
+    /// A passing load whose contract also declares `protected_columns`
+    /// succeeds and surfaces the unenforceable-clause warning on the gate
+    /// result (decision #4: warn, don't silently no-op). Exercises the path
+    /// from `validate_contract_typed` warnings into `load_with_contract_gate`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn test_contract_gate_pass_surfaces_unenforceable_warning() {
+        use rocky_core::contracts::{ContractConfig, validate_contract_typed};
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::DuckDbConnector;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::loader::DuckDbLoaderAdapter;
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("orders.csv");
+        std::fs::write(&csv_path, "id,product\n1,Widget\n").unwrap();
+
+        let shared = Arc::new(Mutex::new(DuckDbConnector::in_memory().unwrap()));
+        let loader = DuckDbLoaderAdapter::new(Arc::clone(&shared));
+        let wh = DuckDbWarehouseAdapter::from_shared(Arc::clone(&shared));
+
+        let contract = ContractConfig {
+            required_columns: vec![rocky_core::contracts::RequiredColumn {
+                name: "id".into(),
+                data_type: "BIGINT".into(),
+                nullable: true,
+            }],
+            protected_columns: vec!["id".into()],
+            ..Default::default()
+        };
+
+        let target = TableRef {
+            catalog: String::new(),
+            schema: "main".into(),
+            table: "orders".into(),
+        };
+        let source = LoadSource::LocalFile(csv_path);
+        let options = LoadOptions {
+            format: Some(FileFormat::Csv),
+            create_table: true,
+            ..LoadOptions::default()
+        };
+
+        let (rows, _bytes, result) =
+            load_with_contract_gate(&loader, &wh, &source, &target, &options, &contract)
+                .await
+                .expect("passing contract should promote");
+        assert_eq!(rows, 1);
+        let result = result.expect("gate result should be present");
+        assert!(result.passed);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("protected_columns")),
+            "unenforceable protected_columns clause must surface as a warning: {:?}",
+            result.warnings
+        );
+
+        // Sanity: the same warning is what validate_contract_typed emits.
+        let landed = wh
+            .describe_table(&rocky_ir::TableRef {
+                catalog: String::new(),
+                schema: "main".into(),
+                table: "orders".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            !validate_contract_typed(&contract, &landed)
+                .warnings
+                .is_empty()
+        );
+    }
+
+    /// (a) A CSV satisfying the contract loads and lands rows in the target.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn test_contract_gate_pass_lands_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("orders.csv"),
+            "id,product,qty\n1,Widget,10\n2,Gadget,5\n3,Doohickey,3\n",
+        )
+        .unwrap();
+
+        let db_path = dir.path().join("wh.duckdb");
+        let config_path = write_contract_config(dir.path(), &db_path);
+
+        run_load(&config_path, None, None, None, None, false, false)
+            .await
+            .expect("contract-satisfying load should succeed");
+
+        // Target has the rows; staging table is gone.
+        assert_eq!(table_row_count(&db_path, "orders"), Some(3));
+        assert_eq!(
+            table_row_count(&db_path, "orders__rocky_stg"),
+            None,
+            "staging table must be dropped after a successful promote"
+        );
+    }
+
+    /// (b) A CSV violating the contract (missing required column AND a
+    /// wrong-type column) fails the command, and the target is never created.
+    /// The staging table must also be gone.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn test_contract_gate_fail_leaves_target_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        // Missing required column `product`; `id` lands as VARCHAR (not BIGINT).
+        std::fs::write(data_dir.join("orders.csv"), "id,qty\nabc,10\ndef,5\n").unwrap();
+
+        let db_path = dir.path().join("wh.duckdb");
+        let config_path = write_contract_config(dir.path(), &db_path);
+
+        let err = run_load(&config_path, None, None, None, None, false, false)
+            .await
+            .expect_err("contract-violating load must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to load"),
+            "unexpected error message: {msg}"
+        );
+
+        // Target was never created; staging is gone (no leaked tables).
+        assert_eq!(
+            table_row_count(&db_path, "orders"),
+            None,
+            "non-conforming data must never land in the target"
+        );
+        assert_eq!(
+            table_row_count(&db_path, "orders__rocky_stg"),
+            None,
+            "staging table must be dropped after a failed gate"
+        );
+    }
+
+    /// On a re-run that satisfies the contract, an existing target with a
+    /// truncate-first option is replaced rather than duplicated.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn test_contract_gate_json_output_reports_violations() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("orders.csv"), "id,qty\n1,10\n").unwrap();
+
+        let db_path = dir.path().join("wh.duckdb");
+        let config_path = write_contract_config(dir.path(), &db_path);
+
+        // JSON mode still fails (non-zero) but should not panic.
+        let err = run_load(&config_path, None, None, None, None, false, true)
+            .await
+            .expect_err("contract-violating load must fail in json mode too");
+        assert!(format!("{err:#}").contains("failed to load"));
+        assert_eq!(table_row_count(&db_path, "orders"), None);
     }
 }

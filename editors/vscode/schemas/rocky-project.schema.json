@@ -402,6 +402,22 @@
       },
       "type": "object"
     },
+    "AllowedTypeChange": {
+      "description": "A permitted type widening (e.g., INT to BIGINT) that won't trigger a violation.",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
     "BindingType": {
       "description": "Workspace binding access level.",
       "enum": [
@@ -665,6 +681,36 @@
         }
       ],
       "description": "Concurrency strategy: the literal `\"adaptive\"` for AIMD-based throttling, or a positive integer for fixed concurrency."
+    },
+    "ContractConfig": {
+      "description": "Data contract configuration — enforced at copy/load time.",
+      "properties": {
+        "allowed_type_changes": {
+          "default": [],
+          "description": "Type changes that are allowed (widening only).",
+          "items": {
+            "$ref": "#/definitions/AllowedTypeChange"
+          },
+          "type": "array"
+        },
+        "protected_columns": {
+          "default": [],
+          "description": "Column names that must never be removed from the target.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "required_columns": {
+          "default": [],
+          "description": "Columns that must exist with specific types.",
+          "items": {
+            "$ref": "#/definitions/RequiredColumn"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
     },
     "CostSection": {
       "additionalProperties": false,
@@ -1431,6 +1477,18 @@
             "row_count": false
           },
           "description": "Data quality checks run after loading."
+        },
+        "contract": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ContractConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional data contract that gates the load. When set, each file is loaded into a staging table, validated against the contract, and promoted to the target only if validation passes. On failure the staging table is dropped and the target is left untouched."
         },
         "depends_on": {
           "default": [],
@@ -2515,6 +2573,27 @@
       "required": [
         "source",
         "target"
+      ],
+      "type": "object"
+    },
+    "RequiredColumn": {
+      "description": "A column that must exist in the source with a specific type.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "nullable": {
+          "default": true,
+          "type": "boolean"
+        },
+        "type": {
+          "description": "Expected type, written in warehouse vocabulary (e.g. `BIGINT`, `VARCHAR`, `NUMBER(38,0)`). It is normalized to a portable Rocky type before comparison, so the same contract ports across warehouses (DuckDB `VARCHAR` and Snowflake `STRING` both match). A type the normalizer doesn't recognize is treated as unknown and never fails the type check — presence and nullability still apply.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "type"
       ],
       "type": "object"
     },
