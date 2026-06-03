@@ -3772,16 +3772,26 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
 /// No-op (returns `Ok` without mutating) when there is no `--model` selection
 /// — a full run builds every model, so nothing is deferred.
 ///
+/// The deferred upstream's **catalog** is validated with the rule that matches
+/// `dialect`: BigQuery allows hyphenated project IDs (validated via
+/// `validate_gcp_project_id`) and the rewritten reference is backtick-quoted to
+/// match the dialect's emitted form; every other dialect keeps the strict
+/// `validate_identifier` rule and renders bare identifiers. Schema and table
+/// always use `validate_identifier` — datasets/schemas and tables have no
+/// hyphens on any supported warehouse.
+///
 /// # Errors
 ///
 /// Returns an error when `--defer-to` (or a deferred upstream's catalog /
-/// table) fails SQL-identifier validation, or when a selected model's SQL is
-/// not parseable. Identifier validation guards against interpolating an
-/// unvalidated string into the rewritten reference.
+/// schema / table) fails the applicable identifier-validation rule, or when a
+/// selected model's SQL cannot be parsed and rewritten. Identifier validation
+/// guards against interpolating an unvalidated string into the rewritten
+/// reference.
 fn apply_defer_rewrite(
     compile_result: &mut rocky_compiler::compile::CompileResult,
     model_name_filter: Option<&str>,
     defer_opts: &DeferOptions,
+    dialect: &dyn rocky_core::traits::SqlDialect,
 ) -> Result<()> {
     use std::collections::{HashMap, HashSet};
 
@@ -3791,8 +3801,17 @@ fn apply_defer_rewrite(
         return Ok(());
     };
 
+    // BigQuery is the one shipping dialect whose qualified parts (the project /
+    // catalog) may contain characters bare SQL identifiers reject — hyphens.
+    // For it the catalog is validated with the GCP-project rule and the
+    // rewritten reference is backtick-quoted to match `format_table_ref`; every
+    // other dialect keeps the strict identifier rule and renders bare names.
+    let is_bigquery = dialect.name() == "bigquery";
+    let quote_style: Option<char> = if is_bigquery { Some('`') } else { None };
+
     // Validate the `--defer-to` schema override once up front — it is user
-    // input that ends up serialized into SQL.
+    // input that ends up serialized into SQL. Schemas/datasets never carry
+    // hyphens, so the strict identifier rule applies on every dialect.
     if let Some(schema) = &defer_opts.defer_to {
         rocky_sql::validation::validate_identifier(schema)
             .with_context(|| format!("invalid --defer-to schema '{schema}'"))?;
@@ -3817,13 +3836,27 @@ fn apply_defer_rewrite(
             .defer_to
             .clone()
             .unwrap_or_else(|| target.schema.clone());
-        // Defense in depth: validate the catalog/table parts too before they
-        // are serialized into the rewritten reference.
+        // Defense in depth: validate every part before it is serialized into
+        // the rewritten reference. The catalog uses the dialect-appropriate
+        // rule (BigQuery project IDs allow hyphens); schema + table always use
+        // the strict identifier rule regardless of where the schema came from
+        // (config target or `--defer-to`).
         if !target.catalog.is_empty() {
-            rocky_sql::validation::validate_identifier(&target.catalog).with_context(|| {
-                format!("deferred upstream '{name}' has an invalid catalog identifier")
-            })?;
+            if is_bigquery {
+                rocky_sql::validation::validate_gcp_project_id(&target.catalog).with_context(
+                    || format!("deferred upstream '{name}' has an invalid BigQuery project ID"),
+                )?;
+            } else {
+                rocky_sql::validation::validate_identifier(&target.catalog).with_context(|| {
+                    format!("deferred upstream '{name}' has an invalid catalog identifier")
+                })?;
+            }
         }
+        rocky_sql::validation::validate_identifier(&schema).with_context(|| {
+            format!(
+                "deferred upstream '{name}' resolves to an invalid schema identifier '{schema}'"
+            )
+        })?;
         rocky_sql::validation::validate_identifier(&target.table).with_context(|| {
             format!("deferred upstream '{name}' has an invalid table identifier")
         })?;
@@ -3833,6 +3866,7 @@ fn apply_defer_rewrite(
                 catalog: target.catalog.clone(),
                 schema,
                 table: target.table.clone(),
+                quote_style,
             },
         );
     }
@@ -3848,11 +3882,16 @@ fn apply_defer_rewrite(
         if !selected_set.contains(model.config.name.as_str()) {
             continue;
         }
-        let rewritten = rocky_sql::defer::qualify_deferred_refs(&model.sql, &deferred)
-            .with_context(|| {
-                format!(
-                    "failed to rewrite deferred upstream references in model '{}'",
-                    model.config.name
+        let rewritten =
+            rocky_sql::defer::qualify_deferred_refs(&model.sql, &deferred).map_err(|e| {
+                anyhow::anyhow!(
+                    "`--defer` could not rewrite the upstream references in model '{}': its SQL \
+                     did not parse ({e}). `--defer` parses each selected model's SQL to qualify \
+                     deferred upstreams; constructs the parser does not yet support (e.g. \
+                     `SELECT * EXCEPT (...)`, trailing-comma select lists, `STRUCT(...)` \
+                     literals) cannot be rewritten. Build this model without `--defer`, or \
+                     adjust its SQL.",
+                    model.config.name,
                 )
             })?;
         model.sql = rewritten;
@@ -3954,7 +3993,12 @@ pub(crate) async fn execute_models(
     // no-op when `--defer` is off, when there's no `--model` selection, or
     // when the selected models reference no deferred upstreams.
     if defer_opts.enabled {
-        apply_defer_rewrite(&mut compile_result, model_name_filter, defer_opts)?;
+        apply_defer_rewrite(
+            &mut compile_result,
+            model_name_filter,
+            defer_opts,
+            warehouse.dialect(),
+        )?;
     }
 
     // §P2.6 emit: compile_complete — fires once after a successful
