@@ -611,6 +611,59 @@ def test_write_state_writes_to_tmp_then_replaces(monkeypatch: pytest.MonkeyPatch
     assert not captured["src"].exists()
 
 
+def test_write_state_emits_alias_keys_and_round_trips(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """The state writer must serialize with ``by_alias=True`` so the on-disk
+    JSON uses the canonical CLI-shape field names, not the Python attribute
+    names. Otherwise a consumer re-parsing the cached state through Pydantic
+    (which has no ``populate_by_name``) fails to validate.
+
+    ``FailedSourceOutput.schema_`` carries an ``alias="schema"`` whose alias
+    differs from the attribute name — so it discriminates ``by_alias=True``
+    from the bare dump: without the alias the writer would emit ``"schema_"``
+    and the round-trip ``model_validate`` would raise ``ValidationError``.
+    """
+    discover = DiscoverResult.model_validate(
+        {
+            "version": "0.0.0",
+            "command": "discover",
+            "sources": [],
+            "failed_sources": [
+                {
+                    "id": "conn_1",
+                    "source_type": "fivetran",
+                    "schema": "raw_shopify",
+                    "error_class": "transient",
+                    "message": "transient fetch failure",
+                }
+            ],
+        }
+    )
+    stub = _StubResource(discover_result=discover)
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_missing_models_dir(tmp_path),  # skip compile
+        surface_optimize_metadata=False,
+    )
+    state_path = tmp_path / "state"
+
+    component.write_state_to_path(state_path)
+
+    state = json.loads(state_path.read_text())
+    failed_source = state["discover"]["failed_sources"][0]
+    # On-disk JSON carries the canonical alias key, not the Python attribute.
+    assert "schema" in failed_source
+    assert "schema_" not in failed_source
+
+    # The persisted discover slot round-trips cleanly back through the model.
+    round_tripped = DiscoverResult.model_validate(state["discover"])
+    assert round_tripped.failed_sources[0].schema_ == "raw_shopify"
+
+
 # ---------------------------------------------------------------------------
 # FR-011: surface_column_lineage walks models_dir and attaches metadata.
 # ---------------------------------------------------------------------------
