@@ -218,20 +218,73 @@ fn build_copy_into_sql(
     format: FileFormat,
     options: &LoadOptions,
 ) -> AdapterResult<String> {
+    build_copy_into_sql_from(&format!("'{path}'"), target_ref, format, options)
+}
+
+/// Build `COPY INTO … FROM <from_clause> …` where `from_clause` is the full
+/// FROM expression — either a quoted path (`'/Volumes/…'`) or a typed-cast
+/// subquery (`(SELECT CAST(…) FROM '…')`). All path + identifier validation
+/// happens in the caller before the clause is assembled.
+fn build_copy_into_sql_from(
+    from_clause: &str,
+    target_ref: &str,
+    format: FileFormat,
+    options: &LoadOptions,
+) -> AdapterResult<String> {
     let fileformat = file_format_clause(format);
     let format_opts = format_options_clause(format, options)?
         .map(|s| format!(" {s}"))
         .unwrap_or_default();
     // mergeSchema lets Databricks evolve the target schema when new columns
-    // appear — matches DuckDB's create_table-from-file semantics.
+    // appear. CSV loads route through a typed-cast subquery (see
+    // `build_csv_cast_source`), so the loaded schema already matches the
+    // target and the merge is a no-op rather than a string-vs-typed conflict.
     let copy_opts = if options.create_table {
         " COPY_OPTIONS ('mergeSchema' = 'true')"
     } else {
         ""
     };
     Ok(format!(
-        "COPY INTO {target_ref} FROM '{path}' FILEFORMAT = {fileformat}{format_opts}{copy_opts}"
+        "COPY INTO {target_ref} FROM {from_clause} FILEFORMAT = {fileformat}{format_opts}{copy_opts}"
     ))
+}
+
+/// Build a typed `(SELECT CAST(`col` AS <type>) … FROM '<path>')` source for a
+/// CSV `COPY INTO`. Databricks reads CSV columns as strings; casting each to
+/// the target's declared type lands real typed values and avoids
+/// `DELTA_FAILED_TO_MERGE_FIELDS` when a target column isn't STRING. `path`
+/// must already be validated via [`validate_sql_path_literal`]; `columns` are
+/// the target's `(name, declared_type)` pairs from
+/// [`DatabricksLoaderAdapter::describe_target_columns`].
+fn build_csv_cast_source(path: &str, columns: &[(String, String)]) -> AdapterResult<String> {
+    let mut casts = Vec::with_capacity(columns.len());
+    for (name, dtype) in columns {
+        validate_identifier(name).map_err(AdapterError::new)?;
+        let ty = validate_sql_type(dtype)?;
+        casts.push(format!("CAST(`{name}` AS {ty}) AS `{name}`"));
+    }
+    Ok(format!("(SELECT {} FROM '{path}')", casts.join(", ")))
+}
+
+/// Reject a column type string that could break out of the `CAST(… AS <type>)`
+/// context. DESCRIBE-sourced types are trusted, but we still constrain them to
+/// `[A-Za-z0-9_(), <>]` (covers `decimal(10,2)`, `array<int>`,
+/// `map<string,int>`) so an unexpected warehouse response can't inject SQL.
+fn validate_sql_type(ty: &str) -> AdapterResult<&str> {
+    let t = ty.trim();
+    if t.is_empty() {
+        return Err(AdapterError::msg("empty column type from DESCRIBE TABLE"));
+    }
+    let safe = t
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '(' | ')' | ',' | ' ' | '<' | '>'));
+    if safe {
+        Ok(t)
+    } else {
+        Err(AdapterError::msg(format!(
+            "unsafe column type {ty:?} from DESCRIBE TABLE"
+        )))
+    }
 }
 
 impl DatabricksLoaderAdapter {
@@ -249,12 +302,66 @@ impl DatabricksLoaderAdapter {
         Ok(())
     }
 
-    /// Run a `COPY INTO ... FROM '<path>'` and return the rows-loaded count.
+    /// Fetch the target table's declared `(name, type)` columns via
+    /// `DESCRIBE TABLE`, so a CSV load can CAST each column to its declared
+    /// type. Returns an empty `Vec` when the table can't be described (e.g. it
+    /// doesn't exist yet) — the caller then falls back to a plain path load.
+    async fn describe_target_columns(&self, target_ref: &str) -> Vec<(String, String)> {
+        let sql = format!("DESCRIBE TABLE {target_ref}");
+        let result = match self.connector.execute_sql(&sql).await {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(error = %e, target = %target_ref, "DESCRIBE TABLE failed; CSV load falls back to a plain COPY INTO");
+                return Vec::new();
+            }
+        };
+        let name_idx = result
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case("col_name"))
+            .unwrap_or(0);
+        let type_idx = result
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case("data_type"))
+            .unwrap_or(1);
+        let mut cols = Vec::new();
+        for row in &result.rows {
+            let name = row
+                .get(name_idx)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            // DESCRIBE TABLE lists data columns first, then a blank row and
+            // `# Partition Information` / `# Detailed Table Information`
+            // sections — stop at the first non-column row.
+            if name.is_empty() || name.starts_with('#') {
+                break;
+            }
+            let dtype = row
+                .get(type_idx)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !dtype.is_empty() {
+                cols.push((name, dtype));
+            }
+        }
+        cols
+    }
+
+    /// Run a `COPY INTO` and return the rows-loaded count.
     ///
-    /// `path` must already be validated via [`validate_sql_path_literal`].
-    /// Databricks' COPY INTO returns a single-row result set whose schema
-    /// includes `num_affected_rows`; if it's absent we fall back to 0 rather
-    /// than fail, so older/non-standard API shapes still return a usable load.
+    /// `path` must already be validated via [`validate_sql_path_literal`]. For
+    /// CSV into an existing table, each column is cast to the target's declared
+    /// type (Databricks reads CSV as strings, so a non-STRING target column
+    /// would otherwise fail `DELTA_FAILED_TO_MERGE_FIELDS`); Parquet/JSON carry
+    /// their own types, and an un-describable target (missing table) falls back
+    /// to a plain path load. Databricks' COPY INTO returns a single-row result
+    /// whose schema includes `num_affected_rows`; if it's absent we fall back
+    /// to 0 rather than fail.
     async fn run_copy_into(
         &self,
         path: &str,
@@ -262,7 +369,17 @@ impl DatabricksLoaderAdapter {
         format: FileFormat,
         options: &LoadOptions,
     ) -> AdapterResult<u64> {
-        let sql = build_copy_into_sql(path, target_ref, format, options)?;
+        let sql = if format == FileFormat::Csv {
+            let columns = self.describe_target_columns(target_ref).await;
+            if columns.is_empty() {
+                build_copy_into_sql(path, target_ref, format, options)?
+            } else {
+                let from = build_csv_cast_source(path, &columns)?;
+                build_copy_into_sql_from(&from, target_ref, format, options)?
+            }
+        } else {
+            build_copy_into_sql(path, target_ref, format, options)?
+        };
         info!(sql = %sql, "databricks COPY INTO");
         let copy_result = self
             .connector
@@ -637,6 +754,53 @@ mod tests {
         assert!(sql.contains("'header' = 'true'"));
         assert!(sql.contains("'delimiter' = ','"));
         assert!(sql.contains("mergeSchema"));
+    }
+
+    #[test]
+    fn test_build_csv_cast_source() {
+        let cols = vec![
+            ("id".to_string(), "BIGINT".to_string()),
+            ("name".to_string(), "STRING".to_string()),
+        ];
+        let src = build_csv_cast_source("/Volumes/c/s/v/f.csv", &cols).unwrap();
+        assert_eq!(
+            src,
+            "(SELECT CAST(`id` AS BIGINT) AS `id`, CAST(`name` AS STRING) AS `name` FROM '/Volumes/c/s/v/f.csv')"
+        );
+    }
+
+    #[test]
+    fn test_build_csv_cast_source_rejects_bad_identifier() {
+        let cols = vec![("id`; DROP".to_string(), "BIGINT".to_string())];
+        assert!(build_csv_cast_source("/p.csv", &cols).is_err());
+    }
+
+    #[test]
+    fn test_validate_sql_type() {
+        assert_eq!(validate_sql_type("BIGINT").unwrap(), "BIGINT");
+        assert_eq!(validate_sql_type("decimal(10,2)").unwrap(), "decimal(10,2)");
+        assert_eq!(validate_sql_type("array<int>").unwrap(), "array<int>");
+        assert!(validate_sql_type("string'; DROP").is_err());
+        assert!(validate_sql_type("").is_err());
+    }
+
+    #[test]
+    fn test_copy_into_csv_cast_subquery_shape() {
+        let cols = vec![
+            ("id".to_string(), "BIGINT".to_string()),
+            ("name".to_string(), "STRING".to_string()),
+        ];
+        let from = build_csv_cast_source("/Volumes/c/s/v/f.csv", &cols).unwrap();
+        let sql = build_copy_into_sql_from(
+            &from,
+            "main.raw.orders",
+            FileFormat::Csv,
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        assert!(sql.starts_with("COPY INTO main.raw.orders FROM (SELECT CAST(`id` AS BIGINT)"));
+        assert!(sql.contains("FILEFORMAT = CSV"));
+        assert!(sql.contains("'header' = 'true'"));
     }
 
     #[test]
