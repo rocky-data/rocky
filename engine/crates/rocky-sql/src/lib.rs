@@ -1,3 +1,4 @@
+pub mod defer;
 pub mod dialect;
 pub mod lineage;
 pub mod parser;

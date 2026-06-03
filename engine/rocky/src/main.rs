@@ -627,6 +627,30 @@ enum Command {
             ],
         )]
         watch: bool,
+
+        /// Build only the selected models locally, resolving unbuilt upstream
+        /// `ref()`s to an existing (production) schema — the dbt-style "defer"
+        /// dev convenience.
+        ///
+        /// Takes effect together with `--model <name>`: the selected model
+        /// builds normally, while its bare references to models you did NOT
+        /// build are qualified to the deferred upstream's own target schema
+        /// (its production home) so they read existing tables instead of
+        /// failing on a missing local table. Without `--model`, a full run
+        /// builds every model and there is nothing to defer, so the flag is
+        /// inert. Default OFF ⇒ behavior is unchanged.
+        ///
+        /// Applies to transformation models. Mutually exclusive with `--dag`
+        /// (cross-pipeline defer is out of scope).
+        #[arg(long, conflicts_with = "dag")]
+        defer: bool,
+
+        /// Schema the deferred upstream `ref()`s resolve to when `--defer` is
+        /// set. Defaults to each unbuilt upstream's own configured target
+        /// schema (its production home); pass this to point every deferred
+        /// reference at a single schema instead (catalog + table preserved).
+        #[arg(long, value_name = "SCHEMA", requires = "defer")]
+        defer_to: Option<String>,
     },
 
     /// Compare shadow tables against production tables
@@ -2223,6 +2247,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             idempotency_key,
             env,
             watch,
+            defer,
+            defer_to,
         } => {
             // --idempotency-key is mutually exclusive with --resume / --resume-latest:
             // a resume is an explicit override and should never be short-circuited.
@@ -2270,6 +2296,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 missing,
                 lookback,
                 parallel,
+            };
+
+            let defer_opts = rocky_cli::commands::DeferOptions {
+                enabled: defer,
+                defer_to,
             };
 
             if watch {
@@ -2333,6 +2364,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     cli.cache_ttl,
                     idempotency_key.as_deref(),
                     env.as_deref(),
+                    &defer_opts,
                 )
                 .await
             }
@@ -3340,6 +3372,81 @@ mod tests {
         remove_env("ROCKY_IDEMPOTENCY_KEY");
         let key = parse_run_idempotency_key(&["rocky", "run"]);
         assert!(key.is_none());
+    }
+
+    // ------------------------------------------------------------------------
+    // `rocky run --defer` flag-surface tests.
+    // ------------------------------------------------------------------------
+
+    fn parse_run_defer(args: &[&str]) -> (bool, Option<String>) {
+        let cli = try_parse_with_big_stack(args);
+        match cli.command {
+            Command::Run {
+                defer, defer_to, ..
+            } => (defer, defer_to),
+            _ => panic!("expected Run subcommand"),
+        }
+    }
+
+    /// Parse on the 8 MiB stack and return whether parsing *succeeded* — used
+    /// by the conflict / requires tests (the recursive clap derive overflows
+    /// the default test-thread stack).
+    fn parse_run_ok(args: &[&str]) -> bool {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(s, || Cli::try_parse_from(&owned).is_ok())
+                .expect("spawn parser thread")
+                .join()
+                .expect("parser thread panicked")
+        })
+    }
+
+    #[test]
+    fn defer_defaults_off() {
+        let (defer, defer_to) = parse_run_defer(&["rocky", "run"]);
+        assert!(!defer, "--defer is off by default");
+        assert!(defer_to.is_none());
+    }
+
+    #[test]
+    fn defer_flag_parses() {
+        let (defer, defer_to) = parse_run_defer(&["rocky", "run", "--model", "x", "--defer"]);
+        assert!(defer);
+        assert!(defer_to.is_none());
+    }
+
+    #[test]
+    fn defer_to_sets_schema_and_implies_defer_required() {
+        let (defer, defer_to) = parse_run_defer(&[
+            "rocky",
+            "run",
+            "--model",
+            "x",
+            "--defer",
+            "--defer-to",
+            "prod",
+        ]);
+        assert!(defer);
+        assert_eq!(defer_to.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn defer_to_without_defer_is_rejected() {
+        // `--defer-to` requires `--defer`.
+        assert!(
+            !parse_run_ok(&["rocky", "run", "--defer-to", "prod"]),
+            "--defer-to without --defer must be rejected at parse time"
+        );
+    }
+
+    #[test]
+    fn defer_conflicts_with_dag() {
+        assert!(
+            !parse_run_ok(&["rocky", "run", "--defer", "--dag"]),
+            "--defer and --dag are mutually exclusive (cross-pipeline defer is out of scope)"
+        );
     }
 
     // ------------------------------------------------------------------------

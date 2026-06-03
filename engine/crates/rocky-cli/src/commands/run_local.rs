@@ -77,6 +77,8 @@ pub async fn run_transformation(
             None,
             schema_cache_cfg,
             pipeline.target.governance.auto_create_schemas,
+            // run_local has no `--model` selection; defer is a no-op here.
+            &super::run::DeferOptions::default(),
         )
         .await?;
     } else {

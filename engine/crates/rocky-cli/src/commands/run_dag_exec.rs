@@ -191,6 +191,9 @@ impl NodeDispatcher for CliDispatcher {
                     // its own call path. Passing `None` preserves the
                     // pre-1.16 workspace-default resolution for DAG runs.
                     None,
+                    // DAG sub-runs build full pipelines (no `--model`
+                    // selection), so `--defer` would be inert anyway.
+                    &super::run::DeferOptions::default(),
                 )
                 .await
                 .map_err(|e| e.to_string())
