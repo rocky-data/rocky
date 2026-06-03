@@ -24,7 +24,7 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 Rocky exists because the most expensive failures in modern data platforms aren't slow queries. They're trust failures. A column type changes upstream and a revenue dashboard quietly diverges for three days. A `SELECT *` pulls a new column nobody designed for. A Snowflake-only function lands in a Databricks-targeted project and only fails in prod. Warehouse spend doubles and nobody can attribute which model caused it. An auditor asks who changed `fct_revenue.amount` and when.
 
-dbt Core 1.x is a templating engine; it can't catch any of these at compile time. SQLMesh moved correctness to the planner. **Rocky moved it to the compiler.** The disasters above become `E013` diagnostics, blocked PRs, `rocky lineage-diff` comments, and content-addressed run records.
+**Rocky moves correctness into the compiler.** The disasters above become things you catch before a row is written: a column-type change is `E013` at compile, a rename's blast radius is a `rocky lineage-diff` comment on the PR, a cost spike is a `[budget]` block that fails the run, and every run leaves a content-addressed record. These failures are invisible to the warehouse and out of reach of the templating layer above it — Rocky is the typed graph in between.
 
 <CardGrid>
   <Card title="Typed compiler, not a templating engine" icon="approve-check">
