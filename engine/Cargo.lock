@@ -4050,6 +4050,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
  "wiremock",
 ]
 

@@ -10,9 +10,24 @@
 //! COPY_OPTIONS ('mergeSchema' = 'true');
 //! ```
 //!
-//! The source file must already live in cloud storage (S3, ADLS, etc.).
-//! Databricks reads the URI directly — Rocky does **not** upload files.
-//! [`LoadSource::LocalFile`] is rejected with a clear error message.
+//! `COPY INTO` reads a file the warehouse can already see. Two paths:
+//!
+//! - **Cloud URI** ([`LoadSource::CloudUri`]) — `s3://…`, `abfss://…`, etc.
+//!   Databricks reads the URI directly; Rocky runs a single `COPY INTO`.
+//! - **Local file** ([`LoadSource::LocalFile`]) — Databricks can't read the
+//!   local filesystem, so Rocky stages the file to a Unity Catalog Volume
+//!   first (mirroring the Snowflake `PUT → COPY INTO` model):
+//!   1. `CREATE VOLUME IF NOT EXISTS <catalog>.<schema>.<volume>` (idempotent),
+//!   2. upload the file to `/Volumes/.../rocky_load_<uuid>.<ext>` via the
+//!      [Files API],
+//!   3. `COPY INTO ... FROM '/Volumes/.../<file>'`,
+//!   4. delete the staged **file** (success or failure); the volume is left
+//!      in place as a reusable governed container.
+//!
+//! The volume lands in the **target table's** catalog + schema, with a
+//! configurable volume name (default [`crate::volume::DEFAULT_STAGING_VOLUME`]).
+//!
+//! [Files API]: https://docs.databricks.com/api/workspace/files
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,16 +42,43 @@ use rocky_adapter_sdk::{
 use rocky_sql::validation::validate_identifier;
 
 use crate::connector::{DatabricksConnector, QueryResult};
+use crate::volume::{
+    DEFAULT_STAGING_VOLUME, StagingVolume, create_volume_sql, generate_staged_file_name,
+};
 
 /// Databricks loader adapter using COPY INTO.
+///
+/// Local files are staged to a Unity Catalog Volume in the target table's
+/// catalog + schema before the COPY INTO; the volume name defaults to
+/// [`crate::volume::DEFAULT_STAGING_VOLUME`] and is configurable via
+/// [`Self::with_staging_volume`].
 pub struct DatabricksLoaderAdapter {
     connector: Arc<DatabricksConnector>,
+    /// Unity Catalog Volume name used to stage local files, created on demand
+    /// in the target table's catalog + schema. Cloud-URI loads never touch it.
+    staging_volume: String,
 }
 
 impl DatabricksLoaderAdapter {
-    /// Create a loader wrapping the given `DatabricksConnector`.
+    /// Create a loader wrapping the given `DatabricksConnector`, staging local
+    /// files to the default volume ([`crate::volume::DEFAULT_STAGING_VOLUME`]).
     pub fn new(connector: Arc<DatabricksConnector>) -> Self {
-        Self { connector }
+        Self {
+            connector,
+            staging_volume: DEFAULT_STAGING_VOLUME.to_string(),
+        }
+    }
+
+    /// Override the Unity Catalog Volume name used to stage local files.
+    ///
+    /// The volume is created on demand (`CREATE VOLUME IF NOT EXISTS`) in the
+    /// target table's catalog + schema. The name is validated as a SQL
+    /// identifier when a local file is actually staged — an invalid name only
+    /// surfaces on a local-file load, never on a cloud-URI load.
+    #[must_use]
+    pub fn with_staging_volume(mut self, volume: impl Into<String>) -> Self {
+        self.staging_volume = volume.into();
+        self
     }
 }
 
@@ -119,18 +161,20 @@ fn validate_csv_delimiter(c: char) -> AdapterResult<char> {
     }
 }
 
-/// Reject cloud URIs that would break out of the `'<uri>'` SQL string literal.
-/// Rocky never escapes embedded quotes — instead we refuse to build the SQL.
-fn validate_cloud_uri(uri: &str) -> AdapterResult<&str> {
-    if uri.is_empty() {
-        return Err(AdapterError::msg("cloud URI cannot be empty"));
+/// Reject a `FROM '<path>'` literal that would break out of the surrounding
+/// `'...'` SQL string literal. Used for both cloud URIs (`s3://…`) and staged
+/// Volume paths (`/Volumes/…`). Rocky never escapes embedded quotes — instead
+/// we refuse to build the SQL.
+fn validate_sql_path_literal(path: &str) -> AdapterResult<&str> {
+    if path.is_empty() {
+        return Err(AdapterError::msg("COPY INTO source path cannot be empty"));
     }
-    if uri.contains(['\'', '\n', '\r', '\\']) {
+    if path.contains(['\'', '\n', '\r', '\\']) {
         return Err(AdapterError::msg(format!(
-            "invalid cloud URI {uri:?}: must not contain quotes, backslashes, or newlines"
+            "invalid COPY INTO source path {path:?}: must not contain quotes, backslashes, or newlines"
         )));
     }
-    Ok(uri)
+    Ok(path)
 }
 
 /// Extract the `num_affected_rows` count from a COPY INTO response.
@@ -160,13 +204,16 @@ fn extract_num_affected_rows(result: &QueryResult) -> Option<u64> {
     }
 }
 
-/// Build the full `COPY INTO ... FROM '<uri>'` SQL statement.
+/// Build the full `COPY INTO ... FROM '<path>'` SQL statement.
 ///
-/// The caller must pass a validated `target_ref` (use [`format_target`]) and a
-/// validated `uri` (use [`validate_cloud_uri`]) so the literal-context
-/// interpolation can't be broken out of.
+/// `path` is either a cloud URI (`s3://…`) or a staged Volume path
+/// (`/Volumes/…`) — the FROM clause and FORMAT_OPTIONS are byte-identical
+/// either way, so both source kinds share this builder. The caller must pass a
+/// validated `target_ref` (use [`format_target`]) and a validated `path` (use
+/// [`validate_sql_path_literal`]) so the literal-context interpolation can't be
+/// broken out of.
 fn build_copy_into_sql(
-    uri: &str,
+    path: &str,
     target_ref: &str,
     format: FileFormat,
     options: &LoadOptions,
@@ -183,8 +230,128 @@ fn build_copy_into_sql(
         ""
     };
     Ok(format!(
-        "COPY INTO {target_ref} FROM '{uri}' FILEFORMAT = {fileformat}{format_opts}{copy_opts}"
+        "COPY INTO {target_ref} FROM '{path}' FILEFORMAT = {fileformat}{format_opts}{copy_opts}"
     ))
+}
+
+impl DatabricksLoaderAdapter {
+    /// Execute `DELETE FROM <target>` when `truncate_first` is set. Databricks
+    /// supports DELETE FROM on managed tables.
+    async fn maybe_truncate(&self, target_ref: &str, options: &LoadOptions) -> AdapterResult<()> {
+        if options.truncate_first {
+            let sql = format!("DELETE FROM {target_ref}");
+            debug!(sql = %sql, "truncating target before COPY INTO");
+            self.connector
+                .execute_statement(&sql)
+                .await
+                .map_err(|e| AdapterError::msg(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Run a `COPY INTO ... FROM '<path>'` and return the rows-loaded count.
+    ///
+    /// `path` must already be validated via [`validate_sql_path_literal`].
+    /// Databricks' COPY INTO returns a single-row result set whose schema
+    /// includes `num_affected_rows`; if it's absent we fall back to 0 rather
+    /// than fail, so older/non-standard API shapes still return a usable load.
+    async fn run_copy_into(
+        &self,
+        path: &str,
+        target_ref: &str,
+        format: FileFormat,
+        options: &LoadOptions,
+    ) -> AdapterResult<u64> {
+        let sql = build_copy_into_sql(path, target_ref, format, options)?;
+        info!(sql = %sql, "databricks COPY INTO");
+        let copy_result = self
+            .connector
+            .execute_sql(&sql)
+            .await
+            .map_err(|e| AdapterError::msg(e.to_string()))?;
+
+        Ok(rows_from_copy_result(&copy_result))
+    }
+
+    /// Stage a local file to a Unity Catalog Volume, COPY INTO from it, then
+    /// clean up the staged file.
+    ///
+    /// Sequence (mirrors the Snowflake `PUT → COPY INTO → DROP` ordering):
+    /// 1. `CREATE VOLUME IF NOT EXISTS` in the target's catalog + schema,
+    /// 2. read the file + upload it to `/Volumes/.../rocky_load_<uuid>.<ext>`,
+    /// 3. `COPY INTO ... FROM` the staged path,
+    /// 4. delete the staged file — on upload failure, COPY failure, or success.
+    ///
+    /// Returns `(rows_loaded, bytes_read)`. The volume is never dropped (it's a
+    /// reusable governed container shared across loads).
+    async fn load_local_file(
+        &self,
+        local_path: &std::path::Path,
+        target: &TableRef,
+        target_ref: &str,
+        format: FileFormat,
+        options: &LoadOptions,
+    ) -> AdapterResult<(u64, u64)> {
+        // Stage into the *target table's* catalog + schema. `format_target`
+        // already validated these identifiers, but `StagingVolume::new`
+        // re-validates (including the configured volume name) so the rendered
+        // DDL + path are provably safe.
+        let volume = StagingVolume::new(&target.catalog, &target.schema, &self.staging_volume)?;
+
+        // Auto-provision the volume (idempotent). Databricks has no
+        // temporary-volume concept, so without this the Files API PUT 404s.
+        let create_sql = create_volume_sql(&volume);
+        debug!(sql = %create_sql, "creating staging volume");
+        self.connector
+            .execute_statement(&create_sql)
+            .await
+            .map_err(|e| AdapterError::msg(e.to_string()))?;
+
+        // Read the local file before uploading so a read error fails fast,
+        // before we've created anything to clean up on the volume.
+        let contents = std::fs::read(local_path).map_err(|e| {
+            AdapterError::msg(format!(
+                "failed to read local file '{}': {e}",
+                local_path.display()
+            ))
+        })?;
+        let bytes_read = contents.len() as u64;
+
+        let file_name = generate_staged_file_name(format.extension());
+        let staged_path = volume.file_path(&file_name)?;
+        // Defensive: the staged path is built from validated components, but
+        // the COPY INTO literal check is the same guard the cloud path uses.
+        let staged_path = validate_sql_path_literal(&staged_path)?.to_string();
+
+        info!(volume_path = %staged_path, "staging local file to UC Volume");
+        if let Err(e) = self.connector.upload_file(&staged_path, contents).await {
+            // Upload failed — best-effort clean up anything partially written.
+            self.cleanup_staged_file(&staged_path).await;
+            return Err(AdapterError::msg(format!(
+                "Files API upload to '{staged_path}' failed: {e}"
+            )));
+        }
+
+        // COPY INTO from the staged path; clean up the file regardless of
+        // the COPY result.
+        let copy_result = self
+            .run_copy_into(&staged_path, target_ref, format, options)
+            .await;
+        self.cleanup_staged_file(&staged_path).await;
+
+        let rows_loaded = copy_result?;
+        Ok((rows_loaded, bytes_read))
+    }
+
+    /// Best-effort deletion of a staged file. Logs (does not fail the load) on
+    /// error — the volume's lifecycle policy and the unique UUID name mean a
+    /// leaked file is harmless, and we never want cleanup to mask the real
+    /// load result.
+    async fn cleanup_staged_file(&self, staged_path: &str) {
+        if let Err(e) = self.connector.delete_file(staged_path).await {
+            warn!(error = %e, volume_path = %staged_path, "failed to delete staged file (non-fatal)");
+        }
+    }
 }
 
 #[async_trait]
@@ -197,67 +364,50 @@ impl LoaderAdapter for DatabricksLoaderAdapter {
     ) -> AdapterResult<LoadResult> {
         let start = Instant::now();
 
-        let uri = match source {
-            LoadSource::CloudUri(uri) => uri.clone(),
-            LoadSource::LocalFile(p) => {
-                return Err(AdapterError::msg(format!(
-                    "Databricks requires files in cloud storage (S3/ADLS/GCS); \
-                     got local path '{}'. Upload the file first, then point \
-                     `source_dir` at the cloud URI (e.g. s3://bucket/prefix/).",
-                    p.display()
-                )));
-            }
-        };
-
         let format = resolve_format(source, options)?;
         let target_ref = format_target(target)?;
-        let uri = validate_cloud_uri(&uri)?.to_string();
 
-        // `truncate_first` maps to a DELETE prior to COPY INTO. Databricks
-        // supports DELETE FROM on managed tables.
-        if options.truncate_first {
-            let sql = format!("DELETE FROM {target_ref}");
-            debug!(sql = %sql, "truncating target before COPY INTO");
-            self.connector
-                .execute_statement(&sql)
-                .await
-                .map_err(|e| AdapterError::msg(e.to_string()))?;
-        }
+        self.maybe_truncate(&target_ref, options).await?;
 
-        let sql = build_copy_into_sql(&uri, &target_ref, format, options)?;
-        info!(sql = %sql, "databricks COPY INTO");
-        let copy_result = self
-            .connector
-            .execute_sql(&sql)
-            .await
-            .map_err(|e| AdapterError::msg(e.to_string()))?;
-
-        // Databricks' COPY INTO returns a single-row result set whose
-        // schema includes `num_affected_rows` (the count of rows written
-        // into the target table for this call). Parse it from the result;
-        // if the column isn't present we fall back to 0 rather than fail,
-        // so older/non-standard API shapes still return a usable load.
-        let rows_loaded = match extract_num_affected_rows(&copy_result) {
-            Some(n) => n,
-            None => {
-                warn!(
-                    statement_id = %copy_result.statement_id,
-                    "databricks COPY INTO response missing `num_affected_rows` \
-                     column; reporting 0 rows loaded"
-                );
-                0
+        let (rows_loaded, bytes_read) = match source {
+            LoadSource::CloudUri(uri) => {
+                let uri = validate_sql_path_literal(uri)?.to_string();
+                let rows = self
+                    .run_copy_into(&uri, &target_ref, format, options)
+                    .await?;
+                (rows, 0) // Cloud-URI sources: no local byte count.
+            }
+            LoadSource::LocalFile(local_path) => {
+                self.load_local_file(local_path, target, &target_ref, format, options)
+                    .await?
             }
         };
 
         Ok(LoadResult {
             rows_loaded,
-            bytes_read: 0, // Cloud-URI sources: no local byte count.
+            bytes_read,
             duration_ms: start.elapsed().as_millis() as u64,
         })
     }
 
     fn supported_formats(&self) -> Vec<FileFormat> {
         vec![FileFormat::Csv, FileFormat::Parquet, FileFormat::JsonLines]
+    }
+}
+
+/// Extract the rows-loaded count from a COPY INTO response, warning (rather
+/// than failing the load) when `num_affected_rows` is absent.
+fn rows_from_copy_result(copy_result: &QueryResult) -> u64 {
+    match extract_num_affected_rows(copy_result) {
+        Some(n) => n,
+        None => {
+            warn!(
+                statement_id = %copy_result.statement_id,
+                "databricks COPY INTO response missing `num_affected_rows` \
+                 column; reporting 0 rows loaded"
+            );
+            0
+        }
     }
 }
 
@@ -345,11 +495,12 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_cloud_uri_rejects_quote() {
-        assert!(validate_cloud_uri("s3://bucket/key").is_ok());
-        assert!(validate_cloud_uri("s3://bucket/key'; DROP --").is_err());
-        assert!(validate_cloud_uri("s3://bucket/\nfoo").is_err());
-        assert!(validate_cloud_uri("").is_err());
+    fn test_validate_sql_path_literal_rejects_quote() {
+        assert!(validate_sql_path_literal("s3://bucket/key").is_ok());
+        assert!(validate_sql_path_literal("/Volumes/main/raw/vol/rocky_load_abc.csv").is_ok());
+        assert!(validate_sql_path_literal("s3://bucket/key'; DROP --").is_err());
+        assert!(validate_sql_path_literal("s3://bucket/\nfoo").is_err());
+        assert!(validate_sql_path_literal("").is_err());
     }
 
     #[test]
@@ -455,5 +606,69 @@ mod tests {
         let mut qr = copy_into_result("num_affected_rows", serde_json::json!(9));
         qr.rows.clear();
         assert_eq!(extract_num_affected_rows(&qr), None);
+    }
+
+    #[test]
+    fn test_rows_from_copy_result_present() {
+        let qr = copy_into_result("num_affected_rows", serde_json::json!(55));
+        assert_eq!(rows_from_copy_result(&qr), 55);
+    }
+
+    #[test]
+    fn test_rows_from_copy_result_missing_defaults_zero() {
+        let qr = copy_into_result("some_other_column", serde_json::json!(99));
+        assert_eq!(rows_from_copy_result(&qr), 0);
+    }
+
+    #[test]
+    fn test_build_copy_into_from_volume_path() {
+        // The Volume-staged path shares the cloud-URI builder, so FORMAT_OPTIONS
+        // are byte-identical — only the FROM literal differs.
+        let opts = LoadOptions::default();
+        let sql = build_copy_into_sql(
+            "/Volumes/main/raw/rocky_staging/rocky_load_abc.csv",
+            "main.raw.orders",
+            FileFormat::Csv,
+            &opts,
+        )
+        .unwrap();
+        assert!(sql.contains("FROM '/Volumes/main/raw/rocky_staging/rocky_load_abc.csv'"));
+        assert!(sql.contains("FILEFORMAT = CSV"));
+        assert!(sql.contains("'header' = 'true'"));
+        assert!(sql.contains("'delimiter' = ','"));
+        assert!(sql.contains("mergeSchema"));
+    }
+
+    #[test]
+    fn test_loader_default_staging_volume() {
+        // `new` uses the default; `with_staging_volume` overrides it. We don't
+        // need a connector to inspect the field — construct via a dummy Arc.
+        // (Build a connector pointing at an unused host; never executed.)
+        use crate::auth::{Auth, AuthConfig};
+        use crate::connector::ConnectorConfig;
+        use std::time::Duration;
+
+        let auth = Auth::from_config(AuthConfig {
+            host: "unused.databricks.com".into(),
+            token: Some("t".into()),
+            client_id: None,
+            client_secret: None,
+        })
+        .unwrap();
+        let connector = Arc::new(DatabricksConnector::new(
+            ConnectorConfig {
+                host: "unused.databricks.com".into(),
+                warehouse_id: "w".into(),
+                timeout: Duration::from_secs(1),
+                retry: Default::default(),
+            },
+            auth,
+        ));
+
+        let default_loader = DatabricksLoaderAdapter::new(Arc::clone(&connector));
+        assert_eq!(default_loader.staging_volume, DEFAULT_STAGING_VOLUME);
+
+        let custom = DatabricksLoaderAdapter::new(connector).with_staging_volume("hc_stage");
+        assert_eq!(custom.staging_volume, "hc_stage");
     }
 }

@@ -453,3 +453,145 @@ async fn live_list_tables_rest_and_sql_paths_agree() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Local-file staging via UC Volume (live merge gate)
+// ---------------------------------------------------------------------------
+//
+// This is the live verification of the local-file → COPY INTO path. It reads
+// ALL sandbox config from `ROCKY_TEST_*` env vars (per the scrubbing rule;
+// note this diverges from the `DATABRICKS_*` convention the other live tests
+// in this file use — the main session must set the `ROCKY_TEST_*` set below to
+// run this gate). The catalog/schema MUST be one where the PAT/SP can
+// `CREATE VOLUME IF NOT EXISTS`, `PUT` to the Files API, and `COPY INTO` — a
+// read-only schema will 403 (a privilege issue, not a bug).
+//
+// Required env vars:
+//   ROCKY_TEST_DATABRICKS_HOST          — workspace hostname (no https://)
+//   ROCKY_TEST_DATABRICKS_HTTP_PATH     — SQL warehouse HTTP path
+//   ROCKY_TEST_DATABRICKS_TOKEN         — PAT
+//     (or ROCKY_TEST_DATABRICKS_CLIENT_ID + ROCKY_TEST_DATABRICKS_CLIENT_SECRET)
+//   ROCKY_TEST_DATABRICKS_CATALOG       — catalog to stage + load into
+//   ROCKY_TEST_DATABRICKS_SCHEMA        — schema to stage + load into
+//   ROCKY_TEST_DATABRICKS_STAGING_VOLUME — optional; defaults to rocky_staging
+//
+// Run with:
+//   cargo test -p rocky-databricks --test integration \
+//     live_load_local_csv_via_volume -- --ignored
+
+/// Build a connector from the `ROCKY_TEST_*` sandbox env vars. Returns `None`
+/// (test skips via `.expect`) when the host/http-path aren't set.
+fn rocky_test_connector_from_env() -> Option<DatabricksConnector> {
+    let host = std::env::var("ROCKY_TEST_DATABRICKS_HOST").ok()?;
+    let http_path = std::env::var("ROCKY_TEST_DATABRICKS_HTTP_PATH").ok()?;
+    let warehouse_id = ConnectorConfig::warehouse_id_from_http_path(&http_path)?;
+
+    let auth = Auth::from_config(AuthConfig {
+        host: host.clone(),
+        token: std::env::var("ROCKY_TEST_DATABRICKS_TOKEN").ok(),
+        client_id: std::env::var("ROCKY_TEST_DATABRICKS_CLIENT_ID").ok(),
+        client_secret: std::env::var("ROCKY_TEST_DATABRICKS_CLIENT_SECRET").ok(),
+    })
+    .ok()?;
+
+    let config = ConnectorConfig {
+        host,
+        warehouse_id,
+        timeout: Duration::from_secs(120),
+        retry: Default::default(),
+    };
+    Some(DatabricksConnector::new(config, auth))
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_load_local_csv_via_volume() {
+    use rocky_adapter_sdk::{LoadOptions, LoadSource, LoaderAdapter, TableRef as SdkTableRef};
+    use rocky_databricks::loader::DatabricksLoaderAdapter;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let connector = rocky_test_connector_from_env().expect("ROCKY_TEST_DATABRICKS_* not set");
+    let catalog = std::env::var("ROCKY_TEST_DATABRICKS_CATALOG")
+        .expect("ROCKY_TEST_DATABRICKS_CATALOG must be set");
+    let schema = std::env::var("ROCKY_TEST_DATABRICKS_SCHEMA")
+        .expect("ROCKY_TEST_DATABRICKS_SCHEMA must be set");
+    let staging_volume = std::env::var("ROCKY_TEST_DATABRICKS_STAGING_VOLUME")
+        .unwrap_or_else(|_| "rocky_staging".into());
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
+    let table = format!("hc_load_local_{suffix}");
+
+    // Write a small CSV to the OS temp dir.
+    let csv_path = std::env::temp_dir().join(format!("rocky_live_load_{suffix}.csv"));
+    {
+        let mut f = std::fs::File::create(&csv_path).expect("create temp csv");
+        f.write_all(b"id,name\n1,alice\n2,bob\n3,carol\n")
+            .expect("write temp csv");
+    }
+
+    // Pre-create the (empty) target table so this gate exercises *staging*, not
+    // COPY INTO's create-from-scratch semantics. Databricks COPY INTO loads
+    // into an existing table (the canonical pattern is CREATE TABLE; then COPY
+    // INTO ... mergeSchema='true'). A separate connector is used for setup /
+    // verify / cleanup since the loader consumes its own Arc.
+    let setup_connector = rocky_test_connector_from_env().expect("ROCKY_TEST_DATABRICKS_* not set");
+    setup_connector
+        .execute_statement(&format!(
+            "CREATE TABLE IF NOT EXISTS {catalog}.{schema}.{table} (id BIGINT, name STRING)"
+        ))
+        .await
+        .expect("create target table");
+
+    let loader =
+        DatabricksLoaderAdapter::new(Arc::new(connector)).with_staging_volume(&staging_volume);
+    let target = SdkTableRef {
+        catalog: catalog.clone(),
+        schema: schema.clone(),
+        table: table.clone(),
+    };
+
+    // Run the load, capturing the result so cleanup always runs.
+    let load_result = loader
+        .load(
+            &LoadSource::LocalFile(csv_path.clone()),
+            &target,
+            &LoadOptions::default(),
+        )
+        .await;
+
+    // Verify row count via the setup connector (the loader consumed its Arc).
+    let verify_connector = setup_connector;
+    let count = if load_result.is_ok() {
+        verify_connector
+            .execute_sql(&format!(
+                "SELECT COUNT(*) AS n FROM {catalog}.{schema}.{table}"
+            ))
+            .await
+            .ok()
+            .and_then(|r| r.rows.first().and_then(|row| row.first().cloned()))
+    } else {
+        None
+    };
+
+    // Unconditional cleanup (best-effort): drop the loaded table. The staging
+    // volume is intentionally left in place (reusable container).
+    let _ = verify_connector
+        .execute_statement(&format!("DROP TABLE IF EXISTS {catalog}.{schema}.{table}"))
+        .await;
+    let _ = std::fs::remove_file(&csv_path);
+
+    let result = load_result.expect("local-file load via UC Volume should succeed");
+    assert_eq!(result.rows_loaded, 3, "expected 3 rows loaded");
+    assert!(result.bytes_read > 0, "should report local byte count");
+
+    let n = count.expect("loaded table should be queryable");
+    let n_num: i64 = n
+        .as_i64()
+        .or_else(|| n.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(-1);
+    assert_eq!(n_num, 3, "table should contain 3 rows, got {n:?}");
+}
