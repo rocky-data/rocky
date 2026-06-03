@@ -55,6 +55,14 @@ pub struct CompileArgs {
     /// way but scopes the returned diagnostics to this model when set.
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional portability target dialect — one of `"databricks"`,
+    /// `"snowflake"`, `"bigquery"`, or `"duckdb"`. When set, the P001
+    /// dialect-divergence lint runs against it on demand: each model's SQL is
+    /// checked for constructs that won't port to the named dialect, surfaced as
+    /// P001 diagnostics. When absent, behaviour is unchanged — the lint runs
+    /// only if `rocky.toml` declares `[portability] target_dialect`.
+    #[serde(default)]
+    pub target_dialect: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -171,6 +179,27 @@ pub struct SuggestFreshnessBlockArgs {
     /// duplicate or conflict with an existing block. Optional.
     #[serde(default)]
     pub current_sidecar: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DraftContractArgs {
+    /// The model to draft a `.contract.toml` for. Its target table must be
+    /// materialized in the warehouse (run the model first) — the contract is
+    /// grounded in the table's observed per-column profile.
+    pub model: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GenerateTestsArgs {
+    /// The model to draft test assertions for, from its intent + schema + SQL.
+    pub model: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ExplainModelArgs {
+    /// The model to draft an intent description for, from its SQL, output
+    /// schema, and upstream dependencies.
+    pub model: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -333,13 +362,24 @@ impl RockyMcpServer {
     #[tool(
         description = "Type-check the Rocky project and return diagnostics (errors/warnings) \
          plus model count. Always reflects the current on-disk models. Read diagnostics' \
-         code/span/suggestion and fix against them — this is the fast feedback loop."
+         code/span/suggestion and fix against them — this is the fast feedback loop. Pass \
+         `target_dialect` (databricks/snowflake/bigquery/duckdb) to additionally run the P001 \
+         portability lint on demand: SQL that won't port to that dialect surfaces as P001."
     )]
     async fn compile(
         &self,
         params: Parameters<CompileArgs>,
     ) -> Result<Json<CompileResult>, String> {
-        let model = params.0.model.as_deref();
+        let args = params.0;
+        let model = args.model.as_deref();
+        // On-demand portability lint: parse the requested dialect (case-
+        // insensitive, matching the `Dialect` serde vocabulary). When absent,
+        // pass `None` so the lint stays driven solely by `[portability]` in
+        // rocky.toml — i.e. behaviour is unchanged.
+        let target_dialect = match args.target_dialect.as_deref() {
+            Some(d) => Some(parse_target_dialect(d)?),
+            None => None,
+        };
         // `--with-seed` hard-fails when `data/seed.sql` is absent, so opt in
         // only when the project actually ships a seed (the playground does);
         // otherwise rely on the warm schema cache / cold-cache degradation.
@@ -351,7 +391,7 @@ impl RockyMcpServer {
             None,
             model,
             false,
-            None,
+            target_dialect,
             with_seed,
             None,
         )
@@ -879,6 +919,292 @@ impl RockyMcpServer {
         }))
     }
 
+    // ------------------------- generator tools -----------------------------
+    // These wrap the existing `rocky-ai` generators (the CLI's `rocky ai-*`
+    // commands). Each is an LLM/BYOK tool gated on ANTHROPIC_API_KEY, exactly
+    // like `suggest_freshness_block`. They return DRAFTS — the agent then runs
+    // `compile` / `propose` to act on them; nothing here mutates the warehouse
+    // or applies anything.
+
+    #[tool(
+        description = "Draft a `.contract.toml` for a model from the aggregate per-column \
+         profile of its target table (the `rocky ai-contract` generator). An LLM proposes \
+         required/protected columns and per-column types; the draft is compile-verified against \
+         the model's inferred schema before it is returned. Returns the contract TOML as a DRAFT \
+         — save it next to the model and run `compile` to enforce it; it mutates nothing. The \
+         model's target table must be materialized. Egress: only aggregate STATISTICS \
+         (row/null/distinct counts) are sent to the LLM — no raw cell values. Requires \
+         ANTHROPIC_API_KEY in the server environment — without it (or when the target isn't \
+         reachable), `contract_toml` is null and `message` explains why."
+    )]
+    async fn draft_contract(
+        &self,
+        params: Parameters<DraftContractArgs>,
+    ) -> Result<Json<DraftContractResult>, String> {
+        let model_name = params.0.model;
+
+        let client = match self.make_ai_client() {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return Ok(Json(DraftContractResult {
+                    model: model_name,
+                    message: Some(format!(
+                        "{} not set in the server environment",
+                        rocky_ai::client::AI_API_KEY_ENV
+                    )),
+                    ..Default::default()
+                }));
+            }
+            Err(e) => return Err(format!("AI client init failed: {e}")),
+        };
+
+        // The model's inferred output schema — the basis for compile-verifying
+        // the drafted contract.
+        let compiled = self.compile_full().map_err(|e| format!("{e:#}"))?;
+        let inferred_schema: Vec<rocky_compiler::types::TypedColumn> = compiled
+            .type_check
+            .typed_models
+            .get(&model_name)
+            .cloned()
+            .ok_or_else(|| {
+                format!("model '{model_name}' not found in compiled project (or has no schema)")
+            })?;
+
+        // Profile each column against the live target table.
+        let profile = match self
+            .profile_table_columns(&model_name, &inferred_schema)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(Json(DraftContractResult {
+                    model: model_name,
+                    message: Some(format!("could not profile the target table: {e:#}")),
+                    ..Default::default()
+                }));
+            }
+        };
+
+        let drafted = rocky_ai::contract::draft_contract(&profile, &inferred_schema, &client, 3)
+            .await
+            .map_err(|e| format!("contract draft failed: {e}"))?;
+
+        Ok(Json(DraftContractResult {
+            model: model_name,
+            contract_toml: Some(drafted.toml),
+            attempts: Some(drafted.attempts),
+            message: None,
+        }))
+    }
+
+    #[tool(
+        description = "Draft test assertions for a model from its intent, schema, and SQL (the \
+         `rocky ai-test` generator). An LLM proposes SQL assertions that each return 0 rows when \
+         the invariant holds (not-null, grain uniqueness, value ranges, referential integrity). \
+         Returns the assertions as DRAFTS — write each into the project's `tests/` directory \
+         (`<model>_<name>.sql`) and run them via the `test` tool; it mutates nothing. Requires \
+         ANTHROPIC_API_KEY in the server environment — without it, `assertions` is empty and \
+         `message` explains why."
+    )]
+    async fn generate_tests(
+        &self,
+        params: Parameters<GenerateTestsArgs>,
+    ) -> Result<Json<GenerateTestsResult>, String> {
+        let model_name = params.0.model;
+
+        let client = match self.make_ai_client() {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return Ok(Json(GenerateTestsResult {
+                    model: model_name,
+                    message: Some(format!(
+                        "{} not set in the server environment",
+                        rocky_ai::client::AI_API_KEY_ENV
+                    )),
+                    ..Default::default()
+                }));
+            }
+            Err(e) => return Err(format!("AI client init failed: {e}")),
+        };
+
+        let (compiled, model) = self.compile_and_find_model(&model_name)?;
+        let assertions = rocky_ai::testgen::generate_tests(&model, &compiled, &client)
+            .await
+            .map_err(|e| format!("test generation failed: {e}"))?;
+
+        let assertions = assertions
+            .into_iter()
+            .map(|a| TestAssertionLite {
+                name: a.name,
+                sql: a.sql,
+                description: a.description,
+            })
+            .collect();
+
+        Ok(Json(GenerateTestsResult {
+            model: model_name,
+            assertions,
+            message: None,
+        }))
+    }
+
+    #[tool(
+        description = "Draft an intent description for a model from its SQL, output schema, and \
+         upstream dependencies (the `rocky ai-explain` generator). An LLM writes a 2-3 sentence \
+         business-logic summary (grain, key filters/joins/aggregations). Returns the description \
+         as a DRAFT — save it to the model's sidecar as `intent = \"...\"` if useful; it mutates \
+         nothing. Requires ANTHROPIC_API_KEY in the server environment — without it, `intent` is \
+         null and `message` explains why."
+    )]
+    async fn explain_model(
+        &self,
+        params: Parameters<ExplainModelArgs>,
+    ) -> Result<Json<ExplainModelResult>, String> {
+        let model_name = params.0.model;
+
+        let client = match self.make_ai_client() {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return Ok(Json(ExplainModelResult {
+                    model: model_name,
+                    message: Some(format!(
+                        "{} not set in the server environment",
+                        rocky_ai::client::AI_API_KEY_ENV
+                    )),
+                    ..Default::default()
+                }));
+            }
+            Err(e) => return Err(format!("AI client init failed: {e}")),
+        };
+
+        let (compiled, model) = self.compile_and_find_model(&model_name)?;
+        let intent = rocky_ai::explain::explain_model(&model, &compiled, &client)
+            .await
+            .map_err(|e| format!("explain failed: {e}"))?;
+
+        Ok(Json(ExplainModelResult {
+            model: model_name,
+            intent: Some(intent),
+            message: None,
+        }))
+    }
+
+    /// Build an [`LlmClient`](rocky_ai::client::LlmClient) for the generator
+    /// tools, BYOK via `ANTHROPIC_API_KEY`. Returns `Ok(None)` when the key is
+    /// unset so each tool degrades to a null draft + explanatory message (the
+    /// same graceful no-op as `suggest_freshness_block`). `[ai] max_tokens`
+    /// from `rocky.toml` is honoured when the config loads.
+    fn make_ai_client(&self) -> anyhow::Result<Option<rocky_ai::client::LlmClient>> {
+        let api_key = match std::env::var(rocky_ai::client::AI_API_KEY_ENV) {
+            Ok(v) if !v.is_empty() => v,
+            _ => return Ok(None),
+        };
+        let max_tokens = rocky_core::config::load_rocky_config(&self.config_path)
+            .map(|cfg| cfg.ai.max_tokens)
+            .unwrap_or(rocky_ai::client::DEFAULT_MAX_TOKENS);
+        let ai_config = rocky_ai::client::AiConfig {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            api_key: rocky_core::redacted::RedactedString::new(api_key),
+            default_format: "rocky".to_string(),
+            max_attempts: 3,
+            max_tokens,
+        };
+        rocky_ai::client::LlmClient::new(ai_config)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Compile the project and resolve `model_name` to its loaded
+    /// [`Model`](rocky_core::models::Model). The generators that read source +
+    /// intent (`generate_tests`, `explain_model`) need both the compile result
+    /// and the owned model.
+    fn compile_and_find_model(
+        &self,
+        model_name: &str,
+    ) -> Result<(CompilerResult, rocky_core::models::Model), String> {
+        let compiled = self.compile_full().map_err(|e| format!("{e:#}"))?;
+        let model = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == model_name)
+            .cloned()
+            .ok_or_else(|| format!("model '{model_name}' not found in project"))?;
+        Ok((compiled, model))
+    }
+
+    /// Profile each column of a model's target table into a
+    /// [`TableProfile`](rocky_ai::contract::TableProfile) for `draft_contract`.
+    ///
+    /// Reuses the grounding path (`prepare_table_query` + `query_grounding`), so
+    /// it works on any configured warehouse, not just DuckDB.
+    ///
+    /// # Egress
+    ///
+    /// Issues **aggregate statistics only** — `COUNT(*)`, `COUNT(col)`,
+    /// `COUNT(DISTINCT col)` — and never selects `MIN`/`MAX` or a domain sample.
+    /// No raw cell value leaves the machine; the prompt the LLM sees carries
+    /// counts, not data. This mirrors the default of the `rocky ai-contract`
+    /// generator this tool wraps (whose `--with-data` opt-in, which would send
+    /// observed min/max and low-cardinality samples, is intentionally NOT
+    /// exposed over MCP). `null_rate` + `distinct` are enough to draft the
+    /// nullable / required / protected constraints; `min`/`max`/`observed_values`
+    /// are left empty. SQL is built only from validated identifiers.
+    async fn profile_table_columns(
+        &self,
+        model_name: &str,
+        schema: &[rocky_compiler::types::TypedColumn],
+    ) -> anyhow::Result<rocky_ai::contract::TableProfile> {
+        let prepared = self.prepare_table_query(model_name).await?;
+
+        let mut columns = Vec::with_capacity(schema.len());
+        for typed_col in schema {
+            let col = rocky_sql::validation::validate_identifier(&typed_col.name)
+                .map_err(|e| anyhow::anyhow!("invalid column identifier: {e}"))?;
+            // Statistics only — counts, never raw cell values. No MIN/MAX, no
+            // domain query, so nothing observable from the table's contents
+            // reaches the LLM prompt.
+            let agg_sql = column_stats_sql(&prepared.table_ref, col);
+            let qr = query_grounding(prepared.adapter.as_ref(), &agg_sql)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("profile query failed for column '{}': {e}", typed_col.name)
+                })?;
+            let row = qr.rows.first().ok_or_else(|| {
+                anyhow::anyhow!("profile query returned no rows for '{}'", typed_col.name)
+            })?;
+
+            let total = row.first().map(json_as_u64).unwrap_or(0);
+            let non_null = row.get(1).map(json_as_u64).unwrap_or(0);
+            let distinct = row.get(2).map(json_as_u64).unwrap_or(0);
+            let nulls = total.saturating_sub(non_null);
+            let null_rate = if total == 0 {
+                0.0
+            } else {
+                nulls as f64 / total as f64
+            };
+
+            columns.push(rocky_ai::contract::ColumnProfile {
+                name: typed_col.name.clone(),
+                type_name: rocky_ai::contract::contract_type_name(typed_col),
+                rows: total,
+                nulls,
+                null_rate,
+                distinct,
+                // Raw cell values are never sent over MCP (see # Egress).
+                observed_values: Vec::new(),
+                min: None,
+                max: None,
+            });
+        }
+
+        Ok(rocky_ai::contract::TableProfile {
+            model: model_name.to_string(),
+            columns,
+        })
+    }
+
     // ------------------------- SHOULD tools --------------------------------
 
     #[tool(
@@ -1332,6 +1658,50 @@ fn commands_adapter_registry(
     rocky_cli::registry::AdapterRegistry::from_config(cfg)
 }
 
+/// Build the per-column **statistics** query for `draft_contract`'s profiler.
+///
+/// Aggregate counts only — `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`.
+/// Deliberately selects no `MIN`/`MAX` and issues no domain query, so no raw
+/// cell value can reach the LLM prompt (the egress contract the MCP
+/// `draft_contract` tool upholds — see `profile_table_columns`). `table_ref`
+/// and `col` are already validated by the caller.
+fn column_stats_sql(table_ref: &str, col: &str) -> String {
+    format!(
+        "SELECT COUNT(*) AS n, COUNT({col}) AS non_null, COUNT(DISTINCT {col}) AS distinct_n \
+         FROM {table_ref}"
+    )
+}
+
+/// Read a `serde_json::Value` grounding cell as a `u64`, tolerating the
+/// string-encoded integers some adapters return.
+fn json_as_u64(v: &serde_json::Value) -> u64 {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
+        serde_json::Value::String(s) => s.parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Parse a `target_dialect` tool argument into the engine's [`Dialect`].
+///
+/// Accepts the `Dialect` serde vocabulary case-insensitively
+/// (`databricks`/`snowflake`/`bigquery`/`duckdb`). An unrecognised value is a
+/// caller error returned as a `String` (the tool's `Err` arm), naming the
+/// accepted values rather than silently ignoring the request.
+fn parse_target_dialect(raw: &str) -> Result<rocky_sql::transpile::Dialect, String> {
+    use rocky_sql::transpile::Dialect;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "databricks" => Ok(Dialect::Databricks),
+        "snowflake" => Ok(Dialect::Snowflake),
+        "bigquery" => Ok(Dialect::BigQuery),
+        "duckdb" => Ok(Dialect::DuckDB),
+        other => Err(format!(
+            "unknown target_dialect '{other}': expected one of \
+             databricks, snowflake, bigquery, duckdb"
+        )),
+    }
+}
+
 /// Project a `CompileOutput` into the trimmed [`CompileResult`].
 fn project_compile_result(output: &rocky_cli::output::CompileOutput) -> CompileResult {
     use rocky_compiler::diagnostic::Severity;
@@ -1608,6 +1978,58 @@ mod tests {
         assert_eq!(SAMPLE_MAX_ROWS, 50);
         assert_eq!(SAMPLE_MAX_BYTES, 16 * 1024);
         assert_eq!(CELL_MAX_CHARS, 256);
+    }
+
+    #[test]
+    fn parse_target_dialect_accepts_known_values_case_insensitively() {
+        use rocky_sql::transpile::Dialect;
+        assert_eq!(parse_target_dialect("bigquery"), Ok(Dialect::BigQuery));
+        assert_eq!(parse_target_dialect("BigQuery"), Ok(Dialect::BigQuery));
+        assert_eq!(parse_target_dialect(" snowflake "), Ok(Dialect::Snowflake));
+        assert_eq!(parse_target_dialect("DATABRICKS"), Ok(Dialect::Databricks));
+        assert_eq!(parse_target_dialect("duckdb"), Ok(Dialect::DuckDB));
+    }
+
+    #[test]
+    fn parse_target_dialect_rejects_unknown_value() {
+        let err = parse_target_dialect("redshift").expect_err("unknown dialect must error");
+        assert!(
+            err.contains("redshift"),
+            "error should name the input: {err}"
+        );
+        assert!(
+            err.contains("bigquery"),
+            "error should list the accepted values: {err}"
+        );
+    }
+
+    /// Egress contract: the `draft_contract` profiler issues STATISTICS only —
+    /// it must never select raw cell values (`MIN`/`MAX`) nor a domain sample,
+    /// matching the default of the `rocky ai-contract` generator it wraps.
+    #[test]
+    fn column_stats_sql_sends_no_raw_cell_values() {
+        let sql = column_stats_sql("out.orders", "status");
+        assert!(
+            sql.contains("COUNT(DISTINCT status)"),
+            "distinct COUNT is a statistic and is expected: {sql}"
+        );
+        let upper = sql.to_uppercase();
+        assert!(
+            !upper.contains("MIN(") && !upper.contains("MAX("),
+            "statistics-only query must not select MIN/MAX: {sql}"
+        );
+        assert!(
+            !upper.contains("DISTINCT CAST"),
+            "statistics-only query must not issue the domain-values query: {sql}"
+        );
+    }
+
+    #[test]
+    fn json_as_u64_handles_null_number_and_string() {
+        assert_eq!(json_as_u64(&serde_json::json!(42)), 42);
+        assert_eq!(json_as_u64(&serde_json::json!("17")), 17);
+        assert_eq!(json_as_u64(&serde_json::json!(null)), 0);
+        assert_eq!(json_as_u64(&serde_json::json!("nope")), 0);
     }
 
     #[test]

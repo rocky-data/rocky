@@ -82,6 +82,9 @@ async fn tools_list_returns_expected_set() {
             "catalog",
             "compile",
             "dependents",
+            "draft_contract",
+            "explain_model",
+            "generate_tests",
             "history",
             "inspect_schema",
             "lineage",
@@ -850,6 +853,162 @@ async fn inspect_schema_discovers_raw_sources_and_tolerates_cold_start() {
         cols.iter()
             .any(|c| c["name"] == serde_json::json!("status")),
         "discovered source carries its columns; got {cols:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn compile_runs_p001_dialect_lint_on_demand() {
+    // Passing `target_dialect` to the compile tool runs the P001 portability
+    // lint on demand, even with no `[portability]` in rocky.toml.
+    // `NVL(...)` does not port to BigQuery, so it must surface as P001.
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    std::fs::write(
+        dir.path().join("models").join("orders.sql"),
+        "SELECT 1 AS id, NVL('COMPLETE', 'PENDING') AS status\n",
+    )
+    .unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // Without target_dialect → no P001 (behaviour unchanged).
+    let baseline = client
+        .call_tool(CallToolRequestParams::new("compile"))
+        .await
+        .expect("compile call")
+        .structured_content
+        .expect("structured content");
+    let baseline_diags = baseline["diagnostics"].as_array().unwrap();
+    assert!(
+        !baseline_diags
+            .iter()
+            .any(|d| d["code"] == serde_json::json!("P001")),
+        "no P001 without target_dialect; got {baseline_diags:?}"
+    );
+
+    // With target_dialect = bigquery → P001 fires for NVL.
+    let args = serde_json::json!({ "target_dialect": "bigquery" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let linted = client
+        .call_tool(CallToolRequestParams::new("compile").with_arguments(args))
+        .await
+        .expect("compile call with target_dialect")
+        .structured_content
+        .expect("structured content");
+    let diags = linted["diagnostics"].as_array().unwrap();
+    assert!(
+        diags.iter().any(|d| d["code"] == serde_json::json!("P001")),
+        "target_dialect=bigquery must surface P001 for NVL; got {diags:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn compile_rejects_unknown_target_dialect() {
+    // An unrecognised target_dialect is a caller error, not a silent no-op.
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let args = serde_json::json!({ "target_dialect": "redshift" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("compile").with_arguments(args))
+        .await
+        .expect("compile call returns a result");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "unknown target_dialect must be an error"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The three generator tools degrade gracefully without an API key: a null
+/// draft + a message naming the missing env var, never an error and never a
+/// network call. Driven from one test so the `remove_var` happens once.
+#[tokio::test]
+async fn generator_tools_degrade_without_api_key() {
+    // SAFETY: `#[tokio::test]` runs on a current-thread runtime, so the spawned
+    // server task shares this single thread; nothing else reads the env
+    // concurrently.
+    unsafe {
+        std::env::remove_var(rocky_ai::client::AI_API_KEY_ENV);
+    }
+
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let args = serde_json::json!({ "model": "orders" })
+        .as_object()
+        .unwrap()
+        .clone();
+
+    // draft_contract: contract_toml null, message names the env var.
+    let dc = client
+        .call_tool(CallToolRequestParams::new("draft_contract").with_arguments(args.clone()))
+        .await
+        .expect("draft_contract call");
+    assert_ne!(dc.is_error, Some(true), "missing key is a no-op, not error");
+    let sc = dc.structured_content.expect("structured content");
+    assert!(
+        sc.get("contract_toml").is_none() || sc["contract_toml"].is_null(),
+        "no contract without a key; got {sc:?}"
+    );
+    assert!(
+        sc["message"]
+            .as_str()
+            .unwrap()
+            .contains(rocky_ai::client::AI_API_KEY_ENV),
+        "draft_contract message should name the env var; got {sc:?}"
+    );
+
+    // generate_tests: assertions empty, message names the env var.
+    let gt = client
+        .call_tool(CallToolRequestParams::new("generate_tests").with_arguments(args.clone()))
+        .await
+        .expect("generate_tests call");
+    assert_ne!(gt.is_error, Some(true));
+    let sc = gt.structured_content.expect("structured content");
+    assert!(
+        sc["assertions"].as_array().unwrap().is_empty(),
+        "no assertions without a key; got {sc:?}"
+    );
+    assert!(
+        sc["message"]
+            .as_str()
+            .unwrap()
+            .contains(rocky_ai::client::AI_API_KEY_ENV)
+    );
+
+    // explain_model: intent null, message names the env var.
+    let em = client
+        .call_tool(CallToolRequestParams::new("explain_model").with_arguments(args))
+        .await
+        .expect("explain_model call");
+    assert_ne!(em.is_error, Some(true));
+    let sc = em.structured_content.expect("structured content");
+    assert!(
+        sc.get("intent").is_none() || sc["intent"].is_null(),
+        "no intent without a key; got {sc:?}"
+    );
+    assert!(
+        sc["message"]
+            .as_str()
+            .unwrap()
+            .contains(rocky_ai::client::AI_API_KEY_ENV)
     );
 
     client.cancel().await.unwrap();
