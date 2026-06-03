@@ -509,3 +509,79 @@ pub struct SuggestFreshnessBlockResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
+
+/// `draft_contract` result — an LLM-drafted `.contract.toml` grounded in the
+/// observed profile of a model's target table, compile-verified against the
+/// model's inferred schema before it is returned.
+///
+/// `contract_toml` is the ready-to-save contract when drafting succeeds; it is
+/// a DRAFT — the caller writes it next to the model and runs `compile` to
+/// enforce it. `message` explains why no contract was produced (the API key is
+/// unset, the target isn't materialized, or the warehouse isn't reachable) so a
+/// graceful no-op is distinguishable from an error.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct DraftContractResult {
+    /// The model the contract was drafted for.
+    pub model: String,
+    /// The drafted `.contract.toml`, when one was produced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_toml: Option<String>,
+    /// Number of LLM attempts the compile-verify loop took, when it ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<usize>,
+    /// Why no contract was produced (key unset / target unavailable), when
+    /// `contract_toml` is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// One generated test assertion in a `generate_tests` result.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TestAssertionLite {
+    /// Short assertion name (also the suggested test filename stem).
+    pub name: String,
+    /// The assertion SQL — returns 0 rows when the invariant holds.
+    pub sql: String,
+    /// What the assertion checks, in plain language.
+    pub description: String,
+}
+
+/// `generate_tests` result — LLM-drafted test assertions for a model, derived
+/// from its intent + schema + source code.
+///
+/// `assertions` are DRAFTS the caller writes into the project's `tests/`
+/// directory (each becomes a `<model>_<name>.sql` file) and runs via the `test`
+/// tool. `message` explains why no assertions were produced (the API key is
+/// unset, or the model wasn't found) so a no-op is distinguishable from an
+/// error.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct GenerateTestsResult {
+    /// The model the tests were drafted for.
+    pub model: String,
+    /// The drafted assertions, when any were produced.
+    pub assertions: Vec<TestAssertionLite>,
+    /// Why no assertions were produced (key unset / model missing), when
+    /// `assertions` is empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// `explain_model` result — an LLM-drafted intent description for a model,
+/// derived from its source code, schema, and upstream dependencies.
+///
+/// `intent` is the drafted 2-3 sentence description when drafting succeeds; the
+/// caller can save it to the model's sidecar as `intent = "..."`. `message`
+/// explains why no description was produced (the API key is unset, or the model
+/// wasn't found) so a no-op is distinguishable from an error.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct ExplainModelResult {
+    /// The model the description was drafted for.
+    pub model: String,
+    /// The drafted intent description, when one was produced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    /// Why no description was produced (key unset / model missing), when
+    /// `intent` is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
