@@ -228,6 +228,30 @@ impl PartitionRunOptions {
     }
 }
 
+/// CLI selection state for `rocky run --defer` (dev-against-prod-upstreams).
+///
+/// When [`enabled`](Self::enabled) is set, transformation models that are
+/// **not** part of the build selection (`--model <name>`) have their bare
+/// `ref()` upstreams rewritten to resolve against an existing "defer target"
+/// — typically the production schema — instead of the working schema. This
+/// lets a developer build only their changed models locally while reading
+/// every unbuilt upstream from production, the standard dbt `--defer`
+/// convenience.
+///
+/// Default is OFF (`enabled = false`), in which case the run is byte-for-byte
+/// identical to today. `--defer` only takes effect alongside `--model`: a
+/// full run builds every model, so there are no unbuilt upstreams to defer.
+#[derive(Debug, Clone, Default)]
+pub struct DeferOptions {
+    /// Whether `--defer` was passed.
+    pub enabled: bool,
+    /// Optional `--defer-to <schema>` override. When `None`, each unbuilt
+    /// upstream's reference resolves to its own configured target schema (its
+    /// production home). When `Some(schema)`, every deferred reference is
+    /// pointed at that schema instead (catalog + table preserved).
+    pub defer_to: Option<String>,
+}
+
 /// Borrowed slice of compile-time facts that the per-model execution path
 /// needs at materialization time.
 ///
@@ -825,6 +849,12 @@ pub async fn run(
     // override shape — so this value does NOT flow into
     // `reconcile_role_graph`.
     env: Option<&str>,
+    // `--defer` / `--defer-to`. Default OFF ⇒ byte-identical behavior. When
+    // enabled, transformation models outside the `--model` selection have
+    // their bare upstream `ref()`s rewritten to resolve against the defer
+    // target (its production schema, or `--defer-to`). Only meaningful with
+    // `--model`; a full run builds everything and defers nothing.
+    defer_opts: &DeferOptions,
 ) -> Result<()> {
     let start = Instant::now();
     let started_at = Utc::now();
@@ -990,6 +1020,7 @@ pub async fn run(
             None,
             &schema_cache_cfg,
             false, // model-only entry point has no pipeline governance context
+            defer_opts,
         )
         .await?;
 
@@ -3080,6 +3111,10 @@ pub async fn run(
                     Some(pipeline_name),
                     &schema_cache_cfg,
                     pipeline.target.governance.auto_create_schemas,
+                    // No `--model` selection on the full-pipeline path, so
+                    // `apply_defer_rewrite` is a no-op even when `--defer` is
+                    // set (a full run builds every model).
+                    defer_opts,
                 )
                 .await?;
                 Ok(())
@@ -3723,6 +3758,109 @@ pub(super) fn emit_pipes_events(pipes: &crate::pipes::PipesEmitter, output: &Run
 /// goes through `execute_time_interval_model()` (per-partition path);
 /// everything else (full_refresh / incremental / merge / materialized_view)
 /// uses the single-statement path via `generate_transformation_sql`.
+/// Rewrite the build-selected models' SQL so bare references to **unbuilt**
+/// upstreams resolve against the defer target (`--defer`).
+///
+/// The deferred set is every compiled project model whose name is not the
+/// `--model` selection. For each selected model, bare `ref()`s to a deferred
+/// model are qualified to `<defer_schema>.<table>` (or
+/// `<catalog>.<defer_schema>.<table>`), where `defer_schema` is the upstream's
+/// own configured target schema (its production home) unless `--defer-to`
+/// overrides it. Models in the selection build normally and keep bare refs to
+/// each other.
+///
+/// No-op (returns `Ok` without mutating) when there is no `--model` selection
+/// — a full run builds every model, so nothing is deferred.
+///
+/// # Errors
+///
+/// Returns an error when `--defer-to` (or a deferred upstream's catalog /
+/// table) fails SQL-identifier validation, or when a selected model's SQL is
+/// not parseable. Identifier validation guards against interpolating an
+/// unvalidated string into the rewritten reference.
+fn apply_defer_rewrite(
+    compile_result: &mut rocky_compiler::compile::CompileResult,
+    model_name_filter: Option<&str>,
+    defer_opts: &DeferOptions,
+) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+
+    // Without a `--model` selection every model is built; there are no
+    // unbuilt upstreams to defer. Leave the SQL untouched.
+    let Some(selected) = model_name_filter else {
+        return Ok(());
+    };
+
+    // Validate the `--defer-to` schema override once up front — it is user
+    // input that ends up serialized into SQL.
+    if let Some(schema) = &defer_opts.defer_to {
+        rocky_sql::validation::validate_identifier(schema)
+            .with_context(|| format!("invalid --defer-to schema '{schema}'"))?;
+    }
+
+    // Build the set of selected (built-locally) model names. Today `--model`
+    // selects exactly one model, but treat it as a set so the logic survives
+    // a future multi-select.
+    let selected_set: HashSet<&str> = std::iter::once(selected).collect();
+
+    // The deferred set = every compiled model not in the selection, mapped to
+    // its qualified defer target. `--defer-to` overrides the schema part;
+    // catalog + table always come from the upstream's own configured target.
+    let mut deferred: HashMap<String, rocky_sql::defer::DeferTarget> = HashMap::new();
+    for model in &compile_result.project.models {
+        let name = model.config.name.as_str();
+        if selected_set.contains(name) {
+            continue;
+        }
+        let target = &model.config.target;
+        let schema = defer_opts
+            .defer_to
+            .clone()
+            .unwrap_or_else(|| target.schema.clone());
+        // Defense in depth: validate the catalog/table parts too before they
+        // are serialized into the rewritten reference.
+        if !target.catalog.is_empty() {
+            rocky_sql::validation::validate_identifier(&target.catalog).with_context(|| {
+                format!("deferred upstream '{name}' has an invalid catalog identifier")
+            })?;
+        }
+        rocky_sql::validation::validate_identifier(&target.table).with_context(|| {
+            format!("deferred upstream '{name}' has an invalid table identifier")
+        })?;
+        deferred.insert(
+            model.config.name.clone(),
+            rocky_sql::defer::DeferTarget {
+                catalog: target.catalog.clone(),
+                schema,
+                table: target.table.clone(),
+            },
+        );
+    }
+
+    if deferred.is_empty() {
+        return Ok(());
+    }
+
+    // Rewrite each selected model's SQL in place. Only the selected models
+    // execute, so rewriting just those is sufficient (and avoids touching
+    // upstream SQL that won't run).
+    for model in &mut compile_result.project.models {
+        if !selected_set.contains(model.config.name.as_str()) {
+            continue;
+        }
+        let rewritten = rocky_sql::defer::qualify_deferred_refs(&model.sql, &deferred)
+            .with_context(|| {
+                format!(
+                    "failed to rewrite deferred upstream references in model '{}'",
+                    model.config.name
+                )
+            })?;
+        model.sql = rewritten;
+    }
+
+    Ok(())
+}
+
 #[tracing::instrument(skip_all, name = "execute_models")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_models(
@@ -3746,6 +3884,12 @@ pub(crate) async fn execute_models(
     // `pipeline.target.governance.auto_create_schemas` here; defaults to
     // `false` for the model-only entry point that has no pipeline context.
     auto_create_schemas: bool,
+    // `--defer` selection state. When enabled (and a `model_name_filter` is
+    // set), every project model NOT in the selection is treated as a deferred
+    // upstream: the selected models' bare `ref()`s to those upstreams are
+    // rewritten to qualified `<defer_schema>.<table>` references before SQL
+    // generation. Default OFF ⇒ no rewrite, byte-identical behavior.
+    defer_opts: &DeferOptions,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -3780,7 +3924,7 @@ pub(crate) async fn execute_models(
         ..Default::default()
     };
 
-    let compile_result = match rocky_compiler::compile::compile(&compile_config) {
+    let mut compile_result = match rocky_compiler::compile::compile(&compile_config) {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "model compilation failed — skipping model execution");
@@ -3801,6 +3945,16 @@ pub(crate) async fn execute_models(
         }
         warn!("model compilation had errors — skipping model execution");
         return Ok(());
+    }
+
+    // `--defer`: rewrite the selected models' bare upstream `ref()`s to point
+    // at the defer target (production) for every model NOT in the selection.
+    // Lineage was already computed during compile, so mutating `.sql` now is
+    // safe — it only affects the SQL fed to `to_model_ir()` downstream. A
+    // no-op when `--defer` is off, when there's no `--model` selection, or
+    // when the selected models reference no deferred upstreams.
+    if defer_opts.enabled {
+        apply_defer_rewrite(&mut compile_result, model_name_filter, defer_opts)?;
     }
 
     // §P2.6 emit: compile_complete — fires once after a successful
@@ -6608,6 +6762,7 @@ adapter = "default"
             None,
             Some(key),
             None,
+            &DeferOptions::default(),
         )
         .await
         .expect("transformation run should succeed");
@@ -6712,6 +6867,7 @@ schema = "mart"
             None,
             None,
             None,
+            &DeferOptions::default(),
         )
         .await
         .expect(
@@ -7684,9 +7840,213 @@ merge_keys = ["id"]
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            &DeferOptions::default(),
         )
         .await;
         (output, result)
+    }
+
+    /// `rocky run --model down --defer`: the selected model `down` reads its
+    /// unbuilt upstream `up` from the defer (production) schema, and only
+    /// `down` is materialized.
+    ///
+    /// Discriminator: `up` exists *only* in the defer schema (`prod`) with a
+    /// known row set, plus a decoy `up` with different rows in the working
+    /// schema (`main`). If defer works, `main.down` reflects the `prod` rows
+    /// and the decoy is never read; if it silently fell back to the working
+    /// schema, the row count would differ. We also assert `prod.up` is NOT
+    /// re-materialized (its rows are left exactly as seeded).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn defer_resolves_unbuilt_upstream_to_prod_schema() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db_path = tmp.path().join("defer.duckdb");
+
+        // Seed the warehouse: `prod.up` has the real upstream rows; `main.up`
+        // is a decoy with a *different* row count that defer must NOT read.
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db_path).expect("open duckdb for seeding");
+            seed.execute_statement("CREATE SCHEMA IF NOT EXISTS prod")
+                .await
+                .unwrap();
+            // 3 real upstream rows in the defer schema.
+            seed.execute_statement(
+                "CREATE TABLE prod.up AS SELECT * FROM (VALUES (1), (2), (3)) AS t(id)",
+            )
+            .await
+            .unwrap();
+            // Decoy with a single row in the working (main) schema. If defer
+            // wrongly resolved to `main`, `down` would have 1 row, not 3.
+            seed.execute_statement("CREATE TABLE main.up AS SELECT 99 AS id")
+                .await
+                .unwrap();
+        }
+
+        // Model `up` targets the prod schema (its production home). Model
+        // `down` targets `main` and selects from the bare upstream `up`.
+        std::fs::write(models_dir.join("up.sql"), "SELECT id FROM prod.up\n").unwrap();
+        std::fs::write(
+            models_dir.join("up.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"prod\"\ntable = \"up\"\n",
+        )
+        .unwrap();
+        std::fs::write(models_dir.join("down.sql"), "SELECT id FROM up\n").unwrap();
+        std::fs::write(
+            models_dir.join("down.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"down\"\n",
+        )
+        .unwrap();
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).expect("open duckdb");
+        let opts = PartitionRunOptions::default();
+        let defer_opts = DeferOptions {
+            enabled: true,
+            defer_to: None,
+        };
+        let mut output = RunOutput::new(String::new(), 0, 1);
+
+        super::execute_models(
+            &models_dir,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &opts,
+            "test-defer",
+            Some("down"), // build only `down`
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            &defer_opts,
+        )
+        .await
+        .expect("deferred run must succeed");
+
+        // Only `down` was materialized — `up` was deferred, not built.
+        assert_eq!(
+            output.materializations.len(),
+            1,
+            "exactly one model (down) should materialize: {:?}",
+            output
+                .materializations
+                .iter()
+                .map(|m| &m.asset_key)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            output.materializations[0].asset_key,
+            vec![String::new(), "main".to_string(), "down".to_string()],
+            "the materialized model must be main.down"
+        );
+
+        // DuckDB COUNT(*) may serialize as a JSON number or string depending
+        // on the adapter path; accept both, matching the existing tests.
+        let count_of = |v: &serde_json::Value| -> Option<i64> {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        };
+
+        // `main.down` must reflect the defer-schema (prod) rows: 3, not the
+        // decoy's 1.
+        let verify = DuckDbWarehouseAdapter::open(&db_path).expect("reopen");
+        let r = verify
+            .execute_query("SELECT COUNT(*) FROM main.down")
+            .await
+            .expect("main.down must exist");
+        assert_eq!(
+            count_of(&r.rows[0][0]),
+            Some(3),
+            "down must read the 3 rows from prod.up (defer schema), not the decoy in main.up"
+        );
+
+        // The deferred upstream `prod.up` was never re-materialized by this
+        // run — it still holds exactly its seeded 3 rows.
+        let up = verify
+            .execute_query("SELECT COUNT(*) FROM prod.up")
+            .await
+            .expect("prod.up must still exist");
+        assert_eq!(
+            count_of(&up.rows[0][0]),
+            Some(3),
+            "the deferred upstream prod.up is untouched"
+        );
+    }
+
+    /// Control: WITHOUT `--defer`, the same `--model down` run fails because
+    /// the bare `up` ref resolves against the working schema where the table
+    /// the model expects does not exist as a queryable bare name in a CTAS
+    /// targeting `main`. This pins that defer is what makes the cross-schema
+    /// read work — the behavior is genuinely off by default.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn without_defer_unbuilt_upstream_is_not_rewritten() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db_path = tmp.path().join("nodefer.duckdb");
+
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db_path).expect("open duckdb for seeding");
+            seed.execute_statement("CREATE SCHEMA IF NOT EXISTS prod")
+                .await
+                .unwrap();
+            seed.execute_statement(
+                "CREATE TABLE prod.up AS SELECT * FROM (VALUES (1), (2), (3)) AS t(id)",
+            )
+            .await
+            .unwrap();
+        }
+
+        std::fs::write(models_dir.join("up.sql"), "SELECT id FROM prod.up\n").unwrap();
+        std::fs::write(
+            models_dir.join("up.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"prod\"\ntable = \"up\"\n",
+        )
+        .unwrap();
+        std::fs::write(models_dir.join("down.sql"), "SELECT id FROM up\n").unwrap();
+        std::fs::write(
+            models_dir.join("down.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"down\"\n",
+        )
+        .unwrap();
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).expect("open duckdb");
+        let opts = PartitionRunOptions::default();
+        let mut output = RunOutput::new(String::new(), 0, 1);
+
+        // No defer: the bare `up` is not rewritten, and `main.up` does not
+        // exist, so building `down` alone fails on the unresolved upstream.
+        let result = super::execute_models(
+            &models_dir,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &opts,
+            "test-no-defer",
+            Some("down"),
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            &DeferOptions::default(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "without --defer the unbuilt bare upstream must not resolve, so the run fails"
+        );
+        assert!(
+            output.materializations.is_empty(),
+            "no model should materialize when the upstream is unresolved"
+        );
     }
 
     /// (a) A wide single-layer project (four dependency-free models) runs

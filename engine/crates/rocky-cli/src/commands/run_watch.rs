@@ -276,6 +276,9 @@ async fn iter_once(
         cache_ttl_override,
         None,
         env,
+        // `--watch` is mutually exclusive with `--model`, so there is no
+        // selection to defer against.
+        &super::run::DeferOptions::default(),
     )
     .await;
     let elapsed_ms = started.elapsed().as_millis();

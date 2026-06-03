@@ -226,6 +226,9 @@ async fn execute_run_plan(
         None, // cache_ttl_override — runtime-only, not part of the plan
         run_plan.idempotency_key.as_deref(),
         run_plan.env.as_deref(),
+        // `--defer` is a runtime-only dev convenience, not persisted on the
+        // plan; the two-step `rocky plan`/`apply` path always runs without it.
+        &crate::commands::run::DeferOptions::default(),
     )
     .await
     .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))?;
@@ -437,6 +440,8 @@ async fn run_apply_replication_plan(
         None,
         replication_plan.idempotency_key.as_deref(),
         replication_plan.env.as_deref(),
+        // Replication apply never runs transformation models; defer is moot.
+        &crate::commands::run::DeferOptions::default(),
     )
     .await
     .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
@@ -804,6 +809,7 @@ pub async fn run_apply_inline_for_run(
     cache_ttl_override: Option<u64>,
     idempotency_key: Option<&str>,
     env: Option<&str>,
+    defer_opts: &crate::commands::run::DeferOptions,
 ) -> Result<()> {
     // Thin passthrough — routes to the existing run implementation.
     crate::commands::run::run(
@@ -823,6 +829,7 @@ pub async fn run_apply_inline_for_run(
         cache_ttl_override,
         idempotency_key,
         env,
+        defer_opts,
     )
     .await
 }
