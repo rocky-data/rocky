@@ -46,6 +46,23 @@ pub enum BigQueryError {
     #[error("BigQuery job failed: {message} (reason: {reason})")]
     JobError { reason: String, message: String },
 
+    /// A **load** job (`jobs.insert` → polled via `jobs.get`) that reached
+    /// `status.state == "DONE"` carrying a `status.errorResult`.
+    ///
+    /// Unlike the query path — where an async failure surfaces as a
+    /// *top-level* `errors[]` array on the `jobs.query` /
+    /// `jobs.getQueryResults` response (see [`Self::JobError`]) — a load
+    /// job's terminal failure lives under the `Job` resource's
+    /// `status.errorResult` (an `ErrorProto`), with the full list under
+    /// `status.errors[]`. `jobs.insert` has no synchronous result
+    /// endpoint, so this is the only place a load failure can appear.
+    /// Classified **non-transient**: a malformed file or a schema
+    /// mismatch won't pass on retry. `message` aggregates the per-row /
+    /// per-file reasons from `status.errors[]` when present so the
+    /// operator sees *why* the load failed, not just "load job failed".
+    #[error("BigQuery load job failed: {message} (reason: {reason})")]
+    LoadJobError { reason: String, message: String },
+
     #[error("authentication error: {0}")]
     Auth(#[from] crate::auth::AuthError),
 
@@ -655,6 +672,218 @@ impl BigQueryAdapter {
             ),
         })
     }
+
+    /// Run a native BigQuery **load job** via `jobs.insert` and poll it to
+    /// completion.
+    ///
+    /// This is the bulk-ingest primitive behind the BigQuery `load`
+    /// pipeline. Unlike the query path (`jobs.query`, which can return
+    /// inline), a load job is **always asynchronous**: `jobs.insert`
+    /// accepts the configuration and returns a `Job` resource in
+    /// `PENDING`/`RUNNING`; the caller polls `jobs.get` until
+    /// `status.state == "DONE"`.
+    ///
+    /// # Source URIs
+    ///
+    /// `spec.source_uris` are `gs://bucket/object` paths (BigQuery load
+    /// jobs read only from Google Cloud Storage — local files are not a
+    /// load-job input, which is why the loader keeps an INSERT fallback
+    /// for `LocalFile`). Wildcards (`gs://bucket/prefix*`) are honoured by
+    /// BigQuery natively.
+    ///
+    /// # Errors
+    ///
+    /// - [`BigQueryError::ApiError`] — a non-2xx from `jobs.insert` /
+    ///   `jobs.get` (auth, malformed config, quota).
+    /// - [`BigQueryError::LoadJobError`] — the job reached `DONE` with a
+    ///   `status.errorResult`. The message aggregates `status.errors[]`
+    ///   so per-row / per-file reasons are visible.
+    /// - [`BigQueryError::Timeout`] — the job didn't finish within the
+    ///   adapter's configured timeout.
+    pub async fn load_via_job(&self, spec: &LoadJobSpec) -> Result<LoadJobOutcome, BigQueryError> {
+        let token = self.auth.get_token(&self.client).await?;
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/jobs",
+            self.base_url(),
+            self.project_id
+        );
+
+        let request =
+            JobInsertRequest::for_load(self.project_id.clone(), self.location.clone(), spec);
+
+        debug!(
+            uris = ?spec.source_uris,
+            format = %spec.source_format.as_api_str(),
+            write_disposition = %spec.write_disposition.as_api_str(),
+            "submitting BigQuery load job"
+        );
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&request)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().to_string();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(BigQueryError::ApiError {
+                status,
+                message: body,
+            });
+        }
+
+        // `jobs.insert` returns the freshly-created `Job` resource. It may
+        // already be `DONE` (a synchronous rejection, or a tiny load) or
+        // still `PENDING`/`RUNNING`.
+        let inserted: JobResource = resp.json().await?;
+        let job_ref = inserted
+            .job_reference
+            .ok_or_else(|| BigQueryError::ApiError {
+                status: "missing jobReference".into(),
+                message: "jobs.insert response had no jobReference; cannot poll the load job"
+                    .into(),
+            })?;
+
+        // Surface an inline failure immediately (the insert response can
+        // carry `status.errorResult` for a job rejected synchronously).
+        Self::check_load_status_error(inserted.status.as_ref())?;
+
+        // For rows-loaded, always resolve via `jobs.get`: the
+        // `statistics.load` block (and `outputRows` in particular) is only
+        // reliably populated on the `Job` resource returned by `jobs.get`,
+        // not necessarily on the `jobs.insert` response — even when that
+        // response already reports `state == DONE`. Reading stats from the
+        // insert body would risk reporting `rows_loaded = 0` on an inline
+        // DONE that omitted the stats. `poll_load_job`'s first GET returns
+        // immediately for an already-DONE job, so this is at most one extra
+        // (cheap) roundtrip on the rare inline-DONE path.
+        self.poll_load_job(&job_ref).await
+    }
+
+    /// Poll `jobs.get` for a load job until `status.state == "DONE"` or the
+    /// configured timeout elapses. Reuses the same fixed-ladder →
+    /// exponential-cap [`poll_delay`] cadence as the query poll loop.
+    async fn poll_load_job(&self, job_ref: &JobReference) -> Result<LoadJobOutcome, BigQueryError> {
+        let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
+        let token = self.auth.get_token(&self.client).await?;
+        let url = format!(
+            "{}/bigquery/v2/projects/{}/jobs/{}",
+            self.base_url(),
+            self.project_id,
+            job_ref.job_id
+        );
+
+        for attempt in 0..usize::MAX {
+            if Instant::now() >= deadline {
+                return Err(BigQueryError::Timeout {
+                    timeout_secs: self.timeout_secs,
+                });
+            }
+
+            tokio::time::sleep(poll_delay(attempt)).await;
+
+            let resp = self
+                .client
+                .get(&url)
+                .bearer_auth(&token)
+                .query(&[("location", self.location.as_str())])
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let status = resp.status().to_string();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(BigQueryError::ApiError {
+                    status,
+                    message: body,
+                });
+            }
+
+            let job: JobResource = resp.json().await?;
+            if let Some(outcome) = Self::load_outcome_if_done(&job.status, &job.statistics)? {
+                debug!(
+                    job_id = %job_ref.job_id,
+                    attempts = attempt + 1,
+                    rows = outcome.rows_loaded,
+                    "BigQuery load job completed"
+                );
+                return Ok(outcome);
+            }
+        }
+
+        Err(BigQueryError::Timeout {
+            timeout_secs: self.timeout_secs,
+        })
+    }
+
+    /// Map a load job's `status.errorResult` (set once the job is `DONE`
+    /// and failed) to a [`BigQueryError::LoadJobError`]. No-op when the
+    /// status is absent, still running, or DONE without an error.
+    ///
+    /// A load job's terminal failure lives under `status.errorResult`
+    /// (an `ErrorProto`) — **not** the top-level `errors[]` the query path
+    /// uses — which is why this can't reuse
+    /// [`BigQueryResponse::check_job_error`]. Called both on the
+    /// `jobs.insert` response (synchronous rejections) and during the
+    /// `jobs.get` poll loop. No-op when `status` is absent or carries no
+    /// `errorResult`.
+    fn check_load_status_error(status: Option<&JobStatus>) -> Result<(), BigQueryError> {
+        let Some(status) = status else {
+            return Ok(());
+        };
+        let Some(err) = &status.error_result else {
+            return Ok(());
+        };
+        let reason = err.reason.clone().unwrap_or_else(|| "unknown".into());
+        // Aggregate per-row / per-file reasons from `errors[]` when present
+        // so the operator sees the underlying cause, not just the summary
+        // `errorResult`. Fall back to `errorResult.message`.
+        let detail: Vec<String> = status
+            .errors
+            .iter()
+            .flatten()
+            .filter_map(|e| e.message.clone())
+            .collect();
+        let message = if detail.is_empty() {
+            err.message.clone().unwrap_or_default()
+        } else {
+            detail.join("; ")
+        };
+        Err(BigQueryError::LoadJobError { reason, message })
+    }
+
+    /// If a load job's `status.state == "DONE"`, map it to either a
+    /// [`LoadJobOutcome`] (success — rows-loaded from
+    /// `statistics.load.outputRows`) or a
+    /// [`BigQueryError::LoadJobError`]. Returns `Ok(None)` while the job is
+    /// still `PENDING`/`RUNNING` so the poll loop keeps going.
+    fn load_outcome_if_done(
+        status: &Option<JobStatus>,
+        statistics: &Option<BigQueryStatistics>,
+    ) -> Result<Option<LoadJobOutcome>, BigQueryError> {
+        let Some(status) = status else {
+            // No status block yet → job hasn't reached a reportable state.
+            return Ok(None);
+        };
+        if status.state.as_deref() != Some("DONE") {
+            return Ok(None);
+        }
+
+        Self::check_load_status_error(Some(status))?;
+
+        let load_stats = statistics.as_ref().and_then(|s| s.load.as_ref());
+        let rows_loaded = load_stats
+            .and_then(BigQueryLoadStatistics::output_rows_u64)
+            .unwrap_or(0);
+        let input_bytes = load_stats.and_then(BigQueryLoadStatistics::input_file_bytes_u64);
+        Ok(Some(LoadJobOutcome {
+            rows_loaded,
+            input_file_bytes: input_bytes,
+        }))
+    }
 }
 
 #[async_trait]
@@ -1077,6 +1306,116 @@ fn record_warehouse_attrs_on_current_span(response: &BigQueryResponse) {
     }
 }
 
+// -- BigQuery load-job public API --
+
+/// Source file format for a BigQuery load job. Maps to the
+/// `configuration.load.sourceFormat` enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BigQuerySourceFormat {
+    /// `CSV` — header rows / delimiter controlled via [`LoadJobSpec`].
+    Csv,
+    /// `PARQUET` — self-describing; schema autodetect is implicit.
+    Parquet,
+    /// `NEWLINE_DELIMITED_JSON` (JSONL / NDJSON).
+    NewlineDelimitedJson,
+}
+
+impl BigQuerySourceFormat {
+    /// The exact `sourceFormat` string BigQuery's load config expects.
+    pub fn as_api_str(self) -> &'static str {
+        match self {
+            Self::Csv => "CSV",
+            Self::Parquet => "PARQUET",
+            Self::NewlineDelimitedJson => "NEWLINE_DELIMITED_JSON",
+        }
+    }
+}
+
+/// `configuration.load.writeDisposition` — what to do with existing rows
+/// in the destination table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteDisposition {
+    /// `WRITE_TRUNCATE` — overwrite the table (truncate then load).
+    Truncate,
+    /// `WRITE_APPEND` — append to existing rows.
+    Append,
+}
+
+impl WriteDisposition {
+    /// The exact `writeDisposition` string BigQuery expects.
+    pub fn as_api_str(self) -> &'static str {
+        match self {
+            Self::Truncate => "WRITE_TRUNCATE",
+            Self::Append => "WRITE_APPEND",
+        }
+    }
+}
+
+/// `configuration.load.createDisposition` — whether to create the table
+/// when it doesn't exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadCreateDisposition {
+    /// `CREATE_IF_NEEDED` — create the table if it doesn't exist
+    /// (autodetect or explicit schema).
+    IfNeeded,
+    /// `CREATE_NEVER` — fail if the table doesn't already exist.
+    Never,
+}
+
+impl LoadCreateDisposition {
+    /// The exact `createDisposition` string BigQuery expects.
+    pub fn as_api_str(self) -> &'static str {
+        match self {
+            Self::IfNeeded => "CREATE_IF_NEEDED",
+            Self::Never => "CREATE_NEVER",
+        }
+    }
+}
+
+/// A fully-resolved BigQuery load-job configuration, consumed by
+/// [`BigQueryAdapter::load_via_job`].
+///
+/// The caller (the [`crate::BigQueryLoaderAdapter`]) translates the
+/// generic [`rocky_adapter_sdk::LoadOptions`] into this BigQuery-specific
+/// shape so the connector stays free of SDK types.
+#[derive(Debug, Clone)]
+pub struct LoadJobSpec {
+    /// GCP project that owns the destination table. Empty means "use the
+    /// adapter's project".
+    pub destination_project: String,
+    /// Destination dataset (BigQuery "schema").
+    pub destination_dataset: String,
+    /// Destination table name.
+    pub destination_table: String,
+    /// `gs://bucket/object` source URIs (wildcards allowed).
+    pub source_uris: Vec<String>,
+    /// File format of the source data.
+    pub source_format: BigQuerySourceFormat,
+    /// Overwrite vs append.
+    pub write_disposition: WriteDisposition,
+    /// Create-if-needed vs never.
+    pub create_disposition: LoadCreateDisposition,
+    /// Let BigQuery infer the schema from the data. Set for CSV/JSONL when
+    /// no explicit schema is supplied; implicit/harmless for Parquet.
+    pub autodetect: bool,
+    /// CSV only: number of leading header rows to skip. `None` for
+    /// non-CSV formats (the field is omitted from the request).
+    pub skip_leading_rows: Option<u64>,
+    /// CSV only: field delimiter. `None` for non-CSV formats.
+    pub field_delimiter: Option<String>,
+}
+
+/// Outcome of a completed BigQuery load job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadJobOutcome {
+    /// Rows written into the destination table
+    /// (`statistics.load.outputRows`).
+    pub rows_loaded: u64,
+    /// Bytes read from the source URIs (`statistics.load.inputFileBytes`),
+    /// when BigQuery reported it.
+    pub input_file_bytes: Option<u64>,
+}
+
 // -- BigQuery REST API types --
 
 #[derive(Debug, Serialize)]
@@ -1087,6 +1426,134 @@ struct QueryRequest {
     location: String,
     timeout_ms: u64,
     max_results: u32,
+}
+
+// -- load-job (`jobs.insert`) wire request --
+
+/// `jobs.insert` request body: a `Job` resource carrying only a
+/// `configuration.load` block and a `jobReference.location`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JobInsertRequest {
+    job_reference: JobReferenceRequest,
+    configuration: JobConfigurationRequest,
+}
+
+impl JobInsertRequest {
+    /// Build the request from a [`LoadJobSpec`], pinning the job to the
+    /// adapter's `project`/`location` and translating the typed
+    /// dispositions to BigQuery's enum strings. An empty
+    /// `destination_project` falls back to the adapter's project so the
+    /// destinationTable never carries an empty `projectId`.
+    fn for_load(project: String, location: String, spec: &LoadJobSpec) -> Self {
+        let destination_project = if spec.destination_project.is_empty() {
+            project.clone()
+        } else {
+            spec.destination_project.clone()
+        };
+        JobInsertRequest {
+            job_reference: JobReferenceRequest {
+                project_id: project,
+                location,
+            },
+            configuration: JobConfigurationRequest {
+                load: JobConfigurationLoad {
+                    source_uris: spec.source_uris.clone(),
+                    source_format: spec.source_format.as_api_str().to_string(),
+                    write_disposition: spec.write_disposition.as_api_str().to_string(),
+                    create_disposition: spec.create_disposition.as_api_str().to_string(),
+                    autodetect: spec.autodetect,
+                    destination_table: DestinationTableRef {
+                        project_id: destination_project,
+                        dataset_id: spec.destination_dataset.clone(),
+                        table_id: spec.destination_table.clone(),
+                    },
+                    skip_leading_rows: spec.skip_leading_rows,
+                    field_delimiter: spec.field_delimiter.clone(),
+                },
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JobReferenceRequest {
+    project_id: String,
+    location: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JobConfigurationRequest {
+    load: JobConfigurationLoad,
+}
+
+/// `configuration.load` — the load-job knobs. Optional CSV fields are
+/// omitted entirely (not sent as `null`) for non-CSV formats so the
+/// request mirrors what a hand-written BigQuery load config looks like.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JobConfigurationLoad {
+    source_uris: Vec<String>,
+    source_format: String,
+    write_disposition: String,
+    create_disposition: String,
+    autodetect: bool,
+    destination_table: DestinationTableRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skip_leading_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field_delimiter: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DestinationTableRef {
+    project_id: String,
+    dataset_id: String,
+    table_id: String,
+}
+
+// -- load-job (`jobs.insert` / `jobs.get`) wire response --
+
+/// A BigQuery `Job` resource as returned by `jobs.insert` and `jobs.get`.
+/// Only the slices the load path reads are modelled; everything else is
+/// ignored by serde.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JobResource {
+    #[serde(default)]
+    job_reference: Option<JobReference>,
+    #[serde(default)]
+    status: Option<JobStatus>,
+    #[serde(default)]
+    statistics: Option<BigQueryStatistics>,
+}
+
+/// `Job.status`. `state` is `PENDING` / `RUNNING` / `DONE`; a terminal
+/// failure carries `errorResult` (the summary `ErrorProto`) plus the full
+/// `errors[]` list.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JobStatus {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    error_result: Option<JobErrorProto>,
+    #[serde(default)]
+    errors: Option<Vec<JobErrorProto>>,
+}
+
+/// An `ErrorProto` under `Job.status`. Distinct from the query path's
+/// top-level [`ErrorProto`] only in where it lives on the wire; the shape
+/// (`reason` + `message`) is the same subset.
+#[derive(Debug, Deserialize)]
+struct JobErrorProto {
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1195,6 +1662,7 @@ fn is_transient(err: &BigQueryError) -> bool {
         }
         BigQueryError::Http(e) => e.is_connect() || e.is_timeout(),
         BigQueryError::JobError { .. }
+        | BigQueryError::LoadJobError { .. }
         | BigQueryError::Auth(_)
         | BigQueryError::Timeout { .. }
         | BigQueryError::RetryBudgetExhausted { .. }
@@ -1210,6 +1678,44 @@ fn is_transient(err: &BigQueryError) -> bool {
 struct BigQueryStatistics {
     #[serde(default)]
     query: Option<BigQueryQueryStatistics>,
+    /// `statistics.load` slice — populated on a load job's `jobs.get`
+    /// response. Carries `outputRows` (rows landed in the target) and
+    /// `inputFileBytes` (bytes read from the source URIs). Both are
+    /// decimal-string int64s, parsed best-effort.
+    #[serde(default)]
+    load: Option<BigQueryLoadStatistics>,
+}
+
+/// `statistics.load` subset for a BigQuery load job.
+///
+/// BigQuery encodes int64 figures as decimal strings (JSON has no native
+/// 64-bit int), so both fields are `Option<String>` parsed to `u64`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BigQueryLoadStatistics {
+    /// Number of rows the load job wrote into the destination table.
+    #[serde(default)]
+    output_rows: Option<String>,
+    /// Bytes read from the source URIs. Used as `LoadResult.bytes_read`
+    /// on the cloud-URI path, where the caller has no local file size.
+    #[serde(default)]
+    input_file_bytes: Option<String>,
+}
+
+impl BigQueryLoadStatistics {
+    /// Parse `outputRows` to `u64`. Missing / unparseable → `None`.
+    fn output_rows_u64(&self) -> Option<u64> {
+        self.output_rows
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok())
+    }
+
+    /// Parse `inputFileBytes` to `u64`. Missing / unparseable → `None`.
+    fn input_file_bytes_u64(&self) -> Option<u64> {
+        self.input_file_bytes
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok())
+    }
 }
 
 /// `statistics.query` subset we care about today.

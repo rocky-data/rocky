@@ -14,7 +14,10 @@ pub mod governance;
 pub mod loader;
 pub mod storage_read;
 
-pub use connector::BigQueryAdapter;
+pub use connector::{
+    BigQueryAdapter, BigQuerySourceFormat, LoadCreateDisposition, LoadJobOutcome, LoadJobSpec,
+    WriteDisposition,
+};
 pub use dialect::BigQueryDialect;
 pub use discovery::BigQueryDiscoveryAdapter;
 pub use loader::BigQueryLoaderAdapter;
