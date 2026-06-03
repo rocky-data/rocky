@@ -1070,3 +1070,168 @@ async fn test_governance_set_tags_applies_labels() {
         "table labels should contain env + owner; got {table_label_value}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Native LOAD JOB — end-to-end against a real GCS object
+// ---------------------------------------------------------------------------
+//
+// This is the live merge-gate for the `gs://` native-load path (the
+// headline feature). Because the loader does **not** upload local files to
+// GCS, the cloud-load path can't self-create its source — the test reads a
+// pre-staged GCS object from the sandbox bucket.
+//
+// Required env (all `ROCKY_TEST_*`, scrubbed of any committed identifiers):
+//   - `ROCKY_TEST_BIGQUERY_PROJECT`  — GCP project for the ephemeral
+//     dataset + load job.
+//   - `ROCKY_TEST_BIGQUERY_GCS_URI`  — a `gs://bucket/object.csv` that the
+//     tester has staged in the sandbox bucket. A 1-header-row CSV; the
+//     test counts the loaded rows and asserts they match the table.
+//   - `GOOGLE_APPLICATION_CREDENTIALS` *or* `BIGQUERY_TOKEN` — auth (the
+//     Google contract `BigQueryAuth::from_env()` already honours). The
+//     service account / token needs `bigquery.dataEditor` +
+//     `bigquery.jobUser` on the project and `storage.objects.get` on the
+//     bucket object.
+// Optional:
+//   - `ROCKY_TEST_BIGQUERY_LOCATION` — dataset location (default `EU`);
+//     **must** match the bucket's region/multi-region or BigQuery rejects
+//     the load.
+//
+// Run with:
+//   cargo test -p rocky-bigquery --test integration \
+//     load_via_gcs_csv -- --ignored --nocapture
+//
+// The test creates `hc_load_<ts>` (matching the sandbox `hc_` housekeeping
+// prefix), loads the object, verifies, and DROPs the dataset CASCADE in a
+// `finally`-style block so a mid-test failure still cleans up.
+
+/// Build a loader + the destination `TableRef` from `ROCKY_TEST_*` env.
+/// Returns `None` (skip) when the required vars aren't present.
+fn load_env() -> Option<(rocky_bigquery::BigQueryLoaderAdapter, String, String)> {
+    let project = std::env::var("ROCKY_TEST_BIGQUERY_PROJECT").ok()?;
+    let gcs_uri = std::env::var("ROCKY_TEST_BIGQUERY_GCS_URI").ok()?;
+    let location =
+        std::env::var("ROCKY_TEST_BIGQUERY_LOCATION").unwrap_or_else(|_| "EU".to_string());
+    let auth = BigQueryAuth::from_env().ok()?;
+    let adapter = std::sync::Arc::new(BigQueryAdapter::new(project.clone(), location, auth));
+    let loader = rocky_bigquery::BigQueryLoaderAdapter::new(adapter);
+    Some((loader, project, gcs_uri))
+}
+
+/// End-to-end: load a pre-staged GCS CSV into a fresh table via the native
+/// BigQuery load-job path (`LoadSource::CloudUri` → `jobs.insert`), then
+/// verify the row count. Exercises the *full* loader dispatch, not just
+/// the connector primitive.
+#[tokio::test]
+#[ignore]
+async fn load_via_gcs_csv() {
+    use rocky_adapter_sdk::{LoadOptions, LoadSource, LoaderAdapter};
+
+    let Some((loader, project, gcs_uri)) = load_env() else {
+        eprintln!(
+            "skipping load_via_gcs_csv: set ROCKY_TEST_BIGQUERY_PROJECT, \
+             ROCKY_TEST_BIGQUERY_GCS_URI, and GCP auth to run"
+        );
+        return;
+    };
+
+    // A second adapter for verification / setup / teardown SQL. (The
+    // loader owns its own Arc<BigQueryAdapter>; this one issues the
+    // dataset DDL and the post-load COUNT.)
+    let admin = adapter_from_rocky_env().expect("ROCKY_TEST_BIGQUERY_PROJECT must be set");
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
+    let dataset = format!("hc_load_{suffix}");
+    let table = "loaded";
+    let location =
+        std::env::var("ROCKY_TEST_BIGQUERY_LOCATION").unwrap_or_else(|_| "EU".to_string());
+
+    // Create the dataset in the right location so the load (and the bucket
+    // region) line up.
+    admin
+        .execute_statement(&format!(
+            "CREATE SCHEMA IF NOT EXISTS `{project}`.`{dataset}` OPTIONS(location='{location}')"
+        ))
+        .await
+        .expect("create dataset");
+
+    // Run the load + verification, capturing the result so we always drop
+    // the dataset afterwards. The loader takes the adapter-SDK `TableRef`
+    // (a distinct type from the `rocky_ir::TableRef` the admin adapter
+    // uses), so it's fully qualified here.
+    let outcome = async {
+        let target = rocky_adapter_sdk::TableRef {
+            catalog: project.clone(),
+            schema: dataset.clone(),
+            table: table.into(),
+        };
+        let source = LoadSource::CloudUri(gcs_uri.clone());
+        let options = LoadOptions {
+            // Native load job: CREATE_IF_NEEDED + autodetect + skip 1
+            // header row. WRITE_TRUNCATE so a re-run is idempotent.
+            create_table: true,
+            truncate_first: true,
+            csv_has_header: true,
+            ..Default::default()
+        };
+
+        let result = loader.load(&source, &target, &options).await?;
+        assert!(
+            result.rows_loaded > 0,
+            "expected the GCS CSV to load at least one row; loaded {}",
+            result.rows_loaded
+        );
+
+        // Cross-check against a COUNT(*) on the destination table. The
+        // admin adapter's query error type differs from the loader's, so
+        // this uses `.expect()` rather than `?` to keep the closure's
+        // error type purely the loader's `AdapterError`.
+        let count_res = admin
+            .execute_query(&format!(
+                "SELECT COUNT(*) FROM `{project}`.`{dataset}`.`{table}`"
+            ))
+            .await
+            .expect("COUNT(*) on loaded table");
+        let counted: u64 = count_res.rows[0][0]
+            .as_str()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+        assert_eq!(
+            counted, result.rows_loaded,
+            "COUNT(*) ({counted}) should equal rows_loaded ({})",
+            result.rows_loaded
+        );
+
+        // Idempotency: a second WRITE_TRUNCATE load yields the same count.
+        let result2 = loader.load(&source, &target, &options).await?;
+        assert_eq!(
+            result2.rows_loaded, result.rows_loaded,
+            "WRITE_TRUNCATE re-load should land the same row count"
+        );
+
+        Ok::<_, rocky_adapter_sdk::AdapterError>(result)
+    }
+    .await;
+
+    // Teardown regardless of outcome.
+    let _ = admin
+        .execute_statement(&format!(
+            "DROP SCHEMA IF EXISTS `{project}`.`{dataset}` CASCADE"
+        ))
+        .await;
+
+    outcome.expect("GCS CSV load + verification");
+}
+
+/// Admin adapter built from the `ROCKY_TEST_*` env (mirrors `load_env`'s
+/// project/location/auth) for the setup + teardown SQL in the load test.
+fn adapter_from_rocky_env() -> Option<BigQueryAdapter> {
+    let project = std::env::var("ROCKY_TEST_BIGQUERY_PROJECT").ok()?;
+    let location =
+        std::env::var("ROCKY_TEST_BIGQUERY_LOCATION").unwrap_or_else(|_| "EU".to_string());
+    let auth = BigQueryAuth::from_env().ok()?;
+    Some(BigQueryAdapter::new(project, location, auth))
+}

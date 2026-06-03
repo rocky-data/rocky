@@ -49,15 +49,18 @@
 use rocky_bigquery::BigQueryAdapter;
 use rocky_bigquery::auth::BigQueryAuth;
 use rocky_bigquery::connector::BigQueryError;
+use rocky_bigquery::{BigQuerySourceFormat, LoadCreateDisposition, LoadJobSpec, WriteDisposition};
 use rocky_core::config::RetryConfig;
 use rocky_core::retry_budget::RetryBudget;
 use rocky_core::traits::{AdapterError, WarehouseAdapter};
 use serde_json::{Value, json};
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{body_partial_json, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Path of the `jobs.query` endpoint for the test project.
 const QUERIES_PATH: &str = "/bigquery/v2/projects/test-project/queries";
+/// Path of the `jobs.insert` endpoint for the test project.
+const JOBS_PATH: &str = "/bigquery/v2/projects/test-project/jobs";
 
 /// Build an adapter with a static bearer token pointed at the mock server.
 /// `with_timeout` defaults to the production 300 s so the poll deadline
@@ -860,4 +863,500 @@ async fn missing_schema_yields_empty_columns_and_rows() {
 
     assert!(result.columns.is_empty());
     assert!(result.rows.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// (f) Native LOAD JOBS (`jobs.insert` → poll `jobs.get`)
+// ---------------------------------------------------------------------------
+//
+// The load path is `POST /…/jobs` (insert) followed by `GET /…/jobs/{id}`
+// (get) polled until `status.state == "DONE"`. Unlike the query path, a
+// load failure surfaces under `status.errorResult` on the `Job` resource,
+// not a top-level `errors[]` — these tests pin that distinction plus the
+// request-body shape per source format and per writeDisposition.
+
+/// A CSV `LoadJobSpec` for `test-project`, WRITE_TRUNCATE + CREATE_IF_NEEDED.
+fn csv_truncate_spec() -> LoadJobSpec {
+    LoadJobSpec {
+        destination_project: "test-project".into(),
+        destination_dataset: "ds".into(),
+        destination_table: "tbl".into(),
+        source_uris: vec!["gs://bucket/data.csv".into()],
+        source_format: BigQuerySourceFormat::Csv,
+        write_disposition: WriteDisposition::Truncate,
+        create_disposition: LoadCreateDisposition::IfNeeded,
+        autodetect: true,
+        skip_leading_rows: Some(1),
+        field_delimiter: Some(",".into()),
+    }
+}
+
+/// `jobs.get` (or inline `jobs.insert`) DONE response carrying load
+/// statistics. `output_rows` and `input_file_bytes` are decimal strings
+/// (BigQuery's int64-as-string).
+fn load_done_body(job_id: &str, output_rows: &str, input_bytes: &str) -> Value {
+    json!({
+        "jobReference": {"projectId": "test-project", "jobId": job_id},
+        "status": {"state": "DONE"},
+        "statistics": {
+            "load": {
+                "outputRows": output_rows,
+                "inputFileBytes": input_bytes
+            }
+        }
+    })
+}
+
+/// Mount a `jobs.get` mock for `job_id` that returns a DONE body with the
+/// given load stats. The request-shape tests assert the *insert* body; the
+/// connector always resolves rows-loaded from `jobs.get`, so they need a
+/// matching GET to complete.
+async fn mount_get_done(server: &MockServer, job_id: &str, output_rows: &str, input_bytes: &str) {
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            r"^/bigquery/v2/projects/test-project/jobs/{job_id}$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(load_done_body(
+            job_id,
+            output_rows,
+            input_bytes,
+        )))
+        .mount(server)
+        .await;
+}
+
+/// Happy path: insert returns RUNNING, the poll loop hits `jobs.get` which
+/// returns DONE with `statistics.load.outputRows`. Asserts rows-loaded and
+/// bytes-read are parsed from the load statistics.
+#[tokio::test]
+async fn load_job_polls_to_done_and_parses_output_rows() {
+    let server = MockServer::start().await;
+
+    // jobs.insert → RUNNING, no statistics yet.
+    Mock::given(method("POST"))
+        .and(path(JOBS_PATH))
+        .and(header("authorization", "Bearer test-bq-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": "test-project", "jobId": "load-1"},
+            "status": {"state": "RUNNING"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // jobs.get → DONE with load stats.
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/bigquery/v2/projects/test-project/jobs/load-1$",
+        ))
+        .and(header("authorization", "Bearer test-bq-token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(load_done_body("load-1", "1000", "204800")),
+        )
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let adapter = test_adapter(&server).with_timeout(5);
+    let outcome = adapter
+        .load_via_job(&csv_truncate_spec())
+        .await
+        .expect("load job should complete");
+
+    assert_eq!(outcome.rows_loaded, 1000);
+    assert_eq!(outcome.input_file_bytes, Some(204_800));
+}
+
+/// Inline DONE: `jobs.insert` returns `state=DONE` but **without** a
+/// `statistics.load` block (BigQuery only reliably populates `outputRows`
+/// on the `Job` resource from `jobs.get`, not on the insert response). The
+/// connector must therefore still call `jobs.get` for the authoritative
+/// rows-loaded rather than reporting `0` from the stats-less insert body.
+/// This pins the fix for that silent-zero-rows hazard.
+#[tokio::test]
+async fn load_job_inline_done_still_fetches_stats_via_get() {
+    let server = MockServer::start().await;
+
+    // Insert → DONE but no statistics block.
+    Mock::given(method("POST"))
+        .and(path(JOBS_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": "test-project", "jobId": "load-inline"},
+            "status": {"state": "DONE"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // jobs.get → DONE with the real load stats.
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/bigquery/v2/projects/test-project/jobs/load-inline$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(load_done_body(
+            "load-inline",
+            "7",
+            "512",
+        )))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let adapter = test_adapter(&server).with_timeout(5);
+    let outcome = adapter
+        .load_via_job(&csv_truncate_spec())
+        .await
+        .expect("inline-DONE load job should still resolve stats via jobs.get");
+
+    assert_eq!(outcome.rows_loaded, 7);
+    assert_eq!(outcome.input_file_bytes, Some(512));
+}
+
+/// Request-shape: a CSV WRITE_TRUNCATE load sends the right
+/// `configuration.load` block — sourceFormat=CSV, writeDisposition,
+/// createDisposition, the structured destinationTable, and the CSV-only
+/// knobs (skipLeadingRows / fieldDelimiter). `body_partial_json` asserts
+/// the request the connector PUT on the wire.
+#[tokio::test]
+async fn load_job_csv_truncate_request_shape() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(JOBS_PATH))
+        .and(body_partial_json(json!({
+            "jobReference": {"projectId": "test-project", "location": "EU"},
+            "configuration": {
+                "load": {
+                    "sourceUris": ["gs://bucket/data.csv"],
+                    "sourceFormat": "CSV",
+                    "writeDisposition": "WRITE_TRUNCATE",
+                    "createDisposition": "CREATE_IF_NEEDED",
+                    "autodetect": true,
+                    "destinationTable": {
+                        "projectId": "test-project",
+                        "datasetId": "ds",
+                        "tableId": "tbl"
+                    },
+                    "skipLeadingRows": 1,
+                    "fieldDelimiter": ","
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(load_done_body("load-csv", "1", "10")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_get_done(&server, "load-csv", "1", "10").await;
+
+    let adapter = test_adapter(&server).with_timeout(5);
+    adapter
+        .load_via_job(&csv_truncate_spec())
+        .await
+        .expect("csv truncate load should submit");
+    server.verify().await;
+}
+
+/// Request-shape: a PARQUET WRITE_APPEND / CREATE_NEVER load. Asserts the
+/// sourceFormat + flipped dispositions on the wire. (The CSV-only knobs
+/// `skipLeadingRows` / `fieldDelimiter` are omitted from the body via
+/// `skip_serializing_if` for non-CSV formats — absence is covered by the
+/// `build_load_spec_*` unit tests; `body_partial_json` here only asserts
+/// the keys that *are* present.)
+#[tokio::test]
+async fn load_job_parquet_append_request_shape() {
+    let server = MockServer::start().await;
+
+    let spec = LoadJobSpec {
+        destination_project: "test-project".into(),
+        destination_dataset: "ds".into(),
+        destination_table: "tbl".into(),
+        source_uris: vec!["gs://bucket/data.parquet".into()],
+        source_format: BigQuerySourceFormat::Parquet,
+        write_disposition: WriteDisposition::Append,
+        create_disposition: LoadCreateDisposition::Never,
+        autodetect: true,
+        skip_leading_rows: None,
+        field_delimiter: None,
+    };
+
+    Mock::given(method("POST"))
+        .and(path(JOBS_PATH))
+        .and(body_partial_json(json!({
+            "configuration": {
+                "load": {
+                    "sourceUris": ["gs://bucket/data.parquet"],
+                    "sourceFormat": "PARQUET",
+                    "writeDisposition": "WRITE_APPEND",
+                    "createDisposition": "CREATE_NEVER"
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(load_done_body("load-pq", "42", "9999")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_get_done(&server, "load-pq", "42", "9999").await;
+
+    let adapter = test_adapter(&server).with_timeout(5);
+    let outcome = adapter
+        .load_via_job(&spec)
+        .await
+        .expect("parquet append load");
+    assert_eq!(outcome.rows_loaded, 42);
+    server.verify().await;
+}
+
+/// Request-shape: a NEWLINE_DELIMITED_JSON load sends `sourceFormat =
+/// NEWLINE_DELIMITED_JSON`. Pins the JSONL → API-enum mapping.
+#[tokio::test]
+async fn load_job_jsonl_source_format_request_shape() {
+    let server = MockServer::start().await;
+
+    let spec = LoadJobSpec {
+        destination_project: "test-project".into(),
+        destination_dataset: "ds".into(),
+        destination_table: "tbl".into(),
+        source_uris: vec!["gs://bucket/data.jsonl".into()],
+        source_format: BigQuerySourceFormat::NewlineDelimitedJson,
+        write_disposition: WriteDisposition::Truncate,
+        create_disposition: LoadCreateDisposition::IfNeeded,
+        autodetect: true,
+        skip_leading_rows: None,
+        field_delimiter: None,
+    };
+
+    Mock::given(method("POST"))
+        .and(path(JOBS_PATH))
+        .and(body_partial_json(json!({
+            "configuration": {
+                "load": {
+                    "sourceFormat": "NEWLINE_DELIMITED_JSON",
+                    "writeDisposition": "WRITE_TRUNCATE"
+                }
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(load_done_body(
+            "load-jsonl",
+            "3",
+            "120",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_get_done(&server, "load-jsonl", "3", "120").await;
+
+    let adapter = test_adapter(&server).with_timeout(5);
+    adapter.load_via_job(&spec).await.expect("jsonl load");
+    server.verify().await;
+}
+
+/// Empty `destination_project` on the spec falls back to the adapter's
+/// project so the wire `destinationTable.projectId` is never empty.
+#[tokio::test]
+async fn load_job_empty_destination_project_falls_back_to_adapter_project() {
+    let server = MockServer::start().await;
+
+    let spec = LoadJobSpec {
+        destination_project: String::new(),
+        destination_dataset: "ds".into(),
+        destination_table: "tbl".into(),
+        source_uris: vec!["gs://bucket/data.csv".into()],
+        source_format: BigQuerySourceFormat::Csv,
+        write_disposition: WriteDisposition::Append,
+        create_disposition: LoadCreateDisposition::IfNeeded,
+        autodetect: true,
+        skip_leading_rows: Some(1),
+        field_delimiter: Some(",".into()),
+    };
+
+    Mock::given(method("POST"))
+        .and(path(JOBS_PATH))
+        .and(body_partial_json(json!({
+            "configuration": {
+                "load": {
+                    "destinationTable": {"projectId": "test-project"}
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(load_done_body("load-fb", "1", "10")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_get_done(&server, "load-fb", "1", "10").await;
+
+    let adapter = test_adapter(&server).with_timeout(5);
+    adapter
+        .load_via_job(&spec)
+        .await
+        .expect("load with project fallback");
+    server.verify().await;
+}
+
+/// A load job that reaches DONE with a `status.errorResult` maps to
+/// [`BigQueryError::LoadJobError`], and the message aggregates the
+/// per-file reasons from `status.errors[]` (not just the summary). This is
+/// the load path's analogue of the query path's top-level-`errors[]`
+/// handling — and proves the connector reads the *right* nesting.
+#[tokio::test]
+async fn load_job_error_result_maps_to_load_job_error() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(JOBS_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": "test-project", "jobId": "load-bad"},
+            "status": {"state": "RUNNING"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/bigquery/v2/projects/test-project/jobs/load-bad$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": "test-project", "jobId": "load-bad"},
+            "status": {
+                "state": "DONE",
+                "errorResult": {
+                    "reason": "invalid",
+                    "message": "Error while reading data, error message: CSV table references column position 3, but line contains only 2 columns."
+                },
+                "errors": [
+                    {"reason": "invalid", "message": "Error while reading data: field count mismatch (line 1)"},
+                    {"reason": "invalid", "message": "Error while reading data: field count mismatch (line 2)"}
+                ]
+            }
+        })))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let adapter = test_adapter(&server).with_timeout(5);
+    let err = adapter
+        .load_via_job(&csv_truncate_spec())
+        .await
+        .expect_err("a DONE job with errorResult must be an error");
+
+    match err {
+        BigQueryError::LoadJobError { reason, message } => {
+            assert_eq!(reason, "invalid");
+            // Message aggregates the two per-line errors[] entries.
+            assert!(
+                message.contains("line 1") && message.contains("line 2"),
+                "expected aggregated per-line reasons, got: {message}"
+            );
+        }
+        other => panic!("expected LoadJobError, got: {other:?}"),
+    }
+}
+
+/// A load job whose `errorResult` has no `errors[]` detail falls back to
+/// the `errorResult.message` summary.
+#[tokio::test]
+async fn load_job_error_result_without_errors_uses_summary_message() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(JOBS_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": "test-project", "jobId": "load-bad2"},
+            "status": {
+                "state": "DONE",
+                "errorResult": {"reason": "notFound", "message": "Not found: URI gs://bucket/missing.csv"}
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let adapter = test_adapter(&server).with_timeout(5);
+    let err = adapter
+        .load_via_job(&csv_truncate_spec())
+        .await
+        .expect_err("missing-source load must error");
+
+    match err {
+        BigQueryError::LoadJobError { reason, message } => {
+            assert_eq!(reason, "notFound");
+            assert!(message.contains("missing.csv"), "got: {message}");
+        }
+        other => panic!("expected LoadJobError, got: {other:?}"),
+    }
+}
+
+/// A non-2xx from `jobs.insert` (e.g. a 403 from a missing
+/// `bigquery.jobUser` role) maps to [`BigQueryError::ApiError`] on the
+/// first attempt — no poll, retries disabled by `test_adapter`.
+#[tokio::test]
+async fn load_job_insert_non_2xx_maps_to_api_error() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(JOBS_PATH))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error": {"code": 403, "message": "Access Denied: missing bigquery.jobs.create"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let adapter = test_adapter(&server).with_timeout(5);
+    let err = adapter
+        .load_via_job(&csv_truncate_spec())
+        .await
+        .expect_err("403 insert must error");
+
+    match err {
+        BigQueryError::ApiError { status, message } => {
+            assert!(status.starts_with("403"), "status: {status}");
+            assert!(message.contains("Access Denied"), "message: {message}");
+        }
+        other => panic!("expected ApiError, got: {other:?}"),
+    }
+}
+
+/// The poll loop respects the configured timeout: if `jobs.get` never
+/// reports DONE, the call returns [`BigQueryError::Timeout`] rather than
+/// looping forever. A 1 s timeout keeps the test fast.
+#[tokio::test]
+async fn load_job_poll_times_out_when_never_done() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(JOBS_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": "test-project", "jobId": "load-stuck"},
+            "status": {"state": "RUNNING"}
+        })))
+        .mount(&server)
+        .await;
+
+    // Always RUNNING — never reaches DONE.
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/bigquery/v2/projects/test-project/jobs/load-stuck$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobReference": {"projectId": "test-project", "jobId": "load-stuck"},
+            "status": {"state": "RUNNING"}
+        })))
+        .mount(&server)
+        .await;
+
+    let adapter = test_adapter(&server).with_timeout(1);
+    let err = adapter
+        .load_via_job(&csv_truncate_spec())
+        .await
+        .expect_err("a never-DONE load job must time out");
+
+    assert!(
+        matches!(err, BigQueryError::Timeout { timeout_secs: 1 }),
+        "expected Timeout, got: {err:?}"
+    );
 }
