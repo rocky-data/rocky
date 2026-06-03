@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, Query, Statement, visit_relations_mut};
+use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, Query, VisitMut, VisitorMut};
 
 use crate::parser::{ParseError, parse_single_statement};
 
@@ -38,19 +38,40 @@ pub struct DeferTarget {
     pub schema: String,
     /// Table name of the deferred upstream.
     pub table: String,
+    /// Optional identifier quote character to wrap each part in when the
+    /// reference is re-serialized.
+    ///
+    /// `None` renders bare identifiers (`catalog.schema.table`) — the default
+    /// for warehouses whose qualified parts always match the strict
+    /// SQL-identifier rule (Databricks, Snowflake, DuckDB). Dialects that
+    /// permit characters bare identifiers reject — notably BigQuery, whose
+    /// project IDs allow hyphens (`my-gcp-project-123`) — set this so the
+    /// rewritten reference is quoted exactly as the warehouse expects
+    /// (`` `my-gcp-project-123`.`schema`.`table` ``) instead of parsing the
+    /// hyphen as subtraction.
+    pub quote_style: Option<char>,
 }
 
 impl DeferTarget {
     /// Build the qualified `ObjectName` for this target, applying the
     /// empty-catalog rule (`catalog.is_empty()` ⇒ `[schema, table]`, else
-    /// `[catalog, schema, table]`).
+    /// `[catalog, schema, table]`) and the configured [`quote_style`].
+    ///
+    /// [`quote_style`]: DeferTarget::quote_style
     fn to_object_name(&self) -> ObjectName {
+        let ident = |value: &str| -> ObjectNamePart {
+            let part = match self.quote_style {
+                Some(q) => Ident::with_quote(q, value.to_string()),
+                None => Ident::new(value.to_string()),
+            };
+            ObjectNamePart::Identifier(part)
+        };
         let mut parts: Vec<ObjectNamePart> = Vec::with_capacity(3);
         if !self.catalog.is_empty() {
-            parts.push(ObjectNamePart::Identifier(Ident::new(self.catalog.clone())));
+            parts.push(ident(&self.catalog));
         }
-        parts.push(ObjectNamePart::Identifier(Ident::new(self.schema.clone())));
-        parts.push(ObjectNamePart::Identifier(Ident::new(self.table.clone())));
+        parts.push(ident(&self.schema));
+        parts.push(ident(&self.table));
         ObjectName(parts)
     }
 }
@@ -60,15 +81,20 @@ impl DeferTarget {
 ///
 /// `deferred` maps a deferred model's bare name to the fully qualified
 /// location its reference should resolve to. Only single-part relations whose
-/// identifier matches a key in `deferred` (and that are not CTE names defined
-/// within the statement) are rewritten; everything else is preserved
-/// byte-for-byte by re-serializing the parsed AST.
+/// identifier matches a key in `deferred` — and that are not shadowed by a CTE
+/// in scope at that point — are rewritten; everything else is left as parsed.
 ///
-/// Returns the rewritten SQL. When `deferred` is empty, or the SQL contains
-/// no matching bare references, the parsed-then-reserialized form of the
-/// input is returned unchanged in meaning (note: AST round-trip may
-/// normalize incidental whitespace — callers only invoke this in `--defer`
-/// mode, never on the default path).
+/// CTE shadowing is resolved with lexical scope: the rewrite walks the AST
+/// maintaining a stack of the CTE names in scope (each query's `WITH` names
+/// cover its own body and every CTE body nested under it), so a `WITH orders
+/// AS (…)` inside a derived-table / `IN` / `UNION` subquery only shadows the
+/// deferred `orders` *within that subquery*, while a genuine top-level `FROM
+/// orders` with no shadowing CTE is still qualified.
+///
+/// Re-serialization preserves the statement's semantics, but the AST round
+/// trip may strip comments and trailing semicolons and normalize incidental
+/// whitespace — callers only invoke this in `--defer` mode, never on the
+/// default path.
 ///
 /// # Errors
 ///
@@ -83,47 +109,77 @@ pub fn qualify_deferred_refs(
 
     let mut statement = parse_single_statement(sql)?;
 
-    // Collect every CTE name defined anywhere in the statement so a CTE that
-    // shadows a deferred model name is never rewritten — a `WITH orders AS
-    // (...) SELECT * FROM orders` must keep reading the CTE, not the deferred
-    // production table.
-    let mut cte_names: HashSet<String> = HashSet::new();
-    if let Statement::Query(query) = &statement {
-        collect_cte_names(query, &mut cte_names);
+    // Walk the whole AST with a scope-aware visitor. `visit_relations_mut`
+    // reaches every relation (including those inside derived-table / scalar /
+    // `IN` subqueries and set-op branches), but it is scope-blind — so the
+    // visitor tracks the CTE names in scope on a stack and only rewrites a
+    // bare reference that is *not* shadowed at that point. The visitor never
+    // breaks, so the `ControlFlow` is always `Continue`.
+    let mut rewriter = DeferRewriter {
+        deferred,
+        scopes: Vec::new(),
+    };
+    let _: ControlFlow<()> = statement.visit(&mut rewriter);
+
+    Ok(statement.to_string())
+}
+
+/// Scope-aware visitor that qualifies bare deferred-model references while
+/// honouring lexical CTE shadowing.
+///
+/// `scopes` is a stack of the CTE names introduced by each enclosing query's
+/// `WITH` clause. A query's frame is pushed in `pre_visit_query` (before its
+/// body *and* its CTE bodies are walked) and popped in `post_visit_query`, so
+/// a name on the stack shadows the deferred model for exactly the subtree
+/// where that `WITH` is in scope.
+struct DeferRewriter<'a> {
+    deferred: &'a HashMap<String, DeferTarget>,
+    scopes: Vec<HashSet<String>>,
+}
+
+impl DeferRewriter<'_> {
+    /// Whether `name` is shadowed by a CTE in any enclosing scope.
+    fn is_shadowed(&self, name: &str) -> bool {
+        self.scopes.iter().any(|frame| frame.contains(name))
+    }
+}
+
+impl VisitorMut for DeferRewriter<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        let mut frame: HashSet<String> = HashSet::new();
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                frame.insert(cte.alias.name.value.clone());
+            }
+        }
+        self.scopes.push(frame);
+        ControlFlow::Continue(())
     }
 
-    // The closure never breaks, so the `ControlFlow` is always `Continue`.
-    let _: ControlFlow<()> = visit_relations_mut(&mut statement, |relation: &mut ObjectName| {
+    fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+        self.scopes.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(&mut self, relation: &mut ObjectName) -> ControlFlow<Self::Break> {
         // Only single-part bare names are candidates; anything already
         // qualified (`schema.table`, `catalog.schema.table`) is left alone.
         if relation.0.len() != 1 {
-            return ControlFlow::<()>::Continue(());
+            return ControlFlow::Continue(());
         }
         let Some(ident) = relation.0[0].as_ident() else {
             return ControlFlow::Continue(());
         };
         let name = ident.value.clone();
-        if cte_names.contains(&name) {
+        if self.is_shadowed(&name) {
             return ControlFlow::Continue(());
         }
-        if let Some(target) = deferred.get(&name) {
+        if let Some(target) = self.deferred.get(&name) {
             *relation = target.to_object_name();
         }
         ControlFlow::Continue(())
-    });
-
-    Ok(statement.to_string())
-}
-
-/// Recursively collect CTE alias names from a query's `WITH` clause and from
-/// every nested subquery's `WITH` clause.
-fn collect_cte_names(query: &Query, names: &mut HashSet<String>) {
-    if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            names.insert(cte.alias.name.value.clone());
-            // A CTE body is itself a query and may declare further CTEs.
-            collect_cte_names(&cte.query, names);
-        }
     }
 }
 
@@ -136,6 +192,16 @@ mod tests {
             catalog: catalog.to_string(),
             schema: schema.to_string(),
             table: table.to_string(),
+            quote_style: None,
+        }
+    }
+
+    fn quoted_target(catalog: &str, schema: &str, table: &str, quote: char) -> DeferTarget {
+        DeferTarget {
+            catalog: catalog.to_string(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+            quote_style: Some(quote),
         }
     }
 
@@ -221,6 +287,115 @@ mod tests {
             !out.contains("prod.orders"),
             "CTE shadowing a model name must not be qualified: {out}"
         );
+    }
+
+    #[test]
+    fn does_not_rewrite_cte_shadow_inside_derived_table_subquery() {
+        // Case A: the shadowing `WITH orders` lives inside a derived-table
+        // subquery (`FROM (... ) sub`). Its inner `FROM orders` must read the
+        // CTE, not the deferred production table — the scope-aware walk must
+        // not flatten the nested CTE name into a global shadow set either, but
+        // here we only assert the inner ref stays unqualified.
+        let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
+        let out = qualify_deferred_refs(
+            "SELECT * FROM (WITH orders AS (SELECT 1 AS id) SELECT * FROM orders) sub",
+            &deferred,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("prod.orders"),
+            "CTE inside a derived-table subquery must shadow the deferred ref: {out}"
+        );
+    }
+
+    #[test]
+    fn does_not_rewrite_cte_shadow_inside_in_subquery() {
+        // Case B: the shadowing `WITH orders` lives inside an `IN (...)`
+        // scalar subquery — an `Expr`, not a `TableFactor`. The whole-AST
+        // visitor still reaches it, and the scope stack keeps the inner
+        // `FROM orders` reading the CTE.
+        let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
+        let out = qualify_deferred_refs(
+            "SELECT id FROM events WHERE id IN \
+             (WITH orders AS (SELECT 1 AS id) SELECT id FROM orders)",
+            &deferred,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("prod.orders"),
+            "CTE inside an IN-subquery must shadow the deferred ref: {out}"
+        );
+    }
+
+    #[test]
+    fn does_not_rewrite_cte_shadow_inside_union_branch() {
+        // Case C: the shadowing `WITH orders` lives inside a set-op (UNION)
+        // branch. The visitor descends into both branches; the inner branch's
+        // CTE shadows its own `FROM orders`.
+        let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
+        let out = qualify_deferred_refs(
+            "SELECT 1 AS id UNION ALL \
+             (WITH orders AS (SELECT 2 AS id) SELECT id FROM orders)",
+            &deferred,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("prod.orders"),
+            "CTE inside a UNION branch must shadow the deferred ref: {out}"
+        );
+    }
+
+    #[test]
+    fn qualifies_top_level_ref_with_no_shadowing_cte() {
+        // Case D (positive control): a genuine top-level `FROM orders` with no
+        // shadowing CTE anywhere is still qualified.
+        let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
+        let out = qualify_deferred_refs("SELECT * FROM orders", &deferred).unwrap();
+        assert!(
+            out.contains("prod.orders"),
+            "top-level deferred ref with no shadow must be qualified: {out}"
+        );
+    }
+
+    #[test]
+    fn qualifies_outer_ref_but_not_nested_cte_shadow() {
+        // Case E (the discriminating case): a flat global shadow set would
+        // wrongly skip the top-level `FROM orders`, and a scope-blind walk
+        // would wrongly qualify the inner one. Only a scope-aware stack gets
+        // both: the top-level ref IS qualified, the nested CTE-shadowed ref is
+        // NOT.
+        let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
+        let out = qualify_deferred_refs(
+            "SELECT * FROM orders WHERE id IN \
+             (WITH orders AS (SELECT 1 AS id) SELECT id FROM orders)",
+            &deferred,
+        )
+        .unwrap();
+        // Exactly one occurrence of the qualified production ref (the outer
+        // FROM); the inner CTE ref stays bare.
+        assert_eq!(
+            out.matches("prod.orders").count(),
+            1,
+            "outer ref qualified, nested CTE-shadowed ref left bare: {out}"
+        );
+        assert!(
+            out.contains("FROM prod.orders WHERE"),
+            "the outer FROM must be the qualified one: {out}"
+        );
+    }
+
+    #[test]
+    fn quotes_hyphenated_catalog_for_bigquery_style_target() {
+        // A BigQuery-style defer target: the project (catalog) contains
+        // hyphens, so the rewritten reference must be backtick-quoted to match
+        // what the BigQuery dialect emits — bare hyphens would parse as
+        // subtraction and the warehouse would reject the SQL.
+        let deferred = deferred_map(&[(
+            "orders",
+            quoted_target("my-gcp-project-123", "prod", "orders", '`'),
+        )]);
+        let out = qualify_deferred_refs("SELECT * FROM orders", &deferred).unwrap();
+        assert_eq!(out, "SELECT * FROM `my-gcp-project-123`.`prod`.`orders`");
     }
 
     #[test]
