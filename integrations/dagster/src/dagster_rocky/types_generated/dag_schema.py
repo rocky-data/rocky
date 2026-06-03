@@ -398,6 +398,12 @@ class DagOutput(BaseModel):
     """
     Every stage in the pipeline as an enriched DAG node.
     """
+    schema_version: str | None = "1"
+    """
+    Version of the graph-export contract this payload conforms to.
+
+    Distinct from `version` (the engine release, which churns every release): `schema_version` identifies the *shape* of the graph export — the node/edge/lineage fields orchestrators build an asset graph from. It is bumped only on a backward-incompatible change to that shape, so an orchestrator can pin against it across engine releases. Additive, backward-compatible field additions do not bump it (and surface through codegen-drift CI instead). Always emitted; older payloads that predate the field are treated as `"1"`.
+    """
     summary: DagSummaryOutput
     """
     Summary counts for the DAG.

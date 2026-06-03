@@ -2750,6 +2750,13 @@ fn default_parallel() -> u32 {
     1
 }
 
+/// Current version of the `rocky dag` graph-export contract.
+///
+/// See [`DagOutput::schema_version`] for the bump policy.
+fn default_dag_schema_version() -> String {
+    "1".to_string()
+}
+
 // Phase 2 plan-spine note: plan_id / plan_kind / created_at / models /
 // execution_layers fields are added directly to `PlanOutput` (inline fields,
 // not a wrapper) so the existing `"plan"` command wire key in
@@ -3965,6 +3972,18 @@ impl RetentionSweepOutput {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DagOutput {
     pub version: String,
+    /// Version of the graph-export contract this payload conforms to.
+    ///
+    /// Distinct from `version` (the engine release, which churns every
+    /// release): `schema_version` identifies the *shape* of the graph
+    /// export — the node/edge/lineage fields orchestrators build an asset
+    /// graph from. It is bumped only on a backward-incompatible change to
+    /// that shape, so an orchestrator can pin against it across engine
+    /// releases. Additive, backward-compatible field additions do not bump
+    /// it (and surface through codegen-drift CI instead). Always emitted;
+    /// older payloads that predate the field are treated as `"1"`.
+    #[serde(default = "default_dag_schema_version")]
+    pub schema_version: String,
     pub command: String,
     /// Every stage in the pipeline as an enriched DAG node.
     pub nodes: Vec<DagNodeOutput>,
