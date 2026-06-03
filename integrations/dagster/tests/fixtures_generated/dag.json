@@ -1,5 +1,6 @@
 {
   "version": "0.0.0-SENTINEL",
+  "schema_version": "1",
   "command": "dag",
   "nodes": [
     {

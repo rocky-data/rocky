@@ -22,6 +22,17 @@ use crate::output::*;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Version of the `rocky dag` graph-export contract. Bumped only on a
+/// backward-incompatible change to the node/edge/lineage shape orchestrators
+/// consume; see [`crate::output::DagOutput::schema_version`].
+///
+/// This is the version the CURRENT engine emits, and is intentionally SEPARATE
+/// from `default_dag_schema_version()` in `output.rs` (the value a consumer
+/// assumes when the field is absent, which stays `"1"` across future bumps
+/// because an absent field means a pre-field engine emitting the original v1
+/// shape). The two must NOT be collapsed into one shared const.
+const DAG_SCHEMA_VERSION: &str = "1";
+
 /// Execute `rocky dag`.
 ///
 /// `cache_ttl_override`: CLI `--cache-ttl` flag override for the
@@ -224,6 +235,7 @@ fn build_dag_output(
 
     Ok(DagOutput {
         version: VERSION.to_string(),
+        schema_version: DAG_SCHEMA_VERSION.to_string(),
         command: "dag".to_string(),
         nodes,
         edges,
