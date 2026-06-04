@@ -15,6 +15,10 @@ workspace = true
 rmcp = { workspace = true }
 rocky-cli = { path = "../rocky-cli" }
 rocky-core = { path = "../rocky-core" }
+# Typed IR data types: `TableRef` (parsed for drift_preview's describe_table
+# calls) and `DriftAction` (projected to a wire name). A leaf data crate — no
+# cycle (rocky-core already depends on it).
+rocky-ir = { path = "../rocky-ir" }
 rocky-sql = { path = "../rocky-sql" }
 rocky-compiler = { path = "../rocky-compiler" }
 # Direct dependency for the suggest_freshness_block tool: the hoisted

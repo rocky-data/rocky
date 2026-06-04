@@ -4193,6 +4193,7 @@ dependencies = [
  "rocky-compiler",
  "rocky-core",
  "rocky-duckdb",
+ "rocky-ir",
  "rocky-snowflake",
  "rocky-sql",
  "schemars 1.2.1",

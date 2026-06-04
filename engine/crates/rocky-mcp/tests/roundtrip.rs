@@ -83,8 +83,10 @@ async fn tools_list_returns_expected_set() {
             "compile",
             "dependents",
             "draft_contract",
+            "drift_preview",
             "explain_model",
             "generate_tests",
+            "governance_preview",
             "history",
             "inspect_schema",
             "lineage",
@@ -304,17 +306,25 @@ async fn dependents_returns_downstream_consumers() {
 }
 
 #[tokio::test]
-async fn prompts_list_includes_build_model() {
+async fn prompts_list_returns_expected_set() {
     let dir = TempDir::new().unwrap();
     write_project(dir.path(), &dir.path().join("test.duckdb"));
     let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
 
     let client = connect(server).await;
     let prompts = client.list_all_prompts().await.expect("list prompts");
-    let names: Vec<String> = prompts.iter().map(|p| p.name.clone()).collect();
-    assert!(
-        names.iter().any(|n| n == "build_model"),
-        "prompts/list must include build_model, got {names:?}"
+    let mut names: Vec<String> = prompts.iter().map(|p| p.name.clone()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "add_tests_to_pks",
+            "build_model",
+            "find_untested_models",
+            "fix_failing_test",
+            "summarize_project",
+        ],
+        "prompts/list must enumerate the full trajectory set"
     );
 
     // The build_model prompt declares its single `intent` argument.
@@ -329,6 +339,19 @@ async fn prompts_list_includes_build_model() {
     assert!(
         args.iter().any(|a| a.name == "intent"),
         "build_model must declare an `intent` argument"
+    );
+
+    // The scoped trajectories declare an optional `model` argument.
+    let add_tests = prompts
+        .iter()
+        .find(|p| p.name == "add_tests_to_pks")
+        .expect("add_tests_to_pks prompt present");
+    assert!(
+        add_tests
+            .arguments
+            .as_ref()
+            .is_some_and(|a| a.iter().any(|arg| arg.name == "model")),
+        "add_tests_to_pks must declare a `model` argument"
     );
 
     client.cancel().await.unwrap();
@@ -390,6 +413,121 @@ async fn prompt_get_build_model_returns_authoring_loop() {
     assert!(
         haystack.to_lowercase().contains("reconcile"),
         "build_model must emphasize the reconcile discipline"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// Flatten a prompt result's text messages into one searchable haystack.
+fn prompt_text(result: &rmcp::model::GetPromptResult) -> String {
+    use rmcp::model::PromptMessageContent;
+    result
+        .messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            PromptMessageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Each authoring trajectory orchestrates the existing read-only / grounding
+/// MCP tools and stops at the human gate — the propose-stop discipline must
+/// survive copy edits, so assert on the load-bearing anchors. `summarize_project`
+/// is the read-only exception: it must NOT propose.
+#[tokio::test]
+async fn authoring_trajectories_orchestrate_tools_and_stop_at_the_gate() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // find_untested_models — catalog -> generate_tests/draft_contract -> propose,
+    // stopping at the review/apply gate.
+    let untested = client
+        .get_prompt(GetPromptRequestParams::new("find_untested_models"))
+        .await
+        .expect("get_prompt find_untested_models");
+    let haystack = prompt_text(&untested);
+    for anchor in [
+        "catalog",
+        "generate_tests",
+        "draft_contract",
+        "propose",
+        "review",
+        "apply",
+    ] {
+        assert!(
+            haystack.contains(anchor),
+            "find_untested_models should mention `{anchor}`; full text:\n{haystack}"
+        );
+    }
+    assert!(
+        haystack.to_lowercase().contains("reconcile"),
+        "find_untested_models must carry the reconcile discipline"
+    );
+
+    // add_tests_to_pks — inspect_schema -> profile_column -> generate_tests ->
+    // propose. The optional `model` arg scopes the trajectory text.
+    let pk_args = serde_json::json!({ "model": "orders" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let pks = client
+        .get_prompt(GetPromptRequestParams::new("add_tests_to_pks").with_arguments(pk_args))
+        .await
+        .expect("get_prompt add_tests_to_pks");
+    let haystack = prompt_text(&pks);
+    for anchor in [
+        "orders", // the scoped model name threads into the text
+        "inspect_schema",
+        "profile_column",
+        "generate_tests",
+        "propose",
+        "review",
+        "apply",
+    ] {
+        assert!(
+            haystack.contains(anchor),
+            "add_tests_to_pks should mention `{anchor}`; full text:\n{haystack}"
+        );
+    }
+
+    // fix_failing_test — test -> profile_column -> propose, stopping at the gate.
+    let fix = client
+        .get_prompt(GetPromptRequestParams::new("fix_failing_test"))
+        .await
+        .expect("get_prompt fix_failing_test");
+    let haystack = prompt_text(&fix);
+    for anchor in ["test", "profile_column", "propose", "review", "apply"] {
+        assert!(
+            haystack.contains(anchor),
+            "fix_failing_test should mention `{anchor}`; full text:\n{haystack}"
+        );
+    }
+
+    // summarize_project — read-only: catalog + lineage, and explicitly NOT a
+    // propose/apply trajectory.
+    let summary = client
+        .get_prompt(GetPromptRequestParams::new("summarize_project"))
+        .await
+        .expect("get_prompt summarize_project");
+    let haystack = prompt_text(&summary);
+    for anchor in ["catalog", "lineage"] {
+        assert!(
+            haystack.contains(anchor),
+            "summarize_project should mention `{anchor}`; full text:\n{haystack}"
+        );
+    }
+    assert!(
+        haystack.to_lowercase().contains("read-only")
+            || haystack.to_lowercase().contains("read only"),
+        "summarize_project must declare itself read-only"
+    );
+    assert!(
+        !haystack.contains("plan_id"),
+        "summarize_project is read-only and must not drive a propose/plan flow:\n{haystack}"
     );
 
     client.cancel().await.unwrap();
@@ -1009,6 +1147,236 @@ async fn generator_tools_degrade_without_api_key() {
             .as_str()
             .unwrap()
             .contains(rocky_ai::client::AI_API_KEY_ENV)
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// Write a DuckDB project whose single model declares governance — a
+/// `[classification]` tag + a `retention` policy, with a workspace `[mask]`
+/// resolving the tag. `governance_preview` reads this offline (no warehouse).
+fn write_governed_project(dir: &Path, db_path: &Path) {
+    std::fs::create_dir_all(dir.join("models")).unwrap();
+    std::fs::write(
+        dir.join("rocky.toml"),
+        format!(
+            r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[mask]
+pii = "hash"
+
+[mask.prod]
+pii = "redact"
+
+[pipeline.p]
+strategy = "full_refresh"
+
+[pipeline.p.source.discovery]
+adapter = "default"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+catalog_template = "warehouse"
+schema_template = "out"
+"#,
+            db_path.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("models").join("orders.sql"),
+        "SELECT 1 AS id, 'a@b.com' AS email\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("models").join("orders.toml"),
+        r#"name = "orders"
+retention = "90d"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "out"
+table = "orders"
+
+[classification]
+email = "pii"
+"#,
+    )
+    .unwrap();
+}
+
+/// `governance_preview` is offline (compile + sidecar read, no warehouse): it
+/// surfaces the classification / mask / retention the model declares, resolving
+/// the mask against the active env. Requires no API key and no live creds.
+#[tokio::test]
+async fn governance_preview_surfaces_declared_actions_offline() {
+    let dir = TempDir::new().unwrap();
+    // No DuckDB file is created — the tool must not touch the warehouse.
+    write_governed_project(dir.path(), &dir.path().join("warehouse.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // Default env → `pii` resolves to `hash`.
+    let result = client
+        .call_tool(CallToolRequestParams::new("governance_preview"))
+        .await
+        .expect("governance_preview call");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "governance_preview is offline and must not error"
+    );
+    let sc = result.structured_content.expect("structured content");
+
+    let classifications = sc["classification_actions"].as_array().unwrap();
+    assert_eq!(classifications.len(), 1, "one (model,column,tag): {sc:?}");
+    assert_eq!(classifications[0]["model"], serde_json::json!("orders"));
+    assert_eq!(classifications[0]["column"], serde_json::json!("email"));
+    assert_eq!(classifications[0]["tag"], serde_json::json!("pii"));
+
+    let masks = sc["mask_actions"].as_array().unwrap();
+    assert_eq!(masks.len(), 1, "pii resolves to a strategy: {sc:?}");
+    assert_eq!(masks[0]["resolved_strategy"], serde_json::json!("hash"));
+
+    let retentions = sc["retention_actions"].as_array().unwrap();
+    assert_eq!(retentions.len(), 1, "one retention policy: {sc:?}");
+    assert_eq!(retentions[0]["duration_days"], serde_json::json!(90));
+
+    // The `prod` env override resolves `pii` to `redact` instead.
+    let prod_args = serde_json::json!({ "env": "prod" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let prod = client
+        .call_tool(CallToolRequestParams::new("governance_preview").with_arguments(prod_args))
+        .await
+        .expect("governance_preview --env prod call")
+        .structured_content
+        .expect("structured content");
+    assert_eq!(prod["env"], serde_json::json!("prod"));
+    assert_eq!(
+        prod["mask_actions"][0]["resolved_strategy"],
+        serde_json::json!("redact"),
+        "prod env must resolve pii to redact: {prod:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// `drift_preview` DESCRIBEs two warehouse tables and compares their reported
+/// column types — the same apples-to-apples comparison `rocky run` performs.
+/// Source has a widened `id` (BIGINT vs INTEGER) plus an extra column the
+/// target lacks; the tool must surface both, and report a missing target as
+/// `target_exists: false`.
+#[tokio::test]
+async fn drift_preview_compares_source_and_target_on_duckdb() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("warehouse.duckdb");
+    write_project(dir.path(), &db_path);
+
+    {
+        use rocky_core::traits::WarehouseAdapter;
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        adapter
+            .execute_statement("CREATE SCHEMA IF NOT EXISTS out")
+            .await
+            .unwrap();
+        // Target: id INTEGER, status VARCHAR.
+        adapter
+            .execute_statement(
+                "CREATE OR REPLACE TABLE out.orders AS \
+                 SELECT CAST(1 AS INTEGER) AS id, 'COMPLETE' AS status",
+            )
+            .await
+            .unwrap();
+        // Source: id BIGINT (widened), status VARCHAR, plus a new `region` column.
+        adapter
+            .execute_statement(
+                "CREATE OR REPLACE TABLE out.orders_next AS \
+                 SELECT CAST(1 AS BIGINT) AS id, 'COMPLETE' AS status, 'EU' AS region",
+            )
+            .await
+            .unwrap();
+    }
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let args = serde_json::json!({
+        "source_table": "out.orders_next",
+        "target_table": "out.orders",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("drift_preview").with_arguments(args))
+        .await
+        .expect("drift_preview call");
+    assert_ne!(result.is_error, Some(true), "drift_preview must not error");
+    let sc = result.structured_content.expect("structured content");
+
+    assert_eq!(sc["target_exists"], serde_json::json!(true));
+    // `id` drifted (BIGINT vs INTEGER) — a type change between the two tables.
+    let drifted = sc["drifted_columns"].as_array().unwrap();
+    assert!(
+        drifted.iter().any(|d| d["name"] == serde_json::json!("id")),
+        "id must drift (BIGINT vs INTEGER): {sc:?}"
+    );
+    // `region` is present in the source but absent from the target.
+    let added = sc["added_columns"].as_array().unwrap();
+    assert!(
+        added.iter().any(|c| *c == serde_json::json!("region")),
+        "region must be an added column: {sc:?}"
+    );
+
+    // A non-existent target → target_exists false, empty drift lists.
+    let absent_args = serde_json::json!({
+        "source_table": "out.orders_next",
+        "target_table": "out.does_not_exist",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let absent = client
+        .call_tool(CallToolRequestParams::new("drift_preview").with_arguments(absent_args))
+        .await
+        .expect("drift_preview call (absent target)")
+        .structured_content
+        .expect("structured content");
+    assert_eq!(absent["target_exists"], serde_json::json!(false));
+    assert!(
+        absent["drifted_columns"].as_array().unwrap().is_empty(),
+        "absent target → no drift rows: {absent:?}"
+    );
+
+    // A missing SOURCE is an error, never a vacuously-clean "no drift" answer —
+    // the source side is the thing being compared against, so its absence must
+    // surface, not silently report zero drift.
+    let bad_source_args = serde_json::json!({
+        "source_table": "out.does_not_exist",
+        "target_table": "out.orders",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let bad_source = client
+        .call_tool(CallToolRequestParams::new("drift_preview").with_arguments(bad_source_args))
+        .await
+        .expect("drift_preview call (absent source)");
+    assert_eq!(
+        bad_source.is_error,
+        Some(true),
+        "a missing source_table must be an error, not a clean no-drift result"
     );
 
     client.cancel().await.unwrap();

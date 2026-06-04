@@ -202,6 +202,27 @@ pub struct ExplainModelArgs {
     pub model: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GovernancePreviewArgs {
+    /// Optional environment name (mirrors `rocky plan --env <name>`). When
+    /// set, masking policies resolve `[mask.<env>]` overrides on top of the
+    /// workspace `[mask]` defaults. Classification + retention previews are
+    /// env-invariant.
+    #[serde(default)]
+    pub env: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DriftPreviewArgs {
+    /// The source table to compare — a qualified `schema.table` (or
+    /// `catalog.schema.table`) reference. Both tables are `DESCRIBE`d and
+    /// their warehouse-reported types compared.
+    pub source_table: String,
+    /// The target table to compare against — a qualified `schema.table` (or
+    /// `catalog.schema.table`) reference.
+    pub target_table: String,
+}
+
 // ---------------------------------------------------------------------------
 // Prompt argument structs (schemars 1.x — rmcp's `Parameters<T>` bound).
 // MCP prompt arguments are string-typed on the wire; `Serialize` is part of
@@ -214,6 +235,20 @@ pub struct BuildModelArgs {
     /// (e.g. "daily completed-orders revenue by region"). The prompt threads
     /// this intent through Rocky's authoring loop.
     pub intent: String,
+}
+
+/// No-argument prompt args for the project-wide trajectories
+/// (`find_untested_models`, `summarize_project`). MCP prompts must declare a
+/// `Parameters<T>` type even when they take no input.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct NoArgs {}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct ScopedModelArgs {
+    /// Optional single-model scope. When set, the trajectory focuses on this
+    /// model; when omitted, it sweeps the whole project.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,6 +1240,184 @@ impl RockyMcpServer {
         })
     }
 
+    // ----------------- governance + drift preview tools --------------------
+    // These let an agent see the full enforcement picture in-loop. Both are
+    // read-only DRY-RUNs — neither applies anything. `governance_preview` is
+    // offline (compile + sidecar read, the same core `rocky plan` uses);
+    // `drift_preview` hits the configured warehouse via the same adapter path
+    // as the grounding tools.
+
+    #[tool(
+        description = "Preview the pre-apply governance actions a subsequent `rocky run` would \
+         reconcile: classification tags, masking policies, and retention policies declared across \
+         the project's model sidecars. This is the same control-plane work `rocky plan` previews \
+         — a DRY-RUN computed offline from the compiled models + their `[classification]` / `mask` \
+         / `retention` config. It performs NO warehouse I/O and applies nothing. Empty action \
+         lists mean the project declares no governance for that surface. Pass `env` to resolve \
+         `[mask.<env>]` overrides (classification + retention are env-invariant). Use this to \
+         confirm a model's PII / masking / retention is wired before proposing — encode an \
+         invariant as governance, not just a WHERE clause."
+    )]
+    async fn governance_preview(
+        &self,
+        params: Parameters<GovernancePreviewArgs>,
+    ) -> Result<Json<GovernancePreviewResult>, String> {
+        let env = params.0.env;
+
+        let cfg = rocky_core::config::load_rocky_config(&self.config_path)
+            .map_err(|e| format!("could not load rocky.toml: {e:#}"))?;
+        // Resolve the active pipeline's target adapter type — the same input
+        // `rocky plan` feeds `populate_governance_actions` so retention's
+        // `warehouse_preview` renders the warehouse-native form. This is the
+        // ONLY thing the adapter type drives; classification + masking don't
+        // touch it, and retention already degrades to `None` on an unknown
+        // type. So a pipeline that won't resolve must not fail this offline
+        // tool — degrade to "" and the preview still reports every declared
+        // action, just without the warehouse-native retention rendering.
+        let adapter_type = rocky_cli::registry::resolve_pipeline(&cfg, None)
+            .ok()
+            .and_then(|(_, pipeline)| {
+                cfg.adapters
+                    .get(pipeline.target_adapter())
+                    .map(|a| a.adapter_type.clone())
+            })
+            .unwrap_or_default();
+
+        // Reuse the exact offline governance-preview core `rocky plan` uses —
+        // it compiles the models dir and reads each sidecar's governance
+        // config, populating a PlanOutput. No discovery, no adapter call.
+        let mut output = rocky_cli::output::PlanOutput::new(String::new());
+        output.env = env.clone();
+        commands::populate_governance_actions(
+            &cfg,
+            &self.models_dir,
+            env.as_deref(),
+            &adapter_type,
+            &mut output,
+        )
+        .map_err(|e| format!("governance preview failed: {e:#}"))?;
+
+        Ok(Json(GovernancePreviewResult {
+            env,
+            classification_actions: output
+                .classification_actions
+                .into_iter()
+                .map(|a| ClassificationActionLite {
+                    model: a.model,
+                    column: a.column,
+                    tag: a.tag,
+                })
+                .collect(),
+            mask_actions: output
+                .mask_actions
+                .into_iter()
+                .map(|a| MaskActionLite {
+                    model: a.model,
+                    column: a.column,
+                    tag: a.tag,
+                    resolved_strategy: a.resolved_strategy,
+                })
+                .collect(),
+            retention_actions: output
+                .retention_actions
+                .into_iter()
+                .map(|a| RetentionActionLite {
+                    model: a.model,
+                    duration_days: a.duration_days,
+                    warehouse_preview: a.warehouse_preview,
+                })
+                .collect(),
+        }))
+    }
+
+    #[tool(
+        description = "Preview source-vs-target schema drift between two warehouse tables — the \
+         same apples-to-apples comparison `rocky run` performs before an incremental load. Both \
+         tables are `DESCRIBE`d and their warehouse-reported column types compared via the engine's \
+         drift detector. Read-only: it applies nothing. Pass `source_table` and `target_table` as \
+         qualified `schema.table` (or `catalog.schema.table`) references. Returns drifted columns \
+         (type changed), added columns (in source, missing from target — a run would ADD COLUMN), \
+         and the action the runtime would take (`ignore` / `alter_column_types` / \
+         `drop_and_recreate`). When the target doesn't exist yet, `target_exists` is false and the \
+         lists are empty. Hits the configured warehouse — requires live credentials."
+    )]
+    async fn drift_preview(
+        &self,
+        params: Parameters<DriftPreviewArgs>,
+    ) -> Result<Json<DriftPreviewResult>, String> {
+        let args = params.0;
+
+        let adapter = self
+            .warehouse_adapter()
+            .map_err(|e| format!("could not resolve the warehouse adapter: {e:#}"))?
+            .ok_or_else(|| "could not resolve the target warehouse adapter".to_string())?;
+
+        let source_ref = parse_table_ref(&args.source_table)
+            .ok_or_else(|| format!("invalid source_table reference '{}'", args.source_table))?;
+        let target_ref = parse_table_ref(&args.target_table)
+            .ok_or_else(|| format!("invalid target_table reference '{}'", args.target_table))?;
+
+        // DESCRIBE both tables. A failed describe on the TARGET means it is not
+        // materialized yet (the first run would create it) — that's a clean
+        // "no drift, target absent" answer, not an error. A failed describe on
+        // the SOURCE is a genuine error (you asked to compare against a table
+        // that isn't there).
+        let source_cols = adapter.describe_table(&source_ref).await.map_err(|e| {
+            format!(
+                "could not describe source_table '{}': {e}",
+                args.source_table
+            )
+        })?;
+        // Most adapters `Err` on a missing table, but some report an empty
+        // column set instead; treat an empty source as not-found rather than
+        // letting it produce a vacuously "no drift" answer that would lie.
+        if source_cols.is_empty() {
+            return Err(format!(
+                "source_table '{}' has no columns (table not found or empty schema)",
+                args.source_table
+            ));
+        }
+        let target_cols = adapter
+            .describe_table(&target_ref)
+            .await
+            .unwrap_or_default();
+        let target_exists = !target_cols.is_empty();
+
+        if !target_exists {
+            return Ok(Json(DriftPreviewResult {
+                source_table: args.source_table,
+                target_table: args.target_table,
+                target_exists: false,
+                action: drift_action_wire_name(&rocky_ir::DriftAction::Ignore).to_string(),
+                ..Default::default()
+            }));
+        }
+
+        let result = rocky_core::drift::detect_drift(
+            &target_ref,
+            &source_cols,
+            &target_cols,
+            adapter.dialect(),
+        );
+
+        Ok(Json(DriftPreviewResult {
+            source_table: args.source_table,
+            target_table: args.target_table,
+            target_exists: true,
+            drifted_columns: result
+                .drifted_columns
+                .into_iter()
+                .map(|c| DriftedColumnLite {
+                    name: c.name,
+                    source_type: c.source_type,
+                    target_type: c.target_type,
+                })
+                .collect(),
+            added_columns: result.added_columns.into_iter().map(|c| c.name).collect(),
+            action: drift_action_wire_name(&result.action).to_string(),
+        }))
+    }
+
     // ------------------------- SHOULD tools --------------------------------
 
     #[tool(
@@ -1550,6 +1763,231 @@ impl RockyMcpServer {
         Ok(GetPromptResult::new(messages)
             .with_description(format!("Rocky model-authoring loop for: {intent}")))
     }
+
+    /// Sweep the project for models with no declarative tests and draft tests
+    /// for them. Orchestrates the read-only catalog + generator tools and stops
+    /// at *propose* — never applies.
+    #[prompt(
+        name = "find_untested_models",
+        description = "Find models with no declarative tests and draft tests for them: catalog \
+         -> identify untested models -> generate_tests / draft_contract -> propose. Stops at the \
+         human approval gate."
+    )]
+    async fn find_untested_models(
+        &self,
+        Parameters(_args): Parameters<NoArgs>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        let messages = vec![
+            PromptMessage::new_text(
+                PromptMessageRole::Assistant,
+                "I'll find the models that carry no declarative tests, draft tests grounded in \
+                 their real data, and stop at a proposed plan for you to review and apply. A model \
+                 that compiles is not the same as a model that is checked — tests are what make \
+                 the substrate trust a future run.",
+            ),
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                "Find the untested models in this Rocky project and draft tests for them, using \
+                 the MCP tools at each step:\n\n\
+                 1. catalog — enumerate every model with its declared tests, checks, and \
+                 contract. Treat a model with no checks, no contract, and no test files as \
+                 untested. Prioritise leaf/marts models and anything carrying a primary key or a \
+                 grain you can name.\n\
+                 2. For each untested model, ground before you assert: sample_rows to see real \
+                 values, and profile_column on any key, status, or amount column to learn its null \
+                 rate, distinct count, and domain. The schema says a column exists; only the data \
+                 tells you whether it is unique, non-null, or bounded.\n\
+                 3. generate_tests — draft SQL assertions (not-null, grain uniqueness, value \
+                 ranges, referential integrity) from what you observed. For invariants better \
+                 expressed as required/protected columns, draft_contract instead. Both return \
+                 DRAFTS — write each assertion into the project's tests/ directory and the \
+                 contract next to its model.\n\
+                 4. compile — type-check after writing, and run the new tests via the `test` tool. \
+                 Fix against any diagnostic and re-run until clean.\n\
+                 5. propose — generate the plan that records the new tests/contracts. It is an \
+                 AI-authored plan with a plan_id.\n\n\
+                 RECONCILE DISCIPLINE: a test that asserts the wrong invariant passes and is still \
+                 wrong. Confirm the grain, the not-null columns, and the value domain against the \
+                 sampled data before you encode them — do not assume `id` is unique or `status` is \
+                 non-null without checking.\n\n\
+                 STOP at propose. Never apply an AI-authored change directly — a bare apply is \
+                 refused by design. Surface the plan_id and the review report, then the human runs \
+                 `rocky review <plan-id> --approve` and `rocky apply <plan-id>`. Do not approve on \
+                 the user's behalf unless they explicitly tell you to.",
+            ),
+        ];
+
+        Ok(GetPromptResult::new(messages).with_description(
+            "Find untested Rocky models and draft tests, stopping at the approval gate",
+        ))
+    }
+
+    /// Add uniqueness + not-null tests to a model's primary-key / unique
+    /// columns. Inspects the schema, identifies the key columns, drafts tests,
+    /// and stops at *propose*.
+    #[prompt(
+        name = "add_tests_to_pks",
+        description = "Add uniqueness + not-null tests to a model's primary-key / unique columns: \
+         inspect_schema -> identify key columns -> generate_tests for uniqueness + not-null -> \
+         propose. Stops at the human approval gate."
+    )]
+    async fn add_tests_to_pks(
+        &self,
+        Parameters(args): Parameters<ScopedModelArgs>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        let scope = match args.model.as_deref().map(str::trim) {
+            Some(m) if !m.is_empty() => format!("the model `{m}`"),
+            _ => "every model".to_string(),
+        };
+        let messages = vec![
+            PromptMessage::new_text(
+                PromptMessageRole::Assistant,
+                "I'll identify the primary-key and unique columns, draft uniqueness and not-null \
+                 tests grounded in the real data, and stop at a proposed plan for you to review \
+                 and apply. A declared key is a claim; the data is what proves it.",
+            ),
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!(
+                    "Add uniqueness + not-null tests to the key columns of {scope} in this Rocky \
+                     project, using the MCP tools at each step:\n\n\
+                     1. inspect_schema — read the typed columns. Identify the primary-key / unique \
+                     / grain columns: an explicit key in the sidecar, an `id`-shaped column, or \
+                     the columns that define the model's grain.\n\
+                     2. profile_column — for each candidate key column, confirm it is actually \
+                     unique (distinct count == row count) and non-null before you assert it. A \
+                     column named `id` that has duplicates or nulls is not a key, and a test that \
+                     claims it is will fail on the next run — find that out now, from the data.\n\
+                     3. generate_tests — draft a uniqueness assertion and a not-null assertion for \
+                     each confirmed key column (each returns 0 rows when the invariant holds). \
+                     These are DRAFTS — write each into the project's tests/ directory as \
+                     `<model>_<name>.sql`.\n\
+                     4. compile, then run the new tests via the `test` tool. Loop until clean.\n\
+                     5. propose — generate the plan recording the new tests. It is an AI-authored \
+                     plan with a plan_id.\n\n\
+                     RECONCILE DISCIPLINE: only assert uniqueness/not-null on columns the profile \
+                     actually shows to be unique/non-null. Encoding a wrong key invariant is worse \
+                     than none — it green-lights a future run that should have failed.\n\n\
+                     STOP at propose. Never apply an AI-authored change directly — a bare apply is \
+                     refused by design. Surface the plan_id and the review report, then the human \
+                     runs `rocky review <plan-id> --approve` and `rocky apply <plan-id>`. Do not \
+                     approve on the user's behalf unless they explicitly tell you to."
+                ),
+            ),
+        ];
+
+        Ok(GetPromptResult::new(messages).with_description(format!(
+            "Add uniqueness + not-null tests to the keys of {scope}"
+        )))
+    }
+
+    /// Produce a structured, read-only summary of the project from the catalog
+    /// and lineage. No edits, no propose — purely informational.
+    #[prompt(
+        name = "summarize_project",
+        description = "Produce a structured, read-only summary of the Rocky project: catalog + \
+         lineage -> grouped overview of models, their grain, governance, tests, and DAG shape. \
+         Read-only — no edits, no propose."
+    )]
+    async fn summarize_project(
+        &self,
+        Parameters(_args): Parameters<NoArgs>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        let messages = vec![
+            PromptMessage::new_text(
+                PromptMessageRole::Assistant,
+                "I'll summarize this Rocky project from the catalog and lineage. This is a \
+                 read-only orientation — I will not edit, propose, or apply anything.",
+            ),
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                "Summarize this Rocky project, using only the read-only MCP tools:\n\n\
+                 1. catalog — enumerate every model with its target table, materialization \
+                 strategy, declared tests/checks, contract, and governance (classification / mask \
+                 / retention).\n\
+                 2. lineage — for the key models (sources, marts/leaf models), trace upstream \
+                 dependencies to understand the DAG shape and how data flows.\n\
+                 3. Group the result into a structured summary: sources and raw inputs; \
+                 intermediate transforms; marts / leaf outputs. For each, note its grain (one row \
+                 per what?), its materialization strategy, whether it carries tests / a contract / \
+                 governance, and its place in the DAG.\n\
+                 4. Call out gaps an owner would care about: untested leaf models, PII columns \
+                 with no mask, models with no contract, or long undocumented dependency chains. \
+                 Frame these as observations, not actions.\n\n\
+                 This is purely informational — do NOT write SQL, draft tests, propose a plan, or \
+                 apply anything. If the user then wants to act on a gap, the find_untested_models \
+                 or build_model trajectory is the next step.",
+            ),
+        ];
+
+        Ok(GetPromptResult::new(messages)
+            .with_description("Read-only structured summary of the Rocky project"))
+    }
+
+    /// Diagnose and fix failing declarative tests: run the tests, ground each
+    /// failure with profile_column, propose a fix. Stops at *propose*.
+    #[prompt(
+        name = "fix_failing_test",
+        description = "Diagnose and fix failing declarative tests: run `test` -> for each failure \
+         profile_column the implicated columns to ground the cause -> propose a fix. Stops at the \
+         human approval gate."
+    )]
+    async fn fix_failing_test(
+        &self,
+        Parameters(args): Parameters<ScopedModelArgs>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        let scope = match args.model.as_deref().map(str::trim) {
+            Some(m) if !m.is_empty() => format!("the model `{m}`"),
+            _ => "the project".to_string(),
+        };
+        let messages = vec![
+            PromptMessage::new_text(
+                PromptMessageRole::Assistant,
+                "I'll run the tests, ground each failure in the real data before changing \
+                 anything, and stop at a proposed fix for you to review and apply. A failing test \
+                 is a signal — I will find out whether the test is wrong or the data is wrong \
+                 before I touch either.",
+            ),
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!(
+                    "Diagnose and fix the failing tests in {scope}, using the MCP tools at each \
+                     step:\n\n\
+                     1. test — run the declarative tests and read which assertions fail, on which \
+                     model, and the failing-row count. Each failure names the invariant it \
+                     checks.\n\
+                     2. For each failure, ground the cause before deciding the fix: profile_column \
+                     the implicated columns (the ones the assertion references) to see their \
+                     actual null rate, distinct count, and value domain, and sample_rows to look \
+                     at offending rows. The failure tells you WHAT broke; the data tells you \
+                     WHY.\n\
+                     3. Decide which side is wrong. Either the model SQL is wrong (it produces \
+                     duplicates / nulls / out-of-domain values it shouldn't) — fix the SQL — or \
+                     the test encodes an invariant the data was never meant to hold — fix the \
+                     assertion. Do not weaken a test just to make it pass; that hides the \
+                     defect.\n\
+                     4. compile, then re-run the `test` tool. Loop until the failure is genuinely \
+                     resolved, not silenced.\n\
+                     5. propose — generate the plan recording the fix. It is an AI-authored plan \
+                     with a plan_id.\n\n\
+                     RECONCILE DISCIPLINE: the whole point is to check the data, not just the \
+                     schema. A uniqueness test failing because the grain is actually composite \
+                     (two columns, not one) is a real finding you can only see in the rows.\n\n\
+                     STOP at propose. Never apply an AI-authored change directly — a bare apply is \
+                     refused by design. Surface the plan_id and the review report, then the human \
+                     runs `rocky review <plan-id> --approve` and `rocky apply <plan-id>`. Do not \
+                     approve on the user's behalf unless they explicitly tell you to."
+                ),
+            ),
+        ];
+
+        Ok(GetPromptResult::new(messages)
+            .with_description(format!("Diagnose and fix failing tests in {scope}")))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -1670,6 +2108,43 @@ fn column_stats_sql(table_ref: &str, col: &str) -> String {
         "SELECT COUNT(*) AS n, COUNT({col}) AS non_null, COUNT(DISTINCT {col}) AS distinct_n \
          FROM {table_ref}"
     )
+}
+
+/// Parse a qualified `schema.table` / `catalog.schema.table` reference into a
+/// [`TableRef`](rocky_ir::TableRef) for `drift_preview`'s `describe_table`
+/// calls.
+///
+/// Mirrors `commands/profile.rs::observed_column_types`: a two-part name has an
+/// empty catalog (DuckDB / catalog-less dialects), a three-part name carries
+/// one. Any other arity is rejected (returns `None`). Segments are not
+/// validated here — `describe_table` is parameter-safe (the adapter quotes the
+/// ref); a bad name surfaces as a describe error, not SQL injection.
+fn parse_table_ref(reference: &str) -> Option<rocky_ir::TableRef> {
+    let parts: Vec<&str> = reference.split('.').collect();
+    match parts.as_slice() {
+        [schema, table] => Some(rocky_ir::TableRef {
+            catalog: String::new(),
+            schema: (*schema).to_string(),
+            table: (*table).to_string(),
+        }),
+        [catalog, schema, table] => Some(rocky_ir::TableRef {
+            catalog: (*catalog).to_string(),
+            schema: (*schema).to_string(),
+            table: (*table).to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// Stable wire name for a [`DriftAction`](rocky_ir::DriftAction) in a
+/// `drift_preview` result — snake_case, matching the strings `rocky run`
+/// emits in `DriftActionOutput.action`.
+fn drift_action_wire_name(action: &rocky_ir::DriftAction) -> &'static str {
+    match action {
+        rocky_ir::DriftAction::DropAndRecreate => "drop_and_recreate",
+        rocky_ir::DriftAction::AlterColumnTypes => "alter_column_types",
+        rocky_ir::DriftAction::Ignore => "ignore",
+    }
 }
 
 /// Read a `serde_json::Value` grounding cell as a `u64`, tolerating the
