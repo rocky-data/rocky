@@ -339,6 +339,7 @@ fn load_single_rocky_model_with_db(
             classification: Default::default(),
             retention: None,
             budget: None,
+            skip: None,
             name_declared: String::new(),
             target_table_declared: String::new(),
         }
@@ -385,6 +386,7 @@ mod tests {
                 classification: Default::default(),
                 retention: None,
                 budget: None,
+                skip: None,
                 name_declared: String::new(),
                 target_table_declared: String::new(),
             },

@@ -66,6 +66,9 @@ pub async fn run_watch(
     partition_opts: &PartitionRunOptions,
     cache_ttl_override: Option<u64>,
     env: Option<&str>,
+    // `--skip-unchanged` / `--force-rebuild` overlay; threaded into each
+    // watch iteration's `run()`. Default OFF ⇒ unchanged watch behavior.
+    skip_opts: &super::run::SkipRunOptions,
 ) -> Result<()> {
     // -------------------------------------------------------------------
     // Resolve watcher scope.
@@ -179,6 +182,7 @@ pub async fn run_watch(
         partition_opts,
         cache_ttl_override,
         env,
+        skip_opts,
     )
     .await;
 
@@ -225,6 +229,7 @@ pub async fn run_watch(
                     partition_opts,
                     cache_ttl_override,
                     env,
+                    skip_opts,
                 )
                 .await;
             }
@@ -254,6 +259,7 @@ async fn iter_once(
     partition_opts: &PartitionRunOptions,
     cache_ttl_override: Option<u64>,
     env: Option<&str>,
+    skip_opts: &super::run::SkipRunOptions,
 ) {
     let started = std::time::Instant::now();
     let result = run(
@@ -279,6 +285,7 @@ async fn iter_once(
         // `--watch` is mutually exclusive with `--model`, so there is no
         // selection to defer against.
         &super::run::DeferOptions::default(),
+        skip_opts,
     )
     .await;
     let elapsed_ms = started.elapsed().as_millis();

@@ -2132,6 +2132,57 @@ pub struct RockyConfig {
     /// project with no imports incurs no extra work.
     #[serde(default)]
     pub imports: IndexMap<String, ImportEntry>,
+
+    /// Opt-in run-execution tuning for the `--skip-unchanged` model-skip
+    /// gate. Default-OFF: an absent `[run]` block (or one that leaves every
+    /// field at its default) keeps `rocky run`'s behavior byte-identical to
+    /// before the gate existed. See [`RunConfig`].
+    #[serde(default)]
+    pub run: RunConfig,
+}
+
+/// `[run]` — opt-in tuning for the model-skip gate.
+///
+/// The gate lets `rocky run` skip re-materializing a model whose logic and
+/// upstream data both *appear* unchanged since the last successful build.
+/// It is a best-effort optimization, **not** a guarantee of result-
+/// equivalence: non-deterministic SQL is excluded, and any ambiguity rebuilds.
+/// Every field defaults to the safe (no-skip) choice — the whole feature is
+/// off unless `skip_unchanged = true` (or the `--skip-unchanged` flag) is set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunConfig {
+    /// Master switch for the model-skip gate. `false` (default) ⇒ every
+    /// selected model always builds, exactly as before. The `--skip-unchanged`
+    /// CLI flag turns the gate on for a single invocation regardless of this
+    /// value.
+    #[serde(default)]
+    pub skip_unchanged: bool,
+
+    /// Allow a rowcount-only data-stability signal (`COUNT(*)`) when an
+    /// upstream has no tracked timestamp column. Default `false`: without an
+    /// explicit opt-in, a model whose upstreams are not watermarkable is not
+    /// skip-eligible. Rowcount equality is weaker than a watermark (it can
+    /// hide an equal-size update+delete), so it stays behind this switch.
+    #[serde(default)]
+    pub skip_rowcount_fallback: bool,
+
+    /// Treat an upstream `MAX(ts)` that moved by fewer than this many seconds
+    /// as unchanged for the B3 freshness comparison — the late-arriving-but-
+    /// irrelevant micro-update analog of a freshness SLA threshold. Default
+    /// `0`: any movement at all forces a rebuild.
+    #[serde(default)]
+    pub lag_tolerance_seconds: u64,
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            skip_unchanged: false,
+            skip_rowcount_fallback: false,
+            lag_tolerance_seconds: 0,
+        }
+    }
 }
 
 impl RockyConfig {

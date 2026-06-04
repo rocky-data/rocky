@@ -2685,6 +2685,30 @@
       },
       "type": "object"
     },
+    "RunConfig": {
+      "additionalProperties": false,
+      "description": "`[run]` — opt-in tuning for the model-skip gate.\n\nThe gate lets `rocky run` skip re-materializing a model whose logic and upstream data both *appear* unchanged since the last successful build. It is a best-effort optimization, **not** a guarantee of result- equivalence: non-deterministic SQL is excluded, and any ambiguity rebuilds. Every field defaults to the safe (no-skip) choice — the whole feature is off unless `skip_unchanged = true` (or the `--skip-unchanged` flag) is set.",
+      "properties": {
+        "lag_tolerance_seconds": {
+          "default": 0,
+          "description": "Treat an upstream `MAX(ts)` that moved by fewer than this many seconds as unchanged for the B3 freshness comparison — the late-arriving-but- irrelevant micro-update analog of a freshness SLA threshold. Default `0`: any movement at all forces a rebuild.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "skip_rowcount_fallback": {
+          "default": false,
+          "description": "Allow a rowcount-only data-stability signal (`COUNT(*)`) when an upstream has no tracked timestamp column. Default `false`: without an explicit opt-in, a model whose upstreams are not watermarkable is not skip-eligible. Rowcount equality is weaker than a watermark (it can hide an equal-size update+delete), so it stays behind this switch.",
+          "type": "boolean"
+        },
+        "skip_unchanged": {
+          "default": false,
+          "description": "Master switch for the model-skip gate. `false` (default) ⇒ every selected model always builds, exactly as before. The `--skip-unchanged` CLI flag turns the gate on for a single invocation regardless of this value.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "RunRetryConfig": {
       "additionalProperties": false,
       "description": "Top-level retry configuration applied across every adapter for this run. See [`RockyConfig::retry`] for the cross-adapter semantics this unlocks.",
@@ -3710,6 +3734,19 @@
       "default": {},
       "description": "Hierarchical role declarations reconciled against the warehouse's native role/group system.\n\nSee [`RoleConfig`] for the TOML shape and [`crate::role_graph::flatten_role_graph`] for the inheritance resolution semantics (DAG walk with cycle detection).",
       "type": "object"
+    },
+    "run": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RunConfig"
+        }
+      ],
+      "default": {
+        "lag_tolerance_seconds": 0,
+        "skip_rowcount_fallback": false,
+        "skip_unchanged": false
+      },
+      "description": "Opt-in run-execution tuning for the `--skip-unchanged` model-skip gate. Default-OFF: an absent `[run]` block (or one that leaves every field at its default) keeps `rocky run`'s behavior byte-identical to before the gate existed. See [`RunConfig`]."
     },
     "schema_evolution": {
       "allOf": [

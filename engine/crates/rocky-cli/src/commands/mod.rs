@@ -132,7 +132,9 @@ pub use review::run_review;
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.
 pub use rocky_sql::transpile::Dialect;
-pub use run::{DeferOptions, Interrupted, PartialFailure, PartitionRunOptions, run};
+pub use run::{
+    DeferOptions, Interrupted, PartialFailure, PartitionRunOptions, SkipRunOptions, run,
+};
 pub use run_dag_exec::run_with_dag;
 pub use run_watch::run_watch as run_with_watch;
 pub use seed::run_seed;

@@ -591,6 +591,7 @@ mod tests {
             branch: Default::default(),
             freshness: Default::default(),
             imports: Default::default(),
+            run: Default::default(),
         }
     }
 
@@ -987,6 +988,7 @@ mod tests {
                 classification: Default::default(),
                 retention: None,
                 budget: None,
+                skip: None,
                 name_declared: String::new(),
                 target_table_declared: String::new(),
             },

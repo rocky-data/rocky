@@ -252,6 +252,90 @@ pub struct DeferOptions {
     pub defer_to: Option<String>,
 }
 
+/// CLI overlay for the opt-in `--skip-unchanged` model-skip gate.
+///
+/// Both fields default to `false`, which keeps the gate off and the run
+/// byte-identical to before the gate existed. The gate is a best-effort
+/// optimization, not a result-equivalence guarantee — see
+/// [`rocky_core::config::RunConfig`] and `ModelIr::skip_hash`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SkipRunOptions {
+    /// Whether `--skip-unchanged` was passed. Turns the gate on for this
+    /// invocation regardless of the `[run] skip_unchanged` config value
+    /// (the two are OR-ed at the gate).
+    pub skip_unchanged: bool,
+    /// Whether `--force-rebuild` was passed. When `true`, every selected
+    /// model builds unconditionally — the gate's escape hatch. Takes
+    /// precedence over `skip_unchanged` and over any config.
+    pub force_rebuild: bool,
+}
+
+/// Fully-resolved configuration for the model-skip gate, assembled in
+/// `run()` from the CLI overlay ([`SkipRunOptions`]), the `[run]` config
+/// ([`rocky_core::config::RunConfig`]), and the run mode (shadow/branch),
+/// then handed to [`execute_models`].
+///
+/// The gate is a best-effort optimization, **not** a result-equivalence
+/// guarantee. [`Self::enabled`] is the single "should the gate even run?"
+/// predicate; when it is `false`, `execute_models` issues zero extra
+/// state reads or warehouse queries and behaves byte-identically to before
+/// the gate existed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SkipGateConfig {
+    /// `--skip-unchanged` flag OR `[run] skip_unchanged = true`.
+    pub feature_enabled: bool,
+    /// `--force-rebuild` — forces every model to build (gate never skips).
+    pub force_rebuild: bool,
+    /// `[run] skip_rowcount_fallback` — permit a `COUNT(*)` data-stability
+    /// signal when an upstream has no tracked timestamp column.
+    pub rowcount_fallback: bool,
+    /// `[run] lag_tolerance_seconds` — treat an upstream `MAX(ts)` that
+    /// moved by fewer than this many seconds as unchanged.
+    pub lag_tolerance_seconds: u64,
+    /// True when this is a shadow / branch run. Shadow and branch runs are
+    /// never skip-eligible in v1 — they are verification runs that write to
+    /// different targets, so skipping defeats their purpose.
+    pub shadow_or_branch: bool,
+}
+
+impl SkipGateConfig {
+    /// Resolve the effective gate config from the CLI overlay, the `[run]`
+    /// config block, and whether this is a shadow/branch run.
+    pub(crate) fn resolve(
+        skip_opts: &SkipRunOptions,
+        run_config: &rocky_core::config::RunConfig,
+        shadow_or_branch: bool,
+    ) -> Self {
+        Self {
+            feature_enabled: skip_opts.skip_unchanged || run_config.skip_unchanged,
+            force_rebuild: skip_opts.force_rebuild,
+            rowcount_fallback: run_config.skip_rowcount_fallback,
+            lag_tolerance_seconds: run_config.lag_tolerance_seconds,
+            shadow_or_branch,
+        }
+    }
+
+    /// Whether the gate may skip *any* model on this run. `false` ⇒ the gate
+    /// is fully inert (default-off, force-rebuild, or a shadow/branch run),
+    /// and `execute_models` takes the unchanged build-everything path.
+    pub(crate) fn is_active(&self) -> bool {
+        self.feature_enabled && !self.force_rebuild && !self.shadow_or_branch
+    }
+
+    /// The fully-inert gate — the default-off configuration used by callers
+    /// that don't surface the skip flags (and by tests that don't exercise
+    /// the gate).
+    pub(crate) fn off() -> Self {
+        Self {
+            feature_enabled: false,
+            force_rebuild: false,
+            rowcount_fallback: false,
+            lag_tolerance_seconds: 0,
+            shadow_or_branch: false,
+        }
+    }
+}
+
 /// Borrowed slice of compile-time facts that the per-model execution path
 /// needs at materialization time.
 ///
@@ -855,6 +939,9 @@ pub async fn run(
     // target (its production schema, or `--defer-to`). Only meaningful with
     // `--model`; a full run builds everything and defers nothing.
     defer_opts: &DeferOptions,
+    // `--skip-unchanged` / `--force-rebuild` CLI overlay for the opt-in
+    // model-skip gate. Default OFF (both `false`) ⇒ byte-identical behavior.
+    skip_opts: &SkipRunOptions,
 ) -> Result<()> {
     let start = Instant::now();
     let started_at = Utc::now();
@@ -953,6 +1040,12 @@ pub async fn run(
         .clone()
         .with_ttl_override(cache_ttl_override);
 
+    // Resolve the model-skip gate once. Shadow / branch runs are never
+    // skip-eligible (they write to different targets), so a shadow config
+    // forces the gate inert regardless of the flag / config.
+    let skip_gate =
+        SkipGateConfig::resolve(skip_opts, &rocky_cfg.run, shadow_config.is_some());
+
     // Model-only execution: skip the entire replication path and execute
     // just the named model. Dagster uses this for per-asset materialization
     // when it controls the DAG scheduling.
@@ -1021,6 +1114,7 @@ pub async fn run(
             &schema_cache_cfg,
             false, // model-only entry point has no pipeline governance context
             defer_opts,
+            skip_gate,
         )
         .await?;
 
@@ -1120,6 +1214,7 @@ pub async fn run(
                 output_json,
                 partition_opts,
                 &schema_cache_cfg,
+                skip_gate,
             )
             .await?;
             finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
@@ -3115,6 +3210,7 @@ pub async fn run(
                     // `apply_defer_rewrite` is a no-op even when `--defer` is
                     // set (a full run builds every model).
                     defer_opts,
+                    skip_gate,
                 )
                 .await?;
                 Ok(())
@@ -3929,6 +4025,10 @@ pub(crate) async fn execute_models(
     // rewritten to qualified `<defer_schema>.<table>` references before SQL
     // generation. Default OFF ⇒ no rewrite, byte-identical behavior.
     defer_opts: &DeferOptions,
+    // Fully-resolved model-skip gate config. When `!skip_gate.is_active()`
+    // the gate is inert and this function builds every selected model
+    // exactly as before — no extra state reads or warehouse queries.
+    skip_gate: SkipGateConfig,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -6818,6 +6918,7 @@ adapter = "default"
             Some(key),
             None,
             &DeferOptions::default(),
+            &SkipRunOptions::default(),
         )
         .await
         .expect("transformation run should succeed");
@@ -6923,6 +7024,7 @@ schema = "mart"
             None,
             None,
             &DeferOptions::default(),
+            &SkipRunOptions::default(),
         )
         .await
         .expect(
@@ -7896,6 +7998,7 @@ merge_keys = ["id"]
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
             &DeferOptions::default(),
+            super::SkipGateConfig::off(),
         )
         .await;
         (output, result)
@@ -7978,6 +8081,7 @@ merge_keys = ["id"]
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
             &defer_opts,
+            super::SkipGateConfig::off(),
         )
         .await
         .expect("deferred run must succeed");
@@ -8091,6 +8195,7 @@ merge_keys = ["id"]
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
             &DeferOptions::default(),
+            super::SkipGateConfig::off(),
         )
         .await;
 
