@@ -64,6 +64,33 @@ const DEFAULT_S3_PREFIX: &str = "rocky/state/";
 const DEFAULT_GCS_PREFIX: &str = "rocky/state/";
 const DEFAULT_VALKEY_PREFIX: &str = "rocky:state:";
 
+/// Derive the remote object key (within the configured prefix) for a local
+/// state file.
+///
+/// The local file name and the remote key are intentionally decoupled: the
+/// global local file `<models>/.rocky-state.redb` maps to the fixed remote key
+/// `state.redb`. When per-namespace state-file namespacing is on, the local
+/// file lives under a `.rocky-state/` directory as `<namespace>.redb`; this
+/// returns `<namespace>.redb` so each namespace round-trips to a distinct
+/// remote object instead of every pipeline clobbering the same `state.redb`
+/// (silent cross-pod state loss).
+///
+/// The gate is the **parent directory name**, not the local file stem: the
+/// legacy global file's stem is `.rocky-state`, which must keep mapping to the
+/// unchanged `state.redb` key so the namespacing-OFF path is byte-identical on
+/// the wire.
+fn remote_state_key(local_path: &Path) -> String {
+    let is_namespaced = local_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some(crate::state::STATE_NAMESPACE_DIR);
+    if is_namespaced && let Some(name) = local_path.file_name().and_then(|n| n.to_str()) {
+        return name.to_string();
+    }
+    STATE_FILE.to_string()
+}
+
 /// Build an `ObjectStoreProvider` rooted at `<scheme>://<bucket>/<prefix>`.
 fn cloud_provider(
     scheme: &str,
@@ -369,6 +396,7 @@ async fn download_from_object_store(
     timeout: Duration,
 ) -> Result<(), StateSyncError> {
     let provider = cloud_provider(scheme, bucket, prefix)?;
+    let key = remote_state_key(local_path);
     let span = info_span!(
         "state.download",
         backend = %provider.scheme(),
@@ -376,15 +404,15 @@ async fn download_from_object_store(
     );
     async {
         info!(
-            uri = format!("{scheme}://{bucket}/{prefix}{STATE_FILE}"),
+            uri = format!("{scheme}://{bucket}/{prefix}{key}"),
             local = %local_path.display(),
             "downloading state from object store"
         );
 
         with_transfer_timeout(timeout, async {
-            match provider.exists(STATE_FILE).await {
+            match provider.exists(&key).await {
                 Ok(true) => {
-                    provider.download_file(STATE_FILE, local_path).await?;
+                    provider.download_file(&key, local_path).await?;
                     info!(
                         size = local_path.metadata().map(|m| m.len()).unwrap_or(0),
                         outcome = "ok",
@@ -423,6 +451,7 @@ async fn upload_to_object_store(
     retry: &RetryConfig,
 ) -> Result<(), StateSyncError> {
     let provider = cloud_provider(scheme, bucket, prefix)?;
+    let key = remote_state_key(local_path);
     let size_bytes = local_path.metadata().map(|m| m.len()).unwrap_or(0);
     let span = info_span!(
         "state.upload",
@@ -432,13 +461,13 @@ async fn upload_to_object_store(
     );
     async {
         info!(
-            uri = format!("{scheme}://{bucket}/{prefix}{STATE_FILE}"),
+            uri = format!("{scheme}://{bucket}/{prefix}{key}"),
             "uploading state to object store"
         );
         let retries = with_transfer_timeout(timeout, async {
             retry_transient(retry, "state.upload.object_store", || async {
                 provider
-                    .upload_file(local_path, STATE_FILE)
+                    .upload_file(local_path, &key)
                     .await
                     .map_err(StateSyncError::from)
             })
@@ -502,7 +531,7 @@ async fn download_from_valkey(
         .as_deref()
         .unwrap_or(DEFAULT_VALKEY_PREFIX)
         .to_string();
-    let key = format!("{prefix}{STATE_FILE}");
+    let key = format!("{prefix}{}", remote_state_key(local_path));
     let local_path_owned = local_path.to_path_buf();
     let timeout = transfer_timeout(config);
 
@@ -571,7 +600,7 @@ async fn upload_to_valkey(config: &StateConfig, local_path: &Path) -> Result<(),
         .as_deref()
         .unwrap_or(DEFAULT_VALKEY_PREFIX)
         .to_string();
-    let key = format!("{prefix}{STATE_FILE}");
+    let key = format!("{prefix}{}", remote_state_key(local_path));
     let data = std::fs::read(local_path)?;
     let size_bytes = data.len() as u64;
     let timeout = transfer_timeout(config);
@@ -964,6 +993,62 @@ mod tests {
     #[test]
     fn test_state_backend_display_includes_gcs() {
         assert_eq!(StateBackend::Gcs.to_string(), "gcs");
+    }
+
+    // R8 (part 1) — remote key derivation. The legacy global file maps to the
+    // unchanged `state.redb` key (namespacing OFF is byte-identical on the
+    // wire); namespaced files under `.rocky-state/` map to distinct
+    // `<namespace>.redb` keys so pipelines don't clobber a shared object.
+    #[test]
+    fn test_remote_state_key_legacy_vs_namespaced() {
+        // Legacy global file (stem is `.rocky-state`) -> fixed `state.redb`.
+        let legacy = std::path::Path::new("models/.rocky-state.redb");
+        assert_eq!(remote_state_key(legacy), "state.redb");
+
+        // A bare custom --state-path also keeps the fixed key (not under a
+        // `.rocky-state/` parent) — OFF/override paths never gain a key.
+        let custom = std::path::Path::new("/var/data/my-state.redb");
+        assert_eq!(remote_state_key(custom), "state.redb");
+
+        // Namespaced files -> distinct per-namespace keys.
+        let acme = std::path::Path::new("models/.rocky-state/acme.redb");
+        let globex = std::path::Path::new("models/.rocky-state/globex.redb");
+        assert_eq!(remote_state_key(acme), "acme.redb");
+        assert_eq!(remote_state_key(globex), "globex.redb");
+        assert_ne!(remote_state_key(acme), remote_state_key(globex));
+    }
+
+    // R8 (part 2) — no clobber. Two namespaced files round-trip through a real
+    // object store at distinct keys and do not overwrite each other.
+    #[tokio::test]
+    async fn test_remote_keys_round_trip_without_clobber() {
+        let dir = TempDir::new().unwrap();
+        let provider = crate::object_store::ObjectStoreProvider::in_memory();
+
+        // Two namespaced local files with distinct contents.
+        let ns_dir = dir.path().join(crate::state::STATE_NAMESPACE_DIR);
+        std::fs::create_dir_all(&ns_dir).unwrap();
+        let a_local = ns_dir.join("ns_a.redb");
+        let b_local = ns_dir.join("ns_b.redb");
+        std::fs::write(&a_local, b"AAAA").unwrap();
+        std::fs::write(&b_local, b"BBBB").unwrap();
+
+        let key_a = remote_state_key(&a_local);
+        let key_b = remote_state_key(&b_local);
+        assert_ne!(key_a, key_b);
+
+        // Upload both; the second must not overwrite the first.
+        provider.upload_file(&a_local, &key_a).await.unwrap();
+        provider.upload_file(&b_local, &key_b).await.unwrap();
+
+        // Download each back into fresh local paths and assert contents are
+        // intact (no clobber).
+        let a_back = dir.path().join("a_back.redb");
+        let b_back = dir.path().join("b_back.redb");
+        provider.download_file(&key_a, &a_back).await.unwrap();
+        provider.download_file(&key_b, &b_back).await.unwrap();
+        assert_eq!(std::fs::read(&a_back).unwrap(), b"AAAA");
+        assert_eq!(std::fs::read(&b_back).unwrap(), b"BBBB");
     }
 
     #[test]

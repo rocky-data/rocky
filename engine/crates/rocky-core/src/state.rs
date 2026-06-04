@@ -2605,6 +2605,15 @@ pub fn detect_anomaly(
 /// on spelling.
 pub const STATE_FILE_NAME: &str = ".rocky-state.redb";
 
+/// Directory (under `models_dir`) that holds per-namespace state files.
+///
+/// When per-pipeline / per-client namespacing is on, each namespace gets its
+/// own `<models_dir>/.rocky-state/<namespace>.redb`. The directory name is a
+/// dotfile sibling of the legacy global [`STATE_FILE_NAME`] so the two modes
+/// never collide on disk: `.rocky-state.redb` (global file) vs
+/// `.rocky-state/` (namespaced dir).
+pub const STATE_NAMESPACE_DIR: &str = ".rocky-state";
+
 /// Resolution outcome for [`resolve_state_path`].
 ///
 /// `path` is always the state file the caller should open. `warning` is
@@ -2731,6 +2740,117 @@ pub fn resolve_state_path(explicit: Option<&Path>, models_dir: &Path) -> Resolve
             warning: None,
         }
     }
+}
+
+/// Namespace-aware wrapper around [`resolve_state_path`].
+///
+/// redb permits exactly one writer per file (its own `flock` plus Rocky's
+/// advisory `.redb.lock`), so fanning out one `rocky run` process per pipeline
+/// or per client against the single global `<models_dir>/.rocky-state.redb`
+/// forces those independent runs to serialize on one lock. Giving each
+/// namespace its own file gives it its own lock and its own redb handle, so
+/// runs on distinct namespaces proceed concurrently with zero shared
+/// corruption surface — every single-writer invariant still holds *inside*
+/// each file.
+///
+/// Resolution policy:
+///
+/// 1. `namespace` is `None` → delegate verbatim to [`resolve_state_path`].
+///    This is the default and is **byte-identical** to today's behavior;
+///    namespacing is purely opt-in.
+/// 2. `namespace` is `Some(_)` **and** `explicit` is `Some(_)` → the explicit
+///    `--state-path` is a hard override that **disables** namespacing for that
+///    invocation, so this also delegates to [`resolve_state_path`] (which
+///    honors the explicit path verbatim). This mirrors the existing
+///    "`--state-path` wins" rule.
+/// 3. `namespace` is `Some(ns)` and `explicit` is `None` → resolve to
+///    `<models_dir>/.rocky-state/<ns>.redb`. `ns` is validated as a SQL
+///    identifier (`^[a-zA-Z0-9_]+$`) by the caller before reaching here
+///    (see [`validate_namespace`]), which makes path traversal impossible.
+///    The `.rocky-state/` parent directory is created on resolution so the
+///    later advisory-lock open (whose first filesystem op is opening
+///    `<...>/<ns>.redb.lock`) doesn't fail on a missing parent.
+///
+/// The advisory `.redb.lock` derivation in [`StateStore::open`] needs no
+/// change: `path.with_extension("redb.lock")` composes with the nested path,
+/// so `<...>/acme.redb` yields `<...>/acme.redb.lock` — a distinct lock per
+/// namespace.
+///
+/// # Migration
+///
+/// Namespaced files start **fresh**. A pre-existing global
+/// `<models_dir>/.rocky-state.redb` is never moved, deleted, or auto-seeded —
+/// watermark ownership (which `catalog.schema.table` rows belong to a given
+/// pipeline) is not derivable from the state file alone, so seeding can't live
+/// here. Operators who want to carry watermarks forward copy the legacy file
+/// to `<models_dir>/.rocky-state/<ns>.redb` once, or point `--state-path` at
+/// the legacy file for the namespace's first run.
+///
+/// # Panics
+///
+/// Does not panic. If `namespace` somehow reaches this function unvalidated
+/// (it shouldn't — callers validate first), [`sanitize_namespace`] is applied
+/// defensively and an invalid namespace falls back to the global resolution
+/// rather than composing a traversal path.
+pub fn resolve_state_path_ns(
+    explicit: Option<&Path>,
+    models_dir: &Path,
+    namespace: Option<&str>,
+) -> ResolvedStatePath {
+    // Cases 1 + 2: no namespace, or an explicit `--state-path` that disables
+    // it. Both delegate verbatim — transparency by construction (R1).
+    let Some(ns) = namespace else {
+        return resolve_state_path(explicit, models_dir);
+    };
+    if explicit.is_some() {
+        return resolve_state_path(explicit, models_dir);
+    }
+
+    // Defensive sanitize: callers validate the namespace as a SQL identifier
+    // before reaching here, but if an unvalidated value slips through we must
+    // never compose a path-traversal segment. An invalid namespace falls back
+    // to the global resolution (it can't safely become a file name).
+    let Some(sanitized) = sanitize_namespace(ns) else {
+        return resolve_state_path(explicit, models_dir);
+    };
+
+    let ns_dir = models_dir.join(STATE_NAMESPACE_DIR);
+    // Best-effort create of the namespaced parent dir. If creation fails the
+    // later `StateStore::open` will surface the I/O error with a clear
+    // `LockIo`/redb message; we don't swallow-and-fall-back here because the
+    // namespaced path is what the caller asked for.
+    let _ = std::fs::create_dir_all(&ns_dir);
+
+    ResolvedStatePath {
+        path: ns_dir.join(format!("{sanitized}.redb")),
+        warning: None,
+    }
+}
+
+/// Validate a state namespace as a SQL identifier (`^[a-zA-Z0-9_]+$`).
+///
+/// This is the path-traversal guard for `--state-namespace` /
+/// `[state] namespacing`: the namespace becomes a path segment, so anything
+/// outside the SQL-identifier alphabet (`/`, `.`, `..`, spaces, …) is rejected
+/// rather than silently rewritten — silent rewriting would collide distinct
+/// tenants (`acme-1` and `acme_1`) onto the same file. Reuses the same
+/// validator the rest of the engine uses for catalog/schema/table identifiers.
+///
+/// # Errors
+///
+/// Returns [`rocky_sql::validation::ValidationError`] when `ns` is empty or
+/// contains a character outside `[a-zA-Z0-9_]`.
+pub fn validate_namespace(ns: &str) -> Result<&str, rocky_sql::validation::ValidationError> {
+    rocky_sql::validation::validate_identifier(ns)
+}
+
+/// Return `Some(ns)` if `ns` is a valid state namespace, else `None`.
+///
+/// Used by [`resolve_state_path_ns`] as a defensive last line — the real
+/// rejection happens at the CLI boundary via [`validate_namespace`], which
+/// surfaces a clean error to the user.
+fn sanitize_namespace(ns: &str) -> Option<&str> {
+    validate_namespace(ns).ok()
 }
 
 #[cfg(test)]
