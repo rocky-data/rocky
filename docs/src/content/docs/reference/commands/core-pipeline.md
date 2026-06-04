@@ -200,6 +200,29 @@ Discover a specific pipeline when multiple are defined:
 rocky discover --pipeline shopify_us
 ```
 
+### New sources and cross-source collisions
+
+Two opt-in discover-time signals help catch onboarding problems before any catalog is created. Both are configured under [`[pipeline.NAME.source.discovery]`](/reference/configuration/#pipelinenamesourcediscovery) and appear as extra fields on the JSON output (omitted entirely when not enabled).
+
+- **`new_sources`** — set `report_new_sources = true` to diff the discovered inventory against the prior persisted snapshot. First-seen source schemas are listed here; the first discover of a pipeline records the baseline and reports nothing.
+- **`collision_candidates`** — set `on_collision = "warn"` (or `"error"`) to flag the same external object onboarded under more than one schema. Each entry pairs the shared `external_object_id` with the `sources` (schemas) it resolves to. With `"error"`, discover also exits non-zero. Only adapters that resolve external object ids (e.g. Fivetran) populate this.
+
+```json
+{
+  "command": "discover",
+  "sources": [ /* … */ ],
+  "new_sources": ["src__acme__ca_central__shopify"],
+  "collision_candidates": [
+    {
+      "external_object_id": "act_1234567890",
+      "sources": ["src__acme__us_west__shopify", "src__acme__eu_central__shopify"]
+    }
+  ]
+}
+```
+
+`collision_candidates` is the **preventive** half of cross-source duplicate detection; its **detective** counterpart, [`cross_source_overlap`](/concepts/data-quality-checks/#cross-source-overlap), runs at `rocky run` time against the materialized tables.
+
 ### Related Commands
 
 - [`rocky plan`](#rocky-plan) -- generate SQL from discovered sources

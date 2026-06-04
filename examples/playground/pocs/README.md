@@ -5,7 +5,7 @@
 ## Categories
 
 - [00-foundations](00-foundations/) — DSL syntax + materialization basics + trust-arc 1 branches/replay/lineage + config layering + branch approve/promote + file-format ingest + per-tenant routing + plan/apply workflow + project scaffolding (13 POCs · DuckDB)
-- [01-quality](01-quality/) — Contracts, checks, anomaly detection, local testing, SCD-2 snapshots, standalone quality pipeline, freshness SLAs (7 POCs · DuckDB)
+- [01-quality](01-quality/) — Contracts, checks, anomaly detection, local testing, SCD-2 snapshots, standalone quality pipeline, freshness SLAs, cross-source overlap (8 POCs · DuckDB)
 - [02-performance](02-performance/) — Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive concurrency, trust-arc 2 cost+budgets, strategy showcase, EXPLAIN cost estimation, skip-unchanged gate (14 POCs · DuckDB)
 - [03-ai](03-ai/) — AI generation, sync, test generation, trust-arc 5 schema-grounded validation, MCP data-grounding (6 POCs · `ANTHROPIC_API_KEY` for 5, DuckDB for the MCP-grounding POC)
 - [04-governance](04-governance/) — Unity Catalog grants, isolation, tagging, classification + masking, retention, auto-create schemas, cross-team contracts (8 POCs · Databricks / DuckDB)

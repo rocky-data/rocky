@@ -1,0 +1,51 @@
+# 09-cross-source-overlap — detect the same business key arriving via two sources.
+#
+# Two regional Shopify connectors (us, eu) both land an `orders` table. They
+# share some order_ids (the same orders onboarded under two paths), which a
+# per-table `unique` check can never see — only a cross-table overlap check can.
+#
+# `rocky test` auto-loads data/seed.sql into an in-memory DuckDB. For the
+# discover/run flow, seed the persistent file first:
+#   duckdb poc.duckdb < data/seed.sql
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.discovery]
+adapter = "default"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["region", "source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "staging__{region}__{source}"
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true
+
+[pipeline.poc.checks]
+enabled = true
+
+# DETECTIVE, cross-table: flag a business key (order_id) that appears in more
+# than one sibling source (same source type + table name, different target
+# schema). Advisory — surfaces in the JSON, never fails the replication.
+[pipeline.poc.checks.cross_source_overlap]
+keys = ["order_id"]
+severity = "warning"
+
+# DETECTIVE, derived-key: assert a *computed* business key is unique per table —
+# the surrogate `order_id` is unique, but the same logical order (customer +
+# day) must not appear twice. Neither `unique` nor `composite` can express this.
+[[pipeline.poc.checks.assertions]]
+name = "orders_one_per_customer_per_day"
+table = "orders"
+type = "unique_expr"
+key_expr = "md5(CAST(customer_id AS VARCHAR) || '|' || CAST(order_date AS VARCHAR))"
+severity = "warning"

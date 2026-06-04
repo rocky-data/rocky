@@ -8,7 +8,9 @@ sidebar:
 Rocky ships two complementary quality surfaces, both executed inline against the warehouse — there is no separate testing step like `dbt test`:
 
 1. **Pipeline-level checks** — configured per pipeline in `rocky.toml` under `[pipeline.<name>.checks]`. These run after each table is replicated: row count, column match, freshness, null rate, anomaly detection, custom SQL.
-2. **Model-level declarative assertions** — configured per model in the model's sidecar TOML (or directly under `[pipeline.<name>.checks]`) via repeated `[[assertions]]` blocks. These cover the DQX parity surface: `not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, plus the time-window sugar `not_in_future` and `older_than_n_days`.
+2. **Model-level declarative assertions** — configured per model in the model's sidecar TOML (or directly under `[pipeline.<name>.checks]`) via repeated `[[assertions]]` blocks. These cover the DQX parity surface: `not_null`, `unique`, `unique_expr`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, plus the time-window sugar `not_in_future` and `older_than_n_days`.
+
+Assertions run on **every** pipeline type — including **replication**, not just transformation/quality — so a target table doubled by the same source arriving twice is caught at load time. For the cross-*table* variant (the same key arriving through two sibling sources that later get `UNION`-ed together), see [Cross-source overlap](#cross-source-overlap).
 
 Both surfaces share the same JSON output shape (`check_results[]`) and the same severity / quarantine plumbing, so orchestrators don't need to distinguish between them.
 
@@ -124,6 +126,7 @@ filter = "region = 'US'"
 |---|---|---|---|
 | `not_null` | row | — | Column contains no NULL values. |
 | `unique` | set | — | Column contains only unique values. |
+| `unique_expr` | set | `key_expr: String` | A derived **key expression** is unique across rows (`GROUP BY <expr> HAVING COUNT(*) > 1`). For when the meaningful identity is a *computed* value (e.g. a surrogate built to be stable across a multi-tenant union) that neither `unique` (single column) nor `composite` (column tuple) can express. `key_expr` is passed through verbatim (trusted config, like `expression`); NULL keys are not excluded — use `filter` to scope them out. |
 | `accepted_values` | row | `values: [String]` | Every non-NULL value is in the fixed set. |
 | `relationships` | row | `to_table`, `to_column` | Every non-NULL value exists in `to_table.to_column` (referential integrity). |
 | `expression` | row | `expression: String` | Custom SQL boolean predicate must hold per row. |
@@ -135,7 +138,7 @@ filter = "region = 'US'"
 | `not_in_future` | row | — (sugar for `col <= CURRENT_TIMESTAMP()`) | Timestamp column cannot contain future values. NULLs pass. |
 | `older_than_n_days` | row | `days: u32` | Every timestamp must be at least `days` old. NULLs pass. Dialect-aware. |
 
-Row-level assertions are **quarantinable** (see below). Set-based and table-level assertions (`unique`, `composite`, `row_count_range`, `aggregate`) are evaluated post-hoc and cannot be quarantined.
+Row-level assertions are **quarantinable** (see below). Set-based and table-level assertions (`unique`, `unique_expr`, `composite`, `row_count_range`, `aggregate`) are evaluated post-hoc and cannot be quarantined.
 
 ### Severity and `fail_on_error`
 
@@ -210,3 +213,57 @@ Every assertion produces a `check_results[]` entry in the `rocky apply` JSON out
 ```
 
 Consumers (dagster-rocky, the VS Code lineage view, custom scripts) parse this shape via the generated Pydantic / TypeScript bindings — see the [JSON Output](/reference/json-output/) reference.
+
+## Cross-source overlap
+
+The assertions above check one table at a time. They can't catch a subtler duplication: the **same business key arriving through two different sources** that later get `UNION`-ed into one consolidation target. Each source table is internally unique — every per-table `unique` check passes — yet the consolidation double-counts every shared key.
+
+This is the classic "same account onboarded twice under two paths" failure. `cross_source_overlap` is the cross-table check that sees it.
+
+```toml
+[pipeline.bronze.checks.cross_source_overlap]
+keys = ["order_id"]          # or: key_expr = "md5(a || '-' || b)"
+severity = "warning"
+max_overlap_rows = 0          # any overlap fails; raise to tolerate a known set
+sample = 20                   # overlapping keys attached to the result for triage
+```
+
+Exactly one of `keys` (a column tuple) or `key_expr` (a derived SQL expression, passed through verbatim) is required — mirroring `unique` / `unique_expr`.
+
+**How it works.** The runner buckets the pipeline's managed source tables into **sibling groups** — tables with the same source type and table name that landed in more than one target schema (the tenant/region fan-out that gets unioned downstream). It tags each sibling's rows with its source identity and runs:
+
+```sql
+SELECT order_id, COUNT(DISTINCT _src) AS _n_src
+FROM (
+  SELECT order_id, '<table_1>' AS _src FROM <table_1> WHERE order_id IS NOT NULL
+  UNION ALL
+  SELECT order_id, '<table_2>' AS _src FROM <table_2> WHERE order_id IS NOT NULL
+  -- … one arm per sibling
+) _u
+GROUP BY order_id
+HAVING COUNT(DISTINCT _src) > 1
+```
+
+The `COUNT(DISTINCT _src)` is the crux: it counts how many *distinct sources* a key appears in, so a single source's own internal duplicates never false-flag — only a key spanning two or more siblings does. (With a `key_expr` or multi-column `keys`, the projected key list changes accordingly.) A key appearing under more than one source is an overlap. Sibling tables whose key can't be evaluated (missing column / keyless) are **skipped with a logged reason** rather than failing the check. The result is a `check_results[]` entry named `cross_source_overlap:<source_type>.<table>`, carrying the overlap count, the contributing tables, and a bounded `sample` of overlapping keys (the detail fields are flattened onto the result, consistent with every other check):
+
+```json
+{
+  "name": "cross_source_overlap:shopify.orders",
+  "passed": false,
+  "severity": "warning",
+  "overlap_count": 3,
+  "contributing_tables": ["raw__us__shopify.orders", "raw__eu__shopify.orders"],
+  "sample": ["ord_1001", "ord_1002", "ord_1003"]
+}
+```
+
+### Preventive vs detective
+
+Rocky catches cross-source duplication at two points:
+
+| Layer | Mechanism | When it runs | Config |
+|---|---|---|---|
+| **Preventive** | `on_collision` | `rocky discover` — before a stray catalog is even created | `[pipeline.NAME.source.discovery] on_collision` → `collision_candidates` |
+| **Detective** | `cross_source_overlap` | `rocky run` — after the sibling tables are materialized | `[pipeline.NAME.checks.cross_source_overlap]` |
+
+The preventive layer needs an adapter that resolves external object ids (e.g. Fivetran) and inspects connector metadata; the detective layer works on any warehouse by querying the materialized tables directly. They're complementary — use both for defense in depth, or just the detective check if your sources don't expose object ids at discover time. See [discovery configuration](/reference/configuration/#pipelinenamesourcediscovery) for `on_collision`.

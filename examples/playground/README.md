@@ -38,7 +38,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**75 of 87 POCs run with no external credentials.** See each POC's README for prerequisites.
+**76 of 88 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -63,9 +63,9 @@ DSL syntax, materialization basics, playground baseline, the trust-arc 1 storage
 | [11-plan-apply-workflow](pocs/00-foundations/11-plan-apply-workflow) | `rocky plan` persists a content-addressed plan to `.rocky/plans/<id>.json`; `rocky apply <id>` executes it. Re-planning the same intent yields the same `plan_id` |
 | [12-init-scaffolding](pocs/00-foundations/12-init-scaffolding) | `rocky init --template duckdb` scaffolds a project that validates + compiles out of the box; `--template snowflake` shows the layout changes per warehouse |
 
-### 01 — Quality (7 POCs · DuckDB)
+### 01 — Quality (8 POCs · DuckDB)
 
-Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, standalone quality pipeline, freshness SLAs.
+Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, standalone quality pipeline, freshness SLAs, cross-source overlap.
 
 | POC | Feature |
 |---|---|
@@ -76,6 +76,7 @@ Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, sta
 | [05-snapshot-scd2](pocs/01-quality/05-snapshot-scd2) | `type = "snapshot"` pipeline — SCD Type 2 with `unique_key`, `updated_at`, `invalidate_hard_deletes` |
 | [06-quality-pipeline-standalone](pocs/01-quality/06-quality-pipeline-standalone) | `type = "quality"` pipeline — standalone checks (row_count, freshness, null_rate) with `depends_on` chaining |
 | [07-freshness-sla](pocs/01-quality/07-freshness-sla) | Per-model + project `[freshness]` SLAs (`expected_lag_seconds` alias); the **W005** coverage diagnostic fires on a temporal-output model with no freshness declaration (`compile --with-seed`), suppressed by a per-model block or a project default; also surfaces in the editor with an AI fix |
+| [08-cross-source-overlap](pocs/01-quality/08-cross-source-overlap) | The same data arriving via two sibling sources — `cross_source_overlap` flags a business key shared across siblings (which per-table `unique` can't see) + `unique_expr` catches a derived-key duplicate, both at replication time |
 
 ### 02 — Performance (14 POCs · DuckDB)
 
