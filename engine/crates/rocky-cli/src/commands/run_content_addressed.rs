@@ -839,18 +839,33 @@ async fn sync_iceberg_metadata(
 ///
 /// Runs **after** the [`decide_reuse`](crate::commands::reuse_decision::decide_reuse)
 /// verdict already passed every clause (incl. a liveness check). This function
-/// is the trust-critical commit-time half, and it is **verify-before-trust**:
+/// is the trust-critical commit-time half, and it carries its **own** local
+/// content-identity guard rather than relying on the cross-crate
+/// `input_hash`-folds-target invariant to keep it honest:
 ///
 /// 1. **Recover** `R`'s `add` action from its `_delta_log/{commit_version}.json`
 ///    (one GET, no parquet byte read — `R`'s recorded `stats` carry over).
-/// 2. **Re-confirm liveness right before the commit (TOCTOU).** The decision's
+/// 2. **Verify content identity (the real guard).** Files are content-addressed
+///    (`<hash>.parquet`), so the file basename *is* the content hash. Assert the
+///    recovered `add` path's basename equals the validated candidate's
+///    `file_path` basename. A mismatch means the recovered pointer references
+///    DIFFERENT bytes than the decision approved — a cross-target or
+///    version-identity drift — so it is an `Err` ⇒ a BUILD. This is what makes
+///    the function self-defending: a recovered add naming the wrong file can
+///    never be returned as `Ok`.
+/// 3. **Re-confirm liveness right before the commit (TOCTOU).** The decision's
 ///    liveness check and this commit are not atomic — `R`'s file could be
 ///    VACUUM'd/`remove`d in the gap. Re-checking `add_path_is_live` here closes
 ///    that window: a flip to not-live is an `Err`, which the caller treats as a
 ///    BUILD.
-/// 3. **Commit the pointer** via [`UniformWriter::commit_pointer_with_state`].
+/// 4. **Commit the pointer** via [`UniformWriter::commit_pointer_with_state`].
 ///    Its append-only double-count guard makes a same-target re-commit a no-op
 ///    (returns the existing commit version, emits no new commit).
+///
+/// A residual blake3 cross-check after the commit is kept only as a redundant
+/// tripwire on an internal writer regression; the writer copies the candidate
+/// hash straight through, so it is near-tautological and is **not** the guard
+/// the safety argument rests on (step 2 is).
 ///
 /// # Returns
 ///
@@ -861,10 +876,11 @@ async fn sync_iceberg_metadata(
 ///
 /// # Errors
 ///
-/// Returns `Err` on **any** doubt — recover failure, a liveness flip, or a
-/// commit error. The caller maps every `Err` to a normal BUILD; this function
-/// never leaves the target in a partial state (a failed `commit_pointer_with_state`
-/// lands no commit) and never returns `Ok` on an unverified pointer.
+/// Returns `Err` on **any** doubt — recover failure, a content-identity
+/// (basename) mismatch, a liveness flip, or a commit error. The caller maps
+/// every `Err` to a normal BUILD; this function never leaves the target in a
+/// partial state (the content-identity guard fires *before* any commit, and a
+/// failed `commit_pointer_with_state` lands no commit).
 async fn attempt_point_to_reuse(
     writer: &UniformWriter,
     state: &rocky_iceberg::uniform_writer::UniformTableState,
@@ -887,7 +903,32 @@ async fn attempt_point_to_reuse(
     let num_records = num_records_from_recovered_add(&pointer.recovered_add);
     pointer.num_records = num_records;
 
-    // 2. Re-confirm liveness right before the commit (TOCTOU). The decision
+    // 2. Content-identity guard — the real verify-before-trust check. Files are
+    // content-addressed (`<hash>.parquet`), so the basename IS the content hash:
+    // basename equality is content-identity equality. The recovered `add` path
+    // (lifted from R's own `_delta_log`) must name the same file the validated
+    // candidate does. A mismatch means the recovered pointer references DIFFERENT
+    // bytes than the decision approved (cross-target / version-identity drift) ⇒
+    // Err ⇒ the caller BUILDs. This guard is local and self-defending: it does
+    // not lean on the cross-crate `input_hash`-folds-target invariant.
+    let recovered_basename = pointer
+        .add_file_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&pointer.add_file_path);
+    let candidate_basename = candidate
+        .file_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&candidate.file_path);
+    if recovered_basename != candidate_basename {
+        return Err(anyhow!(
+            "recovered add path {recovered_basename:?} != candidate file \
+             {candidate_basename:?}; building"
+        ));
+    }
+
+    // 3. Re-confirm liveness right before the commit (TOCTOU). The decision
     // already checked liveness, but VACUUM could have removed R's file in the
     // gap. A flip to not-live ⇒ Err ⇒ the caller BUILDs.
     let still_live = writer
@@ -902,17 +943,19 @@ async fn attempt_point_to_reuse(
         ));
     }
 
-    // 3. Commit the zero-copy pointer. The double-count guard makes a
+    // 4. Commit the zero-copy pointer. The double-count guard makes a
     // same-target re-commit a no-op.
     let write_result = writer
         .commit_pointer_with_state(&pointer, state.clone())
         .await
         .map_err(|e| anyhow!("commit_pointer_with_state failed: {e}"))?;
 
-    // Defence-in-depth: the bytes we just referenced must carry R's blake3.
-    // The writer copies `pointer.blake3_hash` straight through, so this can
-    // only trip on a programming error — fail closed to a BUILD if it ever
-    // does rather than record a mislabeled shared-bytes reference.
+    // Redundant blake3 cross-check (NOT the primary guard — the basename
+    // content-identity check above is). The writer copies `pointer.blake3_hash`
+    // straight through to `write_result.blake3_hash`, so comparing it back to
+    // `candidate.blake3_hash` is near-tautological; it is kept only as a cheap
+    // belt-and-braces tripwire on an internal writer regression. Fail closed to
+    // a BUILD if it ever fires rather than record a mislabeled reference.
     if write_result.blake3_hash != candidate.blake3_hash {
         return Err(anyhow!(
             "point-to result blake3 {:?} disagrees with candidate {:?}; building",
@@ -1955,6 +1998,60 @@ mod tests {
         assert!(
             format!("{err:#}").contains("recover_pointer_inputs"),
             "recover failure must surface as a build-routing error; got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_to_basename_mismatch_routes_to_build() {
+        // The recovered `add` names a DIFFERENT content-addressed file than the
+        // validated candidate (`<hash>.parquet` basename differs). Because files
+        // are content-addressed, that means the recovered pointer references
+        // different bytes than the decision approved ⇒ the content-identity guard
+        // fires ⇒ Err ⇒ caller BUILDs.
+        //
+        // This is the load-bearing test for the basename guard. The blake3
+        // cross-check alone could NOT catch this: the writer copies the
+        // candidate hash straight through to the result, so it compares the
+        // candidate hash to itself and passes — the case would (wrongly) return
+        // `Ok` without this guard.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let mut candidate = seed_r_build(&store, "tbl_a").await;
+        // Recover, liveness, and commit all key off commit_version / blake3 /
+        // size — never `file_path` — so only the new content-identity guard
+        // sees this mutation. Swap in a different basename (same dir).
+        candidate.file_path = "s3://bucket/tbl_a/deadbeef.parquet".to_string();
+
+        let writer = writer_for(store.clone() as Arc<dyn ObjectStore>, "tbl_a");
+        let state = writer.discover().await.unwrap();
+        let model = dummy_model_ir();
+        let err = attempt_point_to_reuse(&writer, &state, &candidate, &model)
+            .await
+            .expect_err("a recovered add naming a different file must route to BUILD, never reuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("!= candidate file"),
+            "a content-identity mismatch must surface as a build-routing error; got: {msg}"
+        );
+
+        // The guard fires BEFORE any commit — the table is left untouched.
+        assert!(
+            store
+                .get(&ObjPath::from("tbl_a/_delta_log/00000000000000000002.json"))
+                .await
+                .is_err(),
+            "the content-identity guard must trip pre-commit, landing no new commit"
+        );
+        use futures::TryStreamExt;
+        let mut stream = store.list(Some(&ObjPath::from("tbl_a")));
+        let mut parquet_count = 0_usize;
+        while let Some(meta) = stream.try_next().await.unwrap() {
+            if meta.location.to_string().ends_with(".parquet") {
+                parquet_count += 1;
+            }
+        }
+        assert_eq!(
+            parquet_count, 1,
+            "a fail-closed basename mismatch must not write a second parquet object"
         );
     }
 
