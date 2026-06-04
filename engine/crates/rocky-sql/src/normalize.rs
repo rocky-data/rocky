@@ -26,23 +26,40 @@
 //! ## Conservatism
 //!
 //! This is a best-effort *cosmetic* canonicaliser, deliberately biased toward
-//! under-normalising. When an alias cannot be unambiguously renamed (for
-//! example a name reused across nested scopes) it is left as-is: a missed
-//! collapse costs one redundant comparison-miss, whereas a wrong collapse
-//! would equate two genuinely different queries. The function errs toward
-//! distinctness.
+//! under-normalising. A missed collapse costs one redundant comparison-miss,
+//! whereas a wrong collapse would equate two genuinely different queries, so
+//! the function errs toward distinctness.
 //!
-//! Alias *collection* walks `FROM` / `JOIN` / `WITH` positions; aliases bound
-//! only inside a `WHERE` / projection sub-query are not collected, so they are
-//! not renamed. The effect is purely under-normalisation (such queries stay
-//! more distinct), never a wrong collapse.
+//! Alias references are rewritten by a **flat, statement-wide** token map: a
+//! name is assigned one positional token (`_t0`, `_t1`, ...) in first-seen
+//! traversal order, and every reference to it anywhere in the statement is
+//! rewritten to that token. To keep the flat rewrite sound, a name is renamed
+//! **only when it is defined exactly once** across the whole statement. Two
+//! definition classes are therefore excluded from renaming and left verbatim:
+//!
+//! - A name *reused across scopes* (shadowed) — bound by more than one
+//!   definition. A single flat token cannot distinguish the scopes, so the
+//!   name is left as-is rather than risk retargeting a reference to the wrong
+//!   definition.
+//! - A name that is collected from a `FROM` / `JOIN` / `WITH` position **and
+//!   also** bound inside a `WHERE` / projection sub-query the collector skips.
+//!   The collected definition would be rewritten but the sub-query definition
+//!   would not, so a flat rewrite of the sub-query's references would dangle.
+//!   A whole-statement definition count (which *does* reach the sub-query
+//!   binding) sees the name defined more than once and keeps it out of the
+//!   rename map.
+//!
+//! A name whose *only* definition lives in such an uncollected sub-query is
+//! simply never collected, so it is never a rename candidate in the first
+//! place. All of these are pure under-normalisation: the affected query stays
+//! more distinct, never collapsing onto a different one.
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Cte, Expr, Ident, Query, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins,
-    visit_expressions_mut, visit_relations_mut,
+    Cte, Expr, Ident, Query, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins, Visit,
+    Visitor, visit_expressions_mut, visit_relations_mut,
 };
 
 use crate::parser::parse_single_statement;
@@ -70,7 +87,32 @@ pub fn normalize(sql: &str) -> Option<String> {
     if let Statement::Query(query) = &statement {
         collect_aliases(query, &mut order);
     }
+
+    // Pass 1b: count *every* alias definition site in the statement — including
+    // the aliases bound only inside `WHERE` / projection sub-queries that Pass 1
+    // deliberately does not collect. A name that is defined more than once
+    // anywhere is *ambiguous*: it is either shadowed across collected scopes,
+    // or it also names an alias in an uncollected scope. Renaming such a name
+    // via the flat statement-wide reference rewrite (Passes 2b/2c) would be
+    // unsound — references in a scope whose definition was never collected
+    // (and so never rewritten) would be retargeted to a token with no matching
+    // definition, producing a dangling alias. Excluding every ambiguous name
+    // keeps the function under-normalising (the colliding query stays as-is),
+    // which is the safe direction.
+    let mut def_counts: BTreeMap<String, usize> = BTreeMap::new();
+    if let Statement::Query(query) = &statement {
+        let mut counter = AliasDefCounter {
+            counts: &mut def_counts,
+        };
+        let _: ControlFlow<()> = query.visit(&mut counter);
+    }
+
     for name in order {
+        // Skip ambiguous (multiply-defined) names: leaving them untouched
+        // under-normalises but never mangles a reference.
+        if def_counts.get(&name).copied().unwrap_or(0) > 1 {
+            continue;
+        }
         let next = renames.len();
         renames.entry(name).or_insert_with(|| format!("_t{next}"));
     }
@@ -101,15 +143,20 @@ pub fn normalize(sql: &str) -> Option<String> {
         ControlFlow::Continue(())
     });
 
-    // Pass 2c: rewrite the table-qualifier of `alias.col` column references.
+    // Pass 2c: rewrite the table-qualifier of an `alias.col` column reference.
+    // Only an *exactly two-part* identifier matches the `alias.col` contract.
+    // A longer compound (`cat.sch.tbl.col`) is a fully-qualified column whose
+    // table component is a real table name, never a table alias — rewriting
+    // its `tbl` part just because the name happens to collide with an alias
+    // would mangle a real reference. Restricting to `len == 2` keeps the
+    // rewrite to genuine alias qualifiers.
     let _: ControlFlow<()> = visit_expressions_mut(&mut statement, |expr| {
         if let Expr::CompoundIdentifier(parts) = expr
-            && parts.len() >= 2
+            && parts.len() == 2
         {
-            let qualifier = &parts[parts.len() - 2].value;
+            let qualifier = &parts[0].value;
             if let Some(token) = renames.get(qualifier) {
-                let idx = parts.len() - 2;
-                parts[idx] = plain_ident(token);
+                parts[0] = plain_ident(token);
             }
         }
         ControlFlow::Continue(())
@@ -122,6 +169,77 @@ pub fn normalize(sql: &str) -> Option<String> {
 /// `^_t[0-9]+$`, always safe to emit bare.
 fn plain_ident(value: &str) -> Ident {
     Ident::new(value.to_string())
+}
+
+/// Counts every table-level alias *definition* site across the whole
+/// statement, one [`Query`] scope at a time.
+///
+/// `pre_visit_query` fires on every `Query` the derived `Visit` walk reaches —
+/// the top-level query, CTE bodies, FROM-derived sub-queries, set-op branches,
+/// and the sub-queries embedded in `WHERE` / projection expressions that the
+/// Pass-1 collector skips. For each such query it tallies that query's *own*
+/// CTE and FROM/JOIN/derived-table aliases; it does **not** recurse into nested
+/// sub-queries itself (the visitor walk does), so each definition is counted
+/// exactly once. A count greater than one for a name means that name is bound
+/// in more than one place — ambiguous — and must not be globally renamed.
+struct AliasDefCounter<'a> {
+    counts: &'a mut BTreeMap<String, usize>,
+}
+
+impl AliasDefCounter<'_> {
+    fn tally(&mut self, name: &str) {
+        *self.counts.entry(name.to_string()).or_insert(0) += 1;
+    }
+}
+
+impl Visitor for AliasDefCounter<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                self.tally(&cte.alias.name.value);
+            }
+        }
+        count_set_expr_immediate_aliases(&query.body, self);
+        ControlFlow::Continue(())
+    }
+}
+
+/// Tally the aliases defined *directly* in this `SetExpr`'s FROM/JOIN clauses.
+/// Derived-table aliases are counted here (they belong to this scope); the
+/// derived sub-query's *internal* aliases belong to the nested `Query` and are
+/// counted when the visitor reaches it.
+fn count_set_expr_immediate_aliases(body: &SetExpr, counter: &mut AliasDefCounter<'_>) {
+    match body {
+        SetExpr::Select(select) => {
+            for twj in &select.from {
+                count_twj_immediate_aliases(twj, counter);
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            count_set_expr_immediate_aliases(left, counter);
+            count_set_expr_immediate_aliases(right, counter);
+        }
+        // `SetExpr::Query(inner)` is a nested `Query`; the visitor walk reaches
+        // it via `pre_visit_query`, so it is not descended here.
+        _ => {}
+    }
+}
+
+fn count_twj_immediate_aliases(twj: &TableWithJoins, counter: &mut AliasDefCounter<'_>) {
+    count_factor_immediate_alias(&twj.relation, counter);
+    for join in &twj.joins {
+        count_factor_immediate_alias(&join.relation, counter);
+    }
+}
+
+fn count_factor_immediate_alias(factor: &TableFactor, counter: &mut AliasDefCounter<'_>) {
+    match factor {
+        TableFactor::Table { alias: Some(a), .. } => counter.tally(&a.name.value),
+        TableFactor::Derived { alias: Some(a), .. } => counter.tally(&a.name.value),
+        _ => {}
+    }
 }
 
 /// Collect internal table-level alias names in deterministic traversal order.
@@ -341,5 +459,56 @@ mod tests {
         let once = normalize(sql).unwrap();
         let twice = normalize(&once).unwrap();
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn four_part_column_ref_table_component_is_not_mangled() {
+        // A fully-qualified `cat.sch.tbl.col` reference whose `tbl` component
+        // collides with a collected alias name must NOT have `tbl` rewritten:
+        // it is a real table name, not an alias qualifier. Only the genuine
+        // two-part `alias.col` reference is rewritten.
+        let out = normalize("SELECT cat.sch.orders.col FROM cat.sch.t AS orders").unwrap();
+        // The real table component survives verbatim.
+        assert!(
+            out.contains("cat.sch.orders.col"),
+            "4-part table component must not be mangled, got: {out}"
+        );
+        // The alias definition was still rewritten to a positional token.
+        assert!(out.contains("_t0"), "alias should be tokenised, got: {out}");
+    }
+
+    #[test]
+    fn outer_inner_alias_collision_does_not_dangle() {
+        // Outer FROM alias `a` is collected; an inner `WHERE`-sub-query also
+        // binds `a` but is not collected. Renaming `a` globally would leave the
+        // inner definition `AS a` intact while rewriting its references to a
+        // token — a dangling alias. The ambiguity guard leaves both verbatim.
+        let sql = "SELECT a.id FROM cat.sch.t AS a \
+                   WHERE a.id IN (SELECT a.id FROM cat.sch.u AS a WHERE a.id > 0)";
+        let out = normalize(sql).unwrap();
+        // No positional token is introduced (the only alias name is ambiguous).
+        assert!(
+            !out.contains("_t"),
+            "ambiguous alias must be left untouched, got: {out}"
+        );
+        // Every reference still resolves to a real, present alias definition.
+        assert!(
+            out.contains("AS a") && out.contains("a.id"),
+            "both alias definition and references stay consistent, got: {out}"
+        );
+    }
+
+    #[test]
+    fn distinct_scoped_aliases_still_normalise() {
+        // Sanity: when alias names do *not* collide across scopes, the flat
+        // rename still collapses cosmetic alias differences as before. Both the
+        // outer FROM alias and the FROM-derived sub-query's inner alias are
+        // collected, so distinct choices normalise to the same token sequence.
+        let a = "SELECT o.id FROM cat.sch.t AS o \
+                 JOIN (SELECT u.id FROM cat.sch.u AS u) AS d ON o.id = d.id";
+        let b = "SELECT x.id FROM cat.sch.t AS x \
+                 JOIN (SELECT y.id FROM cat.sch.u AS y) AS e ON x.id = e.id";
+        assert_eq!(normalize(a), normalize(b));
+        assert!(normalize(a).unwrap().contains("_t0"));
     }
 }

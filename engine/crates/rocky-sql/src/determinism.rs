@@ -29,7 +29,7 @@
 
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, Query, SetExpr, Statement, visit_expressions};
+use sqlparser::ast::{Expr, Query, SetExpr, Statement, Visit, Visitor, visit_expressions};
 
 use crate::parser::parse_single_statement;
 
@@ -67,15 +67,24 @@ const VOLATILE_FUNCTIONS: &[&str] = &[
 
 /// Volatile builtins that take no parentheses and therefore parse as a bare
 /// [`Expr::Identifier`] (not [`Expr::Function`]) under the engine's dialect —
-/// `SELECT current_user`, `SELECT session_user`. Matched case-insensitively.
+/// `SELECT current_user`, `SELECT current_catalog`. Matched case-insensitively.
 /// A user column that happens to share one of these names is flagged volatile,
 /// which is the safe direction (a redundant rebuild, never a wrong skip).
+///
+/// The session/role/catalog niladic builtins (`CURRENT_CATALOG`,
+/// `CURRENT_SCHEMA`, `CURRENT_DATABASE`) parse as bare identifiers under
+/// `DatabricksDialect` — the [`Expr::Function`] fast-path only fires for the
+/// Postgres/Generic dialects — so they must be screened here as well as in
+/// [`VOLATILE_FUNCTIONS`] (which catches the parenthesised forms).
 const VOLATILE_BARE_IDENTIFIERS: &[&str] = &[
     "CURRENT_USER",
     "SESSION_USER",
     "SYSTEM_USER",
     "USER",
     "CURRENT_ROLE",
+    "CURRENT_CATALOG",
+    "CURRENT_SCHEMA",
+    "CURRENT_DATABASE",
 ];
 
 /// Builtin functions known to be pure (deterministic over the same input
@@ -83,6 +92,14 @@ const VOLATILE_BARE_IDENTIFIERS: &[&str] = &[
 /// transformation SQL (casts, arithmetic, common aggregates and string/date
 /// manipulation) read as deterministic while still flagging anything novel.
 /// Anything absent here is treated as non-deterministic.
+///
+/// Deliberately **absent** for the byte-equality use case: `ANY_VALUE`
+/// (returns an arbitrary group member), and the order/tie-break-unstable
+/// collection and ranking aggregates `ARRAY_AGG`, `COLLECT_LIST`,
+/// `COLLECT_SET`, `MODE` — without a `WITHIN GROUP (ORDER BY ...)` their
+/// output ordering (or, for `MODE`, the tie-break among equally frequent
+/// values) is engine-defined and can differ run to run. Excluding them takes
+/// the fail-safe direction (a redundant rebuild, never a wrong skip).
 const PURE_FUNCTIONS: &[&str] = &[
     // Aggregates
     "COUNT",
@@ -97,11 +114,9 @@ const PURE_FUNCTIONS: &[&str] = &[
     "STDDEV_POP",
     "STDDEV_SAMP",
     "MEDIAN",
-    "MODE",
     "CORR",
     "COVAR_POP",
     "COVAR_SAMP",
-    "ANY_VALUE",
     "APPROX_COUNT_DISTINCT",
     "BIT_AND",
     "BIT_OR",
@@ -241,9 +256,6 @@ const PURE_FUNCTIONS: &[&str] = &[
     "CUME_DIST",
     // Collections / structs
     "ARRAY",
-    "ARRAY_AGG",
-    "COLLECT_LIST",
-    "COLLECT_SET",
     "MAP",
     "STRUCT",
     "NAMED_STRUCT",
@@ -288,6 +300,11 @@ fn query_is_deterministic(query: &Query) -> bool {
     // 1. A row limit with no total ORDER BY — a *structural* property of the
     //    query (and every nested query), invisible to an expression visitor
     //    because it lives on the limit/order-by clauses, not in an `Expr`.
+    //    `any_unordered_limit` runs a query-level `Visitor` whose
+    //    `pre_visit_query` fires on every nested `Query` uniformly — CTE
+    //    bodies, FROM-derived sub-queries, set-op branches, and sub-queries
+    //    embedded in expressions (`IN (...)`, `EXISTS (...)`, scalar
+    //    sub-selects) — so no nested limit is silently skipped.
     // 2. A volatile expression anywhere — a projection, `WHERE`, `HAVING`,
     //    `GROUP BY`, `ORDER BY`, `JOIN ... ON`, or sub-query. A single
     //    statement-wide `visit_expressions` pass reaches every `Expr` node,
@@ -309,34 +326,36 @@ fn query_is_deterministic(query: &Query) -> bool {
 /// Returns `true` if this query or any nested query carries a row limit
 /// (`LIMIT` / `FETCH` / `TOP`) without a total `ORDER BY` — the rows returned
 /// are then implementation-defined.
+///
+/// The check is query-level and recursive: a [`Visitor`] whose
+/// `pre_visit_query` runs the limit-without-order-by test on every `Query`
+/// node the derived `Visit` walk reaches. That walk descends uniformly into
+/// CTE bodies (`WITH c AS (... LIMIT n)`), FROM-derived sub-queries, set-op
+/// branches, and sub-queries embedded in expressions (`x IN (... LIMIT n)`,
+/// `EXISTS (... LIMIT n)`, scalar sub-selects) — a `LIMIT` is not an `Expr`,
+/// so the separate `visit_expressions` pass cannot carry it, but this
+/// query-level visit reaches every one.
 fn any_unordered_limit(query: &Query) -> bool {
-    if query_has_limit(query) && query.order_by.is_none() {
-        return true;
-    }
-    set_expr_has_unordered_limit(&query.body)
+    let mut visitor = UnorderedLimitVisitor { found: false };
+    let _: ControlFlow<()> = query.visit(&mut visitor);
+    visitor.found
 }
 
-fn set_expr_has_unordered_limit(body: &SetExpr) -> bool {
-    match body {
-        SetExpr::Select(select) => select.from.iter().any(|twj| {
-            table_factor_has_unordered_limit(&twj.relation)
-                || twj
-                    .joins
-                    .iter()
-                    .any(|join| table_factor_has_unordered_limit(&join.relation))
-        }),
-        SetExpr::Query(inner) => any_unordered_limit(inner),
-        SetExpr::SetOperation { left, right, .. } => {
-            set_expr_has_unordered_limit(left) || set_expr_has_unordered_limit(right)
+/// Trips its `found` flag on the first `Query` carrying a row limit with no
+/// total `ORDER BY`. Breaks the walk early once such a query is seen.
+struct UnorderedLimitVisitor {
+    found: bool,
+}
+
+impl Visitor for UnorderedLimitVisitor {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if query_has_limit(query) && query.order_by.is_none() {
+            self.found = true;
+            return ControlFlow::Break(());
         }
-        _ => false,
-    }
-}
-
-fn table_factor_has_unordered_limit(factor: &sqlparser::ast::TableFactor) -> bool {
-    match factor {
-        sqlparser::ast::TableFactor::Derived { subquery, .. } => any_unordered_limit(subquery),
-        _ => false,
+        ControlFlow::Continue(())
     }
 }
 
@@ -507,6 +526,101 @@ mod tests {
         // when the outer query is fully ordered.
         assert!(!is_deterministic(
             "SELECT id FROM (SELECT id FROM cat.sch.t LIMIT 5) AS s ORDER BY id"
+        ));
+    }
+
+    #[test]
+    fn unordered_limit_in_cte_body_is_caught() {
+        // A LIMIT without ORDER BY inside a CTE body is non-deterministic.
+        // The CTE query is not a FROM-derived sub-query, so the old
+        // structural walk missed it; the query-level visitor reaches it.
+        assert!(!is_deterministic(
+            "WITH c AS (SELECT id FROM cat.sch.t LIMIT 5) SELECT id FROM c"
+        ));
+    }
+
+    #[test]
+    fn unordered_limit_in_expression_subquery_is_caught() {
+        // A LIMIT without ORDER BY inside an `IN (...)` sub-query is
+        // non-deterministic. The sub-query is embedded in an `Expr`, not in a
+        // FROM clause, so only a query-level visit reaches it.
+        assert!(!is_deterministic(
+            "SELECT id FROM cat.sch.t WHERE id IN (SELECT id FROM cat.sch.u LIMIT 5)"
+        ));
+    }
+
+    #[test]
+    fn unordered_limit_in_exists_subquery_is_caught() {
+        assert!(!is_deterministic(
+            "SELECT id FROM cat.sch.t \
+             WHERE EXISTS (SELECT 1 FROM cat.sch.u LIMIT 5)"
+        ));
+    }
+
+    #[test]
+    fn unordered_limit_in_set_operation_branch_is_caught() {
+        // A LIMIT without ORDER BY on one branch of a UNION is
+        // non-deterministic. The query-level visitor recurses through the
+        // set-op into each branch query.
+        assert!(!is_deterministic(
+            "SELECT id FROM cat.sch.t UNION ALL (SELECT id FROM cat.sch.u LIMIT 5)"
+        ));
+    }
+
+    #[test]
+    fn ordered_limit_in_cte_body_is_deterministic() {
+        // The fail-safe must not over-fire: a CTE LIMIT *with* a total
+        // ORDER BY is deterministic.
+        assert!(is_deterministic(
+            "WITH c AS (SELECT id FROM cat.sch.t ORDER BY id LIMIT 5) SELECT id FROM c"
+        ));
+    }
+
+    #[test]
+    fn bare_current_catalog_is_non_deterministic() {
+        // Under DatabricksDialect, bare `current_catalog` parses as
+        // Expr::Identifier, not Expr::Function — it must be screened as a
+        // volatile bare identifier.
+        assert!(!is_deterministic(
+            "SELECT id FROM cat.sch.t WHERE x = current_catalog"
+        ));
+    }
+
+    #[test]
+    fn bare_current_schema_is_non_deterministic() {
+        assert!(!is_deterministic(
+            "SELECT id FROM cat.sch.t WHERE x = current_schema"
+        ));
+    }
+
+    #[test]
+    fn bare_current_database_is_non_deterministic() {
+        assert!(!is_deterministic(
+            "SELECT id FROM cat.sch.t WHERE x = current_database"
+        ));
+    }
+
+    #[test]
+    fn any_value_is_non_deterministic() {
+        // ANY_VALUE returns an arbitrary group member — not byte-stable.
+        assert!(!is_deterministic(
+            "SELECT k, ANY_VALUE(v) AS v FROM cat.sch.t GROUP BY k"
+        ));
+    }
+
+    #[test]
+    fn array_agg_is_non_deterministic() {
+        // Order-unstable without WITHIN GROUP ORDER BY — fail-safe excludes it.
+        assert!(!is_deterministic(
+            "SELECT k, ARRAY_AGG(v) AS vs FROM cat.sch.t GROUP BY k"
+        ));
+    }
+
+    #[test]
+    fn mode_is_non_deterministic() {
+        // Tie-break among equally frequent values is engine-defined.
+        assert!(!is_deterministic(
+            "SELECT k, MODE(v) AS m FROM cat.sch.t GROUP BY k"
         ));
     }
 
