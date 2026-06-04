@@ -1337,7 +1337,7 @@ impl RockyMcpServer {
          drift detector. Read-only: it applies nothing. Pass `source_table` and `target_table` as \
          qualified `schema.table` (or `catalog.schema.table`) references. Returns drifted columns \
          (type changed), added columns (in source, missing from target — a run would ADD COLUMN), \
-         and the action the runtime would take (`ignore` / `alter_column_types` / \
+         and the action the runtime would take (`ignore` / `add_columns` / `alter_column_types` / \
          `drop_and_recreate`). When the target doesn't exist yet, `target_exists` is false and the \
          lists are empty. Hits the configured warehouse — requires live credentials."
     )]
@@ -1400,6 +1400,20 @@ impl RockyMcpServer {
             adapter.dialect(),
         );
 
+        // `detect_drift` returns `DriftAction::Ignore` whenever there are no
+        // type-changed columns — INCLUDING the added-columns-only case. But
+        // `rocky run` does NOT ignore that case: its `else if
+        // !added_columns.is_empty()` branch (commands/run.rs) issues
+        // `ALTER TABLE ADD COLUMN` and reports the action as `add_columns`.
+        // Mirror the runtime's emitted action here so the preview doesn't tell
+        // an agent "no action" for a run that would actually ALTER the target.
+        let action =
+            if result.action == rocky_ir::DriftAction::Ignore && !result.added_columns.is_empty() {
+                "add_columns".to_string()
+            } else {
+                drift_action_wire_name(&result.action).to_string()
+            };
+
         Ok(Json(DriftPreviewResult {
             source_table: args.source_table,
             target_table: args.target_table,
@@ -1414,7 +1428,7 @@ impl RockyMcpServer {
                 })
                 .collect(),
             added_columns: result.added_columns.into_iter().map(|c| c.name).collect(),
-            action: drift_action_wire_name(&result.action).to_string(),
+            action,
         }))
     }
 

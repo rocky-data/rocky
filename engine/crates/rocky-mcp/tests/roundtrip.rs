@@ -1382,6 +1382,87 @@ async fn drift_preview_compares_source_and_target_on_duckdb() {
     client.cancel().await.unwrap();
 }
 
+/// The added-columns-only case: the source has a column the target lacks, but
+/// NO existing column drifted in type. `detect_drift` returns
+/// `DriftAction::Ignore` for this (it tracks only type changes), yet a
+/// `rocky run` would issue `ALTER TABLE ADD COLUMN` and report the action as
+/// `add_columns`. `drift_preview` must mirror the runtime, not the raw enum —
+/// reporting `ignore` here would tell an agent "no action" for a run that
+/// actually alters the target. The existing drift test combines a type-drift
+/// with an added column (which resolves to `alter_column_types`), so it does
+/// not exercise this path.
+#[tokio::test]
+async fn drift_preview_reports_add_columns_when_only_columns_added() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("warehouse.duckdb");
+    write_project(dir.path(), &db_path);
+
+    {
+        use rocky_core::traits::WarehouseAdapter;
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        adapter
+            .execute_statement("CREATE SCHEMA IF NOT EXISTS out")
+            .await
+            .unwrap();
+        // Target and source share IDENTICAL types for `id`/`status` (no type
+        // drift); the source carries one extra column the target lacks.
+        adapter
+            .execute_statement(
+                "CREATE OR REPLACE TABLE out.orders AS \
+                 SELECT CAST(1 AS INTEGER) AS id, 'COMPLETE' AS status",
+            )
+            .await
+            .unwrap();
+        adapter
+            .execute_statement(
+                "CREATE OR REPLACE TABLE out.orders_next AS \
+                 SELECT CAST(1 AS INTEGER) AS id, 'COMPLETE' AS status, 'EU' AS region",
+            )
+            .await
+            .unwrap();
+    }
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let args = serde_json::json!({
+        "source_table": "out.orders_next",
+        "target_table": "out.orders",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("drift_preview").with_arguments(args))
+        .await
+        .expect("drift_preview call");
+    assert_ne!(result.is_error, Some(true), "drift_preview must not error");
+    let sc = result.structured_content.expect("structured content");
+
+    assert_eq!(sc["target_exists"], serde_json::json!(true));
+    // No existing column changed type — the empty drift list proves we are on
+    // the added-columns-only path, not `alter_column_types`.
+    assert!(
+        sc["drifted_columns"].as_array().unwrap().is_empty(),
+        "no column drifted in type: {sc:?}"
+    );
+    // The new column is surfaced.
+    let added = sc["added_columns"].as_array().unwrap();
+    assert!(
+        added.iter().any(|c| *c == serde_json::json!("region")),
+        "region must be an added column: {sc:?}"
+    );
+    // And the action must mirror what `rocky run` emits, not the raw
+    // `DriftAction::Ignore` the detector returns.
+    assert_eq!(
+        sc["action"],
+        serde_json::json!("add_columns"),
+        "added-columns-only must report add_columns (run would ALTER TABLE ADD COLUMN): {sc:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn suggest_freshness_block_returns_null_without_api_key() {
     // Without ANTHROPIC_API_KEY the tool degrades gracefully: a null block

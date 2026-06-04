@@ -683,8 +683,12 @@ pub struct DriftedColumnLite {
 /// then empty. `added_columns` are present in the source but missing from
 /// the target (a `rocky run` would `ALTER TABLE ADD COLUMN`);
 /// `drifted_columns` carry a type change; `action` is the wire name of the
-/// [`DriftAction`](rocky_ir::DriftAction) the runtime would take
-/// (`ignore` / `alter_column_types` / `drop_and_recreate`).
+/// action the runtime would take (`ignore` / `add_columns` /
+/// `alter_column_types` / `drop_and_recreate`). `add_columns` covers the
+/// added-columns-only case: [`detect_drift`](rocky_core::drift::detect_drift)
+/// returns [`DriftAction::Ignore`](rocky_ir::DriftAction::Ignore) there
+/// (no type change), but a `rocky run` still issues `ALTER TABLE ADD COLUMN`,
+/// so the preview reports `add_columns` to match.
 #[derive(Debug, Default, Serialize, JsonSchema)]
 pub struct DriftPreviewResult {
     /// The source table the drift was checked against.
@@ -699,6 +703,6 @@ pub struct DriftPreviewResult {
     /// Columns present in the source but missing from the target table.
     pub added_columns: Vec<String>,
     /// Wire name of the action the runtime would take: `"ignore"`,
-    /// `"alter_column_types"`, or `"drop_and_recreate"`.
+    /// `"add_columns"`, `"alter_column_types"`, or `"drop_and_recreate"`.
     pub action: String,
 }
