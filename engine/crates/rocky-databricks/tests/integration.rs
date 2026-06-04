@@ -595,3 +595,84 @@ async fn live_load_local_csv_via_volume() {
         .unwrap_or(-1);
     assert_eq!(n_num, 3, "table should contain 3 rows, got {n:?}");
 }
+
+/// Live: load a local CSV into a *non-existent* table with `create_table`. The
+/// loader must create the table from the file's inferred schema
+/// (`CREATE TABLE … AS read_files(…)`) rather than failing on a missing target.
+#[tokio::test]
+#[ignore]
+async fn live_create_table_from_local_csv() {
+    use rocky_adapter_sdk::{LoadOptions, LoadSource, LoaderAdapter, TableRef as SdkTableRef};
+    use rocky_databricks::loader::DatabricksLoaderAdapter;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let connector = rocky_test_connector_from_env().expect("ROCKY_TEST_DATABRICKS_* not set");
+    let catalog = std::env::var("ROCKY_TEST_DATABRICKS_CATALOG")
+        .expect("ROCKY_TEST_DATABRICKS_CATALOG must be set");
+    let schema = std::env::var("ROCKY_TEST_DATABRICKS_SCHEMA")
+        .expect("ROCKY_TEST_DATABRICKS_SCHEMA must be set");
+    let staging_volume = std::env::var("ROCKY_TEST_DATABRICKS_STAGING_VOLUME")
+        .unwrap_or_else(|_| "rocky_staging".into());
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
+    let table = format!("hc_create_local_{suffix}");
+
+    let csv_path = std::env::temp_dir().join(format!("rocky_live_create_{suffix}.csv"));
+    {
+        let mut f = std::fs::File::create(&csv_path).expect("create temp csv");
+        f.write_all(b"id,name\n1,alice\n2,bob\n3,carol\n")
+            .expect("write temp csv");
+    }
+
+    // The target table is intentionally NOT pre-created — the loader must create
+    // it from the file's inferred schema (create_table defaults to true).
+    let loader =
+        DatabricksLoaderAdapter::new(Arc::new(connector)).with_staging_volume(&staging_volume);
+    let target = SdkTableRef {
+        catalog: catalog.clone(),
+        schema: schema.clone(),
+        table: table.clone(),
+    };
+
+    let load_result = loader
+        .load(
+            &LoadSource::LocalFile(csv_path.clone()),
+            &target,
+            &LoadOptions::default(),
+        )
+        .await;
+
+    let verify_connector =
+        rocky_test_connector_from_env().expect("ROCKY_TEST_DATABRICKS_* not set");
+    let count = if load_result.is_ok() {
+        verify_connector
+            .execute_sql(&format!(
+                "SELECT COUNT(*) AS n FROM {catalog}.{schema}.{table}"
+            ))
+            .await
+            .ok()
+            .and_then(|r| r.rows.first().and_then(|row| row.first().cloned()))
+    } else {
+        None
+    };
+
+    let _ = verify_connector
+        .execute_statement(&format!("DROP TABLE IF EXISTS {catalog}.{schema}.{table}"))
+        .await;
+    let _ = std::fs::remove_file(&csv_path);
+
+    let result = load_result.expect("create-table-from-local-CSV load should succeed");
+    assert_eq!(result.rows_loaded, 3, "expected 3 rows loaded");
+    assert!(result.bytes_read > 0, "should report local byte count");
+
+    let n = count.expect("created table should be queryable");
+    let n_num: i64 = n
+        .as_i64()
+        .or_else(|| n.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(-1);
+    assert_eq!(n_num, 3, "created table should contain 3 rows, got {n:?}");
+}

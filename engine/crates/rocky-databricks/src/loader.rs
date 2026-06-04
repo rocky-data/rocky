@@ -287,6 +287,44 @@ fn validate_sql_type(ty: &str) -> AdapterResult<&str> {
     }
 }
 
+/// Build `CREATE TABLE <target> AS SELECT * FROM read_files('<path>', …)`, used
+/// when `create_table` is set and the target doesn't exist (COPY INTO can't
+/// create a table). `read_files` infers the schema from the file — mirroring
+/// DuckDB's `read_csv_auto` / `read_parquet` — so CSV columns get inferred
+/// types rather than all-strings. `path` must already be validated via
+/// [`validate_sql_path_literal`].
+fn build_create_table_from_files_sql(
+    target_ref: &str,
+    path: &str,
+    format: FileFormat,
+    options: &LoadOptions,
+) -> AdapterResult<String> {
+    let fmt = read_files_format(format);
+    let csv_opts = if format == FileFormat::Csv {
+        let header = if options.csv_has_header {
+            "true"
+        } else {
+            "false"
+        };
+        let delim = validate_csv_delimiter(options.csv_delimiter)?;
+        format!(", header => {header}, sep => '{delim}'")
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "CREATE TABLE {target_ref} AS SELECT * FROM read_files('{path}', format => '{fmt}'{csv_opts})"
+    ))
+}
+
+/// `read_files` format token for a [`FileFormat`].
+fn read_files_format(format: FileFormat) -> &'static str {
+    match format {
+        FileFormat::Csv => "csv",
+        FileFormat::Parquet => "parquet",
+        FileFormat::JsonLines => "json",
+    }
+}
+
 impl DatabricksLoaderAdapter {
     /// Execute `DELETE FROM <target>` when `truncate_first` is set. Databricks
     /// supports DELETE FROM on managed tables.
@@ -358,8 +396,8 @@ impl DatabricksLoaderAdapter {
     /// CSV into an existing table, each column is cast to the target's declared
     /// type (Databricks reads CSV as strings, so a non-STRING target column
     /// would otherwise fail `DELTA_FAILED_TO_MERGE_FIELDS`); Parquet/JSON carry
-    /// their own types, and an un-describable target (missing table) falls back
-    /// to a plain path load. Databricks' COPY INTO returns a single-row result
+    /// their own types, and a missing target is created from its inferred schema
+    /// (`read_files`) when `create_table` is set. Databricks' COPY INTO returns a single-row result
     /// whose schema includes `num_affected_rows`; if it's absent we fall back
     /// to 0 rather than fail.
     async fn run_copy_into(
@@ -369,14 +407,35 @@ impl DatabricksLoaderAdapter {
         format: FileFormat,
         options: &LoadOptions,
     ) -> AdapterResult<u64> {
-        let sql = if format == FileFormat::Csv {
-            let columns = self.describe_target_columns(target_ref).await;
-            if columns.is_empty() {
-                build_copy_into_sql(path, target_ref, format, options)?
-            } else {
-                let from = build_csv_cast_source(path, &columns)?;
-                build_copy_into_sql_from(&from, target_ref, format, options)?
+        // Existence check (also yields the declared columns for the CSV cast
+        // path); an empty Vec means the table doesn't exist.
+        let columns = self.describe_target_columns(target_ref).await;
+
+        if columns.is_empty() {
+            // COPY INTO can't create a table. Either create it from the file's
+            // inferred schema (read_files), or fail clearly when create_table
+            // is off.
+            if !options.create_table {
+                return Err(AdapterError::msg(format!(
+                    "target table {target_ref} does not exist and create_table is disabled; \
+                     create the table first or enable create_table"
+                )));
             }
+            let sql = build_create_table_from_files_sql(target_ref, path, format, options)?;
+            info!(sql = %sql, "databricks CREATE TABLE AS read_files");
+            self.connector
+                .execute_sql(&sql)
+                .await
+                .map_err(|e| AdapterError::msg(e.to_string()))?;
+            // CTAS doesn't return a load count — read it back.
+            return self.count_table_rows(target_ref).await;
+        }
+
+        // Target exists → COPY INTO. For CSV, cast each column to its declared
+        // type so string values land typed.
+        let sql = if format == FileFormat::Csv {
+            let from = build_csv_cast_source(path, &columns)?;
+            build_copy_into_sql_from(&from, target_ref, format, options)?
         } else {
             build_copy_into_sql(path, target_ref, format, options)?
         };
@@ -388,6 +447,26 @@ impl DatabricksLoaderAdapter {
             .map_err(|e| AdapterError::msg(e.to_string()))?;
 
         Ok(rows_from_copy_result(&copy_result))
+    }
+
+    /// Count rows in a table — reports rows-loaded after a CTAS create-load,
+    /// which (unlike COPY INTO) doesn't return a `num_affected_rows` counter.
+    async fn count_table_rows(&self, target_ref: &str) -> AdapterResult<u64> {
+        let sql = format!("SELECT COUNT(*) AS n FROM {target_ref}");
+        let result = self
+            .connector
+            .execute_sql(&sql)
+            .await
+            .map_err(|e| AdapterError::msg(e.to_string()))?;
+        Ok(result
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(0))
     }
 
     /// Stage a local file to a Unity Catalog Volume, COPY INTO from it, then
@@ -766,6 +845,38 @@ mod tests {
         assert_eq!(
             src,
             "(SELECT CAST(`id` AS BIGINT) AS `id`, CAST(`name` AS STRING) AS `name` FROM '/Volumes/c/s/v/f.csv')"
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_from_files_csv() {
+        let opts = LoadOptions::default();
+        let sql = build_create_table_from_files_sql(
+            "main.raw.orders",
+            "/Volumes/c/s/v/f.csv",
+            FileFormat::Csv,
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "CREATE TABLE main.raw.orders AS SELECT * FROM read_files('/Volumes/c/s/v/f.csv', format => 'csv', header => true, sep => ',')"
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_from_files_parquet() {
+        let opts = LoadOptions::default();
+        let sql = build_create_table_from_files_sql(
+            "main.raw.orders",
+            "s3://b/d.parquet",
+            FileFormat::Parquet,
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "CREATE TABLE main.raw.orders AS SELECT * FROM read_files('s3://b/d.parquet', format => 'parquet')"
         );
     }
 
