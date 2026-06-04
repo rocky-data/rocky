@@ -585,6 +585,7 @@ fn import_manifest_node(
         classification: Default::default(),
         retention: None,
         budget: None,
+        skip: None,
         name_declared: String::new(),
         target_table_declared: String::new(),
     };
@@ -1385,6 +1386,7 @@ fn import_single_model(
         classification: Default::default(),
         retention: None,
         budget: None,
+        skip: None,
         name_declared: String::new(),
         target_table_declared: String::new(),
     };

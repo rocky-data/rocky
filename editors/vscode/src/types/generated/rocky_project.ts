@@ -422,6 +422,10 @@ export interface RockyConfig {
     [k: string]: RoleConfig;
   };
   /**
+   * Opt-in run-execution tuning for the `--skip-unchanged` model-skip gate. Default-OFF: an absent `[run]` block (or one that leaves every field at its default) keeps `rocky run`'s behavior byte-identical to before the gate existed. See [`RunConfig`].
+   */
+  run?: RunConfig;
+  /**
    * Schema evolution configuration (grace-period column drops).
    */
   schema_evolution?: SchemaEvolutionConfig;
@@ -1703,6 +1707,25 @@ export interface RoleConfig {
    * Permissions this role grants. Rocky unions these with every ancestor's permissions before passing the flattened set to the governance adapter. Defaults to `[]` (permissionless grouping roles are legal — they exist only for inheritance).
    */
   permissions?: string[];
+}
+/**
+ * `[run]` — opt-in tuning for the model-skip gate.
+ *
+ * The gate lets `rocky run` skip re-materializing a model whose logic and upstream data both *appear* unchanged since the last successful build. It is a best-effort optimization, **not** a guarantee of result- equivalence: non-deterministic SQL is excluded, and any ambiguity rebuilds. Every field defaults to the safe (no-skip) choice — the whole feature is off unless `skip_unchanged = true` (or the `--skip-unchanged` flag) is set.
+ */
+export interface RunConfig {
+  /**
+   * Treat an upstream `MAX(ts)` that moved by fewer than this many seconds as unchanged for the B3 freshness comparison — the late-arriving-but- irrelevant micro-update analog of a freshness SLA threshold. Default `0`: any movement at all forces a rebuild.
+   */
+  lag_tolerance_seconds?: number;
+  /**
+   * Allow a rowcount-only data-stability signal (`COUNT(*)`) when an upstream has no tracked timestamp column. Default `false`: without an explicit opt-in, a model whose upstreams are not watermarkable is not skip-eligible. Rowcount equality is weaker than a watermark: it can miss a same-size in-place `UPDATE` (or a matched insert+delete) that mutates values without changing the row count, so it stays behind this switch.
+   */
+  skip_rowcount_fallback?: boolean;
+  /**
+   * Master switch for the model-skip gate. `false` (default) ⇒ every selected model always builds, exactly as before. The `--skip-unchanged` CLI flag turns the gate on for a single invocation regardless of this value.
+   */
+  skip_unchanged?: boolean;
 }
 /**
  * Schema evolution configuration.

@@ -252,6 +252,90 @@ pub struct DeferOptions {
     pub defer_to: Option<String>,
 }
 
+/// CLI overlay for the opt-in `--skip-unchanged` model-skip gate.
+///
+/// Both fields default to `false`, which keeps the gate off and the run
+/// byte-identical to before the gate existed. The gate is a best-effort
+/// optimization, not a result-equivalence guarantee — see
+/// [`rocky_core::config::RunConfig`] and `ModelIr::skip_hash`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SkipRunOptions {
+    /// Whether `--skip-unchanged` was passed. Turns the gate on for this
+    /// invocation regardless of the `[run] skip_unchanged` config value
+    /// (the two are OR-ed at the gate).
+    pub skip_unchanged: bool,
+    /// Whether `--force-rebuild` was passed. When `true`, every selected
+    /// model builds unconditionally — the gate's escape hatch. Takes
+    /// precedence over `skip_unchanged` and over any config.
+    pub force_rebuild: bool,
+}
+
+/// Fully-resolved configuration for the model-skip gate, assembled in
+/// `run()` from the CLI overlay ([`SkipRunOptions`]), the `[run]` config
+/// ([`rocky_core::config::RunConfig`]), and the run mode (shadow/branch),
+/// then handed to [`execute_models`].
+///
+/// The gate is a best-effort optimization, **not** a result-equivalence
+/// guarantee. [`Self::enabled`] is the single "should the gate even run?"
+/// predicate; when it is `false`, `execute_models` issues zero extra
+/// state reads or warehouse queries and behaves byte-identically to before
+/// the gate existed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SkipGateConfig {
+    /// `--skip-unchanged` flag OR `[run] skip_unchanged = true`.
+    pub feature_enabled: bool,
+    /// `--force-rebuild` — forces every model to build (gate never skips).
+    pub force_rebuild: bool,
+    /// `[run] skip_rowcount_fallback` — permit a `COUNT(*)` data-stability
+    /// signal when an upstream has no tracked timestamp column.
+    pub rowcount_fallback: bool,
+    /// `[run] lag_tolerance_seconds` — treat an upstream `MAX(ts)` that
+    /// moved by fewer than this many seconds as unchanged.
+    pub lag_tolerance_seconds: u64,
+    /// True when this is a shadow / branch run. Shadow and branch runs are
+    /// never skip-eligible in v1 — they are verification runs that write to
+    /// different targets, so skipping defeats their purpose.
+    pub shadow_or_branch: bool,
+}
+
+impl SkipGateConfig {
+    /// Resolve the effective gate config from the CLI overlay, the `[run]`
+    /// config block, and whether this is a shadow/branch run.
+    pub(crate) fn resolve(
+        skip_opts: &SkipRunOptions,
+        run_config: &rocky_core::config::RunConfig,
+        shadow_or_branch: bool,
+    ) -> Self {
+        Self {
+            feature_enabled: skip_opts.skip_unchanged || run_config.skip_unchanged,
+            force_rebuild: skip_opts.force_rebuild,
+            rowcount_fallback: run_config.skip_rowcount_fallback,
+            lag_tolerance_seconds: run_config.lag_tolerance_seconds,
+            shadow_or_branch,
+        }
+    }
+
+    /// Whether the gate may skip *any* model on this run. `false` ⇒ the gate
+    /// is fully inert (default-off, force-rebuild, or a shadow/branch run),
+    /// and `execute_models` takes the unchanged build-everything path.
+    pub(crate) fn is_active(&self) -> bool {
+        self.feature_enabled && !self.force_rebuild && !self.shadow_or_branch
+    }
+
+    /// The fully-inert gate — the default-off configuration used by tests
+    /// that exercise `execute_models` without the skip gate.
+    #[cfg(test)]
+    pub(crate) fn off() -> Self {
+        Self {
+            feature_enabled: false,
+            force_rebuild: false,
+            rowcount_fallback: false,
+            lag_tolerance_seconds: 0,
+            shadow_or_branch: false,
+        }
+    }
+}
+
 /// Borrowed slice of compile-time facts that the per-model execution path
 /// needs at materialization time.
 ///
@@ -855,6 +939,9 @@ pub async fn run(
     // target (its production schema, or `--defer-to`). Only meaningful with
     // `--model`; a full run builds everything and defers nothing.
     defer_opts: &DeferOptions,
+    // `--skip-unchanged` / `--force-rebuild` CLI overlay for the opt-in
+    // model-skip gate. Default OFF (both `false`) ⇒ byte-identical behavior.
+    skip_opts: &SkipRunOptions,
 ) -> Result<()> {
     let start = Instant::now();
     let started_at = Utc::now();
@@ -953,6 +1040,12 @@ pub async fn run(
         .clone()
         .with_ttl_override(cache_ttl_override);
 
+    // Resolve the model-skip gate once. Shadow / branch runs are never
+    // skip-eligible (they write to different targets), so a shadow config
+    // forces the gate inert regardless of the flag / config.
+    let skip_gate =
+        SkipGateConfig::resolve(skip_opts, &rocky_cfg.run, shadow_config.is_some());
+
     // Model-only execution: skip the entire replication path and execute
     // just the named model. Dagster uses this for per-asset materialization
     // when it controls the DAG scheduling.
@@ -1021,6 +1114,7 @@ pub async fn run(
             &schema_cache_cfg,
             false, // model-only entry point has no pipeline governance context
             defer_opts,
+            skip_gate,
         )
         .await?;
 
@@ -1120,6 +1214,7 @@ pub async fn run(
                 output_json,
                 partition_opts,
                 &schema_cache_cfg,
+                skip_gate,
             )
             .await?;
             finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
@@ -3115,6 +3210,7 @@ pub async fn run(
                     // `apply_defer_rewrite` is a no-op even when `--defer` is
                     // set (a full run builds every model).
                     defer_opts,
+                    skip_gate,
                 )
                 .await?;
                 Ok(())
@@ -3929,6 +4025,10 @@ pub(crate) async fn execute_models(
     // rewritten to qualified `<defer_schema>.<table>` references before SQL
     // generation. Default OFF ⇒ no rewrite, byte-identical behavior.
     defer_opts: &DeferOptions,
+    // Fully-resolved model-skip gate config. When `!skip_gate.is_active()`
+    // the gate is inert and this function builds every selected model
+    // exactly as before — no extra state reads or warehouse queries.
+    skip_gate: SkipGateConfig,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -4064,6 +4164,11 @@ pub(crate) async fn execute_models(
     let requested_parallel = (partition_opts.parallel as usize).max(1);
     let adapter_supports_concurrency = warehouse.supports_concurrent_execution();
 
+    // Opt-in model-skip gate. Inert unless `skip_gate.is_active()`; when
+    // inactive the gate below short-circuits and `execute_models` builds every
+    // model exactly as before (no extra state reads / warehouse queries).
+    let mut gate = super::skip_gate::SkipGate::new(skip_gate, &compile_result.project);
+
     for layer in &compile_result.project.layers {
         // Collect this layer's matched models (honouring the name filter),
         // tagged with their stable within-layer index so concurrent results
@@ -4075,6 +4180,63 @@ pub(crate) async fn execute_models(
             .enumerate()
             .map(|(idx, (name, model))| (idx, name, model))
             .collect();
+
+        // ---- skip gate (B2 ∧ B3) --------------------------------------
+        // Evaluate the gate over this layer's matched set BEFORE dispatch, so
+        // the serial and `--parallel` paths see identical verdicts and the B3
+        // recursion map is fully populated layer-by-layer. The result is a
+        // `to_build` subset (each carrying the `ModelSkipState` to stamp on a
+        // successful build) plus the skipped models, whose verdict is recorded
+        // and whose `tables_skipped` counter is bumped. When the gate is
+        // inactive, every model passes straight through with no skip state.
+        let mut to_build: Vec<(
+            usize,
+            &String,
+            &rocky_core::models::Model,
+            Option<crate::output::ModelSkipState>,
+        )> = Vec::with_capacity(matched.len());
+        if gate.config().is_active() {
+            for &(idx, name, model) in &matched {
+                // Build the fully-typed IR (merge the typechecker's columns,
+                // mirroring `project_ir_from_compile`) so `skip_hash()` can
+                // canonicalise. An empty `typed_columns` ⇒ `skip_hash()` is
+                // `None` ⇒ the gate builds.
+                let typed_ir = typed_model_ir(model, exec_ctx.typed_models);
+                match gate
+                    .evaluate(model, &typed_ir, warehouse, state_store)
+                    .await
+                {
+                    super::skip_gate::GateDecision::Skip => {
+                        gate.record(name, super::skip_gate::Verdict::Skipped);
+                        output.tables_skipped += 1;
+                        info!(
+                            model = name.as_str(),
+                            "skip-unchanged: logic and upstream data both appear \
+                             unchanged — skipping re-materialization (best-effort)"
+                        );
+                    }
+                    super::skip_gate::GateDecision::Build { skip_state } => {
+                        to_build.push((idx, name, model, Some(skip_state)));
+                    }
+                }
+            }
+        } else {
+            for &(idx, name, model) in &matched {
+                to_build.push((idx, name, model, None));
+            }
+        }
+
+        // Re-tag with a dense within-layer index so the parallel path's
+        // result re-ordering stays contiguous after any skips. Preserves the
+        // matched-order shape (`(idx, name, model)`) the dispatch loops below
+        // expect, with the optional skip state kept alongside.
+        let matched: Vec<(usize, &String, &rocky_core::models::Model)> = to_build
+            .iter()
+            .enumerate()
+            .map(|(i, (_, name, model, _))| (i, *name, *model))
+            .collect();
+        let skip_states: Vec<Option<crate::output::ModelSkipState>> =
+            to_build.into_iter().map(|(_, _, _, s)| s).collect();
 
         // Eligible for concurrent execution only when the user opted in,
         // the adapter supports it, and every matched model is a "plain"
@@ -4148,10 +4310,19 @@ pub(crate) async fn execute_models(
             // any later (dependent) layer starts, preserving the serial
             // path's fail-fast-no-downstream behavior.
             let mut first_error: Option<anyhow::Error> = None;
-            for (_, name, result) in layer_results {
+            for (idx, name, result) in layer_results {
                 match result {
-                    Ok(materialization) => {
+                    Ok(mut materialization) => {
                         let model_duration_ms = materialization.duration_ms;
+                        // Stamp the gate's logic key + upstream signatures so
+                        // the next run can compare against this build, and
+                        // record the model as Built so any downstream in a
+                        // later layer treats it as a changed input. `skip_states`
+                        // is index-aligned with the (post-gate) `matched` set.
+                        if let Some(state) = skip_states.get(idx).and_then(Clone::clone) {
+                            materialization.skip_internal = Some(state);
+                        }
+                        gate.record(name, super::skip_gate::Verdict::Built);
                         output.materializations.push(materialization);
                         if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                             let _ = reg
@@ -4189,8 +4360,14 @@ pub(crate) async fn execute_models(
             continue;
         }
 
-        for &(_, model_name, model) in &matched {
+        for &(idx, model_name, model) in &matched {
             let model_name: &str = model_name.as_str();
+            // Every model reached here is being built (the gate already
+            // removed any skips). Record the Built verdict so a downstream in
+            // a later layer treats it as a changed input. `content_addressed`
+            // / `time_interval` are never skip-eligible but still count as a
+            // build for the B3 recursion signal.
+            gate.record(model_name, super::skip_gate::Verdict::Built);
 
             // §P2.6 per-model emit: before_model_run. Duration is
             // reserved for after_model_run — here we just announce
@@ -4256,6 +4433,8 @@ pub(crate) async fn execute_models(
                             bytes_scanned: None,
                             bytes_written: Some(summary.size_bytes),
                             job_ids: vec![],
+                            // content_addressed is never skip-eligible.
+                            skip_internal: None,
                         });
                         info!(
                             model = model_name,
@@ -4384,8 +4563,16 @@ pub(crate) async fn execute_models(
             )
             .await
             {
-                Ok(materialization) => {
+                Ok(mut materialization) => {
                     let model_duration_ms = materialization.duration_ms;
+                    // Stamp the gate's logic key + upstream signatures so the
+                    // next run can compare against this build. `skip_states`
+                    // is index-aligned with the (post-gate) `matched` set;
+                    // `None` when the gate is off or this model wasn't
+                    // skip-eligible.
+                    if let Some(state) = skip_states.get(idx).and_then(Clone::clone) {
+                        materialization.skip_internal = Some(state);
+                    }
                     // Push a MaterializationOutput so `rocky cost` and
                     // downstream consumers see derived models in the run
                     // output instead of having to infer them from check /
@@ -4449,12 +4636,32 @@ fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static 
 /// (`content_addressed`, `time_interval`) that the serial loop handles
 /// inline. Only plain models are eligible for intra-layer concurrent
 /// execution via [`execute_one_plain_model`].
-fn is_plain_strategy(model: &rocky_core::models::Model) -> bool {
+pub(crate) fn is_plain_strategy(model: &rocky_core::models::Model) -> bool {
     !matches!(
         model.config.strategy,
         rocky_core::models::StrategyConfig::ContentAddressed { .. }
             | rocky_core::models::StrategyConfig::TimeInterval { .. }
     )
+}
+
+/// Build the fully-typed [`ModelIr`] for a model by lowering its config and
+/// then enriching `typed_columns` from the typechecker's per-model schemas —
+/// the same merge `project_ir_from_compile` does. The bare
+/// `Model::to_model_ir()` leaves `typed_columns` empty, which would force
+/// [`ModelIr::skip_hash`] to the never-equal `None` sentinel; merging the
+/// typed columns is what lets the skip gate canonicalise a model's logic.
+///
+/// The IR is built in its **static** form (`TimeInterval.window == None`), the
+/// call-time contract `skip_hash` requires.
+fn typed_model_ir(
+    model: &rocky_core::models::Model,
+    typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+) -> rocky_ir::ModelIr {
+    let mut ir = model.to_model_ir();
+    if let Some(cols) = typed_models.get(&model.config.name) {
+        ir.typed_columns = cols.clone();
+    }
+    ir
 }
 
 /// Execute exactly one "plain" single-statement transformation model:
@@ -4594,6 +4801,10 @@ async fn execute_one_plain_model(
         bytes_scanned: bytes_scanned_acc,
         bytes_written: bytes_written_acc,
         job_ids: job_ids_acc,
+        // Stamped by the gate in `execute_models` after a successful build
+        // when `--skip-unchanged` is enabled; `None` keeps default-off
+        // behavior byte-identical.
+        skip_internal: None,
     })
 }
 
@@ -5002,6 +5213,8 @@ async fn run_one_partition(
             bytes_scanned: bytes_scanned_acc,
             bytes_written: bytes_written_acc,
             job_ids: job_ids_acc,
+            // time_interval is excluded from the v1 skip gate.
+            skip_internal: None,
         }),
     }
 }
@@ -5829,6 +6042,9 @@ async fn process_table(
             bytes_scanned: exec_stats.bytes_scanned,
             bytes_written: exec_stats.bytes_written,
             job_ids: exec_stats.job_id.clone().into_iter().collect(),
+            // Replication materializations are not gated by --skip-unchanged
+            // in v1 (the gate covers transformation models).
+            skip_internal: None,
         },
         drift_checked: true,
         drift_detected: drift_action,
@@ -6807,6 +7023,7 @@ adapter = "default"
             Some(key),
             None,
             &DeferOptions::default(),
+            &SkipRunOptions::default(),
         )
         .await
         .expect("transformation run should succeed");
@@ -6912,6 +7129,7 @@ schema = "mart"
             None,
             None,
             &DeferOptions::default(),
+            &SkipRunOptions::default(),
         )
         .await
         .expect(
@@ -7885,6 +8103,7 @@ merge_keys = ["id"]
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
             &DeferOptions::default(),
+            super::SkipGateConfig::off(),
         )
         .await;
         (output, result)
@@ -7967,6 +8186,7 @@ merge_keys = ["id"]
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
             &defer_opts,
+            super::SkipGateConfig::off(),
         )
         .await
         .expect("deferred run must succeed");
@@ -8080,6 +8300,7 @@ merge_keys = ["id"]
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
             &DeferOptions::default(),
+            super::SkipGateConfig::off(),
         )
         .await;
 
@@ -8254,6 +8475,1336 @@ merge_keys = ["id"]
             out.materializations.len(),
             3,
             "all three models must materialize on the forced-serial DuckDB path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `--skip-unchanged` model-skip gate (B2 ∧ B3)
+    //
+    // DuckDB-backed, no credentials. Each test seeds a raw source + a model,
+    // runs once to establish a baseline (persisting the RunRecord so the next
+    // run can read the prior skip_hash / upstream_freshness), then runs again
+    // under a chosen `SkipGateConfig` and asserts the build-vs-skip verdict.
+    // The verdict is observed via `output.materializations` (a built model
+    // appears) and `output.tables_skipped`. "Target not rewritten" is checked
+    // with a sentinel row inserted between runs: a skip leaves it intact, a
+    // rebuild (full_refresh CTAS) drops it.
+    // -----------------------------------------------------------------------
+
+    /// An active gate with the given tolerances (feature on, no force-rebuild,
+    /// not a shadow run).
+    #[cfg(feature = "duckdb")]
+    fn active_gate(rowcount_fallback: bool, lag_tolerance_seconds: u64) -> SkipGateConfig {
+        SkipGateConfig {
+            feature_enabled: true,
+            force_rebuild: false,
+            rowcount_fallback,
+            lag_tolerance_seconds,
+            shadow_or_branch: false,
+        }
+    }
+
+    /// Run `execute_models` against `db_path` with a real state store and the
+    /// given gate config, then persist the run as a `RunRecord` so a
+    /// subsequent run can read this run's `skip_hash` / `upstream_freshness`
+    /// baseline. Returns the `RunOutput`.
+    #[cfg(feature = "duckdb")]
+    async fn run_with_gate(
+        models_dir: &std::path::Path,
+        db_path: &std::path::Path,
+        state_store: &StateStore,
+        gate: SkipGateConfig,
+        run_id: &str,
+        persist_status: rocky_core::state::RunStatus,
+    ) -> RunOutput {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::open(db_path).expect("open duckdb");
+        let opts = PartitionRunOptions::default();
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::execute_models(
+            models_dir,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            Some(state_store),
+            &opts,
+            run_id,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            &DeferOptions::default(),
+            gate,
+        )
+        .await
+        .expect("gate run must succeed");
+
+        // Persist the run so the next run sees this baseline. We override the
+        // per-model status to `persist_status` so the "prior failed" tests can
+        // record a failed baseline even though the materialization succeeded.
+        //
+        // `started_at` is derived from the trailing run-number so successive
+        // runs are strictly ordered (list_runs sorts by started_at desc): a
+        // wall-clock `now()` could tie at microsecond resolution and make
+        // "which run is latest" ambiguous.
+        let seq: i64 = run_id
+            .rsplit('-')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let started = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000 + seq * 60, 0)
+            .expect("valid timestamp");
+        let mut record = output.to_run_record(
+            run_id,
+            started,
+            started,
+            "cfg".to_string(),
+            rocky_core::state::RunTrigger::Manual,
+            rocky_core::state::RunStatus::Success,
+            RunRecordAudit::test_sentinels(),
+        );
+        if persist_status == rocky_core::state::RunStatus::Failure {
+            for m in &mut record.models_executed {
+                m.status = "failed".to_string();
+            }
+        }
+        state_store.record_run(&record).expect("record run");
+        output
+    }
+
+    /// True when `output` materialized `model` this run (i.e. it built).
+    #[cfg(feature = "duckdb")]
+    fn built(output: &RunOutput, model: &str) -> bool {
+        output
+            .materializations
+            .iter()
+            .any(|m| m.asset_key.last().map(String::as_str) == Some(model))
+    }
+
+    /// Write a full_refresh model `name.sql`/`name.toml` into `main`, with an
+    /// optional `[skip]` block appended to the sidecar.
+    #[cfg(feature = "duckdb")]
+    fn write_model_with_skip(dir: &std::path::Path, name: &str, sql: &str, skip_block: &str) {
+        std::fs::write(dir.join(format!("{name}.sql")), format!("{sql}\n")).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"{name}\"\n{skip_block}"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Seed a raw `main.src` table with `n` integer rows.
+    #[cfg(feature = "duckdb")]
+    async fn seed_src(db_path: &std::path::Path, n: u32) {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        let seed = DuckDbWarehouseAdapter::open(db_path).expect("seed open");
+        seed.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+            .await
+            .unwrap();
+        seed.execute_statement("DROP TABLE IF EXISTS main.src")
+            .await
+            .unwrap();
+        let values: Vec<String> = (1..=n).map(|i| format!("({i})")).collect();
+        seed.execute_statement(&format!(
+            "CREATE TABLE main.src AS SELECT * FROM (VALUES {}) AS t(id)",
+            values.join(", ")
+        ))
+        .await
+        .unwrap();
+    }
+
+    /// Insert a sentinel row into a model's target table so a later run can
+    /// detect whether the target was rewritten (a full_refresh CTAS would drop
+    /// the sentinel; a skip leaves it).
+    #[cfg(feature = "duckdb")]
+    async fn insert_sentinel(db_path: &std::path::Path, table: &str, sentinel: i64) {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        let a = DuckDbWarehouseAdapter::open(db_path).expect("sentinel open");
+        a.execute_statement(&format!("INSERT INTO main.{table} VALUES ({sentinel})"))
+            .await
+            .unwrap();
+    }
+
+    /// Count rows in `main.<table>`.
+    #[cfg(feature = "duckdb")]
+    async fn count_rows(db_path: &std::path::Path, table: &str) -> i64 {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        let a = DuckDbWarehouseAdapter::open(db_path).expect("count open");
+        let r = a
+            .execute_query(&format!("SELECT COUNT(*) FROM main.{table}"))
+            .await
+            .unwrap();
+        r.rows[0][0]
+            .as_i64()
+            .or_else(|| r.rows[0][0].as_str().and_then(|s| s.parse().ok()))
+            .unwrap()
+    }
+
+    /// Both unchanged ⇒ SKIP, and the target is NOT rewritten.
+    ///
+    /// Uses the rowcount fallback (a full_refresh model reading a raw source
+    /// has no tracked timestamp column, so rowcount is the available B3
+    /// signal). A sentinel row inserted after the baseline build survives the
+    /// second run iff the model was skipped.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_both_unchanged_skips_and_does_not_rewrite_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 3).await;
+        write_model_with_skip(&models_dir, "agg", "SELECT id FROM main.src", "");
+
+        // Baseline build.
+        let out1 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(built(&out1, "agg"), "first run must build (no baseline)");
+
+        // Sentinel: if the second run skips, this row remains (4 rows); if it
+        // rebuilds, the CTAS drops it (back to 3 rows).
+        insert_sentinel(&db, "agg", 999).await;
+        assert_eq!(count_rows(&db, "agg").await, 4);
+
+        // Second run: logic + source rowcount both unchanged ⇒ SKIP.
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(!built(&out2, "agg"), "both-unchanged must skip");
+        assert_eq!(out2.tables_skipped, 1, "skip must be counted");
+        assert_eq!(
+            count_rows(&db, "agg").await,
+            4,
+            "a skip must NOT rewrite the target — sentinel row survives"
+        );
+    }
+
+    /// Logic changed (a different WHERE predicate) ⇒ BUILD even when upstream
+    /// data is unchanged.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_logic_changed_builds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 5).await;
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT id FROM main.src WHERE id > 1",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Change the predicate — same source, different logic.
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT id FROM main.src WHERE id > 2",
+            "",
+        );
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(built(&out2, "agg"), "a changed predicate must rebuild");
+    }
+
+    /// Upstream rowcount changed ⇒ BUILD (rowcount-fallback signal).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_upstream_rowcount_changed_builds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 3).await;
+        write_model_with_skip(&models_dir, "agg", "SELECT id FROM main.src", "");
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Append a source row — rowcount moves from 3 to 4.
+        seed_src(&db, 4).await;
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "a changed upstream rowcount must rebuild"
+        );
+    }
+
+    /// Upstream `MAX(ts)` advanced ⇒ BUILD (watermark signal, via an
+    /// incremental-strategy timestamp column on a ts-bearing source).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_upstream_watermark_advanced_builds() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        // Source with a timestamp column, plus a pre-created incremental
+        // target (the incremental strategy appends; it does not CTAS).
+        {
+            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            s.execute_statement(
+                "CREATE TABLE main.ev AS SELECT * FROM (VALUES \
+                 (1, TIMESTAMP '2024-01-01 00:00:00')) AS t(id, ts)",
+            )
+            .await
+            .unwrap();
+            s.execute_statement("CREATE TABLE main.agg AS SELECT * FROM main.ev WHERE 1=0")
+                .await
+                .unwrap();
+        }
+        // Incremental strategy so the gate tracks `ts` for the MAX(ts) probe.
+        std::fs::write(models_dir.join("agg.sql"), "SELECT id, ts FROM main.ev\n").unwrap();
+        std::fs::write(
+            models_dir.join("agg.toml"),
+            "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"agg\"\n",
+        )
+        .unwrap();
+
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(false, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Advance MAX(ts) by inserting a later-timestamped row.
+        {
+            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+            s.execute_statement("INSERT INTO main.ev VALUES (2, TIMESTAMP '2024-06-01 00:00:00')")
+                .await
+                .unwrap();
+        }
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(false, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "an advanced upstream MAX(ts) must rebuild"
+        );
+    }
+
+    /// A model whose `FROM` is a subquery hides its real upstreams from the
+    /// lineage extractor (it records the opaque `(subquery)` marker). The gate
+    /// cannot enumerate the true sources, so it must BUILD even when the
+    /// underlying data changed — never skip against an upstream it never
+    /// examined. This is the load-bearing fail-safe for incomplete lineage.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_subquery_source_always_builds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 3).await;
+        // Subquery in FROM — the extractor sees only `(subquery)`, not main.src.
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT id FROM (SELECT id FROM main.src) t",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Change the underlying source rowcount. A correct gate must rebuild
+        // (it cannot prove the hidden upstream is unchanged); a buggy gate that
+        // dropped the subquery marker would wrongly skip on stale data.
+        seed_src(&db, 5).await;
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "a subquery-in-FROM model must always build — upstreams aren't enumerable"
+        );
+    }
+
+    /// First run (no prior successful execution) ⇒ BUILD.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_first_run_builds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 3).await;
+        write_model_with_skip(&models_dir, "agg", "SELECT id FROM main.src", "");
+        let out = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(built(&out, "agg"), "first run has no baseline ⇒ must build");
+        assert_eq!(out.tables_skipped, 0);
+    }
+
+    /// Prior run failed (latest execution status != success) ⇒ BUILD, even
+    /// though logic + data are unchanged. Covers the stricter variant: a
+    /// matching-hash success exists *earlier*, but the latest is a failure.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_prior_failed_builds_even_with_older_matching_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 3).await;
+        write_model_with_skip(&models_dir, "agg", "SELECT id FROM main.src", "");
+
+        // run-1: an older success with a matching skip_hash.
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Inject a *later* run whose latest `agg` execution FAILED (status !=
+        // success, no skip_hash) — exactly what a real failed run records. The
+        // older success (run-1) still carries a matching hash.
+        let now = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000 + 120, 0).unwrap();
+        let failed = rocky_core::state::RunRecord {
+            run_id: "run-2-failed".to_string(),
+            started_at: now,
+            finished_at: now,
+            status: rocky_core::state::RunStatus::Failure,
+            models_executed: vec![rocky_core::state::ModelExecution {
+                model_name: "agg".to_string(),
+                started_at: now,
+                finished_at: now,
+                duration_ms: 0,
+                rows_affected: None,
+                status: "failed".to_string(),
+                sql_hash: String::new(),
+                skip_hash: None,
+                upstream_freshness: None,
+                bytes_scanned: None,
+                bytes_written: None,
+            }],
+            trigger: rocky_core::state::RunTrigger::Manual,
+            config_hash: "cfg".to_string(),
+            triggering_identity: None,
+            session_source: rocky_core::state::SessionSource::Cli,
+            git_commit: None,
+            git_branch: None,
+            idempotency_key: None,
+            target_catalog: None,
+            hostname: "test".to_string(),
+            rocky_version: "test".to_string(),
+        };
+        state.record_run(&failed).unwrap();
+
+        // run-3: the latest `agg` execution is the failure ⇒ must build, never
+        // skip back to the older success.
+        let out3 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-3",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out3, "agg"),
+            "a latest-failed baseline must rebuild even with an older matching success"
+        );
+    }
+
+    /// Feature off (default gate) ⇒ BUILD even when both unchanged.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_feature_off_builds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 3).await;
+        write_model_with_skip(&models_dir, "agg", "SELECT id FROM main.src", "");
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Second run with the gate OFF — must build despite unchanged inputs.
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            SkipGateConfig::off(),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(built(&out2, "agg"), "gate off ⇒ always build");
+        assert_eq!(out2.tables_skipped, 0);
+    }
+
+    /// `--force-rebuild` ⇒ BUILD even when both unchanged and the feature is
+    /// on.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_force_rebuild_builds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 3).await;
+        write_model_with_skip(&models_dir, "agg", "SELECT id FROM main.src", "");
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        let forced = SkipGateConfig {
+            feature_enabled: true,
+            force_rebuild: true,
+            rowcount_fallback: true,
+            lag_tolerance_seconds: 0,
+            shadow_or_branch: false,
+        };
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            forced,
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(built(&out2, "agg"), "--force-rebuild must always build");
+    }
+
+    /// A non-deterministic model (`RANDOM()`) is never auto-skipped, even when
+    /// both look unchanged — and the SAME model with `[skip] deterministic =
+    /// true` becomes eligible and skips.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_non_deterministic_never_skips_unless_declared() {
+        // Arm 1: non-deterministic SQL ⇒ never skip.
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).unwrap();
+            let db = tmp.path().join("g.duckdb");
+            let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+            seed_src(&db, 3).await;
+            write_model_with_skip(
+                &models_dir,
+                "agg",
+                "SELECT id, RANDOM() AS r FROM main.src",
+                "",
+            );
+            run_with_gate(
+                &models_dir,
+                &db,
+                &state,
+                active_gate(true, 0),
+                "run-1",
+                rocky_core::state::RunStatus::Success,
+            )
+            .await;
+            let out2 = run_with_gate(
+                &models_dir,
+                &db,
+                &state,
+                active_gate(true, 0),
+                "run-2",
+                rocky_core::state::RunStatus::Success,
+            )
+            .await;
+            assert!(
+                built(&out2, "agg"),
+                "non-deterministic SQL must never auto-skip"
+            );
+        }
+        // Arm 2: same SQL, but the owner declares it deterministic ⇒ eligible.
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).unwrap();
+            let db = tmp.path().join("g.duckdb");
+            let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+            seed_src(&db, 3).await;
+            write_model_with_skip(
+                &models_dir,
+                "agg",
+                "SELECT id, RANDOM() AS r FROM main.src",
+                "\n[skip]\ndeterministic = true\n",
+            );
+            run_with_gate(
+                &models_dir,
+                &db,
+                &state,
+                active_gate(true, 0),
+                "run-1",
+                rocky_core::state::RunStatus::Success,
+            )
+            .await;
+            let out2 = run_with_gate(
+                &models_dir,
+                &db,
+                &state,
+                active_gate(true, 0),
+                "run-2",
+                rocky_core::state::RunStatus::Success,
+            )
+            .await;
+            assert!(
+                !built(&out2, "agg"),
+                "[skip] deterministic = true must re-enable skip eligibility"
+            );
+        }
+    }
+
+    /// `[skip] eligible = false` forces a model to always build.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_eligible_false_forces_build() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 3).await;
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT id FROM main.src",
+            "\n[skip]\neligible = false\n",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "[skip] eligible = false must always build"
+        );
+    }
+
+    /// DAG recursion: when an upstream Rocky model is rebuilt this run, a
+    /// downstream whose own logic + raw inputs are unchanged still rebuilds.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_dag_recursion_downstream_builds_when_upstream_rebuilt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 3).await;
+        // up reads the raw source; down reads up (a Rocky-model upstream).
+        write_model_with_skip(&models_dir, "up", "SELECT id FROM main.src", "");
+        write_model_with_skip(&models_dir, "down", "SELECT id FROM up", "");
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Change ONLY up's logic so up rebuilds; down's own logic is unchanged.
+        write_model_with_skip(
+            &models_dir,
+            "up",
+            "SELECT id FROM main.src WHERE id > 0",
+            "",
+        );
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(built(&out2, "up"), "up's changed logic must rebuild it");
+        assert!(
+            built(&out2, "down"),
+            "down must rebuild because its upstream up was rebuilt this run (B3 recursion)"
+        );
+    }
+
+    /// `lag_tolerance_seconds`: a sub-tolerance MAX(ts) movement is treated as
+    /// unchanged (SKIP) only when a tolerance is configured; an above-tolerance
+    /// movement always builds; the default tolerance 0 builds on any movement.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_lag_tolerance_absorbs_small_movement() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        async fn setup(db: &std::path::Path) {
+            let s = DuckDbWarehouseAdapter::open(db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            s.execute_statement("DROP TABLE IF EXISTS main.ev")
+                .await
+                .unwrap();
+            s.execute_statement(
+                "CREATE TABLE main.ev AS SELECT * FROM (VALUES \
+                 (1, TIMESTAMP '2024-01-01 00:00:00')) AS t(id, ts)",
+            )
+            .await
+            .unwrap();
+            // Pre-create the incremental target (append strategy, no CTAS).
+            s.execute_statement("DROP TABLE IF EXISTS main.agg")
+                .await
+                .unwrap();
+            s.execute_statement("CREATE TABLE main.agg AS SELECT * FROM main.ev WHERE 1=0")
+                .await
+                .unwrap();
+        }
+        fn write_inc(models_dir: &std::path::Path) {
+            std::fs::write(models_dir.join("agg.sql"), "SELECT id, ts FROM main.ev\n").unwrap();
+            std::fs::write(
+                models_dir.join("agg.toml"),
+                "[strategy]\ntype = \"incremental\"\ntimestamp_column = \"ts\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"agg\"\n",
+            )
+            .unwrap();
+        }
+
+        // Movement of 30s, tolerance 60s ⇒ within tolerance ⇒ SKIP.
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).unwrap();
+            let db = tmp.path().join("g.duckdb");
+            let state = StateStore::open(&tmp.path().join("state")).unwrap();
+            setup(&db).await;
+            write_inc(&models_dir);
+            run_with_gate(
+                &models_dir,
+                &db,
+                &state,
+                active_gate(false, 60),
+                "run-1",
+                rocky_core::state::RunStatus::Success,
+            )
+            .await;
+            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+            s.execute_statement("INSERT INTO main.ev VALUES (2, TIMESTAMP '2024-01-01 00:00:30')")
+                .await
+                .unwrap();
+            let out2 = run_with_gate(
+                &models_dir,
+                &db,
+                &state,
+                active_gate(false, 60),
+                "run-2",
+                rocky_core::state::RunStatus::Success,
+            )
+            .await;
+            assert!(
+                !built(&out2, "agg"),
+                "a 30s move under a 60s tolerance must skip"
+            );
+        }
+        // Movement of 30s, default tolerance 0 ⇒ any movement ⇒ BUILD.
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).unwrap();
+            let db = tmp.path().join("g.duckdb");
+            let state = StateStore::open(&tmp.path().join("state")).unwrap();
+            setup(&db).await;
+            write_inc(&models_dir);
+            run_with_gate(
+                &models_dir,
+                &db,
+                &state,
+                active_gate(false, 0),
+                "run-1",
+                rocky_core::state::RunStatus::Success,
+            )
+            .await;
+            let s = DuckDbWarehouseAdapter::open(&db).unwrap();
+            s.execute_statement("INSERT INTO main.ev VALUES (2, TIMESTAMP '2024-01-01 00:00:30')")
+                .await
+                .unwrap();
+            let out2 = run_with_gate(
+                &models_dir,
+                &db,
+                &state,
+                active_gate(false, 0),
+                "run-2",
+                rocky_core::state::RunStatus::Success,
+            )
+            .await;
+            assert!(
+                built(&out2, "agg"),
+                "default tolerance 0 must build on any movement"
+            );
+        }
+    }
+
+    /// Parallel parity: the same both-unchanged scenario yields an identical
+    /// skip verdict under `--parallel 1` and `--parallel N` (the gate sits at
+    /// the single shared site feeding both paths).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_parallel_parity() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        async fn scenario(concurrent: bool, parallel: u32) -> RunOutput {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).unwrap();
+            let db = tmp.path().join("g.duckdb");
+            let state = StateStore::open(&tmp.path().join("state")).unwrap();
+            seed_src(&db, 3).await;
+            write_model_with_skip(&models_dir, "agg", "SELECT id FROM main.src", "");
+            run_with_gate(
+                &models_dir,
+                &db,
+                &state,
+                active_gate(true, 0),
+                "run-1",
+                rocky_core::state::RunStatus::Success,
+            )
+            .await;
+
+            // Second run via the chosen parallelism, gate active.
+            let adapter = DuckDbWarehouseAdapter::open(&db)
+                .unwrap()
+                .with_concurrent_for_test(concurrent);
+            let opts = PartitionRunOptions {
+                parallel,
+                ..Default::default()
+            };
+            let mut output = RunOutput::new(String::new(), 0, parallel.max(1) as usize);
+            super::execute_models(
+                &models_dir,
+                &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+                Some(&state),
+                &opts,
+                "run-2",
+                None,
+                &mut output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                &DeferOptions::default(),
+                active_gate(true, 0),
+            )
+            .await
+            .unwrap();
+            output
+        }
+
+        let serial = scenario(false, 1).await;
+        let parallel = scenario(true, 4).await;
+        assert_eq!(
+            serial.tables_skipped, parallel.tables_skipped,
+            "skip verdict must be identical under --parallel 1 and N"
+        );
+        assert_eq!(
+            serial.tables_skipped, 1,
+            "both runs must skip the unchanged model"
+        );
+    }
+
+    /// Forward-deserialization: a prior `ModelExecution` lacking the skip
+    /// fields (so `skip_hash == None`) forces a BUILD even when logic + data
+    /// are unchanged — clause D fails. We simulate the legacy baseline by
+    /// recording a success whose `skip_hash` was stripped.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_pre_field_baseline_builds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 3).await;
+        write_model_with_skip(&models_dir, "agg", "SELECT id FROM main.src", "");
+
+        // Build once, then strip the skip fields from the persisted record to
+        // mimic a pre-gate (forward-deserialized) baseline.
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        let mut runs = state.list_runs(10).unwrap();
+        let mut rec = runs.pop().unwrap();
+        for m in &mut rec.models_executed {
+            m.skip_hash = None;
+            m.upstream_freshness = None;
+        }
+        state.record_run(&rec).unwrap();
+
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "a baseline lacking skip_hash (pre-gate) must rebuild — clause D fails"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Incomplete-lineage fail-safe matrix.
+    //
+    // The lineage walk only enumerates top-level bare `FROM`/`JOIN` tables; it
+    // silently drops PIVOT/UNNEST/nested-join table-factors and never descends
+    // into sub-queries. A model built on any of those hides a real upstream
+    // from the gate, so it must ALWAYS build — never skip against a source it
+    // never examined. Each test mutates the hidden/dropped source between runs
+    // and asserts the second run still BUILDS, mirroring
+    // `gate_subquery_source_always_builds`.
+    // -----------------------------------------------------------------------
+
+    /// `FROM t PIVOT(...)`: the PIVOT table-factor is dropped by the lineage
+    /// walk, so `main.monthly_sales` would be invisible to the enumeration. The
+    /// model must build even after the pivoted source changes. (Belt-and-braces
+    /// here: a PIVOT query's IR has no stable `skip_hash`, so clause D would
+    /// already force a build; the completeness whitelist makes the build
+    /// independent of that. The fix-isolating guard is the unit test
+    /// `rocky_sql::lineage_complete::tests::pivot_source_is_incomplete`.)
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_pivot_source_always_builds() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        async fn seed_sales(db: &std::path::Path, jan: i64, feb: i64) {
+            let s = DuckDbWarehouseAdapter::open(db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            s.execute_statement("DROP TABLE IF EXISTS main.monthly_sales")
+                .await
+                .unwrap();
+            s.execute_statement(&format!(
+                "CREATE TABLE main.monthly_sales AS SELECT * FROM (VALUES \
+                 ('jan', {jan}), ('feb', {feb})) AS t(month, amount)"
+            ))
+            .await
+            .unwrap();
+        }
+
+        seed_sales(&db, 10, 20).await;
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT * FROM main.monthly_sales PIVOT(SUM(amount) FOR month IN ('jan', 'feb'))",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Change the pivoted source values (rowcount steady). The PIVOT
+        // table-factor is not provably complete, so the gate refuses to skip.
+        seed_sales(&db, 999, 888).await;
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "a PIVOT model hides its source from lineage — it must always build"
+        );
+    }
+
+    /// `CROSS JOIN UNNEST(...)`: the UNNEST table function parses as a
+    /// table-valued `Table { args: Some(..) }`, which the completeness
+    /// whitelist rejects. Even though the row source `main.events` is itself
+    /// enumerable, the model must build on any change. (Belt-and-braces here:
+    /// the lineage walk also surfaces a phantom `UNNEST` "table" whose
+    /// `COUNT(*)` probe fails, which would already force a build; the
+    /// completeness whitelist makes the build independent of that. The
+    /// fix-isolating guard is the unit test
+    /// `rocky_sql::lineage_complete::tests::unnest_in_from_is_incomplete`.)
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_unnest_source_always_builds() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        async fn seed_events(db: &std::path::Path, rows: &str) {
+            let s = DuckDbWarehouseAdapter::open(db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            s.execute_statement("DROP TABLE IF EXISTS main.events")
+                .await
+                .unwrap();
+            s.execute_statement(&format!(
+                "CREATE TABLE main.events AS SELECT * FROM (VALUES {rows}) AS t(id, items)"
+            ))
+            .await
+            .unwrap();
+        }
+
+        seed_events(&db, "(1, [10, 20]), (2, [30])").await;
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT id, e FROM main.events CROSS JOIN UNNEST(items) AS t(e)",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Change the unnested arrays. The UNNEST table function disqualifies
+        // the model from skipping, so it must rebuild.
+        seed_events(&db, "(1, [10, 20, 30]), (2, [30, 40])").await;
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "an UNNEST model is not provably complete — it must always build"
+        );
+    }
+
+    /// `FROM (a JOIN b)`: the parenthesised join parses as a
+    /// `TableFactor::NestedJoin`, dropped by the lineage walk. The model must
+    /// build after either nested source changes.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_nested_join_source_always_builds() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        async fn seed_pair(db: &std::path::Path, a_rows: u32, b_rows: u32) {
+            let s = DuckDbWarehouseAdapter::open(db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            for (tbl, n) in [("a", a_rows), ("b", b_rows)] {
+                s.execute_statement(&format!("DROP TABLE IF EXISTS main.{tbl}"))
+                    .await
+                    .unwrap();
+                let values: Vec<String> = (1..=n).map(|i| format!("({i})")).collect();
+                s.execute_statement(&format!(
+                    "CREATE TABLE main.{tbl} AS SELECT * FROM (VALUES {}) AS t(id)",
+                    values.join(", ")
+                ))
+                .await
+                .unwrap();
+            }
+        }
+
+        seed_pair(&db, 3, 3).await;
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT a.id FROM (main.a a JOIN main.b b ON a.id = b.id)",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Grow one nested source. The NestedJoin factor hid both tables from
+        // lineage (the enumeration returned an empty source set), so the
+        // completeness whitelist refuses to skip and the gate builds. (Without
+        // the whitelist this model would wrongly SKIP — it is one of the two
+        // cases that genuinely depend on this fix.)
+        seed_pair(&db, 5, 3).await;
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "a nested-join FROM hides its sources — it must always build"
+        );
+    }
+
+    /// `... WHERE id IN (SELECT dim_id FROM facts)`: the hidden source `facts`
+    /// lives only inside the `IN` sub-query, which the lineage walk never
+    /// descends into. With `rowcount_fallback` on and `dim` held steady, a gate
+    /// that ignored the sub-query would prove `dim` unchanged and wrongly skip;
+    /// the completeness whitelist rejects the sub-query so the model builds when
+    /// `facts` changes.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_in_subquery_source_always_builds() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        async fn seed_dim(db: &std::path::Path) {
+            let s = DuckDbWarehouseAdapter::open(db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            s.execute_statement("DROP TABLE IF EXISTS main.dim")
+                .await
+                .unwrap();
+            s.execute_statement(
+                "CREATE TABLE main.dim AS SELECT * FROM (VALUES (1), (2), (3)) AS t(id)",
+            )
+            .await
+            .unwrap();
+        }
+        async fn seed_facts(db: &std::path::Path, n: u32) {
+            let s = DuckDbWarehouseAdapter::open(db).unwrap();
+            s.execute_statement("DROP TABLE IF EXISTS main.facts")
+                .await
+                .unwrap();
+            let values: Vec<String> = (1..=n).map(|i| format!("({})", i % 3 + 1)).collect();
+            s.execute_statement(&format!(
+                "CREATE TABLE main.facts AS SELECT * FROM (VALUES {}) AS t(dim_id)",
+                values.join(", ")
+            ))
+            .await
+            .unwrap();
+        }
+
+        // `dim` stays steady across both runs; only the hidden `facts` source
+        // (reachable only through the IN sub-query) moves.
+        seed_dim(&db).await;
+        seed_facts(&db, 2).await;
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT id FROM main.dim WHERE id IN (SELECT dim_id FROM main.facts)",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Change only `facts`. The visible `dim` is unchanged, so a gate that
+        // ignored the IN sub-query would wrongly skip on stale data; the
+        // completeness whitelist forces a build. (This is the sharpest of the
+        // four — `dim`'s rowcount is steady and `rowcount_fallback` is on, so
+        // the gate would prove B3 against `dim` alone and skip; the build is
+        // driven by the completeness check rejecting the sub-query, not by the
+        // freshness probe. One of the two cases that genuinely depend on this
+        // fix.)
+        seed_facts(&db, 6).await;
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "an IN-subquery source is invisible to lineage — the model must always build"
         );
     }
 }

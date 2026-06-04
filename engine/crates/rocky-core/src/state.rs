@@ -721,6 +721,31 @@ impl Default for SessionSource {
     }
 }
 
+/// Per-upstream freshness signature recorded for a model on a successful
+/// build, read back by the opt-in `--skip-unchanged` gate to decide whether
+/// any upstream's *data* moved since the last build.
+///
+/// This is a best-effort optimization input, not a correctness guarantee:
+/// a matching signature means an upstream's tracked signal (latest timestamp
+/// and/or row count) *looks* unchanged, not that the upstream data is
+/// provably identical. State-internal — never part of any `*Output` JSON
+/// schema, so it carries no codegen.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UpstreamSig {
+    /// Fully-qualified `catalog.schema.table` identity of the upstream this
+    /// signature describes.
+    pub upstream_key: String,
+    /// Latest observed timestamp (`MAX(ts)`) for the upstream's tracked
+    /// timestamp column, when one is available. `None` when the upstream has
+    /// no tracked timestamp column or the value could not be read.
+    #[serde(default)]
+    pub max_ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// Observed row count (`COUNT(*)`) for the upstream, recorded only when
+    /// the rowcount fallback is enabled. `None` otherwise.
+    #[serde(default)]
+    pub row_count: Option<u64>,
+}
+
 /// Execution record for a single model within a run.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelExecution {
@@ -731,6 +756,21 @@ pub struct ModelExecution {
     pub rows_affected: Option<u64>,
     pub status: String,
     pub sql_hash: String,
+    /// Cosmetic-invariant logic key for the model, recorded on a successful
+    /// build and read back by the opt-in `--skip-unchanged` gate (clause B2:
+    /// "logic looks unchanged"). `None` for executions written by binaries
+    /// predating the gate, for non-canonicalisable models, or for failed
+    /// executions. A best-effort optimization input — never a proof of
+    /// result-equivalence. State-internal: not part of any `*Output` JSON
+    /// schema, so it carries no codegen.
+    #[serde(default)]
+    pub skip_hash: Option<String>,
+    /// Per-upstream freshness signatures captured on a successful build,
+    /// read back by the `--skip-unchanged` gate (clause B3: "upstream data
+    /// looks unchanged"). `None` for pre-gate / failed executions.
+    /// State-internal — carries no codegen.
+    #[serde(default)]
+    pub upstream_freshness: Option<Vec<UpstreamSig>>,
     /// Adapter-reported bytes figure used for cost accounting. This is
     /// the *billing-relevant* number per adapter, not literal scan
     /// volume:
@@ -3239,6 +3279,8 @@ mod tests {
                 rows_affected: Some(5000),
                 status: "success".to_string(),
                 sql_hash: "abc123".to_string(),
+                skip_hash: None,
+                upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
             }],
@@ -3277,6 +3319,8 @@ mod tests {
                     rows_affected: None,
                     status: "success".to_string(),
                     sql_hash: "h1".to_string(),
+                    skip_hash: None,
+                    upstream_freshness: None,
                     bytes_scanned: None,
                     bytes_written: None,
                 },
@@ -3288,6 +3332,8 @@ mod tests {
                     rows_affected: None,
                     status: "success".to_string(),
                     sql_hash: "h2".to_string(),
+                    skip_hash: None,
+                    upstream_freshness: None,
                     bytes_scanned: None,
                     bytes_written: None,
                 },
@@ -3314,6 +3360,8 @@ mod tests {
                     rows_affected: None,
                     status: "success".to_string(),
                     sql_hash: format!("h{i}"),
+                    skip_hash: None,
+                    upstream_freshness: None,
                     bytes_scanned: None,
                     bytes_written: None,
                 }],
@@ -3363,6 +3411,37 @@ mod tests {
         assert_eq!(record.target_catalog, None);
         assert_eq!(record.hostname, "unknown");
         assert_eq!(record.rocky_version, "<pre-audit>");
+    }
+
+    /// A `ModelExecution` blob written before the skip-gate fields existed
+    /// must forward-deserialize with `skip_hash = None` and
+    /// `upstream_freshness = None`. This is the load-bearing fail-safe: a
+    /// prior execution lacking a stored `skip_hash` can never satisfy gate
+    /// clause D, so the next run rebuilds rather than skips.
+    #[test]
+    fn test_pre_skip_gate_model_execution_forward_deserializes_to_none() {
+        let pre_gate_blob = br#"{
+            "model_name": "orders",
+            "started_at": "2024-01-01T12:00:00Z",
+            "finished_at": "2024-01-01T12:00:02Z",
+            "duration_ms": 2000,
+            "rows_affected": 5000,
+            "status": "success",
+            "sql_hash": "legacy-sql-hash"
+        }"#;
+
+        let exec: ModelExecution = serde_json::from_slice(pre_gate_blob)
+            .expect("pre-skip-gate ModelExecution must forward-deserialize");
+
+        assert_eq!(exec.model_name, "orders");
+        assert_eq!(exec.sql_hash, "legacy-sql-hash");
+        // The skip-gate fields default to None — never to an empty Vec or a
+        // sentinel that could be misread as "no upstreams ⇒ stable".
+        assert_eq!(exec.skip_hash, None);
+        assert_eq!(exec.upstream_freshness, None);
+        // bytes fields also default (these predate the skip fields too).
+        assert_eq!(exec.bytes_scanned, None);
+        assert_eq!(exec.bytes_written, None);
     }
 
     /// End-to-end variant of the forward-compat guard: write a v5 blob

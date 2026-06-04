@@ -247,6 +247,9 @@ async fn execute_run_plan(
         // `--defer` is a runtime-only dev convenience, not persisted on the
         // plan; the two-step `rocky plan`/`apply` path always runs without it.
         &crate::commands::run::DeferOptions::default(),
+        // The skip gate is a runtime-only `rocky run` overlay, not persisted
+        // on the plan; the two-step path builds every planned model.
+        &crate::commands::run::SkipRunOptions::default(),
     )
     .await
     .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))?;
@@ -460,6 +463,8 @@ async fn run_apply_replication_plan(
         replication_plan.env.as_deref(),
         // Replication apply never runs transformation models; defer is moot.
         &crate::commands::run::DeferOptions::default(),
+        // The skip gate only applies to transformation models; inert here.
+        &crate::commands::run::SkipRunOptions::default(),
     )
     .await
     .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
@@ -828,6 +833,7 @@ pub async fn run_apply_inline_for_run(
     idempotency_key: Option<&str>,
     env: Option<&str>,
     defer_opts: &crate::commands::run::DeferOptions,
+    skip_opts: &crate::commands::run::SkipRunOptions,
 ) -> Result<()> {
     // Thin passthrough — routes to the existing run implementation.
     crate::commands::run::run(
@@ -848,6 +854,7 @@ pub async fn run_apply_inline_for_run(
         idempotency_key,
         env,
         defer_opts,
+        skip_opts,
     )
     .await
 }

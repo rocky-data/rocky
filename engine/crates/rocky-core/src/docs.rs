@@ -722,6 +722,7 @@ mod tests {
             branch: Default::default(),
             freshness: Default::default(),
             imports: Default::default(),
+            run: Default::default(),
         };
 
         let models = vec![
@@ -745,6 +746,7 @@ mod tests {
                     classification: Default::default(),
                     retention: None,
                     budget: None,
+                    skip: None,
                     name_declared: String::new(),
                     target_table_declared: String::new(),
                 },
@@ -772,6 +774,7 @@ mod tests {
                     classification: Default::default(),
                     retention: None,
                     budget: None,
+                    skip: None,
                     name_declared: String::new(),
                     target_table_declared: String::new(),
                 },
@@ -811,6 +814,7 @@ mod tests {
             branch: Default::default(),
             freshness: Default::default(),
             imports: Default::default(),
+            run: Default::default(),
         };
 
         let models = vec![Model {
@@ -833,6 +837,7 @@ mod tests {
                 classification: Default::default(),
                 retention: None,
                 budget: None,
+                skip: None,
                 name_declared: String::new(),
                 target_table_declared: String::new(),
             },
@@ -891,6 +896,7 @@ mod tests {
             branch: Default::default(),
             freshness: Default::default(),
             imports: Default::default(),
+            run: Default::default(),
         };
 
         let index = build_doc_index(&[], &config, None);

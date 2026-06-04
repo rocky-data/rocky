@@ -314,6 +314,7 @@ mod tests {
             branch: Default::default(),
             freshness: Default::default(),
             imports: Default::default(),
+            run: Default::default(),
         }
     }
 

@@ -560,6 +560,8 @@ fn seed_run_history(models_dir: &Path) {
             rows_affected: Some(42),
             status: "success".to_string(),
             sql_hash: "abc123def456".to_string(),
+            skip_hash: None,
+            upstream_freshness: None,
             bytes_scanned: None,
             bytes_written: Some(1024),
         }],

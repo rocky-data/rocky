@@ -35,6 +35,10 @@ pub async fn run_transformation(
     // `with_ttl_override` so the override propagates consistently
     // across replication and transformation paths.
     schema_cache_cfg: &rocky_core::config::SchemaCacheConfig,
+    // Fully-resolved model-skip gate (default-off unless `--skip-unchanged`
+    // / `[run] skip_unchanged` is set). Passed straight through to
+    // `execute_models`.
+    skip_gate: super::run::SkipGateConfig,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -79,6 +83,7 @@ pub async fn run_transformation(
             pipeline.target.governance.auto_create_schemas,
             // run_local has no `--model` selection; defer is a no-op here.
             &super::run::DeferOptions::default(),
+            skip_gate,
         )
         .await?;
     } else {
@@ -701,6 +706,7 @@ pub async fn run_snapshot(
             bytes_scanned: None,
             bytes_written: None,
             job_ids: Vec::new(),
+            skip_internal: None,
         });
     } else {
         output.tables_failed = 1;

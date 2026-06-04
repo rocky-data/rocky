@@ -676,6 +676,29 @@ enum Command {
         /// reference at a single schema instead (catalog + table preserved).
         #[arg(long, value_name = "SCHEMA", requires = "defer")]
         defer_to: Option<String>,
+
+        /// Skip re-materializing transformation models whose logic and
+        /// upstream data both appear unchanged since the last successful
+        /// build.
+        ///
+        /// This is a best-effort optimization, NOT a guarantee of result-
+        /// equivalence. A model is eligible only when its SQL is provably
+        /// deterministic (no `CURRENT_TIMESTAMP`, `RANDOM()`, unresolved
+        /// UDFs, …) and it uses a plain materialization strategy; anything
+        /// non-deterministic, ambiguous, or unverifiable always rebuilds.
+        /// Per-model `[skip]` sidecar blocks can opt an individual model in
+        /// or out. Turns the gate on for this invocation regardless of the
+        /// `[run] skip_unchanged` config value. Use `--force-rebuild` to
+        /// override.
+        #[arg(long)]
+        skip_unchanged: bool,
+
+        /// Force every selected model to build, bypassing the
+        /// `--skip-unchanged` gate entirely. The escape hatch when you want
+        /// a guaranteed rebuild (e.g. after a non-logic change the IR hash
+        /// can't see, like a UDF redefinition or a session-setting change).
+        #[arg(long)]
+        force_rebuild: bool,
     },
 
     /// Compare shadow tables against production tables
@@ -2340,6 +2363,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             watch,
             defer,
             defer_to,
+            skip_unchanged,
+            force_rebuild,
         } => {
             // --idempotency-key is mutually exclusive with --resume / --resume-latest:
             // a resume is an explicit override and should never be short-circuited.
@@ -2394,6 +2419,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 defer_to,
             };
 
+            // CLI overlay for the opt-in model-skip gate. Default-OFF: both
+            // flags absent ⇒ the gate never engages and the run is
+            // byte-identical to before the gate existed.
+            let skip_opts = rocky_cli::commands::SkipRunOptions {
+                skip_unchanged,
+                force_rebuild,
+            };
+
             if watch {
                 // `--watch` wraps the standard run path in a filesystem
                 // watcher loop. clap conflict declarations on the
@@ -2413,6 +2446,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &partition_opts,
                     cli.cache_ttl,
                     env.as_deref(),
+                    &skip_opts,
                 )
                 .await
             } else if dag {
@@ -2456,6 +2490,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     idempotency_key.as_deref(),
                     env.as_deref(),
                     &defer_opts,
+                    &skip_opts,
                 )
                 .await
             }

@@ -194,6 +194,10 @@ impl NodeDispatcher for CliDispatcher {
                     // DAG sub-runs build full pipelines (no `--model`
                     // selection), so `--defer` would be inert anyway.
                     &super::run::DeferOptions::default(),
+                    // The unified-DAG driver does not surface the skip gate
+                    // (full-pipeline sub-runs); default OFF keeps sub-run
+                    // behavior unchanged.
+                    &super::run::SkipRunOptions::default(),
                 )
                 .await
                 .map_err(|e| e.to_string())

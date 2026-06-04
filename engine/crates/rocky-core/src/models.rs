@@ -163,6 +163,13 @@ pub struct ModelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<ModelBudgetConfig>,
 
+    /// Per-model overrides for the opt-in `--skip-unchanged` gate. Parsed
+    /// from a `[skip]` sidecar block. `None` ⇒ the model follows the gate's
+    /// automatic eligibility rules (static determinism scan + plain
+    /// strategy). See [`SkipConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip: Option<SkipConfig>,
+
     /// Pre-substitution value of the `name` field as it appeared in the
     /// sidecar TOML (or the filename stem when `name` was omitted).
     ///
@@ -409,6 +416,48 @@ pub struct RawModelConfig {
     /// Per-model `[budget]` overrides. See [`ModelConfig::budget`].
     #[serde(default)]
     pub budget: Option<ModelBudgetConfig>,
+
+    /// Per-model `[skip]` overrides for the `--skip-unchanged` gate. See
+    /// [`ModelConfig::skip`].
+    #[serde(default)]
+    pub skip: Option<SkipConfig>,
+}
+
+/// `[skip]` — per-model overrides for the opt-in model-skip gate.
+///
+/// The gate is conservative by default: a model is auto-skip-eligible only
+/// when a static scan finds its SQL deterministic and it uses a plain
+/// materialization strategy. This block lets a model owner override that
+/// per model — either to force a model to always build, or to assert (and
+/// take responsibility for) that a model the scan flagged is in fact pure
+/// and therefore safe to treat as skip-eligible.
+///
+/// ```toml
+/// name = "fct_orders"
+///
+/// [skip]
+/// eligible = true        # opt this model in/out of the gate explicitly
+/// deterministic = true   # owner asserts the SQL is pure → re-eligible
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkipConfig {
+    /// Explicit eligibility override. `Some(false)` ⇒ this model always
+    /// builds, even when the gate is on and everything else looks unchanged
+    /// (use for known-volatile models the static scan might miss).
+    /// `Some(true)` ⇒ the model is eligible (subject to the other gate
+    /// clauses). `None` ⇒ fall back to the automatic eligibility rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible: Option<bool>,
+
+    /// Owner assertion that this model's SQL is deterministic. `Some(true)`
+    /// is the only way a model the static non-determinism scan flagged
+    /// (timestamps, randomness, unresolved UDFs, …) becomes skip-eligible —
+    /// an explicit, auditable, per-model opt-in. `Some(false)` forces the
+    /// model to be treated as non-deterministic (never auto-skipped).
+    /// `None` ⇒ trust the static scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deterministic: Option<bool>,
 }
 
 /// Permissive target config — all fields optional.
@@ -595,6 +644,7 @@ fn resolve_model_config(
         classification: raw.classification,
         retention,
         budget: raw.budget,
+        skip: raw.skip,
         name_declared,
         target_table_declared,
     })

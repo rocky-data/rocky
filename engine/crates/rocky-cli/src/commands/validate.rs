@@ -1535,6 +1535,7 @@ schema_template = "demo"
                 classification: Default::default(),
                 retention: None,
                 budget: None,
+                skip: None,
                 name_declared: "customer_facts".into(),
                 target_table_declared: "${ROCKY_TABLE_OVERRIDE:-customer_facts}".into(),
             },
@@ -1594,6 +1595,7 @@ target.adapter = "default"
                 retention: None,
                 budget: None,
                 // Declared literally — same value as `name_declared`.
+                skip: None,
                 name_declared: "customer_facts".into(),
                 target_table_declared: "customer_facts".into(),
             },
