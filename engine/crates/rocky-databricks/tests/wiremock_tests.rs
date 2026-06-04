@@ -536,11 +536,35 @@ async fn test_empty_result_set() {
     assert_eq!(result.total_row_count, Some(0));
 }
 
+/// Mount a `DESCRIBE TABLE` mock returning a two-column (`id BIGINT`,
+/// `name STRING`) schema. The loader `DESCRIBE`s the target before COPY INTO
+/// (existence check + CSV cast types); without it the `DESCRIBE` 404s, the
+/// loader concludes the table is missing, and takes the unmocked
+/// create-from-file path.
+async fn mount_describe_table_mock(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("DESCRIBE TABLE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statement_id": "stmt-describe",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": { "schema": { "columns": [
+                {"name": "col_name", "type_name": "STRING", "position": 0},
+                {"name": "data_type", "type_name": "STRING", "position": 1},
+                {"name": "comment", "type_name": "STRING", "position": 2}
+            ]}},
+            "result": { "data_array": [["id", "bigint", null], ["name", "string", null]] }
+        })))
+        .mount(server)
+        .await;
+}
+
 /// End-to-end: `DatabricksLoaderAdapter::load` parses `num_affected_rows`
 /// from the COPY INTO response and surfaces it as `LoadResult.rows_loaded`.
 #[tokio::test]
 async fn test_loader_surfaces_num_affected_rows() {
     let server = MockServer::start().await;
+    mount_describe_table_mock(&server).await;
 
     // Mock COPY INTO response: a single-row result set whose first column is
     // `num_affected_rows`. This matches Databricks' observed REST shape for
@@ -594,6 +618,7 @@ async fn test_loader_surfaces_num_affected_rows() {
 #[tokio::test]
 async fn test_loader_missing_num_affected_rows() {
     let server = MockServer::start().await;
+    mount_describe_table_mock(&server).await;
 
     // No manifest / no results — older API shapes or unexpected responses.
     Mock::given(method("POST"))
@@ -667,6 +692,7 @@ fn write_temp_file(contents: &[u8], ext: &str) -> std::path::PathBuf {
 #[tokio::test]
 async fn test_loader_local_file_stages_to_volume() {
     let server = MockServer::start().await;
+    mount_describe_table_mock(&server).await;
     let file = write_temp_file(b"id,name\n1,alice\n2,bob\n", "csv");
 
     // 1. CREATE VOLUME IF NOT EXISTS main.raw.rocky_staging
@@ -765,6 +791,7 @@ async fn test_loader_local_file_stages_to_volume() {
 #[tokio::test]
 async fn test_loader_local_file_custom_volume_name() {
     let server = MockServer::start().await;
+    mount_describe_table_mock(&server).await;
     let file = write_temp_file(b"col\nv\n", "csv");
 
     Mock::given(method("POST"))
@@ -837,6 +864,7 @@ async fn test_loader_local_file_custom_volume_name() {
 #[tokio::test]
 async fn test_loader_local_file_cleans_up_on_copy_failure() {
     let server = MockServer::start().await;
+    mount_describe_table_mock(&server).await;
     let file = write_temp_file(b"id\n1\n", "csv");
 
     Mock::given(method("POST"))
