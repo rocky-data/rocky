@@ -27,6 +27,19 @@ pub struct DiscoveredConnector {
     /// the dagster fixture corpus + codegen-drift CI).
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub metadata: IndexMap<String, serde_json::Value>,
+    /// Stable identities of the underlying external object(s) this source
+    /// replicates (e.g. the Fivetran ad-account ids recovered from connector
+    /// config). A single connector can replicate MANY objects (Fivetran's
+    /// `accounts: ["act_1", "act_2"]`), so this is a set, not a scalar. Empty
+    /// when the adapter can't determine any — collision detection is then
+    /// skipped for this source. Populated lazily by
+    /// [`crate::traits::DiscoveryAdapter::enrich_external_object_ids`], not by
+    /// [`crate::traits::DiscoveryAdapter::discover`], because recovering the
+    /// ids can cost an extra API call per connector. The schema *name*
+    /// deliberately does not encode this, which is exactly why two onboards of
+    /// the same object under different paths can collide unnoticed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_object_ids: Vec<String>,
 }
 
 /// A discovered table within a connector.
@@ -180,6 +193,7 @@ mod tests {
                 },
             ],
             metadata: IndexMap::new(),
+            external_object_ids: Vec::new(),
         };
         let json = serde_json::to_string(&conn).unwrap();
         // Empty metadata is skipped from the wire form so adapters that
@@ -211,6 +225,7 @@ mod tests {
             last_sync_at: None,
             tables: vec![],
             metadata,
+            external_object_ids: Vec::new(),
         };
 
         let json = serde_json::to_string(&conn).unwrap();

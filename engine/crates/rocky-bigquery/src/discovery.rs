@@ -117,6 +117,7 @@ impl DiscoveryAdapter for BigQueryDiscoveryAdapter {
                 last_sync_at: None,
                 tables,
                 metadata: Default::default(),
+                external_object_ids: Vec::new(),
             });
         }
 

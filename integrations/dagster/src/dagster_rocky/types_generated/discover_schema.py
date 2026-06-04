@@ -8,6 +8,21 @@ from typing import Any
 from pydantic import AwareDatetime, BaseModel, Field, conint
 
 
+class CollisionCandidateOutput(BaseModel):
+    """
+    A cross-source collision: one external object id mapped to more than one target path (the same object onboarded twice under different schemas).
+    """
+
+    external_object_id: str
+    """
+    The shared external object id (e.g. a Fivetran ad-account id).
+    """
+    sources: list[str]
+    """
+    The distinct source schemas that resolve to it (≥2), sorted.
+    """
+
+
 class ExcludedTableOutput(BaseModel):
     """
     A table that the discovery adapter reported but that is missing from the source warehouse, so the run skipped it. Tracked separately from `errors` because it is not a runtime failure — the row never made it past the pre-flight existence check.
@@ -120,6 +135,10 @@ class DiscoverOutput(BaseModel):
     checks: ChecksConfigOutput | None = None
     """
     Pipeline-level data quality check configuration. Present when the pipeline declares a `[checks]` block in `rocky.toml`. Downstream orchestrators (e.g. Dagster) consume this to attach asset-level freshness policies and check expectations without re-reading `rocky.toml` themselves.
+    """
+    collision_candidates: list[CollisionCandidateOutput] | None = None
+    """
+    Groups of ≥2 discovered sources sharing the SAME external object id but resolving to DIFFERENT target paths — the same underlying object onboarded twice. Populated only when discovery's `on_collision` is `warn`/`error` and the adapter supplies `external_object_id`; empty (and omitted from the wire format) otherwise.
     """
     command: str
     excluded_tables: list[ExcludedTableOutput] | None = None

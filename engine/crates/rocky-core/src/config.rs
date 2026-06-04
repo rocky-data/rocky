@@ -4275,6 +4275,22 @@ pub struct PipelineSourceConfig {
     pub discovery: Option<DiscoveryConfig>,
 }
 
+/// Action when `rocky discover` detects a cross-source collision — the same
+/// external object id mapped to more than one target path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum OnCollision {
+    /// Collision detection disabled (default — fully backwards compatible).
+    #[default]
+    Off,
+    /// Report collisions in `collision_candidates` and emit an event, but do
+    /// not fail the discover.
+    Warn,
+    /// Report collisions and fail the discover, so a colliding onboard cannot
+    /// silently create a catalog/table.
+    Error,
+}
+
 /// Discovery configuration within a pipeline source.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -4290,6 +4306,15 @@ pub struct DiscoveryConfig {
     /// when opted in, so existing projects pay nothing.
     #[serde(default)]
     pub report_new_sources: bool,
+
+    /// What to do when discover finds the same external object id mapped to
+    /// more than one target path (likely the same object onboarded twice).
+    /// `off` (default) skips detection entirely; `warn` reports
+    /// `collision_candidates` + emits an event; `error` additionally fails the
+    /// discover. Only adapters that supply `external_object_id` (e.g. Fivetran)
+    /// participate; others are silently skipped.
+    #[serde(default)]
+    pub on_collision: OnCollision,
 }
 
 /// Pipeline target configuration.
@@ -4682,6 +4707,7 @@ fn apply_single_adapter_discovery_default(config: &mut RockyConfig) {
             replication.source.discovery = Some(DiscoveryConfig {
                 adapter: sole_adapter.clone(),
                 report_new_sources: false,
+                on_collision: OnCollision::Off,
             });
         }
     }

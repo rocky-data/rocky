@@ -293,6 +293,10 @@ export type QuarantineMode = "split" | "tag" | "drop";
  */
 export type ConcurrencyMode = "adaptive" | number;
 /**
+ * Action when `rocky discover` detects a cross-source collision — the same external object id mapped to more than one target path.
+ */
+export type OnCollision = "off" | "warn" | "error";
+/**
  * Workspace binding access level.
  */
 export type BindingType = "READ_WRITE" | "READ_ONLY";
@@ -1242,6 +1246,10 @@ export interface DiscoveryConfig {
    * Name of the adapter to use for discovery (references a key in `[adapter.*]`). Defaults to `"default"`.
    */
   adapter?: string;
+  /**
+   * What to do when discover finds the same external object id mapped to more than one target path (likely the same object onboarded twice). `off` (default) skips detection entirely; `warn` reports `collision_candidates` + emits an event; `error` additionally fails the discover. Only adapters that supply `external_object_id` (e.g. Fivetran) participate; others are silently skipped.
+   */
+  on_collision?: OnCollision & string;
   /**
    * When `true`, `rocky discover` diffs the discovered source inventory against the prior persisted snapshot and reports first-seen sources in `new_sources`. Off by default — the diff and its state write only happen when opted in, so existing projects pay nothing.
    */

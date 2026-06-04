@@ -130,6 +130,7 @@ fn map_connection(conn: Connection) -> DiscoveredConnector {
         last_sync_at: conn.last_sync_at,
         tables,
         metadata: Default::default(),
+        external_object_ids: Vec::new(),
     }
 }
 

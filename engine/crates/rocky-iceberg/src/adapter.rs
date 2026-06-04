@@ -75,6 +75,7 @@ impl DiscoveryAdapter for IcebergDiscoveryAdapter {
                         last_sync_at: None,
                         tables,
                         metadata: Default::default(),
+                        external_object_ids: Vec::new(),
                     });
                 }
                 Err(e) => {
@@ -236,6 +237,7 @@ mod tests {
                 },
             ],
             metadata: Default::default(),
+            external_object_ids: Vec::new(),
         };
 
         assert_eq!(connector.id, "raw_shopify");
@@ -279,6 +281,7 @@ mod tests {
             last_sync_at: None,
             tables: vec![],
             metadata: Default::default(),
+            external_object_ids: Vec::new(),
         };
         assert_eq!(connector.source_type, "iceberg");
     }
