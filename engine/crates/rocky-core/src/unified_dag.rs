@@ -613,6 +613,7 @@ fn format_test_label(model_name: &str, test: &crate::tests::TestDecl, index: usi
     let type_str = match &test.test_type {
         TestType::NotNull => "not_null",
         TestType::Unique => "unique",
+        TestType::UniqueExpr { .. } => "unique_expr",
         TestType::AcceptedValues { .. } => "accepted_values",
         TestType::Relationships { .. } => "relationships",
         TestType::Expression { .. } => "expression",

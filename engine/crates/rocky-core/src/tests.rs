@@ -22,6 +22,9 @@ pub enum TestGenError {
     #[error("expression test requires an 'expression' field")]
     MissingExpression,
 
+    #[error("unique_expr test requires a non-empty 'key_expr' field")]
+    EmptyKeyExpr,
+
     #[error("row_count_range test requires at least one of 'min' or 'max'")]
     MissingRange,
 
@@ -163,6 +166,24 @@ pub enum TestType {
         /// Columns that together form the key. Must have at least two
         /// entries (single-column uniqueness is covered by `Unique`).
         columns: Vec<String>,
+    },
+    /// Assert that a derived **key expression** is unique across all rows —
+    /// the `GROUP BY <expr> HAVING COUNT(*) > 1` form that neither `Unique`
+    /// (single column) nor `Composite` (column tuple) can express. The
+    /// meaningful identity is a *computed* value (e.g. a surrogate built to
+    /// be stable across a multi-tenant union), not any stored column.
+    ///
+    /// `key_expr` is a SQL scalar expression evaluated against the target
+    /// (e.g. `md5(databasename || '-' || id)`). It is passed through
+    /// **verbatim** — the same trusted-config contract as
+    /// [`TestType::Expression`] — so the caller is responsible for sandboxing
+    /// execution.
+    ///
+    /// Set-based; not quarantinable. Mirrors `Unique`'s NULL handling (NULL
+    /// keys are not excluded; use `filter` to scope them out).
+    UniqueExpr {
+        /// SQL scalar expression whose value must be unique across rows.
+        key_expr: String,
     },
     /// First-class sugar for `col <= CURRENT_TIMESTAMP()` — no timestamp
     /// in the future. Row-level; quarantinable (NULL column values pass).
@@ -515,6 +536,21 @@ fn generate_test_sql_inner(
                     "SELECT {cols}, COUNT(*) FROM {table}{where_clause} GROUP BY {cols} HAVING COUNT(*) > 1"
                 )),
             }
+        }
+        TestType::UniqueExpr { key_expr } => {
+            if key_expr.trim().is_empty() {
+                return Err(TestGenError::EmptyKeyExpr);
+            }
+            // key_expr is user-supplied SQL (same contract as Expression) —
+            // not an identifier, so it's passed through verbatim, wrapped in
+            // parens. NULL handling mirrors `Unique` (no auto-exclusion; use
+            // `filter` to scope NULL keys out). The expression is repeated in
+            // GROUP BY rather than referencing the `_k` alias because not all
+            // dialects (Databricks, BigQuery) allow grouping by a select alias.
+            let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
+            Ok(format!(
+                "SELECT ({key_expr}) AS _k, COUNT(*) FROM {table}{where_clause} GROUP BY ({key_expr}) HAVING COUNT(*) > 1"
+            ))
         }
         TestType::NotInFuture => {
             let col = require_column(test, "not_in_future")?;
@@ -1392,6 +1428,56 @@ value = "0"
         assert_eq!(
             sql,
             "SELECT order_id, line_item_id, COUNT(*) FROM order_lines GROUP BY order_id, line_item_id HAVING COUNT(*) > 1"
+        );
+    }
+
+    #[test]
+    fn test_unique_expr_sql() {
+        let decl = TestDecl {
+            test_type: TestType::UniqueExpr {
+                key_expr: "md5(databasename || '-' || id)".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let sql = generate_test_sql(&decl, "dims").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT (md5(databasename || '-' || id)) AS _k, COUNT(*) FROM dims GROUP BY (md5(databasename || '-' || id)) HAVING COUNT(*) > 1"
+        );
+    }
+
+    #[test]
+    fn test_unique_expr_empty_rejected() {
+        let decl = TestDecl {
+            test_type: TestType::UniqueExpr {
+                key_expr: "   ".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        assert!(matches!(
+            generate_test_sql(&decl, "dims"),
+            Err(TestGenError::EmptyKeyExpr)
+        ));
+    }
+
+    #[test]
+    fn test_unique_expr_with_filter() {
+        let decl = TestDecl {
+            test_type: TestType::UniqueExpr {
+                key_expr: "lower(email)".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: Some("is_active".into()),
+        };
+        let sql = generate_test_sql(&decl, "users").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT (lower(email)) AS _k, COUNT(*) FROM users WHERE (is_active) GROUP BY (lower(email)) HAVING COUNT(*) > 1"
         );
     }
 

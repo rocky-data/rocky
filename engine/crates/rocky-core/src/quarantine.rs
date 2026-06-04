@@ -272,6 +272,7 @@ fn synthesize_label(test_type: &TestType, column: Option<&str>) -> String {
         TestType::AcceptedValues { .. } => "accepted_values",
         TestType::Expression { .. } => "expression",
         TestType::Unique => "unique",
+        TestType::UniqueExpr { .. } => "unique_expr",
         TestType::Relationships { .. } => "relationships",
         TestType::RowCountRange { .. } => "row_count_range",
         TestType::InRange { .. } => "in_range",
@@ -389,6 +390,7 @@ fn lower_valid_predicate(
         }
         // Non-quarantinable kinds filtered upstream by `is_quarantinable`.
         TestType::Unique
+        | TestType::UniqueExpr { .. }
         | TestType::Relationships { .. }
         | TestType::RowCountRange { .. }
         | TestType::Aggregate { .. }

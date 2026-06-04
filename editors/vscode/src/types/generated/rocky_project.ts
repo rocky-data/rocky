@@ -239,6 +239,14 @@ export type QualityAssertion1 =
       [k: string]: unknown;
     }
   | {
+      /**
+       * SQL scalar expression whose value must be unique across rows.
+       */
+      key_expr: string;
+      type: "unique_expr";
+      [k: string]: unknown;
+    }
+  | {
       type: "not_in_future";
       [k: string]: unknown;
     }

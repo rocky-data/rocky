@@ -898,10 +898,14 @@ class Type36(StrEnum):
 
 
 class Type37(StrEnum):
-    not_in_future = "not_in_future"
+    unique_expr = "unique_expr"
 
 
 class Type38(StrEnum):
+    not_in_future = "not_in_future"
+
+
+class Type39(StrEnum):
     older_than_n_days = "older_than_n_days"
 
 
@@ -2137,6 +2141,46 @@ class QualityAssertion10(BaseModel):
 
 class QualityAssertion11(BaseModel):
     """
+    Assert that a derived **key expression** is unique across all rows — the `GROUP BY <expr> HAVING COUNT(*) > 1` form that neither `Unique` (single column) nor `Composite` (column tuple) can express. The meaningful identity is a *computed* value (e.g. a surrogate built to be stable across a multi-tenant union), not any stored column.
+
+    `key_expr` is a SQL scalar expression evaluated against the target (e.g. `md5(databasename || '-' || id)`). It is passed through **verbatim** — the same trusted-config contract as [`TestType::Expression`] — so the caller is responsible for sandboxing execution.
+
+    Set-based; not quarantinable. Mirrors `Unique`'s NULL handling (NULL keys are not excluded; use `filter` to scope them out).
+    """
+
+    column: str | None = None
+    """
+    Column under test. Required for `not_null`, `unique`, `accepted_values`, `relationships`, `in_range`, `regex_match`. Ignored for `expression` and `row_count_range`.
+    """
+    filter: str | None = None
+    """
+    Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
+
+    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+
+    Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
+    """
+    name: str | None = None
+    """
+    Optional identifier used as the `CheckResult.name` in the JSON output. When unset, a synthesized `"{kind}:{column}"` name is used — which can collide if multiple assertions share the same table, kind, and column. Set `name` explicitly to disambiguate.
+    """
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
+    """
+    Severity of failure. Defaults to `error`.
+    """
+    table: str
+    """
+    Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
+    """
+    key_expr: str
+    """
+    SQL scalar expression whose value must be unique across rows.
+    """
+    type: Type37
+
+
+class QualityAssertion12(BaseModel):
+    """
     First-class sugar for `col <= CURRENT_TIMESTAMP()` — no timestamp in the future. Row-level; quarantinable (NULL column values pass).
     """
 
@@ -2164,10 +2208,10 @@ class QualityAssertion11(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type37
+    type: Type38
 
 
-class QualityAssertion12(BaseModel):
+class QualityAssertion13(BaseModel):
     """
     First-class sugar for `col <= CURRENT_DATE - N days` — every row's timestamp must be at least `days` days old. Row-level; quarantinable (NULL column values pass). Dialect-specific: uses [`SqlDialect::date_minus_days_expr`].
     """
@@ -2200,7 +2244,7 @@ class QualityAssertion12(BaseModel):
     """
     N — days in the past. Must be > 0.
     """
-    type: Type38
+    type: Type39
 
 
 class QuarantineConfig(BaseModel):
@@ -2296,6 +2340,7 @@ class ChecksConfig(BaseModel):
             | QualityAssertion10
             | QualityAssertion11
             | QualityAssertion12
+            | QualityAssertion13
         ]
         | None
     ) = Field([], validate_default=True)
