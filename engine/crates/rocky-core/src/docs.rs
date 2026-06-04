@@ -401,6 +401,7 @@ fn test_type_label(test_type: &crate::tests::TestType) -> String {
     match test_type {
         crate::tests::TestType::NotNull => "not_null".into(),
         crate::tests::TestType::Unique => "unique".into(),
+        crate::tests::TestType::UniqueExpr { .. } => "unique_expr".into(),
         crate::tests::TestType::AcceptedValues { .. } => "accepted_values".into(),
         crate::tests::TestType::Relationships { .. } => "relationships".into(),
         crate::tests::TestType::Expression { .. } => "expression".into(),

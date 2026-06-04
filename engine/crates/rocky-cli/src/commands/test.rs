@@ -387,8 +387,10 @@ fn interpret_result(
             }
         }
 
-        // unique / accepted_values / relationships / composite: rows returned = failures
+        // unique / unique_expr / accepted_values / relationships / composite:
+        // rows returned = failures
         TestType::Unique
+        | TestType::UniqueExpr { .. }
         | TestType::AcceptedValues { .. }
         | TestType::Relationships { .. }
         | TestType::Composite { .. } => {
@@ -398,6 +400,7 @@ fn interpret_result(
             } else {
                 let what = match test_type {
                     TestType::Unique => "duplicate value(s)",
+                    TestType::UniqueExpr { .. } => "duplicate key(s)",
                     TestType::AcceptedValues { .. } => "unexpected value(s)",
                     TestType::Relationships { .. } => "orphaned row(s)",
                     TestType::Composite { .. } => "duplicate key(s)",
@@ -453,6 +456,7 @@ fn test_type_label(tt: &TestType) -> &'static str {
     match tt {
         TestType::NotNull => "not_null",
         TestType::Unique => "unique",
+        TestType::UniqueExpr { .. } => "unique_expr",
         TestType::AcceptedValues { .. } => "accepted_values",
         TestType::Relationships { .. } => "relationships",
         TestType::Expression { .. } => "expression",

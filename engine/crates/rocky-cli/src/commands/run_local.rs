@@ -453,6 +453,7 @@ fn test_type_kind(t: &rocky_core::tests::TestType) -> &'static str {
     match t {
         TestType::NotNull => "not_null",
         TestType::Unique => "unique",
+        TestType::UniqueExpr { .. } => "unique_expr",
         TestType::AcceptedValues { .. } => "accepted_values",
         TestType::Relationships { .. } => "relationships",
         TestType::Expression { .. } => "expression",
@@ -501,6 +502,7 @@ fn classify_assertion(
         }
         // Row-set-based: every returned row is a violation.
         TestType::Unique
+        | TestType::UniqueExpr { .. }
         | TestType::AcceptedValues { .. }
         | TestType::Relationships { .. }
         | TestType::Composite { .. } => {

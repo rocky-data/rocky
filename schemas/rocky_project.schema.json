@@ -2258,6 +2258,26 @@
           "type": "object"
         },
         {
+          "description": "Assert that a derived **key expression** is unique across all rows — the `GROUP BY <expr> HAVING COUNT(*) > 1` form that neither `Unique` (single column) nor `Composite` (column tuple) can express. The meaningful identity is a *computed* value (e.g. a surrogate built to be stable across a multi-tenant union), not any stored column.\n\n`key_expr` is a SQL scalar expression evaluated against the target (e.g. `md5(databasename || '-' || id)`). It is passed through **verbatim** — the same trusted-config contract as [`TestType::Expression`] — so the caller is responsible for sandboxing execution.\n\nSet-based; not quarantinable. Mirrors `Unique`'s NULL handling (NULL keys are not excluded; use `filter` to scope them out).",
+          "properties": {
+            "key_expr": {
+              "description": "SQL scalar expression whose value must be unique across rows.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "unique_expr"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "key_expr",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "description": "First-class sugar for `col <= CURRENT_TIMESTAMP()` — no timestamp in the future. Row-level; quarantinable (NULL column values pass).",
           "properties": {
             "type": {

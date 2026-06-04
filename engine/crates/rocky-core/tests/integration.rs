@@ -747,6 +747,54 @@ async fn test_seed_produces_queryable_data() {
     assert!(orphans < 1000, "too many orphan orders: {orphans}");
 }
 
+/// The `unique_expr` assertion's generated SQL actually executes on DuckDB and
+/// catches a duplicated *derived* surrogate — the case column-level uniqueness
+/// can't express. The PASS case is the crux: `databasename` repeats and `id`
+/// repeats, yet the surrogate `md5(name || '-' || id)` is unique per row.
+#[tokio::test]
+async fn test_unique_expr_assertion_executes_on_duckdb() {
+    use rocky_core::tests::{TestDecl, TestSeverity, TestType, generate_test_sql};
+
+    let key_expr = "md5(databasename || '-' || CAST(id AS VARCHAR))";
+    let gen_sql = |table: &str| {
+        generate_test_sql(
+            &TestDecl {
+                test_type: TestType::UniqueExpr {
+                    key_expr: key_expr.to_string(),
+                },
+                column: None,
+                severity: TestSeverity::Error,
+                filter: None,
+            },
+            table,
+        )
+        .unwrap()
+    };
+
+    let p = TestPipeline::new();
+    p.execute("CREATE SCHEMA IF NOT EXISTS t").await.unwrap();
+
+    // FAIL — two identical onboards collide on the surrogate.
+    p.execute("CREATE TABLE t.dup (databasename VARCHAR, id INTEGER)")
+        .await
+        .unwrap();
+    p.execute("INSERT INTO t.dup VALUES ('acme', 1), ('acme', 1), ('beta', 2)")
+        .await
+        .unwrap();
+    let fail = p.query(&gen_sql("t.dup")).await.unwrap();
+    assert_eq!(fail.rows.len(), 1, "duplicated surrogate must be caught");
+
+    // PASS — name repeats and id repeats, but every surrogate is distinct.
+    p.execute("CREATE TABLE t.ok (databasename VARCHAR, id INTEGER)")
+        .await
+        .unwrap();
+    p.execute("INSERT INTO t.ok VALUES ('acme', 1), ('beta', 2), ('acme', 2)")
+        .await
+        .unwrap();
+    let pass = p.query(&gen_sql("t.ok")).await.unwrap();
+    assert!(pass.rows.is_empty(), "distinct surrogates must pass");
+}
+
 #[tokio::test]
 async fn test_full_refresh_on_seeded_data() {
     let (p, _stats) = TestPipeline::with_seed(SeedScale::Small);
