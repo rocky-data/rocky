@@ -528,6 +528,127 @@ pub(super) async fn find_commit_with_add_path<S: ObjectStore + ?Sized>(
     Ok(None)
 }
 
+/// Per-commit reference outcome for a single content-addressed file path.
+///
+/// Returned by [`commit_jsonl_reference_for_path`] for one `_delta_log` commit
+/// body. The point-to liveness check folds these across commits in version
+/// order: a file is **live** iff the highest-versioned commit that references
+/// it does so with an `add`, not a `remove`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PathReference {
+    /// The commit contains an `add` action for the path.
+    Added,
+    /// The commit contains a `remove` action for the path (and no `add`).
+    Removed,
+    /// The commit does not reference the path at all.
+    Absent,
+}
+
+/// Classify how a single `_delta_log` commit body (JSONL) references
+/// `file_path`: as an `add`, as a `remove`, or not at all.
+///
+/// Pure parsing — no I/O — so it is unit-testable. A single content-addressed
+/// commit carries exactly one `add` (see `commit::build_commit_jsonl`); a
+/// compaction/VACUUM commit carries a `remove`. If a commit somehow contains
+/// both for the same path (it never does in practice), `Added` wins for that
+/// commit — but the cross-commit fold in [`add_path_is_live`] is what carries
+/// the real ordering, so a later `remove` commit still supersedes an earlier
+/// `add` commit.
+pub(super) fn commit_jsonl_reference_for_path(
+    body: &[u8],
+    file_path: &str,
+) -> Result<PathReference> {
+    let text = std::str::from_utf8(body)
+        .map_err(|e| UniformWriterError::DeltaLog(format!("non-utf8 _delta_log: {e}")))?;
+    let mut saw_remove = false;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| UniformWriterError::DeltaLog(format!("scan path reference: {e}")))?;
+        if let Some(add) = value.get("add")
+            && add.get("path").and_then(|v| v.as_str()) == Some(file_path)
+        {
+            return Ok(PathReference::Added);
+        }
+        if let Some(remove) = value.get("remove")
+            && remove.get("path").and_then(|v| v.as_str()) == Some(file_path)
+        {
+            saw_remove = true;
+        }
+    }
+    if saw_remove {
+        Ok(PathReference::Removed)
+    } else {
+        Ok(PathReference::Absent)
+    }
+}
+
+/// Determine whether `add_file_path` is **still live** in the target table's
+/// current `_delta_log` — i.e. it was `add`ed and has NOT since been
+/// `remove`d (VACUUM'd / compacted / superseded).
+///
+/// This is the liveness gate the fail-closed reuse decision needs **before**
+/// pointing a new commit at a prior run `R`'s parquet: if `R`'s file is no
+/// longer active in the target table's log, reusing it would point a commit at
+/// a file Delta considers removed — a no-op into removed bytes. The decision
+/// must fall back to a normal BUILD in that case.
+///
+/// # Semantics
+///
+/// Scans every `_delta_log/<20-digit>.json` commit, classifies each via
+/// [`commit_jsonl_reference_for_path`], and takes the reference from the
+/// **highest-versioned** commit that mentions the path. The file is live iff
+/// that reference is an `add`. A path that no commit references (it was never
+/// added to *this* table, or its add was rewritten away with no surviving add)
+/// is **not** live.
+///
+/// # Fail-closed
+///
+/// Any object-store error (cannot list, cannot GET a commit) or a malformed
+/// commit body returns `Err`; the caller treats that — like every other doubt
+/// — as "not provably live" and BUILDs. A `false` return (provably removed or
+/// absent) is the explicit "do not reuse" answer.
+///
+/// # Errors
+///
+/// [`UniformWriterError::ObjectStore`] when the listing or a GET fails;
+/// [`UniformWriterError::DeltaLog`] when a commit body cannot be parsed.
+pub(super) async fn add_path_is_live<S: ObjectStore + ?Sized>(
+    store: &S,
+    prefix: &str,
+    add_file_path: &str,
+) -> Result<bool> {
+    use futures::TryStreamExt;
+    let log_prefix = Path::from(format!("{prefix}/_delta_log"));
+    let mut versions: Vec<(u64, Path)> = Vec::new();
+    let mut stream = store.list(Some(&log_prefix));
+    while let Some(meta) = stream.try_next().await? {
+        let key = meta.location.to_string();
+        if let Some((_, last)) = key.rsplit_once('/')
+            && let Some(stem) = last.strip_suffix(".json")
+            && stem.len() == 20
+            && let Ok(v) = stem.parse::<u64>()
+        {
+            versions.push((v, meta.location));
+        }
+    }
+    // Newest → oldest: the first commit that references the path decides
+    // liveness (a later remove supersedes an earlier add).
+    versions.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
+    for (_version, path) in versions {
+        let body = store.get(&path).await?.bytes().await?;
+        match commit_jsonl_reference_for_path(&body, add_file_path)? {
+            PathReference::Added => return Ok(true),
+            PathReference::Removed => return Ok(false),
+            PathReference::Absent => {}
+        }
+    }
+    // No commit references the path at all — not live in this table.
+    Ok(false)
+}
+
 /// Scan `_delta_log/` for the highest `<20-digit>.json` and return that + 1.
 pub(super) async fn next_commit_version<S: ObjectStore + ?Sized>(
     store: &S,
@@ -621,6 +742,42 @@ mod tests {
         assert!(
             first_add_action(body).unwrap().is_none(),
             "a commit with no add action yields None"
+        );
+    }
+
+    #[test]
+    fn commit_reference_classifies_add_remove_absent() {
+        let added = br#"{"commitInfo":{}}
+{"add":{"path":"data/h.parquet","size":42}}"#;
+        assert_eq!(
+            commit_jsonl_reference_for_path(added, "data/h.parquet").unwrap(),
+            PathReference::Added
+        );
+
+        let removed = br#"{"commitInfo":{}}
+{"remove":{"path":"data/h.parquet","dataChange":true}}"#;
+        assert_eq!(
+            commit_jsonl_reference_for_path(removed, "data/h.parquet").unwrap(),
+            PathReference::Removed
+        );
+
+        let other = br#"{"add":{"path":"data/other.parquet"}}"#;
+        assert_eq!(
+            commit_jsonl_reference_for_path(other, "data/h.parquet").unwrap(),
+            PathReference::Absent,
+            "a commit referencing a different path does not reference ours"
+        );
+    }
+
+    #[test]
+    fn commit_reference_add_wins_within_a_single_commit() {
+        // A single commit carrying both (it never does in practice) reports
+        // Added — the cross-commit fold in add_path_is_live carries ordering.
+        let both = br#"{"add":{"path":"data/h.parquet"}}
+{"remove":{"path":"data/h.parquet"}}"#;
+        assert_eq!(
+            commit_jsonl_reference_for_path(both, "data/h.parquet").unwrap(),
+            PathReference::Added
         );
     }
 
