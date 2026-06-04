@@ -74,6 +74,16 @@ pub enum CheckDetails {
         result_value: u64,
         threshold: u64,
     },
+    /// Cross-source overlap: the same business key found in more than one
+    /// sibling source feeding a shared consolidation target.
+    CrossSourceOverlap {
+        /// Count of distinct keys that appear in more than one sibling table.
+        overlap_count: u64,
+        /// Fully-qualified sibling tables that were compared.
+        contributing_tables: Vec<String>,
+        /// Bounded sample of overlapping key values (stringified) for triage.
+        sample: Vec<String>,
+    },
 }
 
 /// Generates a batched null rate query using the given dialect's TABLESAMPLE syntax.
@@ -150,6 +160,66 @@ pub fn generate_custom_check_sql(
 ) -> Result<String, SqlGenError> {
     let ref_str = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
     Ok(sql_template.replace("{target}", &ref_str))
+}
+
+/// Generates the cross-source overlap query for a set of ≥2 sibling tables.
+///
+/// `key_exprs` is the business key — a list of column names (a composite tuple)
+/// or a single derived expression — already vetted by the caller (columns
+/// validated as identifiers; a `key_expr` is trusted config, passed verbatim).
+/// Each sibling is tagged with its fully-qualified ref and `UNION ALL`'d; the
+/// outer query returns the key values appearing in more than one sibling, so
+/// the result's row count is the overlap count and the rows are the sample.
+pub fn generate_cross_source_overlap_sql(
+    siblings: &[TableRef],
+    key_exprs: &[String],
+    dialect: &dyn SqlDialect,
+) -> Result<String, SqlGenError> {
+    let key_list = key_exprs.join(", ");
+    let not_null = key_exprs
+        .iter()
+        .map(|k| format!("{k} IS NOT NULL"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let mut union = String::new();
+    for (i, t) in siblings.iter().enumerate() {
+        let ref_str = dialect.format_table_ref(&t.catalog, &t.schema, &t.table)?;
+        if i > 0 {
+            union.push_str("\n  UNION ALL\n  ");
+        }
+        // Tag each row with its source table as a string literal so the outer
+        // query can count distinct contributing sources per key.
+        let src_lit = ref_str.replace('\'', "''");
+        let _ = write!(
+            union,
+            "SELECT {key_list}, '{src_lit}' AS _src FROM {ref_str} WHERE {not_null}"
+        );
+    }
+    Ok(format!(
+        "SELECT {key_list}, COUNT(DISTINCT _src) AS _n_src FROM (\n  {union}\n) _u GROUP BY {key_list} HAVING COUNT(DISTINCT _src) > 1"
+    ))
+}
+
+/// Builds a `CheckResult` for a cross-source overlap check. Passes when the
+/// distinct-overlap-key count is within `max_overlap_rows`.
+pub fn check_cross_source_overlap(
+    name: impl Into<String>,
+    overlap_count: u64,
+    max_overlap_rows: u64,
+    contributing_tables: Vec<String>,
+    sample: Vec<String>,
+    severity: TestSeverity,
+) -> CheckResult {
+    CheckResult {
+        name: name.into(),
+        passed: overlap_count <= max_overlap_rows,
+        severity,
+        details: CheckDetails::CrossSourceOverlap {
+            overlap_count,
+            contributing_tables,
+            sample,
+        },
+    }
 }
 
 /// Compares source and target row counts.
@@ -565,5 +635,59 @@ mod tests {
         let r = check_custom("my_check", "SELECT 1", 0, 0);
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("my_check"));
+    }
+
+    fn sibling(schema: &str, table: &str) -> TableRef {
+        TableRef {
+            catalog: "cat".into(),
+            schema: schema.into(),
+            table: table.into(),
+        }
+    }
+
+    #[test]
+    fn test_cross_source_overlap_sql_single_key() {
+        let siblings = vec![sibling("s1", "orders"), sibling("s2", "orders")];
+        let sql =
+            generate_cross_source_overlap_sql(&siblings, &["_fivetran_id".into()], &dialect())
+                .unwrap();
+        assert!(sql.contains("UNION ALL"), "must union the siblings: {sql}");
+        assert!(sql.contains("COUNT(DISTINCT _src) > 1"));
+        assert!(sql.contains("GROUP BY _fivetran_id"));
+        assert!(sql.contains("'cat.s1.orders' AS _src FROM cat.s1.orders"));
+        assert!(sql.contains("'cat.s2.orders' AS _src FROM cat.s2.orders"));
+        assert!(sql.contains("_fivetran_id IS NOT NULL"));
+    }
+
+    #[test]
+    fn test_cross_source_overlap_sql_composite_key() {
+        let siblings = vec![sibling("s1", "t"), sibling("s2", "t")];
+        let sql = generate_cross_source_overlap_sql(
+            &siblings,
+            &["clientid".into(), "databaseid".into()],
+            &dialect(),
+        )
+        .unwrap();
+        assert!(sql.contains("clientid, databaseid"));
+        assert!(sql.contains("clientid IS NOT NULL AND databaseid IS NOT NULL"));
+        assert!(sql.contains("GROUP BY clientid, databaseid"));
+    }
+
+    #[test]
+    fn test_cross_source_overlap_check_pass_fail() {
+        let pass = check_cross_source_overlap("x", 0, 0, vec![], vec![], TestSeverity::Warning);
+        assert!(pass.passed);
+        let fail = check_cross_source_overlap(
+            "x",
+            3,
+            0,
+            vec!["cat.s1.t".into(), "cat.s2.t".into()],
+            vec!["k1".into()],
+            TestSeverity::Error,
+        );
+        assert!(!fail.passed);
+        // max_overlap_rows tolerance.
+        let within = check_cross_source_overlap("x", 2, 5, vec![], vec![], TestSeverity::Error);
+        assert!(within.passed);
     }
 }

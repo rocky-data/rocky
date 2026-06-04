@@ -3189,6 +3189,103 @@ pub async fn run(
         }
     }
 
+    // Cross-source overlap — flag a business key shared across SIBLING targets:
+    // tables with the same source type + table name that landed in more than
+    // one target schema (the hierarchy/tenant fan-out that gets unioned
+    // downstream, doubling rows). Generic — groups by the discovered source
+    // type (asset_key[0]) + table name, with no schema-pattern-component
+    // assumptions. Self-limiting: only groups of ≥2 siblings are checked, so a
+    // single-target pipeline runs nothing. Surfaced advisorily like the other
+    // replication checks; a missing-key/keyless table is skipped with a logged
+    // reason rather than failing.
+    if let Some(ref overlap_cfg) = pipeline.checks.cross_source_overlap {
+        match overlap_cfg.resolved_key_exprs() {
+            Ok(key_exprs) => {
+                // (source_type, table) -> sibling members (target ref, asset key).
+                type SiblingGroups = HashMap<(String, String), Vec<(TableRef, Vec<String>)>>;
+                let mut groups: SiblingGroups = HashMap::new();
+                for (tref, asset_key) in &assertion_targets {
+                    let source_type = asset_key.first().cloned().unwrap_or_default();
+                    groups
+                        .entry((source_type, tref.table.clone()))
+                        .or_default()
+                        .push((tref.clone(), asset_key.clone()));
+                }
+                // Deterministic order for stable output.
+                let mut group_keys: Vec<&(String, String)> = groups.keys().collect();
+                group_keys.sort();
+
+                let dialect = shared_warehouse.dialect();
+                for gk in group_keys {
+                    let members = &groups[gk];
+                    if members.len() < 2 {
+                        continue; // a single target cannot overlap with itself
+                    }
+                    let (source_type, table) = gk;
+                    let siblings: Vec<TableRef> =
+                        members.iter().map(|(t, _)| t.clone()).collect();
+                    let sql = match rocky_core::checks::generate_cross_source_overlap_sql(
+                        &siblings, &key_exprs, dialect,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(source_type, table, error = %e, "cross_source_overlap SQL generation failed — skipping group");
+                            continue;
+                        }
+                    };
+                    let name = format!("cross_source_overlap:{source_type}.{table}");
+                    match shared_warehouse.execute_query(&sql).await {
+                        Ok(result) => {
+                            let overlap_count = result.rows.len() as u64;
+                            let sample: Vec<String> = result
+                                .rows
+                                .iter()
+                                .take(overlap_cfg.sample)
+                                .map(|row| {
+                                    row.iter()
+                                        .take(key_exprs.len())
+                                        .map(|v| {
+                                            v.as_str()
+                                                .map(str::to_string)
+                                                .unwrap_or_else(|| v.to_string())
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(" | ")
+                                })
+                                .collect();
+                            let contributing: Vec<String> =
+                                siblings.iter().map(TableRef::full_name).collect();
+                            let check = rocky_core::checks::check_cross_source_overlap(
+                                name,
+                                overlap_count,
+                                overlap_cfg.max_overlap_rows,
+                                contributing,
+                                sample,
+                                overlap_cfg.severity,
+                            );
+                            // Attach to the first sibling's asset (the result's
+                            // contributing_tables lists the whole group).
+                            let entry = pending_checks
+                                .entry(siblings[0].full_name())
+                                .or_insert_with(|| PendingCheck {
+                                    asset_key: members[0].1.clone(),
+                                    checks: Vec::new(),
+                                });
+                            entry.checks.push(check);
+                        }
+                        Err(e) => {
+                            // A missing key column / keyless table surfaces as a
+                            // query error — skip the group with a reason, don't
+                            // fail (FR acceptance criterion).
+                            warn!(source_type, table, error = %e, "cross_source_overlap query failed (missing key column / keyless table?) — skipping group");
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "cross_source_overlap misconfigured — skipping"),
+        }
+    }
+
     // Assemble check results
     for (_table_key, pending) in pending_checks {
         if !pending.checks.is_empty() {

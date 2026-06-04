@@ -192,6 +192,37 @@
             "threshold"
           ],
           "type": "object"
+        },
+        {
+          "description": "Cross-source overlap: the same business key found in more than one sibling source feeding a shared consolidation target.",
+          "properties": {
+            "contributing_tables": {
+              "description": "Fully-qualified sibling tables that were compared.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "overlap_count": {
+              "description": "Count of distinct keys that appear in more than one sibling table.",
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "sample": {
+              "description": "Bounded sample of overlapping key values (stringified) for triage.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "contributing_tables",
+            "overlap_count",
+            "sample"
+          ],
+          "type": "object"
         }
       ],
       "description": "Result of a single data quality check.",

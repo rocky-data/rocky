@@ -1611,6 +1611,38 @@ class ContractConfig(BaseModel):
     """
 
 
+class CrossSourceOverlapConfig(BaseModel):
+    """
+    Cross-source overlap check: flags the same business key appearing in more than one *sibling* source feeding a shared consolidation target (the "same account onboarded twice under two paths" case). Siblings are grouped by the runner; this config carries only the key + thresholds.
+
+    `keys` (a column tuple) and `key_expr` (a derived SQL expression) are mutually exclusive — exactly one must be set, mirroring `unique` / `unique_expr`.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    key_expr: str | None = None
+    """
+    Derived business-key expression (e.g. `md5(a || '-' || b)`), for sources without a single natural key. Mutually exclusive with `keys`. Passed through verbatim (trusted config, like `unique_expr`).
+    """
+    keys: list[str] | None = []
+    """
+    Business-key columns whose shared value across sibling tables signals a duplicate. Mutually exclusive with `key_expr`.
+    """
+    max_overlap_rows: conint(ge=0) | None = 0
+    """
+    Overlap-key count above which the check fails. Default 0 — any overlap fails.
+    """
+    sample: conint(ge=0) | None = 20
+    """
+    Maximum overlapping keys attached to the result for triage.
+    """
+    severity: TestSeverity5 | TestSeverity6 | None = "error"
+    """
+    Severity reported when the overlap-key count exceeds `max_overlap_rows`.
+    """
+
+
 class CustomCheckConfig(BaseModel):
     """
     A user-defined SQL check with a name, query template, and pass/fail threshold.
@@ -2356,6 +2388,10 @@ class ChecksConfig(BaseModel):
     ```toml # Legacy — still supported row_count = true
 
     # New — per-check severity [pipeline.x.checks.row_count] enabled  = true severity = "warning" ```
+    """
+    cross_source_overlap: CrossSourceOverlapConfig | None = None
+    """
+    Cross-source overlap check — flags the same business key appearing in more than one sibling source feeding a shared consolidation target. Disabled when unset. See [`CrossSourceOverlapConfig`].
     """
     custom: list[CustomCheckConfig] | None = Field([], validate_default=True)
     enabled: bool | None = False
