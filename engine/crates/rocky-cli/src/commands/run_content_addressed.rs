@@ -35,6 +35,7 @@ use rocky_iceberg::uniform_writer::{
     Result as UfResult, SqlClient, UniformWriter, UniformWriterConfig, UniformWriterError,
 };
 use rocky_ir::{MaterializationStrategy, ModelIr, RockyType, TypedColumn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 /// Placeholder SqlClient used at writer construction time.
@@ -477,15 +478,143 @@ fn parse_decimal_to_i128(s: &str, scale: u8) -> Result<i128> {
     Ok(sign * magnitude)
 }
 
+/// Reuse-decision context handed to [`execute_content_addressed_model`] when
+/// `[reuse]` is active (clause 1 already satisfied by the caller passing a
+/// `Some`).
+///
+/// The caller resolves the *cheap* inputs (the model's recomputed `input_hash`
+/// from its all-strong upstream chain, plus a state-store handle and the run
+/// id). The expensive, writer-bound clause — liveness against the target's
+/// live `_delta_log` — is evaluated *inside* `execute_content_addressed_model`,
+/// where the `UniformWriter` already exists. Passing `None` (reuse off, no
+/// resolvable input hash, partitioned, …) is a zero-cost pure BUILD.
+pub struct ReuseDecisionCtx<'a> {
+    /// This run's recomputed `input_hash` (hex) — `None` when the model's read
+    /// set did not resolve to an all-strong content-hash chain, in which case
+    /// the decision is a guaranteed BUILD (clause 3).
+    pub input_hash: Option<String>,
+    /// State store for the `INPUT_INDEX` / `OUTPUT_ARTIFACTS` lookups.
+    pub state_store: &'a rocky_core::state::StateStore,
+    /// This run's id (for the would-reuse log line).
+    pub run_id: &'a str,
+}
+
+/// Evaluate the **fail-closed reuse decision** for a content-addressed model.
+///
+/// Resolves clauses 3–6 (the caller has already established clauses 1–2 by
+/// passing a `Some(ctx)` for an unpartitioned, non-rowTracking model) and
+/// returns the verdict. Any lookup error or unreadable log is mapped to a
+/// BUILD verdict — never propagated — so a state-store or object-store hiccup
+/// can only ever cause a (safe) rebuild, never a wrong reuse.
+async fn evaluate_reuse_decision(
+    ctx: &ReuseDecisionCtx<'_>,
+    writer: &UniformWriter,
+    state: &rocky_iceberg::uniform_writer::UniformTableState,
+) -> crate::commands::reuse_decision::ReuseVerdict {
+    use crate::commands::reuse_decision::{BuildReason, ReuseInputs, ReuseVerdict, decide_reuse};
+
+    // Clause 2 (runtime confirmation): the discovered table must itself be
+    // unpartitioned + non-rowTracking. The caller gates on the *model's*
+    // declared shape; this re-checks the *table's* actual shape so a drift
+    // between the two can only fall back to BUILD.
+    let eligible_shape = state.partition_columns.is_empty() && !state.row_tracking_enabled;
+
+    // Clause 3 — input hash present + index hit. Any lookup error ⇒ BUILD.
+    let Some(input_hash) = ctx.input_hash.as_deref() else {
+        return decide_reuse(&ReuseInputs {
+            enabled: true,
+            eligible_shape,
+            input_hash: None,
+            candidate: None,
+            artifact: None,
+            refcount: None,
+            add_is_live: None,
+        });
+    };
+    let candidate = match ctx.state_store.get_by_input_hash(input_hash) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, input_hash, "reuse: INPUT_INDEX lookup failed; building");
+            None
+        }
+    };
+
+    // Clauses 5–6 need the candidate's recorded output blake3. Resolve the
+    // artifact + refcount + liveness only when there is a strong candidate to
+    // resolve — every failure path here is fail-closed to BUILD.
+    let mut artifact: Option<rocky_core::state::ArtifactRecord> = None;
+    let mut refcount: Option<u64> = None;
+    let mut add_is_live: Option<bool> = None;
+    if let Some(c) = candidate.as_ref()
+        && c.proof_class == "strong"
+        && let Some(blake3) = c.output_blake3.first()
+    {
+        match ctx.state_store.list_artifacts_by_hash(blake3) {
+            Ok(records) => artifact = records.into_iter().next(),
+            Err(e) => warn!(error = %e, blake3, "reuse: artifact lookup failed; building"),
+        }
+        match ctx.state_store.refcount_for_hash(blake3) {
+            Ok(n) => refcount = Some(n),
+            Err(e) => warn!(error = %e, blake3, "reuse: refcount lookup failed; building"),
+        }
+        // Liveness (clause 6): the recovered `add`'s path must still be live
+        // in THIS table's `_delta_log`. The `add.path` is relative to the
+        // table prefix — derive it from the artifact's full object path.
+        if let Some(a) = artifact.as_ref() {
+            let add_file_path = a.file_path.rsplit('/').next().unwrap_or(&a.file_path);
+            match writer.add_path_is_live(add_file_path).await {
+                Ok(live) => add_is_live = Some(live),
+                Err(e) => warn!(
+                    error = %e,
+                    add_file_path,
+                    "reuse: liveness check failed; building"
+                ),
+            }
+        }
+    }
+
+    let verdict = decide_reuse(&ReuseInputs {
+        enabled: true,
+        eligible_shape,
+        input_hash: Some(input_hash),
+        candidate: candidate.as_ref(),
+        artifact: artifact.as_ref(),
+        refcount,
+        add_is_live,
+    });
+    if let ReuseVerdict::Build(BuildReason::NotLive) = &verdict
+        && add_is_live == Some(false)
+    {
+        info!(
+            input_hash,
+            "reuse: candidate found but its file is no longer live in the target log; building"
+        );
+    }
+    verdict
+}
+
 /// Materialize a single model whose strategy is
 /// [`MaterializationStrategy::ContentAddressed`].
 ///
 /// Handles both unpartitioned (single `write_batch` commit) and
 /// partitioned (one `write_partitioned_batch` commit per partition tuple)
 /// targets.
+///
+/// # Reuse decision (Stage 1 — ONLY-BUILD)
+///
+/// When `reuse_ctx` is `Some`, the **fail-closed reuse decision** runs after
+/// `discover()` and *before* `execute_query`: if every clause holds (enabled,
+/// eligible shape, input-hash match to a STRONG prior run `R`, `R`'s artifact
+/// resolves with a sane refcount, and `R`'s file is still live in the target's
+/// `_delta_log`), the model *could* point-to `R`'s bytes. In this slice the
+/// decision is **ONLY-BUILD**: a positive verdict is *logged* (`would-reuse
+/// R`) and the model is **still built**. A decision that can only BUILD is
+/// incapable of producing a wrong output, which is the safe first step before
+/// the live point-to invocation is wired behind the same verdict.
 pub async fn execute_content_addressed_model(
     model_ir: &ModelIr,
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    reuse_ctx: Option<ReuseDecisionCtx<'_>>,
 ) -> Result<ContentAddressedRunSummary> {
     let MaterializationStrategy::ContentAddressed {
         storage_prefix,
@@ -532,6 +661,39 @@ pub async fn execute_content_addressed_model(
             partition_columns,
             state.partition_columns
         ));
+    }
+
+    // 3b. Fail-closed reuse decision (Stage 1 — ONLY-BUILD). Computed only
+    // when `[reuse]` is active (caller passed `Some`). On a would-reuse
+    // verdict we LOG and still BUILD: a decision that can only build cannot
+    // produce a wrong output. The live point-to invocation is wired behind
+    // this same verdict next.
+    if let Some(ctx) = &reuse_ctx {
+        let verdict = evaluate_reuse_decision(ctx, &writer, &state).await;
+        match verdict {
+            crate::commands::reuse_decision::ReuseVerdict::WouldReuse(candidate) => {
+                info!(
+                    model = %model_ir.name,
+                    run_id = ctx.run_id,
+                    target = %format!(
+                        "{}.{}.{}",
+                        model_ir.target.catalog, model_ir.target.schema, model_ir.target.table
+                    ),
+                    reuse_run_id = candidate.run_id.as_str(),
+                    blake3 = candidate.blake3_hash.as_str(),
+                    commit_version = candidate.commit_version,
+                    proof_class = candidate.proof_class.as_str(),
+                    "reuse: would point-to prior run R (ONLY-BUILD: still executing the SQL this run)"
+                );
+            }
+            crate::commands::reuse_decision::ReuseVerdict::Build(reason) => {
+                debug!(
+                    model = %model_ir.name,
+                    reason = reason.as_str(),
+                    "reuse: building (no eligible point-to candidate)"
+                );
+            }
+        }
     }
 
     // 4. Execute the model SQL.
@@ -1350,7 +1512,7 @@ mod live_tests {
             },
         ];
 
-        let summary = execute_content_addressed_model(&model_ir, warehouse_dyn)
+        let summary = execute_content_addressed_model(&model_ir, warehouse_dyn, None)
             .await
             .expect("partitioned end-to-end must succeed");
         assert_eq!(
@@ -1470,7 +1632,7 @@ mod live_tests {
             },
         ];
 
-        let summary = execute_content_addressed_model(&model_ir, warehouse_dyn)
+        let summary = execute_content_addressed_model(&model_ir, warehouse_dyn, None)
             .await
             .expect("end-to-end runner must succeed");
         assert_eq!(summary.num_rows, 3);

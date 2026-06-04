@@ -46,6 +46,7 @@ mod profile_storage;
 mod publish_ir;
 mod replay;
 mod retention_status;
+mod reuse_decision;
 mod review;
 mod run;
 mod run_audit;
