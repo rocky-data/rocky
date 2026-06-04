@@ -112,6 +112,36 @@ const IDEMPOTENCY_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("ide
 /// treats the artifact ledger as global ground truth, not machine-local
 /// scratch.
 const OUTPUT_ARTIFACTS: TableDefinition<&str, &[u8]> = TableDefinition::new("output_artifacts");
+/// Pre-execution-style input-match index for auditable reuse.
+///
+/// Key format: the model's `input_hash` (hex) — see
+/// [`crate::reuse::compute_input_hash`]. Value: serialized
+/// [`InputIndexEntry`], locating the prior run that produced those inputs.
+///
+/// The complement of [`OUTPUT_ARTIFACTS`]: that ledger is keyed by the
+/// **output** blake3 and read after execution by GC; this index is keyed by
+/// the **inputs** (logic key + upstream identities + target) and is the
+/// surface a future reuse decision reads *before* execution. In Stage 1 it
+/// is written on a successful run and read back only by tests — nothing
+/// consults it for a reuse decision yet (the index is dormant).
+///
+/// Replicates across backends by default — like [`OUTPUT_ARTIFACTS`], the
+/// reuse spine is global ground truth, not machine-local scratch.
+const INPUT_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("input_index");
+/// Offline-verifiable provenance for each indexed model build.
+///
+/// Key format: `"{run_id}|{model_name}"`. Value: serialized
+/// [`ProvenanceRecord`], embedding the model's canonical `ModelIr` JSON plus
+/// the output blake3(s), recorded `skip_hash`, and `proof_class`. An auditor
+/// with the state store and object store — and no trust in the runtime — can
+/// later deserialize the embedded IR, recompute its `skip_hash`, and `b3sum`
+/// the recorded parquet to verify the *input-logic match* and the
+/// *byte-identity of the recorded bytes*. It does **not** attest that a fresh
+/// re-run would reproduce them.
+///
+/// State-internal: never part of any `*Output` JSON schema, so it carries no
+/// codegen. Replicates across backends by default.
+const INPUT_PROVENANCE: TableDefinition<&str, &[u8]> = TableDefinition::new("input_provenance");
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -158,7 +188,14 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   A v7-recorded run with entries still in the header blob continues to
 ///   resume — the readers fall back to the header's `tables` when the
 ///   per-entry scan is empty.
-const CURRENT_SCHEMA_VERSION: u32 = 8;
+/// - **v9** — adds the [`INPUT_INDEX`] + [`INPUT_PROVENANCE`] tables for the
+///   auditable-reuse input-match spine. Pure additive schema change: v8
+///   databases auto-create both empty tables on next open and stamp
+///   themselves as v9. No blob migration needed; existing tables are
+///   untouched. Both tables are dormant in Stage 1 — populated on a
+///   successful run when `[reuse]` is enabled, never read for a reuse
+///   decision yet.
+const CURRENT_SCHEMA_VERSION: u32 = 9;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -354,6 +391,8 @@ impl StateStore {
             let _table = txn.open_table(SCHEMA_CACHE)?;
             let _table = txn.open_table(IDEMPOTENCY_KEYS)?;
             let _table = txn.open_table(OUTPUT_ARTIFACTS)?;
+            let _table = txn.open_table(INPUT_INDEX)?;
+            let _table = txn.open_table(INPUT_PROVENANCE)?;
         }
         txn.commit()?;
 
@@ -2083,6 +2122,108 @@ impl StateStore {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Input-match index + provenance (auditable-reuse spine — dormant)
+    // -----------------------------------------------------------------------
+
+    /// Record input-index entries and provenance records for a run in a
+    /// single write transaction.
+    ///
+    /// Called once per successful run, from the persist path, when `[reuse]`
+    /// is enabled. Batching both tables into one `begin_write` / `commit`
+    /// keeps the cost to a single extra fsync per run regardless of model
+    /// count — the same posture [`Self::batch_set_watermarks`] takes.
+    ///
+    /// The two slices are written independently (a model may contribute an
+    /// index entry, a provenance record, or both); callers typically pass
+    /// index entries and provenance records for the same set of models. An
+    /// empty pair is a no-op (no transaction is opened).
+    ///
+    /// **Dormant in Stage 1.** This only *writes* the spine; no reuse
+    /// decision reads it. The index attests an *input-logic match*, never
+    /// reproduction of an output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if any record fails to serialize or the
+    /// transaction fails. The whole batch is atomic — a partial write is
+    /// never observable.
+    pub fn record_reuse_spine(
+        &self,
+        index_entries: &[InputIndexEntry],
+        provenance: &[ProvenanceRecord],
+    ) -> Result<(), StateError> {
+        if index_entries.is_empty() && provenance.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut index = txn.open_table(INPUT_INDEX)?;
+            for entry in index_entries {
+                let bytes = serde_json::to_vec(entry)?;
+                index.insert(entry.input_hash.as_str(), bytes.as_slice())?;
+            }
+            let mut prov = txn.open_table(INPUT_PROVENANCE)?;
+            for record in provenance {
+                let key = provenance_key(&record.run_id, &record.model_name);
+                let bytes = serde_json::to_vec(record)?;
+                prov.insert(key.as_str(), bytes.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Look up the indexed prior run for a model's `input_hash`.
+    ///
+    /// **Provided for Stage 2 to consume — nothing in Stage 1 calls this for
+    /// a reuse decision.** Returns the [`InputIndexEntry`] (locating the
+    /// prior run + its output artifact) when an entry exists for the given
+    /// `input_hash`, else `None`.
+    ///
+    /// A hit attests an *input-logic match* against a prior build. It is a
+    /// reuse *candidate* lookup only: a fail-closed Stage-2 decision must
+    /// still verify the artifact and refcount before reusing any bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] when the read transaction or deserialize fails.
+    pub fn get_by_input_hash(
+        &self,
+        input_hash: &str,
+    ) -> Result<Option<InputIndexEntry>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(INPUT_INDEX)?;
+        match table.get(input_hash)? {
+            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch the provenance record for a `(run_id, model_name)` build.
+    ///
+    /// The input to the offline-verify recipe: an auditor reads this,
+    /// deserializes the embedded canonical `ModelIr` JSON, recomputes its
+    /// `skip_hash`, and `b3sum`s the recorded parquet. Returns `None` when no
+    /// provenance was recorded for that build.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] when the read transaction or deserialize fails.
+    pub fn get_provenance(
+        &self,
+        run_id: &str,
+        model_name: &str,
+    ) -> Result<Option<ProvenanceRecord>, StateError> {
+        let key = provenance_key(run_id, model_name);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(INPUT_PROVENANCE)?;
+        match table.get(key.as_str())? {
+            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
     /// Return every artifact record whose `blake3_hash` matches.
     ///
     /// Phase 6 VACUUM uses this to answer "is this file still referenced
@@ -2400,6 +2541,16 @@ fn artifact_key(run_id: &str, model_name: &str, file_path: &str) -> String {
     format!("{run_id}|{model_name}|{file_path}")
 }
 
+/// Builds the key for the [`INPUT_PROVENANCE`] table.
+///
+/// Composition: `"{run_id}|{model_name}"` — unique per (run, model). The
+/// trailing-`|`-free pair is unambiguous because `model_name` is a validated
+/// identifier with no `|`. Mirrors the per-run anchoring of
+/// [`artifact_key`].
+fn provenance_key(run_id: &str, model_name: &str) -> String {
+    format!("{run_id}|{model_name}")
+}
+
 /// One row in the content-addressed write ledger ([`OUTPUT_ARTIFACTS`]).
 ///
 /// Recorded once per `WriteResult` from
@@ -2439,6 +2590,102 @@ pub struct ArtifactRecord {
     /// same as the write's Delta `modification_time_millis` (that's in
     /// the log); close enough for retention sweep windows.
     pub written_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One row in the input-match index ([`INPUT_INDEX`]).
+///
+/// Keyed by the model's `input_hash` (see
+/// [`crate::reuse::compute_input_hash`]), it locates the prior run that
+/// produced a build with those declared inputs. A future reuse decision
+/// reads this *before* execution to find a candidate run `R`; the shipped
+/// [`OUTPUT_ARTIFACTS`] ledger + [`StateStore::refcount_for_hash`] then make
+/// any reuse of `R`'s bytes safe.
+///
+/// **Dormant in Stage 1.** This record is written on a successful run and
+/// read back only by tests — nothing consults the index for a reuse
+/// decision yet. It attests an *input-logic match*, never that re-running
+/// the model would reproduce its output.
+///
+/// Forward-compatible via `#[serde(default)]` on any field added later,
+/// the same pattern that carried [`ArtifactRecord`] and [`RunRecord`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct InputIndexEntry {
+    /// Hex-encoded `input_hash` this entry is keyed by. Stored redundantly
+    /// inside the value so a by-value scan (e.g. for diagnostics) is
+    /// self-describing.
+    pub input_hash: String,
+    /// Run that produced the inputs. Joins to `RunRecord.run_id`.
+    pub run_id: String,
+    /// Model these inputs belong to. Matches `ModelExecution.model_name`
+    /// for the same `run_id`.
+    pub model_name: String,
+    /// Output blake3 hash(es) the run produced for this model — one per
+    /// content-addressed file (one entry for an unpartitioned model). Empty
+    /// when the model was not written content-addressed.
+    #[serde(default)]
+    pub output_blake3: Vec<String>,
+    /// Object-store path(s) of the output parquet, index-aligned with
+    /// [`Self::output_blake3`]. Empty when the model was not written
+    /// content-addressed.
+    #[serde(default)]
+    pub output_path: Vec<String>,
+    /// Strength of the match this entry would back: `"strong"` (every
+    /// upstream identity is a content hash) or `"heuristic"` (at least one
+    /// upstream is a freshness signal). See [`crate::reuse::ProofClass`].
+    pub proof_class: String,
+    /// Best-effort wall clock when the entry was recorded.
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Offline-verifiable provenance for one indexed model build
+/// ([`INPUT_PROVENANCE`]).
+///
+/// Keyed `"{run_id}|{model_name}"`. Embeds everything an auditor needs to
+/// re-derive the claim *without trusting the runtime*:
+///
+/// - the canonical `ModelIr` JSON (via
+///   [`rocky_ir::ModelIr::canonical_json`]) — deserialize it and recompute
+///   [`rocky_ir::ModelIr::skip_hash`], compare to [`Self::skip_hash`];
+/// - the recorded output blake3(s) — re-fetch the parquet at the recorded
+///   path and `b3sum` it, compare to the recorded hash (the byte-identity
+///   half of the claim);
+/// - the [`Self::proof_class`] label so a consumer never mistakes a
+///   freshness heuristic for a byte-proof.
+///
+/// The claim is narrow: an *input-logic match* plus *byte-identity of the
+/// recorded bytes*. It is **not** a reproducibility guarantee — re-executing
+/// the model need not reproduce these bytes (non-deterministic SQL, session
+/// settings, UDFs). State-internal; carries no codegen.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ProvenanceRecord {
+    /// Run that produced this build. Joins to `RunRecord.run_id`.
+    pub run_id: String,
+    /// Model this provenance describes.
+    pub model_name: String,
+    /// The model's `input_hash` (hex) — the [`INPUT_INDEX`] key this build
+    /// is reachable through.
+    pub input_hash: String,
+    /// Hex of the model's [`rocky_ir::ModelIr::skip_hash`] at build time.
+    /// The auditor recomputes this from [`Self::model_ir_canonical_json`]
+    /// and compares.
+    pub skip_hash: String,
+    /// Canonical `ModelIr` JSON (key-sorted, whitespace-free) — the exact
+    /// form [`rocky_ir::ModelIr::canonical_json`] emits, round-trippable
+    /// back into a `ModelIr` for the offline `skip_hash` recompute.
+    pub model_ir_canonical_json: String,
+    /// Output blake3 hash(es) for the build, one per content-addressed
+    /// file. Empty when the model was not written content-addressed.
+    #[serde(default)]
+    pub output_blake3: Vec<String>,
+    /// Object-store path(s) of the output parquet, index-aligned with
+    /// [`Self::output_blake3`].
+    #[serde(default)]
+    pub output_path: Vec<String>,
+    /// Match-strength label: `"strong"` or `"heuristic"`. See
+    /// [`crate::reuse::ProofClass`].
+    pub proof_class: String,
+    /// Best-effort wall clock when the provenance was recorded.
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Result of splitting a batch of candidate artifacts by refcount.
@@ -5607,5 +5854,174 @@ mod tests {
         // Two unique hashes ("h-dup", "h-other") → exactly two lookups.
         assert_eq!(hits, 2);
         assert_eq!(partition.safe_to_delete.len(), 3);
+    }
+
+    // ---------------------------------------------------------------------
+    // Auditable-reuse spine: INPUT_INDEX + INPUT_PROVENANCE round-trips
+    // ---------------------------------------------------------------------
+
+    fn make_index_entry(input_hash: &str, run_id: &str, model: &str) -> InputIndexEntry {
+        InputIndexEntry {
+            input_hash: input_hash.to_string(),
+            run_id: run_id.to_string(),
+            model_name: model.to_string(),
+            output_blake3: vec!["blake3:out".to_string()],
+            output_path: vec!["s3://bucket/prefix/out.parquet".to_string()],
+            proof_class: "strong".to_string(),
+            recorded_at: Utc::now(),
+        }
+    }
+
+    /// A real, canonicalisable `ModelIr` for the offline-recompute test.
+    fn sample_model_ir() -> rocky_ir::ModelIr {
+        let mut model_ir = rocky_ir::ModelIr::transformation(
+            rocky_ir::TargetRef {
+                catalog: "analytics".to_string(),
+                schema: "marts".to_string(),
+                table: "fct_orders".to_string(),
+            },
+            rocky_ir::MaterializationStrategy::FullRefresh,
+            Vec::new(),
+            "SELECT id, amount FROM raw.orders".to_string(),
+            rocky_ir::GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        model_ir.typed_columns = vec![
+            rocky_ir::TypedColumn {
+                name: "id".into(),
+                data_type: rocky_ir::RockyType::Int64,
+                nullable: false,
+            },
+            rocky_ir::TypedColumn {
+                name: "amount".into(),
+                data_type: rocky_ir::RockyType::Float64,
+                nullable: true,
+            },
+        ];
+        model_ir
+    }
+
+    #[test]
+    fn input_index_put_get_round_trip() {
+        let (store, _dir) = temp_store();
+        let entry = make_index_entry("ih-abc", "run-1", "fct_orders");
+        store
+            .record_reuse_spine(std::slice::from_ref(&entry), &[])
+            .unwrap();
+
+        let got = store.get_by_input_hash("ih-abc").unwrap();
+        assert_eq!(got.as_ref(), Some(&entry), "index entry must round-trip");
+
+        // A different input_hash → no hit (the index is dormant: lookup only).
+        assert!(store.get_by_input_hash("ih-not-there").unwrap().is_none());
+    }
+
+    #[test]
+    fn provenance_put_get_round_trip() {
+        let (store, _dir) = temp_store();
+        let model_ir = sample_model_ir();
+        let skip_hash = model_ir.skip_hash().expect("sample model canonicalises");
+        let record = ProvenanceRecord {
+            run_id: "run-7".to_string(),
+            model_name: "fct_orders".to_string(),
+            input_hash: "ih-xyz".to_string(),
+            skip_hash: skip_hash.to_hex().to_string(),
+            model_ir_canonical_json: model_ir.canonical_json(),
+            output_blake3: vec!["blake3:out".to_string()],
+            output_path: vec!["s3://bucket/prefix/out.parquet".to_string()],
+            proof_class: "strong".to_string(),
+            recorded_at: Utc::now(),
+        };
+        store
+            .record_reuse_spine(&[], std::slice::from_ref(&record))
+            .unwrap();
+
+        let got = store.get_provenance("run-7", "fct_orders").unwrap();
+        assert_eq!(got.as_ref(), Some(&record), "provenance must round-trip");
+
+        // Wrong key → no hit.
+        assert!(
+            store
+                .get_provenance("run-7", "other_model")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn provenance_offline_ir_hash_recompute_matches() {
+        // The offline-verify recipe's step 1: an auditor deserializes the
+        // embedded canonical ModelIr JSON, recomputes its skip_hash, and
+        // compares against the recorded value. This must match what produced
+        // the record — without re-running the model.
+        let (store, _dir) = temp_store();
+        let model_ir = sample_model_ir();
+        let recorded_skip_hash = model_ir
+            .skip_hash()
+            .expect("canonicalises")
+            .to_hex()
+            .to_string();
+        let record = ProvenanceRecord {
+            run_id: "run-9".to_string(),
+            model_name: "fct_orders".to_string(),
+            input_hash: "ih-9".to_string(),
+            skip_hash: recorded_skip_hash.clone(),
+            model_ir_canonical_json: model_ir.canonical_json(),
+            output_blake3: vec!["blake3:out".to_string()],
+            output_path: vec!["s3://bucket/prefix/out.parquet".to_string()],
+            proof_class: "strong".to_string(),
+            recorded_at: Utc::now(),
+        };
+        store
+            .record_reuse_spine(&[], std::slice::from_ref(&record))
+            .unwrap();
+
+        // Read the record back and recompute the IR hash from the embedded
+        // canonical JSON exactly as an offline verifier would.
+        let got = store
+            .get_provenance("run-9", "fct_orders")
+            .unwrap()
+            .unwrap();
+        let reparsed: rocky_ir::ModelIr =
+            serde_json::from_str(&got.model_ir_canonical_json).expect("canonical JSON round-trips");
+        let recomputed = reparsed.skip_hash().expect("reparsed model canonicalises");
+        assert_eq!(
+            recomputed.to_hex().to_string(),
+            got.skip_hash,
+            "offline skip_hash recompute must equal the recorded value"
+        );
+        assert_eq!(got.skip_hash, recorded_skip_hash);
+    }
+
+    #[test]
+    fn reuse_spine_empty_batch_is_noop() {
+        let (store, _dir) = temp_store();
+        // No transaction should be opened; nothing recorded.
+        store.record_reuse_spine(&[], &[]).unwrap();
+        assert!(store.get_by_input_hash("anything").unwrap().is_none());
+    }
+
+    #[test]
+    fn input_index_entry_forward_deserializes_without_optional_fields() {
+        // A v9 reader must accept a record written without the
+        // `#[serde(default)]` output_* arrays (the minimum a future heuristic
+        // entry might carry). Forward-deserialize safety for new fields.
+        let minimal = serde_json::json!({
+            "input_hash": "ih-min",
+            "run_id": "run-x",
+            "model_name": "m",
+            "proof_class": "heuristic",
+            "recorded_at": Utc::now(),
+        });
+        let parsed: InputIndexEntry =
+            serde_json::from_value(minimal).expect("optional output_* fields default to empty");
+        assert!(parsed.output_blake3.is_empty());
+        assert!(parsed.output_path.is_empty());
+        assert_eq!(parsed.proof_class, "heuristic");
     }
 }

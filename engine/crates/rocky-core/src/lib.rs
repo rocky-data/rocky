@@ -36,6 +36,7 @@ pub mod redacted;
 pub mod retention;
 pub mod retry;
 pub mod retry_budget;
+pub mod reuse;
 pub mod role_graph;
 pub mod schema;
 pub mod schema_cache;

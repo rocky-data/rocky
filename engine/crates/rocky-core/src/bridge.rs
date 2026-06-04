@@ -315,6 +315,7 @@ mod tests {
             freshness: Default::default(),
             imports: Default::default(),
             run: Default::default(),
+            reuse: Default::default(),
         }
     }
 

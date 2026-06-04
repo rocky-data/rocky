@@ -2139,6 +2139,14 @@ pub struct RockyConfig {
     /// before the gate existed. See [`RunConfig`].
     #[serde(default)]
     pub run: RunConfig,
+
+    /// Opt-in population of the auditable-reuse input-match spine.
+    /// Default-OFF: an absent `[reuse]` block keeps `rocky run` byte- and
+    /// cost-identical (no per-model hashing, no extra state write). Dormant
+    /// in Stage 1 even when enabled — it only records the index + provenance,
+    /// it makes no reuse decision. See [`ReuseConfig`].
+    #[serde(default)]
+    pub reuse: ReuseConfig,
 }
 
 /// `[run]` — opt-in tuning for the model-skip gate.
@@ -2174,6 +2182,29 @@ pub struct RunConfig {
     /// `0`: any movement at all forces a rebuild.
     #[serde(default)]
     pub lag_tolerance_seconds: u64,
+}
+
+/// `[reuse]` — opt-in population of the auditable-reuse input-match spine.
+///
+/// When `enabled = true`, a successful run records, per model, an input-match
+/// index entry and an offline-verifiable provenance record (the model's
+/// logic key, upstream input identities, output blake3(s), and proof class).
+/// This is the *input* side of reuse — the index that a future reuse
+/// decision will read.
+///
+/// **Dormant by default.** `enabled = false` (the default) keeps `rocky run`
+/// byte- *and* cost-identical to before the spine existed: no extra
+/// normalize+hash work, no extra state write. Even when enabled, Stage 1
+/// only *populates* the spine — it makes no reuse decision and skips nothing.
+/// The spine attests an *input-logic match*, never that re-running a model
+/// would reproduce its output.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReuseConfig {
+    /// Master switch for input-match spine population. `false` (default) ⇒
+    /// the spine is never written and no per-model hashing cost is paid.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 impl RockyConfig {

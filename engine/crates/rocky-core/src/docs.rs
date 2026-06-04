@@ -723,6 +723,7 @@ mod tests {
             freshness: Default::default(),
             imports: Default::default(),
             run: Default::default(),
+            reuse: Default::default(),
         };
 
         let models = vec![
@@ -815,6 +816,7 @@ mod tests {
             freshness: Default::default(),
             imports: Default::default(),
             run: Default::default(),
+            reuse: Default::default(),
         };
 
         let models = vec![Model {
@@ -897,6 +899,7 @@ mod tests {
             freshness: Default::default(),
             imports: Default::default(),
             run: Default::default(),
+            reuse: Default::default(),
         };
 
         let index = build_doc_index(&[], &config, None);
