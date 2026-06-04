@@ -291,8 +291,10 @@ threshold = 0                                            # max failing rows
 
 ## Contracts
 
+Enforced on `load` pipelines: the load runs into a staging table, validates the landed schema against the contract, and promotes to the target only on pass — a violation drops staging and fails, so non-conforming data never lands. Types compare in Rocky's normalized vocabulary, so one contract ports across warehouses.
+
 ```toml
-[pipeline.<name>.contracts]
+[pipeline.<name>.contract]
 required_columns = [
     { name = "id", type = "BIGINT", nullable = false },
 ]
