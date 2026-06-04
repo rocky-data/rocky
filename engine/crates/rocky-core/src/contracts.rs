@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::column_map;
-use rocky_ir::{ColumnInfo, RockyType};
+use rocky_ir::{ColumnInfo, RockyType, is_assignable};
 
 /// Data contract configuration — enforced at copy/load time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -171,12 +171,13 @@ pub fn validate_contract(
 ///   exist in the landed data.
 /// - **Nullability** (fully portable): a required column declared
 ///   `nullable = false` whose landed column is nullable is a violation.
-/// - **Type match** (best-effort): both the landed raw type and the
-///   contract's expected type string are normalized to [`RockyType`]; a
-///   violation is emitted only when both normalize to a *known* type and
-///   those types differ. If either side normalizes to [`RockyType::Unknown`],
-///   the match is skipped (never a false failure) — mirroring the compiler's
-///   contract type-checking.
+/// - **Type match** (best-effort, widening-aware): both the landed raw type
+///   and the contract's expected type string are normalized to [`RockyType`];
+///   a violation is emitted only when both normalize to a *known* type and the
+///   landed type is not assignable to (does not fit within) the expected type.
+///   So a narrower landed type (`INT32`) satisfies a wider contract (`BIGINT`),
+///   but not the reverse. If either side normalizes to [`RockyType::Unknown`],
+///   the match is skipped (never a false failure).
 ///
 /// `protected_columns` and `allowed_type_changes` describe source-vs-target
 /// *evolution*, which a single-table load can't meaningfully evaluate (there
@@ -217,7 +218,7 @@ pub fn validate_contract_typed(
         // Type match — best-effort in Rocky's type vocabulary.
         let landed_ty = warehouse_type_to_rocky(&col.data_type);
         let expected_ty = warehouse_type_to_rocky(&req.data_type);
-        if !rocky_types_match(&landed_ty, &expected_ty) {
+        if !landed_type_conforms(&landed_ty, &expected_ty) {
             violations.push(ContractViolation {
                 rule: "required_column_type".to_string(),
                 column: req.name.clone(),
@@ -314,8 +315,13 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
 /// Returns `true` (a match, so no violation) when either side is
 /// [`RockyType::Unknown`] — an un-normalizable type is never a false
 /// failure. Otherwise compares by equality.
-fn rocky_types_match(a: &RockyType, b: &RockyType) -> bool {
-    *a == RockyType::Unknown || *b == RockyType::Unknown || a == b
+/// Whether a landed column type conforms to a contract's expected type: the
+/// landed type must be *assignable to* (fit within) the expected type, so a
+/// narrower landed type (e.g. `INT32`) satisfies a wider contract (`BIGINT`),
+/// but a wider landed type does not satisfy a narrower contract. `Unknown` on
+/// either side passes (never a false failure) — `is_assignable` handles both.
+fn landed_type_conforms(landed: &RockyType, expected: &RockyType) -> bool {
+    is_assignable(landed, expected)
 }
 
 #[cfg(test)]
@@ -601,6 +607,42 @@ mod tests {
         let landed = vec![col_n("name", "VARCHAR", true)];
         let result = validate_contract_typed(&contract, &landed);
         assert!(result.passed, "violations: {:?}", result.violations);
+    }
+
+    #[test]
+    fn test_typed_widening_narrower_landed_satisfies_wider_contract() {
+        // Landed INT (Int32) satisfies a BIGINT (Int64) contract — INT widens
+        // to BIGINT. (Databricks `read_files` infers small CSV ints as INT, so
+        // a natural BIGINT contract must accept the inferred INT.)
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "id".into(),
+                data_type: "BIGINT".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let landed = vec![col_n("id", "INT", true)];
+        let result = validate_contract_typed(&contract, &landed);
+        assert!(result.passed, "violations: {:?}", result.violations);
+    }
+
+    #[test]
+    fn test_typed_narrowing_wider_landed_fails() {
+        // Landed BIGINT (Int64) does NOT satisfy an INT (Int32) contract —
+        // narrowing could overflow, so it stays a violation.
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "id".into(),
+                data_type: "INT".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let landed = vec![col_n("id", "BIGINT", true)];
+        let result = validate_contract_typed(&contract, &landed);
+        assert!(!result.passed);
+        assert_eq!(result.violations[0].rule, "required_column_type");
     }
 
     #[test]
