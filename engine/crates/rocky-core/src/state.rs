@@ -142,6 +142,12 @@ const INPUT_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("input_in
 /// State-internal: never part of any `*Output` JSON schema, so it carries no
 /// codegen. Replicates across backends by default.
 const INPUT_PROVENANCE: TableDefinition<&str, &[u8]> = TableDefinition::new("input_provenance");
+
+/// Prior `rocky discover` source inventory, keyed by pipeline name →
+/// JSON-encoded sorted `Vec<String>` of discovered source schemas. Read and
+/// rewritten each `discover` run when `report_new_sources` is set, so the next
+/// run can diff "sources present now but absent before" into `new_sources`.
+const DISCOVER_SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("discover_snapshots");
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -393,6 +399,7 @@ impl StateStore {
             let _table = txn.open_table(OUTPUT_ARTIFACTS)?;
             let _table = txn.open_table(INPUT_INDEX)?;
             let _table = txn.open_table(INPUT_PROVENANCE)?;
+            let _table = txn.open_table(DISCOVER_SNAPSHOTS)?;
         }
         txn.commit()?;
 
@@ -2444,6 +2451,39 @@ impl StateStore {
         }
         txn.commit()?;
         Ok(entries.len())
+    }
+
+    /// Read the prior `rocky discover` source inventory for `pipeline`.
+    ///
+    /// Returns the JSON-decoded `Vec<String>` of source schemas persisted by
+    /// the last [`Self::put_discover_snapshot`], or `None` when this pipeline
+    /// has never been discovered (the first-run baseline case).
+    pub fn get_discover_snapshot(&self, pipeline: &str) -> Result<Option<Vec<String>>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DISCOVER_SNAPSHOTS)?;
+        match table.get(pipeline)? {
+            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the current `rocky discover` source inventory for `pipeline`,
+    /// overwriting any prior snapshot. `sources` should be the deduplicated,
+    /// sorted list of discovered source schemas so the stored baseline is
+    /// deterministic.
+    pub fn put_discover_snapshot(
+        &self,
+        pipeline: &str,
+        sources: &[String],
+    ) -> Result<(), StateError> {
+        let bytes = serde_json::to_vec(sources)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DISCOVER_SNAPSHOTS)?;
+            table.insert(pipeline, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     /// Delete a single schema cache entry. Returns `true` when a row was

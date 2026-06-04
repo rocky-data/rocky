@@ -130,6 +130,10 @@ class DiscoverOutput(BaseModel):
     """
     Sources the discovery adapter attempted to fetch metadata for and failed (transient HTTP error, timeout, rate-limit budget exhausted, auth blip). Their absence from `sources` does NOT mean they were removed upstream — consumers diffing against a prior run must treat failed sources as "unknown state, do not delete." Empty when discovery completed cleanly. See FR-014.
     """
+    new_sources: list[str] | None = None
+    """
+    Source schemas seen for the first time relative to the prior persisted `discover` snapshot — the catch-a-duplicate-at-onboarding signal. Populated only when the pipeline's discovery config sets `report_new_sources`; empty (and omitted from the wire format) otherwise. The first-ever discover of a pipeline establishes the baseline and reports none.
+    """
     schemas_cached: conint(ge=0) | None = None
     """
     Number of schema-cache entries written by this invocation.

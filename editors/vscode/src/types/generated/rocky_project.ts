@@ -1203,6 +1203,10 @@ export interface DiscoveryConfig {
    * Name of the adapter to use for discovery (references a key in `[adapter.*]`). Defaults to `"default"`.
    */
   adapter?: string;
+  /**
+   * When `true`, `rocky discover` diffs the discovered source inventory against the prior persisted snapshot and reports first-seen sources in `new_sources`. Off by default — the diff and its state write only happen when opted in, so existing projects pay nothing.
+   */
+  report_new_sources?: boolean;
 }
 /**
  * Schema pattern configuration from TOML, converted to [`SchemaPattern`] at runtime.

@@ -23,6 +23,10 @@ export interface DiscoverOutput {
    */
   failed_sources?: FailedSourceOutput[];
   /**
+   * Source schemas seen for the first time relative to the prior persisted `discover` snapshot — the catch-a-duplicate-at-onboarding signal. Populated only when the pipeline's discovery config sets `report_new_sources`; empty (and omitted from the wire format) otherwise. The first-ever discover of a pipeline establishes the baseline and reports none.
+   */
+  new_sources?: string[];
+  /**
    * Number of schema-cache entries written by this invocation.
    *
    * Populated by `rocky discover --with-schemas` — the explicit warm-up path for the schema cache. Zero — and omitted from the wire format — when `--with-schemas` isn't set, so fixtures captured without the flag stay byte-stable.
