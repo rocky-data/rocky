@@ -1,0 +1,24 @@
+# 11-state-namespacing — give each pipeline / client its own state file so
+# concurrent runs don't contend on redb's single-writer lock.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.events]
+strategy = "full_refresh"
+
+[pipeline.events.source.discovery]
+adapter = "default"
+
+[pipeline.events.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.events.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+[pipeline.events.target.governance]
+auto_create_schemas = true

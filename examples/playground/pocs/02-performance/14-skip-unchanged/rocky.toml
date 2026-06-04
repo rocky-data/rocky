@@ -1,0 +1,28 @@
+# 14-skip-unchanged — the opt-in model-skip gate. A model whose logic AND
+# upstream data both appear unchanged since its last successful build is
+# skipped instead of re-materialized.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.demo]
+type = "transformation"
+models = "models/**"
+
+[pipeline.demo.target.governance]
+auto_create_schemas = true
+
+# The model-skip gate. Default-off; everything here is the safe (no-skip)
+# choice until turned on. See README for the full eligibility contract.
+[run]
+# Master switch. `true` turns the gate on without needing the --skip-unchanged
+# CLI flag (verified: config-alone skips on the full-DAG `rocky run` path). The
+# flag turns it on for a single invocation regardless of this value;
+# --force-rebuild bypasses it.
+skip_unchanged = true
+# This model is a full_refresh over a raw source, so it carries no tracked
+# timestamp column — the watermark MAX(ts) signal isn't available. Opt into the
+# weaker COUNT(*) rowcount signal so an unchanged upstream is provable here.
+# Rowcount is weaker than a watermark: it can miss a same-size in-place UPDATE.
+skip_rowcount_fallback = true
