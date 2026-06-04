@@ -699,6 +699,18 @@ enum Command {
         /// can't see, like a UDF redefinition or a session-setting change).
         #[arg(long)]
         force_rebuild: bool,
+
+        /// Disable the content-addressed reuse decision for this invocation,
+        /// even when `[reuse]` is enabled in config.
+        ///
+        /// When `[reuse]` is on, a content-addressed model whose declared
+        /// inputs byte-for-byte match a prior strong run may point a new Delta
+        /// commit at that run's already-written parquet instead of executing
+        /// its SQL — a fail-closed decision that BUILDs on any doubt. This
+        /// flag is the escape hatch that forces every model to BUILD,
+        /// parallel to `--force-rebuild` for `--skip-unchanged`. Default OFF.
+        #[arg(long)]
+        no_reuse: bool,
     },
 
     /// Compare shadow tables against production tables
@@ -2365,6 +2377,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             defer_to,
             skip_unchanged,
             force_rebuild,
+            no_reuse,
         } => {
             // --idempotency-key is mutually exclusive with --resume / --resume-latest:
             // a resume is an explicit override and should never be short-circuited.
@@ -2425,6 +2438,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             let skip_opts = rocky_cli::commands::SkipRunOptions {
                 skip_unchanged,
                 force_rebuild,
+                no_reuse,
             };
 
             if watch {

@@ -497,6 +497,30 @@ impl UniformWriter {
         )))
     }
 
+    /// Whether a prior run `R`'s content-addressed file is **still live** in
+    /// this table's current `_delta_log` — added and not since removed
+    /// (VACUUM'd / compacted / superseded).
+    ///
+    /// The liveness gate the fail-closed reuse decision consults **before**
+    /// pointing a new commit at `R`'s parquet. A `false` answer (the file was
+    /// `remove`d, or no commit in this table references it) means a point-to
+    /// would reference removed bytes — the caller must fall back to a normal
+    /// BUILD. Any error (cannot read the log) is propagated so the caller can
+    /// treat the doubt as "not provably live" and BUILD.
+    ///
+    /// `add_file_path` is the path relative to the table prefix
+    /// (`<hash>.parquet`), i.e. [`PointerInputs::add_file_path`].
+    ///
+    /// # Errors
+    ///
+    /// [`UniformWriterError::ObjectStore`] when the `_delta_log` listing or a
+    /// commit GET fails; [`UniformWriterError::DeltaLog`] when a commit body
+    /// cannot be parsed.
+    pub async fn add_path_is_live(&self, add_file_path: &str) -> Result<bool> {
+        let prefix = self.config.prefix.trim_end_matches('/').to_string();
+        discover::add_path_is_live(&*self.store, &prefix, add_file_path).await
+    }
+
     /// Shared write pipeline used by both unpartitioned and partitioned
     /// entry points. `path_for_hash` produces the `add.path` (relative to
     /// the table prefix) given the blake3 hash of the Parquet bytes.
@@ -1352,5 +1376,68 @@ mod tests {
 
         let result = writer.write_batch(make_batch(3)).await.unwrap();
         assert_eq!(result.commit_version, 2, "writer must skip the parked v=1");
+    }
+
+    #[tokio::test]
+    async fn add_path_is_live_true_for_a_freshly_written_file() {
+        // After a normal build, the file's `add` is live (no later remove).
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        let r = writer.write_batch(make_batch(4)).await.unwrap();
+        let add_file = r.file_path.split('/').next_back().unwrap();
+
+        assert!(
+            writer.add_path_is_live(add_file).await.unwrap(),
+            "a just-added file must be live"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_path_is_live_false_after_a_later_remove() {
+        // Build, then land a later commit that `remove`s the file (the
+        // VACUUM/compaction case). Liveness must flip to false so the reuse
+        // decision falls back to BUILD rather than pointing at removed bytes.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        let r = writer.write_batch(make_batch(4)).await.unwrap();
+        let add_file = r.file_path.split('/').next_back().unwrap();
+
+        // Land v=2: a remove of R's file (what a VACUUM/compaction emits).
+        let remove_body = format!(
+            "{{\"commitInfo\":{{\"operation\":\"VACUUM END\"}}}}\n\
+             {{\"remove\":{{\"path\":\"{add_file}\",\"dataChange\":false}}}}\n"
+        );
+        store
+            .put(
+                &object_store::path::Path::from(
+                    "tbl/_delta_log/00000000000000000002.json".to_string(),
+                ),
+                PutPayload::from(Bytes::from(remove_body)),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !writer.add_path_is_live(add_file).await.unwrap(),
+            "a removed file must NOT be live — reuse must fall back to BUILD"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_path_is_live_false_for_a_path_no_commit_references() {
+        // A path that was never added to this table is not live.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+
+        assert!(
+            !writer
+                .add_path_is_live("never-added.parquet")
+                .await
+                .unwrap(),
+            "a path no commit references is not live in this table"
+        );
     }
 }

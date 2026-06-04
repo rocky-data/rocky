@@ -252,12 +252,14 @@ pub struct DeferOptions {
     pub defer_to: Option<String>,
 }
 
-/// CLI overlay for the opt-in `--skip-unchanged` model-skip gate.
+/// CLI overlay for the run command's build-decision gates — the
+/// `--skip-unchanged` model-skip gate and the `--no-reuse` reuse override.
 ///
-/// Both fields default to `false`, which keeps the gate off and the run
-/// byte-identical to before the gate existed. The gate is a best-effort
-/// optimization, not a result-equivalence guarantee — see
-/// [`rocky_core::config::RunConfig`] and `ModelIr::skip_hash`.
+/// Every field defaults to `false`, which keeps both gates off and the run
+/// byte-identical to before they existed. Neither gate is a result-equivalence
+/// guarantee — see [`rocky_core::config::RunConfig`] and `ModelIr::skip_hash`
+/// for the skip gate, and the fail-closed reuse decision
+/// ([`crate::commands::reuse_decision`]) for reuse.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SkipRunOptions {
     /// Whether `--skip-unchanged` was passed. Turns the gate on for this
@@ -268,6 +270,11 @@ pub struct SkipRunOptions {
     /// model builds unconditionally — the gate's escape hatch. Takes
     /// precedence over `skip_unchanged` and over any config.
     pub force_rebuild: bool,
+    /// Whether `--no-reuse` was passed. When `true`, the content-addressed
+    /// reuse decision is disabled for this invocation even if `[reuse]` is
+    /// enabled in config — clause 1 of the fail-closed gate. The escape
+    /// hatch that forces every content-addressed model to BUILD.
+    pub no_reuse: bool,
 }
 
 /// Fully-resolved configuration for the model-skip gate, assembled in
@@ -1115,7 +1122,11 @@ pub async fn run(
             false, // model-only entry point has no pipeline governance context
             defer_opts,
             skip_gate,
-            rocky_cfg.reuse.enabled,
+            // Reuse is active iff `[reuse]` is enabled AND `--no-reuse` was
+            // not passed (clause 1 of the fail-closed decision). `--no-reuse`
+            // suppresses the whole reuse path for this invocation — both the
+            // point-to decision and the spine population it would feed.
+            rocky_cfg.reuse.enabled && !skip_opts.no_reuse,
         )
         .await?;
 
@@ -3212,7 +3223,9 @@ pub async fn run(
                     // set (a full run builds every model).
                     defer_opts,
                     skip_gate,
-                    rocky_cfg.reuse.enabled,
+                    // Reuse is active iff `[reuse]` is enabled AND `--no-reuse`
+                    // was not passed (clause 1 of the fail-closed decision).
+                    rocky_cfg.reuse.enabled && !skip_opts.no_reuse,
                 )
                 .await?;
                 Ok(())
@@ -4448,8 +4461,40 @@ pub(crate) async fn execute_models(
                     model_ir.target.schema.clone(),
                     model_ir.target.table.clone(),
                 ];
+                // Build the fail-closed reuse-decision context (clauses 1–3
+                // input side). Only for an unpartitioned (clause 2) model when
+                // `[reuse]` is active (clause 1) and a state store exists —
+                // otherwise pass `None` for a zero-cost pure BUILD. The
+                // decision-time `input_hash` is recomputed from the SAME
+                // all-strong upstream chain + `skip_hash` + target that spine
+                // population uses, so a hit is only possible when the inputs
+                // genuinely match a prior strong run.
+                let reuse_ctx = if reuse_enabled {
+                    let model_is_unpartitioned = !matches!(
+                        &model_ir.materialization,
+                        MaterializationStrategy::ContentAddressed { partition_columns, .. }
+                            if !partition_columns.is_empty()
+                    );
+                    match (model_is_unpartitioned, state_store) {
+                        (true, Some(store)) => {
+                            let input_hash = compute_decision_input_hash(
+                                &model_ir,
+                                &reuse_target_by_model,
+                                &reuse_outputs,
+                            );
+                            Some(super::run_content_addressed::ReuseDecisionCtx {
+                                input_hash,
+                                state_store: store,
+                                run_id,
+                            })
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let summary = super::run_content_addressed::execute_content_addressed_model(
-                    &model_ir, warehouse,
+                    &model_ir, warehouse, reuse_ctx,
                 )
                 .await
                 .with_context(|| format!("model '{model_name}' failed"));
@@ -4797,6 +4842,37 @@ where
 /// not indexed. A model that reads nothing resolves to an empty (vacuously
 /// strong) set. This keeps a `strong` label honest: a mixed-input or ambiguous
 /// model is never mislabeled — it is simply deferred.
+/// Recompute a content-addressed model's decision-time `input_hash` for the
+/// fail-closed reuse gate, using the **same** all-strong upstream chain +
+/// `skip_hash` + target identity that spine population
+/// ([`rocky_core::reuse::build_records`]) folds into the key it stores. This
+/// symmetry is load-bearing: the gate can only hit a prior run's `INPUT_INDEX`
+/// entry when the inputs genuinely match.
+///
+/// Returns `None` — a guaranteed BUILD (clause 3) — when the read set does not
+/// resolve to an all-strong content-hash chain (a raw source, a mixed/heuristic
+/// or ambiguous read, a model not built this run) or the model cannot be
+/// canonicalised (`skip_hash` is `None`). A `None` here is the same fail-safe
+/// that keeps a `strong` label honest on the population side.
+fn compute_decision_input_hash(
+    model_ir: &rocky_ir::ModelIr,
+    target_by_model: &std::collections::HashMap<String, String>,
+    outputs_by_target: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let upstreams =
+        resolve_read_set_content_upstreams(&model_ir.sql, target_by_model, outputs_by_target)?;
+    let skip_hash = model_ir.skip_hash()?.to_hex().to_string();
+    let target_identity = format!(
+        "{}.{}.{}",
+        model_ir.target.catalog, model_ir.target.schema, model_ir.target.table
+    );
+    Some(
+        rocky_core::reuse::compute_input_hash(&skip_hash, &target_identity, &upstreams)
+            .to_hex()
+            .to_string(),
+    )
+}
+
 fn resolve_read_set_content_upstreams(
     sql: &str,
     target_by_model: &std::collections::HashMap<String, String>,
