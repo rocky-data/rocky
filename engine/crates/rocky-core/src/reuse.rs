@@ -226,6 +226,46 @@ pub fn proof_class_for(upstreams: &[UpstreamIdentity]) -> ProofClass {
     ProofClass::min(upstreams.iter().map(UpstreamIdentity::proof_class))
 }
 
+/// Resolve a model's **entire read set** to STRONG content-hash upstream
+/// identities, or refuse.
+///
+/// `read_tables` is every table the model reads, as enumerated from its SQL
+/// lineage — *not* just its project-model dependencies. `resolve` maps a read
+/// table to the content blake3 hash + canonical upstream key for the artifact
+/// it produced this run, or `None` when that table has no content hash
+/// available (a raw source, a model not written content-addressed, a model
+/// not built this run, or a partitioned write whose ledger hash is
+/// incomplete).
+///
+/// # Returns
+///
+/// `Some(_)` **only when every** read table resolves to a content hash — the
+/// all-strong chain that is legitimately `b3sum`-verifiable end-to-end. A
+/// single unresolved read (most importantly a raw source, which `skip_hash`
+/// captures by name but cannot byte-verify) returns `None` so the caller does
+/// **not** index the model. This is the fail-safe that keeps a `strong`
+/// label honest: a mixed-input model is never mislabeled strong — it is
+/// simply not indexed in this slice (heuristic/watermark population for such
+/// models is deferred). A model that reads nothing resolves to an empty
+/// (vacuously strong) set.
+pub fn resolve_content_upstreams<F>(
+    read_tables: &[String],
+    mut resolve: F,
+) -> Option<Vec<UpstreamIdentity>>
+where
+    F: FnMut(&str) -> Option<(String, String)>,
+{
+    let mut identities = Vec::with_capacity(read_tables.len());
+    for table in read_tables {
+        let (upstream_key, blake3_hash) = resolve(table)?;
+        identities.push(UpstreamIdentity::Content {
+            upstream_key,
+            blake3_hash,
+        });
+    }
+    Some(identities)
+}
+
 /// The output a model produced for one content-addressed file.
 ///
 /// Index-aligned `(blake3, path)` pairs flow from the writer's `WriteResult`
@@ -567,5 +607,47 @@ mod tests {
             build_records(&m, "run-1", &[], &[], chrono::Utc::now()).is_none(),
             "a non-canonicalisable model must not be indexed"
         );
+    }
+
+    // -- read-set resolver --------------------------------------------------
+
+    #[test]
+    fn resolve_content_upstreams_all_resolved_is_some() {
+        let reads = vec!["a".to_string(), "b".to_string()];
+        let got = resolve_content_upstreams(&reads, |t| {
+            Some((format!("cat.sch.{t}"), format!("hash-{t}")))
+        })
+        .expect("every read resolved");
+        assert_eq!(got.len(), 2);
+        assert!(
+            got.iter()
+                .all(|u| matches!(u, UpstreamIdentity::Content { .. }))
+        );
+        assert_eq!(proof_class_for(&got), ProofClass::Strong);
+    }
+
+    #[test]
+    fn resolve_content_upstreams_any_unresolved_is_none() {
+        let reads = vec!["a".to_string(), "raw_source".to_string()];
+        let got = resolve_content_upstreams(&reads, |t| {
+            // The raw source has no content hash.
+            if t == "raw_source" {
+                None
+            } else {
+                Some((format!("cat.sch.{t}"), format!("hash-{t}")))
+            }
+        });
+        assert!(
+            got.is_none(),
+            "a single unresolved read (raw source) must refuse to index, not mislabel strong"
+        );
+    }
+
+    #[test]
+    fn resolve_content_upstreams_empty_read_set_is_strong() {
+        let got = resolve_content_upstreams(&[], |_| unreachable!("no reads"))
+            .expect("an empty read set resolves");
+        assert!(got.is_empty());
+        assert_eq!(proof_class_for(&got), ProofClass::Strong);
     }
 }

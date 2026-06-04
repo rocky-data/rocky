@@ -6024,4 +6024,25 @@ mod tests {
         assert!(parsed.output_path.is_empty());
         assert_eq!(parsed.proof_class, "heuristic");
     }
+
+    #[test]
+    fn provenance_record_forward_deserializes_without_optional_fields() {
+        // Symmetric to the index-entry forward test: a v9 reader must accept a
+        // provenance record written without the `#[serde(default)]` output_*
+        // arrays. Forward-deserialize safety for new fields.
+        let minimal = serde_json::json!({
+            "run_id": "run-x",
+            "model_name": "m",
+            "input_hash": "ih",
+            "skip_hash": "sh",
+            "model_ir_canonical_json": "{}",
+            "proof_class": "strong",
+            "recorded_at": Utc::now(),
+        });
+        let parsed: ProvenanceRecord =
+            serde_json::from_value(minimal).expect("optional output_* fields default to empty");
+        assert!(parsed.output_blake3.is_empty());
+        assert!(parsed.output_path.is_empty());
+        assert_eq!(parsed.proof_class, "strong");
+    }
 }

@@ -4132,43 +4132,36 @@ pub(crate) async fn execute_models(
     // when reuse is off, so the default path pays nothing.
     //
     // `reuse_outputs` maps a built model's fully-qualified target identity to
-    // its output blake3, so a *downstream* content-addressed model in a later
-    // layer can resolve its upstreams to STRONG content-hash identities
-    // without any extra warehouse query. Stage 1 indexes only models whose
-    // every upstream resolves to a content hash; watermark/heuristic upstream
-    // population is deferred (it needs the freshness-signal machinery).
+    // its output blake3 keyed by its target identity, so a *downstream*
+    // content-addressed model in a later layer can resolve a table it reads to
+    // a STRONG content-hash identity without any extra warehouse query. Stage 1
+    // indexes a model only when EVERY table it reads resolves to a content
+    // hash; a raw-source read (or any unresolved read) leaves the model
+    // unindexed rather than mislabeled strong.
     let mut reuse_index_entries: Vec<rocky_core::state::InputIndexEntry> = Vec::new();
     let mut reuse_provenance: Vec<rocky_core::state::ProvenanceRecord> = Vec::new();
     let mut reuse_outputs: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
-    // Static lookups for upstream resolution, built once when reuse is on:
-    // model name → its immediate upstream **model** names (DAG edges), and
-    // model name → its target `catalog.schema.table` identity. Empty when
-    // reuse is off so the default path allocates nothing.
-    let (reuse_depends_on, reuse_target_by_model): (
-        std::collections::HashMap<String, Vec<String>>,
-        std::collections::HashMap<String, String>,
-    ) = if reuse_enabled {
-        let depends = compile_result
-            .project
-            .dag_nodes
-            .iter()
-            .map(|n| (n.name.clone(), n.depends_on.clone()))
-            .collect();
-        let targets = compile_result
-            .project
-            .models
-            .iter()
-            .map(|m| {
-                let t = &m.config.target;
-                (
-                    m.config.name.to_string(),
-                    format!("{}.{}.{}", t.catalog, t.schema, t.table),
-                )
-            })
-            .collect();
-        (depends, targets)
+    // Static lookup built once when reuse is on: every lowercased identity a
+    // model can be *read by* in SQL (its bare name and its `schema.table`
+    // form) → that model's target `catalog.schema.table` full name. Lets the
+    // read-set resolver map a table reference from SQL lineage to the producing
+    // model's recorded output. Empty when reuse is off so the default path
+    // allocates nothing. Mirrors the identity set `skip_gate` builds for the
+    // same raw-source-vs-project-model distinction.
+    let reuse_target_by_model: std::collections::HashMap<String, String> = if reuse_enabled {
+        let mut map = std::collections::HashMap::new();
+        for m in &compile_result.project.models {
+            let t = &m.config.target;
+            let target_full = format!("{}.{}.{}", t.catalog, t.schema, t.table);
+            map.insert(m.config.name.to_lowercase(), target_full.clone());
+            map.insert(
+                format!("{}.{}", t.schema, t.table).to_lowercase(),
+                target_full,
+            );
+        }
+        map
     } else {
         Default::default()
     };
@@ -4537,47 +4530,58 @@ pub(crate) async fn execute_models(
                         }
                         // Auditable-reuse spine (dormant). When `[reuse]` is
                         // enabled, accumulate this model's input-match index
-                        // entry + provenance record. Stage 1 indexes only when
-                        // every immediate upstream resolves to a STRONG
+                        // entry + provenance record. Stage 1 indexes a model
+                        // only when EVERY table it reads resolves to a STRONG
                         // content hash produced earlier in this run — no extra
-                        // warehouse query. The output is recorded regardless so
-                        // a downstream content-addressed model can resolve THIS
-                        // model as a content-hash upstream. Best-effort and
-                        // additive: it never changes what was materialized.
-                        // First slice is unpartitioned-only (the partitioned
-                        // ledger is last-group-only — see the Phase 6 TODO
-                        // above); a multi-group write records no spine entry.
+                        // warehouse query. A read of a raw source, a model not
+                        // written content-addressed, or a model not built this
+                        // run means the chain is not byte-verifiable
+                        // end-to-end, so the model is left unindexed rather
+                        // than mislabeled strong (heuristic/watermark
+                        // population is deferred). Best-effort and additive: it
+                        // never changes what was materialized.
+                        //
+                        // Only UNPARTITIONED writes participate: the
+                        // partitioned ledger is last-group-only (the Phase 6
+                        // TODO above), so a partitioned hash is incomplete and
+                        // is recorded neither as this model's identity nor as a
+                        // resolvable upstream.
                         if reuse_enabled {
-                            let target_identity = target_table_full_name.clone();
-                            reuse_outputs
-                                .insert(target_identity.clone(), summary.blake3_hash.clone());
                             let is_unpartitioned = !matches!(
                                 &model_ir.materialization,
                                 MaterializationStrategy::ContentAddressed { partition_columns, .. }
                                     if !partition_columns.is_empty()
                             );
-                            if is_unpartitioned
-                                && let Some(upstreams) = resolve_strong_upstreams(
-                                    model_name,
-                                    &reuse_depends_on,
+                            if is_unpartitioned {
+                                if let Some(upstreams) = resolve_read_set_content_upstreams(
+                                    &model_ir.sql,
                                     &reuse_target_by_model,
                                     &reuse_outputs,
-                                )
-                            {
-                                let outputs = vec![rocky_core::reuse::OutputArtifact {
-                                    blake3_hash: summary.blake3_hash.clone(),
-                                    file_path: summary.file_path.clone(),
-                                }];
-                                if let Some((entry, prov)) = rocky_core::reuse::build_records(
-                                    &model_ir,
-                                    run_id,
-                                    &upstreams,
-                                    &outputs,
-                                    Utc::now(),
                                 ) {
-                                    reuse_index_entries.push(entry);
-                                    reuse_provenance.push(prov);
+                                    let outputs = vec![rocky_core::reuse::OutputArtifact {
+                                        blake3_hash: summary.blake3_hash.clone(),
+                                        file_path: summary.file_path.clone(),
+                                    }];
+                                    if let Some((entry, prov)) = rocky_core::reuse::build_records(
+                                        &model_ir,
+                                        run_id,
+                                        &upstreams,
+                                        &outputs,
+                                        Utc::now(),
+                                    ) {
+                                        reuse_index_entries.push(entry);
+                                        reuse_provenance.push(prov);
+                                    }
                                 }
+                                // Record THIS model's content identity only
+                                // after the resolve above, and only for an
+                                // unpartitioned (complete-hash) write, so a
+                                // downstream can resolve it as a STRONG
+                                // upstream without inheriting a partial hash.
+                                reuse_outputs.insert(
+                                    target_table_full_name.clone(),
+                                    summary.blake3_hash.clone(),
+                                );
                             }
                         }
                         if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
@@ -4740,32 +4744,48 @@ pub(crate) async fn execute_models(
 /// Resolve a content-addressed model's immediate upstreams to STRONG
 /// content-hash identities for the auditable-reuse spine.
 ///
-/// Looks each upstream **model** name (from the DAG edges) up to its target
-/// `catalog.schema.table` identity, then to the output blake3 it produced
-/// earlier in this run (`outputs_by_target`). Returns `Some(_)` only when
-/// **every** upstream resolves to a content hash — the all-strong Stage-1
-/// path that needs no warehouse query. Returns `None` if any upstream is
-/// unresolved (a raw source, a non-content-addressed model, or an upstream
-/// not built this run): such models are simply not indexed in Stage 1, since
-/// watermark/heuristic upstream population is deferred. An upstream-free model
-/// resolves to an empty (vacuously strong) set.
-fn resolve_strong_upstreams(
-    model_name: &str,
-    depends_on: &std::collections::HashMap<String, Vec<String>>,
+/// Enumerates **every table the model reads** from its SQL lineage — not just
+/// its project-model dependencies — and resolves each to the content blake3 a
+/// project model produced earlier in this run. The read set is trusted only
+/// when [`rocky_sql::lineage_complete::lineage_is_provably_complete`] holds
+/// (a plain `SELECT` over bare tables, no CTEs/subqueries that the lineage
+/// walk could silently drop); any other shape returns `None` so an
+/// un-enumerable read can never be mistaken for "no raw-source reads". This is
+/// the same completeness fail-safe `skip_gate` uses.
+///
+/// Returns `Some(_)` **only when every** read table maps (via
+/// `target_by_model`, keyed by lowercased bare name and `schema.table`) to a
+/// producing model whose unpartitioned content hash is in `outputs_by_target`.
+/// A read of a raw source (absent from `target_by_model`), a model not written
+/// content-addressed, or a model not built this run leaves the read unresolved
+/// ⇒ `None` ⇒ the model is not indexed. A model that reads nothing resolves to
+/// an empty (vacuously strong) set. This keeps a `strong` label honest: a
+/// mixed-input model is never mislabeled — it is simply deferred.
+fn resolve_read_set_content_upstreams(
+    sql: &str,
     target_by_model: &std::collections::HashMap<String, String>,
     outputs_by_target: &std::collections::HashMap<String, String>,
 ) -> Option<Vec<rocky_core::reuse::UpstreamIdentity>> {
-    let upstream_models = depends_on.get(model_name).map(Vec::as_slice).unwrap_or(&[]);
-    let mut identities = Vec::with_capacity(upstream_models.len());
-    for upstream in upstream_models {
-        let target = target_by_model.get(upstream)?;
-        let blake3_hash = outputs_by_target.get(target)?;
-        identities.push(rocky_core::reuse::UpstreamIdentity::Content {
-            upstream_key: target.clone(),
-            blake3_hash: blake3_hash.clone(),
-        });
+    // Fail-safe: only trust the read-set enumeration for SQL shapes where the
+    // lineage walk provably surfaces every upstream.
+    if !rocky_sql::lineage_complete::lineage_is_provably_complete(sql) {
+        return None;
     }
-    Some(identities)
+    let lineage = rocky_sql::lineage::extract_lineage(sql).ok()?;
+    let read_tables: Vec<String> = lineage
+        .source_tables
+        .iter()
+        .map(|t| t.name.to_lowercase())
+        .collect();
+    // Any unparseable "(subquery)" marker means the read set is incomplete.
+    if read_tables.iter().any(|t| t == "(subquery)") {
+        return None;
+    }
+    rocky_core::reuse::resolve_content_upstreams(&read_tables, |table| {
+        let target = target_by_model.get(table)?;
+        let blake3_hash = outputs_by_target.get(target)?;
+        Some((target.clone(), blake3_hash.clone()))
+    })
 }
 
 /// Map a `MaterializationStrategy` (post-`to_plan()`) onto the string used
