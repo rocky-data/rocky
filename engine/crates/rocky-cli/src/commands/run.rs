@@ -4531,8 +4531,28 @@ pub(crate) async fn execute_models(
                             commit_version = summary.commit_version,
                             blake3 = summary.blake3_hash.as_str(),
                             file_path = summary.file_path.as_str(),
+                            reused = summary.reused_from.is_some(),
                             "content_addressed model materialized"
                         );
+                        // Point-to reuse: this run referenced a prior run R's
+                        // bytes (zero copy) instead of executing the SQL. The
+                        // artifact + spine writes below run unchanged — they
+                        // key off `summary.blake3_hash`, which is R's shared
+                        // blake3 here, so the ledger gains a SECOND reference
+                        // at that hash (`refcount_for_hash` >= 2) and the spine
+                        // records this run's input-match entry at R's hash. The
+                        // back-link to R is surfaced here for the run log.
+                        if let Some(reuse) = &summary.reused_from {
+                            info!(
+                                model = model_name,
+                                target = target_table_full_name.as_str(),
+                                reused_run_id = reuse.reused_run_id.as_str(),
+                                proof_class = reuse.proof_class.as_str(),
+                                blake3 = reuse.blake3_hash.as_str(),
+                                "content_addressed model REUSED prior run R's parquet \
+                                 (no SQL executed; shared-bytes reference recorded)"
+                            );
+                        }
                         // Persist the content-hash artifact to the
                         // `OUTPUT_ARTIFACTS` redb table so Phase 6 VACUUM
                         // refcount can query "which runs touched this

@@ -676,28 +676,55 @@ pub async fn execute_content_addressed_model(
         ));
     }
 
-    // 3b. Fail-closed reuse decision (Stage 1 — ONLY-BUILD). Computed only
-    // when `[reuse]` is active (caller passed `Some`). On a would-reuse
-    // verdict we LOG and still BUILD: a decision that can only build cannot
-    // produce a wrong output. The live point-to invocation is wired behind
-    // this same verdict next.
+    // 3b. Fail-closed point-to reuse. Computed only when `[reuse]` is active
+    // (caller passed `Some`). On a fully-validated `WouldReuse(R)` verdict we
+    // attempt a ZERO-COPY point-to commit referencing `R`'s existing parquet
+    // — no SQL executes, no bytes are copied. ANY failure (recover error,
+    // a liveness flip discovered at commit time, commit error) falls through
+    // to a normal BUILD: the target is never left unwritten, and a pointer is
+    // never committed unless it was recovered + re-verified live. A `Build`
+    // verdict (the default — reuse off returns no ctx) skips the attempt.
     if let Some(ctx) = &reuse_ctx {
         let verdict = evaluate_reuse_decision(ctx, &writer, &state).await;
         match verdict {
             crate::commands::reuse_decision::ReuseVerdict::WouldReuse(candidate) => {
-                info!(
-                    model = %model_ir.name,
-                    run_id = ctx.run_id,
-                    target = %format!(
-                        "{}.{}.{}",
-                        model_ir.target.catalog, model_ir.target.schema, model_ir.target.table
-                    ),
-                    reuse_run_id = candidate.run_id.as_str(),
-                    blake3 = candidate.blake3_hash.as_str(),
-                    commit_version = candidate.commit_version,
-                    proof_class = candidate.proof_class.as_str(),
-                    "reuse: would point-to prior run R (ONLY-BUILD: still executing the SQL this run)"
-                );
+                match attempt_point_to_reuse(&writer, &state, &candidate, model_ir).await {
+                    Ok(summary) => {
+                        // Reuse succeeded — sync metadata so cross-engine
+                        // readers see the new pointer commit, then return. (A
+                        // no-op double-count re-commit still benefits from a
+                        // SYNC; it is cheap and idempotent.)
+                        sync_iceberg_metadata(warehouse, model_ir).await?;
+                        info!(
+                            model = %model_ir.name,
+                            run_id = ctx.run_id,
+                            target = %format!(
+                                "{}.{}.{}",
+                                model_ir.target.catalog,
+                                model_ir.target.schema,
+                                model_ir.target.table
+                            ),
+                            reuse_run_id = candidate.run_id.as_str(),
+                            blake3 = candidate.blake3_hash.as_str(),
+                            commit_version = summary.commit_version,
+                            proof_class = candidate.proof_class.as_str(),
+                            "reuse: pointed-to prior run R's parquet (zero-copy; SQL not executed)"
+                        );
+                        return Ok(summary);
+                    }
+                    Err(e) => {
+                        // Verify-before-trust: any doubt about recovering or
+                        // re-confirming R's bytes is a BUILD, never a silent
+                        // wrong reuse. Fall through to execute the SQL.
+                        warn!(
+                            model = %model_ir.name,
+                            run_id = ctx.run_id,
+                            reuse_run_id = candidate.run_id.as_str(),
+                            error = %format!("{e:#}"),
+                            "reuse: point-to could not be completed/verified; building instead"
+                        );
+                    }
+                }
             }
             crate::commands::reuse_decision::ReuseVerdict::Build(reason) => {
                 debug!(
@@ -770,11 +797,32 @@ pub async fn execute_content_addressed_model(
         };
 
     // 7. Sync iceberg metadata so cross-engine readers see the new
-    // commit(s). Issued directly via the warehouse adapter rather than
-    // through `UniformWriter::sync_iceberg_metadata` to avoid the
-    // `'static` lifetime requirement on `Arc<dyn SqlClient>` (see the
-    // NoOpSqlClient docstring above). One MSCK call covers all the
-    // commits the partitioned loop just emitted.
+    // commit(s). One MSCK call covers all the commits the partitioned loop
+    // just emitted.
+    sync_iceberg_metadata(warehouse, model_ir).await?;
+
+    Ok(ContentAddressedRunSummary {
+        num_rows: total_rows,
+        blake3_hash: last_blake3,
+        commit_version: last_commit_version,
+        file_path: last_file_path,
+        size_bytes: total_size_bytes,
+        // A normal BUILD wrote fresh bytes — no point-to provenance.
+        reused_from: None,
+    })
+}
+
+/// Issue `MSCK REPAIR TABLE ... SYNC METADATA` directly via the warehouse
+/// adapter so DuckDB iceberg_scan + Iceberg-aware Trino + Photon see the
+/// commit(s) the writer just landed.
+///
+/// Issued through the adapter rather than [`UniformWriter::sync_iceberg_metadata`]
+/// to avoid the `'static` lifetime requirement on `Arc<dyn SqlClient>` (see
+/// the [`NoOpSqlClient`] docstring).
+async fn sync_iceberg_metadata(
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    model_ir: &ModelIr,
+) -> Result<()> {
     let msck_sql = format!(
         "MSCK REPAIR TABLE {}.{}.{} SYNC METADATA",
         model_ir.target.catalog, model_ir.target.schema, model_ir.target.table,
@@ -783,14 +831,143 @@ pub async fn execute_content_addressed_model(
         .execute_statement(&msck_sql)
         .await
         .map_err(|e| anyhow!("MSCK REPAIR failed: {e}"))?;
+    Ok(())
+}
+
+/// Attempt a **zero-copy point-to reuse** of prior run `R`'s parquet for a
+/// fully-validated [`ReuseCandidate`].
+///
+/// Runs **after** the [`decide_reuse`](crate::commands::reuse_decision::decide_reuse)
+/// verdict already passed every clause (incl. a liveness check). This function
+/// is the trust-critical commit-time half, and it is **verify-before-trust**:
+///
+/// 1. **Recover** `R`'s `add` action from its `_delta_log/{commit_version}.json`
+///    (one GET, no parquet byte read — `R`'s recorded `stats` carry over).
+/// 2. **Re-confirm liveness right before the commit (TOCTOU).** The decision's
+///    liveness check and this commit are not atomic — `R`'s file could be
+///    VACUUM'd/`remove`d in the gap. Re-checking `add_path_is_live` here closes
+///    that window: a flip to not-live is an `Err`, which the caller treats as a
+///    BUILD.
+/// 3. **Commit the pointer** via [`UniformWriter::commit_pointer_with_state`].
+///    Its append-only double-count guard makes a same-target re-commit a no-op
+///    (returns the existing commit version, emits no new commit).
+///
+/// # Returns
+///
+/// `Ok(summary)` carrying `R`'s `blake3_hash` / `file_path` / `commit_version`
+/// (those bytes *are* this run's output) plus a [`ReuseProvenance`] back-link
+/// to `R`. The caller records the reusing run's `ArtifactRecord` at `R`'s
+/// shared blake3 — driving `refcount_for_hash` to `>= 2` with no byte copy.
+///
+/// # Errors
+///
+/// Returns `Err` on **any** doubt — recover failure, a liveness flip, or a
+/// commit error. The caller maps every `Err` to a normal BUILD; this function
+/// never leaves the target in a partial state (a failed `commit_pointer_with_state`
+/// lands no commit) and never returns `Ok` on an unverified pointer.
+async fn attempt_point_to_reuse(
+    writer: &UniformWriter,
+    state: &rocky_iceberg::uniform_writer::UniformTableState,
+    candidate: &crate::commands::reuse_decision::ReuseCandidate,
+    model_ir: &ModelIr,
+) -> Result<ContentAddressedRunSummary> {
+    // 1. Recover R's `add` action verbatim (one GET). The row count rides in
+    // the recovered `add.stats` JSON — read it back so the run-output
+    // `rows_copied` is accurate (the candidate's `ArtifactRecord` records
+    // size_bytes but not the row count).
+    let mut pointer = writer
+        .recover_pointer_inputs(
+            candidate.commit_version,
+            candidate.blake3_hash.clone(),
+            0,
+            candidate.size_bytes,
+        )
+        .await
+        .map_err(|e| anyhow!("recover_pointer_inputs failed: {e}"))?;
+    let num_records = num_records_from_recovered_add(&pointer.recovered_add);
+    pointer.num_records = num_records;
+
+    // 2. Re-confirm liveness right before the commit (TOCTOU). The decision
+    // already checked liveness, but VACUUM could have removed R's file in the
+    // gap. A flip to not-live ⇒ Err ⇒ the caller BUILDs.
+    let still_live = writer
+        .add_path_is_live(&pointer.add_file_path)
+        .await
+        .map_err(|e| anyhow!("commit-time liveness re-check failed: {e}"))?;
+    if !still_live {
+        return Err(anyhow!(
+            "R's file {:?} is no longer live in the target log at commit time \
+             (VACUUM'd/removed between decision and commit); building",
+            pointer.add_file_path
+        ));
+    }
+
+    // 3. Commit the zero-copy pointer. The double-count guard makes a
+    // same-target re-commit a no-op.
+    let write_result = writer
+        .commit_pointer_with_state(&pointer, state.clone())
+        .await
+        .map_err(|e| anyhow!("commit_pointer_with_state failed: {e}"))?;
+
+    // Defence-in-depth: the bytes we just referenced must carry R's blake3.
+    // The writer copies `pointer.blake3_hash` straight through, so this can
+    // only trip on a programming error — fail closed to a BUILD if it ever
+    // does rather than record a mislabeled shared-bytes reference.
+    if write_result.blake3_hash != candidate.blake3_hash {
+        return Err(anyhow!(
+            "point-to result blake3 {:?} disagrees with candidate {:?}; building",
+            write_result.blake3_hash,
+            candidate.blake3_hash
+        ));
+    }
+
+    debug!(
+        model = %model_ir.name,
+        reuse_run_id = candidate.run_id.as_str(),
+        blake3 = write_result.blake3_hash.as_str(),
+        commit_version = write_result.commit_version,
+        "reuse: pointer commit landed (or no-op double-count guard satisfied)"
+    );
 
     Ok(ContentAddressedRunSummary {
-        num_rows: total_rows,
-        blake3_hash: last_blake3,
-        commit_version: last_commit_version,
-        file_path: last_file_path,
-        size_bytes: total_size_bytes,
+        // R's recorded row count, parsed from the recovered `add.stats` above
+        // and threaded through `commit_pointer_with_state`. A `0` here only
+        // occurs if R's recorded stats were absent — the referenced data is
+        // still correct; this field is purely the run-output rows_copied
+        // display.
+        num_rows: write_result.num_records,
+        blake3_hash: write_result.blake3_hash,
+        commit_version: write_result.commit_version,
+        file_path: write_result.file_path,
+        size_bytes: write_result.size_bytes,
+        reused_from: Some(ReuseProvenance {
+            reused_run_id: candidate.run_id.clone(),
+            blake3_hash: candidate.blake3_hash.clone(),
+            proof_class: candidate.proof_class.clone(),
+        }),
     })
+}
+
+/// Parse `numRecords` out of a recovered Delta `add` action's `stats`.
+///
+/// Delta encodes `add.stats` as a **JSON string** (e.g.
+/// `"{\"numRecords\":3}"`), so this double-parses: read the `stats` string,
+/// then parse it as JSON and read `numRecords`. Returns `0` on any absence or
+/// shape surprise — the byte reference is unaffected; only the run-output
+/// `rows_copied` display would show `0`.
+fn num_records_from_recovered_add(
+    recovered_add: &serde_json::Map<String, serde_json::Value>,
+) -> usize {
+    let Some(stats_str) = recovered_add.get("stats").and_then(|v| v.as_str()) else {
+        return 0;
+    };
+    serde_json::from_str::<serde_json::Value>(stats_str)
+        .ok()
+        .as_ref()
+        .and_then(|stats| stats.get("numRecords"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0)
 }
 
 /// Group a `RecordBatch` by partition tuple.
@@ -925,6 +1102,26 @@ fn stringify_partition_value(
     }
 }
 
+/// Provenance of a **point-to reuse** — recorded when this run referenced a
+/// prior run `R`'s already-written parquet instead of executing its SQL.
+///
+/// The reusing run's [`ContentAddressedRunSummary`] carries `R`'s `blake3_hash`
+/// / `file_path` / `commit_version` as its own (those bytes *are* this run's
+/// output), so the runner's existing artifact-ledger write records a second
+/// reference at `R`'s shared blake3 — driving `refcount_for_hash` to `>= 2`
+/// with **zero byte copy**. This struct adds the back-link to `R` (and `R`'s
+/// `proof_class`) that the bytes-identity ledger row alone does not name.
+#[derive(Debug, Clone)]
+pub struct ReuseProvenance {
+    /// Prior run `R` whose bytes this run referenced.
+    pub reused_run_id: String,
+    /// The shared content blake3 (hex) — `R`'s and now also this run's.
+    pub blake3_hash: String,
+    /// `R`'s proof class (always `"strong"` — a point-to is byte-identity,
+    /// never a freshness heuristic). Carried so the reuse label is never lost.
+    pub proof_class: String,
+}
+
 /// Summary returned by [`execute_content_addressed_model`].
 #[derive(Debug, Clone)]
 pub struct ContentAddressedRunSummary {
@@ -933,6 +1130,13 @@ pub struct ContentAddressedRunSummary {
     pub commit_version: u64,
     pub file_path: String,
     pub size_bytes: u64,
+    /// `Some` when this run **reused** a prior run `R`'s bytes via a zero-copy
+    /// point-to commit instead of executing the model SQL. `None` for a normal
+    /// BUILD (including every reuse-decision fall-back to BUILD). The
+    /// `blake3_hash` / `file_path` / `commit_version` above are `R`'s in the
+    /// reuse case — by design, so the runner records the shared-bytes
+    /// reference without re-counting.
+    pub reused_from: Option<ReuseProvenance>,
 }
 
 #[cfg(test)]
