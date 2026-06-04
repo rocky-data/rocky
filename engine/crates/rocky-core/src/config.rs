@@ -2149,7 +2149,7 @@ pub struct RockyConfig {
 /// equivalence: non-deterministic SQL is excluded, and any ambiguity rebuilds.
 /// Every field defaults to the safe (no-skip) choice — the whole feature is
 /// off unless `skip_unchanged = true` (or the `--skip-unchanged` flag) is set.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RunConfig {
     /// Master switch for the model-skip gate. `false` (default) ⇒ every
@@ -2173,16 +2173,6 @@ pub struct RunConfig {
     /// `0`: any movement at all forces a rebuild.
     #[serde(default)]
     pub lag_tolerance_seconds: u64,
-}
-
-impl Default for RunConfig {
-    fn default() -> Self {
-        Self {
-            skip_unchanged: false,
-            skip_rowcount_fallback: false,
-            lag_tolerance_seconds: 0,
-        }
-    }
 }
 
 impl RockyConfig {

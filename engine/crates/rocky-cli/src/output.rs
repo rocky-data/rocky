@@ -869,10 +869,10 @@ pub struct MaterializationOutput {
     /// by the `--skip-unchanged` gate after a successful build; `None` when
     /// the gate is off or the model was not skip-eligible.
     ///
-    /// Never serialized and never part of the JSON schema (`#[serde(skip)]`
-    /// + `#[schemars(skip)]`) — mirrors the `name_declared` internal-field
-    /// pattern on `ModelConfig`. Keeps the skip-gate state out of every
-    /// `*Output` codegen surface.
+    /// Never serialized and never part of the JSON schema (via
+    /// `#[serde(skip)]` and `#[schemars(skip)]`) — mirrors the
+    /// `name_declared` internal-field pattern on `ModelConfig`. Keeps the
+    /// skip-gate state out of every `*Output` codegen surface.
     #[serde(skip)]
     #[schemars(skip)]
     pub skip_internal: Option<ModelSkipState>,

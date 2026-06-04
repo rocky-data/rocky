@@ -56,6 +56,7 @@ mod run_watch;
 mod seed;
 mod serve;
 mod shell;
+mod skip_gate;
 mod snapshot;
 mod state;
 #[cfg(feature = "duckdb")]

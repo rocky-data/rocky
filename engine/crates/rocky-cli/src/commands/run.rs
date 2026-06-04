@@ -322,9 +322,9 @@ impl SkipGateConfig {
         self.feature_enabled && !self.force_rebuild && !self.shadow_or_branch
     }
 
-    /// The fully-inert gate — the default-off configuration used by callers
-    /// that don't surface the skip flags (and by tests that don't exercise
-    /// the gate).
+    /// The fully-inert gate — the default-off configuration used by tests
+    /// that exercise `execute_models` without the skip gate.
+    #[cfg(test)]
     pub(crate) fn off() -> Self {
         Self {
             feature_enabled: false,
@@ -4164,6 +4164,11 @@ pub(crate) async fn execute_models(
     let requested_parallel = (partition_opts.parallel as usize).max(1);
     let adapter_supports_concurrency = warehouse.supports_concurrent_execution();
 
+    // Opt-in model-skip gate. Inert unless `skip_gate.is_active()`; when
+    // inactive the gate below short-circuits and `execute_models` builds every
+    // model exactly as before (no extra state reads / warehouse queries).
+    let mut gate = super::skip_gate::SkipGate::new(skip_gate, &compile_result.project);
+
     for layer in &compile_result.project.layers {
         // Collect this layer's matched models (honouring the name filter),
         // tagged with their stable within-layer index so concurrent results
@@ -4175,6 +4180,59 @@ pub(crate) async fn execute_models(
             .enumerate()
             .map(|(idx, (name, model))| (idx, name, model))
             .collect();
+
+        // ---- skip gate (B2 ∧ B3) --------------------------------------
+        // Evaluate the gate over this layer's matched set BEFORE dispatch, so
+        // the serial and `--parallel` paths see identical verdicts and the B3
+        // recursion map is fully populated layer-by-layer. The result is a
+        // `to_build` subset (each carrying the `ModelSkipState` to stamp on a
+        // successful build) plus the skipped models, whose verdict is recorded
+        // and whose `tables_skipped` counter is bumped. When the gate is
+        // inactive, every model passes straight through with no skip state.
+        let mut to_build: Vec<(usize, &String, &rocky_core::models::Model, Option<crate::output::ModelSkipState>)> =
+            Vec::with_capacity(matched.len());
+        if gate.config().is_active() {
+            for &(idx, name, model) in &matched {
+                // Build the fully-typed IR (merge the typechecker's columns,
+                // mirroring `project_ir_from_compile`) so `skip_hash()` can
+                // canonicalise. An empty `typed_columns` ⇒ `skip_hash()` is
+                // `None` ⇒ the gate builds.
+                let typed_ir = typed_model_ir(model, exec_ctx.typed_models);
+                match gate
+                    .evaluate(model, &typed_ir, warehouse, state_store)
+                    .await
+                {
+                    super::skip_gate::GateDecision::Skip => {
+                        gate.record(name, super::skip_gate::Verdict::Skipped);
+                        output.tables_skipped += 1;
+                        info!(
+                            model = name.as_str(),
+                            "skip-unchanged: logic and upstream data both appear \
+                             unchanged — skipping re-materialization (best-effort)"
+                        );
+                    }
+                    super::skip_gate::GateDecision::Build { skip_state } => {
+                        to_build.push((idx, name, model, Some(skip_state)));
+                    }
+                }
+            }
+        } else {
+            for &(idx, name, model) in &matched {
+                to_build.push((idx, name, model, None));
+            }
+        }
+
+        // Re-tag with a dense within-layer index so the parallel path's
+        // result re-ordering stays contiguous after any skips. Preserves the
+        // matched-order shape (`(idx, name, model)`) the dispatch loops below
+        // expect, with the optional skip state kept alongside.
+        let matched: Vec<(usize, &String, &rocky_core::models::Model)> = to_build
+            .iter()
+            .enumerate()
+            .map(|(i, (_, name, model, _))| (i, *name, *model))
+            .collect();
+        let skip_states: Vec<Option<crate::output::ModelSkipState>> =
+            to_build.into_iter().map(|(_, _, _, s)| s).collect();
 
         // Eligible for concurrent execution only when the user opted in,
         // the adapter supports it, and every matched model is a "plain"
@@ -4248,10 +4306,19 @@ pub(crate) async fn execute_models(
             // any later (dependent) layer starts, preserving the serial
             // path's fail-fast-no-downstream behavior.
             let mut first_error: Option<anyhow::Error> = None;
-            for (_, name, result) in layer_results {
+            for (idx, name, result) in layer_results {
                 match result {
-                    Ok(materialization) => {
+                    Ok(mut materialization) => {
                         let model_duration_ms = materialization.duration_ms;
+                        // Stamp the gate's logic key + upstream signatures so
+                        // the next run can compare against this build, and
+                        // record the model as Built so any downstream in a
+                        // later layer treats it as a changed input. `skip_states`
+                        // is index-aligned with the (post-gate) `matched` set.
+                        if let Some(state) = skip_states.get(idx).and_then(Clone::clone) {
+                            materialization.skip_internal = Some(state);
+                        }
+                        gate.record(name, super::skip_gate::Verdict::Built);
                         output.materializations.push(materialization);
                         if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                             let _ = reg
@@ -4289,8 +4356,14 @@ pub(crate) async fn execute_models(
             continue;
         }
 
-        for &(_, model_name, model) in &matched {
+        for &(idx, model_name, model) in &matched {
             let model_name: &str = model_name.as_str();
+            // Every model reached here is being built (the gate already
+            // removed any skips). Record the Built verdict so a downstream in
+            // a later layer treats it as a changed input. `content_addressed`
+            // / `time_interval` are never skip-eligible but still count as a
+            // build for the B3 recursion signal.
+            gate.record(model_name, super::skip_gate::Verdict::Built);
 
             // §P2.6 per-model emit: before_model_run. Duration is
             // reserved for after_model_run — here we just announce
@@ -4486,8 +4559,16 @@ pub(crate) async fn execute_models(
             )
             .await
             {
-                Ok(materialization) => {
+                Ok(mut materialization) => {
                     let model_duration_ms = materialization.duration_ms;
+                    // Stamp the gate's logic key + upstream signatures so the
+                    // next run can compare against this build. `skip_states`
+                    // is index-aligned with the (post-gate) `matched` set;
+                    // `None` when the gate is off or this model wasn't
+                    // skip-eligible.
+                    if let Some(state) = skip_states.get(idx).and_then(Clone::clone) {
+                        materialization.skip_internal = Some(state);
+                    }
                     // Push a MaterializationOutput so `rocky cost` and
                     // downstream consumers see derived models in the run
                     // output instead of having to infer them from check /
@@ -4551,12 +4632,32 @@ fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static 
 /// (`content_addressed`, `time_interval`) that the serial loop handles
 /// inline. Only plain models are eligible for intra-layer concurrent
 /// execution via [`execute_one_plain_model`].
-fn is_plain_strategy(model: &rocky_core::models::Model) -> bool {
+pub(crate) fn is_plain_strategy(model: &rocky_core::models::Model) -> bool {
     !matches!(
         model.config.strategy,
         rocky_core::models::StrategyConfig::ContentAddressed { .. }
             | rocky_core::models::StrategyConfig::TimeInterval { .. }
     )
+}
+
+/// Build the fully-typed [`ModelIr`] for a model by lowering its config and
+/// then enriching `typed_columns` from the typechecker's per-model schemas —
+/// the same merge `project_ir_from_compile` does. The bare
+/// `Model::to_model_ir()` leaves `typed_columns` empty, which would force
+/// [`ModelIr::skip_hash`] to the never-equal `None` sentinel; merging the
+/// typed columns is what lets the skip gate canonicalise a model's logic.
+///
+/// The IR is built in its **static** form (`TimeInterval.window == None`), the
+/// call-time contract `skip_hash` requires.
+fn typed_model_ir(
+    model: &rocky_core::models::Model,
+    typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+) -> rocky_ir::ModelIr {
+    let mut ir = model.to_model_ir();
+    if let Some(cols) = typed_models.get(&model.config.name) {
+        ir.typed_columns = cols.clone();
+    }
+    ir
 }
 
 /// Execute exactly one "plain" single-statement transformation model:
