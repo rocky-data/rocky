@@ -578,6 +578,150 @@ async fn test_loader_missing_rows_loaded_column() {
     assert_eq!(result.rows_loaded, 0);
 }
 
+/// End-to-end: loading a LOCAL CSV with `create_table` set first issues
+/// `CREATE TABLE IF NOT EXISTS` with column types inferred from the file and
+/// mapped to Snowflake type names, *then* runs the stage + PUT + COPY INTO
+/// sequence. Proves the infer + CREATE + type-mapping path without credentials.
+///
+/// This is the local-file analogue of `test_loader_surfaces_rows_loaded`
+/// (which uses a cloud URI and therefore skips the create path).
+#[tokio::test]
+async fn test_loader_local_csv_creates_typed_table() {
+    use std::io::Write;
+
+    let server = MockServer::start().await;
+
+    // CREATE TABLE IF NOT EXISTS — asserts the mapped Snowflake types are
+    // present in the DDL body. The CSV below infers id->BIGINT->NUMBER(38,0),
+    // name->STRING->VARCHAR, score->DOUBLE->FLOAT, active->BOOLEAN->BOOLEAN.
+    // `expect(1)` proves the create fires exactly once.
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("CREATE TABLE IF NOT EXISTS"))
+        .and(body_string_contains("\\\"id\\\" NUMBER(38,0)"))
+        .and(body_string_contains("\\\"name\\\" VARCHAR"))
+        .and(body_string_contains("\\\"score\\\" FLOAT"))
+        .and(body_string_contains("\\\"active\\\" BOOLEAN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-create-table",
+            "code": "00000",
+            "message": "Statement executed successfully.",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // CREATE TEMPORARY STAGE — result set not inspected.
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("CREATE TEMPORARY STAGE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-create-stage",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // PUT file://... @stage — local-file upload. Result ignored. Match on
+    // the full `PUT 'file://` prefix, not bare "PUT": every request body
+    // carries `"warehouse":"COMPUTE_WH"`, and "COMPUTE_WH" contains the
+    // substring "PUT", so a bare "PUT" matcher would shadow the COPY mock.
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("PUT 'file://"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-put",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // COPY INTO — one row loaded.
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("COPY INTO"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-copy",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": {
+                "numRows": 1,
+                "rowType": [
+                    {"name": "file", "type": "TEXT", "nullable": false},
+                    {"name": "status", "type": "TEXT", "nullable": false},
+                    {"name": "rows_parsed", "type": "FIXED", "nullable": false},
+                    {"name": "rows_loaded", "type": "FIXED", "nullable": false},
+                    {"name": "errors_seen", "type": "FIXED", "nullable": false}
+                ]
+            },
+            "data": [
+                ["data.csv", "LOADED", "2", "2", "0"]
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // DROP STAGE IF EXISTS — cleanup, result ignored.
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("DROP STAGE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-drop",
+            "code": "00000",
+            "message": "ok",
+            "statementStatusUrl": "",
+            "resultSetMetaData": null,
+            "data": null
+        })))
+        .mount(&server)
+        .await;
+
+    // Write a real CSV so `infer_schema_from_csv` has a file to read.
+    let mut csv = tempfile::NamedTempFile::with_suffix(".csv").unwrap();
+    csv.write_all(b"id,name,score,active\n1,alice,1.5,true\n2,bob,2.5,false\n")
+        .unwrap();
+    csv.flush().unwrap();
+
+    let connector = Arc::new(test_connector(&server));
+    let loader = SnowflakeLoaderAdapter::new(connector);
+
+    let source = LoadSource::LocalFile(csv.path().to_path_buf());
+    let target = TableRef {
+        catalog: "DB".into(),
+        schema: "RAW".into(),
+        table: "PEOPLE".into(),
+    };
+    // create_table defaults to true; be explicit for the contract this test
+    // pins.
+    let options = LoadOptions {
+        create_table: true,
+        ..Default::default()
+    };
+
+    let result = loader.load(&source, &target, &options).await.unwrap();
+    assert_eq!(
+        result.rows_loaded, 2,
+        "rows from COPY INTO should be surfaced after the create"
+    );
+    // Local file → byte count is read from disk.
+    assert!(result.bytes_read > 0);
+}
+
 /// Bearer token is sent correctly in the Authorization header for OAuth
 /// auth, and the matching `X-Snowflake-Authorization-Token-Type: OAUTH`
 /// header rides alongside it.

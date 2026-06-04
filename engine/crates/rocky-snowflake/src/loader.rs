@@ -9,6 +9,29 @@
 //! Temporary stages auto-expire at session end, so a failed load still cleans
 //! up. The explicit `DROP STAGE IF EXISTS` after each load keeps long-running
 //! sessions tidy.
+//!
+//! ## Creating the target from a local CSV
+//!
+//! `COPY INTO` requires the target table to already exist. When loading a
+//! **local CSV** with [`LoadOptions::create_table`] set, the loader first
+//! infers column types from the file (via
+//! [`rocky_core::seeds::infer_schema_from_csv`]), maps them to Snowflake type
+//! names, and emits `CREATE TABLE IF NOT EXISTS` *before* the stage + PUT +
+//! COPY sequence. This unblocks loading a CSV into a fresh table — notably the
+//! typed contract-gate, which loads into a per-load staging table that doesn't
+//! exist yet.
+//!
+//! Scope of the create-from-file path:
+//! - **Local CSV only.** Type inference reads the local file, so it can't run
+//!   against a cloud URI. Auto-creating from `s3://` would need Snowflake's
+//!   server-side `INFER_SCHEMA` table function — left as a follow-up.
+//! - **Comma-delimited.** `infer_schema_from_csv` reads with a comma
+//!   delimiter; a non-comma local CSV with `create_table` won't auto-create
+//!   the right columns. `CREATE TABLE IF NOT EXISTS` keeps an existing table
+//!   safe regardless. A delimiter-aware inference is a follow-up.
+//! - **Local Parquet / JSONL fall through untouched** (no inference, no
+//!   create) — they only load into a pre-existing table today, and silently
+//!   skipping the create preserves that behavior rather than failing the load.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -20,13 +43,17 @@ use rocky_adapter_sdk::{
     AdapterError, AdapterResult, FileFormat, LoadOptions, LoadResult, LoadSource, LoaderAdapter,
     TableRef,
 };
+use rocky_core::sql_gen::validate_sql_type;
 use rocky_sql::validation::validate_identifier;
 
 use crate::connector::{QueryResult, SnowflakeConnector};
+use crate::dialect::SnowflakeSqlDialect;
 use crate::stage::{
     copy_into_sql, create_external_stage_sql, create_temporary_stage_sql, drop_stage_sql,
     generate_stage_name, put_file_sql,
 };
+
+use rocky_core::traits::SqlDialect;
 
 /// Snowflake loader adapter using temporary stages + COPY INTO.
 pub struct SnowflakeLoaderAdapter {
@@ -95,6 +122,66 @@ fn format_target(target: &TableRef) -> AdapterResult<String> {
     }
 }
 
+/// Map a [`rocky_core::seeds`]-inferred generic SQL type to its Snowflake
+/// equivalent.
+///
+/// `infer_schema_from_csv` emits a small, fixed set of generic type names
+/// (`BOOLEAN`, `BIGINT`, `DOUBLE`, `TIMESTAMP`, `STRING`). Snowflake accepts
+/// `BOOLEAN` and `TIMESTAMP` verbatim, but the canonical names that round-trip
+/// through `DESCRIBE TABLE` (and the dialect's safe-widening parsers) are
+/// `NUMBER(38,0)`, `FLOAT`, `TIMESTAMP_NTZ`, and `VARCHAR`. Mapping to those
+/// keeps a later schema-drift comparison stable.
+///
+/// Any name not in the known set is passed through unchanged — it's then
+/// validated by [`validate_sql_type`] before interpolation, so an unexpected
+/// value can't smuggle SQL into the DDL.
+fn map_inferred_type_to_snowflake(generic: &str) -> &str {
+    match generic {
+        "BIGINT" => "NUMBER(38,0)",
+        "DOUBLE" => "FLOAT",
+        "TIMESTAMP" => "TIMESTAMP_NTZ",
+        // `infer_schema_from_csv` emits the generic `STRING`; Snowflake's
+        // canonical text type is `VARCHAR` (its `STRING` alias also works,
+        // but `DESCRIBE` reports `VARCHAR`).
+        "STRING" => "VARCHAR",
+        // `BOOLEAN` and any already-Snowflake / overridden type pass through.
+        other => other,
+    }
+}
+
+/// Build a `CREATE TABLE IF NOT EXISTS <target> (<typed cols>)` statement from
+/// CSV-inferred columns.
+///
+/// Each column name is validated as a SQL identifier and double-quoted (the
+/// adapter's lowercase-preserving convention — matching `format_table_ref`,
+/// `merge_into`, and the COPY column resolution). Each mapped Snowflake type is
+/// validated by [`validate_sql_type`] before interpolation. `IF NOT EXISTS`
+/// makes the statement idempotent and avoids any existence round-trip
+/// (a `DESCRIBE`/exists probe is deliberately *not* issued).
+fn create_table_from_csv_sql(
+    target_ref: &str,
+    columns: &[rocky_core::seeds::ColumnDef],
+) -> AdapterResult<String> {
+    if columns.is_empty() {
+        return Err(AdapterError::msg(
+            "cannot create table from CSV with no columns",
+        ));
+    }
+    let dialect = SnowflakeSqlDialect;
+    let mut col_defs = Vec::with_capacity(columns.len());
+    for col in columns {
+        validate_identifier(&col.name).map_err(AdapterError::new)?;
+        let sf_type = map_inferred_type_to_snowflake(&col.data_type);
+        validate_sql_type(sf_type).map_err(AdapterError::new)?;
+        let col_q = dialect.quote_identifier(&col.name);
+        col_defs.push(format!("{col_q} {sf_type}"));
+    }
+    Ok(format!(
+        "CREATE TABLE IF NOT EXISTS {target_ref} ({})",
+        col_defs.join(", ")
+    ))
+}
+
 #[async_trait]
 impl LoaderAdapter for SnowflakeLoaderAdapter {
     async fn load(
@@ -107,6 +194,24 @@ impl LoaderAdapter for SnowflakeLoaderAdapter {
         let format = resolve_format(source, options)?;
         let target_ref = format_target(target)?;
         let stage = generate_stage_name();
+
+        // `create_table` for a LOCAL CSV: COPY INTO needs an existing table, so
+        // infer column types from the file and `CREATE TABLE IF NOT EXISTS`
+        // before the stage + PUT + COPY sequence. Runs ahead of the truncate
+        // block so a `create_table + truncate_first` combo against a missing
+        // table creates first (the DELETE would otherwise fail on a
+        // non-existent table). Local Parquet/JSONL and cloud URIs fall through
+        // untouched — see the module docs for the create-from-file scope.
+        if options.create_table
+            && format == FileFormat::Csv
+            && let LoadSource::LocalFile(local_path) = source
+        {
+            let columns = rocky_core::seeds::infer_schema_from_csv(local_path)
+                .map_err(|e| AdapterError::msg(format!("failed to infer CSV schema: {e}")))?;
+            let create_sql = create_table_from_csv_sql(&target_ref, &columns)?;
+            debug!(sql = %create_sql, "ensuring target table exists (create from CSV)");
+            self.exec(&create_sql).await?;
+        }
 
         // `truncate_first` → DELETE FROM before COPY INTO. Snowflake supports
         // TRUNCATE TABLE but DELETE is more portable and plays nicer with
@@ -402,5 +507,87 @@ mod tests {
     fn test_sum_rows_loaded_empty_result() {
         let qr = copy_into_result(&["rows_loaded"], vec![]);
         assert_eq!(sum_rows_loaded(&qr), Some(0));
+    }
+
+    use rocky_core::seeds::ColumnDef;
+
+    fn col(name: &str, data_type: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.into(),
+            data_type: data_type.into(),
+        }
+    }
+
+    #[test]
+    fn test_map_inferred_type_to_snowflake_known_types() {
+        // The generic names `infer_schema_from_csv` emits map to Snowflake's
+        // canonical `DESCRIBE`-round-tripping names.
+        assert_eq!(map_inferred_type_to_snowflake("BIGINT"), "NUMBER(38,0)");
+        assert_eq!(map_inferred_type_to_snowflake("DOUBLE"), "FLOAT");
+        assert_eq!(map_inferred_type_to_snowflake("TIMESTAMP"), "TIMESTAMP_NTZ");
+        assert_eq!(map_inferred_type_to_snowflake("STRING"), "VARCHAR");
+        // BOOLEAN is accepted verbatim by Snowflake.
+        assert_eq!(map_inferred_type_to_snowflake("BOOLEAN"), "BOOLEAN");
+    }
+
+    #[test]
+    fn test_map_inferred_type_passthrough_for_unknown() {
+        // Already-Snowflake / overridden types pass through unchanged; the
+        // caller still runs them through `validate_sql_type`.
+        assert_eq!(
+            map_inferred_type_to_snowflake("NUMBER(10,2)"),
+            "NUMBER(10,2)"
+        );
+        assert_eq!(
+            map_inferred_type_to_snowflake("VARCHAR(255)"),
+            "VARCHAR(255)"
+        );
+    }
+
+    #[test]
+    fn test_create_table_from_csv_sql_quotes_and_maps_types() {
+        let cols = vec![
+            col("id", "BIGINT"),
+            col("name", "STRING"),
+            col("amount", "DOUBLE"),
+            col("active", "BOOLEAN"),
+            col("created_at", "TIMESTAMP"),
+        ];
+        let sql = create_table_from_csv_sql("DB.RAW.ORDERS", &cols).unwrap();
+        assert_eq!(
+            sql,
+            "CREATE TABLE IF NOT EXISTS DB.RAW.ORDERS \
+             (\"id\" NUMBER(38,0), \"name\" VARCHAR, \"amount\" FLOAT, \
+             \"active\" BOOLEAN, \"created_at\" TIMESTAMP_NTZ)"
+        );
+    }
+
+    #[test]
+    fn test_create_table_from_csv_sql_is_idempotent() {
+        let cols = vec![col("id", "BIGINT")];
+        let sql = create_table_from_csv_sql("T", &cols).unwrap();
+        // `IF NOT EXISTS` keeps the create safe when the table already exists —
+        // no DESCRIBE / existence round-trip is issued (the #826 lesson).
+        assert!(sql.starts_with("CREATE TABLE IF NOT EXISTS T ("));
+    }
+
+    #[test]
+    fn test_create_table_from_csv_sql_rejects_empty_columns() {
+        assert!(create_table_from_csv_sql("T", &[]).is_err());
+    }
+
+    #[test]
+    fn test_create_table_from_csv_sql_rejects_bad_column_identifier() {
+        // A header carrying SQL must be refused at identifier validation —
+        // never interpolated into the DDL.
+        let cols = vec![col("bad; DROP TABLE x; --", "BIGINT")];
+        assert!(create_table_from_csv_sql("T", &cols).is_err());
+    }
+
+    #[test]
+    fn test_create_table_from_csv_sql_rejects_bad_type() {
+        // A passthrough type carrying SQL must be refused by validate_sql_type.
+        let cols = vec![col("id", "BIGINT; DROP TABLE x")];
+        assert!(create_table_from_csv_sql("T", &cols).is_err());
     }
 }
