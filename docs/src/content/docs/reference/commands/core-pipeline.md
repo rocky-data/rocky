@@ -9,7 +9,13 @@ The core pipeline commands cover the full lifecycle of a Rocky pipeline: project
 
 ## Global Flags
 
-The global flags (`--config`, `--output`, `--state-path`, `--cache-ttl`) apply to every command. See [Global Flags in the CLI Reference](/reference/cli/#global-flags) for the canonical list, defaults, and the `--state-path` resolution order.
+The global flags (`--config`, `--output`, `--state-path`, `--state-namespace`, `--cache-ttl`) apply to every command. See [Global Flags in the CLI Reference](/reference/cli/#global-flags) for the canonical list, defaults, and the `--state-path` resolution order.
+
+### `--state-namespace`
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--state-namespace <KEY>` | `string` | (none) | Route this invocation to its own `<models>/.rocky-state/<KEY>.redb` so concurrent fan-out runs (one per pipeline / client / tenant) don't serialize on redb's single-writer lock. **Opt-in, default-off**: with neither this flag nor `[state] namespacing` set, behavior is byte-identical to the single global state file. `<KEY>` must be a SQL identifier (`^[a-zA-Z0-9_]+$`). An explicit `--state-path` disables namespacing for that invocation; otherwise this flag wins over the `[state] namespacing` config. See [State namespacing](/reference/configuration/#state-namespacing). |
 
 ---
 
@@ -304,6 +310,14 @@ rocky run --filter <key=value> [flags]
 | `--shadow-schema <NAME>` | `string` | | Override schema for shadow tables (mutually exclusive with `--shadow-suffix`). |
 | `--branch <NAME>` | `string` | | Execute against a named branch previously registered with `rocky branch create`. Applies the branch's `schema_prefix` to every target (internally equivalent to `--shadow --shadow-schema <branch.schema_prefix>`). Mutually exclusive with `--shadow` / `--shadow-schema`. |
 | `--watch` | `bool` | `false` | Wrap the run in a filesystem watcher: re-execute the pipeline on every change to `rocky.toml` or any file under `models/`, debounced to 200 ms so editor save bursts coalesce into a single re-run. Failed runs do not exit the loop; Ctrl-C exits cleanly between runs. **v0 limitations:** mutually exclusive with `--dag`, `--resume`, `--resume-latest`, `--idempotency-key`, and `--model` (rejected at parse time). |
+| `--defer` | `bool` | `false` | Build only the `--model`-selected models locally, resolving unbuilt upstream `ref()`s to an existing (production) schema — the dbt-Core-style defer convenience. Takes effect **only together with `--model`**: a full run builds everything, so the flag is inert. Applies to transformation models; mutually exclusive with `--dag`. See the limitation note below. |
+| `--defer-to <SCHEMA>` | `string` | | Schema the deferred upstream `ref()`s resolve to. Requires `--defer`. Defaults to each unbuilt upstream's own configured target schema (its production home); pass this to point every deferred reference at a single schema instead (catalog + table are preserved). |
+| `--skip-unchanged` | `bool` | `false` | Turn on the model-skip gate for this invocation regardless of the `[run] skip_unchanged` config: skip re-materializing a transformation model whose logic and every upstream's data both appear unchanged. **Best-effort optimization, not a result-equivalence guarantee** — non-deterministic SQL and models without provably-complete lineage (CTEs, subqueries, `PIVOT`/`UNNEST`, set operations) always rebuild. See [`[run]`](/reference/configuration/#run) for the full eligibility rules. |
+| `--force-rebuild` | `bool` | `false` | Force every selected model to build, bypassing the `--skip-unchanged` gate entirely. The escape hatch for a guaranteed rebuild after a non-logic change the IR hash can't see (a UDF redefinition, a session-setting change). |
+
+:::caution[`--defer` SQL-rewrite limitation]
+`--defer` rewrites each selected model's SQL to qualify deferred upstream references, and the rewrite parses the model with the Databricks dialect. Constructs the parser does not support — `SELECT * EXCEPT (...)`, trailing-comma select lists, and `STRUCT(...)` literals — cannot be rewritten and fail with a clear error. Build those models without `--defer`. With `--defer` off (the default), runs are byte-identical to before the flag existed.
+:::
 
 ### Pipeline Stages
 

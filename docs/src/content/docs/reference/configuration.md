@@ -569,6 +569,7 @@ Global state persistence: where Rocky stores watermarks, run history, and checkp
 | `valkey_prefix` | string | `"rocky:state:"` | Valkey key prefix for state entries. |
 | `transfer_timeout_seconds` | int | `300` | Wall-clock budget for each transfer (upload *or* download). Retries share this budget rather than extending it; raise for large state or slow networks. |
 | `on_upload_failure` | string | `"skip"` | What to do when upload exhausts retries + circuit-breaker. `"skip"` logs a warning and continues (state goes stale, next run re-derives); `"fail"` propagates the error. |
+| `namespacing` | string | `"none"` | State-file namespacing policy. `"none"` (default) keeps one global state file — byte-identical to a project that omits this key. `"pipeline"` gives each pipeline its own state file (see [State namespacing](#state-namespacing) below). |
 
 **Local (default):**
 
@@ -741,6 +742,107 @@ resource "google_storage_bucket" "rocky_state" {
 - **Bucket lifecycle does not replace `[state.idempotency] retention_days`.** The local redb mirror on each pod still has its own copy of the stamp; Rocky's sweep is what evicts that. Bucket lifecycle handles the durable copy.
 - **In-flight claims (`InFlight`) are TTL-bounded by `in_flight_ttl_hours`, not by the lifecycle rule.** Don't set the lifecycle window shorter than `in_flight_ttl_hours` (default 24) or you risk reaping a live claim.
 - **Tiered backends already serve hits from Valkey first.** A bucket lifecycle that's slightly behind `retention_days` is harmless; Valkey's own TTL evicts the hot copy long before the cold S3/GCS copy expires.
+
+### State namespacing
+
+redb permits **one writer per state file**. Fanning out one `rocky run` process per pipeline or client against the single global state file (`<models>/.rocky-state.redb`) forces those independent runs to serialize on one advisory lock. Namespacing gives each pipeline (or each client/tenant) its own state file — its own lock, its own redb handle, its own remote object key — so runs on distinct namespaces proceed concurrently with zero shared corruption surface.
+
+Namespacing is **opt-in and default-off**. With `namespacing = "none"` (or the key omitted), behavior is **byte-identical** to a project that never set it.
+
+| Mode | Behavior |
+|---|---|
+| `"none"` (default) | One global `<models>/.rocky-state.redb` for the whole project. Identical to today's behavior. |
+| `"pipeline"` | One state file per pipeline, under `<models>/.rocky-state/<pipeline>.redb`. |
+
+```toml
+[state]
+backend = "local"
+namespacing = "pipeline"   # each pipeline gets its own state file
+```
+
+To fan out by **client/tenant** rather than by pipeline name, use the per-invocation [`--state-namespace <key>`](/reference/commands/core-pipeline/#global-flags) flag instead. Its precedence:
+
+1. An explicit `--state-path <path>` is a hard override that **disables** namespacing for that invocation.
+2. Otherwise `--state-namespace <key>` wins over the `[state] namespacing` config.
+3. Neither set ⇒ the single global state file (default).
+
+`<key>` must be a SQL identifier (`^[a-zA-Z0-9_]+$`) — it becomes a path segment. Namespaced files start fresh; the legacy global file is never moved or auto-seeded, so carry watermarks forward manually if needed (copy the global file to `<models>/.rocky-state/<key>.redb`, or point `--state-path` at it for the first run).
+
+---
+
+## `[run]`
+
+Opt-in tuning for the `--skip-unchanged` model-skip gate. The gate lets `rocky run` skip re-materializing a transformation model whose logic **and** every upstream's data both *appear* unchanged since the last successful build.
+
+:::caution[Best-effort, not a result-equivalence guarantee]
+Skipping is a best-effort optimization, **not** a guarantee that a fresh rebuild would produce identical bytes. It rests on heuristics (a cosmetic-invariant IR hash for logic, `MAX(ts)` / rowcount freshness for upstream data). Every field defaults to the safe (no-skip) choice, and **any** missing, unreadable, or ambiguous input rebuilds (fail-safe). The whole feature is off unless `skip_unchanged = true` (or the `--skip-unchanged` flag) is set.
+:::
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `skip_unchanged` | bool | `false` | Master switch for the gate. `false` ⇒ every selected model always builds, exactly as before. The `--skip-unchanged` CLI flag turns the gate on for a single invocation regardless of this value; `--force-rebuild` overrides both. |
+| `skip_rowcount_fallback` | bool | `false` | Allow a rowcount-only (`COUNT(*)`) data-stability signal when an upstream has no tracked timestamp column. Default off: without this, a model whose upstreams are not watermarkable is never skip-eligible. Rowcount equality is weaker than a watermark — it can miss a same-size in-place `UPDATE` (or a matched insert+delete) that mutates values without changing the row count. |
+| `lag_tolerance_seconds` | integer | `0` | Treat an upstream `MAX(ts)` that moved by fewer than this many seconds as unchanged — the late-arriving-but-irrelevant micro-update analog of a freshness SLA threshold. Default `0`: any movement at all forces a rebuild. |
+
+```toml
+[run]
+skip_unchanged = true
+skip_rowcount_fallback = false   # default; only flip on if you accept the weaker signal
+lag_tolerance_seconds = 0        # default; any MAX(ts) movement rebuilds
+```
+
+### What is and is not skip-eligible
+
+A model is skipped only when **both** of these hold; otherwise it always rebuilds (fail-safe):
+
+- **(B) Eligible.** The model uses a plain materialization strategy (**not** `content_addressed` / `time_interval`), its `[skip] eligible` is not `false`, and its SQL is provably deterministic. Non-deterministic SQL is **always rebuilt**: `CURRENT_TIMESTAMP` / `NOW()`, `RANDOM()`, `UUID()`, `CURRENT_USER`, `CURRENT_CATALOG`, `ANY_VALUE`, `ARRAY_AGG`, an unordered `LIMIT`, or any unresolved/unknown function. `full_refresh` **is** eligible (a deterministic full-refresh whose logic and inputs are unchanged is safe to skip).
+- **(G) Upstreams provably unchanged.** Every upstream's data must be provably stable, which requires the model's lineage to be **provably complete**. Only a single plain `SELECT` over bare tables qualifies. Models that use a **CTE**, a subquery in `FROM`, an `IN (SELECT …)` / `EXISTS` / scalar sub-select, a `PIVOT` / `UNNEST` / nested-join table-factor, or a **set operation** (`UNION` / `INTERSECT` / `EXCEPT`) are **never skipped** — their lineage is not provably complete, so Rocky cannot prove it examined every upstream.
+
+`--force-rebuild` plus `full_refresh` always builds.
+
+### Per-model `[skip]` overrides
+
+A model sidecar can override the automatic eligibility decision with a `[skip]` block. See [Model Format](/reference/model-format/) for sidecar structure.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `eligible` | bool | (auto) | `false` ⇒ this model always builds, even when the gate is on and everything else looks unchanged (use for known-volatile models the static scan might miss). `true` ⇒ the model is eligible, subject to the other gate clauses. Unset ⇒ fall back to the automatic eligibility rules. |
+| `deterministic` | bool | (auto) | Owner assertion about the SQL. `true` is the only way a model the static non-determinism scan flagged (timestamps, randomness, unresolved UDFs, …) becomes skip-eligible — an explicit, auditable, per-model opt-in. `false` forces the model to be treated as non-deterministic (never auto-skipped). Unset ⇒ trust the static scan. |
+
+```toml
+# models/fct_orders.toml
+name = "fct_orders"
+
+[skip]
+eligible = true        # opt this model in/out of the gate explicitly
+deterministic = true   # owner asserts the SQL is pure → re-eligible
+```
+
+---
+
+## `[reuse]`
+
+:::caution[Experimental — not live-verified; do not enable in production]
+`[reuse]` is a **preview** surface. It applies **only** to the Databricks–Iceberg content-addressed write path (no DuckDB, Snowflake, or BigQuery), and it has **not yet been live-verified against a warehouse**. Do not enable it in production. This is a config-reference entry only; there is no how-to guide for it yet.
+:::
+
+When `enabled = true`, a successful run records, per model, an input-match index entry and an offline-verifiable provenance record. It attests two things and **only** two things:
+
+1. an **input-logic match** — the model's logic key plus its upstreams' input identities; and
+2. **byte-identity of the bytes Rocky recorded** for that build.
+
+It does **not** attest that a fresh re-run would reproduce those bytes. Even when enabled, the reuse decision path only ever resolves to **BUILD** today (an ONLY-BUILD posture) — a fail-closed verdict is computed but nothing is reused; the live point-to reuse is not yet wired/verified. The spine only *populates* the index.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch for input-match spine population. `false` (default) keeps `rocky run` byte- **and** cost-identical to before the spine existed: no per-model hashing, no extra state write. |
+
+```toml
+[reuse]
+enabled = false   # default; preview-only, not live-verified — leave off in production
+```
+
+The per-invocation `--no-reuse` flag forces every model to build (the escape hatch parallel to `--force-rebuild` for `--skip-unchanged`); the decision path it guards is not yet live, per the caveat above, so today it changes nothing. The provenance side this records is what an auditor reads in [Verify a run](/guides/verify-a-run/).
 
 ---
 

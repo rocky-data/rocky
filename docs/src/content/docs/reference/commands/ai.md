@@ -347,3 +347,113 @@ rocky ai-test fct_revenue --models src/transformations --save
 - [`rocky test`](/reference/commands/modeling/#rocky-test) -- run the generated tests via DuckDB
 - [`rocky ai-explain`](#rocky-ai-explain) -- generate intent that improves test quality
 - [`rocky ci`](/reference/commands/modeling/#rocky-ci) -- compile + test in CI
+
+---
+
+## `rocky mcp`
+
+Run a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server over stdio, exposing Rocky's verification, data-grounding, and draft-generation surface to any MCP-capable agent harness (Claude Desktop, Claude Code, your own client). The server is long-running: it serves until the client disconnects.
+
+```bash
+rocky mcp [flags]
+```
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--config <PATH>` | `PathBuf` | `rocky.toml` | Pipeline config file the server resolves the project from. The models directory is resolved as `<config-dir>/models`. |
+
+The server is **stateless**: every tool call resolves the project from the config + models dir and compiles fresh, so it always reflects the current on-disk files. Logging goes to stderr (stdout is reserved for the MCP wire protocol).
+
+### Local and bring-your-own-key
+
+`rocky mcp` runs entirely **locally against your own infrastructure**. There is no Rocky-hosted service:
+
+- Warehouse-touching tools hit **your own warehouse** with the credentials in your `rocky.toml`.
+- The draft generators call the Anthropic API using **your own `ANTHROPIC_API_KEY`** from the server environment. There is no Rocky vendor in the loop. Without the key set, those tools return a null/empty draft and a `message` explaining why.
+
+What leaves your machine is bounded: warehouse queries go to your warehouse; the generators send your model's SQL and schema — and, for `draft_contract`, aggregate column counts (row / null / distinct) — to **your own** Anthropic key. **No generator sends raw cell values**; `draft_contract` profiles columns to counts only.
+
+### Safety model: read-only and propose-only
+
+The server **never materializes anything**. Materialization stays human-gated:
+
+- The generators (`draft_contract`, `generate_tests`, `explain_model`) return **drafts** and mutate nothing — you save them to disk and run `compile` / `test` yourself.
+- `governance_preview` and `drift_preview` are **read-only** previews.
+- The `propose` tool only writes an **AI-authored plan**; a human runs `rocky review <plan_id> --approve` then `rocky apply <plan_id>`. The server never approves on the user's behalf.
+
+### Tools
+
+**Verify and ground** (read-only; the typed surface a raw shell can't reproduce):
+
+| Tool | What it does |
+|---|---|
+| `compile` | Type-check the project and return diagnostics (errors / warnings). |
+| `plan_preview` | Preview the exact SQL Rocky would execute. Computed offline; no warehouse I/O. |
+| `lineage` | Column-level lineage for a model (or a single column). |
+| `test` | Run the project's DuckDB-backed local tests (contracts + assertions). |
+| `list` | List project entities (`models`, `pipelines`, `adapters`, `sources`). |
+| `inspect_schema` | Typed columns of every model and source table — works at cold start, before anything is materialized. |
+| `catalog` | The project-wide asset catalog (every model + source) in one call. |
+| `breaking_change` | Classify semantic breaking changes between the working tree and a base ref. |
+| `dependents` | List the downstream models that depend on a given model. |
+| `history` | Read run history from the state store. |
+| `metrics` | Read a model's quality-metric snapshots from the state store. |
+| `optimize` | Cost-model materialization recommendations from run history. |
+| `sample_rows` | Sample real rows from a model's target table or a qualified `schema.table`. Hits your warehouse. |
+| `profile_column` | Profile one column of a target table or qualified `schema.table`. Hits your warehouse. |
+| `governance_preview` | DRY-RUN of the classification / masking / retention actions a `rocky run` would reconcile. Computed offline; no warehouse I/O. |
+| `drift_preview` | Source-vs-target schema drift between two warehouse tables. Hits your warehouse. |
+
+**Draft generators** (mutate nothing; require `ANTHROPIC_API_KEY`):
+
+| Tool | What it does |
+|---|---|
+| `draft_contract` | Draft a `.contract.toml` from a model's aggregate per-column profile, compile-verified against its inferred schema. Sends only aggregate statistics — never raw cell values. |
+| `generate_tests` | Draft SQL test assertions (not-null, grain uniqueness, ranges, referential integrity) for a model. |
+| `explain_model` | Draft an intent description for a model from its SQL and schema. |
+| `suggest_freshness_block` | Draft a `[freshness]` TOML block for a model with temporal columns. |
+
+**Propose** (the one write — a plan, not a materialization; no Anthropic key required):
+
+| Tool | What it does |
+|---|---|
+| `propose` | Record an **AI-authored plan** for materializing a model. Writes a plan only — it compiles the project and records the plan offline (no LLM call, no warehouse write). A human must run `rocky review <plan_id> --approve` then `rocky apply <plan_id>`. |
+
+### Prompts (guided trajectories)
+
+The server also exposes MCP prompts that orchestrate the tools above into a guided workflow. Every trajectory **stops at the propose / human-gate step** — it never applies.
+
+| Prompt | What it guides |
+|---|---|
+| `build_model` | Author one model from a plain-language intent through Rocky's inspect → sample → write → compile-loop → propose authoring loop. |
+| `find_untested_models` | Catalog the project, find models with no declarative tests, and draft tests for them. |
+| `add_tests_to_pks` | Add uniqueness + not-null tests to a model's primary-key / unique columns. |
+| `summarize_project` | Produce a structured, read-only summary of the project (uses only read-only tools). |
+| `fix_failing_test` | Run `test`, then for each failure diagnose and draft a fix — stopping at the proposal. |
+
+### Examples
+
+Start the server against the default config:
+
+```bash
+rocky mcp
+```
+
+Start it against a specific project config:
+
+```bash
+rocky mcp --config pipelines/prod.toml
+```
+
+Register it with an MCP client (Claude Code example):
+
+```bash
+claude mcp add rocky -- rocky mcp --config rocky.toml
+```
+
+### Related Commands
+
+- [`rocky ai`](#rocky-ai) -- one-shot model generation from the CLI (no MCP client needed)
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-run) -- execute an approved AI-authored plan (a human runs `rocky review <plan_id> --approve` first)
