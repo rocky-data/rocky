@@ -40,7 +40,9 @@ use rocky_adapter_sdk::{
     AdapterError, AdapterResult, FileFormat, LoadOptions, LoadResult, LoadSource, LoaderAdapter,
     TableRef,
 };
-use rocky_core::arrow_loader::{CsvBatchReader, generate_batch_insert_sql};
+use rocky_core::arrow_loader::{
+    CsvBatchReader, RowBatch, generate_batch_insert_sql, infer_column_types,
+};
 use rocky_core::traits::WarehouseAdapter;
 
 use crate::BigQueryAdapter;
@@ -93,6 +95,62 @@ fn format_target(target: &TableRef) -> String {
             target.catalog, target.schema, target.table
         )
     }
+}
+
+/// Map a generic inferred SQL type name (as produced by
+/// [`infer_column_types`]) to its canonical BigQuery type name.
+///
+/// [`infer_column_types`] emits the DuckDB/generic family
+/// (`BOOLEAN` / `BIGINT` / `DOUBLE` / `TIMESTAMP` / `STRING`); BigQuery's
+/// canonical names are `BOOL` / `INT64` / `FLOAT64` / `TIMESTAMP` /
+/// `STRING` (the names BQ itself logs — see the `FLOAT64` / `INT64`
+/// rationale in `connector.rs`). Anything unrecognized falls back to
+/// `STRING`, which is lossless for the CSV INSERT path.
+fn bq_column_type(generic_type: &str) -> &'static str {
+    match generic_type.to_ascii_uppercase().as_str() {
+        "BOOLEAN" | "BOOL" => "BOOL",
+        "BIGINT" | "INTEGER" | "INT" | "INT64" => "INT64",
+        "DOUBLE" | "FLOAT" | "FLOAT64" => "FLOAT64",
+        "TIMESTAMP" => "TIMESTAMP",
+        _ => "STRING",
+    }
+}
+
+/// Build a `CREATE TABLE IF NOT EXISTS {target_ref} (`col` TYPE, …)`
+/// statement with column types inferred from the CSV batches.
+///
+/// The column list is driven by the CSV header (`column_names`) so a
+/// header-only file (zero data rows, hence no inferred types) still
+/// produces every column — those default to `STRING`. Returns `None`
+/// when there are no columns at all.
+fn build_create_table_sql(
+    target_ref: &str,
+    column_names: &[String],
+    batches: &[RowBatch],
+) -> Option<String> {
+    if column_names.is_empty() {
+        return None;
+    }
+
+    // Inferred types keyed by column name; absent columns (e.g. a
+    // header-only CSV) fall back to STRING below.
+    let inferred: std::collections::HashMap<String, String> = infer_column_types(batches)
+        .into_iter()
+        .map(|c| (c.name, c.data_type))
+        .collect();
+
+    let col_defs: Vec<String> = column_names
+        .iter()
+        .map(|name| {
+            let generic = inferred.get(name).map_or("STRING", String::as_str);
+            format!("`{name}` {}", bq_column_type(generic))
+        })
+        .collect();
+
+    Some(format!(
+        "CREATE TABLE IF NOT EXISTS {target_ref} ({})",
+        col_defs.join(", ")
+    ))
 }
 
 /// Map the SDK [`FileFormat`] to the BigQuery load-job source format.
@@ -229,37 +287,42 @@ impl LoaderAdapter for BigQueryLoaderAdapter {
                 let reader = CsvBatchReader::with_delimiter(local_path, options.batch_size, delim)
                     .map_err(|e| AdapterError::msg(format!("failed to open CSV: {e}")))?;
 
-                // If create_table is requested, infer column names from the
-                // header and create a STRING-columns table. BigQuery type
-                // inference is more involved (would need a sample pass);
-                // STRING is a safe, lossless fallback for the dev-scale
-                // INSERT path.
-                if options.create_table {
-                    let columns = reader.column_names();
-                    if !columns.is_empty() {
-                        let col_defs: Vec<String> =
-                            columns.iter().map(|c| format!("`{c}` STRING")).collect();
-                        let sql = format!(
-                            "CREATE TABLE IF NOT EXISTS {target_ref} ({})",
-                            col_defs.join(", ")
-                        );
-                        debug!(sql = %sql, "ensuring target table exists");
-                        self.adapter
-                            .execute_statement(&sql)
-                            .await
-                            .map_err(|e| AdapterError::msg(e.to_string()))?;
-                    }
+                // Read all batches up front with the caller's delimiter
+                // (re-reading via the comma-only `read_csv_batches` would
+                // misparse a TSV as one column). The whole file is buffered:
+                // this INSERT path is dev-scale by design (see module docs),
+                // and type inference needs the rows anyway. The same batches
+                // then drive the INSERT loop, so the file is read exactly
+                // once.
+                let column_names = reader.column_names().to_vec();
+                let batches: Vec<RowBatch> = reader
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| AdapterError::msg(format!("failed to read CSV batch: {e}")))?;
+
+                // If create_table is requested, infer column TYPES from the
+                // sampled rows and create the table with those types (mapped
+                // to BigQuery's canonical type names). All-STRING would defeat
+                // the typed contract-gate (`rocky load` with a `[contract]`),
+                // which a header-derived STRING column always fails against a
+                // declared `id INT64`. Idempotent via IF NOT EXISTS — no
+                // DESCRIBE / existence round-trip.
+                if options.create_table
+                    && let Some(sql) = build_create_table_sql(&target_ref, &column_names, &batches)
+                {
+                    debug!(sql = %sql, "ensuring target table exists with inferred types");
+                    self.adapter
+                        .execute_statement(&sql)
+                        .await
+                        .map_err(|e| AdapterError::msg(e.to_string()))?;
                 }
 
                 let mut rows_loaded: u64 = 0;
                 let dialect = self.adapter.dialect();
 
-                for batch_res in reader {
-                    let batch = batch_res
-                        .map_err(|e| AdapterError::msg(format!("failed to read CSV batch: {e}")))?;
+                for batch in &batches {
                     let batch_row_count = batch.row_count as u64;
                     let sql =
-                        generate_batch_insert_sql(&batch, &target_ref, dialect).map_err(|e| {
+                        generate_batch_insert_sql(batch, &target_ref, dialect).map_err(|e| {
                             AdapterError::msg(format!("failed to build INSERT SQL: {e}"))
                         })?;
                     debug!(rows = batch_row_count, "inserting CSV batch");
@@ -413,6 +476,88 @@ mod tests {
         let spec = build_load_spec("gs://b/o.csv", &target, FileFormat::Csv, &opts);
         assert_eq!(spec.skip_leading_rows, Some(0));
         assert_eq!(spec.field_delimiter.as_deref(), Some("\t"));
+    }
+
+    #[test]
+    fn bq_column_type_maps_generic_to_canonical_bq_names() {
+        // The generic family infer_column_types emits.
+        assert_eq!(bq_column_type("BOOLEAN"), "BOOL");
+        assert_eq!(bq_column_type("BIGINT"), "INT64");
+        assert_eq!(bq_column_type("DOUBLE"), "FLOAT64");
+        assert_eq!(bq_column_type("TIMESTAMP"), "TIMESTAMP");
+        assert_eq!(bq_column_type("STRING"), "STRING");
+        // Case-insensitive + canonical-name passthrough.
+        assert_eq!(bq_column_type("bigint"), "INT64");
+        assert_eq!(bq_column_type("INT64"), "INT64");
+        assert_eq!(bq_column_type("FLOAT64"), "FLOAT64");
+        // Unknown → STRING (lossless fallback for the INSERT path).
+        assert_eq!(bq_column_type("DECIMAL(10,2)"), "STRING");
+        assert_eq!(bq_column_type(""), "STRING");
+    }
+
+    #[test]
+    fn build_create_table_sql_uses_inferred_types_not_all_string() {
+        let batches = vec![RowBatch {
+            column_names: vec![
+                "id".into(),
+                "amount".into(),
+                "name".into(),
+                "active".into(),
+                "created_at".into(),
+            ],
+            rows: vec![
+                vec![
+                    "1".into(),
+                    "9.99".into(),
+                    "alice".into(),
+                    "true".into(),
+                    "2024-01-15".into(),
+                ],
+                vec![
+                    "2".into(),
+                    "8.50".into(),
+                    "bob".into(),
+                    "false".into(),
+                    "2024-02-20".into(),
+                ],
+            ],
+            row_count: 2,
+        }];
+        let cols = batches[0].column_names.clone();
+        let sql = build_create_table_sql("`p`.`d`.`t`", &cols, &batches).unwrap();
+        assert_eq!(
+            sql,
+            "CREATE TABLE IF NOT EXISTS `p`.`d`.`t` \
+             (`id` INT64, `amount` FLOAT64, `name` STRING, `active` BOOL, `created_at` TIMESTAMP)"
+        );
+        // The whole point: id is NOT all-STRING.
+        assert!(sql.contains("`id` INT64"));
+        assert!(!sql.contains("`id` STRING"));
+        // A date-looking column infers to TIMESTAMP (kept TIMESTAMP, not
+        // downgraded to STRING — STRING would re-fail a `created_at TIMESTAMP`
+        // contract). The INSERT path feeds rocky-core's `format_cell` quoted
+        // string literal `'2024-01-15'` into this column, relying on BigQuery
+        // coercing a string literal to TIMESTAMP — exercised by the live
+        // `load_local_csv_creates_inferred_types` test.
+        assert!(sql.contains("`created_at` TIMESTAMP"));
+    }
+
+    #[test]
+    fn build_create_table_sql_header_only_defaults_to_string() {
+        // A CSV with a header but no data rows: infer_column_types returns
+        // nothing, so every column falls back to STRING — but all columns
+        // are still present (no regression from the old header-derived path).
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let sql = build_create_table_sql("`p`.`d`.`t`", &cols, &[]).unwrap();
+        assert_eq!(
+            sql,
+            "CREATE TABLE IF NOT EXISTS `p`.`d`.`t` (`id` STRING, `name` STRING)"
+        );
+    }
+
+    #[test]
+    fn build_create_table_sql_no_columns_is_none() {
+        assert!(build_create_table_sql("`p`.`d`.`t`", &[], &[]).is_none());
     }
 
     #[test]
