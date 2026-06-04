@@ -789,6 +789,30 @@ impl ModelIr {
         blake3::hash(canonical.as_bytes())
     }
 
+    /// Canonical-JSON encoding of this model.
+    ///
+    /// The exact byte string [`Self::recipe_hash`] hashes: keys sorted at
+    /// every nesting level, no insignificant whitespace, `Option::None`
+    /// fields absent. Round-trips through [`serde_json`] back into a
+    /// [`ModelIr`] without loss.
+    ///
+    /// This is the form an **offline verifier** embeds and re-reads: given
+    /// the stored canonical JSON, a third party can deserialize it back into
+    /// a [`ModelIr`] and recompute [`Self::skip_hash`] independently, without
+    /// trusting the runtime that produced it. It attests an *input-logic
+    /// match* only — never that re-executing the model would reproduce a
+    /// given output (see [`Self::skip_hash`]'s caveat on non-deterministic
+    /// SQL).
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same condition as [`Self::recipe_hash`]: a
+    /// programming error that makes `self` non-JSON-encodable.
+    #[must_use]
+    pub fn canonical_json(&self) -> String {
+        canonical_json(self)
+    }
+
     /// Best-effort *cosmetic-invariant* key for this model's logic.
     ///
     /// Unlike [`Self::recipe_hash`] — which hashes the raw `sql` text so a

@@ -414,6 +414,10 @@ export interface RockyConfig {
    */
   retry?: RunRetryConfig | null;
   /**
+   * Opt-in population of the auditable-reuse input-match spine. Default-OFF: an absent `[reuse]` block keeps `rocky run` byte- and cost-identical (no per-model hashing, no extra state write). Dormant in Stage 1 even when enabled — it only records the index + provenance, it makes no reuse decision. See [`ReuseConfig`].
+   */
+  reuse?: ReuseConfig;
+  /**
    * Hierarchical role declarations reconciled against the warehouse's native role/group system.
    *
    * See [`RoleConfig`] for the TOML shape and [`crate::role_graph::flatten_role_graph`] for the inheritance resolution semantics (DAG walk with cycle detection).
@@ -1684,6 +1688,19 @@ export interface RunRetryConfig {
    * Total number of retries allowed across every adapter for this run. `None` means no cross-adapter cap (each adapter's own `retry.max_retries_per_run` still applies in isolation).
    */
   max_retries_per_run?: number | null;
+}
+/**
+ * `[reuse]` — opt-in population of the auditable-reuse input-match spine.
+ *
+ * When `enabled = true`, a successful run records, per model, an input-match index entry and an offline-verifiable provenance record (the model's logic key, upstream input identities, output blake3(s), and proof class). This is the *input* side of reuse — the index that a future reuse decision will read.
+ *
+ * **Dormant by default.** `enabled = false` (the default) keeps `rocky run` byte- *and* cost-identical to before the spine existed: no extra normalize+hash work, no extra state write. Even when enabled, Stage 1 only *populates* the spine — it makes no reuse decision and skips nothing. The spine attests an *input-logic match*, never that re-running a model would reproduce its output.
+ */
+export interface ReuseConfig {
+  /**
+   * Master switch for input-match spine population. `false` (default) ⇒ the spine is never written and no per-model hashing cost is paid.
+   */
+  enabled?: boolean;
 }
 /**
  * A single entry in the top-level `[role.*]` block, declaring a hierarchical role with optional inheritance and a list of permissions.

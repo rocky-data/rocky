@@ -1000,6 +1000,24 @@ class RetryConfig(BaseModel):
     """
 
 
+class ReuseConfig(BaseModel):
+    """
+    `[reuse]` — opt-in population of the auditable-reuse input-match spine.
+
+    When `enabled = true`, a successful run records, per model, an input-match index entry and an offline-verifiable provenance record (the model's logic key, upstream input identities, output blake3(s), and proof class). This is the *input* side of reuse — the index that a future reuse decision will read.
+
+    **Dormant by default.** `enabled = false` (the default) keeps `rocky run` byte- *and* cost-identical to before the spine existed: no extra normalize+hash work, no extra state write. Even when enabled, Stage 1 only *populates* the spine — it makes no reuse decision and skips nothing. The spine attests an *input-logic match*, never that re-running a model would reproduce its output.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    enabled: bool | None = False
+    """
+    Master switch for input-match spine population. `false` (default) ⇒ the spine is never written and no per-model hashing cost is paid.
+    """
+
+
 class RoleConfig(BaseModel):
     """
     A single entry in the top-level `[role.*]` block, declaring a hierarchical role with optional inheritance and a list of permissions.
@@ -3108,6 +3126,10 @@ class RockyConfig(BaseModel):
     When set, `rocky run` builds a single [`crate::retry_budget::RetryBudget`] from [`RunRetryConfig::max_retries_per_run`] and passes it to every connector via `with_retry_budget(...)`. One bad table that burns through retries on adapter A then has less budget available for adapter B's retries — the protection §P2.7 added within a single adapter now extends across the whole run.
 
     Unset (the default) preserves per-adapter semantics: each adapter still honours its own `retry.max_retries_per_run` independently. That's the backward-compatible path and stays the right choice when adapters have wildly different rate limits.
+    """
+    reuse: ReuseConfig | None = Field({"enabled": False}, validate_default=True)
+    """
+    Opt-in population of the auditable-reuse input-match spine. Default-OFF: an absent `[reuse]` block keeps `rocky run` byte- and cost-identical (no per-model hashing, no extra state write). Dormant in Stage 1 even when enabled — it only records the index + provenance, it makes no reuse decision. See [`ReuseConfig`].
     """
     role: dict[str, RoleConfig] | None = Field({}, validate_default=True)
     """

@@ -84,6 +84,7 @@ pub async fn run_transformation(
             // run_local has no `--model` selection; defer is a no-op here.
             &super::run::DeferOptions::default(),
             skip_gate,
+            rocky_cfg.reuse.enabled,
         )
         .await?;
     } else {
