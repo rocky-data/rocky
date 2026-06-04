@@ -2184,7 +2184,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     let result: Result<()> = match cli.command {
         Command::Init { path, template } => rocky_cli::commands::init(&path, Some(&template)),
         Command::Apply { plan_id } => {
-            rocky_cli::commands::run_apply(&cli.config, &plan_id, json).await
+            rocky_cli::commands::run_apply(&cli.config, &plan_id, &state_path, json).await
         }
         Command::Review {
             plan_id,
@@ -2308,6 +2308,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     promote_filter.as_deref(),
                     promote_pipeline.as_deref(),
                     allow_breaking,
+                    &state_path,
                     json,
                 )
                 .await
@@ -3247,7 +3248,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
         }
         Command::Watch { models, contracts } => {
-            rocky_cli::commands::run_watch(&models, contracts.as_deref(), json).await
+            rocky_cli::commands::run_watch(
+                &models,
+                contracts.as_deref(),
+                state_namespace.as_deref(),
+                json,
+            )
+            .await
         }
         Command::Fmt { paths, check } => rocky_cli::commands::run_fmt(&paths, check),
         Command::ExportSchemas { output_dir } => rocky_cli::commands::export_schemas(&output_dir),

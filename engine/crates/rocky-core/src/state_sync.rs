@@ -97,6 +97,16 @@ fn cloud_provider(
     bucket: &str,
     prefix: &str,
 ) -> Result<ObjectStoreProvider, StateSyncError> {
+    // Test seam: when a test has installed an in-memory provider via
+    // `test_support::install`, route every object-store construction to it so
+    // the real `upload_state → strip → dispatch → upload_to_object_store` path
+    // can be exercised end-to-end without a live cloud client. Production
+    // builds never compile this branch.
+    #[cfg(test)]
+    if let Some(provider) = test_support::current_override() {
+        return Ok(provider);
+    }
+
     let trimmed_prefix = prefix.trim_end_matches('/');
     let uri = if trimmed_prefix.is_empty() {
         format!("{scheme}://{bucket}")
@@ -104,6 +114,48 @@ fn cloud_provider(
         format!("{scheme}://{bucket}/{trimmed_prefix}")
     };
     Ok(ObjectStoreProvider::from_uri(&uri)?)
+}
+
+/// Test-only support for injecting an in-memory object store into the upload
+/// dispatch path. Lets a `#[cfg(test)]` test drive the real
+/// `upload_state → strip → dispatch → upload_to_object_store → cloud_provider`
+/// chain against [`ObjectStoreProvider::in_memory`] instead of a live cloud
+/// client, so it observes the *actual* remote key the upload path computes
+/// (the round-trip-via-`provider.upload_file` test cannot, because it
+/// precomputes the key and skips dispatch entirely).
+#[cfg(test)]
+mod test_support {
+    use super::ObjectStoreProvider;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static PROVIDER_OVERRIDE: RefCell<Option<ObjectStoreProvider>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Install `provider` as the next provider [`super::cloud_provider`] hands
+    /// out on this thread. Returns a clone so the caller retains a handle to
+    /// assert on after the upload (the in-memory store is `Arc`-backed, so the
+    /// clone shares storage with the installed copy).
+    pub(super) fn install(provider: ObjectStoreProvider) -> ObjectStoreProvider {
+        let handle = provider.clone();
+        PROVIDER_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(provider));
+        handle
+    }
+
+    /// Clone the installed override, if any. Returns a clone (rather than
+    /// removing it) so every object-store construction on this thread — e.g.
+    /// both the Valkey and S3 legs of a tiered upload — sees the same
+    /// `Arc`-backed store until the test calls [`clear`].
+    pub(super) fn current_override() -> Option<ObjectStoreProvider> {
+        PROVIDER_OVERRIDE.with(|cell| cell.borrow().clone())
+    }
+
+    /// Clear any installed override so it can't leak into a later test on the
+    /// same thread.
+    pub(super) fn clear() {
+        PROVIDER_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    }
 }
 
 /// Resolve the per-transfer wall-clock budget from `StateConfig`.
@@ -202,9 +254,19 @@ pub async fn upload_state_with_excluded_tables(
         debug!("No local state file to upload");
         return Ok(());
     }
+    // Derive the remote object key ONCE from the original local path, before
+    // any strip/scratch copy. The strip path writes the filtered copy under
+    // `std::env::temp_dir()`, whose parent is `/tmp` — re-deriving the key
+    // from the scratch path would always yield the legacy `state.redb`, so a
+    // namespaced upload would silently clobber the shared object while the
+    // download read the (never-written) namespaced key. Computing it here and
+    // threading it down keeps the key tied to the namespace regardless of
+    // which physical file reaches the upload leaf.
+    let remote_key = remote_state_key(local_path);
+
     if excluded_tables.is_empty() || matches!(config.backend, StateBackend::Local) {
         // Fast path: nothing to strip or local backend is a no-op anyway.
-        let result = dispatch_upload(config, local_path).await;
+        let result = dispatch_upload(config, local_path, &remote_key).await;
         return apply_upload_failure_policy(config, result);
     }
 
@@ -220,11 +282,11 @@ pub async fn upload_state_with_excluded_tables(
             // Fall back to the unfiltered local path so a transient filter
             // failure doesn't block state durability. The filter is a
             // correctness hedge, not a hard privacy boundary.
-            let result = dispatch_upload(config, local_path).await;
+            let result = dispatch_upload(config, local_path, &remote_key).await;
             return apply_upload_failure_policy(config, result);
         }
     };
-    let result = dispatch_upload(config, &scratch).await;
+    let result = dispatch_upload(config, &scratch, &remote_key).await;
     // Scratch files live under `std::env::temp_dir()`; best-effort cleanup
     // on success or failure. A leaked scratch DB on this run is a small
     // cost the OS cleans up at reboot.
@@ -298,7 +360,18 @@ fn strip_local_only_tables(
 /// applying the `on_upload_failure` policy. Tiered recursion uses this
 /// directly so the skip/fail decision is evaluated exactly once at the
 /// outermost `upload_state` call, not per-leg.
-async fn dispatch_upload(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
+///
+/// `remote_key` is the object key derived from the *original* local path by
+/// [`upload_state_with_excluded_tables`]. It is threaded explicitly (rather
+/// than re-derived from `local_path`) because the filter path passes a scratch
+/// copy under `std::env::temp_dir()` whose parent would resolve back to the
+/// legacy `state.redb` key — see the comment at the top of
+/// [`upload_state_with_excluded_tables`].
+async fn dispatch_upload(
+    config: &StateConfig,
+    local_path: &Path,
+    remote_key: &str,
+) -> Result<(), StateSyncError> {
     match config.backend {
         StateBackend::Local => {
             debug!("State backend: local (no sync needed)");
@@ -314,6 +387,7 @@ async fn dispatch_upload(config: &StateConfig, local_path: &Path) -> Result<(), 
                 bucket,
                 prefix,
                 local_path,
+                remote_key,
                 transfer_timeout(config),
                 &config.retry,
             )
@@ -329,12 +403,13 @@ async fn dispatch_upload(config: &StateConfig, local_path: &Path) -> Result<(), 
                 bucket,
                 prefix,
                 local_path,
+                remote_key,
                 transfer_timeout(config),
                 &config.retry,
             )
             .await
         }
-        StateBackend::Valkey => upload_to_valkey(config, local_path).await,
+        StateBackend::Valkey => upload_to_valkey(config, local_path, remote_key).await,
         StateBackend::Tiered => {
             // Write to both Valkey (fast) and S3 (durable)
             info!("State backend: tiered (uploading to Valkey + S3)");
@@ -350,13 +425,15 @@ async fn dispatch_upload(config: &StateConfig, local_path: &Path) -> Result<(), 
             // Valkey first (fast, best-effort). Recurse into the *inner*
             // dispatch so `on_upload_failure` is not applied here — the
             // outer `upload_state` owns that decision for the tiered leg
-            // as a whole.
-            if let Err(e) = Box::pin(dispatch_upload(&valkey_config, local_path)).await {
+            // as a whole. The same `remote_key` flows to both legs so a
+            // namespaced upload lands at `<ns>.redb` on Valkey and S3 alike.
+            if let Err(e) = Box::pin(dispatch_upload(&valkey_config, local_path, remote_key)).await
+            {
                 warn!(error = %e, "Valkey upload failed (non-fatal, S3 is durable)");
             }
 
             // S3 second (durable, required)
-            Box::pin(dispatch_upload(&s3_config, local_path)).await
+            Box::pin(dispatch_upload(&s3_config, local_path, remote_key)).await
         }
     }
 }
@@ -447,11 +524,11 @@ async fn upload_to_object_store(
     bucket: &str,
     prefix: &str,
     local_path: &Path,
+    key: &str,
     timeout: Duration,
     retry: &RetryConfig,
 ) -> Result<(), StateSyncError> {
     let provider = cloud_provider(scheme, bucket, prefix)?;
-    let key = remote_state_key(local_path);
     let size_bytes = local_path.metadata().map(|m| m.len()).unwrap_or(0);
     let span = info_span!(
         "state.upload",
@@ -467,7 +544,7 @@ async fn upload_to_object_store(
         let retries = with_transfer_timeout(timeout, async {
             retry_transient(retry, "state.upload.object_store", || async {
                 provider
-                    .upload_file(local_path, &key)
+                    .upload_file(local_path, key)
                     .await
                     .map_err(StateSyncError::from)
             })
@@ -589,7 +666,11 @@ async fn download_from_valkey(
 /// Mirrors [`download_from_valkey`]: offloads the blocking redis SET via
 /// `spawn_blocking` and wraps the handle with `with_transfer_timeout` so a
 /// hung Valkey peer cannot stall the run past the configured budget.
-async fn upload_to_valkey(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
+async fn upload_to_valkey(
+    config: &StateConfig,
+    local_path: &Path,
+    remote_key: &str,
+) -> Result<(), StateSyncError> {
     let url = config
         .valkey_url
         .as_deref()
@@ -600,7 +681,7 @@ async fn upload_to_valkey(config: &StateConfig, local_path: &Path) -> Result<(),
         .as_deref()
         .unwrap_or(DEFAULT_VALKEY_PREFIX)
         .to_string();
-    let key = format!("{prefix}{}", remote_state_key(local_path));
+    let key = format!("{prefix}{remote_key}");
     let data = std::fs::read(local_path)?;
     let size_bytes = data.len() as u64;
     let timeout = transfer_timeout(config);
@@ -1049,6 +1130,71 @@ mod tests {
         provider.download_file(&key_b, &b_back).await.unwrap();
         assert_eq!(std::fs::read(&a_back).unwrap(), b"AAAA");
         assert_eq!(std::fs::read(&b_back).unwrap(), b"BBBB");
+    }
+
+    // Regression: the *upload* dispatch must land a namespaced state file at
+    // its `<ns>.redb` remote key, NOT the legacy shared `state.redb`. The
+    // strip path copies the file to a scratch under `std::env::temp_dir()`;
+    // before the fix the leaf re-derived the key from that scratch's parent
+    // (`/tmp`) and always wrote `state.redb`, so every namespace clobbered the
+    // shared object on upload while download read the never-written namespaced
+    // key (perpetual cold start). This drives the *real*
+    // `upload_state → strip → dispatch → upload_to_object_store → cloud_provider`
+    // chain via an injected in-memory store — it does NOT precompute the key
+    // and call `provider.upload_file` directly the way
+    // `test_remote_keys_round_trip_without_clobber` does, so it exercises the
+    // path that was actually broken.
+    //
+    // The seed writes a real redb with a schema_cache entry (a local-only
+    // table), so the strip path genuinely runs and the scratch copy is taken —
+    // a non-redb seed would make strip fail, fall back to the unfiltered local
+    // path, and the test would pass against the *unfixed* code.
+    async fn assert_namespaced_upload_key(backend: StateBackend) {
+        // Defensive: clear any override a prior test on this worker thread may
+        // have left armed (the thread-local persists across tests on reuse).
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let ns_dir = dir.path().join(crate::state::STATE_NAMESPACE_DIR);
+        std::fs::create_dir_all(&ns_dir).unwrap();
+        let local = ns_dir.join("acme.redb");
+        seed_watermark_and_cache(&local);
+
+        let label = backend.to_string();
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+
+        let config = StateConfig {
+            backend,
+            s3_bucket: Some("test-bucket".into()),
+            gcs_bucket: Some("test-bucket".into()),
+            ..Default::default()
+        };
+
+        // Default upload path: strips the schema cache into a /tmp scratch,
+        // then dispatches. The remote key must still be derived from `local`.
+        upload_state(&config, &local).await.unwrap();
+
+        test_support::clear();
+
+        // The namespaced object exists at `acme.redb`...
+        assert!(
+            provider.exists("acme.redb").await.unwrap(),
+            "{label} upload must land at the namespaced key `acme.redb`"
+        );
+        // ...and the legacy shared key was NOT written (the clobber).
+        assert!(
+            !provider.exists("state.redb").await.unwrap(),
+            "{label} upload must NOT write the shared legacy `state.redb` for a namespaced file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_namespaced_upload_lands_at_ns_key_s3() {
+        assert_namespaced_upload_key(StateBackend::S3).await;
+    }
+
+    #[tokio::test]
+    async fn test_namespaced_upload_lands_at_ns_key_gcs() {
+        assert_namespaced_upload_key(StateBackend::Gcs).await;
     }
 
     #[test]

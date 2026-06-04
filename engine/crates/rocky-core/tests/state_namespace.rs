@@ -162,6 +162,30 @@ fn namespace_validation_rejects_path_traversal() {
     assert!(!resolved.path().to_string_lossy().contains("escape"));
 }
 
+// FIX 3 — when the `.rocky-state/` namespace dir can't be created because the
+// path already exists as a *file* (e.g. a stray dotfile), resolution falls
+// back to the global state path instead of composing a path that would only
+// fail later at lock-open with an opaque I/O error.
+#[test]
+fn ns_dir_collides_with_file_falls_back_to_global() {
+    let dir = TempDir::new().unwrap();
+    let models_dir = dir.path().join("models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+
+    // Plant a regular file where the namespace directory would go.
+    let collision = models_dir.join(STATE_NAMESPACE_DIR);
+    std::fs::write(&collision, b"not a directory").unwrap();
+
+    let resolved = resolve_state_path_ns(None, &models_dir, Some("acme"));
+    // Falls back to the global resolution rather than the namespaced file.
+    assert_eq!(
+        resolved.path(),
+        resolve_state_path(None, &models_dir).path(),
+        "a non-directory namespace path must fall back to the global state file"
+    );
+    assert!(!resolved.path().ends_with("acme.redb"));
+}
+
 // ---------------------------------------------------------------------------
 // R2 — N concurrent namespaced writers, zero lock contention (core relief).
 //

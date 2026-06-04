@@ -2769,7 +2769,10 @@ pub fn resolve_state_path(explicit: Option<&Path>, models_dir: &Path) -> Resolve
 ///    (see [`validate_namespace`]), which makes path traversal impossible.
 ///    The `.rocky-state/` parent directory is created on resolution so the
 ///    later advisory-lock open (whose first filesystem op is opening
-///    `<...>/<ns>.redb.lock`) doesn't fail on a missing parent.
+///    `<...>/<ns>.redb.lock`) doesn't fail on a missing parent. If that
+///    directory can't be created — or already exists as a non-directory — this
+///    falls back to the global resolution with a `rocky::state_path` warning
+///    rather than composing a path that would only fail later at lock-open.
 ///
 /// The advisory `.redb.lock` derivation in [`StateStore::open`] needs no
 /// change: `path.with_extension("redb.lock")` composes with the nested path,
@@ -2815,11 +2818,29 @@ pub fn resolve_state_path_ns(
     };
 
     let ns_dir = models_dir.join(STATE_NAMESPACE_DIR);
-    // Best-effort create of the namespaced parent dir. If creation fails the
-    // later `StateStore::open` will surface the I/O error with a clear
-    // `LockIo`/redb message; we don't swallow-and-fall-back here because the
-    // namespaced path is what the caller asked for.
-    let _ = std::fs::create_dir_all(&ns_dir);
+    // Create the namespaced parent dir up front. If the path already exists as
+    // a non-directory (e.g. a stray `.rocky-state` file from the legacy global
+    // layout), or creation fails for any other reason, fall back to the global
+    // resolution with a targeted warning rather than composing a path that
+    // would only fail later with an opaque lock-open I/O error.
+    if ns_dir.exists() && !ns_dir.is_dir() {
+        tracing::warn!(
+            target: "rocky::state_path",
+            path = %ns_dir.display(),
+            "state namespace directory path exists but is not a directory; \
+             falling back to the global state file (move or remove it to enable namespacing)"
+        );
+        return resolve_state_path(explicit, models_dir);
+    }
+    if let Err(e) = std::fs::create_dir_all(&ns_dir) {
+        tracing::warn!(
+            target: "rocky::state_path",
+            path = %ns_dir.display(),
+            error = %e,
+            "failed to create state namespace directory; falling back to the global state file"
+        );
+        return resolve_state_path(explicit, models_dir);
+    }
 
     ResolvedStatePath {
         path: ns_dir.join(format!("{sanitized}.redb")),

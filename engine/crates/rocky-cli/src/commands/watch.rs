@@ -14,9 +14,16 @@ use super::compile::run_compile;
 ///
 /// Watches `models_dir` for `.sql`, `.rocky`, and `.toml` file changes,
 /// debounces for 200 ms, then runs `rocky compile`. Blocks until Ctrl-C.
+///
+/// `state_namespace` is the resolved `--state-namespace` (or
+/// `[state] namespacing`) value threaded from `main.rs`, so the compile-time
+/// schema-cache read sees the same namespaced state file that `rocky run`
+/// targets. `None` (the default) keeps the global file, byte-identical to
+/// before.
 pub async fn run_watch(
     models_dir: &Path,
     contracts_dir: Option<&Path>,
+    state_namespace: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
     // Validate the models directory exists before starting the watcher.
@@ -26,7 +33,7 @@ pub async fn run_watch(
 
     // Initial compile so the user gets immediate feedback.
     println!("[watch] compiling...");
-    print_compile_result(models_dir, contracts_dir, output_json);
+    print_compile_result(models_dir, contracts_dir, state_namespace, output_json);
     println!("[watch] waiting for changes...");
 
     // Channel for watcher → debounce task communication.
@@ -86,7 +93,7 @@ pub async fn run_watch(
                 }
 
                 println!("[watch] compiling...");
-                print_compile_result(models_dir, contracts_dir, output_json);
+                print_compile_result(models_dir, contracts_dir, state_namespace, output_json);
                 println!("[watch] waiting for changes...");
             }
             _ = tokio::signal::ctrl_c() => {
@@ -99,14 +106,22 @@ pub async fn run_watch(
 
 /// Run compile and print the result. Errors are printed, not propagated,
 /// so the watch loop continues after a failed compilation.
-fn print_compile_result(models_dir: &Path, contracts_dir: Option<&Path>, output_json: bool) {
+fn print_compile_result(
+    models_dir: &Path,
+    contracts_dir: Option<&Path>,
+    state_namespace: Option<&str>,
+    output_json: bool,
+) {
     // Watch doesn't take a `--state-path` arg today; resolve via the
-    // unified helper so the compile-time schema-cache read sees the same
-    // file that `rocky run` and the LSP see. Fresh projects with no
-    // runs yet still land on the new default
-    // `<models>/.rocky-state.redb` and the cache loader gracefully
-    // returns an empty map.
-    let resolved = rocky_core::state::resolve_state_path(None, models_dir);
+    // namespace-aware helper so the compile-time schema-cache read sees the
+    // same file that `rocky run` and the LSP see. The resolver is keyed off
+    // this command's `models_dir` (which honors `--models`), not the global
+    // `"models"` default, so threading the namespace here — rather than the
+    // already-resolved global state_path — preserves `--models`-relative
+    // resolution. Fresh projects with no runs yet still land on the default
+    // (`<models>/.rocky-state.redb` or `<models>/.rocky-state/<ns>.redb`) and
+    // the cache loader gracefully returns an empty map.
+    let resolved = rocky_core::state::resolve_state_path_ns(None, models_dir, state_namespace);
     if let Some(ref w) = resolved.warning {
         warn!(target: "rocky::state_path", "{w}");
     }

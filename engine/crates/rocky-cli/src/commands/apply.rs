@@ -54,9 +54,21 @@ use super::compact::run_compact_apply_in;
 ///
 /// Reads the plan from `.rocky/plans/<plan_id>.json`, dispatches by kind,
 /// and emits an `ApplyOutput` envelope wrapping the inner result.
-pub async fn run_apply(config_path: &Path, plan_id: &str, output_json: bool) -> Result<()> {
+///
+/// `state_path` is the already-resolved state-file path threaded from
+/// `main.rs` — it is namespace-aware (`resolve_state_path_ns`), so
+/// `rocky --state-namespace <ns> apply <plan>` opens the namespaced state
+/// file rather than re-resolving the global one. This keeps the canonical
+/// `rocky plan` → `rocky apply` workflow consistent with `rocky run`, whose
+/// inline apply already receives the same path.
+pub async fn run_apply(
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    output_json: bool,
+) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    run_apply_in(&cwd, config_path, plan_id, output_json).await
+    run_apply_in(&cwd, config_path, plan_id, state_path, output_json).await
 }
 
 /// Inner implementation — takes an explicit `root` for the plans directory so
@@ -65,6 +77,7 @@ pub(crate) async fn run_apply_in(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
+    state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
     let plan =
@@ -80,13 +93,15 @@ pub(crate) async fn run_apply_in(
             // Delegate to the existing archive apply path.
             run_archive_apply_in(root, config_path, plan_id, output_json).await
         }
-        PlanKind::Run => run_apply_run_plan(root, config_path, plan_id, output_json).await,
+        PlanKind::Run => {
+            run_apply_run_plan(root, config_path, plan_id, state_path, output_json).await
+        }
         PlanKind::Replication => {
-            run_apply_replication_plan(root, config_path, plan_id, output_json).await
+            run_apply_replication_plan(root, config_path, plan_id, state_path, output_json).await
         }
         PlanKind::Promote => run_apply_promote_plan(root, config_path, plan_id, output_json).await,
         PlanKind::AiAuthored => {
-            run_apply_ai_authored_plan(root, config_path, plan_id, output_json).await
+            run_apply_ai_authored_plan(root, config_path, plan_id, state_path, output_json).await
         }
     }
 }
@@ -104,6 +119,7 @@ async fn run_apply_run_plan(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
+    state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
     let plan =
@@ -121,7 +137,7 @@ async fn run_apply_run_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize run plan payload")?;
 
-    execute_run_plan(config_path, plan_id, run_plan, output_json).await
+    execute_run_plan(config_path, plan_id, run_plan, state_path, output_json).await
 }
 
 /// Execute a deserialized [`RunPlan`] against the warehouse.
@@ -138,6 +154,7 @@ async fn execute_run_plan(
     config_path: &Path,
     plan_id: &str,
     run_plan: RunPlan,
+    state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
     // Build partition options from the persisted flags.
@@ -151,10 +168,11 @@ async fn execute_run_plan(
         parallel: run_plan.parallel,
     };
 
-    // Resolve the state path via the standard resolver (mirrors main.rs).
-    // Used both by branch→shadow resolution below and by `run` itself.
-    let resolved = rocky_core::state::resolve_state_path(None, std::path::Path::new("models"));
-    let state_path = resolved.path;
+    // `state_path` is the namespace-aware path threaded from main.rs (mirrors
+    // how `rocky run`'s inline apply receives it). Used both by branch→shadow
+    // resolution below and by `run` itself, so `rocky --state-namespace <ns>
+    // apply <plan>` writes to the namespaced state file rather than the global
+    // one.
 
     // Shadow config. Mirrors the `Command::Run` dispatch in main.rs:
     // `--branch` is internally equivalent to `--shadow --shadow-schema
@@ -167,7 +185,7 @@ async fn execute_run_plan(
         .clone()
         .unwrap_or_else(|| "_rocky_shadow".to_string());
     let shadow_config = if let Some(ref name) = run_plan.branch {
-        let store = rocky_core::state::StateStore::open_read_only(&state_path)
+        let store = rocky_core::state::StateStore::open_read_only(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
         let record = store.get_branch(name)?.with_context(|| {
             format!("branch '{name}' not found — create it with `rocky branch create {name}`")
@@ -213,7 +231,7 @@ async fn execute_run_plan(
         config_path,
         run_plan.filter.as_deref(),
         run_plan.pipeline.as_deref(),
-        &state_path,
+        state_path,
         run_plan.governance_override.as_ref(),
         output_json,
         models_dir_path.as_deref(),
@@ -270,6 +288,7 @@ async fn run_apply_ai_authored_plan(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
+    state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
     let plan = read_plan(root, plan_id)
@@ -295,7 +314,7 @@ async fn run_apply_ai_authored_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize ai_authored plan payload")?;
 
-    execute_run_plan(config_path, plan_id, run_plan, output_json).await
+    execute_run_plan(config_path, plan_id, run_plan, state_path, output_json).await
 }
 
 /// Apply a `PlanKind::Replication` plan by re-running discovery, asserting
@@ -312,6 +331,7 @@ async fn run_apply_replication_plan(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
+    state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
     let plan = read_plan(root, plan_id)
@@ -409,17 +429,15 @@ async fn run_apply_replication_plan(
     // Snapshot matched — delegate to the existing replication codepath
     // by calling `commands::run::run` with model-related args set to
     // defaults. The replication arm inside `run` handles everything
-    // from here.
-    let resolved = rocky_core::state::resolve_state_path(None, std::path::Path::new("models"));
-    let state_path = resolved.path;
-
+    // from here. `state_path` is the namespace-aware path threaded from
+    // main.rs, so a namespaced replication apply writes the namespaced file.
     let partition_opts = crate::commands::run::PartitionRunOptions::default();
 
     crate::commands::run::run(
         config_path,
         replication_plan.filter.as_deref(),
         replication_plan.pipeline.as_deref(),
-        &state_path,
+        state_path,
         replication_plan.governance_override.as_ref(),
         output_json,
         // No models directory — replication-only apply does not run
@@ -955,6 +973,7 @@ mod tests {
             dir.path(),
             std::path::Path::new("rocky.toml"),
             &plan_id,
+            std::path::Path::new("models/.rocky-state.redb"),
             true,
         )
         .await
