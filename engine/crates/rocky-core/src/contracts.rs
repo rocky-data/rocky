@@ -268,25 +268,29 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
     match upper.as_str() {
         "BOOLEAN" | "BOOL" => RockyType::Boolean,
         "TINYINT" | "BYTE" | "SMALLINT" | "SHORT" | "INT" | "INTEGER" => RockyType::Int32,
-        "BIGINT" | "LONG" => RockyType::Int64,
+        // `INT64` / `FLOAT64` / `BYTES` / `DATETIME` are BigQuery's scalar names.
+        "BIGINT" | "LONG" | "INT64" => RockyType::Int64,
         "FLOAT" | "REAL" => RockyType::Float32,
-        "DOUBLE" | "DOUBLE PRECISION" => RockyType::Float64,
+        "DOUBLE" | "DOUBLE PRECISION" | "FLOAT64" => RockyType::Float64,
         "STRING" | "VARCHAR" | "TEXT" => RockyType::String,
-        "BINARY" => RockyType::Binary,
+        "BINARY" | "BYTES" => RockyType::Binary,
         "DATE" => RockyType::Date,
         "TIMESTAMP" => RockyType::Timestamp,
-        "TIMESTAMP_NTZ" => RockyType::TimestampNtz,
+        // BigQuery `DATETIME` is a timezone-naive timestamp.
+        "TIMESTAMP_NTZ" | "DATETIME" => RockyType::TimestampNtz,
         "VARIANT" => RockyType::Variant,
         // DECIMAL / NUMERIC (ANSI, Databricks, BigQuery) and NUMBER
         // (Snowflake's fixed-point name). Snowflake's `DESCRIBE` returns
         // `NUMBER(38,0)`, so it must normalize to the same RockyType as a
         // contract written `DECIMAL(38,0)` for the contract to port.
         _ if upper.starts_with("DECIMAL")
+            || upper.starts_with("BIGNUMERIC")
             || upper.starts_with("NUMERIC")
             || upper.starts_with("NUMBER") =>
         {
             if let Some(params) = upper
                 .strip_prefix("DECIMAL(")
+                .or_else(|| upper.strip_prefix("BIGNUMERIC("))
                 .or_else(|| upper.strip_prefix("NUMERIC("))
                 .or_else(|| upper.strip_prefix("NUMBER("))
                 .and_then(|s| s.strip_suffix(')'))
@@ -534,6 +538,15 @@ mod tests {
             warehouse_type_to_rocky("SOMETHING_WEIRD"),
             RockyType::Unknown
         );
+        // BigQuery scalar names.
+        assert_eq!(warehouse_type_to_rocky("INT64"), RockyType::Int64);
+        assert_eq!(warehouse_type_to_rocky("FLOAT64"), RockyType::Float64);
+        assert_eq!(warehouse_type_to_rocky("BYTES"), RockyType::Binary);
+        assert_eq!(warehouse_type_to_rocky("DATETIME"), RockyType::TimestampNtz);
+        assert!(matches!(
+            warehouse_type_to_rocky("BIGNUMERIC(76,38)"),
+            RockyType::Decimal { .. }
+        ));
     }
 
     #[test]
