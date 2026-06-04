@@ -81,10 +81,11 @@ pub(crate) enum GateDecision {
 pub(crate) struct SkipGate<'a> {
     /// Resolved gate configuration (feature flags, tolerances).
     cfg: super::run::SkipGateConfig,
-    /// `target catalog.schema.table` → model name, for every model in the
-    /// project. Lets B3 classify an IR source ref as "produced by a Rocky
-    /// model this run" (→ recursion) vs "raw source" (→ `MAX(ts)`/`COUNT`).
-    target_to_model: HashMap<String, String>,
+    /// Lowercased identities that belong to a **project model** — either the
+    /// model's name or its `catalog.schema.table` target. Lets B3 classify a
+    /// referenced table as "produced by a Rocky model" (→ recursion verdict)
+    /// vs "raw source" (→ `MAX(ts)`/`COUNT(*)` freshness probe).
+    model_identities: std::collections::HashSet<String>,
     /// `model name` → resolved upstream **model** names (the DAG edges). The
     /// authoritative recursion signal — a name here is always a project model.
     depends_on: HashMap<String, Vec<String>>,
@@ -103,19 +104,24 @@ impl<'a> SkipGate<'a> {
         cfg: super::run::SkipGateConfig,
         project: &'a rocky_compiler::project::Project,
     ) -> Self {
-        let mut target_to_model = HashMap::with_capacity(project.models.len());
+        let mut model_identities = std::collections::HashSet::new();
         let mut depends_on = HashMap::with_capacity(project.models.len());
         for model in &project.models {
+            model_identities.insert(model.config.name.to_lowercase());
             let t = &model.config.target;
-            let key = format!("{}.{}.{}", t.catalog, t.schema, t.table);
-            target_to_model.insert(key, model.config.name.clone());
+            // Both the fully-qualified `catalog.schema.table` and the
+            // schema-qualified `schema.table` form, since a referenced table
+            // may be written either way.
+            model_identities
+                .insert(format!("{}.{}.{}", t.catalog, t.schema, t.table).to_lowercase());
+            model_identities.insert(format!("{}.{}", t.schema, t.table).to_lowercase());
         }
         for node in &project.dag_nodes {
             depends_on.insert(node.name.clone(), node.depends_on.clone());
         }
         Self {
             cfg,
-            target_to_model,
+            model_identities,
             depends_on,
             verdict_map: HashMap::new(),
             _marker: std::marker::PhantomData,
@@ -153,14 +159,14 @@ impl<'a> SkipGate<'a> {
         state_store: Option<&StateStore>,
     ) -> GateDecision {
         // Current logic key + upstream signatures, needed for the Build path
-        // regardless of the verdict.
+        // regardless of the verdict. `None` upstream sigs ⇒ we could not
+        // enumerate this model's raw-source upstreams (SQL won't parse) ⇒ B3
+        // is unprovable ⇒ the model must build.
         let current_skip_hash = typed_ir.skip_hash().map(|h| h.to_hex().to_string());
-        let upstream_sigs = self
-            .compute_upstream_sigs(model, typed_ir, warehouse)
-            .await;
+        let upstream_sigs = self.compute_upstream_sigs(model, warehouse).await;
         let skip_state = ModelSkipState {
             skip_hash: current_skip_hash.clone(),
-            upstream_freshness: upstream_sigs.clone(),
+            upstream_freshness: upstream_sigs.clone().unwrap_or_default(),
         };
         let build = || GateDecision::Build {
             skip_state: skip_state.clone(),
@@ -170,6 +176,12 @@ impl<'a> SkipGate<'a> {
         if !self.is_eligible(model, typed_ir) {
             return build();
         }
+
+        // Raw-source upstreams must be enumerable to prove B3. Unparseable
+        // SQL ⇒ unknown upstreams ⇒ build.
+        let Some(upstream_sigs) = upstream_sigs else {
+            return build();
+        };
 
         // State store is required to read a prior baseline. No store ⇒ build.
         let Some(store) = state_store else {
@@ -315,68 +327,58 @@ impl<'a> SkipGate<'a> {
     }
 
     /// Compute the current freshness signature for every **raw-source**
-    /// upstream of `model` (sources not produced by a project model this run).
+    /// upstream of `model` — the tables it reads in `FROM`/`JOIN` that are
+    /// NOT produced by a project model (those are covered by the B3 recursion
+    /// verdict, not a freshness query).
     ///
-    /// For each raw source we read `MAX(<ts>)` when the model declares a
-    /// timestamp column (incremental / microbatch strategies), and `COUNT(*)`
+    /// Returns `None` when the model's SQL cannot be parsed to enumerate its
+    /// upstreams — an unknown upstream set is unprovable, so the caller must
+    /// build. For each raw source we read `MAX(<ts>)` when the model declares a
+    /// timestamp column (incremental / microbatch strategies) and `COUNT(*)`
     /// when `skip_rowcount_fallback` is enabled. Read failures leave the
     /// corresponding field `None` (⇒ that upstream is later judged unprovable
     /// ⇒ build) — they never collapse to "stable".
     async fn compute_upstream_sigs(
         &self,
         model: &rocky_core::models::Model,
-        typed_ir: &ModelIr,
         warehouse: &dyn WarehouseAdapter,
-    ) -> Vec<UpstreamSig> {
+    ) -> Option<Vec<UpstreamSig>> {
         let ts_column = strategy_timestamp_column(&model.config.strategy);
-        let dialect = warehouse.dialect();
 
-        // Collect the raw-source physical refs: IR `source` + `sources`,
-        // minus any that are the target of a project model (those are covered
-        // by the recursion signal, not a freshness query).
-        let mut refs: Vec<(String, String, String)> = Vec::new();
-        if let Some(s) = &typed_ir.source {
-            refs.push((s.catalog.clone(), s.schema.clone(), s.table.clone()));
-        }
-        for s in &typed_ir.sources {
-            refs.push((s.catalog.clone(), s.schema.clone(), s.table.clone()));
-        }
+        // Enumerate the tables the model reads. Unparseable SQL ⇒ `None` ⇒ the
+        // caller builds (we can't prove inputs are unchanged).
+        let referenced = rocky_sql::lineage::referenced_tables(&model.sql).ok()?;
 
         let mut sigs = Vec::new();
-        for (catalog, schema, table) in refs {
-            let full = format!("{catalog}.{schema}.{table}");
-            // Produced by a project model ⇒ handled by recursion, not here.
-            if self.target_to_model.contains_key(&full) {
+        for name in referenced {
+            let lname = name.to_lowercase();
+            // Produced by a project model ⇒ governed by the recursion verdict,
+            // not a freshness probe. Match by model name or target identity.
+            if self.model_identities.contains(&lname) {
                 continue;
             }
-            let Ok(table_ref) = dialect.format_table_ref(&catalog, &schema, &table) else {
-                // Can't even render the ref ⇒ leave a signal-less signature so
-                // clause G judges it unprovable and the model builds.
-                sigs.push(UpstreamSig {
-                    upstream_key: full,
-                    max_ts: None,
-                    row_count: None,
-                });
-                continue;
-            };
 
+            // `name` is already a (possibly-qualified) table reference. It came
+            // from the parsed AST, so the components are valid identifiers; we
+            // interpolate it directly (the per-component validation lives in
+            // `query_max_ts` for the ts column, the only user-typed part).
             let max_ts = match ts_column {
-                Some(col) => query_max_ts(warehouse, &table_ref, col).await,
+                Some(col) => query_max_ts(warehouse, &name, col).await,
                 None => None,
             };
             let row_count = if self.cfg.rowcount_fallback {
-                query_row_count(warehouse, &table_ref).await
+                query_row_count(warehouse, &name).await
             } else {
                 None
             };
 
             sigs.push(UpstreamSig {
-                upstream_key: full,
+                upstream_key: lname,
                 max_ts,
                 row_count,
             });
         }
-        sigs
+        Some(sigs)
     }
 }
 
