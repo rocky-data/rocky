@@ -59,6 +59,21 @@ export type CheckResult1 =
       result_value: number;
       threshold: number;
       [k: string]: unknown;
+    }
+  | {
+      /**
+       * Fully-qualified sibling tables that were compared.
+       */
+      contributing_tables: string[];
+      /**
+       * Count of distinct keys that appear in more than one sibling table.
+       */
+      overlap_count: number;
+      /**
+       * Bounded sample of overlapping key values (stringified) for triage.
+       */
+      sample: string[];
+      [k: string]: unknown;
     };
 /**
  * Severity of a test failure.

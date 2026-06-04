@@ -855,6 +855,11 @@ pub struct ChecksConfig {
     pub null_rate: Option<NullRateConfig>,
     #[serde(default)]
     pub custom: Vec<CustomCheckConfig>,
+    /// Cross-source overlap check — flags the same business key appearing in
+    /// more than one sibling source feeding a shared consolidation target.
+    /// Disabled when unset. See [`CrossSourceOverlapConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_source_overlap: Option<CrossSourceOverlapConfig>,
     /// Row-level assertions (`not_null`, `unique`, `accepted_values`,
     /// `relationships`, `expression`, `row_count_range`) executed against
     /// specific tables in the quality pipeline. Each entry targets a single
@@ -1124,6 +1129,75 @@ pub struct CustomCheckConfig {
     /// Severity reported when this check fails.
     #[serde(default)]
     pub severity: crate::tests::TestSeverity,
+}
+
+/// Cross-source overlap check: flags the same business key appearing in more
+/// than one *sibling* source feeding a shared consolidation target (the
+/// "same account onboarded twice under two paths" case). Siblings are grouped
+/// by the runner; this config carries only the key + thresholds.
+///
+/// `keys` (a column tuple) and `key_expr` (a derived SQL expression) are
+/// mutually exclusive — exactly one must be set, mirroring `unique` /
+/// `unique_expr`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CrossSourceOverlapConfig {
+    /// Business-key columns whose shared value across sibling tables signals a
+    /// duplicate. Mutually exclusive with `key_expr`.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// Derived business-key expression (e.g. `md5(a || '-' || b)`), for sources
+    /// without a single natural key. Mutually exclusive with `keys`. Passed
+    /// through verbatim (trusted config, like `unique_expr`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_expr: Option<String>,
+    /// Severity reported when the overlap-key count exceeds `max_overlap_rows`.
+    #[serde(default)]
+    pub severity: crate::tests::TestSeverity,
+    /// Overlap-key count above which the check fails. Default 0 — any overlap
+    /// fails.
+    #[serde(default)]
+    pub max_overlap_rows: u64,
+    /// Maximum overlapping keys attached to the result for triage.
+    #[serde(default = "default_overlap_sample")]
+    pub sample: usize,
+}
+
+fn default_overlap_sample() -> usize {
+    20
+}
+
+impl CrossSourceOverlapConfig {
+    /// Resolve the configured key into a list of SQL key-expressions: the
+    /// `keys` column list, or a single-element list holding `key_expr`.
+    ///
+    /// Enforces the mutual-exclusion invariant: exactly one of `keys` /
+    /// `key_expr` must be set (both-set or neither-set is an error). Column
+    /// names in `keys` are validated as SQL identifiers; `key_expr` is trusted
+    /// config and passed through verbatim.
+    pub fn resolved_key_exprs(&self) -> Result<Vec<String>, String> {
+        let has_keys = !self.keys.is_empty();
+        let has_expr = self
+            .key_expr
+            .as_deref()
+            .is_some_and(|e| !e.trim().is_empty());
+        match (has_keys, has_expr) {
+            (true, true) => Err(
+                "cross_source_overlap: set exactly one of `keys` or `key_expr`, not both".into(),
+            ),
+            (false, false) => {
+                Err("cross_source_overlap: one of `keys` or `key_expr` is required".into())
+            }
+            (true, false) => {
+                for c in &self.keys {
+                    rocky_sql::validation::validate_identifier(c)
+                        .map_err(|e| format!("cross_source_overlap key column '{c}': {e}"))?;
+                }
+                Ok(self.keys.clone())
+            }
+            (false, true) => Ok(vec![self.key_expr.clone().unwrap()]),
+        }
+    }
 }
 
 /// Governance settings: auto-creation of catalogs/schemas, tags, isolation, and grants.
@@ -9487,5 +9561,31 @@ schema_template = "raw__{source}"
         assert_eq!(fv.retry.max_retries, 8);
         assert_eq!(fv.retry.initial_backoff_ms, 1000);
         assert_eq!(fv.retry.max_backoff_ms, 60000);
+    }
+
+    #[test]
+    fn test_cross_source_overlap_key_mutual_exclusion() {
+        let cfg = |keys: Vec<&str>, key_expr: Option<&str>| CrossSourceOverlapConfig {
+            keys: keys.into_iter().map(String::from).collect(),
+            key_expr: key_expr.map(String::from),
+            severity: crate::tests::TestSeverity::Error,
+            max_overlap_rows: 0,
+            sample: 20,
+        };
+        // keys only → the column list.
+        assert_eq!(
+            cfg(vec!["a", "b"], None).resolved_key_exprs().unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // key_expr only → single-element list.
+        assert_eq!(
+            cfg(vec![], Some("md5(a||b)")).resolved_key_exprs().unwrap(),
+            vec!["md5(a||b)".to_string()]
+        );
+        // both set → error; neither set → error.
+        assert!(cfg(vec!["a"], Some("x")).resolved_key_exprs().is_err());
+        assert!(cfg(vec![], None).resolved_key_exprs().is_err());
+        // invalid column name is rejected (injection guard on `keys`).
+        assert!(cfg(vec!["a; DROP"], None).resolved_key_exprs().is_err());
     }
 }

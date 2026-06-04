@@ -578,6 +578,17 @@
           ],
           "default": false
         },
+        "cross_source_overlap": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CrossSourceOverlapConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Cross-source overlap check — flags the same business key appearing in more than one sibling source feeding a shared consolidation target. Disabled when unset. See [`CrossSourceOverlapConfig`]."
+        },
         "custom": {
           "default": [],
           "items": {
@@ -738,6 +749,51 @@
           "default": "Medium",
           "description": "Warehouse size for cost estimation (e.g., \"Small\", \"Medium\", \"Large\").",
           "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "CrossSourceOverlapConfig": {
+      "additionalProperties": false,
+      "description": "Cross-source overlap check: flags the same business key appearing in more than one *sibling* source feeding a shared consolidation target (the \"same account onboarded twice under two paths\" case). Siblings are grouped by the runner; this config carries only the key + thresholds.\n\n`keys` (a column tuple) and `key_expr` (a derived SQL expression) are mutually exclusive — exactly one must be set, mirroring `unique` / `unique_expr`.",
+      "properties": {
+        "key_expr": {
+          "description": "Derived business-key expression (e.g. `md5(a || '-' || b)`), for sources without a single natural key. Mutually exclusive with `keys`. Passed through verbatim (trusted config, like `unique_expr`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "keys": {
+          "default": [],
+          "description": "Business-key columns whose shared value across sibling tables signals a duplicate. Mutually exclusive with `key_expr`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "max_overlap_rows": {
+          "default": 0,
+          "description": "Overlap-key count above which the check fails. Default 0 — any overlap fails.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "sample": {
+          "default": 20,
+          "description": "Maximum overlapping keys attached to the result for triage.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "severity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TestSeverity"
+            }
+          ],
+          "default": "error",
+          "description": "Severity reported when the overlap-key count exceeds `max_overlap_rows`."
         }
       },
       "type": "object"

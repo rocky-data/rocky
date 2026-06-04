@@ -515,6 +515,31 @@ class CheckResult6(BaseModel):
     threshold: conint(ge=0)
 
 
+class CheckResult7(BaseModel):
+    """
+    Cross-source overlap: the same business key found in more than one sibling source feeding a shared consolidation target.
+    """
+
+    name: str
+    passed: bool
+    severity: TestSeverity7 | TestSeverity8 | None = "error"
+    """
+    Severity reported when the check fails. `error` causes the quality pipeline to exit non-zero (subject to `fail_on_error`); `warning` is advisory and does not fail the run.
+    """
+    contributing_tables: list[str]
+    """
+    Fully-qualified sibling tables that were compared.
+    """
+    overlap_count: conint(ge=0)
+    """
+    Count of distinct keys that appear in more than one sibling table.
+    """
+    sample: list[str]
+    """
+    Bounded sample of overlapping key values (stringified) for triage.
+    """
+
+
 class MaterializationOutput(BaseModel):
     asset_key: list[str]
     bytes_scanned: conint(ge=0) | None = None
@@ -559,6 +584,7 @@ class TableCheckOutput(BaseModel):
         | CheckResult4
         | CheckResult5
         | CheckResult6
+        | CheckResult7
     ]
 
 

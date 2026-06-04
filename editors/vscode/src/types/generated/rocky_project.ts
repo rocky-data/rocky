@@ -1070,6 +1070,10 @@ export interface ChecksConfig {
    */
   assertions?: QualityAssertion[];
   column_match?: AggregateCheckToggle & boolean;
+  /**
+   * Cross-source overlap check — flags the same business key appearing in more than one sibling source feeding a shared consolidation target. Disabled when unset. See [`CrossSourceOverlapConfig`].
+   */
+  cross_source_overlap?: CrossSourceOverlapConfig | null;
   custom?: CustomCheckConfig[];
   enabled?: boolean;
   /**
@@ -1083,6 +1087,33 @@ export interface ChecksConfig {
    */
   quarantine?: QuarantineConfig | null;
   row_count?: AggregateCheckToggle & boolean;
+}
+/**
+ * Cross-source overlap check: flags the same business key appearing in more than one *sibling* source feeding a shared consolidation target (the "same account onboarded twice under two paths" case). Siblings are grouped by the runner; this config carries only the key + thresholds.
+ *
+ * `keys` (a column tuple) and `key_expr` (a derived SQL expression) are mutually exclusive — exactly one must be set, mirroring `unique` / `unique_expr`.
+ */
+export interface CrossSourceOverlapConfig {
+  /**
+   * Derived business-key expression (e.g. `md5(a || '-' || b)`), for sources without a single natural key. Mutually exclusive with `keys`. Passed through verbatim (trusted config, like `unique_expr`).
+   */
+  key_expr?: string | null;
+  /**
+   * Business-key columns whose shared value across sibling tables signals a duplicate. Mutually exclusive with `key_expr`.
+   */
+  keys?: string[];
+  /**
+   * Overlap-key count above which the check fails. Default 0 — any overlap fails.
+   */
+  max_overlap_rows?: number;
+  /**
+   * Maximum overlapping keys attached to the result for triage.
+   */
+  sample?: number;
+  /**
+   * Severity reported when the overlap-key count exceeds `max_overlap_rows`.
+   */
+  severity?: TestSeverity & string;
 }
 /**
  * A user-defined SQL check with a name, query template, and pass/fail threshold.
