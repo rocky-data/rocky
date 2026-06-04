@@ -676,28 +676,55 @@ pub async fn execute_content_addressed_model(
         ));
     }
 
-    // 3b. Fail-closed reuse decision (Stage 1 — ONLY-BUILD). Computed only
-    // when `[reuse]` is active (caller passed `Some`). On a would-reuse
-    // verdict we LOG and still BUILD: a decision that can only build cannot
-    // produce a wrong output. The live point-to invocation is wired behind
-    // this same verdict next.
+    // 3b. Fail-closed point-to reuse. Computed only when `[reuse]` is active
+    // (caller passed `Some`). On a fully-validated `WouldReuse(R)` verdict we
+    // attempt a ZERO-COPY point-to commit referencing `R`'s existing parquet
+    // — no SQL executes, no bytes are copied. ANY failure (recover error,
+    // a liveness flip discovered at commit time, commit error) falls through
+    // to a normal BUILD: the target is never left unwritten, and a pointer is
+    // never committed unless it was recovered + re-verified live. A `Build`
+    // verdict (the default — reuse off returns no ctx) skips the attempt.
     if let Some(ctx) = &reuse_ctx {
         let verdict = evaluate_reuse_decision(ctx, &writer, &state).await;
         match verdict {
             crate::commands::reuse_decision::ReuseVerdict::WouldReuse(candidate) => {
-                info!(
-                    model = %model_ir.name,
-                    run_id = ctx.run_id,
-                    target = %format!(
-                        "{}.{}.{}",
-                        model_ir.target.catalog, model_ir.target.schema, model_ir.target.table
-                    ),
-                    reuse_run_id = candidate.run_id.as_str(),
-                    blake3 = candidate.blake3_hash.as_str(),
-                    commit_version = candidate.commit_version,
-                    proof_class = candidate.proof_class.as_str(),
-                    "reuse: would point-to prior run R (ONLY-BUILD: still executing the SQL this run)"
-                );
+                match attempt_point_to_reuse(&writer, &state, &candidate, model_ir).await {
+                    Ok(summary) => {
+                        // Reuse succeeded — sync metadata so cross-engine
+                        // readers see the new pointer commit, then return. (A
+                        // no-op double-count re-commit still benefits from a
+                        // SYNC; it is cheap and idempotent.)
+                        sync_iceberg_metadata(warehouse, model_ir).await?;
+                        info!(
+                            model = %model_ir.name,
+                            run_id = ctx.run_id,
+                            target = %format!(
+                                "{}.{}.{}",
+                                model_ir.target.catalog,
+                                model_ir.target.schema,
+                                model_ir.target.table
+                            ),
+                            reuse_run_id = candidate.run_id.as_str(),
+                            blake3 = candidate.blake3_hash.as_str(),
+                            commit_version = summary.commit_version,
+                            proof_class = candidate.proof_class.as_str(),
+                            "reuse: pointed-to prior run R's parquet (zero-copy; SQL not executed)"
+                        );
+                        return Ok(summary);
+                    }
+                    Err(e) => {
+                        // Verify-before-trust: any doubt about recovering or
+                        // re-confirming R's bytes is a BUILD, never a silent
+                        // wrong reuse. Fall through to execute the SQL.
+                        warn!(
+                            model = %model_ir.name,
+                            run_id = ctx.run_id,
+                            reuse_run_id = candidate.run_id.as_str(),
+                            error = %format!("{e:#}"),
+                            "reuse: point-to could not be completed/verified; building instead"
+                        );
+                    }
+                }
             }
             crate::commands::reuse_decision::ReuseVerdict::Build(reason) => {
                 debug!(
@@ -770,11 +797,32 @@ pub async fn execute_content_addressed_model(
         };
 
     // 7. Sync iceberg metadata so cross-engine readers see the new
-    // commit(s). Issued directly via the warehouse adapter rather than
-    // through `UniformWriter::sync_iceberg_metadata` to avoid the
-    // `'static` lifetime requirement on `Arc<dyn SqlClient>` (see the
-    // NoOpSqlClient docstring above). One MSCK call covers all the
-    // commits the partitioned loop just emitted.
+    // commit(s). One MSCK call covers all the commits the partitioned loop
+    // just emitted.
+    sync_iceberg_metadata(warehouse, model_ir).await?;
+
+    Ok(ContentAddressedRunSummary {
+        num_rows: total_rows,
+        blake3_hash: last_blake3,
+        commit_version: last_commit_version,
+        file_path: last_file_path,
+        size_bytes: total_size_bytes,
+        // A normal BUILD wrote fresh bytes — no point-to provenance.
+        reused_from: None,
+    })
+}
+
+/// Issue `MSCK REPAIR TABLE ... SYNC METADATA` directly via the warehouse
+/// adapter so DuckDB iceberg_scan + Iceberg-aware Trino + Photon see the
+/// commit(s) the writer just landed.
+///
+/// Issued through the adapter rather than [`UniformWriter::sync_iceberg_metadata`]
+/// to avoid the `'static` lifetime requirement on `Arc<dyn SqlClient>` (see
+/// the [`NoOpSqlClient`] docstring).
+async fn sync_iceberg_metadata(
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    model_ir: &ModelIr,
+) -> Result<()> {
     let msck_sql = format!(
         "MSCK REPAIR TABLE {}.{}.{} SYNC METADATA",
         model_ir.target.catalog, model_ir.target.schema, model_ir.target.table,
@@ -783,14 +831,186 @@ pub async fn execute_content_addressed_model(
         .execute_statement(&msck_sql)
         .await
         .map_err(|e| anyhow!("MSCK REPAIR failed: {e}"))?;
+    Ok(())
+}
+
+/// Attempt a **zero-copy point-to reuse** of prior run `R`'s parquet for a
+/// fully-validated [`ReuseCandidate`].
+///
+/// Runs **after** the [`decide_reuse`](crate::commands::reuse_decision::decide_reuse)
+/// verdict already passed every clause (incl. a liveness check). This function
+/// is the trust-critical commit-time half, and it carries its **own** local
+/// content-identity guard rather than relying on the cross-crate
+/// `input_hash`-folds-target invariant to keep it honest:
+///
+/// 1. **Recover** `R`'s `add` action from its `_delta_log/{commit_version}.json`
+///    (one GET, no parquet byte read — `R`'s recorded `stats` carry over).
+/// 2. **Verify content identity (the real guard).** Files are content-addressed
+///    (`<hash>.parquet`), so the file basename *is* the content hash. Assert the
+///    recovered `add` path's basename equals the validated candidate's
+///    `file_path` basename. A mismatch means the recovered pointer references
+///    DIFFERENT bytes than the decision approved — a cross-target or
+///    version-identity drift — so it is an `Err` ⇒ a BUILD. This is what makes
+///    the function self-defending: a recovered add naming the wrong file can
+///    never be returned as `Ok`.
+/// 3. **Re-confirm liveness right before the commit (TOCTOU).** The decision's
+///    liveness check and this commit are not atomic — `R`'s file could be
+///    VACUUM'd/`remove`d in the gap. Re-checking `add_path_is_live` here closes
+///    that window: a flip to not-live is an `Err`, which the caller treats as a
+///    BUILD.
+/// 4. **Commit the pointer** via [`UniformWriter::commit_pointer_with_state`].
+///    Its append-only double-count guard makes a same-target re-commit a no-op
+///    (returns the existing commit version, emits no new commit).
+///
+/// A residual blake3 cross-check after the commit is kept only as a redundant
+/// tripwire on an internal writer regression; the writer copies the candidate
+/// hash straight through, so it is near-tautological and is **not** the guard
+/// the safety argument rests on (step 2 is).
+///
+/// # Returns
+///
+/// `Ok(summary)` carrying `R`'s `blake3_hash` / `file_path` / `commit_version`
+/// (those bytes *are* this run's output) plus a [`ReuseProvenance`] back-link
+/// to `R`. The caller records the reusing run's `ArtifactRecord` at `R`'s
+/// shared blake3 — driving `refcount_for_hash` to `>= 2` with no byte copy.
+///
+/// # Errors
+///
+/// Returns `Err` on **any** doubt — recover failure, a content-identity
+/// (basename) mismatch, a liveness flip, or a commit error. The caller maps
+/// every `Err` to a normal BUILD; this function never leaves the target in a
+/// partial state (the content-identity guard fires *before* any commit, and a
+/// failed `commit_pointer_with_state` lands no commit).
+async fn attempt_point_to_reuse(
+    writer: &UniformWriter,
+    state: &rocky_iceberg::uniform_writer::UniformTableState,
+    candidate: &crate::commands::reuse_decision::ReuseCandidate,
+    model_ir: &ModelIr,
+) -> Result<ContentAddressedRunSummary> {
+    // 1. Recover R's `add` action verbatim (one GET). The row count rides in
+    // the recovered `add.stats` JSON — read it back so the run-output
+    // `rows_copied` is accurate (the candidate's `ArtifactRecord` records
+    // size_bytes but not the row count).
+    let mut pointer = writer
+        .recover_pointer_inputs(
+            candidate.commit_version,
+            candidate.blake3_hash.clone(),
+            0,
+            candidate.size_bytes,
+        )
+        .await
+        .map_err(|e| anyhow!("recover_pointer_inputs failed: {e}"))?;
+    let num_records = num_records_from_recovered_add(&pointer.recovered_add);
+    pointer.num_records = num_records;
+
+    // 2. Content-identity guard — the real verify-before-trust check. Files are
+    // content-addressed (`<hash>.parquet`), so the basename IS the content hash:
+    // basename equality is content-identity equality. The recovered `add` path
+    // (lifted from R's own `_delta_log`) must name the same file the validated
+    // candidate does. A mismatch means the recovered pointer references DIFFERENT
+    // bytes than the decision approved (cross-target / version-identity drift) ⇒
+    // Err ⇒ the caller BUILDs. This guard is local and self-defending: it does
+    // not lean on the cross-crate `input_hash`-folds-target invariant.
+    let recovered_basename = pointer
+        .add_file_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&pointer.add_file_path);
+    let candidate_basename = candidate
+        .file_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&candidate.file_path);
+    if recovered_basename != candidate_basename {
+        return Err(anyhow!(
+            "recovered add path {recovered_basename:?} != candidate file \
+             {candidate_basename:?}; building"
+        ));
+    }
+
+    // 3. Re-confirm liveness right before the commit (TOCTOU). The decision
+    // already checked liveness, but VACUUM could have removed R's file in the
+    // gap. A flip to not-live ⇒ Err ⇒ the caller BUILDs.
+    let still_live = writer
+        .add_path_is_live(&pointer.add_file_path)
+        .await
+        .map_err(|e| anyhow!("commit-time liveness re-check failed: {e}"))?;
+    if !still_live {
+        return Err(anyhow!(
+            "R's file {:?} is no longer live in the target log at commit time \
+             (VACUUM'd/removed between decision and commit); building",
+            pointer.add_file_path
+        ));
+    }
+
+    // 4. Commit the zero-copy pointer. The double-count guard makes a
+    // same-target re-commit a no-op.
+    let write_result = writer
+        .commit_pointer_with_state(&pointer, state.clone())
+        .await
+        .map_err(|e| anyhow!("commit_pointer_with_state failed: {e}"))?;
+
+    // Redundant blake3 cross-check (NOT the primary guard — the basename
+    // content-identity check above is). The writer copies `pointer.blake3_hash`
+    // straight through to `write_result.blake3_hash`, so comparing it back to
+    // `candidate.blake3_hash` is near-tautological; it is kept only as a cheap
+    // belt-and-braces tripwire on an internal writer regression. Fail closed to
+    // a BUILD if it ever fires rather than record a mislabeled reference.
+    if write_result.blake3_hash != candidate.blake3_hash {
+        return Err(anyhow!(
+            "point-to result blake3 {:?} disagrees with candidate {:?}; building",
+            write_result.blake3_hash,
+            candidate.blake3_hash
+        ));
+    }
+
+    debug!(
+        model = %model_ir.name,
+        reuse_run_id = candidate.run_id.as_str(),
+        blake3 = write_result.blake3_hash.as_str(),
+        commit_version = write_result.commit_version,
+        "reuse: pointer commit landed (or no-op double-count guard satisfied)"
+    );
 
     Ok(ContentAddressedRunSummary {
-        num_rows: total_rows,
-        blake3_hash: last_blake3,
-        commit_version: last_commit_version,
-        file_path: last_file_path,
-        size_bytes: total_size_bytes,
+        // R's recorded row count, parsed from the recovered `add.stats` above
+        // and threaded through `commit_pointer_with_state`. A `0` here only
+        // occurs if R's recorded stats were absent — the referenced data is
+        // still correct; this field is purely the run-output rows_copied
+        // display.
+        num_rows: write_result.num_records,
+        blake3_hash: write_result.blake3_hash,
+        commit_version: write_result.commit_version,
+        file_path: write_result.file_path,
+        size_bytes: write_result.size_bytes,
+        reused_from: Some(ReuseProvenance {
+            reused_run_id: candidate.run_id.clone(),
+            blake3_hash: candidate.blake3_hash.clone(),
+            proof_class: candidate.proof_class.clone(),
+        }),
     })
+}
+
+/// Parse `numRecords` out of a recovered Delta `add` action's `stats`.
+///
+/// Delta encodes `add.stats` as a **JSON string** (e.g.
+/// `"{\"numRecords\":3}"`), so this double-parses: read the `stats` string,
+/// then parse it as JSON and read `numRecords`. Returns `0` on any absence or
+/// shape surprise — the byte reference is unaffected; only the run-output
+/// `rows_copied` display would show `0`.
+fn num_records_from_recovered_add(
+    recovered_add: &serde_json::Map<String, serde_json::Value>,
+) -> usize {
+    let Some(stats_str) = recovered_add.get("stats").and_then(|v| v.as_str()) else {
+        return 0;
+    };
+    serde_json::from_str::<serde_json::Value>(stats_str)
+        .ok()
+        .as_ref()
+        .and_then(|stats| stats.get("numRecords"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0)
 }
 
 /// Group a `RecordBatch` by partition tuple.
@@ -925,6 +1145,26 @@ fn stringify_partition_value(
     }
 }
 
+/// Provenance of a **point-to reuse** — recorded when this run referenced a
+/// prior run `R`'s already-written parquet instead of executing its SQL.
+///
+/// The reusing run's [`ContentAddressedRunSummary`] carries `R`'s `blake3_hash`
+/// / `file_path` / `commit_version` as its own (those bytes *are* this run's
+/// output), so the runner's existing artifact-ledger write records a second
+/// reference at `R`'s shared blake3 — driving `refcount_for_hash` to `>= 2`
+/// with **zero byte copy**. This struct adds the back-link to `R` (and `R`'s
+/// `proof_class`) that the bytes-identity ledger row alone does not name.
+#[derive(Debug, Clone)]
+pub struct ReuseProvenance {
+    /// Prior run `R` whose bytes this run referenced.
+    pub reused_run_id: String,
+    /// The shared content blake3 (hex) — `R`'s and now also this run's.
+    pub blake3_hash: String,
+    /// `R`'s proof class (always `"strong"` — a point-to is byte-identity,
+    /// never a freshness heuristic). Carried so the reuse label is never lost.
+    pub proof_class: String,
+}
+
 /// Summary returned by [`execute_content_addressed_model`].
 #[derive(Debug, Clone)]
 pub struct ContentAddressedRunSummary {
@@ -933,6 +1173,13 @@ pub struct ContentAddressedRunSummary {
     pub commit_version: u64,
     pub file_path: String,
     pub size_bytes: u64,
+    /// `Some` when this run **reused** a prior run `R`'s bytes via a zero-copy
+    /// point-to commit instead of executing the model SQL. `None` for a normal
+    /// BUILD (including every reuse-decision fall-back to BUILD). The
+    /// `blake3_hash` / `file_path` / `commit_version` above are `R`'s in the
+    /// reuse case — by design, so the runner records the shared-bytes
+    /// reference without re-counting.
+    pub reused_from: Option<ReuseProvenance>,
 }
 
 #[cfg(test)]
@@ -1555,6 +1802,345 @@ mod tests {
             ),
         }
     }
+
+    // --- Point-to invocation routing (attempt_point_to_reuse) --------------
+    //
+    // The trust-critical commit-time half. `attempt_point_to_reuse` returns
+    // `Ok` ONLY on a fully-validated, recovered, re-verified-live, committed
+    // point-to; every simulated failure returns `Err` — which the caller in
+    // `execute_content_addressed_model` maps to a normal BUILD (execute_query).
+    // These tests pin that routing without a warehouse.
+
+    use crate::commands::reuse_decision::ReuseCandidate;
+
+    /// A small single-column (`id`) batch matching the bootstrap schema that
+    /// [`seed_unpartitioned_with_live_add`]'s sibling `seed_id_only_bootstrap`
+    /// installs.
+    fn id_batch(ids: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef],
+        )
+        .unwrap()
+    }
+
+    /// Seed only the `v=0` bootstrap (the `id`-column, unpartitioned,
+    /// non-rowTracking shape) — no data commit yet.
+    async fn seed_id_only_bootstrap(store: &InMemory, prefix: &str) {
+        let bootstrap = serde_json::json!({
+            "protocol": {
+                "minReaderVersion": 2,
+                "minWriterVersion": 7,
+                "writerFeatures": ["columnMapping", "icebergCompatV2", "invariants", "appendOnly"],
+            }
+        });
+        let metadata = serde_json::json!({
+            "metaData": {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": serde_json::to_string(&serde_json::json!({
+                    "type": "struct",
+                    "fields": [
+                        {"name": "id", "type": "long", "nullable": false, "metadata": {
+                            "delta.columnMapping.id": 1,
+                            "delta.columnMapping.physicalName": "col-id-uuid"
+                        }}
+                    ]
+                })).unwrap(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.columnMapping.mode": "name",
+                    "delta.universalFormat.enabledFormats": "iceberg",
+                    "delta.enableIcebergCompatV2": "true"
+                },
+                "createdTime": 0
+            }
+        });
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&bootstrap).unwrap(),
+            serde_json::to_string(&metadata).unwrap(),
+        );
+        store
+            .put(
+                &ObjPath::from(format!("{prefix}/_delta_log/00000000000000000000.json")),
+                PutPayload::from(body.into_bytes()),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn writer_for(store: Arc<dyn ObjectStore>, prefix: &str) -> UniformWriter {
+        UniformWriter::new(
+            UniformWriterConfig {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+                prefix: prefix.into(),
+                engine_info: "rocky-cli/test".into(),
+            },
+            store,
+            Arc::new(NoOpSqlClient),
+        )
+    }
+
+    fn dummy_model_ir() -> ModelIr {
+        use rocky_ir::{GovernanceConfig, TargetRef};
+        let mut m = ModelIr::transformation(
+            TargetRef {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: "s3://bucket/tbl".into(),
+                partition_columns: vec![],
+            },
+            vec![],
+            "SELECT 1".into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        m.name = Arc::from("fct_orders");
+        m
+    }
+
+    /// Write R's real parquet + recoverable `add` into `prefix`, returning the
+    /// [`ReuseCandidate`] that points at it (blake3 + commit_version + size).
+    async fn seed_r_build(store: &Arc<InMemory>, prefix: &str) -> ReuseCandidate {
+        seed_id_only_bootstrap(store, prefix).await;
+        let writer = writer_for(store.clone() as Arc<dyn ObjectStore>, prefix);
+        let state = writer.discover().await.unwrap();
+        let r = writer
+            .write_batch_with_state(id_batch(&[10, 20, 30]), state)
+            .await
+            .unwrap();
+        ReuseCandidate {
+            run_id: "run-R".into(),
+            blake3_hash: r.blake3_hash,
+            file_path: r.file_path,
+            commit_version: r.commit_version,
+            size_bytes: r.size_bytes,
+            proof_class: "strong".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn point_to_happy_path_returns_reuse_summary_no_copy() {
+        // Same-table reuse — the path the runner takes when a second run's
+        // input_hash hits R's prior build of THIS target. R's file is recovered
+        // from this table's own `_delta_log`, re-verified live, and the
+        // double-count guard makes the re-commit a no-op (returns R's version).
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let candidate = seed_r_build(&store, "tbl_a").await;
+
+        let writer = writer_for(store.clone() as Arc<dyn ObjectStore>, "tbl_a");
+        let state = writer.discover().await.unwrap();
+        let model = dummy_model_ir();
+        let summary = attempt_point_to_reuse(&writer, &state, &candidate, &model)
+            .await
+            .expect("fully-validated point-to must succeed");
+
+        let reuse = summary
+            .reused_from
+            .expect("a successful point-to carries reuse provenance");
+        assert_eq!(reuse.reused_run_id, "run-R");
+        assert_eq!(reuse.blake3_hash, candidate.blake3_hash);
+        assert_eq!(reuse.proof_class, "strong");
+        assert_eq!(
+            summary.blake3_hash, candidate.blake3_hash,
+            "summary carries R's shared blake3 (drives refcount >= 2 in the runner)"
+        );
+        assert_eq!(
+            summary.num_rows, 3,
+            "row count parsed back from R's recovered add.stats"
+        );
+        assert_eq!(
+            summary.commit_version, candidate.commit_version,
+            "double-count guard: same-table re-commit returns R's existing version (no-op)"
+        );
+
+        // No second parquet object under tbl_a — zero byte copy.
+        use futures::TryStreamExt;
+        let mut stream = store.list(Some(&ObjPath::from("tbl_a")));
+        let mut parquet_count = 0_usize;
+        while let Some(meta) = stream.try_next().await.unwrap() {
+            if meta.location.to_string().ends_with(".parquet") {
+                parquet_count += 1;
+            }
+        }
+        assert_eq!(
+            parquet_count, 1,
+            "a point-to must not write a second parquet object"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_to_recover_error_routes_to_build() {
+        // A candidate naming a commit_version that does not exist in the table
+        // ⇒ recover_pointer_inputs errors ⇒ Err ⇒ caller BUILDs.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let mut candidate = seed_r_build(&store, "tbl_a").await;
+        candidate.commit_version = 999; // no such commit
+
+        let writer = writer_for(store.clone() as Arc<dyn ObjectStore>, "tbl_a");
+        let state = writer.discover().await.unwrap();
+        let model = dummy_model_ir();
+        let err = attempt_point_to_reuse(&writer, &state, &candidate, &model)
+            .await
+            .expect_err("a missing commit must not yield a (false) reuse");
+        assert!(
+            format!("{err:#}").contains("recover_pointer_inputs"),
+            "recover failure must surface as a build-routing error; got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_to_basename_mismatch_routes_to_build() {
+        // The recovered `add` names a DIFFERENT content-addressed file than the
+        // validated candidate (`<hash>.parquet` basename differs). Because files
+        // are content-addressed, that means the recovered pointer references
+        // different bytes than the decision approved ⇒ the content-identity guard
+        // fires ⇒ Err ⇒ caller BUILDs.
+        //
+        // This is the load-bearing test for the basename guard. The blake3
+        // cross-check alone could NOT catch this: the writer copies the
+        // candidate hash straight through to the result, so it compares the
+        // candidate hash to itself and passes — the case would (wrongly) return
+        // `Ok` without this guard.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let mut candidate = seed_r_build(&store, "tbl_a").await;
+        // Recover, liveness, and commit all key off commit_version / blake3 /
+        // size — never `file_path` — so only the new content-identity guard
+        // sees this mutation. Swap in a different basename (same dir).
+        candidate.file_path = "s3://bucket/tbl_a/deadbeef.parquet".to_string();
+
+        let writer = writer_for(store.clone() as Arc<dyn ObjectStore>, "tbl_a");
+        let state = writer.discover().await.unwrap();
+        let model = dummy_model_ir();
+        let err = attempt_point_to_reuse(&writer, &state, &candidate, &model)
+            .await
+            .expect_err("a recovered add naming a different file must route to BUILD, never reuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("!= candidate file"),
+            "a content-identity mismatch must surface as a build-routing error; got: {msg}"
+        );
+
+        // The guard fires BEFORE any commit — the table is left untouched.
+        assert!(
+            store
+                .get(&ObjPath::from("tbl_a/_delta_log/00000000000000000002.json"))
+                .await
+                .is_err(),
+            "the content-identity guard must trip pre-commit, landing no new commit"
+        );
+        use futures::TryStreamExt;
+        let mut stream = store.list(Some(&ObjPath::from("tbl_a")));
+        let mut parquet_count = 0_usize;
+        while let Some(meta) = stream.try_next().await.unwrap() {
+            if meta.location.to_string().ends_with(".parquet") {
+                parquet_count += 1;
+            }
+        }
+        assert_eq!(
+            parquet_count, 1,
+            "a fail-closed basename mismatch must not write a second parquet object"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_to_liveness_flip_at_commit_routes_to_build() {
+        // R's file was VACUUM'd/removed AFTER the decision: the commit-time
+        // liveness re-check sees not-live ⇒ Err ⇒ caller BUILDs. (This is the
+        // TOCTOU guard — the decision's own liveness check passed earlier.)
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let candidate = seed_r_build(&store, "tbl_a").await;
+
+        // Append a `remove` for R's file at v=2 so add_path_is_live is false,
+        // while recover_pointer_inputs (which reads v=1 directly) still works.
+        let r_basename = candidate.file_path.rsplit('/').next().unwrap().to_string();
+        let remove_commit = serde_json::json!({"remove": {"path": r_basename, "dataChange": true}});
+        let body = format!("{}\n", serde_json::to_string(&remove_commit).unwrap());
+        store
+            .put(
+                &ObjPath::from("tbl_a/_delta_log/00000000000000000002.json"),
+                PutPayload::from(body.into_bytes()),
+            )
+            .await
+            .unwrap();
+
+        let writer = writer_for(store.clone() as Arc<dyn ObjectStore>, "tbl_a");
+        let state = writer.discover().await.unwrap();
+        let model = dummy_model_ir();
+        let err = attempt_point_to_reuse(&writer, &state, &candidate, &model)
+            .await
+            .expect_err("a commit-time liveness flip must route to BUILD, never reuse");
+        assert!(
+            format!("{err:#}").contains("no longer live"),
+            "a removed file must surface as a liveness-flip build-routing error; got: {err:#}"
+        );
+
+        // No v=3 commit landed — the failed reuse left the table untouched.
+        assert!(
+            store
+                .get(&ObjPath::from("tbl_a/_delta_log/00000000000000000003.json"))
+                .await
+                .is_err(),
+            "a fail-closed reuse must not land any commit before falling back to BUILD"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_to_commit_error_on_partitioned_routes_to_build() {
+        // R's add recovers fine, liveness holds, but the target is partitioned
+        // ⇒ commit_pointer_with_state errors ⇒ Err ⇒ caller BUILDs. (The
+        // decision gates on shape too; this is defence-in-depth at commit time.)
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let candidate = seed_r_build(&store, "tbl_a").await;
+
+        // Build a discovered state that claims a partition column. Recover +
+        // liveness use the store (unpartitioned tbl_a), but the commit consults
+        // `state.partition_columns`, which we force non-empty.
+        let writer = writer_for(store.clone() as Arc<dyn ObjectStore>, "tbl_a");
+        let mut state = writer.discover().await.unwrap();
+        state.partition_columns = vec!["region".to_string()];
+        let model = dummy_model_ir();
+        let err = attempt_point_to_reuse(&writer, &state, &candidate, &model)
+            .await
+            .expect_err("a commit error must route to BUILD, never a partial reuse");
+        assert!(
+            format!("{err:#}").contains("commit_pointer_with_state"),
+            "commit failure must surface as a build-routing error; got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn num_records_parsed_from_recovered_add_stats() {
+        // The stats field is a JSON STRING (Delta encodes it doubly).
+        let mut add = serde_json::Map::new();
+        add.insert(
+            "stats".into(),
+            serde_json::Value::String("{\"numRecords\":42}".into()),
+        );
+        assert_eq!(num_records_from_recovered_add(&add), 42);
+
+        // Absent / malformed stats ⇒ 0 (byte reference unaffected).
+        assert_eq!(
+            num_records_from_recovered_add(&serde_json::Map::new()),
+            0,
+            "absent stats must not panic — display row count falls back to 0"
+        );
+        let mut bad = serde_json::Map::new();
+        bad.insert("stats".into(), serde_json::Value::String("not json".into()));
+        assert_eq!(num_records_from_recovered_add(&bad), 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1864,6 +2450,341 @@ mod live_tests {
             n_after,
             n_before + 3,
             "Photon count must bump by 3 (before={n_before}, after={n_after})"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Live point-to REUSE tests (B5 final). These three are what verifies the
+    // whole capstone end-to-end against a real UniForm table: the writer
+    // no-op double-count guard (#838) + the fail-closed decision (#840) + the
+    // invocation wired here. Same env vars + sandbox shape as
+    // `content_addressed_e2e_live_sandbox` (unpartitioned `(id, name, ts)`).
+    // ----------------------------------------------------------------------
+
+    /// Build the canonical unpartitioned `(id, name, ts)` content-addressed
+    /// model for the reuse fixtures. `seed` differentiates the row values (and
+    /// thus the parquet blake3) so a "changed upstream" run produces a
+    /// different file.
+    fn reuse_model(env: &LiveEnv, seed: i64) -> ModelIr {
+        let base = chrono::Utc::now().timestamp_micros();
+        let ts = |off: i64| {
+            chrono::DateTime::from_timestamp_micros(base + off)
+                .unwrap()
+                .format("%Y-%m-%dT%H:%M:%S%.6f")
+                .to_string()
+        };
+        let model_sql = format!(
+            "SELECT * FROM VALUES \
+             (CAST({s}01 AS BIGINT), CAST('reuse-a' AS STRING), TIMESTAMP'{a}'), \
+             (CAST({s}02 AS BIGINT), CAST('reuse-b' AS STRING), TIMESTAMP'{b}'), \
+             (CAST({s}03 AS BIGINT), CAST('reuse-c' AS STRING), TIMESTAMP'{c}') \
+             AS t(id, name, ts)",
+            s = seed,
+            a = ts(0),
+            b = ts(1),
+            c = ts(2),
+        );
+        let mut model_ir = ModelIr::transformation(
+            TargetRef {
+                catalog: env.catalog.clone(),
+                schema: env.schema.clone(),
+                table: env.table.clone(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: env.storage_prefix.clone(),
+                partition_columns: vec![],
+            },
+            vec![],
+            model_sql,
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        model_ir.name = Arc::from("live_reuse_test");
+        model_ir.typed_columns = vec![
+            TypedColumn {
+                name: "id".into(),
+                data_type: RockyType::Int64,
+                nullable: false,
+            },
+            TypedColumn {
+                name: "name".into(),
+                data_type: RockyType::String,
+                nullable: false,
+            },
+            TypedColumn {
+                name: "ts".into(),
+                data_type: RockyType::Timestamp,
+                nullable: false,
+            },
+        ];
+        model_ir
+    }
+
+    /// Record R's build into the state store exactly as the runner does:
+    /// the `ArtifactRecord` (for refcount) plus the input-match spine entry
+    /// (for the index hit). Returns the `input_hash` the second run reuses by.
+    fn record_r_build(
+        store: &rocky_core::state::StateStore,
+        model_ir: &ModelIr,
+        run_id: &str,
+        summary: &ContentAddressedRunSummary,
+    ) -> String {
+        store
+            .record_artifact(&rocky_core::state::ArtifactRecord {
+                blake3_hash: summary.blake3_hash.clone(),
+                run_id: run_id.to_string(),
+                model_name: model_ir.name.to_string(),
+                file_path: summary.file_path.clone(),
+                commit_version: summary.commit_version,
+                size_bytes: summary.size_bytes,
+                written_at: chrono::Utc::now(),
+            })
+            .expect("record R's artifact");
+        // No upstreams (a literal SELECT) ⇒ proof_class "strong" — the
+        // self-contained reuse fixture.
+        let outputs = vec![rocky_core::reuse::OutputArtifact {
+            blake3_hash: summary.blake3_hash.clone(),
+            file_path: summary.file_path.clone(),
+        }];
+        let (entry, prov) =
+            rocky_core::reuse::build_records(model_ir, run_id, &[], &outputs, chrono::Utc::now())
+                .expect("build R's spine records");
+        let input_hash = entry.input_hash.clone();
+        store
+            .record_reuse_spine(std::slice::from_ref(&entry), std::slice::from_ref(&prov))
+            .expect("record R's spine");
+        input_hash
+    }
+
+    /// (a) Run a content-addressed model twice with reuse on ⇒ the SECOND run
+    /// REUSES R's parquet: no new bytes written, the row count is unchanged
+    /// (the no-op double-count guard returns R's existing commit), the
+    /// `ArtifactRecord` refcount at the shared blake3 is 2, and the summary
+    /// carries the reuse-provenance back-link to R.
+    #[tokio::test]
+    #[ignore]
+    async fn reuse_second_run_points_to_first_no_copy() {
+        let Some(env) = try_load_env() else {
+            eprintln!("skipping: ROCKY_TEST_* env vars not set");
+            return;
+        };
+        let Some(connector) = try_load_connector() else {
+            eprintln!("skipping: DATABRICKS_* env vars not set");
+            return;
+        };
+        let warehouse = DatabricksWarehouseAdapter::new(connector);
+        let warehouse_dyn: &dyn WarehouseAdapter = &warehouse;
+        let fqtn = format!("{}.{}.{}", env.catalog, env.schema, env.table);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = rocky_core::state::StateStore::open(&dir.path().join("state.redb")).unwrap();
+
+        // Run 1 — a normal BUILD. No reuse ctx (R has nothing to reuse yet).
+        let model_ir = reuse_model(&env, 9061);
+        let r_summary = execute_content_addressed_model(&model_ir, warehouse_dyn, None)
+            .await
+            .expect("first build must succeed");
+        assert!(r_summary.reused_from.is_none(), "first run is a build");
+        let count_after_build = count_rows(warehouse_dyn, &fqtn);
+        let input_hash = record_r_build(&store, &model_ir, "run-R", &r_summary);
+        assert_eq!(
+            store.refcount_for_hash(&r_summary.blake3_hash).unwrap(),
+            1,
+            "after R's build the shared blake3 has a single reference"
+        );
+
+        // Run 2 — reuse on, SAME inputs ⇒ point-to R's parquet, no SQL.
+        let ctx = ReuseDecisionCtx {
+            input_hash: Some(input_hash),
+            state_store: &store,
+            run_id: "run-reuse",
+        };
+        let reuse_summary = execute_content_addressed_model(&model_ir, warehouse_dyn, Some(ctx))
+            .await
+            .expect("second run must succeed (as a reuse)");
+
+        let prov = reuse_summary
+            .reused_from
+            .as_ref()
+            .expect("second run must REUSE, not build");
+        assert_eq!(prov.reused_run_id, "run-R");
+        assert_eq!(prov.proof_class, "strong");
+        assert_eq!(
+            reuse_summary.blake3_hash, r_summary.blake3_hash,
+            "reuse references R's shared bytes (same blake3)"
+        );
+        assert_eq!(
+            reuse_summary.commit_version, r_summary.commit_version,
+            "same-table reuse is a no-op: returns R's existing commit version"
+        );
+
+        // The data is correct + unchanged — reuse did not duplicate R's rows.
+        let count_after_reuse = count_rows(warehouse_dyn, &fqtn);
+        assert_eq!(
+            count_after_reuse, count_after_build,
+            "a same-target point-to must NOT change the row count (no double-count)"
+        );
+
+        // Record the reusing run's reference exactly as the runner does, and
+        // assert the shared blake3 refcount is now 2.
+        store
+            .record_artifact(&rocky_core::state::ArtifactRecord {
+                blake3_hash: reuse_summary.blake3_hash.clone(),
+                run_id: "run-reuse".into(),
+                model_name: model_ir.name.to_string(),
+                file_path: reuse_summary.file_path.clone(),
+                commit_version: reuse_summary.commit_version,
+                size_bytes: reuse_summary.size_bytes,
+                written_at: chrono::Utc::now(),
+            })
+            .expect("record the reusing run's artifact");
+        assert_eq!(
+            store.refcount_for_hash(&r_summary.blake3_hash).unwrap(),
+            2,
+            "the reusing run adds a SECOND reference at R's shared blake3 (zero copy)"
+        );
+    }
+
+    /// (b) VACUUM R's file then re-run ⇒ BUILD. A point-to into a removed file
+    /// would be a silent wrong reuse; the liveness clause (and the commit-time
+    /// re-check that closes the TOCTOU window) must catch the removal and fall
+    /// back to a build. `VACUUM ... RETAIN 0 HOURS` physically removes R's
+    /// no-longer-referenced bytes, making its `add` not-live.
+    #[tokio::test]
+    #[ignore]
+    async fn reuse_falls_back_to_build_when_file_vacuumed() {
+        let Some(env) = try_load_env() else {
+            eprintln!("skipping: ROCKY_TEST_* env vars not set");
+            return;
+        };
+        let Some(connector) = try_load_connector() else {
+            eprintln!("skipping: DATABRICKS_* env vars not set");
+            return;
+        };
+        let warehouse = DatabricksWarehouseAdapter::new(connector);
+        let warehouse_dyn: &dyn WarehouseAdapter = &warehouse;
+        let fqtn = format!("{}.{}.{}", env.catalog, env.schema, env.table);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = rocky_core::state::StateStore::open(&dir.path().join("state.redb")).unwrap();
+
+        // Run 1 — build R.
+        let model_ir = reuse_model(&env, 9071);
+        let r_summary = execute_content_addressed_model(&model_ir, warehouse_dyn, None)
+            .await
+            .expect("first build must succeed");
+        let input_hash = record_r_build(&store, &model_ir, "run-R", &r_summary);
+
+        // VACUUM the table with retention 0 so R's add is no longer live.
+        // (Requires `spark.databricks.delta.retentionDurationCheck.enabled =
+        // false` on the sandbox; the sandbox is configured for it.)
+        warehouse_dyn
+            .execute_statement(&format!("VACUUM {fqtn} RETAIN 0 HOURS"))
+            .await
+            .expect("VACUUM must succeed on the sandbox");
+
+        let count_before_reuse = count_rows(warehouse_dyn, &fqtn);
+
+        // Run 2 — reuse on, but R's file is gone ⇒ the decision's liveness
+        // clause (or the commit-time re-check) fails ⇒ BUILD.
+        let ctx = ReuseDecisionCtx {
+            input_hash: Some(input_hash),
+            state_store: &store,
+            run_id: "run-after-vacuum",
+        };
+        let summary = execute_content_addressed_model(&model_ir, warehouse_dyn, Some(ctx))
+            .await
+            .expect("the run must succeed as a BUILD");
+        assert!(
+            summary.reused_from.is_none(),
+            "with R's file VACUUM'd, the run must BUILD, never point-to a missing file"
+        );
+        // A fresh build wrote 3 rows back.
+        let count_after = count_rows(warehouse_dyn, &fqtn);
+        assert_eq!(
+            count_after,
+            count_before_reuse + 3,
+            "the fallback BUILD must re-materialize the 3 rows"
+        );
+    }
+
+    /// (c) Change an upstream ⇒ different `input_hash` ⇒ no index hit ⇒ BUILD.
+    /// Different row values produce a different parquet blake3, and a different
+    /// `input_hash` means the second run finds no candidate to reuse.
+    #[tokio::test]
+    #[ignore]
+    async fn reuse_builds_when_input_hash_differs() {
+        let Some(env) = try_load_env() else {
+            eprintln!("skipping: ROCKY_TEST_* env vars not set");
+            return;
+        };
+        let Some(connector) = try_load_connector() else {
+            eprintln!("skipping: DATABRICKS_* env vars not set");
+            return;
+        };
+        let warehouse = DatabricksWarehouseAdapter::new(connector);
+        let warehouse_dyn: &dyn WarehouseAdapter = &warehouse;
+        let fqtn = format!("{}.{}.{}", env.catalog, env.schema, env.table);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = rocky_core::state::StateStore::open(&dir.path().join("state.redb")).unwrap();
+
+        // Run 1 — build R with seed 9081 and record its spine.
+        let r_model = reuse_model(&env, 9081);
+        let r_summary = execute_content_addressed_model(&r_model, warehouse_dyn, None)
+            .await
+            .expect("first build must succeed");
+        let _r_input_hash = record_r_build(&store, &r_model, "run-R", &r_summary);
+
+        // Run 2 — a DIFFERENT model (seed 9082 ⇒ different SQL ⇒ different
+        // skip_hash ⇒ different input_hash). Its decision-time input_hash is
+        // recomputed from the new model, so the INPUT_INDEX lookup misses.
+        let changed_model = reuse_model(&env, 9082);
+        let changed_input_hash = rocky_core::reuse::build_records(
+            &changed_model,
+            "run-changed",
+            &[],
+            &[rocky_core::reuse::OutputArtifact {
+                blake3_hash: "placeholder".into(),
+                file_path: "placeholder".into(),
+            }],
+            chrono::Utc::now(),
+        )
+        .expect("derive changed input_hash")
+        .0
+        .input_hash;
+        assert_ne!(
+            changed_input_hash, _r_input_hash,
+            "a changed upstream/model must yield a different input_hash"
+        );
+
+        let count_before = count_rows(warehouse_dyn, &fqtn);
+        let ctx = ReuseDecisionCtx {
+            input_hash: Some(changed_input_hash),
+            state_store: &store,
+            run_id: "run-changed",
+        };
+        let summary = execute_content_addressed_model(&changed_model, warehouse_dyn, Some(ctx))
+            .await
+            .expect("the run must succeed as a BUILD");
+        assert!(
+            summary.reused_from.is_none(),
+            "a different input_hash misses the index ⇒ must BUILD"
+        );
+        assert_ne!(
+            summary.blake3_hash, r_summary.blake3_hash,
+            "different inputs produce a different output blake3"
+        );
+        let count_after = count_rows(warehouse_dyn, &fqtn);
+        assert_eq!(
+            count_after,
+            count_before + 3,
+            "the BUILD must materialize the 3 new rows"
         );
     }
 }
