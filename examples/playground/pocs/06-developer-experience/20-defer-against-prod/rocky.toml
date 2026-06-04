@@ -1,0 +1,17 @@
+# 20-defer-against-prod — build only your changed model locally, resolving its
+# unbuilt upstream ref()s against an existing (production) schema.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.demo]
+type = "transformation"
+models = "models/**"
+
+# Both models land in the database's default schema (`poc.main`), so a model
+# references its upstream by bare name (`FROM stg_events`). A deferred run
+# rewrites that bare ref to a different schema (the "prod" home) instead of
+# requiring a local copy of the upstream table.
+[pipeline.demo.target.governance]
+auto_create_schemas = true

@@ -38,7 +38,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**72 of 84 POCs run with no external credentials.** See each POC's README for prerequisites.
+**75 of 87 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -77,7 +77,7 @@ Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, sta
 | [06-quality-pipeline-standalone](pocs/01-quality/06-quality-pipeline-standalone) | `type = "quality"` pipeline — standalone checks (row_count, freshness, null_rate) with `depends_on` chaining |
 | [07-freshness-sla](pocs/01-quality/07-freshness-sla) | Per-model + project `[freshness]` SLAs (`expected_lag_seconds` alias); the **W005** coverage diagnostic fires on a temporal-output model with no freshness declaration (`compile --with-seed`), suppressed by a per-model block or a project default; also surfaces in the editor with an AI fix |
 
-### 02 — Performance (13 POCs · DuckDB)
+### 02 — Performance (14 POCs · DuckDB)
 
 Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive concurrency, cost + budgets, side-by-side strategy showcase, per-table override rules, EXPLAIN-based cost estimation.
 
@@ -96,6 +96,7 @@ Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive 
 | [11-strategy-showcase](pocs/02-performance/11-strategy-showcase) | Three strategies side-by-side on one source: `full_refresh` + `incremental` + `merge`, with a cheat-sheet README |
 | [12-replication-table-overrides](pocs/02-performance/12-replication-table-overrides) | `[[table_overrides]]` — per-table `strategy`/`merge_keys`/`timestamp_column`/`enabled` overrides with glob matching and most-specific-match-wins resolution |
 | [13-estimate-explain-cost](pocs/02-performance/13-estimate-explain-cost) | `rocky estimate` runs each model's SELECT through DuckDB `EXPLAIN` — row estimates, join strategy, filter pushdown — as a pure dry-run, no tables materialized |
+| [14-skip-unchanged](pocs/02-performance/14-skip-unchanged) | `rocky run --skip-unchanged` — opt-in model-skip gate: unchanged logic + unchanged upstream data ⇒ SKIP (`tables_skipped: 1`); mutate the upstream ⇒ BUILD. Best-effort, default-off, fail-safe |
 
 ### 03 — AI (6 POCs · `ANTHROPIC_API_KEY` for 01–05, DuckDB for 06)
 
@@ -125,7 +126,7 @@ Unity Catalog grants, schema patterns, workspace isolation, tagging, classificat
 | [07-auto-create-schemas](pocs/04-governance/07-auto-create-schemas) | `[…target.governance] auto_create_schemas = true` on a transformation pipeline targeting a fresh schema (v1.29.0 parity fix) | none |
 | [08-cross-team-contracts](pocs/04-governance/08-cross-team-contracts) | Consumer imports a producer's published IR snapshot via `[imports.<name>]`; `rocky compile` fails with E030 when the producer drops a column the consumer reads (E033 on pin mismatch) | none |
 
-### 05 — Orchestration (10 POCs · DuckDB / docker)
+### 05 — Orchestration (11 POCs · DuckDB / docker)
 
 Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode, circuit breaker, idempotency.
 
@@ -141,8 +142,9 @@ Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode
 | [08-circuit-breaker](pocs/05-orchestration/08-circuit-breaker) | **Trust arc 3** — `[adapter.retry]` exponential backoff + three-state `CircuitBreaker` |
 | [09-idempotency-key](pocs/05-orchestration/09-idempotency-key) | `rocky run --idempotency-key` dedup — second run with the same key yields `status = "skipped_idempotent"` |
 | [10-state-retention-sweep](pocs/05-orchestration/10-state-retention-sweep) | `[state.retention]` + `rocky state retention sweep` — manual + end-of-run auto-sweep of run history / lineage / audit domains |
+| [11-state-namespacing](pocs/05-orchestration/11-state-namespacing) | `rocky --state-namespace <key>` routes each pipeline/client to its own `<models>/.rocky-state/<key>.redb` (own single-writer lock) — opt-in, byte-identical when off |
 
-### 06 — Developer Experience (19 POCs · DuckDB)
+### 06 — Developer Experience (20 POCs · DuckDB)
 
 Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, portability lint, SQL types, PR-preview, lineage-diff, run-watch, dbt-import failure modes, view strategy, dbt unit-test import.
 
@@ -167,6 +169,7 @@ Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, p
 | [17-trace-replay-cost-combo](pocs/06-developer-experience/17-trace-replay-cost-combo) | One `RunRecord`, three views — `rocky trace` + `rocky cost` + `rocky replay` all project from the same run id |
 | [18-view-strategy](pocs/06-developer-experience/18-view-strategy) | `[strategy] type = "view"` — model compiles to `CREATE OR REPLACE VIEW <target>` on every warehouse |
 | [19-import-dbt-unit-tests](pocs/06-developer-experience/19-import-dbt-unit-tests) | `rocky import-dbt --manifest` walks `manifest.unit_tests` into Rocky `[[test]]` sidecars; `data_tests:` accepted as alias for `tests:` on column tests (dbt 1.7+) |
+| [20-defer-against-prod](pocs/06-developer-experience/20-defer-against-prod) | `rocky run --model <name> --defer --defer-to <schema>` — build only the changed model locally, resolve its unbuilt upstream `ref()`s against a production schema (default-off dev convenience) |
 
 ### 07 — Adapters (7 POCs · mixed)
 
