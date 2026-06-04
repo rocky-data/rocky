@@ -309,6 +309,14 @@ export type StateBackend = "local" | "s3" | "gcs" | "valkey" | "tiered";
  */
 export type DedupPolicy = "success" | "any";
 /**
+ * Per-pipeline / per-client state-file namespacing policy.
+ *
+ * redb permits one writer per file, so fanning out one `rocky run` process per pipeline or client against the single global state file forces those independent runs to serialize on one advisory lock. Namespacing gives each namespace its own `<models>/.rocky-state/<namespace>.redb` file (its own lock, its own redb handle, its own remote object key), so runs on distinct namespaces proceed concurrently with zero shared corruption surface.
+ *
+ * Default is [`StateNamespacing::None`] — behavior is **byte-identical** to a project that never sets this key. Namespacing is purely opt-in.
+ */
+export type StateNamespacing = "none" | "pipeline";
+/**
  * Policy applied when state upload fails after retries + circuit-breaker are exhausted. See [`StateConfig::on_upload_failure`].
  */
 export type StateUploadFailureMode = "skip" | "fail";
@@ -1731,6 +1739,10 @@ export interface StateConfig {
    * Per-run idempotency-key policy (`rocky run --idempotency-key`). Controls retention of stamped keys, what terminal statuses count as "deduplicated", and how long an `InFlight` entry survives before it's treated as a crashed-pod corpse and adopted by a fresh caller. See [`IdempotencyConfig`].
    */
   idempotency?: IdempotencyConfig;
+  /**
+   * Per-pipeline / per-client state-file namespacing. Defaults to [`StateNamespacing::None`] (one global state file — byte-identical to a project that omits this key). Set `namespacing = "pipeline"` to give each pipeline its own `<models>/.rocky-state/<pipeline>.redb` so independent fan-out runs don't serialize on one advisory lock. The per-invocation `--state-namespace <key>` flag overrides this; an explicit `--state-path` disables namespacing for that run.
+   */
+  namespacing?: StateNamespacing & string;
   /**
    * What to do when state upload exhausts retries + circuit-breaker. Defaults to `skip` — rocky continues the run and the next run re-derives state from target-table metadata. See [`StateUploadFailureMode`].
    */

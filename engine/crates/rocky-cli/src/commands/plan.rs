@@ -1234,7 +1234,11 @@ fn render_budget_diagnostics_text(output: &PlanOutput) {
 /// - `base_ref` — git ref to diff against.
 /// - `branch_name` — branch being promoted.
 /// - `filter` — optional replication filter (e.g. `"client=acme"`).
+/// - `pipeline_name` — optional pipeline selector.
 /// - `allow_breaking` — bypass the breaking-change block gate.
+/// - `state_path` — already-resolved (namespace-aware) state-file path threaded
+///   from `main.rs`, so `rocky --state-namespace <ns> plan promote` reads the
+///   namespaced branch state rather than the global file.
 /// - `output_json` — emit machine-readable JSON instead of text.
 #[allow(clippy::too_many_arguments)]
 pub async fn plan_promote(
@@ -1246,6 +1250,7 @@ pub async fn plan_promote(
     filter: Option<&str>,
     pipeline_name: Option<&str>,
     allow_breaking: bool,
+    state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
     let result = build_promote_plan_inner(
@@ -1257,6 +1262,7 @@ pub async fn plan_promote(
         filter,
         pipeline_name,
         allow_breaking,
+        state_path,
     )
     .await?;
 
@@ -1314,6 +1320,7 @@ pub(crate) async fn build_promote_plan_inner(
     filter: Option<&str>,
     pipeline_name: Option<&str>,
     allow_breaking: bool,
+    state_path: &Path,
 ) -> Result<PromotePlanResult> {
     use crate::commands::branch::{
         APPROVAL_SKIP_ENV, approver_identity_pub, compute_branch_state_hash_pub,
@@ -1324,9 +1331,9 @@ pub(crate) async fn build_promote_plan_inner(
 
     validate_branch_name_pub(branch_name)?;
 
-    let state_path =
-        rocky_core::state::resolve_state_path(None, std::path::Path::new("models")).path;
-    let store = StateStore::open_read_only(&state_path).with_context(|| {
+    // `state_path` is the namespace-aware path threaded from main.rs; the
+    // branch record lives in whichever state file this invocation targets.
+    let store = StateStore::open_read_only(state_path).with_context(|| {
         format!(
             "failed to open state store at {} — run `rocky branch create {}` first",
             state_path.display(),

@@ -1152,6 +1152,22 @@ class StateBackend5(StrEnum):
     tiered = "tiered"
 
 
+class StateNamespacing1(StrEnum):
+    """
+    One global `<models>/.rocky-state.redb` for the whole project (default). Identical to today's behavior.
+    """
+
+    none = "none"
+
+
+class StateNamespacing2(StrEnum):
+    """
+    One state file per pipeline, under `<models>/.rocky-state/<pipeline>.redb`. The per-invocation `--state-namespace <key>` flag takes precedence over this config and is the explicit way to fan out by client/tenant rather than by pipeline name. An explicit `--state-path` disables namespacing entirely for that invocation.
+    """
+
+    pipeline = "pipeline"
+
+
 class StateRetentionDomain1(StrEnum):
     """
     Pipeline run records (`run_history` table). Each row carries `started_at`/`finished_at` and the governance audit trail.
@@ -2591,6 +2607,10 @@ class StateConfig(BaseModel):
     """
     Per-run idempotency-key policy (`rocky run --idempotency-key`). Controls retention of stamped keys, what terminal statuses count as "deduplicated", and how long an `InFlight` entry survives before it's treated as a crashed-pod corpse and adopted by a fresh caller. See [`IdempotencyConfig`].
     """
+    namespacing: StateNamespacing1 | StateNamespacing2 | None = "none"
+    """
+    Per-pipeline / per-client state-file namespacing. Defaults to [`StateNamespacing::None`] (one global state file — byte-identical to a project that omits this key). Set `namespacing = "pipeline"` to give each pipeline its own `<models>/.rocky-state/<pipeline>.redb` so independent fan-out runs don't serialize on one advisory lock. The per-invocation `--state-namespace <key>` flag overrides this; an explicit `--state-path` disables namespacing for that run.
+    """
     on_upload_failure: StateUploadFailureMode1 | StateUploadFailureMode2 | None = "skip"
     """
     What to do when state upload exhausts retries + circuit-breaker. Defaults to `skip` — rocky continues the run and the next run re-derives state from target-table metadata. See [`StateUploadFailureMode`].
@@ -3087,6 +3107,7 @@ class RockyConfig(BaseModel):
                 "in_flight_ttl_hours": 24,
                 "retention_days": 30,
             },
+            "namespacing": "none",
             "on_upload_failure": "skip",
             "retention": {
                 "applies_to": ["history", "lineage", "audit"],

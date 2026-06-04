@@ -520,6 +520,32 @@ pub enum StateUploadFailureMode {
     Fail,
 }
 
+/// Per-pipeline / per-client state-file namespacing policy.
+///
+/// redb permits one writer per file, so fanning out one `rocky run` process
+/// per pipeline or client against the single global state file forces those
+/// independent runs to serialize on one advisory lock. Namespacing gives each
+/// namespace its own `<models>/.rocky-state/<namespace>.redb` file (its own
+/// lock, its own redb handle, its own remote object key), so runs on distinct
+/// namespaces proceed concurrently with zero shared corruption surface.
+///
+/// Default is [`StateNamespacing::None`] — behavior is **byte-identical** to a
+/// project that never sets this key. Namespacing is purely opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum StateNamespacing {
+    /// One global `<models>/.rocky-state.redb` for the whole project (default).
+    /// Identical to today's behavior.
+    #[default]
+    None,
+    /// One state file per pipeline, under `<models>/.rocky-state/<pipeline>.redb`.
+    /// The per-invocation `--state-namespace <key>` flag takes precedence over
+    /// this config and is the explicit way to fan out by client/tenant rather
+    /// than by pipeline name. An explicit `--state-path` disables namespacing
+    /// entirely for that invocation.
+    Pipeline,
+}
+
 /// State persistence configuration.
 ///
 /// Controls where Rocky stores watermarks and anomaly history between runs.
@@ -582,6 +608,15 @@ pub struct StateConfig {
     /// [`crate::retention::StateRetentionConfig`].
     #[serde(default)]
     pub retention: crate::retention::StateRetentionConfig,
+    /// Per-pipeline / per-client state-file namespacing. Defaults to
+    /// [`StateNamespacing::None`] (one global state file — byte-identical to a
+    /// project that omits this key). Set `namespacing = "pipeline"` to give
+    /// each pipeline its own `<models>/.rocky-state/<pipeline>.redb` so
+    /// independent fan-out runs don't serialize on one advisory lock. The
+    /// per-invocation `--state-namespace <key>` flag overrides this; an
+    /// explicit `--state-path` disables namespacing for that run.
+    #[serde(default)]
+    pub namespacing: StateNamespacing,
 }
 
 impl Default for StateConfig {
@@ -599,6 +634,7 @@ impl Default for StateConfig {
             on_upload_failure: StateUploadFailureMode::default(),
             idempotency: IdempotencyConfig::default(),
             retention: crate::retention::StateRetentionConfig::default(),
+            namespacing: StateNamespacing::default(),
         }
     }
 }

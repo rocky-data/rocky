@@ -86,6 +86,31 @@ struct Cli {
     #[arg(long)]
     state_path: Option<PathBuf>,
 
+    /// Per-pipeline / per-client state-file namespace.
+    ///
+    /// redb permits one writer per state file, so fanning out one `rocky run`
+    /// per pipeline or client against the single global
+    /// `<models>/.rocky-state.redb` forces those independent runs to serialize
+    /// on one advisory lock. Passing `--state-namespace <key>` routes this
+    /// invocation to its own `<models>/.rocky-state/<key>.redb` (its own lock,
+    /// its own remote object key), so runs on distinct namespaces proceed
+    /// concurrently with zero shared corruption surface.
+    ///
+    /// `<key>` must be a SQL identifier (`^[a-zA-Z0-9_]+$`) — it becomes a
+    /// path segment, so anything else is rejected.
+    ///
+    /// Precedence: an explicit `--state-path` is a hard override that
+    /// **disables** namespacing for that invocation. Otherwise this flag wins
+    /// over `[state] namespacing` in `rocky.toml`. Default (neither set) is the
+    /// single global state file — byte-identical to today.
+    ///
+    /// Namespaced files start fresh; the legacy global file is never moved or
+    /// auto-seeded. Carry watermarks forward manually if needed (copy the
+    /// global file to `<models>/.rocky-state/<key>.redb`, or point
+    /// `--state-path` at it for the first run).
+    #[arg(long)]
+    state_namespace: Option<String>,
+
     /// Override `[cache.schemas] ttl_seconds` for this invocation.
     ///
     /// Precedence: `--cache-ttl` > `[cache.schemas] ttl_seconds` in
@@ -2043,6 +2068,61 @@ fn parse_governance_override(
 /// `2` is reserved exclusively for run partial-success; doctor-critical
 /// and ci-warnings were split off to `3` / `4` so they no longer collide
 /// with it.
+/// Resolve the state-file namespace for this invocation, if any.
+///
+/// Precedence:
+/// 1. An explicit `--state-path` disables namespacing entirely (returns
+///    `None`); the explicit path is honored verbatim downstream. Checked here
+///    so a `--state-namespace` typo doesn't error out a run that the explicit
+///    path already pins.
+/// 2. `--state-namespace <key>` — validated as a SQL identifier
+///    (`^[a-zA-Z0-9_]+$`); an invalid key is a hard error so a path-traversal
+///    or tenant-collision value never silently composes a file path.
+/// 3. `[state] namespacing = "pipeline"` — best-effort: load the config and, if
+///    exactly one pipeline is defined (or it resolves unambiguously), use its
+///    name. If the config can't be loaded or the pipeline is ambiguous, fall
+///    back to the global state file rather than failing the invocation (a
+///    convenience knob should never block a command that doesn't even touch a
+///    single pipeline). Use `--state-namespace` for explicit multi-pipeline /
+///    multi-tenant fan-out.
+fn resolve_state_namespace(cli: &Cli) -> Result<Option<String>> {
+    // Explicit --state-path wins and disables namespacing.
+    if cli.state_path.is_some() {
+        return Ok(None);
+    }
+
+    if let Some(ns) = cli.state_namespace.as_deref() {
+        rocky_core::state::validate_namespace(ns).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid --state-namespace '{ns}': {e}. A state namespace becomes a \
+                 file path segment, so it must be a SQL identifier (^[a-zA-Z0-9_]+$)."
+            )
+        })?;
+        return Ok(Some(ns.to_string()));
+    }
+
+    // Config-driven `[state] namespacing = "pipeline"`. Best-effort: this site
+    // runs for every command, so a config that doesn't parse (or isn't a
+    // single-pipeline project) must not hard-fail here.
+    let Ok(cfg) = rocky_core::config::load_rocky_config(&cli.config) else {
+        return Ok(None);
+    };
+    if cfg.state.namespacing != rocky_core::config::StateNamespacing::Pipeline {
+        return Ok(None);
+    }
+    match rocky_cli::registry::resolve_pipeline(&cfg, None) {
+        Ok((name, _)) => match rocky_core::state::validate_namespace(name) {
+            Ok(_) => Ok(Some(name.to_string())),
+            // A pipeline name that isn't a valid identifier (unusual) can't be a
+            // file segment; fall back to the global file rather than erroring.
+            Err(_) => Ok(None),
+        },
+        // Ambiguous (multiple pipelines, no selector) or empty: fall back to
+        // the global file. The user should pass `--state-namespace` to fan out.
+        Err(_) => Ok(None),
+    }
+}
+
 async fn run_async(cli: Cli, json: bool) -> Result<()> {
     // Install miette's fancy handler for rich error rendering in text mode.
     // In JSON mode we skip it — errors are serialized as structured data.
@@ -2082,9 +2162,19 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     // per-command `--models` override (on `rocky run`, `rocky compile`,
     // etc.) intentionally doesn't feed back in — the state file lives
     // with the project, not with a one-shot `--models` override.
-    let resolved = rocky_core::state::resolve_state_path(
+    //
+    // Namespacing (opt-in, default off): redb permits one writer per state
+    // file, so fanning out one `rocky run` per pipeline/client against the
+    // single global file serializes them on one advisory lock.
+    // `--state-namespace <key>` (or `[state] namespacing = "pipeline"`) routes
+    // this invocation to its own `<models>/.rocky-state/<key>.redb`. An
+    // explicit `--state-path` is a hard override that disables namespacing.
+    // The default (neither set) is byte-identical to today.
+    let state_namespace: Option<String> = resolve_state_namespace(&cli)?;
+    let resolved = rocky_core::state::resolve_state_path_ns(
         cli.state_path.as_deref(),
         std::path::Path::new("models"),
+        state_namespace.as_deref(),
     );
     if let Some(ref w) = resolved.warning {
         warn!(target: "rocky::state_path", "{w}");
@@ -2094,7 +2184,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     let result: Result<()> = match cli.command {
         Command::Init { path, template } => rocky_cli::commands::init(&path, Some(&template)),
         Command::Apply { plan_id } => {
-            rocky_cli::commands::run_apply(&cli.config, &plan_id, json).await
+            rocky_cli::commands::run_apply(&cli.config, &plan_id, &state_path, json).await
         }
         Command::Review {
             plan_id,
@@ -2218,6 +2308,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     promote_filter.as_deref(),
                     promote_pipeline.as_deref(),
                     allow_breaking,
+                    &state_path,
                     json,
                 )
                 .await
@@ -3157,7 +3248,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
         }
         Command::Watch { models, contracts } => {
-            rocky_cli::commands::run_watch(&models, contracts.as_deref(), json).await
+            rocky_cli::commands::run_watch(
+                &models,
+                contracts.as_deref(),
+                state_namespace.as_deref(),
+                json,
+            )
+            .await
         }
         Command::Fmt { paths, check } => rocky_cli::commands::run_fmt(&paths, check),
         Command::ExportSchemas { output_dir } => rocky_cli::commands::export_schemas(&output_dir),
