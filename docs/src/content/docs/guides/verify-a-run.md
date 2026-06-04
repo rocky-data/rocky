@@ -214,11 +214,20 @@ A `ProvenanceRecord` embeds everything the recompute needs:
   "input_hash": "<hex>",
   "skip_hash": "<hex>",
   "model_ir_canonical_json": "{...canonical, key-sorted ModelIr JSON...}",
+  "upstreams": [
+    {
+      "kind": "content",
+      "upstream_key": "analytics_prod.staging__orders.stg_orders",
+      "blake3_hash": "<hex of stg_orders' recorded output>"
+    }
+  ],
   "output_blake3": ["736713a2611f762af09ee4445c09157bcfdbf6e07145dd8edf2cfd203d8d5bf0"],
   "output_path": ["s3://bucket/analytics_prod/fct_revenue/736713a2…parquet"],
   "proof_class": "strong"
 }
 ```
+
+The `upstreams` array is the exact `Vec<UpstreamIdentity>` that was folded into `input_hash`. Each entry is either a `"content"` identity (a `strong` upstream — carries the upstream's recorded `blake3_hash`) or a `"watermark"` identity (a `heuristic` upstream — carries a `max_ts` and/or `row_count`). Persisting it is what makes the input side recomputable offline: without it you would have to trust Rocky's recorded `input_hash`; with it you re-derive `input_hash` yourself.
 
 ### The two-claim split — read this carefully
 
@@ -231,13 +240,14 @@ So the provenance record attests an **input-logic match plus the byte-identity o
 
 ### Recompute it yourself
 
-Three independent checks, none of which needs the `rocky` binary:
+Four independent checks, none of which needs the `rocky` binary:
 
 1. **IR-hash check.** Read the `ProvenanceRecord`, parse `model_ir_canonical_json` back into a `ModelIr` (it is the exact canonical, key-sorted JSON the recorder hashed), recompute its `skip_hash`, and confirm it equals the recorded `skip_hash`. This is the input-logic half — it confirms the embedded logic matches what was indexed.
-2. **Byte-identity check.** For each `output_blake3` / `output_path` pair, fetch the Parquet at the path, `b3sum` it, and confirm the hash equals the recorded `output_blake3` and the file's own content-addressed name (the previous section's check, applied to the reused file).
-3. **Refcount sanity.** Once a reuse backend lands (a later stage) and two runs genuinely share one set of bytes, `refcount_for_hash(blake3)` over the `output_artifacts` table returns `≥ 2` — both the original run's and the reusing run's `ArtifactRecord` rows point at the same hash. That is the evidence the reuse was *recorded*, not merely asserted. In the current dormant stage no reuse occurs, so a freshly recorded build's hash has a refcount of `1`; the `≥ 2` condition is the verification contract the provenance record *enables*, live the moment a reuse backend records the shared reference.
+2. **Input-hash recompute.** Re-derive `input_hash` from the bytes of the record alone and confirm it equals the recorded `input_hash`. The key is `blake3` over a canonical (key-sorted, whitespace-free) JSON projection of: a version byte, the `skip_hash`, the target `catalog.schema.table` identity (read it off the `target` in the parsed `model_ir_canonical_json`), and the `upstreams` array sorted by `upstream_key`. Because the projection and its inputs are all in the record, the recompute needs no live model and no Rocky binary — it confirms the recorded `input_hash` is the one those inputs actually produce, closing the input side that step 1 only half-covers.
+3. **Byte-identity check.** For each `output_blake3` / `output_path` pair, fetch the Parquet at the path, `b3sum` it, and confirm the hash equals the recorded `output_blake3` and the file's own content-addressed name (the previous section's check, applied to the reused file). For a `strong` record you can extend this one hop upstream: each `"content"` entry in `upstreams` carries the upstream's recorded `blake3_hash`, which you cross-check against *that upstream's own* `ProvenanceRecord` (its `output_blake3`), whose `output_path` then locates the upstream bytes to `b3sum`. The `UpstreamIdentity` itself carries only the key and hash — the path to the bytes lives on the upstream's record, not on this one.
+4. **Refcount sanity.** Once a reuse backend lands (a later stage) and two runs genuinely share one set of bytes, `refcount_for_hash(blake3)` over the `output_artifacts` table returns `≥ 2` — both the original run's and the reusing run's `ArtifactRecord` rows point at the same hash. That is the evidence the reuse was *recorded*, not merely asserted. In the current dormant stage no reuse occurs, so a freshly recorded build's hash has a refcount of `1`; the `≥ 2` condition is the verification contract the provenance record *enables*, live the moment a reuse backend records the shared reference.
 
-The `proof_class` label — `strong` or `heuristic` — tells a consumer which guarantee applies. `strong` means every upstream identity folded into the `input_hash` was itself a content hash, so the whole chain is `b3sum`-verifiable. `heuristic` means at least one upstream was attested by a freshness signal (a watermark or row count) rather than a content hash; that attests *freshness*, not byte-identity, and a `heuristic` record must never be read as a byte-proof.
+The `proof_class` label — `strong` or `heuristic` — tells a consumer which guarantee applies. `strong` means every upstream identity folded into the `input_hash` was itself a content hash, so every link in the chain has a recorded `b3sum` you can check against its own provenance record (this attests the *recorded* bytes, not that re-execution reproduces them). `heuristic` means at least one upstream was attested by a freshness signal (a watermark or row count) rather than a content hash; that attests *freshness*, not byte-identity, and a `heuristic` record must never be read as a byte-proof.
 
 ## What this verifies, and what it does not
 
@@ -247,7 +257,7 @@ Verifies, with the tools above and no `rocky` binary:
 - What code ran, fingerprinted by `sql_hash` and anchored to an immutable `git_commit`.
 - The output table's live schema and row count, checked against the warehouse directly.
 - On the content-addressed path, that the output bytes match the recorded hash exactly.
-- With `[reuse]` enabled, that an indexed build's declared inputs match (recompute `skip_hash` from the embedded canonical IR) and that the recorded output bytes are exactly those bytes (`b3sum`), each labelled `strong` or `heuristic`.
+- With `[reuse]` enabled, that an indexed build's declared inputs are internally consistent — recompute `skip_hash` from the embedded canonical IR, then recompute `input_hash` from the persisted `skip_hash` + target identity + `upstreams` and confirm it matches the recorded value — and that the recorded output bytes are exactly those bytes (`b3sum`, extendable one hop to each `strong` upstream's recorded bytes via its own record), each labelled `strong` or `heuristic`.
 
 Does **not** verify:
 
@@ -264,7 +274,7 @@ Every load-bearing claim above, graded against what ships today:
 | `rocky replay` surfaces the recorded run | Shipped (inspection only) |
 | Re-execution with pinned inputs reproduces the output | Not yet — planned follow-up |
 | Content-addressed Parquet named by BLAKE3 + recorded in `output_artifacts` | Shipped, but on the S3 content-addressed path only — not what a general DuckDB/Snowflake/BigQuery/Databricks run produces |
-| `[reuse]` input-match index + provenance record (offline-recomputable `skip_hash` + `b3sum` + `proof_class`) | Shipped as an opt-in, **dormant** record on the content-addressed path — populated, but nothing reads it back to skip or reuse yet |
+| `[reuse]` input-match index + provenance record (offline-recomputable `skip_hash` *and* `input_hash` over persisted `upstreams` + `b3sum` + `proof_class`) | Shipped as an opt-in, **dormant** record on the content-addressed path — populated, but nothing reads it back to skip or reuse yet |
 | Reuse *decision*: actually skipping a build by pointing at or cloning a prior run's bytes | Not yet — the index is recorded; consuming it to reuse bytes is a later stage |
 | `bytes_written` per model | Not yet — `null` on every adapter today |
 | Warehouse-native zero-copy clones for branches | Not yet — branches are isolated schema prefixes, not engine-native clones |

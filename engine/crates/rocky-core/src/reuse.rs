@@ -341,6 +341,10 @@ pub fn build_records(
         input_hash,
         skip_hash,
         model_ir_canonical_json: model_ir.canonical_json(),
+        // Persist the exact upstream identities folded into `input_hash` so an
+        // offline auditor can recompute it (and re-verify each strong
+        // upstream's blake3) without trusting the runtime.
+        upstreams: upstreams.to_vec(),
         output_blake3,
         output_path,
         proof_class,
@@ -558,6 +562,21 @@ mod tests {
         assert_eq!(entry.input_hash, prov.input_hash);
         let expected_skip = m.skip_hash().unwrap().to_hex().to_string();
         assert_eq!(prov.skip_hash, expected_skip);
+
+        // The provenance record persists the exact upstreams folded into
+        // input_hash, so an offline recompute is possible without the runtime.
+        assert_eq!(prov.upstreams, ups);
+        let recomputed = compute_input_hash(
+            &prov.skip_hash,
+            "analytics.marts.fct_orders",
+            &prov.upstreams,
+        )
+        .to_hex()
+        .to_string();
+        assert_eq!(
+            recomputed, prov.input_hash,
+            "input_hash must recompute from the persisted skip_hash + target + upstreams"
+        );
 
         // Provenance embeds the round-trippable canonical IR.
         let reparsed: rocky_ir::ModelIr =

@@ -4144,24 +4144,18 @@ pub(crate) async fn execute_models(
         std::collections::HashMap::new();
 
     // Static lookup built once when reuse is on: every lowercased identity a
-    // model can be *read by* in SQL (its bare name and its `schema.table`
-    // form) → that model's target `catalog.schema.table` full name. Lets the
-    // read-set resolver map a table reference from SQL lineage to the producing
-    // model's recorded output. Empty when reuse is off so the default path
-    // allocates nothing. Mirrors the identity set `skip_gate` builds for the
-    // same raw-source-vs-project-model distinction.
+    // model can be UNAMBIGUOUSLY *read by* in SQL → that model's target
+    // `catalog.schema.table` full name. Lets the read-set resolver map a table
+    // reference from SQL lineage to the producing model's recorded output.
+    // Empty when reuse is off so the default path allocates nothing.
     let reuse_target_by_model: std::collections::HashMap<String, String> = if reuse_enabled {
-        let mut map = std::collections::HashMap::new();
-        for m in &compile_result.project.models {
-            let t = &m.config.target;
-            let target_full = format!("{}.{}.{}", t.catalog, t.schema, t.table);
-            map.insert(m.config.name.to_lowercase(), target_full.clone());
-            map.insert(
-                format!("{}.{}", t.schema, t.table).to_lowercase(),
-                target_full,
-            );
-        }
-        map
+        build_reuse_target_by_model(
+            compile_result
+                .project
+                .models
+                .iter()
+                .map(|m| (m.config.name.as_str(), &m.config.target)),
+        )
     } else {
         Default::default()
     };
@@ -4741,6 +4735,37 @@ pub(crate) async fn execute_models(
     Ok(())
 }
 
+/// Build the static `read-identity → target catalog.schema.table` lookup the
+/// reuse read-set resolver consults.
+///
+/// Keys a model only by identities that bind UNAMBIGUOUSLY to it:
+///
+/// - its lowercased bare model NAME (the compiler rejects duplicate model
+///   names at `project.rs`, so a 1-part read resolves to exactly one model);
+/// - its lowercased fully-qualified `catalog.schema.table` target identity (a
+///   3-part read names a single catalog).
+///
+/// The catalog-less `schema.table` form is deliberately **omitted**: two
+/// models targeting `cat1.marts.orders` and `cat2.marts.orders` share the same
+/// `marts.orders` and the compiler permits that (it only rejects duplicate
+/// model names). Keying on `schema.table` would let a catalog-ambiguous 2-part
+/// read bind to an arbitrary one of them and inherit its content hash under a
+/// `strong` label — the exact false-strong this resolver must refuse. A 2-part
+/// read therefore finds no key here and is left unresolved (see
+/// [`resolve_read_set_content_upstreams`]).
+fn build_reuse_target_by_model<'a, I>(models: I) -> std::collections::HashMap<String, String>
+where
+    I: IntoIterator<Item = (&'a str, &'a rocky_core::models::TargetConfig)>,
+{
+    let mut map = std::collections::HashMap::new();
+    for (name, t) in models {
+        let target_full = format!("{}.{}.{}", t.catalog, t.schema, t.table);
+        map.insert(target_full.to_lowercase(), target_full.clone());
+        map.insert(name.to_lowercase(), target_full);
+    }
+    map
+}
+
 /// Resolve a content-addressed model's immediate upstreams to STRONG
 /// content-hash identities for the auditable-reuse spine.
 ///
@@ -4753,14 +4778,25 @@ pub(crate) async fn execute_models(
 /// un-enumerable read can never be mistaken for "no raw-source reads". This is
 /// the same completeness fail-safe `skip_gate` uses.
 ///
+/// Only an UNAMBIGUOUS read resolves: a 1-part bare name (unique per project)
+/// or a 3-part `catalog.schema.table` (names a single catalog). A 2-part
+/// `schema.table` read is **catalog-ambiguous** — it binds to the session
+/// default catalog at runtime and `classify_table_ref` already treats it as an
+/// external source with no DAG edge — so it is refused here (returns `None` for
+/// that read ⇒ the whole model is left UNINDEXED, the same fail-safe as a
+/// raw-source read). Without this guard a 2-part read could collide with a
+/// project model in a *different* catalog and inherit its content hash under a
+/// `strong` label.
+///
 /// Returns `Some(_)` **only when every** read table maps (via
-/// `target_by_model`, keyed by lowercased bare name and `schema.table`) to a
-/// producing model whose unpartitioned content hash is in `outputs_by_target`.
-/// A read of a raw source (absent from `target_by_model`), a model not written
-/// content-addressed, or a model not built this run leaves the read unresolved
-/// ⇒ `None` ⇒ the model is not indexed. A model that reads nothing resolves to
-/// an empty (vacuously strong) set. This keeps a `strong` label honest: a
-/// mixed-input model is never mislabeled — it is simply deferred.
+/// `target_by_model`, keyed by lowercased bare name and full 3-part identity)
+/// to a producing model whose unpartitioned content hash is in
+/// `outputs_by_target`. A read of a raw source (absent from `target_by_model`),
+/// a catalog-ambiguous 2-part read, a model not written content-addressed, or a
+/// model not built this run leaves the read unresolved ⇒ `None` ⇒ the model is
+/// not indexed. A model that reads nothing resolves to an empty (vacuously
+/// strong) set. This keeps a `strong` label honest: a mixed-input or ambiguous
+/// model is never mislabeled — it is simply deferred.
 fn resolve_read_set_content_upstreams(
     sql: &str,
     target_by_model: &std::collections::HashMap<String, String>,
@@ -4782,6 +4818,18 @@ fn resolve_read_set_content_upstreams(
         return None;
     }
     rocky_core::reuse::resolve_content_upstreams(&read_tables, |table| {
+        // Only an UNAMBIGUOUS read may resolve to a project model's content
+        // hash: a 1-part bare name or a 3-part `catalog.schema.table`. A 2-part
+        // `schema.table` read is catalog-ambiguous — refuse it (and defensively
+        // any other arity) so it can never be bound to an arbitrary
+        // same-`schema.table` model in a different catalog under a strong
+        // label. `target_by_model` carries no 2-part keys either; the explicit
+        // guard is the load-bearing fail-safe, the key omission is defence in
+        // depth.
+        match table.matches('.').count() {
+            0 | 2 => {}
+            _ => return None,
+        }
         let target = target_by_model.get(table)?;
         let blake3_hash = outputs_by_target.get(target)?;
         Some((target.clone(), blake3_hash.clone()))
@@ -9987,5 +10035,136 @@ merge_keys = ["id"]
             built(&out2, "agg"),
             "an IN-subquery source is invisible to lineage — the model must always build"
         );
+    }
+
+    // -- reuse spine: catalog-ambiguous read must not false-strong -----------
+    //
+    // These exercise the *production* lookup builder + resolver
+    // (`build_reuse_target_by_model` / `resolve_read_set_content_upstreams`),
+    // not a hand-rolled map, so the "no catalog-less `schema.table` key"
+    // guarantee is genuinely under test.
+
+    fn target_cfg(catalog: &str, schema: &str, table: &str) -> rocky_core::models::TargetConfig {
+        rocky_core::models::TargetConfig {
+            catalog: catalog.to_string(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+        }
+    }
+
+    #[test]
+    fn reuse_target_map_omits_catalog_less_schema_table_key() {
+        // Two models share `marts.orders` across distinct catalogs — exactly
+        // the collision the compiler permits (it only rejects duplicate model
+        // NAMES). The map must carry no `marts.orders` key, only the bare names
+        // and the full 3-part identities.
+        let t1 = target_cfg("cat1", "marts", "orders");
+        let t2 = target_cfg("cat2", "marts", "orders");
+        let map = build_reuse_target_by_model([("orders_a", &t1), ("orders_b", &t2)]);
+
+        assert!(
+            !map.contains_key("marts.orders"),
+            "a catalog-less schema.table key would let a 2-part read false-strong"
+        );
+        assert_eq!(map.get("orders_a"), Some(&"cat1.marts.orders".to_string()));
+        assert_eq!(map.get("orders_b"), Some(&"cat2.marts.orders".to_string()));
+        assert_eq!(
+            map.get("cat1.marts.orders"),
+            Some(&"cat1.marts.orders".to_string())
+        );
+        assert_eq!(
+            map.get("cat2.marts.orders"),
+            Some(&"cat2.marts.orders".to_string())
+        );
+    }
+
+    #[test]
+    fn reuse_two_part_ambiguous_read_leaves_model_unindexed() {
+        // (a) Two models cat1.marts.orders + cat2.marts.orders both built this
+        // run; a downstream content-addressed model reads the catalog-ambiguous
+        // 2-part `FROM marts.orders`. It must NOT resolve to either upstream's
+        // content hash — the whole model is left UNINDEXED (None).
+        let t1 = target_cfg("cat1", "marts", "orders");
+        let t2 = target_cfg("cat2", "marts", "orders");
+        let target_by_model = build_reuse_target_by_model([("orders_a", &t1), ("orders_b", &t2)]);
+
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert("cat1.marts.orders".to_string(), "hash-cat1".to_string());
+        outputs.insert("cat2.marts.orders".to_string(), "hash-cat2".to_string());
+
+        let resolved = resolve_read_set_content_upstreams(
+            "SELECT id FROM marts.orders",
+            &target_by_model,
+            &outputs,
+        );
+        assert!(
+            resolved.is_none(),
+            "a catalog-ambiguous 2-part read must leave the downstream unindexed, \
+             not bind it to an arbitrary upstream's hash under a strong label"
+        );
+    }
+
+    #[test]
+    fn reuse_three_part_qualified_read_resolves_to_named_catalog() {
+        // (b) A fully-qualified 3-part read names a single catalog and must
+        // resolve to THAT catalog's content hash — the legitimate strong chain
+        // still works.
+        let t1 = target_cfg("cat1", "marts", "orders");
+        let t2 = target_cfg("cat2", "marts", "orders");
+        let target_by_model = build_reuse_target_by_model([("orders_a", &t1), ("orders_b", &t2)]);
+
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert("cat1.marts.orders".to_string(), "hash-cat1".to_string());
+        outputs.insert("cat2.marts.orders".to_string(), "hash-cat2".to_string());
+
+        let resolved = resolve_read_set_content_upstreams(
+            "SELECT id FROM cat1.marts.orders",
+            &target_by_model,
+            &outputs,
+        )
+        .expect("a fully-qualified 3-part read resolves");
+        assert_eq!(resolved.len(), 1);
+        match &resolved[0] {
+            rocky_core::reuse::UpstreamIdentity::Content {
+                upstream_key,
+                blake3_hash,
+            } => {
+                assert_eq!(upstream_key, "cat1.marts.orders");
+                assert_eq!(
+                    blake3_hash, "hash-cat1",
+                    "must bind cat1's hash, not cat2's"
+                );
+            }
+            other => panic!("expected a Content identity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reuse_one_part_bare_name_read_still_resolves() {
+        // (c) A 1-part bare model-name read still resolves (names are unique
+        // per project, so there is no ambiguity to refuse).
+        let t1 = target_cfg("cat1", "marts", "orders");
+        let target_by_model = build_reuse_target_by_model([("orders_a", &t1)]);
+
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert("cat1.marts.orders".to_string(), "hash-cat1".to_string());
+
+        let resolved = resolve_read_set_content_upstreams(
+            "SELECT id FROM orders_a",
+            &target_by_model,
+            &outputs,
+        )
+        .expect("a 1-part bare-name read resolves");
+        assert_eq!(resolved.len(), 1);
+        match &resolved[0] {
+            rocky_core::reuse::UpstreamIdentity::Content {
+                upstream_key,
+                blake3_hash,
+            } => {
+                assert_eq!(upstream_key, "cat1.marts.orders");
+                assert_eq!(blake3_hash, "hash-cat1");
+            }
+            other => panic!("expected a Content identity, got {other:?}"),
+        }
     }
 }

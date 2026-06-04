@@ -2646,6 +2646,12 @@ pub struct InputIndexEntry {
 /// - the canonical `ModelIr` JSON (via
 ///   [`rocky_ir::ModelIr::canonical_json`]) — deserialize it and recompute
 ///   [`rocky_ir::ModelIr::skip_hash`], compare to [`Self::skip_hash`];
+/// - the resolved [`Self::upstreams`] — the exact `Vec<UpstreamIdentity>`
+///   that justified [`Self::proof_class`], so an auditor can recompute
+///   [`Self::input_hash`] offline (via
+///   [`crate::reuse::compute_input_hash`]) and, for each `strong` upstream,
+///   independently cross-check its recorded blake3 against that upstream's
+///   own provenance record;
 /// - the recorded output blake3(s) — re-fetch the parquet at the recorded
 ///   path and `b3sum` it, compare to the recorded hash (the byte-identity
 ///   half of the claim);
@@ -2673,6 +2679,21 @@ pub struct ProvenanceRecord {
     /// form [`rocky_ir::ModelIr::canonical_json`] emits, round-trippable
     /// back into a `ModelIr` for the offline `skip_hash` recompute.
     pub model_ir_canonical_json: String,
+    /// The resolved immediate-upstream identities that justified
+    /// [`Self::proof_class`] and were folded into [`Self::input_hash`].
+    ///
+    /// Persisting them is what makes the input side offline-auditable: an
+    /// auditor recomputes `input_hash` via
+    /// [`crate::reuse::compute_input_hash`] from [`Self::skip_hash`], the
+    /// target identity (parsed back out of [`Self::model_ir_canonical_json`]),
+    /// and this list — no trust in the runtime required. Each `strong`
+    /// ([`crate::reuse::UpstreamIdentity::Content`]) entry carries the
+    /// upstream's recorded blake3, which the auditor cross-checks against that
+    /// upstream's *own* provenance record (whose `output_path` locates the
+    /// bytes to `b3sum`). Empty for a model that reads nothing (vacuously
+    /// strong). `#[serde(default)]` keeps pre-field records readable.
+    #[serde(default)]
+    pub upstreams: Vec<crate::reuse::UpstreamIdentity>,
     /// Output blake3 hash(es) for the build, one per content-addressed
     /// file. Empty when the model was not written content-addressed.
     #[serde(default)]
@@ -5932,6 +5953,10 @@ mod tests {
             input_hash: "ih-xyz".to_string(),
             skip_hash: skip_hash.to_hex().to_string(),
             model_ir_canonical_json: model_ir.canonical_json(),
+            upstreams: vec![crate::reuse::UpstreamIdentity::Content {
+                upstream_key: "analytics.marts.dim_x".to_string(),
+                blake3_hash: "up-hash".to_string(),
+            }],
             output_blake3: vec!["blake3:out".to_string()],
             output_path: vec!["s3://bucket/prefix/out.parquet".to_string()],
             proof_class: "strong".to_string(),
@@ -5972,6 +5997,7 @@ mod tests {
             input_hash: "ih-9".to_string(),
             skip_hash: recorded_skip_hash.clone(),
             model_ir_canonical_json: model_ir.canonical_json(),
+            upstreams: Vec::new(),
             output_blake3: vec!["blake3:out".to_string()],
             output_path: vec!["s3://bucket/prefix/out.parquet".to_string()],
             proof_class: "strong".to_string(),
@@ -6043,6 +6069,79 @@ mod tests {
             serde_json::from_value(minimal).expect("optional output_* fields default to empty");
         assert!(parsed.output_blake3.is_empty());
         assert!(parsed.output_path.is_empty());
+        assert!(
+            parsed.upstreams.is_empty(),
+            "a pre-field record must deserialize with an empty upstreams list"
+        );
         assert_eq!(parsed.proof_class, "strong");
+    }
+
+    #[test]
+    fn provenance_offline_input_hash_recompute_matches() {
+        // The offline-verify recipe's input-side step: an auditor holding ONLY
+        // a persisted ProvenanceRecord recomputes the model's input_hash from
+        // the bytes in that record — skip_hash, the target identity parsed back
+        // out of the canonical ModelIr JSON, and the persisted upstreams — and
+        // it must equal the recorded input_hash. Nothing here touches the live
+        // model: every input is derived from the deserialized record.
+        let (store, _dir) = temp_store();
+        let model_ir = sample_model_ir();
+        let skip_hash = model_ir
+            .skip_hash()
+            .expect("canonicalises")
+            .to_hex()
+            .to_string();
+        let upstreams = vec![crate::reuse::UpstreamIdentity::Content {
+            upstream_key: "analytics.marts.dim_x".to_string(),
+            blake3_hash: "up-hash".to_string(),
+        }];
+        let target_identity = format!(
+            "{}.{}.{}",
+            model_ir.target.catalog, model_ir.target.schema, model_ir.target.table
+        );
+        let input_hash = crate::reuse::compute_input_hash(&skip_hash, &target_identity, &upstreams)
+            .to_hex()
+            .to_string();
+        let record = ProvenanceRecord {
+            run_id: "run-11".to_string(),
+            model_name: "fct_orders".to_string(),
+            input_hash: input_hash.clone(),
+            skip_hash,
+            model_ir_canonical_json: model_ir.canonical_json(),
+            upstreams,
+            output_blake3: vec!["blake3:out".to_string()],
+            output_path: vec!["s3://bucket/prefix/out.parquet".to_string()],
+            proof_class: "strong".to_string(),
+            recorded_at: Utc::now(),
+        };
+        store
+            .record_reuse_spine(&[], std::slice::from_ref(&record))
+            .unwrap();
+
+        // Read the record back and recompute input_hash purely from its bytes.
+        let got = store
+            .get_provenance("run-11", "fct_orders")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got.upstreams.len(),
+            1,
+            "the persisted upstreams must round-trip"
+        );
+        let reparsed: rocky_ir::ModelIr =
+            serde_json::from_str(&got.model_ir_canonical_json).expect("canonical JSON round-trips");
+        let recomputed_target = format!(
+            "{}.{}.{}",
+            reparsed.target.catalog, reparsed.target.schema, reparsed.target.table
+        );
+        let recomputed =
+            crate::reuse::compute_input_hash(&got.skip_hash, &recomputed_target, &got.upstreams)
+                .to_hex()
+                .to_string();
+        assert_eq!(
+            recomputed, got.input_hash,
+            "offline input_hash recompute from the persisted record must equal the recorded value"
+        );
+        assert_eq!(got.input_hash, input_hash);
     }
 }
