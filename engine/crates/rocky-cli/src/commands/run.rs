@@ -50,6 +50,11 @@ struct TableResult {
     freshness_batch_ref: Option<TableRef>,
     asset_key: Vec<String>,
     target_full_name: String,
+    /// Fully-qualified target table ref, populated unconditionally (unlike
+    /// `target_batch_ref`, which is gated on `check_row_count`). The assertion
+    /// phase needs it for every materialized table so uniqueness/assertions run
+    /// even when row-count and freshness checks are disabled.
+    target_ref: TableRef,
     /// Deferred governance tags — applied in a post-run batch phase instead
     /// of inside the per-table concurrent loop, avoiding sequential SQL waits
     /// that block the concurrency semaphore.
@@ -1376,6 +1381,9 @@ pub async fn run(
     let mut target_batch_refs: Vec<TableRef> = Vec::new();
     let mut freshness_batch_refs: Vec<TableRef> = Vec::new();
     let mut batch_asset_keys: Vec<(String, Vec<String>)> = Vec::new();
+    // (target_ref, asset_key) per materialized table — populated unconditionally
+    // so row-level assertions run regardless of row_count/freshness config.
+    let mut assertion_targets: Vec<(TableRef, Vec<String>)> = Vec::new();
     let mut pending_checks: HashMap<String, PendingCheck> = HashMap::new();
     let mut tables_to_process: Vec<TableTask> = Vec::new();
     // PR-B3: count how many `(connector, table)` pairs matched each
@@ -2384,6 +2392,7 @@ pub async fn run(
                     target_batch_refs.push(tgt_ref);
                 }
                 batch_asset_keys.push((tr.target_full_name.clone(), tr.asset_key.clone()));
+                assertion_targets.push((tr.target_ref.clone(), tr.asset_key.clone()));
 
                 if let Some(fresh_ref) = tr.freshness_batch_ref {
                     freshness_batch_refs.push(fresh_ref);
@@ -2744,6 +2753,7 @@ pub async fn run(
                         if let Some(tgt_ref) = tr.target_batch_ref {
                             target_batch_refs.push(tgt_ref);
                         }
+                        assertion_targets.push((tr.target_ref.clone(), tr.asset_key.clone()));
                         batch_asset_keys.push((tr.target_full_name.clone(), tr.asset_key));
                         if let Some(tags) = tr.deferred_tags {
                             deferred_tags.push(tags);
@@ -3131,6 +3141,50 @@ pub async fn run(
                     });
                     entry.checks.push(check);
                 }
+            }
+        }
+    }
+
+    // Row-level assertions (uniqueness, etc.) on each replication target.
+    // The replication runner runs the SAME `[checks].assertions` the quality
+    // runner does, so uniqueness fires at replication time. Driven by
+    // `assertion_targets` (populated per materialized table, independent of
+    // row_count/freshness) so it runs even when those checks are disabled.
+    // Results are surfaced advisorily — like every other check in this runner,
+    // the run does not bail; the orchestrator decides from the JSON
+    // CheckResult + severity. (The data has already landed by check time, so
+    // bailing would only change the exit code, not prevent the write.)
+    if !pipeline.checks.assertions.is_empty() {
+        let dialect = shared_warehouse.dialect();
+        for (tref, asset_key) in &assertion_targets {
+            let full = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        table = %tref.full_name(),
+                        error = %e,
+                        "assertion table ref formatting failed — skipping"
+                    );
+                    continue;
+                }
+            };
+            let results = super::run_local::run_table_assertions(
+                shared_warehouse.as_ref(),
+                dialect,
+                &full,
+                &tref.table,
+                &pipeline.checks.assertions,
+            )
+            .await;
+            if !results.is_empty() {
+                let entry =
+                    pending_checks
+                        .entry(tref.full_name())
+                        .or_insert_with(|| PendingCheck {
+                            asset_key: asset_key.clone(),
+                            checks: Vec::new(),
+                        });
+                entry.checks.extend(results);
             }
         }
     }
@@ -6374,6 +6428,11 @@ async fn process_table(
         freshness_batch_ref,
         asset_key,
         target_full_name: target_table_full_name,
+        target_ref: TableRef {
+            catalog: target_table.catalog.clone(),
+            schema: target_table.schema.clone(),
+            table: target_table.table.clone(),
+        },
         deferred_tags,
         deferred_watermark,
     })
