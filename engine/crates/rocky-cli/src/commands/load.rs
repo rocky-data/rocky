@@ -477,10 +477,15 @@ async fn load_with_contract_gate(
         .with_context(|| format!("invalid target table name '{}'", target.table))?;
     rocky_sql::validation::validate_identifier(&target.schema)
         .with_context(|| format!("invalid target schema '{}'", target.schema))?;
-    if !target.catalog.is_empty() {
-        rocky_sql::validation::validate_identifier(&target.catalog)
-            .with_context(|| format!("invalid target catalog '{}'", target.catalog))?;
-    }
+    // The catalog is intentionally NOT validated with the strict
+    // `validate_identifier` here. It's the project/catalog component, which on
+    // BigQuery is a GCP project ID containing hyphens (`my-project-123`) that
+    // the strict rule rejects. It's validated dialect-appropriately by
+    // `dialect.format_table_ref` below — BigQuery via `validate_gcp_project_id`
+    // (blocks injection chars, permits hyphens), every other dialect via the
+    // strict `validate_identifier` — and that runs before any SQL touches the
+    // warehouse (see the `format_table_ref` calls preceding the first
+    // `execute_statement`). This matches the non-gate `rocky load` path.
     // staging_name is derived from the already-validated table name + a static
     // suffix, so it's guaranteed valid; validate anyway as a belt-and-braces.
     rocky_sql::validation::validate_identifier(&staging_name)
