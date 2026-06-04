@@ -20,6 +20,34 @@ plan_id=$(rocky --config rocky.toml --state-path /var/lib/rocky/state.redb plan 
 rocky --state-path /var/lib/rocky/state.redb apply "$plan_id"
 ```
 
+## Per-namespace state files
+
+redb permits **one writer per state file**. When you fan out one `rocky run` per pipeline or per client against the single global `.rocky-state.redb`, those independent runs serialize on one advisory lock — even though they touch unrelated watermarks. Namespacing gives each run its own state file so they proceed concurrently.
+
+This is **opt-in and default-off**: with neither knob set, Rocky uses the single global state file, byte-identical to before.
+
+Per invocation, route a run to its own state file with `--state-namespace <key>`:
+
+```bash
+rocky run --state-namespace acme       # writes/reads <models>/.rocky-state/acme.redb
+rocky run --state-namespace globex      # independent file, independent lock — runs concurrently
+```
+
+`<key>` must be a SQL identifier (`^[a-zA-Z0-9_]+$`) because it becomes a path segment; anything else is rejected.
+
+Or make each pipeline namespace itself by default in `rocky.toml`:
+
+```toml
+[state]
+namespacing = "pipeline"   # each pipeline → <models>/.rocky-state/<pipeline>.redb
+```
+
+The per-invocation `--state-namespace` flag overrides the config (use it to fan out by client/tenant rather than by pipeline name). An explicit `--state-path` is a hard override that **disables** namespacing for that invocation — it always wins, so a `--state-namespace` typo can't error out a run the explicit path already pins.
+
+:::note[Namespaced files start fresh]
+A new namespace's file starts empty — the legacy global file is never moved or auto-seeded. Carry watermarks forward manually if you need them (copy the global file to `<models>/.rocky-state/<key>.redb`, or point `--state-path` at it for the first run). See the [`[state]` configuration reference](/reference/configuration/#state) for the full field.
+:::
+
 ## What it stores
 
 ### Watermarks

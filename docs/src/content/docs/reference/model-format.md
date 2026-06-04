@@ -93,6 +93,37 @@ Warehouse-managed table shapes — **Delta tables**, **Iceberg tables**, **mater
 | `schema` | string | Yes | Source schema name. |
 | `table` | string | Yes | Source table name. |
 
+### `[skip]`
+
+Per-model overrides for the opt-in `--skip-unchanged` model-skip gate. The gate is conservative by default: a model is auto-skip-eligible only when a static scan finds its SQL deterministic and it uses a plain materialization strategy. This block lets an owner override that decision per model. Omit it entirely to follow the automatic rules.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `eligible` | bool \| null | `null` | Explicit eligibility override. `false` ⇒ this model **always builds**, even when the gate is on and everything looks unchanged (use for a known-volatile model the static scan might miss). `true` ⇒ the model is eligible, subject to the other gate clauses. `null` ⇒ fall back to the automatic rules. |
+| `deterministic` | bool \| null | `null` | Owner assertion about the SQL's purity. `true` is the only way a model the static non-determinism scan flagged (timestamps, randomness, unresolved UDFs, order-unstable aggregates) becomes skip-eligible — an explicit, auditable opt-in. `false` forces the model to be treated as non-deterministic (never auto-skipped). `null` ⇒ trust the static scan. |
+
+```toml
+name = "fct_orders"
+
+[skip]
+eligible = false        # opt this model out — always rebuild
+```
+
+```toml
+name = "dim_dates"
+
+[skip]
+deterministic = true    # owner asserts the SQL is pure → re-eligible despite the scan
+```
+
+**Fail-safe rules.** The gate exists to avoid silent production staleness, so it builds on any doubt. Beyond `[skip]`, a model is **never** auto-skip-eligible (it always rebuilds) when:
+
+- its SQL is **non-deterministic** — it calls a volatile builtin (`CURRENT_TIMESTAMP`, `NOW`, `RANDOM`, `UUID`, `CURRENT_USER`, `CURRENT_CATALOG`, …), an order/tie-break-unstable aggregate (`ANY_VALUE`, `ARRAY_AGG`, `COLLECT_LIST`, `COLLECT_SET`, `MODE`), an unordered `LIMIT`/`TOP`/`FETCH`, or any function not on Rocky's pure-function allowlist;
+- its **lineage isn't provably complete** — anything beyond a single plain `SELECT` over bare tables (CTEs, sub-queries in `FROM`, `PIVOT`/`UNNEST`/nested joins, `IN (SELECT …)`/`EXISTS`/scalar sub-selects, or set operations) forces a rebuild;
+- it uses a `content_addressed` or `time_interval` strategy (a `full_refresh` model **is** eligible).
+
+`deterministic = true` overrides only the first bullet. Even an eligible model is skipped only when its logic and every upstream's data are both unchanged. See [Skip Unchanged Models and Defer to Prod](/guides/skip-and-defer/) for the full workflow and the `[run]` tuning knobs.
+
 ### Environment variables
 
 Sidecar `.toml` files (and `models/_defaults.toml`) go through the same `${VAR}` / `${VAR:-default}` substitution as `rocky.toml`. This lets an orchestrator inject per-model `[target]` values via subprocess env without templating the sidecar:
