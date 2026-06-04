@@ -611,6 +611,20 @@ pub(super) fn commit_jsonl_reference_for_path(
 /// — as "not provably live" and BUILDs. A `false` return (provably removed or
 /// absent) is the explicit "do not reuse" answer.
 ///
+/// # Limitations
+///
+/// This scans only the `_delta_log/<20-digit>.json` commit files; it does
+/// **not** consult Delta **checkpoint** parquet files (`*.checkpoint.parquet`,
+/// `_last_checkpoint`). On a table whose log has been **truncated** behind a
+/// checkpoint, `R`'s original `add` commit JSON is no longer present, so this
+/// returns `Absent` ⇒ not-live ⇒ BUILD even though the file is still active.
+/// That is **fail-closed** (a missed reuse, never a wrong reuse), so the gate
+/// stays correct — but it silently disables reuse on large/old (checkpointed)
+/// tables. Folding in checkpoint state (read `_last_checkpoint`, then the
+/// referenced checkpoint parquet's surviving `add`s before the JSON tail) is a
+/// tracked follow-up; until then, an invocation author must expect reuse to
+/// quietly degrade to BUILD once a table accumulates a checkpoint.
+///
 /// # Errors
 ///
 /// [`UniformWriterError::ObjectStore`] when the listing or a GET fails;

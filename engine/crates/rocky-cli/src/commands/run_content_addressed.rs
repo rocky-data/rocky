@@ -549,8 +549,21 @@ async fn evaluate_reuse_decision(
         && c.proof_class == "strong"
         && let Some(blake3) = c.output_blake3.first()
     {
+        // `list_artifacts_by_hash` returns *every* ledger row carrying this
+        // blake3. Because the hash is a CONTENT hash, byte-identical parquet
+        // across virtual branches / replayed runs (the documented refcount > 1
+        // case) yields multiple same-blake3 rows for *different* tables — so a
+        // bare `.next()` could resolve a row belonging to some other
+        // `(run_id, model_name)`, corrupting the candidate's `file_path` +
+        // `commit_version` that the live point-to GET is load-bearing on.
+        // Pin the row to R's own `(run_id, model_name)`. A no-match falls
+        // through to the existing `ArtifactUnresolved` fail-closed BUILD.
         match ctx.state_store.list_artifacts_by_hash(blake3) {
-            Ok(records) => artifact = records.into_iter().next(),
+            Ok(records) => {
+                artifact = records
+                    .into_iter()
+                    .find(|r| r.run_id == c.run_id && r.model_name == c.model_name);
+            }
             Err(e) => warn!(error = %e, blake3, "reuse: artifact lookup failed; building"),
         }
         match ctx.state_store.refcount_for_hash(blake3) {
@@ -1347,6 +1360,200 @@ mod tests {
         assert!(!arr.is_null(0));
         assert!(arr.is_null(1));
         assert!(!arr.is_null(2));
+    }
+
+    // --- Cross-table artifact resolution (clause 5) ------------------------
+    //
+    // `list_artifacts_by_hash` returns a row per `{run_id, model_name,
+    // file_path}`. Because blake3 is a CONTENT hash, byte-identical parquet
+    // across virtual branches / replayed runs produces multiple same-blake3
+    // rows for *different* tables. `evaluate_reuse_decision` must resolve R's
+    // OWN ledger row (its correct `file_path`/`commit_version`), not whichever
+    // row the redb key order happens to surface first.
+
+    use object_store::PutPayload;
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjPath;
+
+    /// Seed an unpartitioned, non-rowTracking bootstrap commit (`v=0`) plus a
+    /// single `add` commit (`v=1`) that adds `live_basename`. After this, only
+    /// `live_basename` is live in the table's `_delta_log`.
+    async fn seed_unpartitioned_with_live_add(store: &InMemory, prefix: &str, live_basename: &str) {
+        let bootstrap = serde_json::json!({
+            "protocol": {
+                "minReaderVersion": 2,
+                "minWriterVersion": 7,
+                "writerFeatures": ["columnMapping", "icebergCompatV2", "invariants", "appendOnly"],
+            }
+        });
+        let metadata = serde_json::json!({
+            "metaData": {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": serde_json::to_string(&serde_json::json!({
+                    "type": "struct",
+                    "fields": [
+                        {"name": "id", "type": "long", "nullable": false, "metadata": {
+                            "delta.columnMapping.id": 1,
+                            "delta.columnMapping.physicalName": "col-id-uuid"
+                        }}
+                    ]
+                })).unwrap(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.columnMapping.mode": "name",
+                    "delta.universalFormat.enabledFormats": "iceberg",
+                    "delta.enableIcebergCompatV2": "true"
+                },
+                "createdTime": 0
+            }
+        });
+        let bootstrap_body = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&bootstrap).unwrap(),
+            serde_json::to_string(&metadata).unwrap(),
+        );
+        store
+            .put(
+                &ObjPath::from(format!("{prefix}/_delta_log/00000000000000000000.json")),
+                PutPayload::from(bootstrap_body.into_bytes()),
+            )
+            .await
+            .unwrap();
+
+        // v=1: an `add` for the live file. This is the *only* path the
+        // liveness scan will classify as `Added`.
+        let add_commit = serde_json::json!({"add": {"path": live_basename}});
+        let add_body = format!("{}\n", serde_json::to_string(&add_commit).unwrap());
+        store
+            .put(
+                &ObjPath::from(format!("{prefix}/_delta_log/00000000000000000001.json")),
+                PutPayload::from(add_body.into_bytes()),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn artifact_row(
+        run_id: &str,
+        model_name: &str,
+        blake3: &str,
+        file_path: &str,
+        commit_version: u64,
+    ) -> rocky_core::state::ArtifactRecord {
+        rocky_core::state::ArtifactRecord {
+            blake3_hash: blake3.to_string(),
+            run_id: run_id.to_string(),
+            model_name: model_name.to_string(),
+            file_path: file_path.to_string(),
+            commit_version,
+            size_bytes: 4096,
+            written_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluate_reuse_resolves_r_own_artifact_row_not_another_tables() {
+        // Two byte-identical (same-blake3) writes exist in the ledger:
+        //  - run-A / other_model wrote a DIFFERENT table's file (sorts FIRST
+        //    in the redb `{run_id}|...` key order, so a bare `.next()` picks it)
+        //  - run-R / fct_orders wrote THIS table's file (the correct row)
+        // Only run-R's file is live in this table's `_delta_log`.
+        let prefix = "tbl";
+        let r_basename = "rrrrrrrrrrrrrrrrrrrrrrrr.parquet";
+        let r_file_path = format!("s3://bucket/{prefix}/{r_basename}");
+        let r_commit_version = 7_u64;
+        let other_file_path = "s3://bucket/other-tbl/aaaaaaaaaaaaaaaaaaaaaaaa.parquet";
+
+        // State store with the INPUT_INDEX entry + two same-blake3 rows.
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_store =
+            rocky_core::state::StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let index_entry = rocky_core::state::InputIndexEntry {
+            input_hash: "ih-cross-table".to_string(),
+            run_id: "run-R".to_string(),
+            model_name: "fct_orders".to_string(),
+            output_blake3: vec!["shared-blake3".to_string()],
+            output_path: vec![r_file_path.clone()],
+            proof_class: "strong".to_string(),
+            recorded_at: chrono::Utc::now(),
+        };
+        state_store
+            .record_reuse_spine(std::slice::from_ref(&index_entry), &[])
+            .unwrap();
+        // Seed the OTHER table's row first — its `run-A` key sorts before
+        // `run-R`, so the pre-fix `.next()` would surface it.
+        state_store
+            .record_artifact(&artifact_row(
+                "run-A",
+                "other_model",
+                "shared-blake3",
+                other_file_path,
+                99,
+            ))
+            .unwrap();
+        state_store
+            .record_artifact(&artifact_row(
+                "run-R",
+                "fct_orders",
+                "shared-blake3",
+                &r_file_path,
+                r_commit_version,
+            ))
+            .unwrap();
+
+        // Writer + discovered state over an InMemory store where only R's
+        // file is live.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_unpartitioned_with_live_add(&store, prefix, r_basename).await;
+        let writer = UniformWriter::new(
+            UniformWriterConfig {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+                prefix: prefix.into(),
+                engine_info: "rocky-cli/test".into(),
+            },
+            store.clone() as Arc<dyn ObjectStore>,
+            Arc::new(NoOpSqlClient),
+        );
+        let state = writer
+            .discover()
+            .await
+            .expect("discover unpartitioned state");
+        assert!(
+            state.partition_columns.is_empty() && !state.row_tracking_enabled,
+            "fixture must be the eligible unpartitioned, non-rowTracking shape"
+        );
+
+        let ctx = ReuseDecisionCtx {
+            input_hash: Some("ih-cross-table".to_string()),
+            state_store: &state_store,
+            run_id: "run-current",
+        };
+        let verdict = evaluate_reuse_decision(&ctx, &writer, &state).await;
+
+        // Load-bearing: pre-fix, `.next()` resolves run-A's row (other table),
+        // whose basename is NOT live ⇒ Build(NotLive). Post-fix, `.find`
+        // resolves run-R's own row ⇒ WouldReuse with R's commit_version.
+        match verdict {
+            crate::commands::reuse_decision::ReuseVerdict::WouldReuse(c) => {
+                assert_eq!(c.run_id, "run-R");
+                assert_eq!(
+                    c.commit_version, r_commit_version,
+                    "must carry R's OWN commit_version, not the other table's"
+                );
+                assert_eq!(
+                    c.file_path, r_file_path,
+                    "must carry R's OWN file_path, not the other table's"
+                );
+            }
+            other => panic!(
+                "expected WouldReuse resolved to R's own row; got {other:?} \
+                 (a Build(NotLive) here is the pre-fix bug: the wrong table's \
+                 row was resolved and its file is not live in this log)"
+            ),
+        }
     }
 }
 
