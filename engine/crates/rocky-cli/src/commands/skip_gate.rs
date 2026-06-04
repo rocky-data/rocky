@@ -331,9 +331,19 @@ impl<'a> SkipGate<'a> {
     /// NOT produced by a project model (those are covered by the B3 recursion
     /// verdict, not a freshness query).
     ///
-    /// Returns `None` when the model's SQL cannot be parsed to enumerate its
-    /// upstreams — an unknown upstream set is unprovable, so the caller must
-    /// build. For each raw source we read `MAX(<ts>)` when the model declares a
+    /// Returns `None` when the model's upstreams cannot be fully enumerated —
+    /// an unknown / incomplete upstream set is unprovable, so the caller must
+    /// build. Two cases force `None`:
+    ///
+    /// - the SQL won't parse, and
+    /// - the SQL reads a **subquery in `FROM`** (`SELECT … FROM (SELECT …)`).
+    ///   The lineage extractor records a subquery as the opaque marker
+    ///   `(subquery)` without recursing into its body, so the real sources are
+    ///   invisible. Rather than risk proving B3 against an upstream we never
+    ///   looked at, such a model always builds. (Recursing into subquery
+    ///   bodies is a follow-up; over-building is the safe direction.)
+    ///
+    /// For each raw source we read `MAX(<ts>)` when the model declares a
     /// timestamp column (incremental / microbatch strategies) and `COUNT(*)`
     /// when `skip_rowcount_fallback` is enabled. Read failures leave the
     /// corresponding field `None` (⇒ that upstream is later judged unprovable
@@ -346,11 +356,19 @@ impl<'a> SkipGate<'a> {
         let ts_column = strategy_timestamp_column(&model.config.strategy);
 
         // Enumerate the tables the model reads. Unparseable SQL ⇒ `None` ⇒ the
-        // caller builds (we can't prove inputs are unchanged).
-        let referenced = rocky_sql::lineage::referenced_tables(&model.sql).ok()?;
+        // caller builds (we can't prove inputs are unchanged). We use
+        // `extract_lineage` (not `referenced_tables`) so the `(subquery)`
+        // marker is preserved rather than silently dropped.
+        let lineage = rocky_sql::lineage::extract_lineage(&model.sql).ok()?;
 
         let mut sigs = Vec::new();
-        for name in referenced {
+        for source in &lineage.source_tables {
+            let name = &source.name;
+            // A subquery in FROM hides its true sources from the extractor ⇒
+            // we cannot enumerate the real upstreams ⇒ unprovable ⇒ build.
+            if name == "(subquery)" {
+                return None;
+            }
             let lname = name.to_lowercase();
             // Produced by a project model ⇒ governed by the recursion verdict,
             // not a freshness probe. Match by model name or target identity.
@@ -363,11 +381,11 @@ impl<'a> SkipGate<'a> {
             // interpolate it directly (the per-component validation lives in
             // `query_max_ts` for the ts column, the only user-typed part).
             let max_ts = match ts_column {
-                Some(col) => query_max_ts(warehouse, &name, col).await,
+                Some(col) => query_max_ts(warehouse, name.as_str(), col).await,
                 None => None,
             };
             let row_count = if self.cfg.rowcount_fallback {
-                query_row_count(warehouse, &name).await
+                query_row_count(warehouse, name.as_str()).await
             } else {
                 None
             };

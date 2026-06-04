@@ -8857,6 +8857,57 @@ merge_keys = ["id"]
         );
     }
 
+    /// A model whose `FROM` is a subquery hides its real upstreams from the
+    /// lineage extractor (it records the opaque `(subquery)` marker). The gate
+    /// cannot enumerate the true sources, so it must BUILD even when the
+    /// underlying data changed — never skip against an upstream it never
+    /// examined. This is the load-bearing fail-safe for incomplete lineage.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_subquery_source_always_builds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        seed_src(&db, 3).await;
+        // Subquery in FROM — the extractor sees only `(subquery)`, not main.src.
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT id FROM (SELECT id FROM main.src) t",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Change the underlying source rowcount. A correct gate must rebuild
+        // (it cannot prove the hidden upstream is unchanged); a buggy gate that
+        // dropped the subquery marker would wrongly skip on stale data.
+        seed_src(&db, 5).await;
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "a subquery-in-FROM model must always build — upstreams aren't enumerable"
+        );
+    }
+
     /// First run (no prior successful execution) ⇒ BUILD.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
