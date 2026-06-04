@@ -2355,4 +2355,339 @@ mod live_tests {
             "Photon count must bump by 3 (before={n_before}, after={n_after})"
         );
     }
+
+    // ----------------------------------------------------------------------
+    // Live point-to REUSE tests (B5 final). These three are what verifies the
+    // whole capstone end-to-end against a real UniForm table: the writer
+    // no-op double-count guard (#838) + the fail-closed decision (#840) + the
+    // invocation wired here. Same env vars + sandbox shape as
+    // `content_addressed_e2e_live_sandbox` (unpartitioned `(id, name, ts)`).
+    // ----------------------------------------------------------------------
+
+    /// Build the canonical unpartitioned `(id, name, ts)` content-addressed
+    /// model for the reuse fixtures. `seed` differentiates the row values (and
+    /// thus the parquet blake3) so a "changed upstream" run produces a
+    /// different file.
+    fn reuse_model(env: &LiveEnv, seed: i64) -> ModelIr {
+        let base = chrono::Utc::now().timestamp_micros();
+        let ts = |off: i64| {
+            chrono::DateTime::from_timestamp_micros(base + off)
+                .unwrap()
+                .format("%Y-%m-%dT%H:%M:%S%.6f")
+                .to_string()
+        };
+        let model_sql = format!(
+            "SELECT * FROM VALUES \
+             (CAST({s}01 AS BIGINT), CAST('reuse-a' AS STRING), TIMESTAMP'{a}'), \
+             (CAST({s}02 AS BIGINT), CAST('reuse-b' AS STRING), TIMESTAMP'{b}'), \
+             (CAST({s}03 AS BIGINT), CAST('reuse-c' AS STRING), TIMESTAMP'{c}') \
+             AS t(id, name, ts)",
+            s = seed,
+            a = ts(0),
+            b = ts(1),
+            c = ts(2),
+        );
+        let mut model_ir = ModelIr::transformation(
+            TargetRef {
+                catalog: env.catalog.clone(),
+                schema: env.schema.clone(),
+                table: env.table.clone(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: env.storage_prefix.clone(),
+                partition_columns: vec![],
+            },
+            vec![],
+            model_sql,
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        model_ir.name = Arc::from("live_reuse_test");
+        model_ir.typed_columns = vec![
+            TypedColumn {
+                name: "id".into(),
+                data_type: RockyType::Int64,
+                nullable: false,
+            },
+            TypedColumn {
+                name: "name".into(),
+                data_type: RockyType::String,
+                nullable: false,
+            },
+            TypedColumn {
+                name: "ts".into(),
+                data_type: RockyType::Timestamp,
+                nullable: false,
+            },
+        ];
+        model_ir
+    }
+
+    /// Record R's build into the state store exactly as the runner does:
+    /// the `ArtifactRecord` (for refcount) plus the input-match spine entry
+    /// (for the index hit). Returns the `input_hash` the second run reuses by.
+    fn record_r_build(
+        store: &rocky_core::state::StateStore,
+        model_ir: &ModelIr,
+        run_id: &str,
+        summary: &ContentAddressedRunSummary,
+    ) -> String {
+        store
+            .record_artifact(&rocky_core::state::ArtifactRecord {
+                blake3_hash: summary.blake3_hash.clone(),
+                run_id: run_id.to_string(),
+                model_name: model_ir.name.to_string(),
+                file_path: summary.file_path.clone(),
+                commit_version: summary.commit_version,
+                size_bytes: summary.size_bytes,
+                written_at: chrono::Utc::now(),
+            })
+            .expect("record R's artifact");
+        // No upstreams (a literal SELECT) ⇒ proof_class "strong" — the
+        // self-contained reuse fixture.
+        let outputs = vec![rocky_core::reuse::OutputArtifact {
+            blake3_hash: summary.blake3_hash.clone(),
+            file_path: summary.file_path.clone(),
+        }];
+        let (entry, prov) =
+            rocky_core::reuse::build_records(model_ir, run_id, &[], &outputs, chrono::Utc::now())
+                .expect("build R's spine records");
+        let input_hash = entry.input_hash.clone();
+        store
+            .record_reuse_spine(std::slice::from_ref(&entry), std::slice::from_ref(&prov))
+            .expect("record R's spine");
+        input_hash
+    }
+
+    /// (a) Run a content-addressed model twice with reuse on ⇒ the SECOND run
+    /// REUSES R's parquet: no new bytes written, the row count is unchanged
+    /// (the no-op double-count guard returns R's existing commit), the
+    /// `ArtifactRecord` refcount at the shared blake3 is 2, and the summary
+    /// carries the reuse-provenance back-link to R.
+    #[tokio::test]
+    #[ignore]
+    async fn reuse_second_run_points_to_first_no_copy() {
+        let Some(env) = try_load_env() else {
+            eprintln!("skipping: ROCKY_TEST_* env vars not set");
+            return;
+        };
+        let Some(connector) = try_load_connector() else {
+            eprintln!("skipping: DATABRICKS_* env vars not set");
+            return;
+        };
+        let warehouse = DatabricksWarehouseAdapter::new(connector);
+        let warehouse_dyn: &dyn WarehouseAdapter = &warehouse;
+        let fqtn = format!("{}.{}.{}", env.catalog, env.schema, env.table);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = rocky_core::state::StateStore::open(&dir.path().join("state.redb")).unwrap();
+
+        // Run 1 — a normal BUILD. No reuse ctx (R has nothing to reuse yet).
+        let model_ir = reuse_model(&env, 9061);
+        let r_summary = execute_content_addressed_model(&model_ir, warehouse_dyn, None)
+            .await
+            .expect("first build must succeed");
+        assert!(r_summary.reused_from.is_none(), "first run is a build");
+        let count_after_build = count_rows(warehouse_dyn, &fqtn);
+        let input_hash = record_r_build(&store, &model_ir, "run-R", &r_summary);
+        assert_eq!(
+            store.refcount_for_hash(&r_summary.blake3_hash).unwrap(),
+            1,
+            "after R's build the shared blake3 has a single reference"
+        );
+
+        // Run 2 — reuse on, SAME inputs ⇒ point-to R's parquet, no SQL.
+        let ctx = ReuseDecisionCtx {
+            input_hash: Some(input_hash),
+            state_store: &store,
+            run_id: "run-reuse",
+        };
+        let reuse_summary = execute_content_addressed_model(&model_ir, warehouse_dyn, Some(ctx))
+            .await
+            .expect("second run must succeed (as a reuse)");
+
+        let prov = reuse_summary
+            .reused_from
+            .as_ref()
+            .expect("second run must REUSE, not build");
+        assert_eq!(prov.reused_run_id, "run-R");
+        assert_eq!(prov.proof_class, "strong");
+        assert_eq!(
+            reuse_summary.blake3_hash, r_summary.blake3_hash,
+            "reuse references R's shared bytes (same blake3)"
+        );
+        assert_eq!(
+            reuse_summary.commit_version, r_summary.commit_version,
+            "same-table reuse is a no-op: returns R's existing commit version"
+        );
+
+        // The data is correct + unchanged — reuse did not duplicate R's rows.
+        let count_after_reuse = count_rows(warehouse_dyn, &fqtn);
+        assert_eq!(
+            count_after_reuse, count_after_build,
+            "a same-target point-to must NOT change the row count (no double-count)"
+        );
+
+        // Record the reusing run's reference exactly as the runner does, and
+        // assert the shared blake3 refcount is now 2.
+        store
+            .record_artifact(&rocky_core::state::ArtifactRecord {
+                blake3_hash: reuse_summary.blake3_hash.clone(),
+                run_id: "run-reuse".into(),
+                model_name: model_ir.name.to_string(),
+                file_path: reuse_summary.file_path.clone(),
+                commit_version: reuse_summary.commit_version,
+                size_bytes: reuse_summary.size_bytes,
+                written_at: chrono::Utc::now(),
+            })
+            .expect("record the reusing run's artifact");
+        assert_eq!(
+            store.refcount_for_hash(&r_summary.blake3_hash).unwrap(),
+            2,
+            "the reusing run adds a SECOND reference at R's shared blake3 (zero copy)"
+        );
+    }
+
+    /// (b) VACUUM R's file then re-run ⇒ BUILD. A point-to into a removed file
+    /// would be a silent wrong reuse; the liveness clause (and the commit-time
+    /// re-check that closes the TOCTOU window) must catch the removal and fall
+    /// back to a build. `VACUUM ... RETAIN 0 HOURS` physically removes R's
+    /// no-longer-referenced bytes, making its `add` not-live.
+    #[tokio::test]
+    #[ignore]
+    async fn reuse_falls_back_to_build_when_file_vacuumed() {
+        let Some(env) = try_load_env() else {
+            eprintln!("skipping: ROCKY_TEST_* env vars not set");
+            return;
+        };
+        let Some(connector) = try_load_connector() else {
+            eprintln!("skipping: DATABRICKS_* env vars not set");
+            return;
+        };
+        let warehouse = DatabricksWarehouseAdapter::new(connector);
+        let warehouse_dyn: &dyn WarehouseAdapter = &warehouse;
+        let fqtn = format!("{}.{}.{}", env.catalog, env.schema, env.table);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = rocky_core::state::StateStore::open(&dir.path().join("state.redb")).unwrap();
+
+        // Run 1 — build R.
+        let model_ir = reuse_model(&env, 9071);
+        let r_summary = execute_content_addressed_model(&model_ir, warehouse_dyn, None)
+            .await
+            .expect("first build must succeed");
+        let input_hash = record_r_build(&store, &model_ir, "run-R", &r_summary);
+
+        // VACUUM the table with retention 0 so R's add is no longer live.
+        // (Requires `spark.databricks.delta.retentionDurationCheck.enabled =
+        // false` on the sandbox; the sandbox is configured for it.)
+        warehouse_dyn
+            .execute_statement(&format!("VACUUM {fqtn} RETAIN 0 HOURS"))
+            .await
+            .expect("VACUUM must succeed on the sandbox");
+
+        let count_before_reuse = count_rows(warehouse_dyn, &fqtn);
+
+        // Run 2 — reuse on, but R's file is gone ⇒ the decision's liveness
+        // clause (or the commit-time re-check) fails ⇒ BUILD.
+        let ctx = ReuseDecisionCtx {
+            input_hash: Some(input_hash),
+            state_store: &store,
+            run_id: "run-after-vacuum",
+        };
+        let summary = execute_content_addressed_model(&model_ir, warehouse_dyn, Some(ctx))
+            .await
+            .expect("the run must succeed as a BUILD");
+        assert!(
+            summary.reused_from.is_none(),
+            "with R's file VACUUM'd, the run must BUILD, never point-to a missing file"
+        );
+        // A fresh build wrote 3 rows back.
+        let count_after = count_rows(warehouse_dyn, &fqtn);
+        assert_eq!(
+            count_after,
+            count_before_reuse + 3,
+            "the fallback BUILD must re-materialize the 3 rows"
+        );
+    }
+
+    /// (c) Change an upstream ⇒ different `input_hash` ⇒ no index hit ⇒ BUILD.
+    /// Different row values produce a different parquet blake3, and a different
+    /// `input_hash` means the second run finds no candidate to reuse.
+    #[tokio::test]
+    #[ignore]
+    async fn reuse_builds_when_input_hash_differs() {
+        let Some(env) = try_load_env() else {
+            eprintln!("skipping: ROCKY_TEST_* env vars not set");
+            return;
+        };
+        let Some(connector) = try_load_connector() else {
+            eprintln!("skipping: DATABRICKS_* env vars not set");
+            return;
+        };
+        let warehouse = DatabricksWarehouseAdapter::new(connector);
+        let warehouse_dyn: &dyn WarehouseAdapter = &warehouse;
+        let fqtn = format!("{}.{}.{}", env.catalog, env.schema, env.table);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = rocky_core::state::StateStore::open(&dir.path().join("state.redb")).unwrap();
+
+        // Run 1 — build R with seed 9081 and record its spine.
+        let r_model = reuse_model(&env, 9081);
+        let r_summary = execute_content_addressed_model(&r_model, warehouse_dyn, None)
+            .await
+            .expect("first build must succeed");
+        let _r_input_hash = record_r_build(&store, &r_model, "run-R", &r_summary);
+
+        // Run 2 — a DIFFERENT model (seed 9082 ⇒ different SQL ⇒ different
+        // skip_hash ⇒ different input_hash). Its decision-time input_hash is
+        // recomputed from the new model, so the INPUT_INDEX lookup misses.
+        let changed_model = reuse_model(&env, 9082);
+        let changed_input_hash = rocky_core::reuse::build_records(
+            &changed_model,
+            "run-changed",
+            &[],
+            &[rocky_core::reuse::OutputArtifact {
+                blake3_hash: "placeholder".into(),
+                file_path: "placeholder".into(),
+            }],
+            chrono::Utc::now(),
+        )
+        .expect("derive changed input_hash")
+        .0
+        .input_hash;
+        assert_ne!(
+            changed_input_hash, _r_input_hash,
+            "a changed upstream/model must yield a different input_hash"
+        );
+
+        let count_before = count_rows(warehouse_dyn, &fqtn);
+        let ctx = ReuseDecisionCtx {
+            input_hash: Some(changed_input_hash),
+            state_store: &store,
+            run_id: "run-changed",
+        };
+        let summary = execute_content_addressed_model(&changed_model, warehouse_dyn, Some(ctx))
+            .await
+            .expect("the run must succeed as a BUILD");
+        assert!(
+            summary.reused_from.is_none(),
+            "a different input_hash misses the index ⇒ must BUILD"
+        );
+        assert_ne!(
+            summary.blake3_hash, r_summary.blake3_hash,
+            "different inputs produce a different output blake3"
+        );
+        let count_after = count_rows(warehouse_dyn, &fqtn);
+        assert_eq!(
+            count_after,
+            count_before + 3,
+            "the BUILD must materialize the 3 new rows"
+        );
+    }
 }
