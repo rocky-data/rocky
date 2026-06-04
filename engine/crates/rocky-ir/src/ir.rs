@@ -789,6 +789,62 @@ impl ModelIr {
         blake3::hash(canonical.as_bytes())
     }
 
+    /// Best-effort *cosmetic-invariant* key for this model's logic.
+    ///
+    /// Unlike [`Self::recipe_hash`] — which hashes the raw `sql` text so a
+    /// whitespace or alias edit changes the value — `skip_hash` hashes a
+    /// **normalised** projection: the model's SQL re-emitted through
+    /// [`rocky_sql::normalize`] (comments stripped, whitespace collapsed,
+    /// keyword case folded, internal table/CTE aliases positionally renamed)
+    /// plus the already-typed structural facts (output columns,
+    /// materialisation, target, sources, masks, governance, lakehouse
+    /// format, ...). Two models that differ only in cosmetic SQL edits map to
+    /// the **same** `skip_hash`; any semantic difference (a `WHERE` predicate,
+    /// a selected column, the materialisation strategy, a column mask) maps to
+    /// a **different** one.
+    ///
+    /// This is a heuristic equivalence key, **not** a guarantee of result
+    /// equivalence. Equal `skip_hash` means "the logic looks unchanged"; it
+    /// says nothing about non-deterministic SQL (timestamps, randomness,
+    /// session settings, user-defined functions) — those are screened
+    /// separately by [`rocky_sql::determinism`]. Never present an equal
+    /// `skip_hash` to a user as proof that two runs produce identical output.
+    ///
+    /// # Returns
+    ///
+    /// `None` — a never-equal sentinel — when the model cannot be safely
+    /// canonicalised: its SQL does not re-parse through the normaliser, or
+    /// `typed_columns` is empty (a partial typecheck). A `None` model is never
+    /// equal to any other, so a caller comparing two `skip_hash` values can
+    /// never wrongly treat such a model as unchanged.
+    #[must_use]
+    pub fn skip_hash(&self) -> Option<blake3::Hash> {
+        if self.typed_columns.is_empty() {
+            return None;
+        }
+        let normalized_sql = rocky_sql::normalize::normalize(&self.sql)?;
+        let projection = SkipHashProjection {
+            normalizer_version: NORMALIZER_VERSION,
+            normalized_sql,
+            typed_columns: &self.typed_columns,
+            materialization: &self.materialization,
+            target: &self.target,
+            source: self.source.as_ref(),
+            sources: &self.sources,
+            columns: self.columns.as_ref(),
+            metadata_columns: &self.metadata_columns,
+            unique_key: &self.unique_key,
+            updated_at: self.updated_at.as_deref(),
+            invalidate_hard_deletes: self.invalidate_hard_deletes,
+            column_masks: &self.column_masks,
+            governance: &self.governance,
+            format: self.format.as_ref(),
+            format_options: self.format_options.as_ref(),
+        };
+        let canonical = canonical_json(&projection);
+        Some(blake3::hash(canonical.as_bytes()))
+    }
+
     /// Predicate underlying variant inference for snapshot. The single
     /// source of truth shared by [`Self::variant`]. Snapshot takes
     /// priority over replication in inference: if both `unique_key`
@@ -871,6 +927,51 @@ impl ProjectIr {
         }
         hasher.finalize()
     }
+}
+
+/// Version byte folded into every [`ModelIr::skip_hash`] input.
+///
+/// Bump this whenever the SQL normaliser or the skip-hash projection changes
+/// in a way that could alter the hash for unchanged logic. The bump
+/// deterministically invalidates every previously-stored `skip_hash`, forcing
+/// a rebuild on first encounter rather than risking a silent collision across
+/// normaliser versions. Rebuild-on-upgrade is the safe direction.
+const NORMALIZER_VERSION: u8 = 1;
+
+/// Borrowed projection of [`ModelIr`] hashed by [`ModelIr::skip_hash`].
+///
+/// Holds the normalised SQL string plus the typed structural facts that
+/// define a model's logic, excluding cosmetic SQL text and runtime-derived
+/// fields (`lineage_edges`, partition `window`). Serialised through the same
+/// canonical-JSON machinery as [`ModelIr::recipe_hash`].
+#[derive(Serialize)]
+struct SkipHashProjection<'a> {
+    normalizer_version: u8,
+    normalized_sql: String,
+    typed_columns: &'a [crate::types::TypedColumn],
+    materialization: &'a MaterializationStrategy,
+    target: &'a TargetRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'a SourceRef>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    sources: &'a [SourceRef],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    columns: Option<&'a ColumnSelection>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    metadata_columns: &'a [MetadataColumn],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    unique_key: &'a [Arc<str>],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    invalidate_hard_deletes: bool,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    column_masks: &'a [ColumnMask],
+    governance: &'a GovernanceConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'a LakehouseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format_options: Option<&'a LakehouseOptions>,
 }
 
 /// Canonical-JSON encoder used by [`ModelIr::recipe_hash`].
@@ -1290,6 +1391,151 @@ mod tests {
             h1, h2,
             "SQL text changes must propagate into the recipe hash"
         );
+    }
+
+    // ── skip_hash ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn skip_hash_is_deterministic() {
+        let m1 = sample_transformation_model();
+        let m2 = sample_transformation_model();
+        assert_eq!(
+            m1.skip_hash(),
+            m2.skip_hash(),
+            "identical IR must produce identical skip_hash"
+        );
+        assert!(m1.skip_hash().is_some());
+    }
+
+    #[test]
+    fn skip_hash_invariant_to_whitespace_but_recipe_hash_is_not() {
+        // The deliberate divergence: a whitespace-only SQL edit leaves
+        // skip_hash unchanged (cosmetic-invariant) while changing recipe_hash
+        // (text-sensitive). Pinning both halves guards the divergence against
+        // a future normaliser regression.
+        let mut m = sample_transformation_model();
+        let skip_before = m.skip_hash();
+        let recipe_before = m.recipe_hash();
+
+        m.sql = "SELECT   customer_id,\n   email\nFROM   stg_customers".into();
+
+        assert_eq!(
+            skip_before,
+            m.skip_hash(),
+            "whitespace-only edit must NOT change skip_hash"
+        );
+        assert_ne!(
+            recipe_before,
+            m.recipe_hash(),
+            "whitespace-only edit MUST change recipe_hash (pins the divergence)"
+        );
+    }
+
+    #[test]
+    fn skip_hash_invariant_to_comment_edits() {
+        let mut m = sample_transformation_model();
+        let before = m.skip_hash();
+        m.sql = "SELECT customer_id, email FROM stg_customers -- staging".into();
+        assert_eq!(
+            before,
+            m.skip_hash(),
+            "comment edit must not change skip_hash"
+        );
+    }
+
+    #[test]
+    fn skip_hash_invariant_to_internal_alias_rename() {
+        // Same output columns, only the internal table alias differs → same
+        // skip_hash. typed_columns is identical, so the output column names are
+        // unaffected by the rename.
+        let mut a = sample_transformation_model();
+        let mut b = sample_transformation_model();
+        a.sql = "SELECT s.customer_id, s.email FROM stg_customers AS s".into();
+        b.sql = "SELECT z.customer_id, z.email FROM stg_customers AS z".into();
+        assert_eq!(
+            a.skip_hash(),
+            b.skip_hash(),
+            "internal alias rename with identical output columns must not change skip_hash"
+        );
+    }
+
+    #[test]
+    fn skip_hash_changes_when_where_predicate_changes() {
+        let mut a = sample_transformation_model();
+        let mut b = sample_transformation_model();
+        a.sql = "SELECT customer_id, email FROM stg_customers WHERE customer_id > 10".into();
+        b.sql = "SELECT customer_id, email FROM stg_customers WHERE customer_id > 20".into();
+        assert_ne!(
+            a.skip_hash(),
+            b.skip_hash(),
+            "a changed WHERE predicate is a semantic change → different skip_hash"
+        );
+    }
+
+    #[test]
+    fn skip_hash_changes_when_selected_column_changes() {
+        let mut m = sample_transformation_model();
+        let before = m.skip_hash();
+        // A genuinely different output column changes typed_columns too.
+        m.sql = "SELECT customer_id, phone FROM stg_customers".into();
+        m.typed_columns[1] = TypedColumn {
+            name: "phone".into(),
+            data_type: RockyType::String,
+            nullable: true,
+        };
+        assert_ne!(before, m.skip_hash());
+    }
+
+    #[test]
+    fn skip_hash_changes_when_materialization_strategy_changes() {
+        let mut m = sample_transformation_model();
+        let before = m.skip_hash();
+        m.materialization = MaterializationStrategy::FullRefresh;
+        assert_ne!(
+            before,
+            m.skip_hash(),
+            "materialization strategy is part of the logic identity"
+        );
+    }
+
+    #[test]
+    fn skip_hash_changes_when_column_mask_changes() {
+        let mut m = sample_transformation_model();
+        let before = m.skip_hash();
+        m.column_masks[0].strategy = MaskStrategy::Redact;
+        assert_ne!(
+            before,
+            m.skip_hash(),
+            "a changed column mask changes skip_hash"
+        );
+    }
+
+    #[test]
+    fn skip_hash_is_none_when_typed_columns_empty() {
+        // Empty typed_columns simulates a partial typecheck — the never-equal
+        // sentinel so the model can never be wrongly treated as unchanged.
+        let mut m = sample_transformation_model();
+        m.typed_columns.clear();
+        assert_eq!(m.skip_hash(), None);
+    }
+
+    #[test]
+    fn skip_hash_is_none_when_sql_unparseable() {
+        let mut m = sample_transformation_model();
+        m.sql = "SELCT FROM nowhere".into();
+        assert_eq!(m.skip_hash(), None);
+    }
+
+    #[test]
+    fn skip_hash_none_is_never_equal_to_itself_via_option_semantics() {
+        // Two unhashable models both yield None; a caller comparing
+        // `Some == Some` can never match them. (Documents the sentinel
+        // contract rather than asserting None != None.)
+        let mut a = sample_transformation_model();
+        let mut b = sample_transformation_model();
+        a.typed_columns.clear();
+        b.typed_columns.clear();
+        assert!(a.skip_hash().is_none() && b.skip_hash().is_none());
     }
 
     #[test]
