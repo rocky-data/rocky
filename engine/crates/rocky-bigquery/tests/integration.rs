@@ -1226,6 +1226,171 @@ async fn load_via_gcs_csv() {
     outcome.expect("GCS CSV load + verification");
 }
 
+/// End-to-end: load a local CSV into a *fresh* table via the INSERT-fallback
+/// path (`LoadSource::LocalFile` + `create_table: true`) and assert the
+/// auto-created columns are **inferred + typed**, not all-STRING. This is
+/// the live merge-gate for the typed-create fix: an all-STRING `id` column
+/// would silently pass the wiremock row-count assertions but defeat the
+/// typed contract-gate, so only a real BigQuery readback proves the types.
+///
+/// Required env (all `ROCKY_TEST_*`, scrubbed of any committed identifiers):
+///   - `ROCKY_TEST_BIGQUERY_PROJECT` — GCP project for the ephemeral dataset.
+///   - `GOOGLE_APPLICATION_CREDENTIALS` *or* `BIGQUERY_TOKEN` — auth (the SA
+///     / token needs `bigquery.dataEditor` + `bigquery.jobUser` on the
+///     project). No GCS object or bucket grant is needed — the CSV is local.
+/// Optional:
+///   - `ROCKY_TEST_BIGQUERY_LOCATION` — dataset location (default `EU`).
+///
+/// Run with:
+///   cargo test -p rocky-bigquery --test integration \
+///     load_local_csv_creates_inferred_types -- --ignored --nocapture
+///
+/// Creates `hc_loadlocal_<ts>` (the sandbox `hc_` housekeeping prefix),
+/// loads a 4-column CSV, reads the column types back from the
+/// dataset-qualified `INFORMATION_SCHEMA.COLUMNS`, then DROPs the dataset
+/// CASCADE regardless of outcome.
+#[tokio::test]
+#[ignore]
+async fn load_local_csv_creates_inferred_types() {
+    use rocky_adapter_sdk::{LoadOptions, LoadSource, LoaderAdapter};
+
+    let project = match std::env::var("ROCKY_TEST_BIGQUERY_PROJECT") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!(
+                "skipping load_local_csv_creates_inferred_types: set \
+                 ROCKY_TEST_BIGQUERY_PROJECT and GCP auth to run"
+            );
+            return;
+        }
+    };
+    let location =
+        std::env::var("ROCKY_TEST_BIGQUERY_LOCATION").unwrap_or_else(|_| "EU".to_string());
+    let Some(auth) = BigQueryAuth::from_env().ok() else {
+        eprintln!("skipping load_local_csv_creates_inferred_types: no GCP auth in env");
+        return;
+    };
+
+    let adapter = std::sync::Arc::new(BigQueryAdapter::new(
+        project.clone(),
+        location.clone(),
+        auth,
+    ));
+    let loader = rocky_bigquery::BigQueryLoaderAdapter::new(adapter.clone());
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
+    let dataset = format!("hc_loadlocal_{suffix}");
+    let table = "typed_create";
+
+    // Distinct inferred types: int / float / string / bool / timestamp.
+    // `id` must land as INT64, not STRING. `created_at` is the one INSERT
+    // path that's new behaviorally: a date cell infers to TIMESTAMP, but
+    // rocky-core's `format_cell` emits it as a quoted string literal — this
+    // live test is what confirms BigQuery coerces `'2024-01-15'` into the
+    // TIMESTAMP column on INSERT VALUES (the wiremock test can't, it doesn't
+    // execute SQL).
+    let csv = "id,amount,name,active,created_at\n\
+               1,9.99,alice,true,2024-01-15\n\
+               2,8.50,bob,false,2024-02-20\n";
+    let csv_path = std::env::temp_dir().join(format!("rocky_bq_live_{suffix}.csv"));
+    std::fs::write(&csv_path, csv).expect("write temp CSV");
+
+    adapter
+        .execute_statement(&format!(
+            "CREATE SCHEMA IF NOT EXISTS `{project}`.`{dataset}` OPTIONS(location='{location}')"
+        ))
+        .await
+        .expect("create dataset");
+
+    let outcome = async {
+        let target = rocky_adapter_sdk::TableRef {
+            catalog: project.clone(),
+            schema: dataset.clone(),
+            table: table.into(),
+        };
+        let options = LoadOptions {
+            create_table: true,
+            csv_has_header: true,
+            ..Default::default()
+        };
+
+        let result = loader
+            .load(&LoadSource::LocalFile(csv_path.clone()), &target, &options)
+            .await?;
+        assert_eq!(result.rows_loaded, 2, "expected 2 rows from the local CSV");
+
+        // Read the auto-created column types back from the dataset-qualified
+        // INFORMATION_SCHEMA (the dialect's bare `describe_table_sql` view
+        // doesn't resolve a specific dataset).
+        let schema_rows = adapter
+            .execute_query(&format!(
+                "SELECT column_name, data_type \
+                 FROM `{project}`.`{dataset}`.INFORMATION_SCHEMA.COLUMNS \
+                 WHERE table_name = '{table}' ORDER BY ordinal_position"
+            ))
+            .await
+            .expect("read INFORMATION_SCHEMA.COLUMNS");
+
+        let types: std::collections::HashMap<String, String> = schema_rows
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r[0].as_str().unwrap_or_default().to_string(),
+                    r[1].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+
+        // The crux: `id` is an integer type, NOT STRING.
+        assert_eq!(
+            types.get("id").map(String::as_str),
+            Some("INT64"),
+            "id must be created as INT64, not STRING; got {types:?}"
+        );
+        assert_eq!(
+            types.get("amount").map(String::as_str),
+            Some("FLOAT64"),
+            "amount must be FLOAT64; got {types:?}"
+        );
+        assert_eq!(
+            types.get("active").map(String::as_str),
+            Some("BOOL"),
+            "active must be BOOL; got {types:?}"
+        );
+        assert_eq!(
+            types.get("name").map(String::as_str),
+            Some("STRING"),
+            "name must be STRING; got {types:?}"
+        );
+        // Confirms both the inference (date → TIMESTAMP column) and that the
+        // INSERT actually landed — the load() above would have errored if BQ
+        // rejected the `'2024-01-15'` string literal against a TIMESTAMP
+        // column, so reaching here with a TIMESTAMP type proves the coercion.
+        assert_eq!(
+            types.get("created_at").map(String::as_str),
+            Some("TIMESTAMP"),
+            "created_at must be TIMESTAMP; got {types:?}"
+        );
+
+        Ok::<_, rocky_adapter_sdk::AdapterError>(())
+    }
+    .await;
+
+    // Teardown regardless of outcome.
+    let _ = adapter
+        .execute_statement(&format!(
+            "DROP SCHEMA IF EXISTS `{project}`.`{dataset}` CASCADE"
+        ))
+        .await;
+    let _ = std::fs::remove_file(&csv_path);
+
+    outcome.expect("local CSV typed-create load + schema verification");
+}
+
 /// Admin adapter built from the `ROCKY_TEST_*` env (mirrors `load_env`'s
 /// project/location/auth) for the setup + teardown SQL in the load test.
 fn adapter_from_rocky_env() -> Option<BigQueryAdapter> {

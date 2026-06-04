@@ -54,7 +54,9 @@ use rocky_core::config::RetryConfig;
 use rocky_core::retry_budget::RetryBudget;
 use rocky_core::traits::{AdapterError, WarehouseAdapter};
 use serde_json::{Value, json};
-use wiremock::matchers::{body_partial_json, header, method, path, path_regex, query_param};
+use wiremock::matchers::{
+    body_partial_json, body_string_contains, header, method, path, path_regex, query_param,
+};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Path of the `jobs.query` endpoint for the test project.
@@ -1359,4 +1361,102 @@ async fn load_job_poll_times_out_when_never_done() {
         matches!(err, BigQueryError::Timeout { timeout_secs: 1 }),
         "expected Timeout, got: {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// (f) Local-file INSERT-fallback: create_table emits INFERRED column types
+// ---------------------------------------------------------------------------
+
+/// The local-file loader path (`LoadSource::LocalFile`, CSV-only INSERT
+/// fallback) must create a missing table with **inferred, typed** columns —
+/// not all-STRING. All-STRING defeats the typed contract-gate (a contract
+/// `id INT64` fails against an all-STRING `id`).
+///
+/// This is the credential-free behavioral proof of the typed-create fix:
+/// the loader issues its `CREATE TABLE IF NOT EXISTS …` and each `INSERT`
+/// through `execute_statement` → `jobs.query`, which the mock server
+/// captures. A high-priority mock matches the CREATE TABLE body for the
+/// canonical BigQuery types (`` `id` INT64 ``, `` `amount` FLOAT64 ``,
+/// `` `active` BOOL ``) and `.expect(1)`; a catch-all absorbs the INSERTs.
+/// `server.verify()` fails if the typed CREATE never went out — i.e. if the
+/// loader regressed to all-STRING (`` `id` STRING ``).
+///
+/// Note the deliberate single behavioral test on the loader's local path:
+/// `--lib` + `clippy --all-targets` *compile* this file but don't run it,
+/// so without a mounted-and-verified expectation the all-STRING→typed
+/// change could pass both and still be wrong at runtime.
+#[tokio::test]
+async fn local_file_create_table_uses_inferred_types() {
+    use rocky_adapter_sdk::{LoadOptions, LoadSource, LoaderAdapter, TableRef as SdkTableRef};
+    use rocky_bigquery::BigQueryLoaderAdapter;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // A CSV whose columns infer to distinct BigQuery types: int / float /
+    // string / bool. The point of the fix is that `id` lands as INT64, not
+    // STRING.
+    let csv = "id,amount,name,active\n1,9.99,alice,true\n2,8.50,bob,false\n";
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let csv_path = std::env::temp_dir().join(format!("rocky_bq_loader_{suffix}.csv"));
+    std::fs::write(&csv_path, csv).expect("write temp CSV");
+
+    let server = MockServer::start().await;
+
+    // Happy `jobs.query` response body for a DDL/DML statement — the loader
+    // ignores the body and only checks success.
+    let ok_body = json!({
+        "jobComplete": true,
+        "jobReference": {"projectId": "test-project", "jobId": "job-load"}
+    });
+
+    // High-priority: the CREATE TABLE with the inferred, canonical BQ types.
+    // Each `body_string_contains` is an AND, so all four column/type pairs
+    // must appear in the same statement.
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .and(body_string_contains("CREATE TABLE IF NOT EXISTS"))
+        .and(body_string_contains("`id` INT64"))
+        .and(body_string_contains("`amount` FLOAT64"))
+        .and(body_string_contains("`name` STRING"))
+        .and(body_string_contains("`active` BOOL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body.clone()))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Catch-all for the INSERT batch(es) that follow the CREATE.
+    Mock::given(method("POST"))
+        .and(path(QUERIES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body))
+        .mount(&server)
+        .await;
+
+    let adapter = std::sync::Arc::new(test_adapter(&server).with_timeout(5));
+    let loader = BigQueryLoaderAdapter::new(adapter);
+
+    let target = SdkTableRef {
+        catalog: "test-project".into(),
+        schema: "ds".into(),
+        table: "tbl".into(),
+    };
+    let options = LoadOptions {
+        create_table: true,
+        csv_has_header: true,
+        ..Default::default()
+    };
+
+    let result = loader
+        .load(&LoadSource::LocalFile(csv_path.clone()), &target, &options)
+        .await
+        .expect("local-file CSV load should succeed");
+    assert_eq!(result.rows_loaded, 2, "two data rows should be inserted");
+
+    // Fails iff the typed CREATE TABLE was never emitted (i.e. a regression
+    // back to all-STRING columns).
+    server.verify().await;
+
+    let _ = std::fs::remove_file(&csv_path);
 }
