@@ -1115,6 +1115,7 @@ pub async fn run(
             false, // model-only entry point has no pipeline governance context
             defer_opts,
             skip_gate,
+            rocky_cfg.reuse.enabled,
         )
         .await?;
 
@@ -3211,6 +3212,7 @@ pub async fn run(
                     // set (a full run builds every model).
                     defer_opts,
                     skip_gate,
+                    rocky_cfg.reuse.enabled,
                 )
                 .await?;
                 Ok(())
@@ -4029,6 +4031,12 @@ pub(crate) async fn execute_models(
     // the gate is inert and this function builds every selected model
     // exactly as before — no extra state reads or warehouse queries.
     skip_gate: SkipGateConfig,
+    // Opt-in `[reuse]` spine population. When `false` (the default) no
+    // input-match index entry or provenance record is written and no
+    // per-model spine hashing cost is paid — the run is byte- and
+    // cost-identical. Dormant even when `true`: it only records the index,
+    // it makes no reuse decision and skips nothing.
+    reuse_enabled: bool,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -4116,6 +4124,54 @@ pub(crate) async fn execute_models(
     }
 
     let dialect = warehouse.dialect();
+
+    // Auditable-reuse spine accumulator (dormant). When `[reuse]` is enabled,
+    // each successfully-built content-addressed model contributes an
+    // input-match index entry + an offline-verifiable provenance record,
+    // flushed in one transaction at end-of-run. Empty (and never touched)
+    // when reuse is off, so the default path pays nothing.
+    //
+    // `reuse_outputs` maps a built model's fully-qualified target identity to
+    // its output blake3, so a *downstream* content-addressed model in a later
+    // layer can resolve its upstreams to STRONG content-hash identities
+    // without any extra warehouse query. Stage 1 indexes only models whose
+    // every upstream resolves to a content hash; watermark/heuristic upstream
+    // population is deferred (it needs the freshness-signal machinery).
+    let mut reuse_index_entries: Vec<rocky_core::state::InputIndexEntry> = Vec::new();
+    let mut reuse_provenance: Vec<rocky_core::state::ProvenanceRecord> = Vec::new();
+    let mut reuse_outputs: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    // Static lookups for upstream resolution, built once when reuse is on:
+    // model name → its immediate upstream **model** names (DAG edges), and
+    // model name → its target `catalog.schema.table` identity. Empty when
+    // reuse is off so the default path allocates nothing.
+    let (reuse_depends_on, reuse_target_by_model): (
+        std::collections::HashMap<String, Vec<String>>,
+        std::collections::HashMap<String, String>,
+    ) = if reuse_enabled {
+        let depends = compile_result
+            .project
+            .dag_nodes
+            .iter()
+            .map(|n| (n.name.clone(), n.depends_on.clone()))
+            .collect();
+        let targets = compile_result
+            .project
+            .models
+            .iter()
+            .map(|m| {
+                let t = &m.config.target;
+                (
+                    m.config.name.to_string(),
+                    format!("{}.{}.{}", t.catalog, t.schema, t.table),
+                )
+            })
+            .collect();
+        (depends, targets)
+    } else {
+        Default::default()
+    };
 
     // Pre-create target schemas when the caller requested auto-create.
     // Mirrors the replication path's per-source loop (see the
@@ -4479,6 +4535,51 @@ pub(crate) async fn execute_models(
                                 );
                             }
                         }
+                        // Auditable-reuse spine (dormant). When `[reuse]` is
+                        // enabled, accumulate this model's input-match index
+                        // entry + provenance record. Stage 1 indexes only when
+                        // every immediate upstream resolves to a STRONG
+                        // content hash produced earlier in this run — no extra
+                        // warehouse query. The output is recorded regardless so
+                        // a downstream content-addressed model can resolve THIS
+                        // model as a content-hash upstream. Best-effort and
+                        // additive: it never changes what was materialized.
+                        // First slice is unpartitioned-only (the partitioned
+                        // ledger is last-group-only — see the Phase 6 TODO
+                        // above); a multi-group write records no spine entry.
+                        if reuse_enabled {
+                            let target_identity = target_table_full_name.clone();
+                            reuse_outputs
+                                .insert(target_identity.clone(), summary.blake3_hash.clone());
+                            let is_unpartitioned = !matches!(
+                                &model_ir.materialization,
+                                MaterializationStrategy::ContentAddressed { partition_columns, .. }
+                                    if !partition_columns.is_empty()
+                            );
+                            if is_unpartitioned
+                                && let Some(upstreams) = resolve_strong_upstreams(
+                                    model_name,
+                                    &reuse_depends_on,
+                                    &reuse_target_by_model,
+                                    &reuse_outputs,
+                                )
+                            {
+                                let outputs = vec![rocky_core::reuse::OutputArtifact {
+                                    blake3_hash: summary.blake3_hash.clone(),
+                                    file_path: summary.file_path.clone(),
+                                }];
+                                if let Some((entry, prov)) = rocky_core::reuse::build_records(
+                                    &model_ir,
+                                    run_id,
+                                    &upstreams,
+                                    &outputs,
+                                    Utc::now(),
+                                ) {
+                                    reuse_index_entries.push(entry);
+                                    reuse_provenance.push(prov);
+                                }
+                            }
+                        }
                         if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                             let _ = reg
                                 .fire(&HookContext::after_model_run(
@@ -4608,8 +4709,63 @@ pub(crate) async fn execute_models(
         }
     }
 
+    // Flush the auditable-reuse spine in one transaction at end-of-run, only
+    // on the success path (a failed run returns early above and discards the
+    // accumulator — dormant Stage-1 indexes only fully-successful builds).
+    // Best-effort: a write failure logs and continues, mirroring the
+    // `record_artifact` posture — the run itself is already durable.
+    if reuse_enabled
+        && !(reuse_index_entries.is_empty() && reuse_provenance.is_empty())
+        && let Some(store) = state_store
+    {
+        if let Err(e) = store.record_reuse_spine(&reuse_index_entries, &reuse_provenance) {
+            warn!(
+                error = %e,
+                entries = reuse_index_entries.len(),
+                "failed to persist auditable-reuse spine (run still successful; \
+                 index/provenance may be incomplete)"
+            );
+        } else {
+            info!(
+                entries = reuse_index_entries.len(),
+                "recorded auditable-reuse input-match spine (dormant)"
+            );
+        }
+    }
+
     info!(models = models_executed, "model execution complete");
     Ok(())
+}
+
+/// Resolve a content-addressed model's immediate upstreams to STRONG
+/// content-hash identities for the auditable-reuse spine.
+///
+/// Looks each upstream **model** name (from the DAG edges) up to its target
+/// `catalog.schema.table` identity, then to the output blake3 it produced
+/// earlier in this run (`outputs_by_target`). Returns `Some(_)` only when
+/// **every** upstream resolves to a content hash — the all-strong Stage-1
+/// path that needs no warehouse query. Returns `None` if any upstream is
+/// unresolved (a raw source, a non-content-addressed model, or an upstream
+/// not built this run): such models are simply not indexed in Stage 1, since
+/// watermark/heuristic upstream population is deferred. An upstream-free model
+/// resolves to an empty (vacuously strong) set.
+fn resolve_strong_upstreams(
+    model_name: &str,
+    depends_on: &std::collections::HashMap<String, Vec<String>>,
+    target_by_model: &std::collections::HashMap<String, String>,
+    outputs_by_target: &std::collections::HashMap<String, String>,
+) -> Option<Vec<rocky_core::reuse::UpstreamIdentity>> {
+    let upstream_models = depends_on.get(model_name).map(Vec::as_slice).unwrap_or(&[]);
+    let mut identities = Vec::with_capacity(upstream_models.len());
+    for upstream in upstream_models {
+        let target = target_by_model.get(upstream)?;
+        let blake3_hash = outputs_by_target.get(target)?;
+        identities.push(rocky_core::reuse::UpstreamIdentity::Content {
+            upstream_key: target.clone(),
+            blake3_hash: blake3_hash.clone(),
+        });
+    }
+    Some(identities)
 }
 
 /// Map a `MaterializationStrategy` (post-`to_plan()`) onto the string used
@@ -8104,6 +8260,7 @@ merge_keys = ["id"]
             false,
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
+            false,
         )
         .await;
         (output, result)
@@ -8187,6 +8344,7 @@ merge_keys = ["id"]
             false,
             &defer_opts,
             super::SkipGateConfig::off(),
+            false,
         )
         .await
         .expect("deferred run must succeed");
@@ -8301,6 +8459,7 @@ merge_keys = ["id"]
             false,
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
+            false,
         )
         .await;
 
@@ -8536,6 +8695,7 @@ merge_keys = ["id"]
             false,
             &DeferOptions::default(),
             gate,
+            false,
         )
         .await
         .expect("gate run must succeed");
@@ -9425,6 +9585,7 @@ merge_keys = ["id"]
                 false,
                 &DeferOptions::default(),
                 active_gate(true, 0),
+                false,
             )
             .await
             .unwrap();

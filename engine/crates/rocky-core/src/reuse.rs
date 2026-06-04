@@ -226,6 +226,89 @@ pub fn proof_class_for(upstreams: &[UpstreamIdentity]) -> ProofClass {
     ProofClass::min(upstreams.iter().map(UpstreamIdentity::proof_class))
 }
 
+/// The output a model produced for one content-addressed file.
+///
+/// Index-aligned `(blake3, path)` pairs flow from the writer's `WriteResult`
+/// straight into the index entry + provenance record. A model with no
+/// content-addressed output passes an empty slice.
+#[derive(Debug, Clone)]
+pub struct OutputArtifact {
+    /// Hex-encoded blake3 of the output parquet.
+    pub blake3_hash: String,
+    /// Object-store path of the output parquet.
+    pub file_path: String,
+}
+
+/// Build the [`crate::state::InputIndexEntry`] +
+/// [`crate::state::ProvenanceRecord`] pair for one successfully-built model.
+///
+/// This is the pure heart of spine population: given the model's typed IR,
+/// the run it built in, its resolved immediate-upstream identities, and the
+/// output artifact(s) it produced, it assembles both records — computing the
+/// `input_hash`, the `proof_class` (MIN over upstreams), and embedding the
+/// canonical `ModelIr` JSON for the offline verifier. It performs no I/O, so
+/// the warehouse-agnostic population logic is unit-testable without a live
+/// adapter.
+///
+/// # Returns
+///
+/// `None` when the model cannot be safely canonicalised — its
+/// [`rocky_ir::ModelIr::skip_hash`] is `None` (empty typed columns or SQL
+/// that does not re-normalise). A non-canonicalisable model is **not
+/// indexed**: a never-equal logic key must never be presented as a reuse
+/// candidate. Otherwise returns `Some((index_entry, provenance))`.
+///
+/// # What the records attest
+///
+/// An *input-logic match* plus the *byte-identity of the recorded output
+/// bytes* — never that re-executing the model would reproduce them.
+pub fn build_records(
+    model_ir: &rocky_ir::ModelIr,
+    run_id: &str,
+    upstreams: &[UpstreamIdentity],
+    outputs: &[OutputArtifact],
+    recorded_at: chrono::DateTime<chrono::Utc>,
+) -> Option<(
+    crate::state::InputIndexEntry,
+    crate::state::ProvenanceRecord,
+)> {
+    let skip_hash = model_ir.skip_hash()?.to_hex().to_string();
+    let target_identity = format!(
+        "{}.{}.{}",
+        model_ir.target.catalog, model_ir.target.schema, model_ir.target.table
+    );
+    let input_hash = compute_input_hash(&skip_hash, &target_identity, upstreams)
+        .to_hex()
+        .to_string();
+    let proof_class = proof_class_for(upstreams).as_str().to_string();
+    let model_name = model_ir.name.to_string();
+
+    let output_blake3: Vec<String> = outputs.iter().map(|o| o.blake3_hash.clone()).collect();
+    let output_path: Vec<String> = outputs.iter().map(|o| o.file_path.clone()).collect();
+
+    let index_entry = crate::state::InputIndexEntry {
+        input_hash: input_hash.clone(),
+        run_id: run_id.to_string(),
+        model_name: model_name.clone(),
+        output_blake3: output_blake3.clone(),
+        output_path: output_path.clone(),
+        proof_class: proof_class.clone(),
+        recorded_at,
+    };
+    let provenance = crate::state::ProvenanceRecord {
+        run_id: run_id.to_string(),
+        model_name,
+        input_hash,
+        skip_hash,
+        model_ir_canonical_json: model_ir.canonical_json(),
+        output_blake3,
+        output_path,
+        proof_class,
+        recorded_at,
+    };
+    Some((index_entry, provenance))
+}
+
 /// Canonical-JSON encoder mirroring [`rocky_ir::ModelIr::canonical_json`]'s
 /// key-sorted, whitespace-free form so spine keys are stable across machines.
 fn canonical_json<T: Serialize>(value: &T) -> String {
@@ -374,6 +457,115 @@ mod tests {
         assert_eq!(
             ProofClass::min([ProofClass::Strong, ProofClass::Strong]),
             ProofClass::Strong
+        );
+    }
+
+    // -- pure record builder ------------------------------------------------
+
+    fn model_ir(table: &str, sql: &str, canonicalisable: bool) -> rocky_ir::ModelIr {
+        let mut m = rocky_ir::ModelIr::transformation(
+            rocky_ir::TargetRef {
+                catalog: "analytics".to_string(),
+                schema: "marts".to_string(),
+                table: table.to_string(),
+            },
+            rocky_ir::MaterializationStrategy::FullRefresh,
+            Vec::new(),
+            sql.to_string(),
+            rocky_ir::GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        m.name = std::sync::Arc::from(table);
+        if canonicalisable {
+            // skip_hash returns None on empty typed_columns; populate one.
+            m.typed_columns = vec![rocky_ir::TypedColumn {
+                name: "id".into(),
+                data_type: rocky_ir::RockyType::Int64,
+                nullable: false,
+            }];
+        }
+        m
+    }
+
+    fn output(hash: &str, path: &str) -> OutputArtifact {
+        OutputArtifact {
+            blake3_hash: hash.to_string(),
+            file_path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn build_records_assembles_index_and_provenance() {
+        let m = model_ir("fct_orders", "SELECT id FROM raw.orders", true);
+        let ups = vec![content("analytics.marts.dim_x", "up-hash")];
+        let outs = vec![output("out-hash", "s3://b/p/out.parquet")];
+        let now = chrono::Utc::now();
+
+        let (entry, prov) = build_records(&m, "run-1", &ups, &outs, now).expect("canonicalisable");
+
+        assert_eq!(entry.run_id, "run-1");
+        assert_eq!(entry.model_name, "fct_orders");
+        assert_eq!(entry.proof_class, "strong");
+        assert_eq!(entry.output_blake3, vec!["out-hash".to_string()]);
+        assert_eq!(entry.output_path, vec!["s3://b/p/out.parquet".to_string()]);
+
+        // Both records key off the same input_hash, derived from skip_hash.
+        assert_eq!(entry.input_hash, prov.input_hash);
+        let expected_skip = m.skip_hash().unwrap().to_hex().to_string();
+        assert_eq!(prov.skip_hash, expected_skip);
+
+        // Provenance embeds the round-trippable canonical IR.
+        let reparsed: rocky_ir::ModelIr =
+            serde_json::from_str(&prov.model_ir_canonical_json).expect("round-trips");
+        assert_eq!(
+            reparsed.skip_hash().unwrap().to_hex().to_string(),
+            prov.skip_hash,
+            "offline skip_hash recompute matches the recorded value"
+        );
+    }
+
+    #[test]
+    fn build_records_input_hash_matches_compute_input_hash() {
+        // The builder's input_hash must equal what an offline verifier would
+        // recompute from the same skip_hash + target + upstreams.
+        let m = model_ir("fct_orders", "SELECT id FROM raw.orders", true);
+        let ups = vec![content("analytics.marts.dim_x", "up-hash")];
+        let (entry, _) =
+            build_records(&m, "run-1", &ups, &[], chrono::Utc::now()).expect("canonicalisable");
+
+        let skip = m.skip_hash().unwrap().to_hex().to_string();
+        let expected = compute_input_hash(&skip, "analytics.marts.fct_orders", &ups)
+            .to_hex()
+            .to_string();
+        assert_eq!(entry.input_hash, expected);
+    }
+
+    #[test]
+    fn build_records_proof_class_is_min_over_upstreams() {
+        let m = model_ir("fct_orders", "SELECT id FROM raw.orders", true);
+        let mixed = vec![
+            content("analytics.marts.a", "h1"),
+            watermark("raw.src.b", Some("2026-06-04T00:00:00Z"), None),
+        ];
+        let (entry, prov) =
+            build_records(&m, "run-1", &mixed, &[], chrono::Utc::now()).expect("canonicalisable");
+        assert_eq!(entry.proof_class, "heuristic");
+        assert_eq!(prov.proof_class, "heuristic");
+    }
+
+    #[test]
+    fn build_records_skips_non_canonicalisable_model() {
+        // Empty typed_columns ⇒ skip_hash None ⇒ not indexed.
+        let m = model_ir("fct_orders", "SELECT id FROM raw.orders", false);
+        assert!(m.skip_hash().is_none());
+        assert!(
+            build_records(&m, "run-1", &[], &[], chrono::Utc::now()).is_none(),
+            "a non-canonicalisable model must not be indexed"
         );
     }
 }
