@@ -73,6 +73,7 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
                         .collect();
                     let tables = dedup_tables_by_name(raw_tables, &conn.id);
                     let metadata = metadata_from_connector(&conn);
+                    let external_object_id = external_object_id_from_config(&conn.config);
                     connectors.push(DiscoveredConnector {
                         id: conn.id,
                         schema: conn.schema,
@@ -80,6 +81,7 @@ impl DiscoveryAdapter for FivetranDiscoveryAdapter {
                         last_sync_at: conn.succeeded_at,
                         tables,
                         metadata,
+                        external_object_id,
                     });
                 }
                 Err(e) => {
@@ -239,6 +241,45 @@ fn dedup_tables_by_name(tables: Vec<DiscoveredTable>, source_id: &str) -> Vec<Di
 /// Iteration order is stable (insertion order via [`IndexMap`]) so the
 /// discover JSON output stays byte-stable across runs — important for the
 /// dagster fixture corpus and the `codegen-drift` CI check.
+/// Best-effort recovery of the underlying external object's stable id from a
+/// Fivetran connector's `config` blob — the account/object the connector
+/// actually replicates, which the schema name deliberately does not encode (so
+/// two teams can onboard the same account under different schemas unnoticed).
+///
+/// Fivetran has no universal account-id key; it is service-specific. We probe a
+/// prioritized list of the common single-value identifiers and take the first
+/// non-empty string (or a numeric id stringified). Returns `None` when none is
+/// present — collision detection is then simply skipped for this source, which
+/// means a *missed* detection, never a false one.
+///
+/// NOTE: the key list is best-effort and has not been tuned against live
+/// Fivetran configs across services (no Fivetran sandbox available). It is
+/// covered by a stub-config unit test only; extend the list as real configs
+/// are observed.
+fn external_object_id_from_config(config: &serde_json::Value) -> Option<String> {
+    const ID_KEYS: &[&str] = &[
+        "account_id",
+        "external_id",
+        "advertiser_id",
+        "merchant_id",
+        "customer_id",
+        "shop",
+        "site_url",
+        "account",
+        "account_name",
+    ];
+    for key in ID_KEYS {
+        match config.get(key) {
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                return Some(s.clone());
+            }
+            Some(v) if v.is_number() => return Some(v.to_string()),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn metadata_from_connector(conn: &Connector) -> IndexMap<String, serde_json::Value> {
     let mut metadata = IndexMap::new();
     // Core identity — always populated even when `config` is empty so
@@ -307,6 +348,37 @@ mod tests {
         assert_eq!(metadata["fivetran.connector_id"], "conn_ads");
         assert!(!metadata.contains_key("fivetran.custom_reports"));
         assert!(!metadata.contains_key("fivetran.custom_tables"));
+    }
+
+    #[test]
+    fn external_object_id_probes_known_config_keys() {
+        // A string account id is taken verbatim.
+        assert_eq!(
+            external_object_id_from_config(&serde_json::json!({"account_id": "act_123"}))
+                .as_deref(),
+            Some("act_123")
+        );
+        // A numeric id is stringified.
+        assert_eq!(
+            external_object_id_from_config(&serde_json::json!({"advertiser_id": 98765})).as_deref(),
+            Some("98765")
+        );
+        // No known key → None (collision detection is then skipped — a missed
+        // detection, never a false one).
+        assert_eq!(
+            external_object_id_from_config(&serde_json::json!({"unrelated": "y"})),
+            None
+        );
+        // Empty / whitespace id is ignored.
+        assert_eq!(
+            external_object_id_from_config(&serde_json::json!({"account_id": "  "})),
+            None
+        );
+        // A non-object config (null) yields None rather than panicking.
+        assert_eq!(
+            external_object_id_from_config(&serde_json::Value::Null),
+            None
+        );
     }
 
     #[test]

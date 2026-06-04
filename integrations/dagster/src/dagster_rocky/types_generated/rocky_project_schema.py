@@ -310,24 +310,6 @@ class Dialect(StrEnum):
     duckdb = "duckdb"
 
 
-class DiscoveryConfig(BaseModel):
-    """
-    Discovery configuration within a pipeline source.
-    """
-
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-    adapter: str | None = "default"
-    """
-    Name of the adapter to use for discovery (references a key in `[adapter.*]`). Defaults to `"default"`.
-    """
-    report_new_sources: bool | None = False
-    """
-    When `true`, `rocky discover` diffs the discovered source inventory against the prior persisted snapshot and reports first-seen sources in `new_sources`. Off by default — the diff and its state write only happen when opted in, so existing projects pay nothing.
-    """
-
-
 class ExecutionConfig(BaseModel):
     """
     Controls parallelism and error handling for table processing.
@@ -815,6 +797,30 @@ class MetadataColumnConfig(BaseModel):
     name: str
     type: str
     value: str
+
+
+class OnCollision1(StrEnum):
+    """
+    Collision detection disabled (default — fully backwards compatible).
+    """
+
+    off = "off"
+
+
+class OnCollision2(StrEnum):
+    """
+    Report collisions in `collision_candidates` and emit an event, but do not fail the discover.
+    """
+
+    warn = "warn"
+
+
+class OnCollision3(StrEnum):
+    """
+    Report collisions and fail the discover, so a colliding onboard cannot silently create a catalog/table.
+    """
+
+    error = "error"
 
 
 class Type(StrEnum):
@@ -1658,6 +1664,28 @@ class CustomCheckConfig(BaseModel):
     """
     sql: str
     threshold: conint(ge=0) | None = 0
+
+
+class DiscoveryConfig(BaseModel):
+    """
+    Discovery configuration within a pipeline source.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    adapter: str | None = "default"
+    """
+    Name of the adapter to use for discovery (references a key in `[adapter.*]`). Defaults to `"default"`.
+    """
+    on_collision: OnCollision1 | OnCollision2 | OnCollision3 | None = "off"
+    """
+    What to do when discover finds the same external object id mapped to more than one target path (likely the same object onboarded twice). `off` (default) skips detection entirely; `warn` reports `collision_candidates` + emits an event; `error` additionally fails the discover. Only adapters that supply `external_object_id` (e.g. Fivetran) participate; others are silently skipped.
+    """
+    report_new_sources: bool | None = False
+    """
+    When `true`, `rocky discover` diffs the discovered source inventory against the prior persisted snapshot and reports first-seen sources in `new_sources`. Off by default — the diff and its state write only happen when opted in, so existing projects pay nothing.
+    """
 
 
 class FreshnessConfig(BaseModel):

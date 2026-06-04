@@ -110,6 +110,23 @@ pub struct DiscoverOutput {
     /// baseline and reports none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_sources: Vec<String>,
+    /// Groups of ≥2 discovered sources sharing the SAME external object id but
+    /// resolving to DIFFERENT target paths — the same underlying object
+    /// onboarded twice. Populated only when discovery's `on_collision` is
+    /// `warn`/`error` and the adapter supplies `external_object_id`; empty (and
+    /// omitted from the wire format) otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collision_candidates: Vec<CollisionCandidateOutput>,
+}
+
+/// A cross-source collision: one external object id mapped to more than one
+/// target path (the same object onboarded twice under different schemas).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CollisionCandidateOutput {
+    /// The shared external object id (e.g. a Fivetran ad-account id).
+    pub external_object_id: String,
+    /// The distinct source schemas that resolve to it (≥2), sorted.
+    pub sources: Vec<String>,
 }
 
 /// Pipeline-level checks configuration projected into the discover output.
@@ -3510,6 +3527,7 @@ impl DiscoverOutput {
             failed_sources: vec![],
             schemas_cached: 0,
             new_sources: vec![],
+            collision_candidates: vec![],
         }
     }
 
@@ -3551,6 +3569,14 @@ impl DiscoverOutput {
     #[must_use]
     pub fn with_new_sources(mut self, new_sources: Vec<String>) -> Self {
         self.new_sources = new_sources;
+        self
+    }
+
+    /// Attach detected cross-source collisions (opt-in via discovery's
+    /// `on_collision`) and return self.
+    #[must_use]
+    pub fn with_collision_candidates(mut self, candidates: Vec<CollisionCandidateOutput>) -> Self {
+        self.collision_candidates = candidates;
         self
     }
 }

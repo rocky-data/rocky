@@ -211,6 +211,44 @@ pub async fn discover(
         Vec::new()
     };
 
+    // Collision detection (opt-in). Group discovered sources by their stable
+    // external object id; an id mapped to >1 distinct source schema is a
+    // collision — likely the same underlying object onboarded twice under two
+    // paths. Only adapters that supply `external_object_id` (e.g. Fivetran)
+    // participate; the rest contribute nothing, so this is a no-op for them.
+    let on_collision = pipeline
+        .source
+        .discovery
+        .as_ref()
+        .map(|d| d.on_collision)
+        .unwrap_or(rocky_core::config::OnCollision::Off);
+    let collision_candidates = if on_collision == rocky_core::config::OnCollision::Off {
+        Vec::new()
+    } else {
+        let found = detect_collisions(connectors);
+        if !found.is_empty() {
+            let bus = rocky_observe::events::global_event_bus();
+            for c in &found {
+                bus.emit(
+                    rocky_observe::events::PipelineEvent::new("source_collision_detected")
+                        .with_metadata(
+                            "external_object_id",
+                            serde_json::json!(c.external_object_id),
+                        )
+                        .with_metadata("sources", serde_json::json!(c.sources)),
+                );
+            }
+            warn!(
+                count = found.len(),
+                "discover: cross-source collision(s) detected — same external object id under \
+                 >1 target path; see `collision_candidates` in JSON output"
+            );
+        }
+        found
+    };
+    let collision_failure =
+        on_collision == rocky_core::config::OnCollision::Error && !collision_candidates.is_empty();
+
     // Schema-cache warm-up. Only runs when `--with-schemas` is set;
     // config gating already happened at the top of this function.
     // Errors inside the warm-up are logged and counted as misses — a
@@ -235,7 +273,8 @@ pub async fn discover(
         .with_excluded_tables(excluded_tables)
         .with_failed_sources(failed_sources)
         .with_schemas_cached(schemas_cached)
-        .with_new_sources(new_sources);
+        .with_new_sources(new_sources)
+        .with_collision_candidates(collision_candidates);
     if output_json {
         print_json(&output)?;
     } else {
@@ -251,6 +290,17 @@ pub async fn discover(
         if with_schemas {
             println!("schemas cached: {schemas_cached}");
         }
+    }
+
+    // `on_collision = "error"` fails the discover after the output is emitted,
+    // so a colliding onboard surfaces a non-zero exit (the JSON still carries
+    // the `collision_candidates` detail for the orchestrator).
+    if collision_failure {
+        anyhow::bail!(
+            "discover: cross-source collision detected (on_collision = error) — \
+             the same external object id is mapped to more than one target path; \
+             see `collision_candidates`"
+        );
     }
     Ok(())
 }
@@ -391,6 +441,32 @@ fn dedup_schemas(connectors: &[rocky_core::source::DiscoveredConnector]) -> Vec<
             } else {
                 None
             }
+        })
+        .collect()
+}
+
+/// Group discovered sources by their stable external object id and return the
+/// ids mapped to more than one distinct source schema — cross-source
+/// collisions (likely the same object onboarded twice under two paths).
+///
+/// Sources without an `external_object_id` are skipped (collision detection is
+/// opt-in per adapter). Deterministic: ids and their source schemas are sorted.
+fn detect_collisions(
+    connectors: &[rocky_core::source::DiscoveredConnector],
+) -> Vec<CollisionCandidateOutput> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_id: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for conn in connectors {
+        if let Some(id) = conn.external_object_id.as_deref() {
+            by_id.entry(id).or_default().insert(conn.schema.as_str());
+        }
+    }
+    by_id
+        .into_iter()
+        .filter(|(_, schemas)| schemas.len() >= 2)
+        .map(|(id, schemas)| CollisionCandidateOutput {
+            external_object_id: id.to_string(),
+            sources: schemas.into_iter().map(str::to_string).collect(),
         })
         .collect()
 }
@@ -891,6 +967,7 @@ mod tests {
                 row_count: None,
             }],
             metadata: Default::default(),
+            external_object_id: None,
         }
     }
 
@@ -937,6 +1014,36 @@ mod tests {
         let p2 =
             diff_and_record_new_sources(&state, "p2", &["a".to_string(), "b".to_string()]).unwrap();
         assert!(p2.is_empty());
+    }
+
+    #[test]
+    fn detect_collisions_groups_by_external_object_id() {
+        let mk = |schema: &str, ext: Option<&str>| DiscoveredConnector {
+            id: format!("conn_{schema}"),
+            schema: schema.to_string(),
+            source_type: "fivetran".to_string(),
+            last_sync_at: None,
+            tables: vec![],
+            metadata: Default::default(),
+            external_object_id: ext.map(String::from),
+        };
+        let connectors = vec![
+            mk("src__acme__shopify", Some("acct_42")),
+            mk("src__coke__shopify", Some("acct_42")), // same object id, different path
+            mk("src__beta__shopify", Some("acct_99")), // unique id → no collision
+            mk("src__gamma__stripe", None),            // no id → skipped entirely
+        ];
+        let collisions = detect_collisions(&connectors);
+        assert_eq!(collisions.len(), 1, "exactly one colliding object id");
+        assert_eq!(collisions[0].external_object_id, "acct_42");
+        // Sources are sorted (deterministic).
+        assert_eq!(
+            collisions[0].sources,
+            vec![
+                "src__acme__shopify".to_string(),
+                "src__coke__shopify".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

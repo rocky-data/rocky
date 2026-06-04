@@ -13,6 +13,10 @@ export interface DiscoverOutput {
    * Pipeline-level data quality check configuration. Present when the pipeline declares a `[checks]` block in `rocky.toml`. Downstream orchestrators (e.g. Dagster) consume this to attach asset-level freshness policies and check expectations without re-reading `rocky.toml` themselves.
    */
   checks?: ChecksConfigOutput | null;
+  /**
+   * Groups of ≥2 discovered sources sharing the SAME external object id but resolving to DIFFERENT target paths — the same underlying object onboarded twice. Populated only when discovery's `on_collision` is `warn`/`error` and the adapter supplies `external_object_id`; empty (and omitted from the wire format) otherwise.
+   */
+  collision_candidates?: CollisionCandidateOutput[];
   command: string;
   /**
    * Tables filtered out of `sources` because they were reported by the discovery adapter but do not exist in the source warehouse. Same shape as `RunOutput.excluded_tables` so consumers can use one parser. Empty when nothing was filtered.
@@ -52,6 +56,20 @@ export interface ChecksConfigOutput {
  */
 export interface FreshnessConfigOutput {
   threshold_seconds: number;
+  [k: string]: unknown;
+}
+/**
+ * A cross-source collision: one external object id mapped to more than one target path (the same object onboarded twice under different schemas).
+ */
+export interface CollisionCandidateOutput {
+  /**
+   * The shared external object id (e.g. a Fivetran ad-account id).
+   */
+  external_object_id: string;
+  /**
+   * The distinct source schemas that resolve to it (≥2), sorted.
+   */
+  sources: string[];
   [k: string]: unknown;
 }
 /**

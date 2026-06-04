@@ -27,6 +27,14 @@ pub struct DiscoveredConnector {
     /// the dagster fixture corpus + codegen-drift CI).
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub metadata: IndexMap<String, serde_json::Value>,
+    /// Stable identity of the underlying external object this source
+    /// replicates (e.g. a Fivetran ad-account id recovered from connector
+    /// config). `None` when the adapter can't determine one — collision
+    /// detection is then skipped for this source. The schema *name*
+    /// deliberately does not encode this, which is exactly why two onboards of
+    /// the same object under different paths can collide unnoticed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_object_id: Option<String>,
 }
 
 /// A discovered table within a connector.
@@ -180,6 +188,7 @@ mod tests {
                 },
             ],
             metadata: IndexMap::new(),
+            external_object_id: None,
         };
         let json = serde_json::to_string(&conn).unwrap();
         // Empty metadata is skipped from the wire form so adapters that
@@ -211,6 +220,7 @@ mod tests {
             last_sync_at: None,
             tables: vec![],
             metadata,
+            external_object_id: None,
         };
 
         let json = serde_json::to_string(&conn).unwrap();
