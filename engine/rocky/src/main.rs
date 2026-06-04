@@ -2464,7 +2464,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 )
                 .await
             } else if dag {
-                let run_future = rocky_cli::commands::run_with_dag(&cli.config, json);
+                let run_future = rocky_cli::commands::run_with_dag(&cli.config, &state_path, json);
                 tokio::select! {
                     result = run_future => result,
                     _ = shutdown_signal() => {

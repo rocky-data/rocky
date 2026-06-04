@@ -21,7 +21,14 @@ use crate::output::{DagRunNodeOutput, DagRunOutput, print_json};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Execute `rocky run --dag`: run every pipeline in dependency order.
-pub async fn run_with_dag(config_path: &Path, json: bool) -> Result<()> {
+///
+/// `state_path` is the canonical state location already resolved by the
+/// caller (`main.rs` via `resolve_state_path_ns`, honoring `--state-path` /
+/// `--state-namespace` / the `<models>/.rocky-state.redb` default). Each
+/// per-pipeline sub-run is driven through `run()` against this same path, so
+/// the unified-DAG path shares the project's canonical state with every other
+/// `rocky run` invocation — it must never invent its own `.rocky_state` file.
+pub async fn run_with_dag(config_path: &Path, state_path: &Path, json: bool) -> Result<()> {
     let cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
         config_path.display()
@@ -53,6 +60,7 @@ pub async fn run_with_dag(config_path: &Path, json: bool) -> Result<()> {
 
     let dispatcher = CliDispatcher {
         config_path: config_path.to_path_buf(),
+        state_path: state_path.to_path_buf(),
     };
     let executor = DagExecutor::new(dispatcher);
     let result = executor
@@ -122,11 +130,17 @@ fn status_str(s: &NodeStatus) -> &'static str {
 /// implicitly inside their parent transformation).
 struct CliDispatcher {
     config_path: std::path::PathBuf,
+    /// Canonical state path threaded from the caller. Every sub-run drives
+    /// `run()` against this shared path so the unified-DAG path reads and
+    /// writes the project's canonical `.rocky-state.redb` (or the namespaced
+    /// / `--state-path` override) — never a private `.rocky_state` file.
+    state_path: std::path::PathBuf,
 }
 
 impl NodeDispatcher for CliDispatcher {
     fn dispatch(&self, _id: &NodeId, kind: NodeKind, label: &str) -> Option<NodeFuture> {
         let config_path = self.config_path.clone();
+        let state_path = self.state_path.clone();
         let label = label.to_string();
         match kind {
             NodeKind::Test => {
@@ -154,11 +168,11 @@ impl NodeDispatcher for CliDispatcher {
                     lookback: None,
                     parallel: 1,
                 };
-                // Use a pipeline-local state path next to the config.
-                let state_path = config_path
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .join(".rocky_state");
+                // Drive each sub-run against the canonical state path the
+                // caller resolved (honoring `--state-path` /
+                // `--state-namespace` / the `<models>/.rocky-state.redb`
+                // default), so the unified-DAG path shares the project's
+                // state with every other `rocky run`.
                 super::run::run(
                     &config_path,
                     None,

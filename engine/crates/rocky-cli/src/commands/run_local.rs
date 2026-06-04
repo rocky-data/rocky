@@ -8,8 +8,8 @@
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::Result;
-use chrono::Utc;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use tracing::warn;
 
 use rocky_core::sql_gen;
@@ -23,6 +23,7 @@ use crate::registry::AdapterRegistry;
 ///
 /// Compiles and executes models from the pipeline's `models` glob using the
 /// target adapter. Reuses the existing [`super::run::execute_models`] path.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run_transformation")]
 pub async fn run_transformation(
     config_path: &Path,
@@ -39,6 +40,30 @@ pub async fn run_transformation(
     // / `[run] skip_unchanged` is set). Passed straight through to
     // `execute_models`.
     skip_gate: super::run::SkipGateConfig,
+    // Canonical state path resolved once by `main.rs` (`--state-path` /
+    // `--state-namespace` / the global `<models>/.rocky-state.redb`
+    // default) — the SAME path the replication path opens. The
+    // transformation run persists its `RunRecord` here so `rocky history`
+    // / `rocky state` see it and `--skip-unchanged` has a prior-successful
+    // baseline to compare against.
+    state_path: &Path,
+    // `run()`'s `run_id` + `started_at`, threaded so the persisted
+    // `RunRecord::run_id` matches the idempotency stamp at the dispatch
+    // site (invariant: `IdempotencyEntry::run_id == RunRecord::run_id`).
+    // `run_id` is derived from `started_at`, so they always travel together.
+    run_id: &str,
+    started_at: DateTime<Utc>,
+    // Config fingerprint computed once in `run()` (mirrors every other
+    // `persist_run_record` call site).
+    config_hash: &str,
+    // Caller-supplied `--idempotency-key` (verbatim, as `run()` received
+    // it). Threaded so the persisted audit records the claimed key — the
+    // model-only (`run.rs`) and replication paths pass the same value into
+    // `AuditContext::detect`. Without it the persisted `RunRecord`'s
+    // `idempotency_key` is `None` even when the run finalized the
+    // idempotency entry under `K`, so `rocky history --audit` shows
+    // `idempotency_key=-` instead of `K`.
+    idempotency_key: Option<&str>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -64,17 +89,22 @@ pub async fn run_transformation(
         .trim_end_matches('/');
     let models_dir = config_dir.join(models_base);
 
+    // Open the canonical state store up front so it stays in scope through
+    // cost population + `persist_run_record` below. Only opened when there's
+    // a models directory to execute — a no-op run must not create a state
+    // file. `persist_run_record` accepts `Option<&StateStore>`, so the
+    // `None` arm flows through cleanly.
+    let mut state_store: Option<StateStore> = None;
     if models_dir.exists() {
-        let run_id = format!("run-{}", Utc::now().format("%Y%m%d-%H%M%S-%3f"));
-        let state_path = config_dir.join(".rocky_state");
-        let state_store = StateStore::open(&state_path)?;
+        let store = StateStore::open(state_path)
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
         super::run::execute_models(
             &models_dir,
             warehouse_adapter.as_ref(),
-            Some(&state_store),
+            Some(&store),
             partition_opts,
-            &run_id,
+            run_id,
             None, // no model filter in local execution path
             &mut output,
             None, // run_local doesn't build a HookRegistry
@@ -87,6 +117,8 @@ pub async fn run_transformation(
             rocky_cfg.reuse.enabled,
         )
         .await?;
+
+        state_store = Some(store);
     } else {
         warn!(
             models_dir = %models_dir.display(),
@@ -106,6 +138,30 @@ pub async fn run_transformation(
         .map(|a| a.adapter_type.clone())
         .unwrap_or_default();
     output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
+
+    // Persist the RunRecord (after cost population, so the recorded
+    // `ModelExecution` entries carry cost + `skip_hash` + upstream
+    // freshness signatures). Mirrors the replication / model-only call
+    // sites in `run.rs`. This is what makes `--skip-unchanged` work on the
+    // full-DAG path — the next run's skip gate reads these per-model
+    // executions as its prior-successful baseline — and what surfaces the
+    // run in `rocky history` / `rocky state`. Failures are logged and
+    // swallowed: bookkeeping must not flip a successful run's exit code.
+    //
+    // Transformation runs have no single target catalog (per-model targets
+    // resolve from each model's sidecar), so `target_catalog = None` — the
+    // same posture as the model-only path.
+    let audit_ctx =
+        super::run_audit::AuditContext::detect(idempotency_key.map(str::to_string), None);
+    let audit = super::run::audit_to_record(&audit_ctx);
+    super::run::persist_run_record(
+        state_store.as_ref(),
+        &output,
+        run_id,
+        started_at,
+        config_hash,
+        &audit,
+    );
 
     if let Some(p) = &pipes {
         super::run::emit_pipes_events(p, &output);
@@ -770,4 +826,352 @@ pub async fn run_snapshot(
         anyhow::bail!("snapshot pipeline failed");
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "duckdb"))]
+mod tests {
+    use std::path::Path;
+
+    use rocky_core::state::StateStore;
+    use rocky_core::traits::WarehouseAdapter;
+    use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+    use super::super::run::{DeferOptions, PartitionRunOptions, SkipRunOptions};
+
+    /// Seed a raw `main.src` table with `n` integer rows in the persistent
+    /// DuckDB file. Drops the connection before returning so `rocky run` can
+    /// reopen the file.
+    async fn seed_src(db: &Path, n: u32) {
+        let a = DuckDbWarehouseAdapter::open(db).expect("seed open");
+        a.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+            .await
+            .unwrap();
+        a.execute_statement("DROP TABLE IF EXISTS main.src")
+            .await
+            .unwrap();
+        let values: Vec<String> = (1..=n).map(|i| format!("({i})")).collect();
+        a.execute_statement(&format!(
+            "CREATE TABLE main.src AS SELECT * FROM (VALUES {}) AS t(id)",
+            values.join(", ")
+        ))
+        .await
+        .unwrap();
+    }
+
+    /// Insert a sentinel row into `main.<table>` so a later run can detect
+    /// whether the target was rewritten: a full_refresh CTAS drops it, a skip
+    /// leaves it.
+    async fn insert_sentinel(db: &Path, table: &str, sentinel: i64) {
+        let a = DuckDbWarehouseAdapter::open(db).expect("sentinel open");
+        a.execute_statement(&format!("INSERT INTO main.{table} VALUES ({sentinel})"))
+            .await
+            .unwrap();
+    }
+
+    /// Count rows in `main.<table>`.
+    async fn count_rows(db: &Path, table: &str) -> i64 {
+        let a = DuckDbWarehouseAdapter::open(db).expect("count open");
+        let r = a
+            .execute_query(&format!("SELECT COUNT(*) FROM main.{table}"))
+            .await
+            .unwrap();
+        r.rows[0][0]
+            .as_i64()
+            .or_else(|| r.rows[0][0].as_str().and_then(|s| s.parse().ok()))
+            .unwrap()
+    }
+
+    /// Write a `full_refresh` SQL model (`name.sql` + `name.toml`) into the
+    /// project's `main` schema, with an optional `depends_on` sidecar key.
+    fn write_model(dir: &Path, name: &str, sql: &str, depends_on: &[&str]) {
+        std::fs::write(dir.join(format!("{name}.sql")), format!("{sql}\n")).unwrap();
+        let dep_line = if depends_on.is_empty() {
+            String::new()
+        } else {
+            let list = depends_on
+                .iter()
+                .map(|d| format!("\"{d}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("depends_on = [{list}]\n")
+        };
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "{dep_line}[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"{name}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Drive `super::super::run::run()` end-to-end against the given config +
+    /// canonical `state_path`, exercising the full transformation dispatch
+    /// (`run() → run_transformation`). `skip_unchanged` toggles the gate.
+    async fn run_full_dag(config_path: &Path, state_path: &Path, skip_unchanged: bool) {
+        let opts = PartitionRunOptions::default();
+        let skip_opts = SkipRunOptions {
+            skip_unchanged,
+            force_rebuild: false,
+            no_reuse: false,
+        };
+        super::super::run::run(
+            config_path,
+            None, // filter
+            None, // pipeline_name_arg — single pipeline resolves
+            state_path,
+            None,  // governance_override
+            false, // output_json
+            None,  // models_dir override — take from config
+            false, // run_all
+            None,  // resume_run_id
+            false, // resume_latest
+            None,  // shadow_config
+            &opts,
+            None, // model_name_filter
+            None, // cache_ttl_override
+            None, // idempotency_key
+            None, // env
+            &DeferOptions::default(),
+            &skip_opts,
+        )
+        .await
+        .expect("full-DAG transformation run should succeed");
+    }
+
+    /// Write the project `rocky.toml`. `skip_block` controls whether the
+    /// `[run]` gate is enabled in config — passed empty for the default-off
+    /// test so the CLI overlay is the only thing that could turn it on.
+    fn write_config(dir: &Path, db: &Path, skip_block: &str) {
+        std::fs::write(
+            dir.join("rocky.toml"),
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{db}"
+{skip_block}
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target.governance]
+auto_create_schemas = true
+"#,
+                db = db.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The `[run]` block that enables the skip gate + rowcount fallback (a
+    /// full_refresh leaf over a raw source has no tracked timestamp column, so
+    /// rowcount is the available B3 signal).
+    const SKIP_ENABLED: &str = "\n[run]\nskip_unchanged = true\nskip_rowcount_fallback = true\n";
+
+    /// Regression test for the full-DAG `--skip-unchanged` bug.
+    ///
+    /// Before the fix, `run() → run_transformation` opened a non-canonical
+    /// `.rocky_state` file and never persisted a `RunRecord`, so the skip
+    /// gate had no prior-successful baseline and the full-DAG path NEVER
+    /// skipped — and the run never showed in `rocky history`.
+    ///
+    /// This drives `run()` end-to-end (NO `--model`) over a 2-model
+    /// transformation DAG and asserts the second byte-identical run SKIPS
+    /// (sentinel rows survive), a later logic change rebuilds only the changed
+    /// model, and the run is persisted to the CANONICAL `state_path`.
+    #[tokio::test]
+    async fn full_dag_skip_unchanged_skips_and_persists_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = dir.join("t.duckdb");
+        // Canonical state path — the SAME location `main.rs` resolves and the
+        // replication path opens. The bug persisted to `.rocky_state` instead.
+        let state_path = dir.join(".rocky-state.redb");
+
+        seed_src(&db, 3).await;
+        write_model(&models_dir, "stg", "SELECT id FROM main.src", &[]);
+        write_model(&models_dir, "mart", "SELECT id FROM main.stg", &["stg"]);
+        write_config(dir, &db, SKIP_ENABLED);
+        let config_path = dir.join("rocky.toml");
+
+        // ---- Run 1: fresh state ⇒ both models build. -------------------
+        run_full_dag(&config_path, &state_path, true).await;
+        assert_eq!(count_rows(&db, "stg").await, 3, "run 1 builds stg");
+        assert_eq!(count_rows(&db, "mart").await, 3, "run 1 builds mart");
+
+        // The fix's history half: the canonical state store now carries this
+        // run. Before the fix, `run_transformation` never persisted, so the
+        // canonical store had nothing and `rocky history` was empty.
+        //
+        // redb permits a single writer per file, so this read handle MUST be
+        // dropped before the next `run()` opens the same path — hence the
+        // explicit scope.
+        {
+            let store = StateStore::open(&state_path).expect("open canonical state");
+            let runs = store.list_runs(10).expect("list runs");
+            assert!(
+                !runs.is_empty(),
+                "a full-DAG transformation run must appear in history at the \
+                 canonical state path"
+            );
+            assert!(
+                store
+                    .get_model_history("stg", 1)
+                    .expect("model history")
+                    .into_iter()
+                    .any(|m| m.status == "success"),
+                "the prior successful ModelExecution baseline must be persisted"
+            );
+        }
+
+        // Sentinels: a skip leaves these rows (4 each); a rebuild's CTAS drops
+        // them (back to 3).
+        insert_sentinel(&db, "stg", 999).await;
+        insert_sentinel(&db, "mart", 999).await;
+        assert_eq!(count_rows(&db, "stg").await, 4);
+        assert_eq!(count_rows(&db, "mart").await, 4);
+
+        // ---- Run 2: byte-identical ⇒ both SKIP (sentinels survive). ----
+        run_full_dag(&config_path, &state_path, true).await;
+        assert_eq!(
+            count_rows(&db, "stg").await,
+            4,
+            "run 2 must SKIP stg — sentinel survives (this is the bug's \
+             regression assertion)"
+        );
+        assert_eq!(
+            count_rows(&db, "mart").await,
+            4,
+            "run 2 must SKIP mart — sentinel survives"
+        );
+
+        // ---- Run 3: change mart's logic ⇒ mart rebuilds, stg still skips.
+        write_model(
+            &models_dir,
+            "mart",
+            "SELECT id FROM main.stg WHERE id > 1",
+            &["stg"],
+        );
+        run_full_dag(&config_path, &state_path, true).await;
+        assert_eq!(
+            count_rows(&db, "stg").await,
+            4,
+            "run 3 must still SKIP stg — its logic + upstream are unchanged"
+        );
+        // mart rebuilt: the CTAS dropped the sentinel and re-derived from stg
+        // (4 rows in stg: ids 1,2,3,999 — WHERE id > 1 keeps 2,3,999 ⇒ 3 rows).
+        assert_eq!(
+            count_rows(&db, "mart").await,
+            3,
+            "run 3 must REBUILD mart — changed logic drops the sentinel"
+        );
+    }
+
+    /// Drive `run()` end-to-end over the full-DAG transformation path WITH an
+    /// `--idempotency-key`, then assert the persisted `RunRecord` carries that
+    /// key in its audit.
+    ///
+    /// Before the fix, `run_transformation` built its audit with
+    /// `AuditContext::detect(None, None)`, so the persisted `RunRecord`'s
+    /// `idempotency_key` was `None` even though the run finalized the
+    /// idempotency entry under `K` — `rocky history --audit` showed
+    /// `idempotency_key=-` instead of `K`. The model-only / replication paths
+    /// pass the claimed key through; this is the transformation path matching
+    /// them.
+    #[tokio::test]
+    async fn full_dag_persists_idempotency_key_in_audit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = dir.join("t.duckdb");
+        // Canonical state path — the SAME location `main.rs` resolves and the
+        // replication path opens.
+        let state_path = dir.join(".rocky-state.redb");
+
+        seed_src(&db, 3).await;
+        write_model(&models_dir, "stg", "SELECT id FROM main.src", &[]);
+        write_config(dir, &db, "");
+        let config_path = dir.join("rocky.toml");
+
+        let key = "ci-deadbeef-1234";
+        let opts = PartitionRunOptions::default();
+        super::super::run::run(
+            &config_path,
+            None, // filter
+            None, // pipeline_name_arg — single pipeline resolves
+            &state_path,
+            None,  // governance_override
+            false, // output_json
+            None,  // models_dir override — take from config
+            false, // run_all
+            None,  // resume_run_id
+            false, // resume_latest
+            None,  // shadow_config
+            &opts,
+            None,      // model_name_filter
+            None,      // cache_ttl_override
+            Some(key), // idempotency_key — the value under test
+            None,      // env
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+        )
+        .await
+        .expect("full-DAG transformation run with idempotency key should succeed");
+
+        // The persisted audit must carry the claimed key, matching the
+        // idempotency entry the dispatch site finalized under the same value.
+        let store = StateStore::open(&state_path).expect("open canonical state");
+        let runs = store.list_runs(10).expect("list runs");
+        let record = runs
+            .iter()
+            .find(|r| r.idempotency_key.as_deref() == Some(key))
+            .unwrap_or_else(|| {
+                panic!(
+                    "persisted RunRecord must carry idempotency_key={key:?}; got {:?}",
+                    runs.iter().map(|r| &r.idempotency_key).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            record.idempotency_key.as_deref(),
+            Some(key),
+            "the full-DAG transformation run's persisted audit must record the \
+             claimed idempotency key (not None)"
+        );
+    }
+
+    /// Default-off must stay byte-identical: with `--skip-unchanged` NOT set,
+    /// every model rebuilds every run (sentinels are dropped), even when logic
+    /// + inputs are unchanged.
+    #[tokio::test]
+    async fn full_dag_default_off_always_rebuilds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = dir.join("t.duckdb");
+        let state_path = dir.join(".rocky-state.redb");
+
+        seed_src(&db, 3).await;
+        write_model(&models_dir, "stg", "SELECT id FROM main.src", &[]);
+        // Empty `[run]` block ⇒ the CLI overlay is the only thing that could
+        // enable the gate; with `skip_unchanged = false` it stays fully inert.
+        write_config(dir, &db, "");
+        let config_path = dir.join("rocky.toml");
+
+        run_full_dag(&config_path, &state_path, false).await;
+        insert_sentinel(&db, "stg", 999).await;
+        assert_eq!(count_rows(&db, "stg").await, 4);
+
+        // Gate off ⇒ run 2 rebuilds unconditionally ⇒ sentinel dropped.
+        run_full_dag(&config_path, &state_path, false).await;
+        assert_eq!(
+            count_rows(&db, "stg").await,
+            3,
+            "default-off must rebuild every run — sentinel dropped"
+        );
+    }
 }

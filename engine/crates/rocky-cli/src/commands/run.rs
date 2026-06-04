@@ -399,7 +399,7 @@ impl<'a> ExecutionContext<'a> {
 /// `run_audit` stays free of a dependency on `crate::output` — the
 /// audit module is pure environment-probing with no JSON-schema
 /// surface.
-fn audit_to_record(ctx: &AuditContext) -> RunRecordAudit {
+pub(crate) fn audit_to_record(ctx: &AuditContext) -> RunRecordAudit {
     RunRecordAudit {
         triggering_identity: ctx.triggering_identity.clone(),
         session_source: ctx.session_source,
@@ -412,7 +412,7 @@ fn audit_to_record(ctx: &AuditContext) -> RunRecordAudit {
     }
 }
 
-fn persist_run_record(
+pub(crate) fn persist_run_record(
     state_store: Option<&StateStore>,
     output: &RunOutput,
     run_id: &str,
@@ -1232,6 +1232,23 @@ pub async fn run(
                 partition_opts,
                 &schema_cache_cfg,
                 skip_gate,
+                // Canonical state path resolved once by `main.rs`
+                // (`--state-path` / `--state-namespace` / the global
+                // default) — the same path the replication path opens. The
+                // transformation path persists its `RunRecord` here so
+                // `--skip-unchanged` has a prior-successful baseline and the
+                // run shows in `rocky history`.
+                state_path,
+                // Share `run()`'s `run_id` + `started_at` so the persisted
+                // `RunRecord::run_id` matches the idempotency stamp below
+                // (invariant: `IdempotencyEntry::run_id == RunRecord::run_id`).
+                &run_id,
+                started_at,
+                &config_hash,
+                // Raw `--idempotency-key` so the persisted audit records the
+                // claimed key, matching the model-only / replication paths.
+                // The claim is finalized under this same value just below.
+                idempotency_key,
             )
             .await?;
             finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
