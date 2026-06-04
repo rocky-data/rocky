@@ -165,7 +165,10 @@ fn compute_plan_id(kind: &PlanKind, payload: &serde_json::Value) -> String {
 
 /// Return the directory where plans are stored, creating it if needed.
 fn plans_dir(root: &Path) -> Result<std::path::PathBuf> {
-    let dir = root.join(".rocky").join("plans");
+    let rocky_dir = root.join(".rocky");
+    // Keep `.rocky/` (plans + traces) out of the user's git repo.
+    rocky_observe::traces::ensure_rocky_gitignore(&rocky_dir);
+    let dir = rocky_dir.join("plans");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create plans directory at {}", dir.display()))?;
     Ok(dir)

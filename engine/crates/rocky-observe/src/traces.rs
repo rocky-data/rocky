@@ -222,9 +222,29 @@ impl Write for JsonlWriter {
     }
 }
 
+/// Best-effort: drop a `.gitignore` (ignoring everything) into Rocky's local
+/// state dir (`.rocky/`) so running `rocky` inside a git repo doesn't leave an
+/// untracked `.rocky/` (plans, traces). No-op if a `.gitignore` already exists;
+/// all failures are ignored — this is convenience, never load-bearing.
+pub fn ensure_rocky_gitignore(rocky_dir: &Path) {
+    let gitignore = rocky_dir.join(".gitignore");
+    if gitignore.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(rocky_dir);
+    let _ = std::fs::write(
+        &gitignore,
+        "# Rocky local state (plans, traces) — not for version control.\n*\n",
+    );
+}
+
 fn open_jsonl(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        // Keep Rocky's `.rocky/` state dir out of the user's git repo.
+        if let Some(rocky_dir) = parent.parent() {
+            ensure_rocky_gitignore(rocky_dir);
+        }
     }
     OpenOptions::new().create(true).append(true).open(path)
 }
@@ -591,5 +611,21 @@ mod tests {
         let b = read_trace_from(dir, "run-B");
         assert_eq!(b.len(), 1);
         assert!(b.iter().all(|s| s.matches_run_id("run-B")));
+    }
+
+    #[test]
+    fn ensure_rocky_gitignore_writes_then_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rocky = tmp.path().join(".rocky");
+        ensure_rocky_gitignore(&rocky);
+        let gi = rocky.join(".gitignore");
+        assert!(
+            std::fs::read_to_string(&gi).unwrap().contains('*'),
+            "the .gitignore should ignore everything under .rocky/"
+        );
+        // A pre-existing .gitignore is left untouched.
+        std::fs::write(&gi, "custom\n").unwrap();
+        ensure_rocky_gitignore(&rocky);
+        assert_eq!(std::fs::read_to_string(&gi).unwrap(), "custom\n");
     }
 }
