@@ -355,7 +355,14 @@ region  = "us-east-1"
 [state]
 backend = "tiered"
 # … S3 fields plus local path
+
+# State-file namespacing (opt-in, default "none")
+[state]
+backend = "local"
+namespacing = "pipeline"   # each pipeline gets its own .rocky-state/<pipeline>.redb
 ```
+
+`namespacing` (`StateNamespacing`, default `"none"`) controls state-file fan-out. redb allows one writer per file, so running one `rocky run` per pipeline/client against the single global `<models>/.rocky-state.redb` serializes them on one lock. `"pipeline"` gives each pipeline its own `<models>/.rocky-state/<pipeline>.redb`. `"none"` is byte-identical to omitting the key. For per-client fan-out use the per-invocation `--state-namespace <key>` flag (overrides this config); an explicit `--state-path` disables namespacing for that run.
 
 ## Plan store
 
@@ -370,6 +377,47 @@ format = "v2"
 ```
 
 Controls how `rocky plan` persists plan artifacts to `.rocky/plans/<plan-id>.json`. Default `"v1"` keeps the legacy `CompactOutput` / `ArchiveOutput` envelope with inline SQL. Opt-in `"v2"` writes typed-IR payloads (`CompactPlanIr` / `ArchivePlanIr`); `rocky apply` regenerates SQL from the IR via `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}`. Stdout JSON is unchanged in both formats; the reader accepts both regardless of writer config. `PromotePlan` (governance) and `RunPlan` (already IR-only) are intentionally untouched.
+
+## Run-skip gate (`[run]` + per-model `[skip]`)
+
+```toml
+# Opt-in model-skip gate — default OFF (omit the block to keep old behavior)
+[run]
+skip_unchanged = true            # master switch (also via the --skip-unchanged flag)
+skip_rowcount_fallback = false   # default; allow COUNT(*) when no timestamp column (weaker signal)
+lag_tolerance_seconds = 0        # default; any MAX(ts) movement forces a rebuild
+```
+
+`[run]` (`RunConfig`) tunes the `--skip-unchanged` gate: skip re-materializing a transformation model whose logic **and** every upstream's data both appear unchanged since the last successful build. It is a **best-effort optimization, not a result-equivalence guarantee** — every field defaults to no-skip, and any missing/unreadable/ambiguous input rebuilds (fail-safe).
+
+**Not skip-eligible (always rebuild):**
+- Non-deterministic SQL: `CURRENT_TIMESTAMP` / `NOW()`, `RANDOM()`, `UUID()`, `CURRENT_USER`, `CURRENT_CATALOG`, `ANY_VALUE`, `ARRAY_AGG`, unordered `LIMIT`, or any unknown function.
+- Models whose lineage isn't provably complete: CTEs, subqueries (`FROM (…)`, `IN (SELECT …)`, `EXISTS`, scalar sub-selects), `PIVOT` / `UNNEST` / nested-join table-factors, and set operations (`UNION` / `INTERSECT` / `EXCEPT`).
+- `content_addressed` / `time_interval` strategies (`full_refresh` **is** eligible).
+
+`--force-rebuild` bypasses the gate entirely.
+
+```toml
+# Per-model override (in the model's .toml sidecar)
+name = "fct_orders"
+
+[skip]
+eligible = true        # Some(false) = always build; Some(true) = eligible; unset = auto
+deterministic = true   # owner asserts SQL is pure → re-eligible despite the static scan
+```
+
+`[skip]` (`SkipConfig` in `rocky-core/src/models.rs`) is a per-model sidecar block. Both fields are `Option<bool>` — unset means "trust the automatic rules."
+
+`--defer` / `--defer-to <schema>` are runtime-only dev flags (not config): build the `--model`-selected models locally and resolve unbuilt upstream `ref()`s to a prod/defer schema. The rewrite parses model SQL with the Databricks dialect, so `SELECT * EXCEPT(...)`, trailing-comma selects, and `STRUCT(...)` literals can't be rewritten — run those without `--defer`.
+
+## Reuse (`[reuse]`) — EXPERIMENTAL, do not enable in production
+
+```toml
+[reuse]
+enabled = false   # default; preview-only, NOT live-verified — leave off in production
+```
+
+`[reuse]` (`ReuseConfig`) is a **preview** surface scoped to the **Databricks–Iceberg content-addressed write path only** (no DuckDB / Snowflake / BigQuery), and it is **not yet live-verified against a warehouse**. When `enabled = true`, a successful run only *populates* an input-match index + provenance record — it makes **no reuse decision and skips nothing**. It attests an input-logic match + byte-identity of the **recorded** bytes, never that a fresh re-run would reproduce them. Default-off keeps `rocky run` byte- and cost-identical. The per-invocation `--no-reuse` flag forces every model to build. Provenance is auditable per `docs/.../guides/verify-a-run.md`.
 
 ## Cache (Valkey/Redis)
 
