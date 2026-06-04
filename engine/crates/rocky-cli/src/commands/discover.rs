@@ -171,6 +171,46 @@ pub async fn discover(
         });
     }
 
+    // New-source diff (opt-in). Diff the discovered source inventory against
+    // the prior persisted snapshot so a freshly-onboarded source surfaces in
+    // `new_sources` — the catch-at-onboarding signal. The first discover of a
+    // pipeline only establishes the baseline. A state-store failure degrades
+    // to "no new sources" + a warn rather than aborting discovery.
+    let report_new_sources = pipeline
+        .source
+        .discovery
+        .as_ref()
+        .map(|d| d.report_new_sources)
+        .unwrap_or(false);
+    let new_sources = if report_new_sources {
+        let mut current = dedup_schemas(connectors);
+        current.sort();
+        match diff_and_record_new_sources(state_path, name, &current) {
+            Ok(found) => {
+                if !found.is_empty() {
+                    let bus = rocky_observe::events::global_event_bus();
+                    for schema in &found {
+                        bus.emit(
+                            rocky_observe::events::PipelineEvent::new("new_source_discovered")
+                                .with_target(schema.clone()),
+                        );
+                    }
+                    warn!(
+                        count = found.len(),
+                        "discover: new source(s) since last run — see `new_sources` in JSON output"
+                    );
+                }
+                found
+            }
+            Err(e) => {
+                warn!(error = %e, "discover: new-source diff failed — skipping (state unavailable)");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     // Schema-cache warm-up. Only runs when `--with-schemas` is set;
     // config gating already happened at the top of this function.
     // Errors inside the warm-up are logged and counted as misses — a
@@ -194,7 +234,8 @@ pub async fn discover(
         .with_checks(checks_output)
         .with_excluded_tables(excluded_tables)
         .with_failed_sources(failed_sources)
-        .with_schemas_cached(schemas_cached);
+        .with_schemas_cached(schemas_cached)
+        .with_new_sources(new_sources);
     if output_json {
         print_json(&output)?;
     } else {
@@ -352,6 +393,37 @@ fn dedup_schemas(connectors: &[rocky_core::source::DiscoveredConnector]) -> Vec<
             }
         })
         .collect()
+}
+
+/// Diff the current discovered source schemas against the prior persisted
+/// snapshot for `pipeline`, then overwrite the snapshot with `current`.
+///
+/// Returns the schemas present now but absent from the prior snapshot. The
+/// first call for a pipeline (no prior snapshot) records the baseline and
+/// returns an empty vec — a first discover is a baseline, not a wave of "new"
+/// sources. `current` must be deduplicated + sorted so the stored baseline is
+/// deterministic. The diff is per-pipeline (keyed by pipeline name), so two
+/// pipelines sharing a state store don't cross-contaminate.
+fn diff_and_record_new_sources(
+    state_path: &Path,
+    pipeline: &str,
+    current: &[String],
+) -> Result<Vec<String>> {
+    let store = StateStore::open(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    let new_sources = match store.get_discover_snapshot(pipeline)? {
+        Some(prior) => {
+            let prior: HashSet<&String> = prior.iter().collect();
+            current
+                .iter()
+                .filter(|s| !prior.contains(s))
+                .cloned()
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    store.put_discover_snapshot(pipeline, current)?;
+    Ok(new_sources)
 }
 
 /// Inner warm-up loop — split out so unit tests can drive it with a stub
@@ -831,6 +903,40 @@ mod tests {
         ];
         let schemas = dedup_schemas(&connectors);
         assert_eq!(schemas, vec!["raw__shopify", "raw__netsuite"]);
+    }
+
+    #[test]
+    fn new_source_diff_reports_only_unseen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state.redb");
+        let baseline = vec!["src__a__shopify".to_string(), "src__b__shopify".to_string()];
+
+        // First run establishes the baseline and reports nothing.
+        let first = diff_and_record_new_sources(&state, "raw", &baseline).unwrap();
+        assert!(first.is_empty(), "first discover is baseline-only");
+
+        // Second run with one added schema reports exactly that schema.
+        let mut grown = baseline.clone();
+        grown.push("src__c__shopify".to_string());
+        grown.sort();
+        let second = diff_and_record_new_sources(&state, "raw", &grown).unwrap();
+        assert_eq!(second, vec!["src__c__shopify".to_string()]);
+
+        // Third identical run is idempotent — nothing new.
+        let third = diff_and_record_new_sources(&state, "raw", &grown).unwrap();
+        assert!(third.is_empty());
+    }
+
+    #[test]
+    fn new_source_diff_is_per_pipeline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state.redb");
+        diff_and_record_new_sources(&state, "p1", &["a".to_string()]).unwrap();
+        // A different pipeline has its own baseline — its first run reports
+        // none, not "a"/"b" as new (no cross-pipeline contamination).
+        let p2 =
+            diff_and_record_new_sources(&state, "p2", &["a".to_string(), "b".to_string()]).unwrap();
+        assert!(p2.is_empty());
     }
 
     #[tokio::test]

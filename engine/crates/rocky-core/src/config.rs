@@ -4209,6 +4209,13 @@ pub struct DiscoveryConfig {
     /// Defaults to `"default"`.
     #[serde(default = "default_adapter_name")]
     pub adapter: String,
+
+    /// When `true`, `rocky discover` diffs the discovered source inventory
+    /// against the prior persisted snapshot and reports first-seen sources in
+    /// `new_sources`. Off by default — the diff and its state write only happen
+    /// when opted in, so existing projects pay nothing.
+    #[serde(default)]
+    pub report_new_sources: bool,
 }
 
 /// Pipeline target configuration.
@@ -4600,6 +4607,7 @@ fn apply_single_adapter_discovery_default(config: &mut RockyConfig) {
         if replication.source.discovery.is_none() {
             replication.source.discovery = Some(DiscoveryConfig {
                 adapter: sole_adapter.clone(),
+                report_new_sources: false,
             });
         }
     }

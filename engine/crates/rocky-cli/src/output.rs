@@ -102,6 +102,14 @@ pub struct DiscoverOutput {
     /// captured without the flag stay byte-stable.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub schemas_cached: usize,
+    /// Source schemas seen for the first time relative to the prior persisted
+    /// `discover` snapshot — the catch-a-duplicate-at-onboarding signal.
+    /// Populated only when the pipeline's discovery config sets
+    /// `report_new_sources`; empty (and omitted from the wire format)
+    /// otherwise. The first-ever discover of a pipeline establishes the
+    /// baseline and reports none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_sources: Vec<String>,
 }
 
 /// Pipeline-level checks configuration projected into the discover output.
@@ -3501,6 +3509,7 @@ impl DiscoverOutput {
             excluded_tables: vec![],
             failed_sources: vec![],
             schemas_cached: 0,
+            new_sources: vec![],
         }
     }
 
@@ -3534,6 +3543,14 @@ impl DiscoverOutput {
     #[must_use]
     pub fn with_schemas_cached(mut self, schemas_cached: usize) -> Self {
         self.schemas_cached = schemas_cached;
+        self
+    }
+
+    /// Attach the list of first-seen source schemas (opt-in via the
+    /// discovery config's `report_new_sources`) and return self.
+    #[must_use]
+    pub fn with_new_sources(mut self, new_sources: Vec<String>) -> Self {
+        self.new_sources = new_sources;
         self
     }
 }
