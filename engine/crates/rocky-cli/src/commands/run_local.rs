@@ -146,7 +146,6 @@ pub async fn run_quality(
     output_json: bool,
 ) -> Result<()> {
     use rocky_core::checks::{CheckDetails, CheckResult};
-    use rocky_core::tests::generate_test_sql_with_dialect;
 
     let start = Instant::now();
 
@@ -305,62 +304,19 @@ pub async fn run_quality(
                 }
 
                 // Row-level assertions — match by unqualified table name.
-                for assertion in &pipeline.checks.assertions {
-                    if assertion.table != *table_name {
-                        continue;
-                    }
-                    let test = &assertion.test;
-                    let sql = match generate_test_sql_with_dialect(test, &full_table, dialect) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!(
-                                error = %e,
-                                table = %full_table,
-                                "failed to generate assertion SQL — skipping"
-                            );
-                            continue;
-                        }
-                    };
-                    let kind = test_type_kind(&test.test_type);
-                    let name = assertion.name.clone().unwrap_or_else(|| {
-                        format!("{kind}:{}", test.column.as_deref().unwrap_or("-"))
-                    });
-
-                    match warehouse_adapter.execute_query(&sql).await {
-                        Ok(result) => {
-                            let (passed, failing_rows) =
-                                classify_assertion(&test.test_type, &result.rows);
-                            checks.push(CheckResult {
-                                name,
-                                passed,
-                                severity: test.severity,
-                                details: CheckDetails::Assertion {
-                                    kind: kind.to_string(),
-                                    column: test.column.clone(),
-                                    failing_rows,
-                                },
-                            });
-                        }
-                        Err(e) => {
-                            warn!(
-                                error = %e,
-                                table = %full_table,
-                                assertion = %name,
-                                "assertion query failed"
-                            );
-                            checks.push(CheckResult {
-                                name,
-                                passed: false,
-                                severity: test.severity,
-                                details: CheckDetails::Assertion {
-                                    kind: kind.to_string(),
-                                    column: test.column.clone(),
-                                    failing_rows: 0,
-                                },
-                            });
-                        }
-                    }
-                }
+                // Shared with the replication runner (run.rs) via
+                // `run_table_assertions` so uniqueness and the other assertions
+                // fire identically on both surfaces.
+                checks.extend(
+                    run_table_assertions(
+                        warehouse_adapter.as_ref(),
+                        dialect,
+                        &full_table,
+                        table_name,
+                        &pipeline.checks.assertions,
+                    )
+                    .await,
+                );
 
                 output.check_results.push(TableCheckOutput {
                     asset_key: asset_key.clone(),
@@ -444,6 +400,80 @@ pub async fn run_quality(
     }
 
     Ok(())
+}
+
+/// Execute every assertion targeting `table_unqualified` against `full_table`,
+/// returning one [`CheckResult`] per matching assertion.
+///
+/// Shared by the quality runner (this module) and the replication runner
+/// (`run.rs`) so uniqueness and the other row-level assertions fire on both
+/// surfaces with identical pass/fail classification. `full_table` must already
+/// be dialect-formatted (quoted/qualified). Degradation is graceful: an
+/// SQL-generation error skips that assertion; a query error records a failed
+/// `CheckResult` — neither aborts the caller.
+pub(crate) async fn run_table_assertions(
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    full_table: &str,
+    table_unqualified: &str,
+    assertions: &[rocky_core::config::QualityAssertion],
+) -> Vec<rocky_core::checks::CheckResult> {
+    use rocky_core::checks::{CheckDetails, CheckResult};
+    use rocky_core::tests::generate_test_sql_with_dialect;
+
+    let mut results = Vec::new();
+    for assertion in assertions {
+        if assertion.table.as_str() != table_unqualified {
+            continue;
+        }
+        let test = &assertion.test;
+        let sql = match generate_test_sql_with_dialect(test, full_table, dialect) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    table = %full_table,
+                    "failed to generate assertion SQL — skipping"
+                );
+                continue;
+            }
+        };
+        let kind = test_type_kind(&test.test_type);
+        let name = assertion
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{kind}:{}", test.column.as_deref().unwrap_or("-")));
+
+        match warehouse.execute_query(&sql).await {
+            Ok(result) => {
+                let (passed, failing_rows) = classify_assertion(&test.test_type, &result.rows);
+                results.push(CheckResult {
+                    name,
+                    passed,
+                    severity: test.severity,
+                    details: CheckDetails::Assertion {
+                        kind: kind.to_string(),
+                        column: test.column.clone(),
+                        failing_rows,
+                    },
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, table = %full_table, assertion = %name, "assertion query failed");
+                results.push(CheckResult {
+                    name,
+                    passed: false,
+                    severity: test.severity,
+                    details: CheckDetails::Assertion {
+                        kind: kind.to_string(),
+                        column: test.column.clone(),
+                        failing_rows: 0,
+                    },
+                });
+            }
+        }
+    }
+    results
 }
 
 /// Short snake_case tag for each `TestType` variant — embedded in check
