@@ -78,7 +78,7 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
                 last_sync_at: None,
                 tables,
                 metadata: Default::default(),
-                external_object_id: None,
+                external_object_ids: Vec::new(),
             });
         }
 

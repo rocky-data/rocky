@@ -283,7 +283,7 @@ mod tests {
             last_sync_at: None,
             tables: vec![],
             metadata: Default::default(),
-            external_object_id: None,
+            external_object_ids: Vec::new(),
         };
         let parsed = ParsedSchema {
             values: IndexMap::from([("client".into(), SchemaValue::Single("acme".into()))]),
@@ -301,7 +301,7 @@ mod tests {
             last_sync_at: None,
             tables: vec![],
             metadata: Default::default(),
-            external_object_id: None,
+            external_object_ids: Vec::new(),
         };
         let parsed = ParsedSchema {
             values: IndexMap::from([
@@ -323,7 +323,7 @@ mod tests {
             last_sync_at: None,
             tables: vec![],
             metadata: Default::default(),
-            external_object_id: None,
+            external_object_ids: Vec::new(),
         };
         let parsed = ParsedSchema {
             values: IndexMap::from([(
@@ -345,7 +345,7 @@ mod tests {
             last_sync_at: None,
             tables: vec![],
             metadata: Default::default(),
-            external_object_id: None,
+            external_object_ids: Vec::new(),
         };
         let parsed = ParsedSchema {
             values: IndexMap::from([("client".into(), SchemaValue::Single("acme".into()))]),
@@ -365,7 +365,7 @@ mod tests {
             last_sync_at: None,
             tables: vec![],
             metadata: Default::default(),
-            external_object_id: None,
+            external_object_ids: Vec::new(),
         };
         let parsed = ParsedSchema {
             values: IndexMap::from([("client".into(), SchemaValue::Single("acme".into()))]),

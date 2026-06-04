@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::retention::RetentionPolicy;
-use crate::source::DiscoveryResult;
+use crate::source::{DiscoveredConnector, DiscoveryResult};
 use rocky_ir::{
     ColumnInfo, ColumnSelection, Grant, GrantTarget, MaskStrategy, MetadataColumn, TableRef,
 };
@@ -188,6 +188,27 @@ pub trait DiscoveryAdapter: Send + Sync {
     /// downstream consumers depend on to avoid mistaking a fetch failure
     /// for a deletion (FR-014).
     async fn discover(&self, schema_prefix: &str) -> AdapterResult<DiscoveryResult>;
+
+    /// Enrich already-discovered connectors with the stable external object
+    /// id(s) each one replicates (e.g. the ad-account ids a Fivetran connector
+    /// syncs), populating [`DiscoveredConnector::external_object_ids`] in place.
+    ///
+    /// Default: **no-op** — adapters that can't determine object identity leave
+    /// the set empty, and cross-source collision detection is simply skipped
+    /// for their sources (a *missed* detection, never a false one).
+    ///
+    /// This is a SEPARATE pass from [`Self::discover`] because recovering the
+    /// id(s) can cost one extra API call per connector (e.g. Fivetran's
+    /// per-connector detail endpoint), which is only worth paying when the
+    /// caller has opted into collision detection. Implementations MUST be
+    /// best-effort: a per-connector failure leaves that connector's ids empty
+    /// and is logged, never aborting the whole pass.
+    async fn enrich_external_object_ids(
+        &self,
+        _connectors: &mut [DiscoveredConnector],
+    ) -> AdapterResult<()> {
+        Ok(())
+    }
 
     /// Cheap connectivity check for the discovery API.
     ///

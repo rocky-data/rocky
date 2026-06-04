@@ -1989,7 +1989,7 @@ table = "m"
                 "fivetran.rate_limit_used".to_string(),
                 serde_json::json!(42),
             )]),
-            external_object_id: None,
+            external_object_ids: Vec::new(),
         }
     }
 

@@ -51,12 +51,38 @@ pub async fn discover(
 
     let adapter_registry = registry::AdapterRegistry::from_config(&rocky_cfg)?;
 
+    // Collision detection is opt-in; resolve the mode up front because it gates
+    // the extra per-connector external-object-id enrichment pass below (skip the
+    // N detail fetches entirely when detection is off).
+    let on_collision = pipeline
+        .source
+        .discovery
+        .as_ref()
+        .map(|d| d.on_collision)
+        .unwrap_or(rocky_core::config::OnCollision::Off);
+
     let discovery_result = if let Some(ref disc) = pipeline.source.discovery {
         let discovery_adapter = adapter_registry.discovery_adapter(&disc.adapter)?;
-        discovery_adapter
+        let mut result = discovery_adapter
             .discover(&pattern.prefix)
             .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Populate each source's external object id(s) for collision detection.
+        // Separate from `discover` because it can cost one API call per
+        // connector — only worth paying when detection is on. Best-effort: a
+        // failure logs and leaves ids empty (a missed detection, never a false
+        // one), never aborting discover.
+        if on_collision != rocky_core::config::OnCollision::Off
+            && let Err(e) = discovery_adapter
+                .enrich_external_object_ids(&mut result.connectors)
+                .await
+        {
+            warn!(
+                error = %e,
+                "discover: external-object-id enrichment failed — collision detection may under-report"
+            );
+        }
+        result
     } else {
         anyhow::bail!(
             "{}",
@@ -211,17 +237,12 @@ pub async fn discover(
         Vec::new()
     };
 
-    // Collision detection (opt-in). Group discovered sources by their stable
-    // external object id; an id mapped to >1 distinct source schema is a
-    // collision — likely the same underlying object onboarded twice under two
-    // paths. Only adapters that supply `external_object_id` (e.g. Fivetran)
-    // participate; the rest contribute nothing, so this is a no-op for them.
-    let on_collision = pipeline
-        .source
-        .discovery
-        .as_ref()
-        .map(|d| d.on_collision)
-        .unwrap_or(rocky_core::config::OnCollision::Off);
+    // Collision detection (opt-in, mode resolved as `on_collision` above). Group
+    // discovered sources by their stable external object id(s); an id mapped to
+    // >1 distinct source schema is a collision — likely the same underlying
+    // object onboarded twice under two paths. Only adapters that populate
+    // `external_object_ids` (e.g. Fivetran, via the enrichment pass) participate;
+    // the rest contribute nothing, so this is a no-op for them.
     let collision_candidates = if on_collision == rocky_core::config::OnCollision::Off {
         Vec::new()
     } else {
@@ -445,26 +466,39 @@ fn dedup_schemas(connectors: &[rocky_core::source::DiscoveredConnector]) -> Vec<
         .collect()
 }
 
-/// Group discovered sources by their stable external object id and return the
-/// ids mapped to more than one distinct source schema — cross-source
+/// Group discovered sources by the external object id(s) each replicates and
+/// return ids mapped to more than one distinct source schema — cross-source
 /// collisions (likely the same object onboarded twice under two paths).
 ///
-/// Sources without an `external_object_id` are skipped (collision detection is
-/// opt-in per adapter). Deterministic: ids and their source schemas are sorted.
+/// Grouping is keyed by `(source_type, id)`, not the bare id: two *different*
+/// services that happen to reuse the same id string (e.g. a Google `customer_id`
+/// and a numeric advertiser id elsewhere) are distinct objects in distinct id
+/// namespaces, so conflating them would be a false collision. Within any one
+/// reported collision every source shares a source_type, so the bare
+/// `external_object_id` in the output is unambiguous.
+///
+/// A connector can replicate many objects, so each id in its
+/// `external_object_ids` contributes that connector's schema to the id's set.
+/// Sources with no ids are skipped (collision detection is opt-in per adapter).
+/// Deterministic: ids and their source schemas are sorted.
 fn detect_collisions(
     connectors: &[rocky_core::source::DiscoveredConnector],
 ) -> Vec<CollisionCandidateOutput> {
     use std::collections::{BTreeMap, BTreeSet};
-    let mut by_id: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    // key = (source_type, external_object_id) → set of distinct source schemas
+    let mut by_id: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
     for conn in connectors {
-        if let Some(id) = conn.external_object_id.as_deref() {
-            by_id.entry(id).or_default().insert(conn.schema.as_str());
+        for id in &conn.external_object_ids {
+            by_id
+                .entry((conn.source_type.as_str(), id.as_str()))
+                .or_default()
+                .insert(conn.schema.as_str());
         }
     }
     by_id
         .into_iter()
         .filter(|(_, schemas)| schemas.len() >= 2)
-        .map(|(id, schemas)| CollisionCandidateOutput {
+        .map(|((_, id), schemas)| CollisionCandidateOutput {
             external_object_id: id.to_string(),
             sources: schemas.into_iter().map(str::to_string).collect(),
         })
@@ -967,7 +1001,7 @@ mod tests {
                 row_count: None,
             }],
             metadata: Default::default(),
-            external_object_id: None,
+            external_object_ids: Vec::new(),
         }
     }
 
@@ -1016,22 +1050,28 @@ mod tests {
         assert!(p2.is_empty());
     }
 
-    #[test]
-    fn detect_collisions_groups_by_external_object_id() {
-        let mk = |schema: &str, ext: Option<&str>| DiscoveredConnector {
+    fn discovered_with(schema: &str, source_type: &str, ids: &[&str]) -> DiscoveredConnector {
+        DiscoveredConnector {
             id: format!("conn_{schema}"),
             schema: schema.to_string(),
-            source_type: "fivetran".to_string(),
+            source_type: source_type.to_string(),
             last_sync_at: None,
             tables: vec![],
             metadata: Default::default(),
-            external_object_id: ext.map(String::from),
-        };
+            external_object_ids: ids.iter().copied().map(str::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn detect_collisions_groups_by_external_object_id() {
         let connectors = vec![
-            mk("src__acme__shopify", Some("acct_42")),
-            mk("src__coke__shopify", Some("acct_42")), // same object id, different path
-            mk("src__beta__shopify", Some("acct_99")), // unique id → no collision
-            mk("src__gamma__stripe", None),            // no id → skipped entirely
+            discovered_with("src__acme__fb", "facebook_ads", &["acct_42"]),
+            // same object id + service, different path → collision
+            discovered_with("src__coke__fb", "facebook_ads", &["acct_42"]),
+            // unique id → no collision
+            discovered_with("src__beta__fb", "facebook_ads", &["acct_99"]),
+            // no id → skipped entirely
+            discovered_with("src__gamma__stripe", "stripe", &[]),
         ];
         let collisions = detect_collisions(&connectors);
         assert_eq!(collisions.len(), 1, "exactly one colliding object id");
@@ -1039,10 +1079,41 @@ mod tests {
         // Sources are sorted (deterministic).
         assert_eq!(
             collisions[0].sources,
-            vec![
-                "src__acme__shopify".to_string(),
-                "src__coke__shopify".to_string()
-            ]
+            vec!["src__acme__fb".to_string(), "src__coke__fb".to_string()]
+        );
+    }
+
+    #[test]
+    fn detect_collisions_does_not_conflate_across_source_types() {
+        // The SAME id string under two DIFFERENT services in two schemas is NOT
+        // a collision — the ids live in separate namespaces (e.g. a Google
+        // `customer_id` vs a numeric advertiser id elsewhere). This is the whole
+        // reason grouping is keyed by (source_type, id), not the bare id.
+        let connectors = vec![
+            discovered_with("src__a__google", "google_ads", &["1234567890"]),
+            discovered_with("src__b__pin", "pinterest_ads", &["1234567890"]),
+        ];
+        assert!(
+            detect_collisions(&connectors).is_empty(),
+            "same id under different source_types must not collide"
+        );
+    }
+
+    #[test]
+    fn detect_collisions_flags_multi_account_connector() {
+        // A connector syncing many accounts contributes each id, so a collision
+        // on ANY one of them is surfaced — the prior `Option<String>` model
+        // would have missed every account but the first.
+        let connectors = vec![
+            discovered_with("src__x__fb", "facebook_ads", &["acct_1", "acct_shared"]),
+            discovered_with("src__y__fb", "facebook_ads", &["acct_2", "acct_shared"]),
+        ];
+        let collisions = detect_collisions(&connectors);
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].external_object_id, "acct_shared");
+        assert_eq!(
+            collisions[0].sources,
+            vec!["src__x__fb".to_string(), "src__y__fb".to_string()]
         );
     }
 
