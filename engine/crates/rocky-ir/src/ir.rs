@@ -817,6 +817,14 @@ impl ModelIr {
     /// `typed_columns` is empty (a partial typecheck). A `None` model is never
     /// equal to any other, so a caller comparing two `skip_hash` values can
     /// never wrongly treat such a model as unchanged.
+    ///
+    /// # Call-time contract
+    ///
+    /// Call this on the **static** form of the IR — the
+    /// [`MaterializationStrategy::TimeInterval`] `window` must be `None`, the
+    /// same invariant [`Self::recipe_hash`] requires. Hashing a resolved
+    /// partition window would yield a different `skip_hash` per partition,
+    /// defeating the partition-invariant intent. See [`SkipHashProjection`].
     #[must_use]
     pub fn skip_hash(&self) -> Option<blake3::Hash> {
         if self.typed_columns.is_empty() {
@@ -941,9 +949,21 @@ const NORMALIZER_VERSION: u8 = 1;
 /// Borrowed projection of [`ModelIr`] hashed by [`ModelIr::skip_hash`].
 ///
 /// Holds the normalised SQL string plus the typed structural facts that
-/// define a model's logic, excluding cosmetic SQL text and runtime-derived
-/// fields (`lineage_edges`, partition `window`). Serialised through the same
-/// canonical-JSON machinery as [`ModelIr::recipe_hash`].
+/// define a model's logic. The whole [`MaterializationStrategy`] *is* hashed
+/// via the `materialization` field — including, for
+/// [`MaterializationStrategy::TimeInterval`], its `time_column` and
+/// `granularity`. The per-partition `window` is part of that strategy but is
+/// runtime-derived, not a property of the model's logic, so the hash must be
+/// computed from the **static** form of the IR where `window` is `None`
+/// (exactly as [`ModelIr::recipe_hash`] requires). Computing the key against
+/// the static form keeps it partition-invariant: the same model produces the
+/// same `skip_hash` regardless of which partition is being built.
+///
+/// Two `ModelIr` fields are intentionally **excluded** from the projection as
+/// non-output identity: `name` (the model's identifier, not its computed
+/// result) and `cost_ceiling` (a budget guard that does not change the rows
+/// produced). Serialised through the same canonical-JSON machinery as
+/// [`ModelIr::recipe_hash`].
 #[derive(Serialize)]
 struct SkipHashProjection<'a> {
     normalizer_version: u8,
