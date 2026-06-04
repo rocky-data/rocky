@@ -2,6 +2,7 @@ pub mod defer;
 pub mod determinism;
 pub mod dialect;
 pub mod lineage;
+pub mod lineage_complete;
 pub mod normalize;
 pub mod parser;
 pub mod portability;

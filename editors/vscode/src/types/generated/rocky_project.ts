@@ -1719,7 +1719,7 @@ export interface RunConfig {
    */
   lag_tolerance_seconds?: number;
   /**
-   * Allow a rowcount-only data-stability signal (`COUNT(*)`) when an upstream has no tracked timestamp column. Default `false`: without an explicit opt-in, a model whose upstreams are not watermarkable is not skip-eligible. Rowcount equality is weaker than a watermark (it can hide an equal-size update+delete), so it stays behind this switch.
+   * Allow a rowcount-only data-stability signal (`COUNT(*)`) when an upstream has no tracked timestamp column. Default `false`: without an explicit opt-in, a model whose upstreams are not watermarkable is not skip-eligible. Rowcount equality is weaker than a watermark: it can miss a same-size in-place `UPDATE` (or a matched insert+delete) that mutates values without changing the row count, so it stays behind this switch.
    */
   skip_rowcount_fallback?: boolean;
   /**

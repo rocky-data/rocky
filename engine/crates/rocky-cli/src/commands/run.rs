@@ -9492,4 +9492,319 @@ merge_keys = ["id"]
             "a baseline lacking skip_hash (pre-gate) must rebuild — clause D fails"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Incomplete-lineage fail-safe matrix.
+    //
+    // The lineage walk only enumerates top-level bare `FROM`/`JOIN` tables; it
+    // silently drops PIVOT/UNNEST/nested-join table-factors and never descends
+    // into sub-queries. A model built on any of those hides a real upstream
+    // from the gate, so it must ALWAYS build — never skip against a source it
+    // never examined. Each test mutates the hidden/dropped source between runs
+    // and asserts the second run still BUILDS, mirroring
+    // `gate_subquery_source_always_builds`.
+    // -----------------------------------------------------------------------
+
+    /// `FROM t PIVOT(...)`: the PIVOT table-factor is dropped by the lineage
+    /// walk, so `main.monthly_sales` would be invisible to the enumeration. The
+    /// model must build even after the pivoted source changes. (Belt-and-braces
+    /// here: a PIVOT query's IR has no stable `skip_hash`, so clause D would
+    /// already force a build; the completeness whitelist makes the build
+    /// independent of that. The fix-isolating guard is the unit test
+    /// `rocky_sql::lineage_complete::tests::pivot_source_is_incomplete`.)
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_pivot_source_always_builds() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        async fn seed_sales(db: &std::path::Path, jan: i64, feb: i64) {
+            let s = DuckDbWarehouseAdapter::open(db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            s.execute_statement("DROP TABLE IF EXISTS main.monthly_sales")
+                .await
+                .unwrap();
+            s.execute_statement(&format!(
+                "CREATE TABLE main.monthly_sales AS SELECT * FROM (VALUES \
+                 ('jan', {jan}), ('feb', {feb})) AS t(month, amount)"
+            ))
+            .await
+            .unwrap();
+        }
+
+        seed_sales(&db, 10, 20).await;
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT * FROM main.monthly_sales PIVOT(SUM(amount) FOR month IN ('jan', 'feb'))",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Change the pivoted source values (rowcount steady). The PIVOT
+        // table-factor is not provably complete, so the gate refuses to skip.
+        seed_sales(&db, 999, 888).await;
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "a PIVOT model hides its source from lineage — it must always build"
+        );
+    }
+
+    /// `CROSS JOIN UNNEST(...)`: the UNNEST table function parses as a
+    /// table-valued `Table { args: Some(..) }`, which the completeness
+    /// whitelist rejects. Even though the row source `main.events` is itself
+    /// enumerable, the model must build on any change. (Belt-and-braces here:
+    /// the lineage walk also surfaces a phantom `UNNEST` "table" whose
+    /// `COUNT(*)` probe fails, which would already force a build; the
+    /// completeness whitelist makes the build independent of that. The
+    /// fix-isolating guard is the unit test
+    /// `rocky_sql::lineage_complete::tests::unnest_in_from_is_incomplete`.)
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_unnest_source_always_builds() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        async fn seed_events(db: &std::path::Path, rows: &str) {
+            let s = DuckDbWarehouseAdapter::open(db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            s.execute_statement("DROP TABLE IF EXISTS main.events")
+                .await
+                .unwrap();
+            s.execute_statement(&format!(
+                "CREATE TABLE main.events AS SELECT * FROM (VALUES {rows}) AS t(id, items)"
+            ))
+            .await
+            .unwrap();
+        }
+
+        seed_events(&db, "(1, [10, 20]), (2, [30])").await;
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT id, e FROM main.events CROSS JOIN UNNEST(items) AS t(e)",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Change the unnested arrays. The UNNEST table function disqualifies
+        // the model from skipping, so it must rebuild.
+        seed_events(&db, "(1, [10, 20, 30]), (2, [30, 40])").await;
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "an UNNEST model is not provably complete — it must always build"
+        );
+    }
+
+    /// `FROM (a JOIN b)`: the parenthesised join parses as a
+    /// `TableFactor::NestedJoin`, dropped by the lineage walk. The model must
+    /// build after either nested source changes.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_nested_join_source_always_builds() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        async fn seed_pair(db: &std::path::Path, a_rows: u32, b_rows: u32) {
+            let s = DuckDbWarehouseAdapter::open(db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            for (tbl, n) in [("a", a_rows), ("b", b_rows)] {
+                s.execute_statement(&format!("DROP TABLE IF EXISTS main.{tbl}"))
+                    .await
+                    .unwrap();
+                let values: Vec<String> = (1..=n).map(|i| format!("({i})")).collect();
+                s.execute_statement(&format!(
+                    "CREATE TABLE main.{tbl} AS SELECT * FROM (VALUES {}) AS t(id)",
+                    values.join(", ")
+                ))
+                .await
+                .unwrap();
+            }
+        }
+
+        seed_pair(&db, 3, 3).await;
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT a.id FROM (main.a a JOIN main.b b ON a.id = b.id)",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Grow one nested source. The NestedJoin factor hid both tables from
+        // lineage (the enumeration returned an empty source set), so the
+        // completeness whitelist refuses to skip and the gate builds. (Without
+        // the whitelist this model would wrongly SKIP — it is one of the two
+        // cases that genuinely depend on this fix.)
+        seed_pair(&db, 5, 3).await;
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "a nested-join FROM hides its sources — it must always build"
+        );
+    }
+
+    /// `... WHERE id IN (SELECT dim_id FROM facts)`: the hidden source `facts`
+    /// lives only inside the `IN` sub-query, which the lineage walk never
+    /// descends into. With `rowcount_fallback` on and `dim` held steady, a gate
+    /// that ignored the sub-query would prove `dim` unchanged and wrongly skip;
+    /// the completeness whitelist rejects the sub-query so the model builds when
+    /// `facts` changes.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn gate_in_subquery_source_always_builds() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("g.duckdb");
+        let state = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        async fn seed_dim(db: &std::path::Path) {
+            let s = DuckDbWarehouseAdapter::open(db).unwrap();
+            s.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            s.execute_statement("DROP TABLE IF EXISTS main.dim")
+                .await
+                .unwrap();
+            s.execute_statement(
+                "CREATE TABLE main.dim AS SELECT * FROM (VALUES (1), (2), (3)) AS t(id)",
+            )
+            .await
+            .unwrap();
+        }
+        async fn seed_facts(db: &std::path::Path, n: u32) {
+            let s = DuckDbWarehouseAdapter::open(db).unwrap();
+            s.execute_statement("DROP TABLE IF EXISTS main.facts")
+                .await
+                .unwrap();
+            let values: Vec<String> = (1..=n).map(|i| format!("({})", i % 3 + 1)).collect();
+            s.execute_statement(&format!(
+                "CREATE TABLE main.facts AS SELECT * FROM (VALUES {}) AS t(dim_id)",
+                values.join(", ")
+            ))
+            .await
+            .unwrap();
+        }
+
+        // `dim` stays steady across both runs; only the hidden `facts` source
+        // (reachable only through the IN sub-query) moves.
+        seed_dim(&db).await;
+        seed_facts(&db, 2).await;
+        write_model_with_skip(
+            &models_dir,
+            "agg",
+            "SELECT id FROM main.dim WHERE id IN (SELECT dim_id FROM main.facts)",
+            "",
+        );
+        run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-1",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+
+        // Change only `facts`. The visible `dim` is unchanged, so a gate that
+        // ignored the IN sub-query would wrongly skip on stale data; the
+        // completeness whitelist forces a build. (This is the sharpest of the
+        // four — `dim`'s rowcount is steady and `rowcount_fallback` is on, so
+        // the gate would prove B3 against `dim` alone and skip; the build is
+        // driven by the completeness check rejecting the sub-query, not by the
+        // freshness probe. One of the two cases that genuinely depend on this
+        // fix.)
+        seed_facts(&db, 6).await;
+        let out2 = run_with_gate(
+            &models_dir,
+            &db,
+            &state,
+            active_gate(true, 0),
+            "run-2",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            built(&out2, "agg"),
+            "an IN-subquery source is invisible to lineage — the model must always build"
+        );
+    }
 }

@@ -333,15 +333,19 @@ impl<'a> SkipGate<'a> {
     ///
     /// Returns `None` when the model's upstreams cannot be fully enumerated —
     /// an unknown / incomplete upstream set is unprovable, so the caller must
-    /// build. Two cases force `None`:
-    ///
-    /// - the SQL won't parse, and
-    /// - the SQL reads a **subquery in `FROM`** (`SELECT … FROM (SELECT …)`).
-    ///   The lineage extractor records a subquery as the opaque marker
-    ///   `(subquery)` without recursing into its body, so the real sources are
-    ///   invisible. Rather than risk proving B3 against an upstream we never
-    ///   looked at, such a model always builds. (Recursing into subquery
-    ///   bodies is a follow-up; over-building is the safe direction.)
+    /// build. The model's lineage must be **provably complete** for the simple
+    /// FROM/JOIN walk before the enumerated source set is trusted:
+    /// [`rocky_sql::lineage_complete::lineage_is_provably_complete`] is a
+    /// conservative whitelist — only a single plain `SELECT` over bare tables,
+    /// with no CTEs and no sub-queries anywhere, is accepted. Anything else
+    /// (a subquery in `FROM`, a `PIVOT`/`UNNEST`/nested-join table-factor, an
+    /// `IN (SELECT …)` / `EXISTS` / scalar sub-select, a CTE, a set operation,
+    /// or any future construct the lineage walk would silently drop) forces
+    /// `None` ⇒ build. The lineage walk records a dropped table-factor as the
+    /// opaque `(subquery)` marker (derived tables) or nothing at all (the other
+    /// variants), so its source set could be incomplete — and proving B3
+    /// against an upstream we never examined is exactly the silent-staleness
+    /// bug the gate exists to prevent.
     ///
     /// For each raw source we read `MAX(<ts>)` when the model declares a
     /// timestamp column (incremental / microbatch strategies) and `COUNT(*)`
@@ -355,17 +359,32 @@ impl<'a> SkipGate<'a> {
     ) -> Option<Vec<UpstreamSig>> {
         let ts_column = strategy_timestamp_column(&model.config.strategy);
 
+        // Completeness gate (whitelist): trust the plain FROM/JOIN enumeration
+        // only when the SQL is a shape for which that walk provably surfaces
+        // *every* upstream — a single plain `SELECT` over bare tables, no CTEs,
+        // no sub-queries anywhere. Anything else (subquery in FROM,
+        // PIVOT/UNNEST/nested-join, IN/EXISTS/scalar sub-select, CTE, set op,
+        // or any future construct the lineage walk would silently drop) is
+        // unprovable ⇒ `None` ⇒ the caller builds. This is the load-bearing
+        // fail-safe against skipping on an upstream we never examined.
+        if !rocky_sql::lineage_complete::lineage_is_provably_complete(&model.sql) {
+            return None;
+        }
+
         // Enumerate the tables the model reads. Unparseable SQL ⇒ `None` ⇒ the
-        // caller builds (we can't prove inputs are unchanged). We use
+        // caller builds (we can't prove inputs are unchanged). The completeness
+        // gate above already guarantees the source set is exhaustive; we use
         // `extract_lineage` (not `referenced_tables`) so the `(subquery)`
-        // marker is preserved rather than silently dropped.
+        // marker is preserved rather than silently dropped, as defence in depth.
         let lineage = rocky_sql::lineage::extract_lineage(&model.sql).ok()?;
 
         let mut sigs = Vec::new();
         for source in &lineage.source_tables {
             let name = &source.name;
-            // A subquery in FROM hides its true sources from the extractor ⇒
-            // we cannot enumerate the real upstreams ⇒ unprovable ⇒ build.
+            // Belt-and-braces: the completeness gate already rejects any model
+            // whose FROM is a subquery, so this marker should never appear here
+            // — but if it ever did, we still cannot enumerate the real
+            // upstreams ⇒ unprovable ⇒ build.
             if name == "(subquery)" {
                 return None;
             }
