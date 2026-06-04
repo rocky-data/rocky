@@ -417,7 +417,7 @@ deterministic = true   # owner asserts SQL is pure → re-eligible despite the s
 enabled = false   # default; preview-only, NOT live-verified — leave off in production
 ```
 
-`[reuse]` (`ReuseConfig`) is a **preview** surface scoped to the **Databricks–Iceberg content-addressed write path only** (no DuckDB / Snowflake / BigQuery), and it is **not yet live-verified against a warehouse**. When `enabled = true`, a successful run only *populates* an input-match index + provenance record — it makes **no reuse decision and skips nothing**. It attests an input-logic match + byte-identity of the **recorded** bytes, never that a fresh re-run would reproduce them. Default-off keeps `rocky run` byte- and cost-identical. The per-invocation `--no-reuse` flag forces every model to build. Provenance is auditable per `docs/.../guides/verify-a-run.md`.
+`[reuse]` (`ReuseConfig`) is a **preview** surface scoped to the **Databricks–Iceberg content-addressed write path only** (no DuckDB / Snowflake / BigQuery), and it is **not yet live-verified against a warehouse**. When `enabled = true`, a successful run only *populates* an input-match index + provenance record; the reuse decision path only ever resolves to **BUILD** today (an ONLY-BUILD posture) — a fail-closed verdict is computed but nothing is reused, since the live point-to reuse is not yet wired/verified. It attests an input-logic match + byte-identity of the **recorded** bytes, never that a fresh re-run would reproduce them. Default-off keeps `rocky run` byte- and cost-identical. The per-invocation `--no-reuse` flag forces every model to build. Provenance is auditable per `docs/.../guides/verify-a-run.md`.
 
 ## Cache (Valkey/Redis)
 

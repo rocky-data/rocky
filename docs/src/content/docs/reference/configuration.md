@@ -831,7 +831,7 @@ When `enabled = true`, a successful run records, per model, an input-match index
 1. an **input-logic match** — the model's logic key plus its upstreams' input identities; and
 2. **byte-identity of the bytes Rocky recorded** for that build.
 
-It does **not** attest that a fresh re-run would reproduce those bytes. Even when enabled, the spine only *populates* the index — it makes **no reuse decision and skips nothing**.
+It does **not** attest that a fresh re-run would reproduce those bytes. Even when enabled, the reuse decision path only ever resolves to **BUILD** today (an ONLY-BUILD posture) — a fail-closed verdict is computed but nothing is reused; the live point-to reuse is not yet wired/verified. The spine only *populates* the index.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
