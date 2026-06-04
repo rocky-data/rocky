@@ -56,6 +56,14 @@ pub async fn run_transformation(
     // Config fingerprint computed once in `run()` (mirrors every other
     // `persist_run_record` call site).
     config_hash: &str,
+    // Caller-supplied `--idempotency-key` (verbatim, as `run()` received
+    // it). Threaded so the persisted audit records the claimed key — the
+    // model-only (`run.rs`) and replication paths pass the same value into
+    // `AuditContext::detect`. Without it the persisted `RunRecord`'s
+    // `idempotency_key` is `None` even when the run finalized the
+    // idempotency entry under `K`, so `rocky history --audit` shows
+    // `idempotency_key=-` instead of `K`.
+    idempotency_key: Option<&str>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -143,7 +151,8 @@ pub async fn run_transformation(
     // Transformation runs have no single target catalog (per-model targets
     // resolve from each model's sidecar), so `target_catalog = None` — the
     // same posture as the model-only path.
-    let audit_ctx = super::run_audit::AuditContext::detect(None, None);
+    let audit_ctx =
+        super::run_audit::AuditContext::detect(idempotency_key.map(str::to_string), None);
     let audit = super::run::audit_to_record(&audit_ctx);
     super::run::persist_run_record(
         state_store.as_ref(),
@@ -1058,6 +1067,79 @@ auto_create_schemas = true
             count_rows(&db, "mart").await,
             3,
             "run 3 must REBUILD mart — changed logic drops the sentinel"
+        );
+    }
+
+    /// Drive `run()` end-to-end over the full-DAG transformation path WITH an
+    /// `--idempotency-key`, then assert the persisted `RunRecord` carries that
+    /// key in its audit.
+    ///
+    /// Before the fix, `run_transformation` built its audit with
+    /// `AuditContext::detect(None, None)`, so the persisted `RunRecord`'s
+    /// `idempotency_key` was `None` even though the run finalized the
+    /// idempotency entry under `K` — `rocky history --audit` showed
+    /// `idempotency_key=-` instead of `K`. The model-only / replication paths
+    /// pass the claimed key through; this is the transformation path matching
+    /// them.
+    #[tokio::test]
+    async fn full_dag_persists_idempotency_key_in_audit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = dir.join("t.duckdb");
+        // Canonical state path — the SAME location `main.rs` resolves and the
+        // replication path opens.
+        let state_path = dir.join(".rocky-state.redb");
+
+        seed_src(&db, 3).await;
+        write_model(&models_dir, "stg", "SELECT id FROM main.src", &[]);
+        write_config(dir, &db, "");
+        let config_path = dir.join("rocky.toml");
+
+        let key = "ci-deadbeef-1234";
+        let opts = PartitionRunOptions::default();
+        super::super::run::run(
+            &config_path,
+            None, // filter
+            None, // pipeline_name_arg — single pipeline resolves
+            &state_path,
+            None,  // governance_override
+            false, // output_json
+            None,  // models_dir override — take from config
+            false, // run_all
+            None,  // resume_run_id
+            false, // resume_latest
+            None,  // shadow_config
+            &opts,
+            None,      // model_name_filter
+            None,      // cache_ttl_override
+            Some(key), // idempotency_key — the value under test
+            None,      // env
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+        )
+        .await
+        .expect("full-DAG transformation run with idempotency key should succeed");
+
+        // The persisted audit must carry the claimed key, matching the
+        // idempotency entry the dispatch site finalized under the same value.
+        let store = StateStore::open(&state_path).expect("open canonical state");
+        let runs = store.list_runs(10).expect("list runs");
+        let record = runs
+            .iter()
+            .find(|r| r.idempotency_key.as_deref() == Some(key))
+            .unwrap_or_else(|| {
+                panic!(
+                    "persisted RunRecord must carry idempotency_key={key:?}; got {:?}",
+                    runs.iter().map(|r| &r.idempotency_key).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            record.idempotency_key.as_deref(),
+            Some(key),
+            "the full-DAG transformation run's persisted audit must record the \
+             claimed idempotency key (not None)"
         );
     }
 

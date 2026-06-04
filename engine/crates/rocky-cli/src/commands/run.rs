@@ -1245,6 +1245,10 @@ pub async fn run(
                 &run_id,
                 started_at,
                 &config_hash,
+                // Raw `--idempotency-key` so the persisted audit records the
+                // claimed key, matching the model-only / replication paths.
+                // The claim is finalized under this same value just below.
+                idempotency_key,
             )
             .await?;
             finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;

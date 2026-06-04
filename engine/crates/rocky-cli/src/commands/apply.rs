@@ -214,7 +214,7 @@ async fn execute_run_plan(
     // unification land separately. This preserves the parity-with-`rocky run`
     // shape for the alias-deprecation path.
     if run_plan.dag {
-        return crate::commands::run_with_dag(config_path, output_json)
+        return crate::commands::run_with_dag(config_path, state_path, output_json)
             .await
             .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"));
     }
