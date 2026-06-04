@@ -716,3 +716,149 @@ async fn schema_evolution_e2e_live_sandbox() {
         .expect("post-ALTER write must succeed");
     assert_eq!(result.num_records, 2);
 }
+
+/// Live end-to-end **point-to** (content-addressed reuse) against the
+/// UniForm sandbox — the Databricks-gated verification of B5 stage 2's
+/// strong reuse backend.
+///
+/// Two claims, kept separate (mirroring the provenance record's two-claim
+/// framing):
+/// 1. **Zero byte copy.** `recover_pointer_inputs` lifts a prior run's `add`
+///    from its `_delta_log/{version}.json` (one GET, no parquet read) and
+///    `commit_pointer_with_state` references that same blake3-named file —
+///    no `build_parquet`, no parquet PUT.
+/// 2. **Append-only correctness (the double-count guard).** On a *same-target*
+///    point-to, the target already references the file. The pre-check must
+///    make the commit a **no-op** (return the existing version, land no new
+///    `_delta_log` entry), so Photon's `SELECT COUNT(*)` stays **unchanged**.
+///    A double-counted row count here is the bug this test exists to catch —
+///    it is why the runner-side reuse DECISION stays unwired until this
+///    passes.
+///
+/// Requires the same env as `round_trip_phase1_compatible_sandbox`: the
+/// `ROCKY_TEST_*` (catalog/schema/table/bucket/prefix) + AWS creds + the
+/// `DATABRICKS_*` connection, against an unpartitioned, non-rowTracking
+/// UniForm table with `(id BIGINT, name STRING, ts TIMESTAMP)`. All
+/// workspace identifiers come from the environment — none are hard-coded.
+#[tokio::test]
+#[ignore]
+async fn point_to_same_target_is_noop_live_sandbox() {
+    let Some(cfg) = try_load_config() else {
+        eprintln!("skipping: ROCKY_TEST_* env vars not set");
+        return;
+    };
+    let Some(store) = build_s3_store(&cfg) else {
+        eprintln!("skipping: failed to build S3 store from environment");
+        return;
+    };
+    let Some(connector) = connector_from_env() else {
+        eprintln!("skipping: DATABRICKS_* env vars not set");
+        return;
+    };
+
+    let sql_client = Arc::new(DatabricksSqlClient { connector });
+    let fqtn = format!("{}.{}.{}", cfg.catalog, cfg.schema, cfg.table);
+    let count_sql = format!("SELECT COUNT(*) AS n FROM {fqtn}");
+
+    let read_count = |sql_client: Arc<DatabricksSqlClient>, sql: String| async move {
+        let res = sql_client.connector.execute_sql(&sql).await.expect("count");
+        let cell = &res.rows[0][0];
+        cell.as_i64()
+            .or_else(|| cell.as_str().and_then(|s| s.parse().ok()))
+            .expect("count parses as i64")
+    };
+
+    let writer = UniformWriter::new(
+        UniformWriterConfig {
+            catalog: cfg.catalog.clone(),
+            schema: cfg.schema.clone(),
+            table: cfg.table.clone(),
+            prefix: cfg.prefix.clone(),
+            engine_info: "rocky-iceberg/point-to-live-test".into(),
+        },
+        store.clone(),
+        sql_client.clone() as Arc<dyn SqlClient>,
+    );
+
+    let state = writer.discover().await.expect("discover");
+    if !state.partition_columns.is_empty() || state.row_tracking_enabled {
+        eprintln!("skipping: point-to needs an unpartitioned, non-rowTracking table");
+        return;
+    }
+    let expected_cols: std::collections::BTreeSet<&str> =
+        ["id", "name", "ts"].into_iter().collect();
+    let actual_cols: std::collections::BTreeSet<&str> =
+        state.physical.keys().map(String::as_str).collect();
+    if expected_cols != actual_cols {
+        eprintln!("skipping: this test expects schema (id, name, ts); table has {actual_cols:?}");
+        return;
+    }
+
+    // Step 1 — R's build: a fresh content-addressed file (unique ts so it
+    // never collides with a prior run's blake3).
+    let now_micros = chrono::Utc::now().timestamp_micros();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]));
+    let ids = Int64Array::from(vec![900_701_i64, 900_702, 900_703]);
+    let names = StringArray::from(vec!["point-to-a", "point-to-b", "point-to-c"]);
+    let ts = TimestampMicrosecondArray::from(vec![now_micros, now_micros + 1, now_micros + 2])
+        .with_timezone("UTC");
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names), Arc::new(ts)]).unwrap();
+
+    let r = writer
+        .write_batch(batch)
+        .await
+        .expect("R build write_batch");
+    writer
+        .sync_iceberg_metadata()
+        .await
+        .expect("MSCK after build");
+    let count_after_build = read_count(sql_client.clone(), count_sql.clone()).await;
+
+    // Step 2 — recover R's add (one GET, no parquet read) and attempt a
+    // same-target point-to.
+    let pointer = writer
+        .recover_pointer_inputs(
+            r.commit_version,
+            r.blake3_hash.clone(),
+            r.num_records,
+            r.size_bytes,
+        )
+        .await
+        .expect("recover_pointer_inputs");
+    assert_eq!(
+        pointer.blake3_hash, r.blake3_hash,
+        "shared bytes — same blake3"
+    );
+
+    let fresh_state = writer.discover().await.expect("discover before point-to");
+    let pr = writer
+        .commit_pointer_with_state(&pointer, fresh_state)
+        .await
+        .expect("point-to commit");
+    writer
+        .sync_iceberg_metadata()
+        .await
+        .expect("MSCK after point-to");
+
+    // Claim 2 — the double-count guard held: the point-to was a no-op
+    // (returned R's version) and Photon's count did NOT change.
+    assert_eq!(
+        pr.commit_version, r.commit_version,
+        "same-target point-to must return R's existing commit version (no new commit)"
+    );
+    let count_after_pointto = read_count(sql_client.clone(), count_sql.clone()).await;
+    assert_eq!(
+        count_after_pointto, count_after_build,
+        "same-target point-to must NOT double-count R's rows \
+         (after_build={count_after_build}, after_point_to={count_after_pointto})"
+    );
+}

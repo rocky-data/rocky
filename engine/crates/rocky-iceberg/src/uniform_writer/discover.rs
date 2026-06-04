@@ -432,6 +432,65 @@ pub(super) fn commit_jsonl_contains_add_path(body: &[u8], add_file_path: &str) -
     Ok(false)
 }
 
+/// Extract the first `add` action object from a `_delta_log` commit body
+/// (JSONL).
+///
+/// Pure parsing — no I/O — so it is unit-testable. Returns the inner object
+/// of the `{"add": {...}}` line (the action body, *not* the one-key wrapper),
+/// or `None` when the commit carries no `add`. Used by the point-to writer to
+/// lift a prior run's `add` action verbatim (path, size, stats,
+/// partitionValues, rowTracking fields) for a zero-byte-copy reuse commit.
+///
+/// A point-to recovery targets a single content-addressed commit, which
+/// always carries exactly one `add` (the writer emits one `add` per commit —
+/// see `commit::build_commit_jsonl`), so returning the first is sufficient.
+pub(super) fn first_add_action(
+    body: &[u8],
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    let text = std::str::from_utf8(body)
+        .map_err(|e| UniformWriterError::DeltaLog(format!("non-utf8 _delta_log: {e}")))?;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| UniformWriterError::DeltaLog(format!("scan add action: {e}")))?;
+        if let Some(serde_json::Value::Object(add)) = value.get("add") {
+            return Ok(Some(add.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// GET a single `_delta_log/{version:020}.json` commit and return its `add`
+/// action object.
+///
+/// Addresses the commit directly by version — no listing, one GET — because
+/// the caller already holds the exact `commit_version` (joined from the prior
+/// run's `ArtifactRecord`). The returned object is the prior run's complete,
+/// correct `add` (path, partitionValues, size, stats, and rowTracking fields
+/// if present), written when that run executed. The point-to writer lifts it
+/// verbatim, refreshing only `modificationTime`, so min/max/nullCount and
+/// `numRecords` carry over byte-for-byte without re-reading the parquet.
+///
+/// Returns [`UniformWriterError::DeltaLog`] when the commit is missing the
+/// `add` action; the underlying object-store GET error (e.g. a missing log
+/// file) surfaces as [`UniformWriterError::ObjectStore`].
+pub(super) async fn recover_add_action_for_version<S: ObjectStore + ?Sized>(
+    store: &S,
+    prefix: &str,
+    commit_version: u64,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let log_path = Path::from(format!("{prefix}/_delta_log/{commit_version:020}.json"));
+    let body = store.get(&log_path).await?.bytes().await?;
+    first_add_action(&body)?.ok_or_else(|| {
+        UniformWriterError::DeltaLog(format!(
+            "commit version {commit_version} carries no `add` action; \
+             cannot recover a point-to source"
+        ))
+    })
+}
+
 /// Scan every `_delta_log/<20-digit>.json` commit for an `add` action that
 /// already references `add_file_path`, returning the commit version that did.
 ///
@@ -530,6 +589,38 @@ mod tests {
         assert!(
             !commit_jsonl_contains_add_path(body, "data/abc123.parquet").unwrap(),
             "a remove action must not be treated as a live add"
+        );
+    }
+
+    #[test]
+    fn first_add_action_returns_the_add_body() {
+        let body = br#"{"commitInfo":{"timestamp":1700000000000}}
+{"add":{"path":"data/abc123.parquet","size":42,"dataChange":true,"stats":"{\"numRecords\":3}"}}"#;
+        let add = first_add_action(body).unwrap().expect("an add is present");
+        // Returns the inner action body, not the {"add": ...} wrapper.
+        assert_eq!(add.get("path").unwrap(), "data/abc123.parquet");
+        assert_eq!(add.get("size").unwrap(), 42);
+        assert_eq!(add.get("stats").unwrap(), "{\"numRecords\":3}");
+    }
+
+    #[test]
+    fn first_add_action_skips_commit_info_and_blank_lines() {
+        let body = br#"
+{"commitInfo":{"operation":"WRITE"}}
+
+{"add":{"path":"x.parquet"}}
+"#;
+        let add = first_add_action(body).unwrap().expect("add present");
+        assert_eq!(add.get("path").unwrap(), "x.parquet");
+    }
+
+    #[test]
+    fn first_add_action_returns_none_without_an_add() {
+        let body = br#"{"commitInfo":{"operation":"WRITE"}}
+{"remove":{"path":"gone.parquet"}}"#;
+        assert!(
+            first_add_action(body).unwrap().is_none(),
+            "a commit with no add action yields None"
         );
     }
 
