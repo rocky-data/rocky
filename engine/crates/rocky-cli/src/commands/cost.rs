@@ -342,6 +342,8 @@ mod tests {
             rows_affected: Some(100),
             status: status.to_string(),
             sql_hash: format!("hash_{name}"),
+            skip_hash: None,
+            upstream_freshness: None,
             bytes_scanned,
             bytes_written,
         }

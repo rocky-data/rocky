@@ -863,6 +863,32 @@ pub struct MaterializationOutput {
     /// (Databricks, Snowflake).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub job_ids: Vec<String>,
+    /// State-internal skip-gate outputs, co-located with the model they
+    /// describe so [`RunOutput::to_run_record`] can copy them onto the
+    /// persisted `ModelExecution` without a second name-keyed map. Stamped
+    /// by the `--skip-unchanged` gate after a successful build; `None` when
+    /// the gate is off or the model was not skip-eligible.
+    ///
+    /// Never serialized and never part of the JSON schema (`#[serde(skip)]`
+    /// + `#[schemars(skip)]`) — mirrors the `name_declared` internal-field
+    /// pattern on `ModelConfig`. Keeps the skip-gate state out of every
+    /// `*Output` codegen surface.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub skip_internal: Option<ModelSkipState>,
+}
+
+/// State-internal skip-gate result for one materialized model, carried on
+/// [`MaterializationOutput`] from the gate to `to_run_record`.
+///
+/// Best-effort optimization metadata only — not a result-equivalence proof.
+#[derive(Debug, Clone)]
+pub struct ModelSkipState {
+    /// Cosmetic-invariant logic key for the built model (`None` when the
+    /// model could not be canonicalised).
+    pub skip_hash: Option<String>,
+    /// Per-upstream freshness signatures observed for this build.
+    pub upstream_freshness: Vec<rocky_core::state::UpstreamSig>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -3833,6 +3859,15 @@ impl RunOutput {
                 rows_affected: mat.rows_copied,
                 status: "success".to_string(),
                 sql_hash: mat.metadata.sql_hash.clone().unwrap_or_default(),
+                // State-internal skip-gate inputs, populated on a successful
+                // build by the `--skip-unchanged` gate via `skip_internal`.
+                // `None` whenever the gate is off or the model was not
+                // skip-eligible — its absence simply forces a rebuild next run.
+                skip_hash: mat.skip_internal.as_ref().and_then(|s| s.skip_hash.clone()),
+                upstream_freshness: mat
+                    .skip_internal
+                    .as_ref()
+                    .map(|s| s.upstream_freshness.clone()),
                 bytes_scanned: mat.bytes_scanned,
                 bytes_written: mat.bytes_written,
             });
@@ -3852,6 +3887,9 @@ impl RunOutput {
                 rows_affected: None,
                 status: "failed".to_string(),
                 sql_hash: String::new(),
+                // A failed execution never seeds a skip baseline.
+                skip_hash: None,
+                upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
             });
@@ -4166,6 +4204,7 @@ mod cost_finalize_tests {
             bytes_scanned: None,
             bytes_written: None,
             job_ids: Vec::new(),
+            skip_internal: None,
         }
     }
 
@@ -4377,6 +4416,7 @@ mod run_record_tests {
             bytes_scanned: None,
             bytes_written: None,
             job_ids: Vec::new(),
+            skip_internal: None,
         }
     }
 

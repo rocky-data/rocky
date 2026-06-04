@@ -1218,6 +1218,8 @@ mod tests {
                 rows_affected: Some(42),
                 status: status.to_string(),
                 sql_hash: "abc123".to_string(),
+                skip_hash: None,
+                upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
             }

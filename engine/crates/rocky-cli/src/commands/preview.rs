@@ -2257,6 +2257,8 @@ mod tests {
             rows_affected: rows,
             status: "success".to_string(),
             sql_hash: format!("hash_{name}"),
+            skip_hash: None,
+            upstream_freshness: None,
             bytes_scanned: bytes,
             bytes_written: None,
         }

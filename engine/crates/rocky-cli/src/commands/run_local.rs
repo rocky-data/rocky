@@ -701,6 +701,7 @@ pub async fn run_snapshot(
             bytes_scanned: None,
             bytes_written: None,
             job_ids: Vec::new(),
+            skip_internal: None,
         });
     } else {
         output.tables_failed = 1;

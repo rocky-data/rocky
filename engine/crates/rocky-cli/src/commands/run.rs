@@ -4256,6 +4256,8 @@ pub(crate) async fn execute_models(
                             bytes_scanned: None,
                             bytes_written: Some(summary.size_bytes),
                             job_ids: vec![],
+                            // content_addressed is never skip-eligible.
+                            skip_internal: None,
                         });
                         info!(
                             model = model_name,
@@ -4594,6 +4596,10 @@ async fn execute_one_plain_model(
         bytes_scanned: bytes_scanned_acc,
         bytes_written: bytes_written_acc,
         job_ids: job_ids_acc,
+        // Stamped by the gate in `execute_models` after a successful build
+        // when `--skip-unchanged` is enabled; `None` keeps default-off
+        // behavior byte-identical.
+        skip_internal: None,
     })
 }
 
@@ -5002,6 +5008,8 @@ async fn run_one_partition(
             bytes_scanned: bytes_scanned_acc,
             bytes_written: bytes_written_acc,
             job_ids: job_ids_acc,
+            // time_interval is excluded from the v1 skip gate.
+            skip_internal: None,
         }),
     }
 }
@@ -5829,6 +5837,9 @@ async fn process_table(
             bytes_scanned: exec_stats.bytes_scanned,
             bytes_written: exec_stats.bytes_written,
             job_ids: exec_stats.job_id.clone().into_iter().collect(),
+            // Replication materializations are not gated by --skip-unchanged
+            // in v1 (the gate covers transformation models).
+            skip_internal: None,
         },
         drift_checked: true,
         drift_detected: drift_action,

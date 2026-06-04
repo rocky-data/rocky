@@ -458,6 +458,8 @@ mod tests {
                 rows_affected: Some(100),
                 status: "success".to_string(),
                 sql_hash: "hash1".to_string(),
+                skip_hash: None,
+                upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
             }],
@@ -523,6 +525,8 @@ mod tests {
             rows_affected,
             status: status.to_string(),
             sql_hash: "abc".to_string(),
+            skip_hash: None,
+            upstream_freshness: None,
             bytes_scanned: None,
             bytes_written: None,
         }
