@@ -826,7 +826,16 @@ fn build_and_persist_replication_plan(
 /// [`rocky_core::config::RockyConfig::resolve_mask_for_env`] — unresolved
 /// tags are a compliance gap, reported by `rocky compliance`, not a
 /// preview row.
-fn populate_governance_actions(
+///
+/// This is the offline core of the governance preview: it compiles the
+/// `models/` directory and reads each model sidecar's
+/// `[classification]` / `mask` / `retention` declarations. It performs no
+/// warehouse I/O and applies nothing — the rows it pushes are a *preview*
+/// of the control-plane work `rocky run` would later issue through the
+/// [`GovernanceAdapter`](rocky_core::traits::GovernanceAdapter). It is
+/// public so the `rocky mcp` server can surface the same preview in-loop
+/// without shelling out or re-running source discovery.
+pub fn populate_governance_actions(
     cfg: &rocky_core::config::RockyConfig,
     models_dir: &Path,
     env: Option<&str>,

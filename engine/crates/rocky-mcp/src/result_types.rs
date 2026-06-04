@@ -585,3 +585,124 @@ pub struct ExplainModelResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Governance + drift preview (read-only, dry-run).
+// ---------------------------------------------------------------------------
+
+/// One classification-tag application in a `governance_preview` result —
+/// projected from `rocky_cli::output::ClassificationAction`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ClassificationActionLite {
+    /// Model the tag would be applied to.
+    pub model: String,
+    /// Column the tag would be applied to.
+    pub column: String,
+    /// Classification tag (e.g. `"pii"`, `"confidential"`).
+    pub tag: String,
+}
+
+/// One masking-policy application in a `governance_preview` result —
+/// projected from `rocky_cli::output::MaskAction`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct MaskActionLite {
+    /// Model the mask would be applied to.
+    pub model: String,
+    /// Column the mask would be applied to.
+    pub column: String,
+    /// Classification tag the mask resolves against.
+    pub tag: String,
+    /// Resolved strategy wire name (`"hash"`, `"redact"`, `"partial"`,
+    /// `"none"`) for the active environment.
+    pub resolved_strategy: String,
+}
+
+/// One retention-policy application in a `governance_preview` result —
+/// projected from `rocky_cli::output::RetentionAction`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RetentionActionLite {
+    /// Model the retention policy would be applied to.
+    pub model: String,
+    /// Retention duration in days, parsed from the sidecar (`"90d"` → 90,
+    /// `"1y"` → 365).
+    pub duration_days: u32,
+    /// Warehouse-native preview of the policy SQL / TBLPROPERTIES on the
+    /// active adapter, when the adapter has a first-class retention knob.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warehouse_preview: Option<String>,
+}
+
+/// `governance_preview` result — the pre-apply enforcement picture a
+/// subsequent `rocky run [--env <name>]` would reconcile: classification
+/// tags, masking policies, and retention policies declared across the
+/// project's model sidecars.
+///
+/// This is a DRY-RUN preview built offline (compile + sidecar read); it
+/// performs no warehouse I/O and applies nothing. Empty action lists mean
+/// the project declares no governance for that surface. There is no
+/// grants diff here — pre-apply governance covers classification / masking
+/// / retention only; grant reconciliation surfaces at `rocky run` time.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct GovernancePreviewResult {
+    /// The active environment the preview resolved masks against, when an
+    /// `env` was supplied (`[mask.<env>]` overrides on top of `[mask]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// Classification tags the reconciler would apply.
+    pub classification_actions: Vec<ClassificationActionLite>,
+    /// Masking policies the reconciler would apply (only tags that resolve
+    /// to a strategy for the active environment).
+    pub mask_actions: Vec<MaskActionLite>,
+    /// Retention policies the reconciler would apply.
+    pub retention_actions: Vec<RetentionActionLite>,
+}
+
+/// One drifted column in a `drift_preview` result — a column present in
+/// both tables whose warehouse-reported type differs between source and
+/// target.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DriftedColumnLite {
+    /// Column name.
+    pub name: String,
+    /// The source table's reported type for this column.
+    pub source_type: String,
+    /// The target table's reported type for this column.
+    pub target_type: String,
+}
+
+/// `drift_preview` result — source-vs-target schema drift between two
+/// warehouse tables, computed via [`rocky_core::drift::detect_drift`] over
+/// the columns each table reports through `DESCRIBE`.
+///
+/// Read-only: it `DESCRIBE`s both tables and compares them, applying
+/// nothing. This is the same apples-to-apples comparison `rocky run`
+/// performs before an incremental load (both sides are warehouse-reported
+/// type strings, so there is no inferred-vs-observed type mismatch).
+/// `target_exists` is `false` when the target has not been materialized yet
+/// (the first `rocky run` would create it via CTAS) — the drift lists are
+/// then empty. `added_columns` are present in the source but missing from
+/// the target (a `rocky run` would `ALTER TABLE ADD COLUMN`);
+/// `drifted_columns` carry a type change; `action` is the wire name of the
+/// action the runtime would take (`ignore` / `add_columns` /
+/// `alter_column_types` / `drop_and_recreate`). `add_columns` covers the
+/// added-columns-only case: [`detect_drift`](rocky_core::drift::detect_drift)
+/// returns [`DriftAction::Ignore`](rocky_ir::DriftAction::Ignore) there
+/// (no type change), but a `rocky run` still issues `ALTER TABLE ADD COLUMN`,
+/// so the preview reports `add_columns` to match.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+pub struct DriftPreviewResult {
+    /// The source table the drift was checked against.
+    pub source_table: String,
+    /// The target table the drift was checked against.
+    pub target_table: String,
+    /// Whether the target table exists in the warehouse. When `false`, the
+    /// target has not been materialized yet and the drift lists are empty.
+    pub target_exists: bool,
+    /// Columns present in both tables whose types differ.
+    pub drifted_columns: Vec<DriftedColumnLite>,
+    /// Columns present in the source but missing from the target table.
+    pub added_columns: Vec<String>,
+    /// Wire name of the action the runtime would take: `"ignore"`,
+    /// `"add_columns"`, `"alter_column_types"`, or `"drop_and_recreate"`.
+    pub action: String,
+}
