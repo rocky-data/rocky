@@ -107,6 +107,38 @@ pub struct WriteResult {
     pub size_bytes: u64,
 }
 
+/// Inputs to a content-addressed *point-to* commit
+/// ([`UniformWriter::commit_pointer_with_state`]).
+///
+/// Carries everything needed to reference a prior run `R`'s existing
+/// blake3-named parquet **without re-reading the bytes**:
+/// - `recovered_add` — `R`'s `add` action object, lifted verbatim from its
+///   `_delta_log/{version}.json` (via
+///   [`discover::recover_add_action_for_version`]). Its `stats`
+///   (`numRecords` + min/max/nullCount) carry over byte-for-byte.
+/// - `add_file_path` — the content-addressed path (`<hash>.parquet`) the new
+///   commit references; used both as the `add.path` and as the
+///   double-count pre-check key. It is `recovered_add["path"]`, surfaced
+///   explicitly so the writer never has to re-parse the lifted action.
+/// - `blake3_hash` / `num_records` / `size_bytes` — `R`'s recorded artifact
+///   identity, flowed straight into the returned [`WriteResult`] so the
+///   runner records a fresh `ArtifactRecord` at the *same* blake3 (driving
+///   `refcount_for_hash` ≥ 2 — shared bytes, not copied).
+#[derive(Debug, Clone)]
+pub struct PointerInputs {
+    /// `R`'s `add` action object, lifted verbatim.
+    pub recovered_add: serde_json::Map<String, serde_json::Value>,
+    /// The content-addressed parquet path the commit references
+    /// (`recovered_add["path"]`).
+    pub add_file_path: String,
+    /// `R`'s output blake3 (hex) — unchanged; the reusing run shares it.
+    pub blake3_hash: String,
+    /// `R`'s row count, carried into the result for the runner's summary.
+    pub num_records: usize,
+    /// `R`'s parquet size in bytes.
+    pub size_bytes: u64,
+}
+
 /// Minimal SQL execution surface the writer needs.
 ///
 /// Phase 1 only uses this for `MSCK REPAIR TABLE ... SYNC METADATA` after
@@ -260,6 +292,209 @@ impl UniformWriter {
             format!("{partition_prefix}{hash}.parquet")
         })
         .await
+    }
+
+    /// Recover the [`PointerInputs`] for a point-to from a prior run `R`'s
+    /// recorded artifact identity.
+    ///
+    /// Given `R`'s `commit_version` (joined from its `ArtifactRecord`), its
+    /// output blake3, and the parquet size + row count, this GETs `R`'s
+    /// `_delta_log/{commit_version}.json` and lifts its `add` action — one
+    /// GET, no listing, no parquet byte read (the `add`'s `stats` already
+    /// hold `numRecords` + min/max/nullCount). The returned `PointerInputs`
+    /// feeds straight into [`Self::commit_pointer_with_state`].
+    ///
+    /// # Errors
+    ///
+    /// [`UniformWriterError::DeltaLog`] when the recovered commit carries no
+    /// `add` action; the object-store GET error when the log file is missing.
+    pub async fn recover_pointer_inputs(
+        &self,
+        commit_version: u64,
+        blake3_hash: String,
+        num_records: usize,
+        size_bytes: u64,
+    ) -> Result<PointerInputs> {
+        let prefix = self.config.prefix.trim_end_matches('/').to_string();
+        let recovered_add =
+            discover::recover_add_action_for_version(&*self.store, &prefix, commit_version).await?;
+        let add_file_path = recovered_add
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                UniformWriterError::DeltaLog(format!(
+                    "recovered `add` at commit {commit_version} has no `path`"
+                ))
+            })?
+            .to_string();
+        Ok(PointerInputs {
+            recovered_add,
+            add_file_path,
+            blake3_hash,
+            num_records,
+            size_bytes,
+        })
+    }
+
+    /// Reuse a prior run `R`'s already-written content-addressed parquet by
+    /// emitting a Delta commit that **references R's existing blake3-named
+    /// file — with zero byte copy.** No SQL executes, no parquet is built,
+    /// nothing is uploaded.
+    ///
+    /// This is the strong (offline-byte-verifiable) reuse backend: the
+    /// reusing run's target gains a commit whose lone `add` action points at
+    /// the same object `R` wrote. `pointer.blake3_hash` and the underlying
+    /// bytes are `R`'s; only a new `_delta_log` entry (and, recorded
+    /// separately by the runner, a fresh `ArtifactRecord` at the same blake3)
+    /// distinguish the reusing run.
+    ///
+    /// # Append-only safety — the double-count guard
+    ///
+    /// Delta is append-only: two live `add` actions for the same `path`
+    /// **double-count** that file's rows (the writer's own cond-put handler
+    /// documents this — see [`Self::write_internal`]). A point-to therefore
+    /// **pre-checks** the live `_delta_log` for an existing `add` referencing
+    /// `pointer.add_file_path`:
+    /// - **already present** ⇒ the target already holds R's file; the reuse
+    ///   is satisfied with **no new commit** — returns that commit's version
+    ///   so the caller records the shared-bytes reference without
+    ///   re-counting.
+    /// - **absent** ⇒ land a fresh pointer commit at `next_commit_version`
+    ///   via the conditional-put loop (retrying on a genuine version race).
+    ///
+    /// # Scope
+    ///
+    /// Unpartitioned, non-rowTracking tables only — validated against the
+    /// discovered `state` (and guarded again in
+    /// [`commit::build_commit_jsonl_from_add`]). A partitioned or rowTracking
+    /// table returns an error rather than a partial point-to; the caller
+    /// falls back to a normal BUILD.
+    ///
+    /// # Errors
+    ///
+    /// - [`UniformWriterError::PartitionedUnsupported`] / a `DeltaLog` error
+    ///   when the table is partitioned or rowTracking;
+    /// - [`UniformWriterError::CondPutRetryExhausted`] when the version race
+    ///   never settles;
+    /// - the underlying object-store / JSON errors otherwise.
+    pub async fn commit_pointer_with_state(
+        &self,
+        pointer: &PointerInputs,
+        mut state: UniformTableState,
+    ) -> Result<WriteResult> {
+        // Scope guard: unpartitioned, non-rowTracking only. A partial
+        // point-to is never emitted — the caller falls back to a BUILD.
+        if !state.partition_columns.is_empty() {
+            return Err(UniformWriterError::PartitionedUnsupported(
+                state.partition_columns.clone(),
+            ));
+        }
+        if state.row_tracking_enabled {
+            return Err(UniformWriterError::DeltaLog(
+                "point-to does not support rowTracking tables (the reusing commit needs a \
+                 freshly re-allocated baseRowId range); falling back to a normal build is the \
+                 caller's responsibility"
+                    .to_string(),
+            ));
+        }
+
+        let prefix = self.config.prefix.trim_end_matches('/').to_string();
+        let parquet_path = Path::from(format!("{prefix}/{}", pointer.add_file_path));
+
+        // Double-count guard: if a live commit already references this exact
+        // content-addressed file, the target already holds R's bytes. Reuse
+        // is already satisfied — return that version, emit NO new commit.
+        if let Some(existing_version) =
+            discover::find_commit_with_add_path(&*self.store, &prefix, &pointer.add_file_path)
+                .await?
+        {
+            tracing::info!(
+                add_file_path = %pointer.add_file_path,
+                existing_version,
+                "point-to: target already references this content-addressed file; \
+                 reuse satisfied with no new commit (append-only double-count guard)"
+            );
+            return Ok(WriteResult {
+                file_path: parquet_path.to_string(),
+                blake3_hash: pointer.blake3_hash.clone(),
+                commit_version: existing_version,
+                num_records: pointer.num_records,
+                size_bytes: pointer.size_bytes,
+            });
+        }
+
+        // File absent on the target: land a fresh pointer commit referencing
+        // R's parquet. Same cond-put loop as a build, minus build_parquet +
+        // the parquet PUT.
+        let modification_time_millis = chrono::Utc::now().timestamp_millis();
+        for attempt in 0..COND_PUT_RETRY_BUDGET {
+            let target_version = state.next_commit_version;
+            let commit_body = commit::build_commit_jsonl_from_add(
+                &pointer.recovered_add,
+                &self.config.engine_info,
+                modification_time_millis,
+                &state.partition_columns,
+            )?;
+            let log_path = Path::from(format!("{prefix}/_delta_log/{target_version:020}.json"));
+            let opts = PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            };
+            match self
+                .store
+                .put_opts(&log_path, PutPayload::from(Bytes::from(commit_body)), opts)
+                .await
+            {
+                Ok(_) => {
+                    return Ok(WriteResult {
+                        file_path: parquet_path.to_string(),
+                        blake3_hash: pointer.blake3_hash.clone(),
+                        commit_version: target_version,
+                        num_records: pointer.num_records,
+                        size_bytes: pointer.size_bytes,
+                    });
+                }
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    // Re-run the double-count pre-check before retrying: a
+                    // concurrent point-to of the *same* file may have landed
+                    // while we raced on the version. If so, return its
+                    // version rather than adding the file a second time.
+                    if let Some(existing_version) = discover::find_commit_with_add_path(
+                        &*self.store,
+                        &prefix,
+                        &pointer.add_file_path,
+                    )
+                    .await?
+                    {
+                        tracing::info!(
+                            add_file_path = %pointer.add_file_path,
+                            existing_version,
+                            "point-to cond-put 412: file landed concurrently; returning \
+                             existing commit (double-count guard)"
+                        );
+                        return Ok(WriteResult {
+                            file_path: parquet_path.to_string(),
+                            blake3_hash: pointer.blake3_hash.clone(),
+                            commit_version: existing_version,
+                            num_records: pointer.num_records,
+                            size_bytes: pointer.size_bytes,
+                        });
+                    }
+                    let observed = discover::next_commit_version(&*self.store, &prefix).await?;
+                    state.next_commit_version = observed.max(target_version.saturating_add(1));
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        previous_target = target_version,
+                        new_target = state.next_commit_version,
+                        "point-to cond-put 412 on _delta_log entry; retrying"
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(UniformWriterError::CondPutRetryExhausted(format!(
+            "exhausted {COND_PUT_RETRY_BUDGET} retries chasing next_commit_version for a point-to"
+        )))
     }
 
     /// Shared write pipeline used by both unpartitioned and partitioned
@@ -894,6 +1129,191 @@ mod tests {
         // Discover again — next_commit_version should now be 2.
         let state2 = writer.discover().await.expect("discover after write");
         assert_eq!(state2.next_commit_version, 2);
+    }
+
+    // -- point-to (commit_pointer_with_state / recover_pointer_inputs) ------
+
+    fn make_unpartitioned_writer(store: Arc<dyn ObjectStore>, prefix: &str) -> UniformWriter {
+        UniformWriter::new(
+            UniformWriterConfig {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+                prefix: prefix.into(),
+                engine_info: "rocky-iceberg/test".into(),
+            },
+            store,
+            Arc::new(PanicSqlClient),
+        )
+    }
+
+    #[tokio::test]
+    async fn point_to_recover_then_commit_into_fresh_table() {
+        // R writes a batch into table A (the build). A *separate* fresh
+        // table B then points to R's parquet with zero byte copy: recover
+        // R's add, commit a pointer into B, assert B's new commit references
+        // the same content-addressed path + same blake3, and no second
+        // parquet object is created under B.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+
+        // R's build into table A.
+        seed_bootstrap(&store, "tbl_a").await;
+        let writer_a = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl_a");
+        let r = writer_a.write_batch(make_batch(7)).await.unwrap();
+        assert_eq!(r.commit_version, 1);
+
+        // Point-to into a fresh table B (its own bootstrap, no data yet).
+        seed_bootstrap(&store, "tbl_b").await;
+        let writer_b = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl_b");
+        let state_b = writer_b.discover().await.unwrap();
+        assert_eq!(state_b.next_commit_version, 1);
+
+        let pointer = writer_a
+            .recover_pointer_inputs(
+                r.commit_version,
+                r.blake3_hash.clone(),
+                r.num_records,
+                r.size_bytes,
+            )
+            .await
+            .unwrap();
+        // The recovered path is R's content-addressed file.
+        assert!(pointer.add_file_path.ends_with(".parquet"));
+        assert_eq!(pointer.blake3_hash, r.blake3_hash);
+
+        let pr = writer_b
+            .commit_pointer_with_state(&pointer, state_b)
+            .await
+            .unwrap();
+        // B's pointer commit lands at version 1, references R's bytes, copies
+        // nothing.
+        assert_eq!(pr.commit_version, 1);
+        assert_eq!(pr.blake3_hash, r.blake3_hash, "shared bytes — same blake3");
+        assert_eq!(pr.num_records, r.num_records);
+
+        // B's _delta_log/...001.json references the SAME content-addressed
+        // path R wrote (the file name; the prefix differs per table).
+        let log_b = store
+            .get(&object_store::path::Path::from(
+                "tbl_b/_delta_log/00000000000000000001.json",
+            ))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let lines: Vec<&str> = std::str::from_utf8(&log_b).unwrap().lines().collect();
+        assert_eq!(lines.len(), 2, "point-to commit is commitInfo + lifted add");
+        let add: Value = serde_json::from_str(lines[1]).unwrap();
+        let r_file = r.file_path.split('/').next_back().unwrap();
+        assert_eq!(
+            add["add"]["path"], r_file,
+            "B's commit must reference R's content-addressed file name"
+        );
+
+        // No parquet object was written under tbl_b — the point-to copied
+        // zero bytes (the only tbl_b objects are _delta_log/*).
+        use futures::TryStreamExt;
+        let mut stream = store.list(Some(&object_store::path::Path::from("tbl_b")));
+        let mut saw_parquet = false;
+        while let Some(meta) = stream.try_next().await.unwrap() {
+            if meta.location.to_string().ends_with(".parquet") {
+                saw_parquet = true;
+            }
+        }
+        assert!(
+            !saw_parquet,
+            "a point-to must not write any parquet object under the target table"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_to_is_a_noop_when_file_already_referenced() {
+        // Double-count guard: if the target already holds R's file, a
+        // point-to emits NO new commit and returns the existing version.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+
+        // R's build lands at v=1 in THIS table.
+        let r = writer.write_batch(make_batch(4)).await.unwrap();
+        assert_eq!(r.commit_version, 1);
+
+        // Recover R's add and attempt a point-to into the SAME table — the
+        // file is already referenced, so this must be a no-op.
+        let pointer = writer
+            .recover_pointer_inputs(
+                r.commit_version,
+                r.blake3_hash.clone(),
+                r.num_records,
+                r.size_bytes,
+            )
+            .await
+            .unwrap();
+        let state = writer.discover().await.unwrap();
+        assert_eq!(state.next_commit_version, 2, "v=1 already taken by R");
+
+        let pr = writer
+            .commit_pointer_with_state(&pointer, state)
+            .await
+            .unwrap();
+        assert_eq!(
+            pr.commit_version, 1,
+            "must return R's existing version, not land a new commit"
+        );
+
+        // No v=2 commit was written — the table still tops out at v=1.
+        let v2 = store
+            .get(&object_store::path::Path::from(
+                "tbl/_delta_log/00000000000000000002.json",
+            ))
+            .await;
+        assert!(
+            v2.is_err(),
+            "the double-count guard must NOT land a second commit for the same file"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_to_rejects_partitioned_table() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_partitioned_bootstrap(&store, "ptbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "ptbl");
+        let state = writer.discover().await.unwrap();
+        let pointer = PointerInputs {
+            recovered_add: serde_json::Map::new(),
+            add_file_path: "x.parquet".into(),
+            blake3_hash: "deadbeef".into(),
+            num_records: 1,
+            size_bytes: 1,
+        };
+        match writer.commit_pointer_with_state(&pointer, state).await {
+            Err(UniformWriterError::PartitionedUnsupported(cols)) => {
+                assert_eq!(cols, vec!["region".to_string()]);
+            }
+            other => panic!("expected PartitionedUnsupported, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn point_to_rejects_row_tracking_table() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_row_tracking_bootstrap(&store, "rt").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "rt");
+        let state = writer.discover().await.unwrap();
+        let pointer = PointerInputs {
+            recovered_add: serde_json::Map::new(),
+            add_file_path: "x.parquet".into(),
+            blake3_hash: "deadbeef".into(),
+            num_records: 1,
+            size_bytes: 1,
+        };
+        match writer.commit_pointer_with_state(&pointer, state).await {
+            Err(UniformWriterError::DeltaLog(msg)) => {
+                assert!(msg.contains("rowTracking"), "must name rowTracking: {msg}");
+            }
+            other => panic!("expected DeltaLog rowTracking refusal, got {other:?}"),
+        }
     }
 
     #[tokio::test]

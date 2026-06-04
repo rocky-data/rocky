@@ -142,6 +142,96 @@ pub fn build_commit_jsonl(inputs: &CommitInputs) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Build a point-to commit body that lifts a prior run's `add` action
+/// verbatim — **no live batch, no recomputed stats, no byte copy.**
+///
+/// This is the commit half of an Iceberg content-addressed *point-to*: the
+/// reusing run references a prior run `R`'s already-written, blake3-named
+/// parquet file instead of executing SQL and re-writing bytes. `recovered_add`
+/// is `R`'s `add` action object (the inner body of the `{"add": {...}}` line),
+/// obtained from `R`'s `_delta_log/{version}.json` via
+/// [`super::discover::recover_add_action_for_version`]. Its `path`, `size`,
+/// `stats` (with `numRecords` + min/max/nullCount keyed by physical UUID), and
+/// `dataChange` carry over byte-for-byte; only `modificationTime` is refreshed
+/// to the reusing commit's wall clock.
+///
+/// Lines emitted, in order:
+/// 1. `commitInfo` (operation `WRITE`, blind append) — fresh for this commit.
+/// 2. the lifted `add` action — `R`'s, with `modificationTime` refreshed.
+///
+/// # Scope — unpartitioned, non-rowTracking only (a hard second guard)
+///
+/// This entry point refuses to lift a partitioned or rowTracking `add` and
+/// returns [`UniformWriterError::DeltaLog`]:
+/// - a non-empty `partitionValues` ⇒ the partitioned point-to (last-group
+///   ledger is incomplete — deferred follow-up);
+/// - a present `baseRowId` ⇒ the rowTracking point-to (the reusing commit
+///   needs a *freshly re-allocated* `baseRowId` range; `R`'s cannot be lifted
+///   verbatim — deferred follow-up).
+///
+/// The runner's decision gate already restricts point-to to unpartitioned,
+/// non-rowTracking tables; this refusal is the defence-in-depth guard so a
+/// mis-routed call can never silently emit a structurally wrong commit.
+pub fn build_commit_jsonl_from_add(
+    recovered_add: &Map<String, Value>,
+    engine_info: &str,
+    modification_time_millis: i64,
+    partition_columns: &[String],
+) -> Result<Vec<u8>> {
+    // Guard 1: refuse a partitioned `add`. A non-empty partitionValues means
+    // this file belongs to a partition group; the partitioned point-to is a
+    // deferred follow-up (the ledger records only the last group's hash).
+    if let Some(Value::Object(pv)) = recovered_add.get("partitionValues")
+        && !pv.is_empty()
+    {
+        return Err(UniformWriterError::DeltaLog(format!(
+            "point-to refuses a partitioned `add` (partitionValues={pv:?}); \
+             partitioned point-to is a deferred follow-up"
+        )));
+    }
+    // Guard 2: refuse a rowTracking `add`. A present baseRowId means the
+    // reusing commit would need a freshly re-allocated row-id range; lifting
+    // R's verbatim would collide in row-id space. Deferred follow-up.
+    if recovered_add.contains_key("baseRowId")
+        || recovered_add.contains_key("defaultRowCommitVersion")
+    {
+        return Err(UniformWriterError::DeltaLog(
+            "point-to refuses a rowTracking `add` (baseRowId/defaultRowCommitVersion present); \
+             rowTracking point-to is a deferred follow-up"
+                .to_string(),
+        ));
+    }
+
+    let partition_by_json = serde_json::to_string(partition_columns)?;
+    let commit_info = json!({
+        "commitInfo": {
+            "timestamp": modification_time_millis,
+            "operation": "WRITE",
+            "operationParameters": {"mode": "Append", "partitionBy": partition_by_json},
+            "isolationLevel": "Serializable",
+            "isBlindAppend": true,
+            "engineInfo": engine_info,
+        }
+    });
+
+    // Lift the recovered `add` verbatim, refreshing only modificationTime so
+    // the reusing commit's add carries this run's wall clock (path, size,
+    // stats, dataChange all carry over byte-for-byte from R).
+    let mut add_obj = recovered_add.clone();
+    add_obj.insert(
+        "modificationTime".into(),
+        Value::from(modification_time_millis),
+    );
+    let add_action = json!({ "add": Value::Object(add_obj) });
+
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(serde_json::to_string(&commit_info)?.as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(serde_json::to_string(&add_action)?.as_bytes());
+    out.push(b'\n');
+    Ok(out)
+}
+
 fn translate_partition_values(inputs: &CommitInputs) -> Result<Map<String, Value>> {
     let table_partitions: HashSet<&str> = inputs
         .state
@@ -565,6 +655,108 @@ mod tests {
         assert_eq!(min["col-name"], "a");
         assert_eq!(max["col-name"], "c");
         assert_eq!(nc["col-id"], 0);
+    }
+
+    // -- point-to (build_commit_jsonl_from_add) -----------------------------
+
+    /// A realistic unpartitioned, non-rowTracking `add` action as a prior
+    /// run would have written it (stats keyed by physical UUID).
+    fn recovered_unpartitioned_add() -> Map<String, Value> {
+        let stats = json!({
+            "numRecords": 3,
+            "minValues": {"col-id": 0},
+            "maxValues": {"col-id": 2},
+            "nullCount": {"col-id": 0},
+        });
+        let mut add = Map::new();
+        add.insert("path".into(), Value::String("abc123.parquet".into()));
+        add.insert("partitionValues".into(), json!({}));
+        add.insert("size".into(), Value::from(4096_u64));
+        add.insert(
+            "modificationTime".into(),
+            Value::from(1_000_000_000_000_i64),
+        );
+        add.insert("dataChange".into(), Value::Bool(true));
+        add.insert(
+            "stats".into(),
+            Value::String(serde_json::to_string(&stats).unwrap()),
+        );
+        add
+    }
+
+    #[test]
+    fn point_to_lifts_add_verbatim_and_refreshes_modification_time() {
+        let add = recovered_unpartitioned_add();
+        let new_mod_time = 1_700_000_000_123_i64;
+        let body =
+            build_commit_jsonl_from_add(&add, "rocky-iceberg/test", new_mod_time, &[]).unwrap();
+        let lines: Vec<&str> = std::str::from_utf8(&body).unwrap().lines().collect();
+        assert_eq!(lines.len(), 2, "point-to emits commitInfo + the lifted add");
+
+        let info: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(info["commitInfo"]["operation"], "WRITE");
+        assert_eq!(info["commitInfo"]["timestamp"], new_mod_time);
+        assert_eq!(info["commitInfo"]["engineInfo"], "rocky-iceberg/test");
+
+        let lifted: Value = serde_json::from_str(lines[1]).unwrap();
+        let lifted_add = lifted.get("add").unwrap();
+        // path / size / dataChange carry over byte-for-byte.
+        assert_eq!(lifted_add["path"], "abc123.parquet");
+        assert_eq!(lifted_add["size"], 4096);
+        assert_eq!(lifted_add["dataChange"], true);
+        // modificationTime is the ONLY field refreshed.
+        assert_eq!(lifted_add["modificationTime"], new_mod_time);
+        // stats (numRecords + min/max/nullCount keyed by physical UUID) lift
+        // verbatim — no recompute, no live batch.
+        let stats: Value = serde_json::from_str(lifted_add["stats"].as_str().unwrap()).unwrap();
+        assert_eq!(stats["numRecords"], 3);
+        assert_eq!(stats["minValues"]["col-id"], 0);
+        assert_eq!(stats["maxValues"]["col-id"], 2);
+        assert_eq!(stats["nullCount"]["col-id"], 0);
+    }
+
+    #[test]
+    fn point_to_refuses_partitioned_add() {
+        let mut add = recovered_unpartitioned_add();
+        add.insert("partitionValues".into(), json!({"col-region": "eu"}));
+        add.insert("path".into(), Value::String("region=eu/abc.parquet".into()));
+        match build_commit_jsonl_from_add(&add, "t", 0, &["region".to_string()]) {
+            Err(UniformWriterError::DeltaLog(msg)) => {
+                assert!(
+                    msg.contains("partitioned"),
+                    "must refuse a partitioned add: {msg}"
+                );
+            }
+            other => panic!("expected DeltaLog refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn point_to_refuses_row_tracking_add() {
+        let mut add = recovered_unpartitioned_add();
+        add.insert("baseRowId".into(), Value::from(100_i64));
+        add.insert("defaultRowCommitVersion".into(), Value::from(7_i64));
+        match build_commit_jsonl_from_add(&add, "t", 0, &[]) {
+            Err(UniformWriterError::DeltaLog(msg)) => {
+                assert!(
+                    msg.contains("rowTracking"),
+                    "must refuse a rowTracking add: {msg}"
+                );
+            }
+            other => panic!("expected DeltaLog refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn point_to_emits_no_extra_actions() {
+        // The point-to is exactly 2 lines — no domainMetadata, no second add.
+        let add = recovered_unpartitioned_add();
+        let body = build_commit_jsonl_from_add(&add, "t", 42, &[]).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap().lines().count(),
+            2,
+            "a point-to commit is commitInfo + one add only"
+        );
     }
 
     #[test]
