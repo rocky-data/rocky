@@ -1759,6 +1759,291 @@ mod tests {
             ),
         }
     }
+
+    // --- Point-to invocation routing (attempt_point_to_reuse) --------------
+    //
+    // The trust-critical commit-time half. `attempt_point_to_reuse` returns
+    // `Ok` ONLY on a fully-validated, recovered, re-verified-live, committed
+    // point-to; every simulated failure returns `Err` — which the caller in
+    // `execute_content_addressed_model` maps to a normal BUILD (execute_query).
+    // These tests pin that routing without a warehouse.
+
+    use crate::commands::reuse_decision::ReuseCandidate;
+
+    /// A small single-column (`id`) batch matching the bootstrap schema that
+    /// [`seed_unpartitioned_with_live_add`]'s sibling `seed_id_only_bootstrap`
+    /// installs.
+    fn id_batch(ids: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef],
+        )
+        .unwrap()
+    }
+
+    /// Seed only the `v=0` bootstrap (the `id`-column, unpartitioned,
+    /// non-rowTracking shape) — no data commit yet.
+    async fn seed_id_only_bootstrap(store: &InMemory, prefix: &str) {
+        let bootstrap = serde_json::json!({
+            "protocol": {
+                "minReaderVersion": 2,
+                "minWriterVersion": 7,
+                "writerFeatures": ["columnMapping", "icebergCompatV2", "invariants", "appendOnly"],
+            }
+        });
+        let metadata = serde_json::json!({
+            "metaData": {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": serde_json::to_string(&serde_json::json!({
+                    "type": "struct",
+                    "fields": [
+                        {"name": "id", "type": "long", "nullable": false, "metadata": {
+                            "delta.columnMapping.id": 1,
+                            "delta.columnMapping.physicalName": "col-id-uuid"
+                        }}
+                    ]
+                })).unwrap(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.columnMapping.mode": "name",
+                    "delta.universalFormat.enabledFormats": "iceberg",
+                    "delta.enableIcebergCompatV2": "true"
+                },
+                "createdTime": 0
+            }
+        });
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&bootstrap).unwrap(),
+            serde_json::to_string(&metadata).unwrap(),
+        );
+        store
+            .put(
+                &ObjPath::from(format!("{prefix}/_delta_log/00000000000000000000.json")),
+                PutPayload::from(body.into_bytes()),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn writer_for(store: Arc<dyn ObjectStore>, prefix: &str) -> UniformWriter {
+        UniformWriter::new(
+            UniformWriterConfig {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+                prefix: prefix.into(),
+                engine_info: "rocky-cli/test".into(),
+            },
+            store,
+            Arc::new(NoOpSqlClient),
+        )
+    }
+
+    fn dummy_model_ir() -> ModelIr {
+        use rocky_ir::{GovernanceConfig, TargetRef};
+        let mut m = ModelIr::transformation(
+            TargetRef {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: "s3://bucket/tbl".into(),
+                partition_columns: vec![],
+            },
+            vec![],
+            "SELECT 1".into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        m.name = Arc::from("fct_orders");
+        m
+    }
+
+    /// Write R's real parquet + recoverable `add` into `prefix`, returning the
+    /// [`ReuseCandidate`] that points at it (blake3 + commit_version + size).
+    async fn seed_r_build(store: &Arc<InMemory>, prefix: &str) -> ReuseCandidate {
+        seed_id_only_bootstrap(store, prefix).await;
+        let writer = writer_for(store.clone() as Arc<dyn ObjectStore>, prefix);
+        let state = writer.discover().await.unwrap();
+        let r = writer
+            .write_batch_with_state(id_batch(&[10, 20, 30]), state)
+            .await
+            .unwrap();
+        ReuseCandidate {
+            run_id: "run-R".into(),
+            blake3_hash: r.blake3_hash,
+            file_path: r.file_path,
+            commit_version: r.commit_version,
+            size_bytes: r.size_bytes,
+            proof_class: "strong".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn point_to_happy_path_returns_reuse_summary_no_copy() {
+        // Same-table reuse — the path the runner takes when a second run's
+        // input_hash hits R's prior build of THIS target. R's file is recovered
+        // from this table's own `_delta_log`, re-verified live, and the
+        // double-count guard makes the re-commit a no-op (returns R's version).
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let candidate = seed_r_build(&store, "tbl_a").await;
+
+        let writer = writer_for(store.clone() as Arc<dyn ObjectStore>, "tbl_a");
+        let state = writer.discover().await.unwrap();
+        let model = dummy_model_ir();
+        let summary = attempt_point_to_reuse(&writer, &state, &candidate, &model)
+            .await
+            .expect("fully-validated point-to must succeed");
+
+        let reuse = summary
+            .reused_from
+            .expect("a successful point-to carries reuse provenance");
+        assert_eq!(reuse.reused_run_id, "run-R");
+        assert_eq!(reuse.blake3_hash, candidate.blake3_hash);
+        assert_eq!(reuse.proof_class, "strong");
+        assert_eq!(
+            summary.blake3_hash, candidate.blake3_hash,
+            "summary carries R's shared blake3 (drives refcount >= 2 in the runner)"
+        );
+        assert_eq!(
+            summary.num_rows, 3,
+            "row count parsed back from R's recovered add.stats"
+        );
+        assert_eq!(
+            summary.commit_version, candidate.commit_version,
+            "double-count guard: same-table re-commit returns R's existing version (no-op)"
+        );
+
+        // No second parquet object under tbl_a — zero byte copy.
+        use futures::TryStreamExt;
+        let mut stream = store.list(Some(&ObjPath::from("tbl_a")));
+        let mut parquet_count = 0_usize;
+        while let Some(meta) = stream.try_next().await.unwrap() {
+            if meta.location.to_string().ends_with(".parquet") {
+                parquet_count += 1;
+            }
+        }
+        assert_eq!(
+            parquet_count, 1,
+            "a point-to must not write a second parquet object"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_to_recover_error_routes_to_build() {
+        // A candidate naming a commit_version that does not exist in the table
+        // ⇒ recover_pointer_inputs errors ⇒ Err ⇒ caller BUILDs.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let mut candidate = seed_r_build(&store, "tbl_a").await;
+        candidate.commit_version = 999; // no such commit
+
+        let writer = writer_for(store.clone() as Arc<dyn ObjectStore>, "tbl_a");
+        let state = writer.discover().await.unwrap();
+        let model = dummy_model_ir();
+        let err = attempt_point_to_reuse(&writer, &state, &candidate, &model)
+            .await
+            .expect_err("a missing commit must not yield a (false) reuse");
+        assert!(
+            format!("{err:#}").contains("recover_pointer_inputs"),
+            "recover failure must surface as a build-routing error; got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_to_liveness_flip_at_commit_routes_to_build() {
+        // R's file was VACUUM'd/removed AFTER the decision: the commit-time
+        // liveness re-check sees not-live ⇒ Err ⇒ caller BUILDs. (This is the
+        // TOCTOU guard — the decision's own liveness check passed earlier.)
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let candidate = seed_r_build(&store, "tbl_a").await;
+
+        // Append a `remove` for R's file at v=2 so add_path_is_live is false,
+        // while recover_pointer_inputs (which reads v=1 directly) still works.
+        let r_basename = candidate.file_path.rsplit('/').next().unwrap().to_string();
+        let remove_commit = serde_json::json!({"remove": {"path": r_basename, "dataChange": true}});
+        let body = format!("{}\n", serde_json::to_string(&remove_commit).unwrap());
+        store
+            .put(
+                &ObjPath::from("tbl_a/_delta_log/00000000000000000002.json"),
+                PutPayload::from(body.into_bytes()),
+            )
+            .await
+            .unwrap();
+
+        let writer = writer_for(store.clone() as Arc<dyn ObjectStore>, "tbl_a");
+        let state = writer.discover().await.unwrap();
+        let model = dummy_model_ir();
+        let err = attempt_point_to_reuse(&writer, &state, &candidate, &model)
+            .await
+            .expect_err("a commit-time liveness flip must route to BUILD, never reuse");
+        assert!(
+            format!("{err:#}").contains("no longer live"),
+            "a removed file must surface as a liveness-flip build-routing error; got: {err:#}"
+        );
+
+        // No v=3 commit landed — the failed reuse left the table untouched.
+        assert!(
+            store
+                .get(&ObjPath::from("tbl_a/_delta_log/00000000000000000003.json"))
+                .await
+                .is_err(),
+            "a fail-closed reuse must not land any commit before falling back to BUILD"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_to_commit_error_on_partitioned_routes_to_build() {
+        // R's add recovers fine, liveness holds, but the target is partitioned
+        // ⇒ commit_pointer_with_state errors ⇒ Err ⇒ caller BUILDs. (The
+        // decision gates on shape too; this is defence-in-depth at commit time.)
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let candidate = seed_r_build(&store, "tbl_a").await;
+
+        // Build a discovered state that claims a partition column. Recover +
+        // liveness use the store (unpartitioned tbl_a), but the commit consults
+        // `state.partition_columns`, which we force non-empty.
+        let writer = writer_for(store.clone() as Arc<dyn ObjectStore>, "tbl_a");
+        let mut state = writer.discover().await.unwrap();
+        state.partition_columns = vec!["region".to_string()];
+        let model = dummy_model_ir();
+        let err = attempt_point_to_reuse(&writer, &state, &candidate, &model)
+            .await
+            .expect_err("a commit error must route to BUILD, never a partial reuse");
+        assert!(
+            format!("{err:#}").contains("commit_pointer_with_state"),
+            "commit failure must surface as a build-routing error; got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn num_records_parsed_from_recovered_add_stats() {
+        // The stats field is a JSON STRING (Delta encodes it doubly).
+        let mut add = serde_json::Map::new();
+        add.insert(
+            "stats".into(),
+            serde_json::Value::String("{\"numRecords\":42}".into()),
+        );
+        assert_eq!(num_records_from_recovered_add(&add), 42);
+
+        // Absent / malformed stats ⇒ 0 (byte reference unaffected).
+        assert_eq!(
+            num_records_from_recovered_add(&serde_json::Map::new()),
+            0,
+            "absent stats must not panic — display row count falls back to 0"
+        );
+        let mut bad = serde_json::Map::new();
+        bad.insert("stats".into(), serde_json::Value::String("not json".into()));
+        assert_eq!(num_records_from_recovered_add(&bad), 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
