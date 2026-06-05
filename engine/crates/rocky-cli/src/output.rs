@@ -230,6 +230,13 @@ pub struct RunOutput {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub shadow: bool,
     pub materializations: Vec<MaterializationOutput>,
+    /// Per-model build/skip/reuse decision + reason, surfaced for
+    /// transformation runs so orchestrators can explain *why* each model
+    /// ran, was skipped, or was reused. Populated only when the
+    /// `--skip-unchanged` gate is active or `[reuse]` is enabled; empty (and
+    /// omitted) for a default run, which stays byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_decisions: Vec<ModelDecisionOutput>,
     pub check_results: Vec<TableCheckOutput>,
     /// Row-quarantine outcomes — one entry per table the quality
     /// pipeline quarantined. Empty for runs that did not use
@@ -914,6 +921,49 @@ pub struct ModelSkipState {
     pub skip_hash: Option<String>,
     /// Per-upstream freshness signatures observed for this build.
     pub upstream_freshness: Vec<rocky_core::state::UpstreamSig>,
+}
+
+/// The per-model build decision the engine made this run — what the
+/// skip-gate and content-addressed reuse machinery actually decided.
+///
+/// Reporting-only: this never changes build behavior, it surfaces a decision
+/// that today only reaches the run log. Populated on
+/// [`RunOutput::model_decisions`] only when the `--skip-unchanged` gate is
+/// active or `[reuse]` is enabled; a default run (both off) emits an empty
+/// list and the field is omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelDecision {
+    /// The model was (re-)materialized this run — its SQL ran (or its
+    /// content-addressed write executed).
+    Build,
+    /// The `--skip-unchanged` gate proved the model's logic and upstream
+    /// data unchanged since the last successful build and skipped
+    /// re-materialization.
+    Skip,
+    /// A content-addressed model pointed-to a prior run's already-written
+    /// parquet via a zero-copy commit instead of executing its SQL.
+    Reused,
+}
+
+/// One per-model decision entry on [`RunOutput::model_decisions`].
+///
+/// Surfaces the skip/build/reuse verdict the engine reached for a single
+/// transformation model, plus a short human-readable reason that mirrors the
+/// gate's actual decision point (never re-derived — threaded from the
+/// evaluation result). Orchestrators (Dagster) and the VS Code extension use
+/// it to explain *why* a model ran, was skipped, or was reused.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ModelDecisionOutput {
+    /// The model's name (matches the model entry in the project DAG).
+    pub model: String,
+    /// What the engine decided for this model.
+    pub decision: ModelDecision,
+    /// Short human-readable justification reflecting the exact decision the
+    /// gate made (e.g. "logic and upstream data unchanged since last build",
+    /// "not skip-eligible", "upstream data may have changed", "reused prior
+    /// run's bytes (strong proof)").
+    pub reason: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -3656,6 +3706,7 @@ impl RunOutput {
             resumed_from: None,
             shadow: false,
             materializations: vec![],
+            model_decisions: vec![],
             check_results: vec![],
             quarantine: vec![],
             anomalies: vec![],

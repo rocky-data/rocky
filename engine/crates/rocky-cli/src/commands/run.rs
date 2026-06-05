@@ -4430,16 +4430,43 @@ pub(crate) async fn execute_models(
                     .evaluate(model, &typed_ir, warehouse, state_store)
                     .await
                 {
-                    super::skip_gate::GateDecision::Skip => {
+                    super::skip_gate::GateDecision::Skip { reason } => {
                         gate.record(name, super::skip_gate::Verdict::Skipped);
                         output.tables_skipped += 1;
+                        // Surface the per-model decision (reporting-only —
+                        // mirrors the log line below, never changes behavior).
+                        output
+                            .model_decisions
+                            .push(crate::output::ModelDecisionOutput {
+                                model: name.to_string(),
+                                decision: crate::output::ModelDecision::Skip,
+                                reason: reason.message().to_string(),
+                            });
                         info!(
                             model = name.as_str(),
+                            reason = reason.as_str(),
                             "skip-unchanged: logic and upstream data both appear \
                              unchanged — skipping re-materialization (best-effort)"
                         );
                     }
-                    super::skip_gate::GateDecision::Build { skip_state } => {
+                    super::skip_gate::GateDecision::Build { skip_state, reason } => {
+                        // Record the Build decision here for the *plain*
+                        // strategies the gate actually adjudicates. The two
+                        // special strategies (`content_addressed`,
+                        // `time_interval`) are never skip-eligible and own
+                        // their own decision entry at their execution site
+                        // (content_addressed surfaces Build/Reused there,
+                        // time_interval surfaces Build), so suppress a
+                        // duplicate here.
+                        if is_plain_strategy(model) {
+                            output
+                                .model_decisions
+                                .push(crate::output::ModelDecisionOutput {
+                                    model: name.to_string(),
+                                    decision: crate::output::ModelDecision::Build,
+                                    reason: reason.message().to_string(),
+                                });
+                        }
                         to_build.push((idx, name, model, Some(skip_state)));
                     }
                 }
@@ -4692,6 +4719,39 @@ pub(crate) async fn execute_models(
                             // content_addressed is never skip-eligible.
                             skip_internal: None,
                         });
+                        // Per-model decision (reporting-only). A
+                        // content_addressed model is never skip-eligible, so it
+                        // is suppressed in the skip-gate loop above and owns its
+                        // decision here: `Reused` when the zero-copy point-to
+                        // landed (no SQL ran), else `Build`. Only emitted when
+                        // the skip gate is active or `[reuse]` is enabled so a
+                        // default run's output stays byte-identical.
+                        if gate.config().is_active() || reuse_enabled {
+                            let (decision, reason) = match &summary.reused_from {
+                                Some(reuse) => (
+                                    crate::output::ModelDecision::Reused,
+                                    format!(
+                                        "reused prior run {}'s bytes ({} proof)",
+                                        reuse.reused_run_id, reuse.proof_class
+                                    ),
+                                ),
+                                None if reuse_enabled => (
+                                    crate::output::ModelDecision::Build,
+                                    "content-addressed: no reusable prior run; built".to_string(),
+                                ),
+                                None => (
+                                    crate::output::ModelDecision::Build,
+                                    "content-addressed: built".to_string(),
+                                ),
+                            };
+                            output
+                                .model_decisions
+                                .push(crate::output::ModelDecisionOutput {
+                                    model: model_name.to_string(),
+                                    decision,
+                                    reason,
+                                });
+                        }
                         info!(
                             model = model_name,
                             target = target_table_full_name.as_str(),
@@ -4868,6 +4928,20 @@ pub(crate) async fn execute_models(
                         .await;
                 }
                 time_interval_res?;
+                // Per-model decision (reporting-only). time_interval is never
+                // skip-eligible, so it is suppressed in the skip-gate loop above
+                // and owns its `Build` entry here. Gated on the skip gate being
+                // active (reuse does not apply to time_interval) so a default
+                // run's output stays byte-identical.
+                if gate.config().is_active() {
+                    output
+                        .model_decisions
+                        .push(crate::output::ModelDecisionOutput {
+                            model: model_name.to_string(),
+                            decision: crate::output::ModelDecision::Build,
+                            reason: "time_interval: built (not skip-eligible)".to_string(),
+                        });
+                }
                 if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                     let _ = reg
                         .fire(&HookContext::after_model_run(
@@ -7193,6 +7267,7 @@ mod tests {
             resumed_from: None,
             shadow: false,
             materializations: vec![],
+            model_decisions: vec![],
             check_results: vec![],
             quarantine: vec![],
             anomalies: vec![],
@@ -9079,6 +9154,21 @@ merge_keys = ["id"]
             .any(|m| m.asset_key.last().map(String::as_str) == Some(model))
     }
 
+    /// The `(decision, reason)` the run surfaced for `model`, if any. Used by
+    /// the gate tests to assert the per-model decision entry mirrors what the
+    /// gate actually decided (not just the build-vs-skip outcome).
+    #[cfg(feature = "duckdb")]
+    fn decision_for<'a>(
+        output: &'a RunOutput,
+        model: &str,
+    ) -> Option<(crate::output::ModelDecision, &'a str)> {
+        output
+            .model_decisions
+            .iter()
+            .find(|d| d.model == model)
+            .map(|d| (d.decision, d.reason.as_str()))
+    }
+
     /// Write a full_refresh model `name.sql`/`name.toml` into `main`, with an
     /// optional `[skip]` block appended to the sidecar.
     #[cfg(feature = "duckdb")]
@@ -9195,6 +9285,43 @@ merge_keys = ["id"]
             4,
             "a skip must NOT rewrite the target — sentinel row survives"
         );
+        // The per-model decision entry must report Skip with the matching
+        // reason — the surfaced justification mirrors the gate's actual path.
+        assert_eq!(
+            decision_for(&out2, "agg"),
+            Some((
+                crate::output::ModelDecision::Skip,
+                "logic and upstream data unchanged since last build"
+            )),
+            "skip decision + reason must be surfaced"
+        );
+        // The first (baseline) run built because there was no prior baseline.
+        assert_eq!(
+            decision_for(&out1, "agg"),
+            Some((
+                crate::output::ModelDecision::Build,
+                "no prior successful build to compare against"
+            )),
+            "first build must report the no-prior-baseline reason"
+        );
+        // A default (gate-off) run surfaces NO decisions — byte-identical.
+        let tmp_off = tempfile::TempDir::new().unwrap();
+        let db_off = tmp_off.path().join("off.duckdb");
+        let state_off = StateStore::open(&tmp_off.path().join("state")).unwrap();
+        seed_src(&db_off, 3).await;
+        let out_off = run_with_gate(
+            &models_dir,
+            &db_off,
+            &state_off,
+            SkipGateConfig::off(),
+            "run-off",
+            rocky_core::state::RunStatus::Success,
+        )
+        .await;
+        assert!(
+            out_off.model_decisions.is_empty(),
+            "a gate-off run must surface no per-model decisions"
+        );
     }
 
     /// Logic changed (a different WHERE predicate) ⇒ BUILD even when upstream
@@ -9242,6 +9369,14 @@ merge_keys = ["id"]
         )
         .await;
         assert!(built(&out2, "agg"), "a changed predicate must rebuild");
+        assert_eq!(
+            decision_for(&out2, "agg"),
+            Some((
+                crate::output::ModelDecision::Build,
+                "model logic changed since last build"
+            )),
+            "a changed predicate must surface the B2 (logic-changed) reason"
+        );
     }
 
     /// Upstream rowcount changed ⇒ BUILD (rowcount-fallback signal).
@@ -9280,6 +9415,14 @@ merge_keys = ["id"]
         assert!(
             built(&out2, "agg"),
             "a changed upstream rowcount must rebuild"
+        );
+        assert_eq!(
+            decision_for(&out2, "agg"),
+            Some((
+                crate::output::ModelDecision::Build,
+                "upstream data may have changed since last build"
+            )),
+            "a changed upstream rowcount must surface the B3 (upstream-changed) reason"
         );
     }
 
