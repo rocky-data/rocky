@@ -243,6 +243,16 @@ class _GroupBuild:
     A "group" is the unit of execution: one Dagster ``multi_asset`` per
     Rocky group (typically tenant/client). The group bundles every spec,
     every source id and the filter that materializes them.
+
+    Tenant-as-partition collapse (when ``RockyComponent.tenant`` is set):
+    a group instead bundles the sources that differ *only* by the tenant
+    component, collapsed into one partitioned spec per
+    ``(non-tenant components, table)``. The extra fields below carry the
+    tenant ``PartitionsDefinition``, the tenant component name, and a
+    ``partition_key → original filter value`` map so the execution
+    ``--filter`` always targets the right per-tenant catalog even if a
+    custom :meth:`RockyDagsterTranslator.get_partition_key` canonicalises
+    the key. They are unset (``None`` / empty) on the default path.
     """
 
     name: str
@@ -251,6 +261,10 @@ class _GroupBuild:
     filter: str = ""
     key_to_source_id: dict[dg.AssetKey, str] = field(default_factory=dict)
     rocky_key_to_dagster_key: dict[tuple[str, ...], dg.AssetKey] = field(default_factory=dict)
+    # Tenant-as-partition collapse fields (default path leaves these unset).
+    partitions_def: dg.PartitionsDefinition | None = None
+    tenant_component: str | None = None
+    partition_key_to_filter_value: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -302,6 +316,37 @@ def _reject_resolver_callable_in_yaml(field_name: str, value: object) -> None:
             config_value=value,
         )
     return None
+
+
+class TenantConfig(dg.Model, dg.Resolvable):
+    """Declares one source component as the *tenant axis* for the
+    tenant-as-partition collapse.
+
+    When set on :attr:`RockyComponent.tenant`, sources that differ *only*
+    by ``component`` are collapsed into one client-agnostic
+    ``AssetSpec`` (+ ``AssetCheckSpec``) per ``(non-tenant components,
+    table)``, partitioned by a :class:`dagster.DynamicPartitionsDefinition`
+    whose keys are the tenant values. This removes the
+    ``O(tenants × connectors × tables)`` asset-spec growth that OOMs the
+    code-server snapshot, while keeping per-tenant physical isolation
+    (each partition still materialises via ``rocky run --filter
+    {component}={partition_key}`` into that tenant's own catalog).
+
+    Attributes:
+        component: Which ``source.components`` key is the tenant axis
+            (e.g. ``"client"``).
+        partitions_name: Name of the ``DynamicPartitionsDefinition`` that
+            holds the tenant values. Reused across the location, so pick a
+            stable, unique name (e.g. ``"rocky_clients"``).
+        sync_partitions_from_discover: When ``True`` (default), the
+            component's sensor adds newly-discovered tenant values to the
+            partition set on each tick (via ``dynamic_partitions_requests``).
+            Set ``False`` to manage the partition set out-of-band.
+    """
+
+    component: str
+    partitions_name: str
+    sync_partitions_from_discover: bool = True
 
 
 class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
@@ -586,6 +631,15 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     #: who rely on "best-effort load with empty graph" as their failure
     #: mode.
     strict_build: bool = False
+    #: Opt-in tenant-as-partition collapse. When set, sources that differ
+    #: only by the named tenant component are collapsed into one
+    #: partitioned ``AssetSpec`` (+ ``AssetCheckSpec``) per
+    #: ``(non-tenant components, table)``, partitioned by a
+    #: ``DynamicPartitionsDefinition`` of tenant values — removing the
+    #: ``O(tenants)`` asset-spec growth that OOMs the code-server snapshot.
+    #: ``None`` (default) is byte-identical to today's one-spec-per-source
+    #: behaviour. See :class:`TenantConfig`.
+    tenant: TenantConfig | None = None
 
     @property
     def defs_state_config(self) -> DefsStateConfig:
@@ -1045,12 +1099,29 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         # `[checks.freshness]` is the fallback for everything else.
         model_policies = per_model_freshness_policies(compile_result)
 
-        groups = _build_group_contexts(
-            discover,
-            translator,
-            model_policies,
-            translation=self.translation,
-        )
+        # Tenant-as-partition collapse (opt-in). When configured, sources
+        # differing only by the tenant component collapse into one
+        # partitioned spec per (non-tenant components, table); the tenant
+        # value becomes a DynamicPartitionsDefinition key. Otherwise the
+        # default one-spec-per-source path runs unchanged.
+        tenant_partitions_def: dg.DynamicPartitionsDefinition | None = None
+        if self.tenant is not None:
+            tenant_partitions_def = dg.DynamicPartitionsDefinition(name=self.tenant.partitions_name)
+            groups = _build_collapsed_group_contexts(
+                discover,
+                translator,
+                self.tenant,
+                tenant_partitions_def,
+                model_policies,
+                translation=self.translation,
+            )
+        else:
+            groups = _build_group_contexts(
+                discover,
+                translator,
+                model_policies,
+                translation=self.translation,
+            )
 
         # Optimize metadata — merged into AssetSpec.metadata at load time
         # when surface_optimize_metadata=True. The model_to_key map is
@@ -1081,6 +1152,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             groups,
             contract_rules_by_model,
             surface_compliance=self.surface_compliance,
+            partitions_def=tenant_partitions_def,
         )
 
         assets: list[dg.AssetsDefinition] = [
@@ -1381,6 +1453,168 @@ def _build_group_contexts(
             group.rocky_key_to_dagster_key[_native_rocky_key(source, table.name)] = spec.key
 
     return list(groups.values())
+
+
+# ---------------------------------------------------------------------------
+# Tenant-as-partition collapse
+# ---------------------------------------------------------------------------
+
+#: Per-tenant metadata keys that are meaningless on a collapsed (client-
+#: agnostic) spec — they describe one arbitrary member source, not the
+#: union. Stripped from the collapsed spec so the asset never advertises a
+#: single tenant's id / sync time / row count as if it were the whole.
+_PER_TENANT_METADATA_KEYS: frozenset[str] = frozenset(
+    {
+        "source_id",
+        "last_sync_at",
+        "row_count",
+        "dagster-rocky/source_id",
+    }
+)
+
+
+def _strip_tenant_component(source: SourceInfo, tenant_component: str) -> SourceInfo:
+    """Return a copy of ``source`` with the tenant component removed.
+
+    The collapsed key/group/tags fall out of the *stock* translator with
+    no API change: every translator method reads ``source.components``, so
+    dropping the tenant entry yields ``[source_type, *non_tenant, table]``
+    and omits the per-tenant ``rocky/{component}`` tag automatically.
+    """
+    remaining = {k: v for k, v in source.components.items() if k != tenant_component}
+    return source.model_copy(update={"components": remaining})
+
+
+def _union_member_tables(members: list[SourceInfo]) -> list[TableInfo]:
+    """Union the tables across all members of a collapsed group, by name.
+
+    A collapsed spec must cover every table any tenant has (FR Q2): if
+    tenant A has a table tenant B lacks, the table still gets an asset; the
+    partition for a tenant missing it simply no-ops at ``rocky run`` time.
+    First occurrence of each name wins (stable order by first appearance).
+    """
+    seen: set[str] = set()
+    tables: list[TableInfo] = []
+    for member in members:
+        for table in member.tables:
+            if table.name not in seen:
+                seen.add(table.name)
+                tables.append(table)
+    return tables
+
+
+def _neutralize_tenant_metadata(spec: dg.AssetSpec) -> dg.AssetSpec:
+    """Drop per-tenant metadata keys from a collapsed spec (FR §4.2 n1).
+
+    The spec is built from one representative member, so ``source_id`` /
+    ``last_sync_at`` / ``row_count`` reflect that single tenant. Removing
+    them prevents the collapsed asset from advertising one tenant's values
+    as the whole. ``source_type`` (shared across tenants) is retained.
+    """
+    if not spec.metadata:
+        return spec
+    cleaned = {k: v for k, v in spec.metadata.items() if k not in _PER_TENANT_METADATA_KEYS}
+    if len(cleaned) == len(spec.metadata):
+        return spec
+    return spec.replace_attributes(metadata=cleaned)
+
+
+def _build_collapsed_group_contexts(
+    discover: DiscoverResult,
+    translator: RockyDagsterTranslator,
+    tenant: TenantConfig,
+    partitions_def: dg.PartitionsDefinition,
+    model_policies: dict[str, dg.FreshnessPolicy] | None = None,
+    *,
+    translation: TranslationFn[RockyTableProps] | None = None,
+) -> list[_GroupBuild]:
+    """Collapse sources differing only by the tenant component.
+
+    Groups discovered sources by *every component except* the tenant axis,
+    and emits **one partitioned spec per ``(non-tenant components, table)``**
+    instead of one spec per ``(tenant, …, table)``. The tenant value
+    becomes a Dagster partition key (on ``partitions_def``); execution
+    routes it back to ``--filter {component}={value}`` via
+    :attr:`_GroupBuild.partition_key_to_filter_value`.
+
+    Distinct from :func:`_build_group_contexts` on purpose: that path's
+    per-source ``seen_keys`` de-dup would treat the intended N-sources →
+    1-key collapse as N−1 "duplicate discover records" and warn/drop them.
+
+    Sources that lack the tenant component, or whose tenant value is not a
+    scalar string, are skipped (logged) — they cannot be placed on the
+    tenant partition axis.
+    """
+    model_policies = model_policies or {}
+    default_policy = freshness_policy_from_checks(discover.checks)
+
+    # Group by the frozen set of non-tenant components. Sorted items make
+    # the key deterministic regardless of dict ordering.
+    grouped: dict[tuple[tuple[str, str | tuple[str, ...]], ...], list[SourceInfo]] = defaultdict(
+        list
+    )
+    for source in discover.sources:
+        tenant_value = source.components.get(tenant.component)
+        if not isinstance(tenant_value, str):
+            _log.warning(
+                "Tenant collapse: skipping source id=%s — tenant component %r is %s "
+                "(expected a scalar string).",
+                source.id,
+                tenant.component,
+                "missing" if tenant_value is None else "list-valued",
+            )
+            continue
+        non_tenant = {k: v for k, v in source.components.items() if k != tenant.component}
+        group_key = tuple(
+            sorted((k, tuple(v) if isinstance(v, list) else v) for k, v in non_tenant.items())
+        )
+        grouped[group_key].append(source)
+
+    groups: list[_GroupBuild] = []
+    for members in grouped.values():
+        representative = _strip_tenant_component(members[0], tenant.component)
+        group = _GroupBuild(name=translator.get_group_name(representative))
+        group.partitions_def = partitions_def
+        group.tenant_component = tenant.component
+        group.source_ids = {m.id for m in members}
+
+        # Single chokepoint for the tenant key: translator.get_partition_key
+        # (default None → raw component value). Map each key back to the raw
+        # component value so --filter targets the real per-tenant catalog
+        # even if a custom hook canonicalises the key.
+        for member in members:
+            raw_value = member.components[tenant.component]
+            assert isinstance(raw_value, str)  # guarded above
+            partition_key = translator.get_partition_key(member) or raw_value
+            group.partition_key_to_filter_value[partition_key] = raw_value
+
+        seen_keys: set[dg.AssetKey] = set()
+        for table in _union_member_tables(members):
+            policy = model_policies.get(table.name, default_policy)
+            spec = _build_asset_spec(
+                representative,
+                table,
+                translator,
+                policy,
+                translation=translation,
+            )
+            spec = _neutralize_tenant_metadata(spec)
+            spec = spec.replace_attributes(partitions_def=partitions_def)
+            if spec.key in seen_keys:
+                # Two non-tenant tables collapsing to the same key — keep
+                # the first, as the non-collapsed path does.
+                _log.warning(
+                    "Tenant collapse: dropping duplicate collapsed key %s (table=%s).",
+                    spec.key.to_user_string(),
+                    table.name,
+                )
+                continue
+            seen_keys.add(spec.key)
+            group.specs.append(spec)
+            group.rocky_key_to_dagster_key[_native_rocky_key(representative, table.name)] = spec.key
+        groups.append(group)
+
+    return groups
 
 
 def _build_asset_spec(
@@ -1712,12 +1946,19 @@ def _make_rocky_asset(
         specs=group.specs,
         check_specs=check_specs,
         can_subset=True,
+        partitions_def=group.partitions_def,
     )
     def _asset(context):
         _log_compile_diagnostics(context, compile_state)
 
         selected_keys = set(context.selected_asset_keys)
-        filters = _select_filters(group, selected_keys, context)
+        # Tenant-collapsed groups derive their filter from the run's tenant
+        # partition key (→ that tenant's own catalog); the default path
+        # uses the group / per-source filter.
+        if group.partitions_def is not None and group.tenant_component is not None:
+            filters = _tenant_partition_filters(group, context)
+        else:
+            filters = _select_filters(group, selected_keys, context)
 
         # Governance events (Waves B + C-2, opt-in). Collected first so
         # the compliance check pairs can be passed into ``_emit_results``
@@ -1991,6 +2232,42 @@ def _select_filters(
         f"selected for group '{group.name}'"
     )
     return [f"id={sid}" for sid in sorted(needed_source_ids)]
+
+
+def _tenant_partition_filters(
+    group: _GroupBuild,
+    context: dg.AssetExecutionContext,
+) -> list[str]:
+    """Build the per-tenant ``--filter`` for a collapsed, partitioned run.
+
+    Maps the run's tenant partition key back to the original component
+    value (via :attr:`_GroupBuild.partition_key_to_filter_value`, falling
+    back to the key itself for the clean no-canonicalisation case) and
+    returns ``["{tenant_component}={value}"]`` — scoping ``rocky run`` to
+    that one tenant's catalog, preserving physical isolation.
+
+    Each partition materialises in its own run (Dagster's default
+    multi-run backfill), so exactly one partition key is present.
+    ``BackfillPolicy.single_run()`` (a partition *range* in one run) is
+    rejected: a single ``--filter`` value cannot span tenant catalogs.
+    """
+    if not context.has_partition_key:
+        raise dg.Failure(
+            description=(
+                "Tenant-collapsed Rocky asset materialised without a single partition "
+                "key. Tenant partitions require one run per tenant — select a tenant "
+                "partition or run a per-partition (multi-run) backfill. "
+                "BackfillPolicy.single_run() is not supported: one --filter value "
+                "cannot target multiple tenant catalogs."
+            ),
+        )
+    partition_key = context.partition_key
+    filter_value = group.partition_key_to_filter_value.get(partition_key, partition_key)
+    assert group.tenant_component is not None  # set whenever partitions_def is
+    context.log.info(
+        f"Tenant partition '{partition_key}' → --filter {group.tenant_component}={filter_value}"
+    )
+    return [f"{group.tenant_component}={filter_value}"]
 
 
 def _run_filters(

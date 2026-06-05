@@ -124,6 +124,33 @@ class RockyDagsterTranslator:
         """
         return []
 
+    def get_partition_key(self, source: SourceInfo) -> str | None:
+        """Returns the tenant partition key for a source, or ``None``.
+
+        Only consulted on the tenant-as-partition collapse path (when
+        ``RockyComponent.tenant`` is configured). It is the **single
+        chokepoint** for deriving a source's tenant partition key: the
+        component, the sensor (dynamic-partition sync + ``RunRequest``),
+        and the execution ``--filter`` all route through it, so a custom
+        derivation can never drift between "which partition" and "which
+        tenant gets materialized."
+
+        Default: ``None`` — meaning "use the raw value of the configured
+        tenant component verbatim" (the component supplies
+        ``source.components[tenant.component]``). Rocky's ``discover``
+        already emits component values as clean, lowercased SQL
+        identifiers, which are valid Dagster partition keys, so the raw
+        value is correct out of the box.
+
+        Override **only** when the raw component value is not a valid /
+        canonical partition key — e.g. to fold case variants onto a
+        canonical client code. If you do, the component keeps a
+        ``partition_key → original component value`` map so the execution
+        ``--filter`` still targets the real per-tenant catalog; your
+        returned key is what the partition set and ``RunRequest`` use.
+        """
+        return None
+
     # ------------------------------------------------------------------ #
     # Derived-model translation (T-derived-models)                       #
     # ------------------------------------------------------------------ #
