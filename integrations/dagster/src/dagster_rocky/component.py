@@ -1585,6 +1585,7 @@ def _build_collapsed_group_contexts(
             group.partition_key_to_filter_value[partition_key] = raw_value
 
         seen_keys: set[dg.AssetKey] = set()
+        spec_key_by_table: dict[str, dg.AssetKey] = {}
         for table in _union_member_tables(members):
             policy = model_policies.get(table.name, default_policy)
             spec = _build_asset_spec(
@@ -1607,7 +1608,25 @@ def _build_collapsed_group_contexts(
                 continue
             seen_keys.add(spec.key)
             group.specs.append(spec)
-            group.rocky_key_to_dagster_key[_native_rocky_key(representative, table.name)] = spec.key
+            spec_key_by_table[table.name] = spec.key
+
+        # Map every member's WITH-tenant native key back to the collapsed
+        # spec key. The engine runs the *real* (un-collapsed) source under
+        # `rocky run --filter {component}={tenant}`, so its materialization
+        # keys always carry the tenant component
+        # (``[source_type, *components-incl-tenant, table]``). _emit_results
+        # remaps those engine keys via this map — registering the stripped
+        # representative key alone would miss every per-tenant
+        # materialization and silently drop it. One entry per (member,
+        # table) → the shared collapsed spec key; at run time only the
+        # active partition's keys are emitted.
+        for member in members:
+            for member_table in member.tables:
+                spec_key = spec_key_by_table.get(member_table.name)
+                if spec_key is not None:
+                    group.rocky_key_to_dagster_key[_native_rocky_key(member, member_table.name)] = (
+                        spec_key
+                    )
         groups.append(group)
 
     return groups

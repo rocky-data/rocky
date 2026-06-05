@@ -7,6 +7,7 @@ default (tenant unset) path is unchanged.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 from unittest.mock import patch
@@ -14,7 +15,14 @@ from unittest.mock import patch
 import dagster as dg
 import pytest
 
-from dagster_rocky import DiscoverResult, RockyResource, SourceInfo, TableInfo, rocky_source_sensor
+from dagster_rocky import (
+    DiscoverResult,
+    RockyComponent,
+    RockyResource,
+    SourceInfo,
+    TableInfo,
+    rocky_source_sensor,
+)
 from dagster_rocky.component import (
     TenantConfig,
     _build_check_specs,
@@ -25,6 +33,7 @@ from dagster_rocky.component import (
     _tenant_partition_filters,
 )
 from dagster_rocky.translator import RockyDagsterTranslator
+from dagster_rocky.types import RunResult
 
 
 def _source(client: str, tables: list[str]) -> SourceInfo:
@@ -112,6 +121,16 @@ def test_partition_key_to_filter_value_identity_by_default():
         "pepsi": "pepsi",
     }
     assert groups[0].tenant_component == "client"
+
+
+def test_collapse_maps_engine_with_tenant_keys_to_collapsed_spec():
+    # The engine emits materializations keyed WITH the tenant component;
+    # every member's with-tenant key must remap to the single collapsed key.
+    groups, _ = _collapse(_discover(_source("coca_cola", ["orders"]), _source("pepsi", ["orders"])))
+    collapsed = dg.AssetKey(["fivetran", "usa", "facebookads", "orders"])
+    mapping = groups[0].rocky_key_to_dagster_key
+    assert mapping[("fivetran", "coca_cola", "usa", "facebookads", "orders")] == collapsed
+    assert mapping[("fivetran", "pepsi", "usa", "facebookads", "orders")] == collapsed
 
 
 def test_get_partition_key_override_canonicalizes_but_filter_maps_to_raw():
@@ -361,7 +380,104 @@ def test_tenant_block_resolves_from_yaml():
 
 
 def test_tenant_omitted_resolves_to_none():
-    from dagster_rocky import RockyComponent
-
     component = RockyComponent.resolve_from_yaml("config_path: rocky.toml\n")
     assert component.tenant is None
+
+
+# --------------------------------------------------------------------------- #
+# Execution end-to-end: engine key (with tenant) remaps to collapsed asset
+# --------------------------------------------------------------------------- #
+
+
+def test_collapsed_execution_remaps_engine_key_to_collapsed_asset(tmp_path):
+    """The engine runs the *real* source under ``--filter client=<tenant>`` and
+    emits materializations keyed WITH the tenant. The collapsed asset must
+    remap those engine keys back to the tenant-agnostic key (+ partition),
+    not drop them. Exercises the full build_defs_from_state → materialize →
+    _emit_results path, which the builder-level tests don't.
+    """
+    discover = {
+        "version": "0.3.0",
+        "command": "discover",
+        "sources": [
+            {
+                "id": "src_coca_cola",
+                "source_type": "fivetran",
+                "components": {"client": "coca_cola", "region": "usa", "source": "facebookads"},
+                "tables": [{"name": "orders"}],
+            },
+            {
+                "id": "src_pepsi",
+                "source_type": "fivetran",
+                "components": {"client": "pepsi", "region": "usa", "source": "facebookads"},
+                "tables": [{"name": "orders"}],
+            },
+        ],
+    }
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"discover": discover}))
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        tenant=TenantConfig(component="client", partitions_name="rocky_clients"),
+    )
+    defs = component.build_defs_from_state(context=None, state_path=state_file)
+
+    # Collapsed graph: one tenant-agnostic asset, partitioned.
+    collapsed_key = dg.AssetKey(["fivetran", "usa", "facebookads", "orders"])
+    asset_defs = [a for a in (defs.assets or []) if isinstance(a, dg.AssetsDefinition)]
+    all_keys = {k for a in asset_defs for k in a.keys}
+    assert collapsed_key in all_keys
+    assert not any("coca_cola" in k.to_user_string() for k in all_keys)
+
+    # Engine RunResult for --filter client=coca_cola: key carries the tenant.
+    run_result = RunResult.model_validate(
+        {
+            "version": "0.3.0",
+            "command": "run",
+            "filter": "client=coca_cola",
+            "duration_ms": 100,
+            "tables_copied": 1,
+            "tables_failed": 0,
+            "materializations": [
+                {
+                    "asset_key": ["fivetran", "coca_cola", "usa", "facebookads", "orders"],
+                    "rows_copied": 10,
+                    "duration_ms": 50,
+                    "metadata": {"strategy": "full_refresh"},
+                }
+            ],
+            "check_results": [],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 1, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+
+    instance = dg.DagsterInstance.ephemeral()
+    instance.add_dynamic_partitions("rocky_clients", ["coca_cola", "pepsi"])
+
+    with (
+        patch.object(RockyResource, "run", return_value=run_result),
+        patch.object(RockyResource, "run_streaming", return_value=run_result),
+    ):
+        result = dg.materialize(
+            asset_defs,
+            resources={"rocky": RockyResource(config_path="rocky.toml")},
+            selection=[collapsed_key],
+            partition_key="coca_cola",
+            instance=instance,
+            raise_on_error=False,
+        )
+
+    assert result.success
+    mat_events = list(result.get_asset_materialization_events())
+    # The engine's tenant-keyed materialization landed on the collapsed key…
+    assert len(mat_events) == 1
+    assert mat_events[0].asset_key == collapsed_key
+    # …attributed to the coca_cola partition.
+    assert mat_events[0].materialization.partition == "coca_cola"
