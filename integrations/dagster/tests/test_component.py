@@ -646,6 +646,13 @@ def test_write_state_emits_alias_keys_and_round_trips(
                     "message": "transient fetch failure",
                 }
             ],
+            "collision_candidates": [
+                {
+                    "external_object_id": "ad_account_42",
+                    "sources": ["acme_shopify", "globex_stripe"],
+                }
+            ],
+            "new_sources": ["globex_stripe"],
         }
     )
     stub = _StubResource(discover_result=discover)
@@ -665,10 +672,16 @@ def test_write_state_emits_alias_keys_and_round_trips(
     # On-disk JSON carries the canonical alias key, not the Python attribute.
     assert "schema" in failed_source
     assert "schema_" not in failed_source
+    # The new onboarding-signal fields survive the discover() → model_dump_json
+    # write hop (not just the read hop) so the warning has data in production.
+    assert state["discover"]["collision_candidates"][0]["external_object_id"] == "ad_account_42"
+    assert state["discover"]["new_sources"] == ["globex_stripe"]
 
     # The persisted discover slot round-trips cleanly back through the model.
     round_tripped = DiscoverResult.model_validate(state["discover"])
     assert round_tripped.failed_sources[0].schema_ == "raw_shopify"
+    assert round_tripped.collision_candidates[0].sources == ["acme_shopify", "globex_stripe"]
+    assert round_tripped.new_sources == ["globex_stripe"]
 
 
 # ---------------------------------------------------------------------------
