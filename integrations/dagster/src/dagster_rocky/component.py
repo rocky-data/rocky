@@ -1488,7 +1488,7 @@ _PER_TENANT_METADATA_KEYS: frozenset[str] = frozenset(
 def _union_member_tables(members: list[SourceInfo]) -> list[TableInfo]:
     """Union the tables across all members of a collapsed group, by name.
 
-    A collapsed spec must cover every table any tenant has (FR Q2): if
+    A collapsed spec must cover every table any tenant has: if
     tenant A has a table tenant B lacks, the table still gets an asset; the
     partition for a tenant missing it simply no-ops at ``rocky run`` time.
     First occurrence of each name wins (stable order by first appearance).
@@ -1534,7 +1534,7 @@ def _unique_collapsed_group_name(representative: SourceInfo, used: set[str]) -> 
 
 
 def _neutralize_tenant_metadata(spec: dg.AssetSpec) -> dg.AssetSpec:
-    """Drop per-tenant metadata keys from a collapsed spec (FR §4.2 n1).
+    """Drop per-tenant metadata keys from a collapsed spec.
 
     The spec is built from one representative member, so ``source_id`` /
     ``last_sync_at`` / ``row_count`` reflect that single tenant. Removing
