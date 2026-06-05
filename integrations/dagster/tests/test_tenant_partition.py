@@ -341,3 +341,27 @@ def test_sensor_tenant_mode_sync_off_skips_unknown_partition():
     # sync off + partition doesn't exist → no run, no add.
     assert result.run_requests == []
     assert not result.dynamic_partitions_requests
+
+
+# --------------------------------------------------------------------------- #
+# Config: YAML resolution of the nested tenant block
+# --------------------------------------------------------------------------- #
+
+
+def test_tenant_block_resolves_from_yaml():
+    from dagster_rocky import RockyComponent
+
+    component = RockyComponent.resolve_from_yaml(
+        "config_path: rocky.toml\ntenant:\n  component: client\n  partitions_name: rocky_clients\n"
+    )
+    assert component.tenant is not None
+    assert component.tenant.component == "client"
+    assert component.tenant.partitions_name == "rocky_clients"
+    assert component.tenant.sync_partitions_from_discover is True
+
+
+def test_tenant_omitted_resolves_to_none():
+    from dagster_rocky import RockyComponent
+
+    component = RockyComponent.resolve_from_yaml("config_path: rocky.toml\n")
+    assert component.tenant is None
