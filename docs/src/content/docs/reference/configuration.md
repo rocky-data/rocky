@@ -318,16 +318,20 @@ adapter = "fivetran"
 
 Optional override for the adapter that lists schemas/tables. Useful when the source is discovered from one system (e.g., DuckDB) but its data lives somewhere else.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `adapter` | string | Yes | Adapter name to use for discovery. |
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `adapter` | string | Yes | — | Adapter name to use for discovery. |
+| `report_new_sources` | bool | No | `false` | Diff the discovered source inventory against the prior persisted snapshot and report first-seen schemas in the discover output's `new_sources`. The first discover of a pipeline records the baseline and reports nothing. Off by default — the diff and its state write only happen when opted in. |
+| `on_collision` | `"off"` \| `"warn"` \| `"error"` | No | `"off"` | Cross-source collision detection. When the same external object (e.g. an ad account) is onboarded under two schemas, its data lands in two target tables and silently doubles any downstream `UNION ALL`. `warn` reports the pairs in the discover output's `collision_candidates` and emits a `source_collision_detected` event; `error` additionally fails the discover so a colliding onboard can't silently create a catalog. `off` (default) skips detection entirely. Only adapters that resolve external object ids (e.g. Fivetran) participate; others contribute nothing. |
 
 ```toml
 [pipeline.bronze.source.discovery]
 adapter = "fivetran"
+report_new_sources = true   # surface freshly-onboarded sources in `new_sources`
+on_collision = "warn"       # surface same-object-twice onboards in `collision_candidates`
 ```
 
-If omitted, Rocky uses the source `adapter` for discovery.
+If omitted, Rocky uses the source `adapter` for discovery. See [Cross-source duplicate detection](#cross-source-duplicate-detection) for the detective counterpart that runs during replication.
 
 ### `[pipeline.NAME.source.schema_pattern]`
 
@@ -456,6 +460,7 @@ Rocky runs quality checks inline during replication. Two surfaces share this sec
 | `anomaly_threshold_pct` | float | `50.0` | Row count deviation percentage that triggers an anomaly. Set to 0 to disable. |
 | `quarantine` | table | | `{ mode = "split" \| "tag" \| "drop" }`. See below. |
 | `assertions` | list | `[]` | Repeated `[[assertions]]` blocks (DQX parity). See below. |
+| `cross_source_overlap` | table | | Flags the same business key appearing across sibling sources that feed one consolidation target. See [Cross-source duplicate detection](#cross-source-duplicate-detection). |
 
 ```toml
 [pipeline.bronze.checks]
@@ -472,7 +477,9 @@ Declarative model-level assertions. Each block declares a `type` and type-specif
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | (required) | One of: `not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`. |
+| `table` | string | (required) | Unqualified target table the assertion runs against. When assertions live in a model's sidecar TOML the table is implied; in pipeline-level `[[checks.assertions]]` blocks (shown below) it must be set explicitly. |
+| `name` | string | | Optional identifier used as the result's `name`; synthesized from `{kind}:{column}` when unset. Set it to disambiguate multiple assertions on the same table/kind/column. |
+| `type` | string | (required) | One of: `not_null`, `unique`, `unique_expr`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`. |
 | `column` | string | | Required for row-level column kinds (`not_null`, `unique`, `accepted_values`, `relationships`, `in_range`, `regex_match`, `not_in_future`, `older_than_n_days`). |
 | `severity` | string | `"error"` | `error` fails the pipeline (subject to `fail_on_error`); `warning` reports but never fails. |
 | `filter` | string | | SQL boolean predicate that scopes the assertion to a subset of rows. |
@@ -489,26 +496,31 @@ Type-specific parameters:
 | `regex_match` | `pattern: String` (dialect-specific regex; no single quotes, backticks, or semicolons) |
 | `aggregate` | `op: sum\|count\|avg\|min\|max`, `cmp: lt\|lte\|gt\|gte\|eq\|ne`, `value: String` |
 | `composite` | `kind: "unique"`, `columns: [String]` (≥2) |
+| `unique_expr` | `key_expr: String` (derived SQL key, e.g. `md5(tenant \|\| '-' \|\| id)`; passed through verbatim) |
 | `older_than_n_days` | `days: u32` |
 
 ```toml
 [[pipeline.silver.checks.assertions]]
+table = "orders"
 type = "not_null"
 column = "order_id"
 
 [[pipeline.silver.checks.assertions]]
+table = "orders"
 type = "accepted_values"
 column = "status"
 values = ["pending", "shipped", "delivered"]
 severity = "warning"
 
 [[pipeline.silver.checks.assertions]]
+table = "orders"
 type = "in_range"
 column = "amount_cents"
 min = "0"
 filter = "region = 'US' AND status != 'cancelled'"
 
 [[pipeline.silver.checks.assertions]]
+table = "orders"
 type = "aggregate"
 op = "sum"
 cmp = "gt"
@@ -516,10 +528,18 @@ value = "0"
 column = "amount_cents"
 
 [[pipeline.silver.checks.assertions]]
+table = "order_lines"
 type = "composite"
 kind = "unique"
 columns = ["order_id", "line_item_id"]
+
+[[pipeline.silver.checks.assertions]]
+table = "orders"
+type = "unique_expr"
+key_expr = "md5(tenant_id || '-' || order_id)"
 ```
+
+Use `unique_expr` when the meaningful identity is a *computed* value rather than any stored column — for example a surrogate key built to be stable across a multi-tenant union, which neither `unique` (single column) nor `composite` (column tuple) can express.
 
 #### `[pipeline.NAME.checks.quarantine]`
 
@@ -531,7 +551,32 @@ Route failing rows from row-level assertions into a dedicated table or column in
 | `tag` | Adds `__dqx_valid` boolean column; failing rows stay with `__dqx_valid = FALSE`. |
 | `drop` | Drops failing rows from `<target>`. |
 
-Set-based and table-level assertions (`unique`, `composite`, `row_count_range`, `aggregate`) run as post-hoc checks regardless of mode.
+Set-based and table-level assertions (`unique`, `unique_expr`, `composite`, `row_count_range`, `aggregate`) run as post-hoc checks regardless of mode.
+
+#### Cross-source duplicate detection
+
+The assertions above (especially `unique` / `unique_expr` / `composite`) also run on **replication** pipelines, not just transformation/quality ones — so a target table that's silently doubled by the same source arriving twice is caught at load time, not three models downstream.
+
+For the cross-*table* case — the same business key arriving through two **sibling** sources that later get `UNION`-ed into one consolidation target — use `[pipeline.NAME.checks.cross_source_overlap]`. A per-table `unique` check passes on each table individually; only an overlap check spanning the siblings sees the duplication.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `keys` | list of strings | `[]` | Business-key columns whose shared value across sibling tables signals a duplicate. Mutually exclusive with `key_expr`. |
+| `key_expr` | string | | Derived business-key expression (e.g. `md5(a \|\| '-' \|\| b)`) for sources without a single natural key. Mutually exclusive with `keys`. Passed through verbatim. |
+| `severity` | string | `"error"` | `error` fails the pipeline (subject to `fail_on_error`); `warning` reports but never fails. |
+| `max_overlap_rows` | integer | `0` | Overlap-key count above which the check fails. `0` means any overlap fails. |
+| `sample` | integer | `20` | Maximum overlapping keys attached to the result for triage. |
+
+Exactly one of `keys` or `key_expr` is required. Sibling tables whose key can't be evaluated (missing column / keyless) are skipped with a logged reason rather than erroring.
+
+```toml
+[pipeline.bronze.checks.cross_source_overlap]
+keys = ["order_id"]
+severity = "warning"
+max_overlap_rows = 0
+```
+
+This is the **detective** counterpart to discover-time `on_collision` (the **preventive** catch). See [Data Quality Checks](/concepts/data-quality-checks/#cross-source-overlap) for the full semantics.
 
 ### `[pipeline.NAME.execution]`
 

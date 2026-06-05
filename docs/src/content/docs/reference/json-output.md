@@ -76,7 +76,14 @@ Returns all discovered sources and their tables.
   ],
   "checks": {
     "freshness": { "threshold_seconds": 86400 }
-  }
+  },
+  "new_sources": ["src__acme__ca_central__shopify"],
+  "collision_candidates": [
+    {
+      "external_object_id": "act_1234567890",
+      "sources": ["src__acme__us_west__shopify", "src__acme__eu_central__shopify"]
+    }
+  ]
 }
 ```
 
@@ -99,8 +106,14 @@ Returns all discovered sources and their tables.
 | `failed_sources[].message` | string | Free-form error detail for human inspection. |
 | `checks` | object or absent | Pipeline-level check configuration, when `[checks]` is declared in `rocky.toml`. |
 | `checks.freshness.threshold_seconds` | integer | Freshness threshold in seconds. |
+| `new_sources` | array or absent | Source schemas seen for the first time since the prior snapshot. Present only when `[…source.discovery] report_new_sources = true`; absent (omitted) otherwise. The first discover of a pipeline establishes the baseline and reports none. |
+| `collision_candidates` | array or absent | Cross-source collisions — the same external object onboarded under more than one schema. Present only when `[…source.discovery] on_collision` is `"warn"` or `"error"`; absent otherwise. With `"error"`, discover also exits non-zero. |
+| `collision_candidates[].external_object_id` | string | The shared external object id (e.g. an ad-account id) found under more than one schema. |
+| `collision_candidates[].sources` | array | The distinct source schemas that resolve to this object id. |
 
 Consumers diffing successive discover snapshots **must** treat ids that appear in `failed_sources` but not in `sources` as "unknown state, do not delete"; that's the contract that distinguishes a fetch failure from a deletion. Available since engine `1.17.4`.
+
+`new_sources` and `collision_candidates` are the discover-time signals for [cross-source duplicate detection](/concepts/data-quality-checks/#cross-source-overlap); both are opt-in and omitted from the payload when their feature is off.
 
 ---
 
