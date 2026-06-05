@@ -761,6 +761,15 @@ class RockyResource(dg.ConfigurableResource):
     binary_path: str = "rocky"
     config_path: str = "rocky.toml"
     state_path: str = ".rocky-state.redb"
+    #: Optional per-namespace state file (engine ``--state-namespace``). When set
+    #: to a SQL identifier (``^[a-zA-Z0-9_]+$``), this resource's commands route
+    #: to ``<models>/.rocky-state/<namespace>.redb`` instead of the single global
+    #: file, so independent fan-out runs (e.g. one resource per client) don't
+    #: serialize on a single redb writer lock. Mutually exclusive with
+    #: ``state_path``: when set, ``--state-namespace`` is sent and the explicit
+    #: ``--state-path`` is omitted (an explicit ``--state-path`` disables
+    #: namespacing engine-side). Default ``None`` keeps the single global file.
+    state_namespace: str | None = None
     models_dir: str = "models"
     contracts_dir: str | None = None
     server_url: str | None = None
@@ -1135,16 +1144,16 @@ class RockyResource(dg.ConfigurableResource):
 
     def _build_cmd(self, args: list[str]) -> list[str]:
         binary = self._resolve_binary()
-        return [
-            binary,
-            "--config",
-            self.config_path,
-            "--state-path",
-            self.state_path,
-            "--output",
-            "json",
-            *args,
-        ]
+        cmd = [binary, "--config", self.config_path]
+        # ``--state-namespace`` and ``--state-path`` are mutually exclusive: the
+        # engine disables namespacing whenever an explicit ``--state-path`` is
+        # present (see ``resolve_state_namespace``), so send exactly one.
+        if self.state_namespace is not None:
+            cmd += ["--state-namespace", self.state_namespace]
+        else:
+            cmd += ["--state-path", self.state_path]
+        cmd += ["--output", "json", *args]
+        return cmd
 
     def _run_rocky_streaming(
         self,
@@ -1578,6 +1587,8 @@ class RockyResource(dg.ConfigurableResource):
         parallel: int | None = None,
         shadow_suffix: str | None = None,
         idempotency_key: str | None = None,
+        defer: bool = False,
+        defer_to: str | None = None,
     ) -> RunResult:
         """Run ``rocky run --filter <key=value>`` and return the parsed result.
 
@@ -1627,6 +1638,14 @@ class RockyResource(dg.ConfigurableResource):
 
                 ⚠️ Keys are stored verbatim in the state store; do NOT put
                 secrets in idempotency keys.
+            defer: Enable ``--defer`` — transformation models outside the build
+                selection resolve their ``ref()`` upstreams against an existing
+                (production) schema instead of being rebuilt. Inert on a full
+                build (nothing is unbuilt); meaningful when a subset is
+                materialized.
+            defer_to: ``--defer-to <schema>`` override for ``defer`` — point
+                every deferred upstream at this schema (catalog + table
+                preserved) instead of each upstream's own production home.
 
         Note on resolver interaction:
             Per-call resolvers registered on the resource (``shadow_suffix_fn``,
@@ -1661,6 +1680,8 @@ class RockyResource(dg.ConfigurableResource):
             "parallel": parallel,
             "shadow_suffix": resolved.get("shadow_suffix"),
             "idempotency_key": resolved.get("idempotency_key"),
+            "defer": defer,
+            "defer_to": defer_to,
         }
         run_args = self._build_run_args(filter, **build_kwargs)
         # Single fused plan+apply spawn. ``rocky run`` is the engine's
@@ -1688,6 +1709,8 @@ class RockyResource(dg.ConfigurableResource):
         parallel: int | None = None,
         shadow_suffix: str | None = None,
         idempotency_key: str | None = None,
+        defer: bool = False,
+        defer_to: str | None = None,
     ) -> RunResult:
         """``rocky run`` with live stderr streaming to ``context.log``.
 
@@ -1762,6 +1785,8 @@ class RockyResource(dg.ConfigurableResource):
             "parallel": parallel,
             "shadow_suffix": resolved.get("shadow_suffix"),
             "idempotency_key": resolved.get("idempotency_key"),
+            "defer": defer,
+            "defer_to": defer_to,
         }
         run_args = self._build_run_args(filter, **build_kwargs)
         # Single fused plan+apply spawn with the long-running run step
@@ -1789,6 +1814,8 @@ class RockyResource(dg.ConfigurableResource):
         parallel: int | None,
         shadow_suffix: str | None = None,
         idempotency_key: str | None = None,
+        defer: bool = False,
+        defer_to: str | None = None,
     ) -> list[str]:
         """Shared argv builder for the ``rocky run`` exec path.
 
@@ -1830,6 +1857,10 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--parallel", str(parallel)])
         if idempotency_key is not None:
             args.extend(["--idempotency-key", idempotency_key])
+        if defer:
+            args.append("--defer")
+        if defer_to is not None:
+            args.extend(["--defer-to", defer_to])
         return args
 
     def _build_plan_args(
@@ -1848,6 +1879,8 @@ class RockyResource(dg.ConfigurableResource):
         parallel: int | None,
         shadow_suffix: str | None = None,
         idempotency_key: str | None = None,
+        defer: bool = False,
+        defer_to: str | None = None,
     ) -> list[str]:
         """Sibling of :meth:`_build_run_args` that emits ``rocky plan`` argv.
 
@@ -1885,6 +1918,10 @@ class RockyResource(dg.ConfigurableResource):
             args.extend(["--parallel", str(parallel)])
         if idempotency_key is not None:
             args.extend(["--idempotency-key", idempotency_key])
+        if defer:
+            args.append("--defer")
+        if defer_to is not None:
+            args.extend(["--defer-to", defer_to])
         return args
 
     @staticmethod
@@ -1979,6 +2016,8 @@ class RockyResource(dg.ConfigurableResource):
         parallel: int | None = None,
         shadow_suffix: str | None = None,
         idempotency_key: str | None = None,
+        defer: bool = False,
+        defer_to: str | None = None,
         pipes_client: dg.PipesSubprocessClient | None = None,
         asset_key_fn: Callable[[list[str]], dg.AssetKey | None] | None = None,
         include_keys: set[dg.AssetKey] | None = None,
@@ -2099,6 +2138,8 @@ class RockyResource(dg.ConfigurableResource):
             "parallel": parallel,
             "shadow_suffix": resolved.get("shadow_suffix"),
             "idempotency_key": resolved.get("idempotency_key"),
+            "defer": defer,
+            "defer_to": defer_to,
         }
         # Deliberate asymmetry: unlike :meth:`run` / :meth:`run_streaming`
         # (which collapse to a single fused ``rocky run`` spawn), run_pipes

@@ -315,6 +315,13 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     binary_path: str = "rocky"
     config_path: str = "rocky.toml"
     state_path: str = ".rocky-state.redb"
+    #: Optional per-namespace state file (engine ``--state-namespace``); mirrors
+    #: :attr:`RockyResource.state_namespace`. When set to a SQL identifier, the
+    #: resource this component builds routes run state to
+    #: ``<models>/.rocky-state/<namespace>.redb`` instead of the single global
+    #: file, so independent fan-out runs don't serialize on one redb writer lock.
+    #: Mutually exclusive with ``state_path`` on the run path. Default ``None``.
+    state_namespace: str | None = None
     models_dir: str = "models"
     contracts_dir: str | None = None
     translator_class: str | None = None
@@ -591,6 +598,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             binary_path=self.binary_path,
             config_path=self.config_path,
             state_path=self.state_path,
+            state_namespace=self.state_namespace,
             models_dir=self.models_dir,
             contracts_dir=self.contracts_dir,
             strict_doctor=self.strict_doctor,

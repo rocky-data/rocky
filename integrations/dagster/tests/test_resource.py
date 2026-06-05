@@ -78,6 +78,54 @@ def test_build_cmd_includes_global_flags():
     ]
 
 
+def test_build_cmd_state_namespace_replaces_state_path():
+    """``state_namespace`` sends ``--state-namespace`` and omits ``--state-path``.
+
+    The engine disables namespacing whenever an explicit ``--state-path`` is
+    present, so the two are mutually exclusive — passing both would silently
+    drop the namespace and serialize fan-out runs on the global state file.
+    """
+    rocky = RockyResource(
+        config_path="rocky.toml",
+        state_path=".rocky-state.redb",
+        state_namespace="acme",
+    )
+    cmd = rocky._build_cmd(["discover"])
+    assert cmd[1:] == [
+        "--config",
+        "rocky.toml",
+        "--state-namespace",
+        "acme",
+        "--output",
+        "json",
+        "discover",
+    ]
+    assert "--state-path" not in cmd
+
+
+def test_build_run_args_defer_flags():
+    """``defer`` / ``defer_to`` emit ``--defer`` / ``--defer-to <schema>``."""
+    rocky = RockyResource(models_dir="m")
+    base: dict[str, Any] = {
+        "governance_override": None,
+        "run_models": False,
+        "partition": None,
+        "partition_from": None,
+        "partition_to": None,
+        "latest": False,
+        "missing": False,
+        "lookback": None,
+        "parallel": None,
+    }
+    args = rocky._build_run_args("tenant=acme", defer=True, defer_to="prod_main", **base)
+    assert "--defer" in args
+    assert args[args.index("--defer-to") + 1] == "prod_main"
+    # Default-off: neither flag appears when not requested (inert).
+    plain = rocky._build_run_args("tenant=acme", **base)
+    assert "--defer" not in plain
+    assert "--defer-to" not in plain
+
+
 def test_binary_path_resolved_once_and_cached():
     """``shutil.which`` is called exactly once per resource lifetime — the
     resolved binary is memoized and reused across the version check and
@@ -1807,6 +1855,8 @@ def test_build_plan_args_mirrors_build_run_args_flag_surface():
         "parallel": 2,
         "shadow_suffix": "_pr_42",
         "idempotency_key": "key-1",
+        "defer": True,
+        "defer_to": "prod_main",
     }
     run_args = rocky._build_run_args("tenant=acme", **kwargs)
     plan_args = rocky._build_plan_args("tenant=acme", **kwargs)
