@@ -2220,12 +2220,9 @@ mod live_tests {
         ))
     }
 
-    fn count_rows(warehouse: &dyn WarehouseAdapter, fqtn: &str) -> i64 {
-        let rt = tokio::runtime::Handle::current();
+    async fn count_rows(warehouse: &dyn WarehouseAdapter, fqtn: &str) -> i64 {
         let sql = format!("SELECT COUNT(*) AS n FROM {fqtn}");
-        let result = rt
-            .block_on(warehouse.execute_query(&sql))
-            .expect("count query");
+        let result = warehouse.execute_query(&sql).await.expect("count query");
         let cell = &result.rows[0][0];
         cell.as_i64()
             .or_else(|| cell.as_str().and_then(|s| s.parse().ok()))
@@ -2474,10 +2471,10 @@ mod live_tests {
                 .to_string()
         };
         let model_sql = format!(
-            "SELECT * FROM VALUES \
+            "SELECT * FROM (VALUES \
              (CAST({s}01 AS BIGINT), CAST('reuse-a' AS STRING), TIMESTAMP'{a}'), \
              (CAST({s}02 AS BIGINT), CAST('reuse-b' AS STRING), TIMESTAMP'{b}'), \
-             (CAST({s}03 AS BIGINT), CAST('reuse-c' AS STRING), TIMESTAMP'{c}') \
+             (CAST({s}03 AS BIGINT), CAST('reuse-c' AS STRING), TIMESTAMP'{c}')) \
              AS t(id, name, ts)",
             s = seed,
             a = ts(0),
@@ -2590,7 +2587,7 @@ mod live_tests {
             .await
             .expect("first build must succeed");
         assert!(r_summary.reused_from.is_none(), "first run is a build");
-        let count_after_build = count_rows(warehouse_dyn, &fqtn);
+        let count_after_build = count_rows(warehouse_dyn, &fqtn).await;
         let input_hash = record_r_build(&store, &model_ir, "run-R", &r_summary);
         assert_eq!(
             store.refcount_for_hash(&r_summary.blake3_hash).unwrap(),
@@ -2624,7 +2621,7 @@ mod live_tests {
         );
 
         // The data is correct + unchanged — reuse did not duplicate R's rows.
-        let count_after_reuse = count_rows(warehouse_dyn, &fqtn);
+        let count_after_reuse = count_rows(warehouse_dyn, &fqtn).await;
         assert_eq!(
             count_after_reuse, count_after_build,
             "a same-target point-to must NOT change the row count (no double-count)"
@@ -2688,7 +2685,7 @@ mod live_tests {
             .await
             .expect("VACUUM must succeed on the sandbox");
 
-        let count_before_reuse = count_rows(warehouse_dyn, &fqtn);
+        let count_before_reuse = count_rows(warehouse_dyn, &fqtn).await;
 
         // Run 2 — reuse on, but R's file is gone ⇒ the decision's liveness
         // clause (or the commit-time re-check) fails ⇒ BUILD.
@@ -2705,7 +2702,7 @@ mod live_tests {
             "with R's file VACUUM'd, the run must BUILD, never point-to a missing file"
         );
         // A fresh build wrote 3 rows back.
-        let count_after = count_rows(warehouse_dyn, &fqtn);
+        let count_after = count_rows(warehouse_dyn, &fqtn).await;
         assert_eq!(
             count_after,
             count_before_reuse + 3,
@@ -2763,7 +2760,7 @@ mod live_tests {
             "a changed upstream/model must yield a different input_hash"
         );
 
-        let count_before = count_rows(warehouse_dyn, &fqtn);
+        let count_before = count_rows(warehouse_dyn, &fqtn).await;
         let ctx = ReuseDecisionCtx {
             input_hash: Some(changed_input_hash),
             state_store: &store,
@@ -2780,7 +2777,7 @@ mod live_tests {
             summary.blake3_hash, r_summary.blake3_hash,
             "different inputs produce a different output blake3"
         );
-        let count_after = count_rows(warehouse_dyn, &fqtn);
+        let count_after = count_rows(warehouse_dyn, &fqtn).await;
         assert_eq!(
             count_after,
             count_before + 3,
