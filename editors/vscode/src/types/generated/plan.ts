@@ -6,6 +6,135 @@
  */
 
 /**
+ * A single typed semantic change between two `ProjectIr` snapshots.
+ *
+ * Each variant carries the minimum identifying context (model + column + before/after values) needed for a CLI / PR-preview surface to render a useful message without re-loading either IR.
+ */
+export type BreakingChange =
+  | {
+      kind: "model_removed";
+      model: string;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "model_added";
+      model: string;
+      [k: string]: unknown;
+    }
+  | {
+      column: string;
+      data_type: string;
+      kind: "column_dropped";
+      model: string;
+      [k: string]: unknown;
+    }
+  | {
+      column: string;
+      data_type: string;
+      kind: "column_added";
+      model: string;
+      nullable: boolean;
+      [k: string]: unknown;
+    }
+  | {
+      column: string;
+      kind: "column_type_changed";
+      model: string;
+      /**
+       * `true` when the new type cannot represent every value of the old type (Int64 → Int32, Decimal precision shrink, Timestamp → Date).
+       */
+      narrowing: boolean;
+      new_type: string;
+      old_type: string;
+      [k: string]: unknown;
+    }
+  | {
+      column: string;
+      kind: "column_nullability_changed";
+      model: string;
+      new_nullable: boolean;
+      old_nullable: boolean;
+      [k: string]: unknown;
+    }
+  | {
+      column: string;
+      kind: "column_reordered";
+      model: string;
+      new_index: number;
+      old_index: number;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "materialization_strategy_changed";
+      model: string;
+      new_strategy: string;
+      old_strategy: string;
+      [k: string]: unknown;
+    }
+  | {
+      /**
+       * Which key changed: `unique_key`, `timestamp_column`, `partition_by`, `time_column`, `granularity`, `target_lag`, `update_columns`, `storage_prefix`, or `partition_columns`.
+       */
+      key_kind: string;
+      kind: "materialization_key_changed";
+      model: string;
+      new: string[];
+      old: string[];
+      [k: string]: unknown;
+    }
+  | {
+      kind: "replication_columns_changed";
+      model: string;
+      new: string[];
+      old: string[];
+      [k: string]: unknown;
+    }
+  | {
+      kind: "partition_by_changed";
+      model: string;
+      new: string[];
+      old: string[];
+      [k: string]: unknown;
+    }
+  | {
+      kind: "target_renamed";
+      model: string;
+      new: string;
+      old: string;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "source_changed";
+      model: string;
+      new: string[];
+      old: string[];
+      [k: string]: unknown;
+    }
+  | {
+      column: string;
+      kind: "column_mask_changed";
+      model: string;
+      new_strategy?: string | null;
+      old_strategy?: string | null;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "lakehouse_format_changed";
+      model: string;
+      new: string;
+      old: string;
+      [k: string]: unknown;
+    }
+  | {
+      kind: "sql_body_changed";
+      model: string;
+      [k: string]: unknown;
+    };
+/**
+ * Severity classification for a single semantic change.
+ */
+export type BreakingSeverity = "breaking" | "warning" | "info";
+/**
  * Severity level of a diagnostic.
  *
  * Serialized in PascalCase (`"Error"`, `"Warning"`, `"Info"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.
@@ -22,6 +151,10 @@ export type Severity = "Error" | "Warning" | "Info";
  * `plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers` are additive — all have `skip_serializing_if` so existing fixtures and consumers that do not include a compile step remain byte-stable. When `rocky plan` runs against a project with a `models/` directory, these fields are populated and the plan is persisted to `.rocky/plans/`.
  */
 export interface PlanOutput {
+  /**
+   * Semantic change-impact verdict from the typed-IR breaking-change classifier, surfaced as decision-support at plan time. Present only when `--semantic` ran with a usable baseline. See [`SemanticPlanVerdict`] — note its `caveat`: the classifier diffs OUTPUT SCHEMA only and is blind to schema-stable value changes.
+   */
+  breaking_verdict?: SemanticPlanVerdict | null;
   /**
    * Per-model E027 budget-exceeded diagnostics produced at plan time using real catalog statistics. Severity reflects the model's `on_breach` policy (`"warn"` or `"error"`). Empty when no ceiling was exceeded or no real stats were available.
    */
@@ -70,6 +203,40 @@ export interface PlanOutput {
   retention_actions?: RetentionAction[];
   statements: PlannedStatement[];
   version: string;
+  [k: string]: unknown;
+}
+/**
+ * Decision-support verdict from the typed-IR breaking-change classifier, attached to `PlanOutput` when `rocky plan --semantic` runs against a usable baseline.
+ *
+ * # Scope and blindness
+ *
+ * The classifier diffs the typed **output schema** of each model between the baseline git ref and the working tree (column drop/add/type narrowing, nullability, materialization keys, masks, target rename). It is **blind to schema-stable value changes**: a `WHERE` / `JOIN`-key / `CASE` rewrite that changes every output row but leaves the column list and types untouched produces **no finding**. An empty `findings` list therefore means "no output-schema change was detected" — it is **not** a completeness or safety signal that the data is unchanged. The [`Self::caveat`] field carries this statement verbatim so a consumer that only reads the JSON cannot miss it.
+ *
+ * # Reporting-only
+ *
+ * This verdict never gates the plan. Even a `breaking`-severity finding leaves the planned statements and the process exit code unchanged. The hard gate (which blocks on `breaking`) lives on `rocky plan promote`.
+ */
+export interface SemanticPlanVerdict {
+  /**
+   * The git ref the working tree was diffed against (the `--base` value, default `"main"`).
+   */
+  base_ref: string;
+  /**
+   * Verbatim statement of what the classifier does and does not see. Always populated — present even when `findings` is empty, because "no findings" is the case most easily misread as "safe". See the type-level docs for why this is load-bearing.
+   */
+  caveat: string;
+  /**
+   * Classified output-schema findings (one per detected change), including `info`-severity entries. Each finding carries its own `model`, tagged `change.kind`, and `severity` (`breaking` / `warning` / `info`). Empty when no output-schema change was detected — which, per `caveat`, is not a safety signal.
+   */
+  findings: BreakingFinding[];
+  [k: string]: unknown;
+}
+/**
+ * A classified finding produced by [`diff_project_ir`].
+ */
+export interface BreakingFinding {
+  change: BreakingChange;
+  severity: BreakingSeverity;
   [k: string]: unknown;
 }
 /**

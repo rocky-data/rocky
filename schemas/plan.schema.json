@@ -1,6 +1,523 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "BreakingChange": {
+      "description": "A single typed semantic change between two `ProjectIr` snapshots.\n\nEach variant carries the minimum identifying context (model + column + before/after values) needed for a CLI / PR-preview surface to render a useful message without re-loading either IR.",
+      "oneOf": [
+        {
+          "description": "A model present on the base side is absent on the head side.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "model_removed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A model present on the head side is absent on the base side.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "model_added"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A column present on the base side is absent on the head side.",
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "data_type": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "column_dropped"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "column",
+            "data_type",
+            "kind",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A column was added.",
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "data_type": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "column_added"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "nullable": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "column",
+            "data_type",
+            "kind",
+            "model",
+            "nullable"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A column's data type changed.",
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "column_type_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "narrowing": {
+              "description": "`true` when the new type cannot represent every value of the old type (Int64 → Int32, Decimal precision shrink, Timestamp → Date).",
+              "type": "boolean"
+            },
+            "new_type": {
+              "type": "string"
+            },
+            "old_type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "column",
+            "kind",
+            "model",
+            "narrowing",
+            "new_type",
+            "old_type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A column's nullability flipped.",
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "column_nullability_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new_nullable": {
+              "type": "boolean"
+            },
+            "old_nullable": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "column",
+            "kind",
+            "model",
+            "new_nullable",
+            "old_nullable"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A column's position in the output schema changed. `SELECT *` downstream consumers see different positional projection.",
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "column_reordered"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new_index": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "old_index": {
+              "format": "uint",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "column",
+            "kind",
+            "model",
+            "new_index",
+            "old_index"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The materialization strategy switched between top-level variants (e.g. `FullRefresh` → `Incremental`).",
+          "properties": {
+            "kind": {
+              "enum": [
+                "materialization_strategy_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new_strategy": {
+              "type": "string"
+            },
+            "old_strategy": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model",
+            "new_strategy",
+            "old_strategy"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Materialization-specific key columns changed without the top-level variant changing (e.g. `Merge` `unique_key` rewritten, `Incremental` `timestamp_column` swapped).",
+          "properties": {
+            "key_kind": {
+              "description": "Which key changed: `unique_key`, `timestamp_column`, `partition_by`, `time_column`, `granularity`, `target_lag`, `update_columns`, `storage_prefix`, or `partition_columns`.",
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "materialization_key_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "old": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "key_kind",
+            "kind",
+            "model",
+            "new",
+            "old"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Replication column-selection mode flipped between `All` and `Explicit(...)` or the explicit list changed.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "replication_columns_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "old": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "model",
+            "new",
+            "old"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`LakehouseOptions::partition_by` changed without the strategy changing. Distinct from `MaterializationKeyChanged` since this lives on `format_options` rather than the strategy enum.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "partition_by_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "old": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "model",
+            "new",
+            "old"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Target table reference renamed (catalog, schema, or table component).",
+          "properties": {
+            "kind": {
+              "enum": [
+                "target_renamed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new": {
+              "type": "string"
+            },
+            "old": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model",
+            "new",
+            "old"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Source reference rebound to a different table.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "source_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "old": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "model",
+            "new",
+            "old"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A column mask was added, removed, or its strategy changed.",
+          "properties": {
+            "column": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "column_mask_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new_strategy": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "old_strategy": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "column",
+            "kind",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Lakehouse format switched (e.g. `DeltaTable` → `IcebergTable`).",
+          "properties": {
+            "kind": {
+              "enum": [
+                "lakehouse_format_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "new": {
+              "type": "string"
+            },
+            "old": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model",
+            "new",
+            "old"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "SQL body changed without any other detectable structural change. Surfaced as `Info` because the typed-output shape is unchanged, but runtime row contents may differ.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "sql_body_changed"
+              ],
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "model"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BreakingFinding": {
+      "description": "A classified finding produced by [`diff_project_ir`].",
+      "properties": {
+        "change": {
+          "$ref": "#/definitions/BreakingChange"
+        },
+        "severity": {
+          "$ref": "#/definitions/BreakingSeverity"
+        }
+      },
+      "required": [
+        "change",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "BreakingSeverity": {
+      "description": "Severity classification for a single semantic change.",
+      "oneOf": [
+        {
+          "description": "Will break a downstream consumer that reads the model's prior shape.",
+          "enum": [
+            "breaking"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "May break consumers depending on usage; e.g. nullable → NOT NULL, column reordered.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Informational only — purely additive or backwards-compatible.",
+          "enum": [
+            "info"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "ClassificationAction": {
       "description": "Classification-tag application row in `PlanOutput.classification_actions`.",
       "properties": {
@@ -148,6 +665,32 @@
       ],
       "type": "object"
     },
+    "SemanticPlanVerdict": {
+      "description": "Decision-support verdict from the typed-IR breaking-change classifier, attached to `PlanOutput` when `rocky plan --semantic` runs against a usable baseline.\n\n# Scope and blindness\n\nThe classifier diffs the typed **output schema** of each model between the baseline git ref and the working tree (column drop/add/type narrowing, nullability, materialization keys, masks, target rename). It is **blind to schema-stable value changes**: a `WHERE` / `JOIN`-key / `CASE` rewrite that changes every output row but leaves the column list and types untouched produces **no finding**. An empty `findings` list therefore means \"no output-schema change was detected\" — it is **not** a completeness or safety signal that the data is unchanged. The [`Self::caveat`] field carries this statement verbatim so a consumer that only reads the JSON cannot miss it.\n\n# Reporting-only\n\nThis verdict never gates the plan. Even a `breaking`-severity finding leaves the planned statements and the process exit code unchanged. The hard gate (which blocks on `breaking`) lives on `rocky plan promote`.",
+      "properties": {
+        "base_ref": {
+          "description": "The git ref the working tree was diffed against (the `--base` value, default `\"main\"`).",
+          "type": "string"
+        },
+        "caveat": {
+          "description": "Verbatim statement of what the classifier does and does not see. Always populated — present even when `findings` is empty, because \"no findings\" is the case most easily misread as \"safe\". See the type-level docs for why this is load-bearing.",
+          "type": "string"
+        },
+        "findings": {
+          "description": "Classified output-schema findings (one per detected change), including `info`-severity entries. Each finding carries its own `model`, tagged `change.kind`, and `severity` (`breaking` / `warning` / `info`). Empty when no output-schema change was detected — which, per `caveat`, is not a safety signal.",
+          "items": {
+            "$ref": "#/definitions/BreakingFinding"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "base_ref",
+        "caveat",
+        "findings"
+      ],
+      "type": "object"
+    },
     "Severity": {
       "description": "Severity level of a diagnostic.\n\nSerialized in PascalCase (`\"Error\"`, `\"Warning\"`, `\"Info\"`) to stay compatible with existing dagster fixtures and the hand-written `Severity` StrEnum in `integrations/dagster/src/dagster_rocky/types.py`.",
       "enum": [
@@ -184,6 +727,17 @@
   },
   "description": "JSON output for `rocky plan`.\n\n`statements` enumerates the warehouse SQL Rocky would emit. The three `*_actions` collections are a parallel view of the control-plane governance work `rocky run` would do *after* a successful DAG — the classification / masking / retention reconcile pass. These never show up as SQL; they fire through [`rocky_core::traits::GovernanceAdapter`] methods (e.g. `apply_column_tags`, `apply_masking_policy`, `apply_retention_policy`). Projects without any `[classification]`, `[mask]`, or `retention` config get empty lists — the fields `skip_serializing_if = Vec::is_empty`, so JSON consumers written against the pre-Wave A shape are byte-stable.\n\n## Phase 2 additions (Cluster 3 B)\n\n`plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers` are additive — all have `skip_serializing_if` so existing fixtures and consumers that do not include a compile step remain byte-stable. When `rocky plan` runs against a project with a `models/` directory, these fields are populated and the plan is persisted to `.rocky/plans/`.",
   "properties": {
+    "breaking_verdict": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SemanticPlanVerdict"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Semantic change-impact verdict from the typed-IR breaking-change classifier, surfaced as decision-support at plan time. Present only when `--semantic` ran with a usable baseline. See [`SemanticPlanVerdict`] — note its `caveat`: the classifier diffs OUTPUT SCHEMA only and is blind to schema-stable value changes."
+    },
     "budget_diagnostics": {
       "description": "Per-model E027 budget-exceeded diagnostics produced at plan time using real catalog statistics. Severity reflects the model's `on_breach` policy (`\"warn\"` or `\"error\"`). Empty when no ceiling was exceeded or no real stats were available.",
       "items": {

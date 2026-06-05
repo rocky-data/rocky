@@ -244,6 +244,10 @@ rocky plan --filter <key=value> [flags]
 |------|------|---------|-------------|
 | `--filter <key=value>` | `string` | **(required)** | Filter sources by component value (e.g., `client=acme`). |
 | `--pipeline <NAME>` | `string` | | Pipeline name (required if multiple pipelines are defined). |
+| `--semantic` | `bool` | `false` | Also run the breaking-change classifier against `--base` and attach the change-impact verdict under `breaking_verdict`. Decision-support only — never gates the plan and never changes the exit code. |
+| `--base <ref>` | `string` | `main` | Git ref the working tree is diffed against for `--semantic`. Ignored without `--semantic`. |
+
+> The `--semantic` verdict diffs **output schema** only and is **blind to schema-stable value changes** (a `WHERE` / `JOIN`-key / `CASE` rewrite that changes values but not the schema). An empty `findings` list is not a safety signal — the verdict's `caveat` field states this verbatim. See the [CI/CD guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate) for the full flow and the [`plan` schema](https://github.com/rocky-data/rocky/blob/main/schemas/plan.schema.json) for the `SemanticPlanVerdict` shape.
 
 ### Examples
 

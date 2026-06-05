@@ -21,61 +21,61 @@ class BreakingChange(BaseModel):
     model: str
 
 
-class Kind57(StrEnum):
+class Kind73(StrEnum):
     model_added = "model_added"
 
 
-class BreakingChange53(BaseModel):
+class BreakingChange70(BaseModel):
     """
     A model present on the head side is absent on the base side.
     """
 
-    kind: Kind57
+    kind: Kind73
     model: str
 
 
-class Kind58(StrEnum):
+class Kind74(StrEnum):
     column_dropped = "column_dropped"
 
 
-class BreakingChange54(BaseModel):
+class BreakingChange71(BaseModel):
     """
     A column present on the base side is absent on the head side.
     """
 
     column: str
     data_type: str
-    kind: Kind58
+    kind: Kind74
     model: str
 
 
-class Kind59(StrEnum):
+class Kind75(StrEnum):
     column_added = "column_added"
 
 
-class BreakingChange55(BaseModel):
+class BreakingChange72(BaseModel):
     """
     A column was added.
     """
 
     column: str
     data_type: str
-    kind: Kind59
+    kind: Kind75
     model: str
     nullable: bool
 
 
-class Kind60(StrEnum):
+class Kind76(StrEnum):
     column_type_changed = "column_type_changed"
 
 
-class BreakingChange56(BaseModel):
+class BreakingChange73(BaseModel):
     """
     A column's data type changed.
     """
 
     column: str
-    kind: Kind60
+    kind: Kind76
     model: str
     narrowing: bool
     """
@@ -85,58 +85,58 @@ class BreakingChange56(BaseModel):
     old_type: str
 
 
-class Kind61(StrEnum):
+class Kind77(StrEnum):
     column_nullability_changed = "column_nullability_changed"
 
 
-class BreakingChange57(BaseModel):
+class BreakingChange74(BaseModel):
     """
     A column's nullability flipped.
     """
 
     column: str
-    kind: Kind61
+    kind: Kind77
     model: str
     new_nullable: bool
     old_nullable: bool
 
 
-class Kind62(StrEnum):
+class Kind78(StrEnum):
     column_reordered = "column_reordered"
 
 
-class BreakingChange58(BaseModel):
+class BreakingChange75(BaseModel):
     """
     A column's position in the output schema changed. `SELECT *` downstream consumers see different positional projection.
     """
 
     column: str
-    kind: Kind62
+    kind: Kind78
     model: str
     new_index: conint(ge=0)
     old_index: conint(ge=0)
 
 
-class Kind63(StrEnum):
+class Kind79(StrEnum):
     materialization_strategy_changed = "materialization_strategy_changed"
 
 
-class BreakingChange59(BaseModel):
+class BreakingChange76(BaseModel):
     """
     The materialization strategy switched between top-level variants (e.g. `FullRefresh` → `Incremental`).
     """
 
-    kind: Kind63
+    kind: Kind79
     model: str
     new_strategy: str
     old_strategy: str
 
 
-class Kind64(StrEnum):
+class Kind80(StrEnum):
     materialization_key_changed = "materialization_key_changed"
 
 
-class BreakingChange60(BaseModel):
+class BreakingChange77(BaseModel):
     """
     Materialization-specific key columns changed without the top-level variant changing (e.g. `Merge` `unique_key` rewritten, `Incremental` `timestamp_column` swapped).
     """
@@ -145,117 +145,117 @@ class BreakingChange60(BaseModel):
     """
     Which key changed: `unique_key`, `timestamp_column`, `partition_by`, `time_column`, `granularity`, `target_lag`, `update_columns`, `storage_prefix`, or `partition_columns`.
     """
-    kind: Kind64
+    kind: Kind80
     model: str
     new: list[str]
     old: list[str]
 
 
-class Kind65(StrEnum):
+class Kind81(StrEnum):
     replication_columns_changed = "replication_columns_changed"
 
 
-class BreakingChange61(BaseModel):
+class BreakingChange78(BaseModel):
     """
     Replication column-selection mode flipped between `All` and `Explicit(...)` or the explicit list changed.
     """
 
-    kind: Kind65
+    kind: Kind81
     model: str
     new: list[str]
     old: list[str]
 
 
-class Kind66(StrEnum):
+class Kind82(StrEnum):
     partition_by_changed = "partition_by_changed"
 
 
-class BreakingChange62(BaseModel):
+class BreakingChange79(BaseModel):
     """
     `LakehouseOptions::partition_by` changed without the strategy changing. Distinct from `MaterializationKeyChanged` since this lives on `format_options` rather than the strategy enum.
     """
 
-    kind: Kind66
+    kind: Kind82
     model: str
     new: list[str]
     old: list[str]
 
 
-class Kind67(StrEnum):
+class Kind83(StrEnum):
     target_renamed = "target_renamed"
 
 
-class BreakingChange63(BaseModel):
+class BreakingChange80(BaseModel):
     """
     Target table reference renamed (catalog, schema, or table component).
     """
 
-    kind: Kind67
+    kind: Kind83
     model: str
     new: str
     old: str
 
 
-class Kind68(StrEnum):
+class Kind84(StrEnum):
     source_changed = "source_changed"
 
 
-class BreakingChange64(BaseModel):
+class BreakingChange81(BaseModel):
     """
     Source reference rebound to a different table.
     """
 
-    kind: Kind68
+    kind: Kind84
     model: str
     new: list[str]
     old: list[str]
 
 
-class Kind69(StrEnum):
+class Kind85(StrEnum):
     column_mask_changed = "column_mask_changed"
 
 
-class BreakingChange65(BaseModel):
+class BreakingChange82(BaseModel):
     """
     A column mask was added, removed, or its strategy changed.
     """
 
     column: str
-    kind: Kind69
+    kind: Kind85
     model: str
     new_strategy: str | None = None
     old_strategy: str | None = None
 
 
-class Kind70(StrEnum):
+class Kind86(StrEnum):
     lakehouse_format_changed = "lakehouse_format_changed"
 
 
-class BreakingChange66(BaseModel):
+class BreakingChange83(BaseModel):
     """
     Lakehouse format switched (e.g. `DeltaTable` → `IcebergTable`).
     """
 
-    kind: Kind70
+    kind: Kind86
     model: str
     new: str
     old: str
 
 
-class Kind71(StrEnum):
+class Kind87(StrEnum):
     sql_body_changed = "sql_body_changed"
 
 
-class BreakingChange67(BaseModel):
+class BreakingChange84(BaseModel):
     """
     SQL body changed without any other detectable structural change. Surfaced as `Info` because the typed-output shape is unchanged, but runtime row contents may differ.
     """
 
-    kind: Kind71
+    kind: Kind87
     model: str
 
 
-class BreakingSeverity10(StrEnum):
+class BreakingSeverity13(StrEnum):
     """
     Will break a downstream consumer that reads the model's prior shape.
     """
@@ -263,7 +263,7 @@ class BreakingSeverity10(StrEnum):
     breaking = "breaking"
 
 
-class BreakingSeverity11(StrEnum):
+class BreakingSeverity14(StrEnum):
     """
     May break consumers depending on usage; e.g. nullable → NOT NULL, column reordered.
     """
@@ -271,7 +271,7 @@ class BreakingSeverity11(StrEnum):
     warning = "warning"
 
 
-class BreakingSeverity12(StrEnum):
+class BreakingSeverity15(StrEnum):
     """
     Informational only — purely additive or backwards-compatible.
     """
@@ -286,28 +286,28 @@ class BreakingFinding(BaseModel):
 
     change: (
         BreakingChange
-        | BreakingChange53
-        | BreakingChange54
-        | BreakingChange55
-        | BreakingChange56
-        | BreakingChange57
-        | BreakingChange58
-        | BreakingChange59
-        | BreakingChange60
-        | BreakingChange61
-        | BreakingChange62
-        | BreakingChange63
-        | BreakingChange64
-        | BreakingChange65
-        | BreakingChange66
-        | BreakingChange67
+        | BreakingChange70
+        | BreakingChange71
+        | BreakingChange72
+        | BreakingChange73
+        | BreakingChange74
+        | BreakingChange75
+        | BreakingChange76
+        | BreakingChange77
+        | BreakingChange78
+        | BreakingChange79
+        | BreakingChange80
+        | BreakingChange81
+        | BreakingChange82
+        | BreakingChange83
+        | BreakingChange84
     )
     """
     A single typed semantic change between two `ProjectIr` snapshots.
 
     Each variant carries the minimum identifying context (model + column + before/after values) needed for a CLI / PR-preview surface to render a useful message without re-loading either IR.
     """
-    severity: BreakingSeverity10 | BreakingSeverity11 | BreakingSeverity12
+    severity: BreakingSeverity13 | BreakingSeverity14 | BreakingSeverity15
     """
     Severity classification for a single semantic change.
     """

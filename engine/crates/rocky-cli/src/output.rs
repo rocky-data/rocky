@@ -1208,7 +1208,79 @@ pub struct PlanOutput {
     /// re-derived at apply time. Empty for replication-only plans.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub execution_layers: Vec<Vec<String>>,
+
+    // ---- Semantic breaking-change verdict (decision-support) ------------
+    //
+    // Populated only when `rocky plan --semantic` runs AND a baseline
+    // compile is available (the `--base` git ref's models compiled
+    // cleanly alongside the working tree). The verdict is REPORTING-ONLY:
+    // it never gates, skips, or alters which statements are planned, and
+    // a `breaking` finding does not change the exit code. The hard gate
+    // lives on `rocky plan promote`.
+    //
+    // `None` (omitted) on a default `rocky plan`, when `--semantic` is
+    // absent, or when no baseline could be materialized — so existing
+    // consumers and fixtures stay byte-stable.
+    /// Semantic change-impact verdict from the typed-IR breaking-change
+    /// classifier, surfaced as decision-support at plan time. Present only
+    /// when `--semantic` ran with a usable baseline. See
+    /// [`SemanticPlanVerdict`] — note its `caveat`: the classifier diffs
+    /// OUTPUT SCHEMA only and is blind to schema-stable value changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breaking_verdict: Option<SemanticPlanVerdict>,
 }
+
+/// Decision-support verdict from the typed-IR breaking-change classifier,
+/// attached to `PlanOutput` when `rocky plan --semantic` runs against a
+/// usable baseline.
+///
+/// # Scope and blindness
+///
+/// The classifier diffs the typed **output schema** of each model between
+/// the baseline git ref and the working tree (column drop/add/type
+/// narrowing, nullability, materialization keys, masks, target rename).
+/// It is **blind to schema-stable value changes**: a `WHERE` / `JOIN`-key
+/// / `CASE` rewrite that changes every output row but leaves the column
+/// list and types untouched produces **no finding**. An empty `findings`
+/// list therefore means "no output-schema change was detected" — it is
+/// **not** a completeness or safety signal that the data is unchanged.
+/// The [`Self::caveat`] field carries this statement verbatim so a
+/// consumer that only reads the JSON cannot miss it.
+///
+/// # Reporting-only
+///
+/// This verdict never gates the plan. Even a `breaking`-severity finding
+/// leaves the planned statements and the process exit code unchanged. The
+/// hard gate (which blocks on `breaking`) lives on `rocky plan promote`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SemanticPlanVerdict {
+    /// Verbatim statement of what the classifier does and does not see.
+    /// Always populated — present even when `findings` is empty, because
+    /// "no findings" is the case most easily misread as "safe". See the
+    /// type-level docs for why this is load-bearing.
+    pub caveat: String,
+    /// The git ref the working tree was diffed against (the `--base`
+    /// value, default `"main"`).
+    pub base_ref: String,
+    /// Classified output-schema findings (one per detected change),
+    /// including `info`-severity entries. Each finding carries its own
+    /// `model`, tagged `change.kind`, and `severity`
+    /// (`breaking` / `warning` / `info`). Empty when no output-schema
+    /// change was detected — which, per `caveat`, is not a safety signal.
+    pub findings: Vec<rocky_core::breaking_change::BreakingFinding>,
+}
+
+/// Verbatim caveat text embedded in every [`SemanticPlanVerdict::caveat`].
+///
+/// Single source of truth so the JSON payload and the text-mode render
+/// never drift. States plainly that the classifier diffs OUTPUT SCHEMA and
+/// is blind to schema-stable value changes, and that an empty finding list
+/// is not a completeness signal.
+pub const SEMANTIC_VERDICT_CAVEAT: &str = "This verdict diffs OUTPUT SCHEMA only \
+(columns, types, nullability, materialization keys, masks, target). It is BLIND to \
+schema-stable value changes: a WHERE / JOIN-key / CASE rewrite that changes every output \
+row but not the schema produces no finding. An empty findings list means no output-schema \
+change was detected — it is NOT a signal that the data or the model is unchanged.";
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PlannedStatement {
@@ -4050,6 +4122,7 @@ impl PlanOutput {
             created_at: None,
             models: vec![],
             execution_layers: vec![],
+            breaking_verdict: None,
         }
     }
 }
