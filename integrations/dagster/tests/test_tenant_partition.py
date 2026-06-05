@@ -481,3 +481,67 @@ def test_collapsed_execution_remaps_engine_key_to_collapsed_asset(tmp_path):
     assert mat_events[0].asset_key == collapsed_key
     # …attributed to the coca_cola partition.
     assert mat_events[0].materialization.partition == "coca_cola"
+
+
+def test_component_entry_builds_collapsed_defs_with_optimize_and_sensor(tmp_path):
+    """Full component entry point with tenant set: the optimize-metadata
+    merge (default on) does replace_attributes on the collapsed specs — must
+    preserve partitions_def so the asset/check partition-match invariant
+    holds after the round-trip — and the sensor is bundled."""
+    discover = {
+        "version": "0.3.0",
+        "command": "discover",
+        "sources": [
+            {
+                "id": f"src_{c}",
+                "source_type": "fivetran",
+                "components": {"client": c, "region": "usa", "source": "facebookads"},
+                "tables": [{"name": "orders"}],
+            }
+            for c in ("coca_cola", "pepsi")
+        ],
+    }
+    # Optimize recommendation keyed to the collapsed table leaf ("orders") so
+    # _merge_optimize_metadata actually merges onto the partitioned spec.
+    optimize = {
+        "version": "0.3.0",
+        "command": "optimize",
+        "total_models_analyzed": 1,
+        "recommendations": [
+            {
+                "model_name": "orders",
+                "current_strategy": "table",
+                "compute_cost_per_run": 0.01,
+                "storage_cost_per_month": 1.0,
+                "downstream_references": 1,
+                "recommended_strategy": "view",
+                "estimated_monthly_savings": 0.5,
+                "reasoning": "cheap",
+            }
+        ],
+    }
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"discover": discover, "optimize": optimize}))
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        tenant=TenantConfig(component="client", partitions_name="rocky_clients"),
+        enable_sensor=True,
+    )
+    defs = component.build_defs_from_state(context=None, state_path=state_file)
+
+    asset_defs = [a for a in (defs.assets or []) if isinstance(a, dg.AssetsDefinition)]
+    all_keys = {k for a in asset_defs for k in a.keys}
+    assert dg.AssetKey(["fivetran", "usa", "facebookads", "orders"]) in all_keys
+    assert not any("coca_cola" in k.to_user_string() for k in all_keys)
+
+    # partitions_def survived the optimize-metadata merge on every spec + check.
+    for a in asset_defs:
+        for spec in a.specs:
+            assert spec.partitions_def is not None and spec.partitions_def.name == "rocky_clients"
+        for cspec in a.check_specs:
+            assert cspec.partitions_def is not None
+    # Sensor bundled.
+    assert defs.sensors
+    # Whole graph resolves (asset/check partition-match invariant holds).
+    defs.resolve_asset_graph().get_all_asset_keys()
