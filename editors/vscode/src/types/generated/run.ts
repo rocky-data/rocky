@@ -93,6 +93,12 @@ export type FailureKind =
   | "not-found"
   | "unknown";
 /**
+ * The per-model build decision the engine made this run — what the skip-gate and content-addressed reuse machinery actually decided.
+ *
+ * Reporting-only: this never changes build behavior, it surfaces a decision that today only reaches the run log. Populated on [`RunOutput::model_decisions`] only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; a default run (both off) emits an empty list and the field is omitted.
+ */
+export type ModelDecision = "build" | "skip" | "reused";
+/**
  * Status of a pipeline run.
  *
  * `Success` / `PartialFailure` / `Failure` cover the terminal outcomes of a run that actually executed. `SkippedIdempotent` / `SkippedInFlight` are the short-circuit outcomes of `rocky run --idempotency-key` — see [`crate::idempotency`].
@@ -133,6 +139,10 @@ export interface RunOutput {
   interrupted: boolean;
   materializations: MaterializationOutput[];
   metrics?: MetricsSnapshot | null;
+  /**
+   * Per-model build/skip/reuse decision + reason, surfaced for transformation runs so orchestrators can explain *why* each model ran, was skipped, or was reused. Populated only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; empty (and omitted) for a default run, which stays byte-identical.
+   */
+  model_decisions?: ModelDecisionOutput[];
   /**
    * Soft warnings raised by the per-table override resolver — one entry per `[[table_overrides]]` rule that matched zero `(connector, table)` pairs this run, or whose connector half resolved nothing. Discovery-time-only — the pipeline runs to completion regardless. Empty for runs whose pipeline declares no overrides.
    */
@@ -398,6 +408,26 @@ export interface MetricsSnapshot {
   table_duration_p95_ms: number;
   tables_failed: number;
   tables_processed: number;
+  [k: string]: unknown;
+}
+/**
+ * One per-model decision entry on [`RunOutput::model_decisions`].
+ *
+ * Surfaces the skip/build/reuse verdict the engine reached for a single transformation model, plus a short human-readable reason that mirrors the gate's actual decision point (never re-derived — threaded from the evaluation result). Orchestrators (Dagster) and the VS Code extension use it to explain *why* a model ran, was skipped, or was reused.
+ */
+export interface ModelDecisionOutput {
+  /**
+   * What the engine decided for this model.
+   */
+  decision: ModelDecision;
+  /**
+   * The model's name (matches the model entry in the project DAG).
+   */
+  model: string;
+  /**
+   * Short human-readable justification reflecting the exact decision the gate made (e.g. "logic and upstream data unchanged since last build", "not skip-eligible", "upstream data may have changed", "reused prior run's bytes (strong proof)").
+   */
+  reason: string;
   [k: string]: unknown;
 }
 /**

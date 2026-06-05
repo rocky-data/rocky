@@ -62,15 +62,99 @@ pub(crate) enum Verdict {
     Skipped,
 }
 
-/// Outcome of evaluating the gate for one model.
+/// Why the gate reached a given build-or-skip outcome for one model.
+///
+/// One variant per *actual return point* in [`SkipGate::evaluate`] — the
+/// reason is recorded at the point the gate decided, never re-derived, so the
+/// surfaced justification cannot drift from what the gate did. Mirrors the
+/// fail-closed [`super::reuse_decision::BuildReason`] pattern: each `Build`
+/// variant names the first clause that did not hold (first-failing-point), and
+/// there is exactly one `Skip` reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateReason {
+    // ---- Skip (the single all-clauses-hold path) ----
+    /// Clauses (B)–(G) all held: logic key matched and every upstream is
+    /// provably unchanged.
+    Skipped,
+
+    // ---- Build (first failing clause) ----
+    /// (B) the model is not skip-eligible — explicit opt-out, a
+    /// non-plain strategy (`content_addressed` / `time_interval`), or
+    /// non-deterministic SQL.
+    NotEligible,
+    /// (G, source side) the model's upstreams could not be provably
+    /// enumerated — a CTE, a subquery, a set operation, or any other shape
+    /// the conservative lineage whitelist rejects — so B3 is unprovable.
+    UpstreamsNotEnumerable,
+    /// (C) no state store is available to read a prior baseline from.
+    NoStateStore,
+    /// (C) no prior successful build of this model exists to compare against.
+    NoPriorBuild,
+    /// (C) the latest recorded build of this model did not succeed, so it is
+    /// not a trustworthy baseline.
+    LastBuildNotSuccess,
+    /// (D)/(E) the prior build or the current IR has no comparable logic key.
+    NoLogicKey,
+    /// (F) the model's logic key changed since the last build — **B2** failed.
+    LogicChanged,
+    /// (G) an upstream may have changed since the last build (an upstream
+    /// Rocky model was rebuilt, or a raw source's freshness signature moved
+    /// or could not be proven stable) — **B3** failed.
+    UpstreamChanged,
+}
+
+impl GateReason {
+    /// Stable lowercase token for structured logs / programmatic branching.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            GateReason::Skipped => "skipped_unchanged",
+            GateReason::NotEligible => "not_eligible",
+            GateReason::UpstreamsNotEnumerable => "upstreams_not_enumerable",
+            GateReason::NoStateStore => "no_state_store",
+            GateReason::NoPriorBuild => "no_prior_build",
+            GateReason::LastBuildNotSuccess => "last_build_not_success",
+            GateReason::NoLogicKey => "no_logic_key",
+            GateReason::LogicChanged => "logic_changed",
+            GateReason::UpstreamChanged => "upstream_changed",
+        }
+    }
+
+    /// Short human-readable justification for the run output's per-model
+    /// `reason` field. Phrased to read truthfully whichever way the gate went.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            GateReason::Skipped => "logic and upstream data unchanged since last build",
+            GateReason::NotEligible => {
+                "not skip-eligible (non-deterministic, opt-out, or special strategy)"
+            }
+            GateReason::UpstreamsNotEnumerable => {
+                "upstreams not provably enumerable (e.g. CTE or subquery)"
+            }
+            GateReason::NoStateStore => "no state store to compare against",
+            GateReason::NoPriorBuild => "no prior successful build to compare against",
+            GateReason::LastBuildNotSuccess => "last build did not succeed",
+            GateReason::NoLogicKey => "no comparable logic key",
+            GateReason::LogicChanged => "model logic changed since last build",
+            GateReason::UpstreamChanged => "upstream data may have changed since last build",
+        }
+    }
+}
+
+/// Outcome of evaluating the gate for one model. Both variants carry the
+/// [`GateReason`] recorded at the decision point so the run output can surface
+/// an accurate per-model justification.
 pub(crate) enum GateDecision {
     /// Build the model. On a *successful* build the caller stamps `skip_state`
     /// onto the `MaterializationOutput` so the current logic key + upstream
-    /// signatures are persisted for the next run's comparison.
-    Build { skip_state: ModelSkipState },
+    /// signatures are persisted for the next run's comparison. `reason` is the
+    /// first clause that did not permit a skip.
+    Build {
+        skip_state: ModelSkipState,
+        reason: GateReason,
+    },
     /// Skip the model — do not re-materialize, do not advance any watermark
     /// or rowcount; the prior successful state stays authoritative.
-    Skip,
+    Skip { reason: GateReason },
 }
 
 /// Per-run gate context shared across the layer loop in `execute_models`.
@@ -168,24 +252,29 @@ impl<'a> SkipGate<'a> {
             skip_hash: current_skip_hash.clone(),
             upstream_freshness: upstream_sigs.clone().unwrap_or_default(),
         };
-        let build = || GateDecision::Build {
+        // Build outcome carrying the first-failing-clause reason. The reason
+        // is recorded at the return point so it cannot drift from the actual
+        // decision (mirrors `reuse_decision::BuildReason`).
+        let build = |reason: GateReason| GateDecision::Build {
             skip_state: skip_state.clone(),
+            reason,
         };
 
         // (B) eligibility.
         if !self.is_eligible(model, typed_ir) {
-            return build();
+            return build(GateReason::NotEligible);
         }
 
-        // Raw-source upstreams must be enumerable to prove B3. Unparseable
-        // SQL ⇒ unknown upstreams ⇒ build.
+        // Raw-source upstreams must be enumerable to prove B3. A lineage shape
+        // the conservative whitelist rejects (CTE, subquery, set op, …) or
+        // unparseable SQL ⇒ unknown upstreams ⇒ build.
         let Some(upstream_sigs) = upstream_sigs else {
-            return build();
+            return build(GateReason::UpstreamsNotEnumerable);
         };
 
         // State store is required to read a prior baseline. No store ⇒ build.
         let Some(store) = state_store else {
-            return build();
+            return build(GateReason::NoStateStore);
         };
 
         // (C) a prior *successful* execution — the single latest execution,
@@ -194,31 +283,33 @@ impl<'a> SkipGate<'a> {
         // build attempt is the authoritative baseline).
         let prior = match store.get_model_history(&model.config.name, 1) {
             Ok(mut history) => history.pop(),
-            Err(_) => return build(),
+            Err(_) => return build(GateReason::NoPriorBuild),
         };
         let Some(prior) = prior else {
-            return build();
+            return build(GateReason::NoPriorBuild);
         };
         if prior.status != "success" {
-            return build();
+            return build(GateReason::LastBuildNotSuccess);
         }
 
         // (D)/(E)/(F) — B2. Both hashes present and equal.
         let (Some(prior_hash), Some(current_hash)) =
             (prior.skip_hash.as_deref(), current_skip_hash.as_deref())
         else {
-            return build();
+            return build(GateReason::NoLogicKey);
         };
         if prior_hash != current_hash {
-            return build();
+            return build(GateReason::LogicChanged);
         }
 
         // (G) — B3. Every upstream provably unchanged.
         if !self.upstream_unchanged(model, &prior, &upstream_sigs) {
-            return build();
+            return build(GateReason::UpstreamChanged);
         }
 
-        GateDecision::Skip
+        GateDecision::Skip {
+            reason: GateReason::Skipped,
+        }
     }
 
     /// Clause (B): is this model eligible to be skipped at all?
@@ -471,4 +562,47 @@ fn parse_timestamp_cell(cell: &serde_json::Value) -> Option<chrono::DateTime<chr
             .ok()
             .map(|naive| naive.and_utc())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `GateReason` carries a stable, distinct log token and a
+    /// non-empty human message. Guards against a silent reason-table drift
+    /// (a trust-sensitive surface: a misleading reason is worse than none).
+    #[test]
+    fn gate_reason_tables_are_stable_and_distinct() {
+        let all = [
+            GateReason::Skipped,
+            GateReason::NotEligible,
+            GateReason::UpstreamsNotEnumerable,
+            GateReason::NoStateStore,
+            GateReason::NoPriorBuild,
+            GateReason::LastBuildNotSuccess,
+            GateReason::NoLogicKey,
+            GateReason::LogicChanged,
+            GateReason::UpstreamChanged,
+        ];
+        let mut tokens = std::collections::HashSet::new();
+        for r in all {
+            assert!(!r.as_str().is_empty(), "as_str must be non-empty");
+            assert!(!r.message().is_empty(), "message must be non-empty");
+            assert!(
+                tokens.insert(r.as_str()),
+                "as_str token must be unique: {}",
+                r.as_str()
+            );
+        }
+        // Spot-check the two load-bearing build reasons so a careless edit
+        // that swaps B2/B3 wording trips the test.
+        assert_eq!(
+            GateReason::LogicChanged.message(),
+            "model logic changed since last build"
+        );
+        assert_eq!(
+            GateReason::UpstreamChanged.message(),
+            "upstream data may have changed since last build"
+        );
+    }
 }

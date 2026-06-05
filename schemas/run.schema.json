@@ -675,6 +675,59 @@
       ],
       "type": "object"
     },
+    "ModelDecision": {
+      "description": "The per-model build decision the engine made this run — what the skip-gate and content-addressed reuse machinery actually decided.\n\nReporting-only: this never changes build behavior, it surfaces a decision that today only reaches the run log. Populated on [`RunOutput::model_decisions`] only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; a default run (both off) emits an empty list and the field is omitted.",
+      "oneOf": [
+        {
+          "description": "The model was (re-)materialized this run — its SQL ran (or its content-addressed write executed).",
+          "enum": [
+            "build"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The `--skip-unchanged` gate proved the model's logic and upstream data unchanged since the last successful build and skipped re-materialization.",
+          "enum": [
+            "skip"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A content-addressed model pointed-to a prior run's already-written parquet via a zero-copy commit instead of executing its SQL.",
+          "enum": [
+            "reused"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ModelDecisionOutput": {
+      "description": "One per-model decision entry on [`RunOutput::model_decisions`].\n\nSurfaces the skip/build/reuse verdict the engine reached for a single transformation model, plus a short human-readable reason that mirrors the gate's actual decision point (never re-derived — threaded from the evaluation result). Orchestrators (Dagster) and the VS Code extension use it to explain *why* a model ran, was skipped, or was reused.",
+      "properties": {
+        "decision": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelDecision"
+            }
+          ],
+          "description": "What the engine decided for this model."
+        },
+        "model": {
+          "description": "The model's name (matches the model entry in the project DAG).",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Short human-readable justification reflecting the exact decision the gate made (e.g. \"logic and upstream data unchanged since last build\", \"not skip-eligible\", \"upstream data may have changed\", \"reused prior run's bytes (strong proof)\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "decision",
+        "model",
+        "reason"
+      ],
+      "type": "object"
+    },
     "OverrideWarningOutput": {
       "description": "Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no tables this run.\n\nDistinct kinds let orchestrators (Dagster) branch on cause without parsing free-form messages.",
       "properties": {
@@ -1110,6 +1163,13 @@
           "type": "null"
         }
       ]
+    },
+    "model_decisions": {
+      "description": "Per-model build/skip/reuse decision + reason, surfaced for transformation runs so orchestrators can explain *why* each model ran, was skipped, or was reused. Populated only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; empty (and omitted) for a default run, which stays byte-identical.",
+      "items": {
+        "$ref": "#/definitions/ModelDecisionOutput"
+      },
+      "type": "array"
     },
     "override_warnings": {
       "description": "Soft warnings raised by the per-table override resolver — one entry per `[[table_overrides]]` rule that matched zero `(connector, table)` pairs this run, or whose connector half resolved nothing. Discovery-time-only — the pipeline runs to completion regardless. Empty for runs whose pipeline declares no overrides.",

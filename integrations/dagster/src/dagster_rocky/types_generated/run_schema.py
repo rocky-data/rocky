@@ -205,6 +205,51 @@ class ModelCostEntry(BaseModel):
     duration_ms: conint(ge=0)
 
 
+class ModelDecision1(StrEnum):
+    """
+    The model was (re-)materialized this run — its SQL ran (or its content-addressed write executed).
+    """
+
+    build = "build"
+
+
+class ModelDecision2(StrEnum):
+    """
+    The `--skip-unchanged` gate proved the model's logic and upstream data unchanged since the last successful build and skipped re-materialization.
+    """
+
+    skip = "skip"
+
+
+class ModelDecision3(StrEnum):
+    """
+    A content-addressed model pointed-to a prior run's already-written parquet via a zero-copy commit instead of executing its SQL.
+    """
+
+    reused = "reused"
+
+
+class ModelDecisionOutput(BaseModel):
+    """
+    One per-model decision entry on [`RunOutput::model_decisions`].
+
+    Surfaces the skip/build/reuse verdict the engine reached for a single transformation model, plus a short human-readable reason that mirrors the gate's actual decision point (never re-derived — threaded from the evaluation result). Orchestrators (Dagster) and the VS Code extension use it to explain *why* a model ran, was skipped, or was reused.
+    """
+
+    decision: ModelDecision1 | ModelDecision2 | ModelDecision3
+    """
+    What the engine decided for this model.
+    """
+    model: str
+    """
+    The model's name (matches the model entry in the project DAG).
+    """
+    reason: str
+    """
+    Short human-readable justification reflecting the exact decision the gate made (e.g. "logic and upstream data unchanged since last build", "not skip-eligible", "upstream data may have changed", "reused prior run's bytes (strong proof)").
+    """
+
+
 class OverrideWarningOutput(BaseModel):
     """
     Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no tables this run.
@@ -623,6 +668,10 @@ class RunOutput(BaseModel):
     """
     materializations: list[MaterializationOutput]
     metrics: MetricsSnapshot | None = None
+    model_decisions: list[ModelDecisionOutput] | None = None
+    """
+    Per-model build/skip/reuse decision + reason, surfaced for transformation runs so orchestrators can explain *why* each model ran, was skipped, or was reused. Populated only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; empty (and omitted) for a default run, which stays byte-identical.
+    """
     override_warnings: list[OverrideWarningOutput] | None = None
     """
     Soft warnings raised by the per-table override resolver — one entry per `[[table_overrides]]` rule that matched zero `(connector, table)` pairs this run, or whose connector half resolved nothing. Discovery-time-only — the pipeline runs to completion regardless. Empty for runs whose pipeline declares no overrides.
