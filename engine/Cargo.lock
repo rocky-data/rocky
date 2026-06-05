@@ -384,7 +384,7 @@ version = "58.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f633dbfdf39c039ada1bf9e34c694816eb71fbb7dc78f613993b7245e078a1ed"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
 ]
 
 [[package]]
@@ -637,9 +637,9 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
-version = "2.11.1"
+version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "bitvec"
@@ -831,9 +831,9 @@ dependencies = [
 
 [[package]]
 name = "chrono"
-version = "0.4.44"
+version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "js-sys",
@@ -1138,7 +1138,7 @@ version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "crossterm_winapi",
  "parking_lot",
  "rustix 0.38.44",
@@ -1492,7 +1492,7 @@ version = "25.12.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "rustc_version",
 ]
 
@@ -2179,11 +2179,11 @@ dependencies = [
 
 [[package]]
 name = "inotify"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd5b3eaf1a28b758ac0faa5a4254e8ab2705605496f1b1f3fbbc3988ad73d199"
+checksum = "533e68a5842e734946fe159fb03fc9bbbb254f590dd0d8ad321ae5ff7beca2c1"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "inotify-sys",
  "libc",
 ]
@@ -2346,7 +2346,7 @@ version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07293a4e297ac234359b510362495713f75ea345d5307140414f20c69ffeb087"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "libc",
 ]
 
@@ -2490,9 +2490,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.30"
+version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
+checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "logos"
@@ -2683,7 +2683,7 @@ version = "8.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d3d07927151ff8575b7087f245456e549fea62edf0ec4e565a5ee50c8402bc3"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "fsevent-sys",
  "inotify",
  "kqueue",
@@ -2701,7 +2701,7 @@ version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42b8cfee0e339a0337359f3c88165702ac6e600dc01c0cc9579a92d62b08477a"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
 ]
 
 [[package]]
@@ -3553,7 +3553,7 @@ version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
 ]
 
 [[package]]
@@ -4391,7 +4391,7 @@ version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
@@ -4404,7 +4404,7 @@ version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
@@ -4429,9 +4429,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-native-certs"
-version = "0.8.3"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "612460d5f7bea540c490b2b6395d8e34a953e52b491accd6c86c8164c5932a63"
+checksum = "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
 dependencies = [
  "openssl-probe",
  "rustls-pki-types",
@@ -4614,7 +4614,7 @@ version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "core-foundation",
  "core-foundation-sys",
  "libc",
@@ -5407,7 +5407,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
  "async-compression",
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "bytes",
  "futures-core",
  "futures-util",
@@ -5604,9 +5604,9 @@ checksum = "3b09c83c3c29d37506a3e260c08c03743a6bb66a9cd432c6934ab501a190571f"
 
 [[package]]
 name = "unicode-segmentation"
-version = "1.13.2"
+version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9629274872b2bfaf8d66f5f15725007f635594914870f65218920345aa11aa8c"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unicode-width"
@@ -5855,7 +5855,7 @@ version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
@@ -6241,7 +6241,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d66ea20e9553b30172b5e831994e35fbde2d165325bec84fc43dbf6f4eb9cb2"
 dependencies = [
  "anyhow",
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "indexmap",
  "log",
  "serde",
@@ -6304,9 +6304,9 @@ checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "yoke"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abe8c5fda708d9ca3df187cae8bfb9ceda00dd96231bed36e445a1a48e66f9ca"
+checksum = "709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5"
 dependencies = [
  "stable_deref_trait",
  "yoke-derive",
