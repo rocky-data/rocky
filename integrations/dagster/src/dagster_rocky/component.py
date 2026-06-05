@@ -25,6 +25,7 @@ import importlib
 import json
 import logging
 import os
+import re
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -1503,19 +1504,26 @@ def _union_member_tables(members: list[SourceInfo]) -> list[TableInfo]:
 
 
 def _unique_collapsed_group_name(representative: SourceInfo, used: set[str]) -> str:
-    """Return a unique op-name stem for a collapsed group.
+    """Return a unique, op-name-safe stem for a collapsed group.
 
     Built from ``source_type`` + every (non-tenant) component value — i.e.
     the collapsed asset-key prefix — so it is 1:1 with the group key, unlike
     ``get_group_name`` (only the first string component), which collides
     across groups that share that component and crashes the implicit
-    ``__ASSET_JOB`` on duplicate op names. ``used`` guards the residual
-    separator-collision edge by appending an index.
+    ``__ASSET_JOB`` on duplicate op names.
+
+    Each part is sanitised to ``[A-Za-z0-9_]`` (the valid op-name charset)
+    and ``used`` is keyed on the *sanitised* result — so two raw stems that
+    differ only in characters sanitisation collapses (``a-b`` vs ``a.b``)
+    still get distinct op names instead of silently re-colliding after
+    ``_safe_asset_name``. Deterministic: dict order of ``components`` is
+    stable, so the same discover state yields the same name (no asset churn
+    across reloads).
     """
     parts = [representative.source_type]
     for value in representative.components.values():
         parts.append("__".join(value) if isinstance(value, list) else str(value))
-    base = "_".join(parts)
+    base = re.sub(r"[^A-Za-z0-9_]", "_", "_".join(parts))
     name = base
     suffix = 2
     while name in used:

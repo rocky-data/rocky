@@ -180,6 +180,18 @@ def rocky_source_sensor(
     is_keyed = isinstance(rocky_resource, str)
     resource_keys: set[str] = {rocky_resource} if is_keyed else set()  # type: ignore[arg-type]
 
+    # Tenant mode needs BOTH the component and the partitions name. Reject a
+    # half-configured call at definition time rather than silently falling
+    # through to the per_source path and emitting unpartitioned RunRequests
+    # against a partitioned asset (which would fail confusingly at run time).
+    if (tenant_component is None) != (tenant_partitions_name is None):
+        raise ValueError(
+            "rocky_source_sensor tenant mode requires both tenant_component and "
+            "tenant_partitions_name, or neither — got "
+            f"tenant_component={tenant_component!r}, "
+            f"tenant_partitions_name={tenant_partitions_name!r}."
+        )
+
     if translator is None:
         translator = RockyDagsterTranslator()
 
@@ -346,9 +358,10 @@ def rocky_source_sensor(
                 except Exception:
                     context.log.warning("on_run_request_emitted hook raised", exc_info=True)
 
+        mode_label = "tenant" if tenant_component is not None else granularity
         context.log.info(
             f"rocky_source_sensor: {len(triggered)} source(s) triggered, "
-            f"emitting {len(run_requests)} run request(s) ({granularity})"
+            f"emitting {len(run_requests)} run request(s) ({mode_label})"
         )
 
         return dg.SensorResult(

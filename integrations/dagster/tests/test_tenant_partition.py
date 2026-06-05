@@ -390,11 +390,16 @@ def test_tenant_omitted_resolves_to_none():
 
 
 def test_collapsed_execution_remaps_engine_key_to_collapsed_asset(tmp_path):
-    """The engine runs the *real* source under ``--filter client=<tenant>`` and
-    emits materializations keyed WITH the tenant. The collapsed asset must
-    remap those engine keys back to the tenant-agnostic key (+ partition),
-    not drop them. Exercises the full build_defs_from_state → materialize →
-    _emit_results path, which the builder-level tests don't.
+    """End-to-end happy path: a known tenant's engine materialization (keyed
+    WITH the tenant) lands on the collapsed key + partition through the full
+    build_defs_from_state → materialize → _emit_results path.
+
+    Note: this exercises the remap but does not *isolate* the with-tenant map
+    (the table-leaf fallback would also rescue a known tenant). The
+    with-tenant registration itself is pinned directly by
+    ``test_collapse_maps_engine_with_tenant_keys_to_collapsed_spec``, and the
+    leaf fallback by
+    ``test_collapsed_execution_new_tenant_falls_back_to_table_leaf``.
     """
     discover = {
         "version": "0.3.0",
@@ -703,3 +708,18 @@ def test_sensor_tenant_mode_sync_off_does_not_advance_cursor_for_skipped():
     # The skipped source's cursor stays absent → it re-fires next tick.
     cursor = json.loads(result.cursor)
     assert "src_coca_cola" not in cursor
+
+
+def test_sensor_tenant_mode_requires_both_args():
+    """rocky_source_sensor is public; a half-configured tenant call must be
+    rejected at definition time, not silently fall through to per_source."""
+    rocky = RockyResource()
+    target = dg.AssetSelection.all()
+    with pytest.raises(ValueError, match="both tenant_component"):
+        rocky_source_sensor(rocky_resource=rocky, target=target, tenant_component="client")
+    with pytest.raises(ValueError, match="both tenant_component"):
+        rocky_source_sensor(
+            rocky_resource=rocky, target=target, tenant_partitions_name="rocky_clients"
+        )
+    # Both unset is fine (default non-tenant sensor).
+    assert rocky_source_sensor(rocky_resource=rocky, target=target) is not None
