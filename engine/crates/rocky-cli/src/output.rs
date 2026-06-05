@@ -2173,6 +2173,15 @@ pub struct ColumnLineageOutput {
     /// direction flags, matching pre-Arc-1 behaviour.
     pub direction: String,
     pub trace: Vec<LineageEdgeRecord>,
+    /// Every downstream column that transitively consumes
+    /// `(model, column)`, deduplicated and deterministically sorted. An
+    /// author-time "what does changing this column affect" signal,
+    /// always populated regardless of `direction` so the default
+    /// (upstream) trace still carries the blast radius. Inspection only —
+    /// this never feeds a build/skip/reuse decision. Empty when the
+    /// column has no consumers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub downstream_consumers: Vec<LineageQualifiedColumn>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

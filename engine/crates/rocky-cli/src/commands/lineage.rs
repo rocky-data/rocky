@@ -315,6 +315,28 @@ pub fn column_lineage_output(
     };
     let trace: Vec<LineageEdgeRecord> = trace_edges.iter().map(|e| to_edge_record(e)).collect();
 
+    // Author-time downstream-impact preview: every column that transitively
+    // consumes `(model_name, column)`. Always computed (independent of
+    // `direction`) so the default upstream trace still surfaces the blast
+    // radius. Deduped + sorted via a BTreeSet keyed on (model, column) — the
+    // graph walk's order is unspecified and `LineageQualifiedColumn` is not
+    // `Eq`, so `.dedup()` wouldn't apply. Mirrors `lineage_diff.rs`.
+    // Inspection only: this never gates a build/skip/reuse decision.
+    let mut seen: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    for edge in result
+        .semantic_graph
+        .trace_column_downstream(model_name, column)
+    {
+        seen.insert((
+            edge.target.model.to_string(),
+            edge.target.column.to_string(),
+        ));
+    }
+    let downstream_consumers: Vec<LineageQualifiedColumn> = seen
+        .into_iter()
+        .map(|(model, column)| LineageQualifiedColumn { model, column })
+        .collect();
+
     Ok(ColumnLineageOutput {
         version: VERSION.to_string(),
         command: "lineage".to_string(),
@@ -322,5 +344,110 @@ pub fn column_lineage_output(
         column: column.to_string(),
         direction: direction.to_string(),
         trace,
+        downstream_consumers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    /// Write a `.sql` model plus its `.toml` sidecar into `dir`. Mirrors
+    /// the helper in `ci_diff.rs`'s tests so the compile path is faithful.
+    fn write_model(dir: &Path, name: &str, sql: &str) {
+        fs::write(dir.join(format!("{name}.sql")), sql).unwrap();
+        fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn compile_chain(models_dir: &Path) -> compile::CompileResult {
+        let config = CompilerConfig {
+            models_dir: models_dir.to_path_buf(),
+            contracts_dir: None,
+            source_schemas: HashMap::new(),
+            source_column_info: HashMap::new(),
+            ..Default::default()
+        };
+        compile::compile(&config).expect("chain compiles")
+    }
+
+    /// The default (upstream) column output must still carry the
+    /// downstream-impact preview: every column that transitively consumes
+    /// the target. Chain: a -> b -> c, so `a.id` reaches `b.id` and `c.id`.
+    #[test]
+    fn upstream_output_carries_downstream_consumers() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path();
+        write_model(models_dir, "a", "SELECT id, name FROM source.raw.users");
+        write_model(models_dir, "b", "SELECT id, name FROM a");
+        write_model(models_dir, "c", "SELECT id FROM b");
+
+        let result = compile_chain(models_dir);
+        // `downstream = false` is the default upstream trace.
+        let out = column_lineage_output(&result, "a", "id", false).unwrap();
+
+        assert_eq!(out.direction, "upstream");
+        let consumers: Vec<(&str, &str)> = out
+            .downstream_consumers
+            .iter()
+            .map(|c| (c.model.as_str(), c.column.as_str()))
+            .collect();
+        assert!(
+            consumers.contains(&("b", "id")),
+            "expected b.id in {consumers:?}"
+        );
+        assert!(
+            consumers.contains(&("c", "id")),
+            "expected c.id in {consumers:?}"
+        );
+
+        // Deterministic: BTreeSet ordering, no duplicates.
+        let mut sorted = consumers.clone();
+        sorted.sort();
+        assert_eq!(consumers, sorted, "consumers must be sorted");
+        assert_eq!(
+            consumers.len(),
+            consumers
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            "consumers must be deduplicated"
+        );
+    }
+
+    /// A leaf column (consumed by nobody) yields an empty consumer set,
+    /// which serde then omits via `skip_serializing_if`.
+    #[test]
+    fn leaf_column_has_no_downstream_consumers() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path();
+        write_model(models_dir, "a", "SELECT id FROM source.raw.users");
+        write_model(models_dir, "b", "SELECT id FROM a");
+
+        let result = compile_chain(models_dir);
+        // `b.id` is the leaf — nothing downstream consumes it.
+        let out = column_lineage_output(&result, "b", "id", false).unwrap();
+        assert!(
+            out.downstream_consumers.is_empty(),
+            "leaf column should have no consumers, got {:?}",
+            out.downstream_consumers
+        );
+
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            !json.contains("downstream_consumers"),
+            "empty consumer set must be omitted from JSON"
+        );
+    }
 }

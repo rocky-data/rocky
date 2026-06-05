@@ -15,9 +15,18 @@ export interface ColumnLineageOutput {
    * Direction of the trace walk: `"upstream"` (producers) or `"downstream"` (consumers). Defaults to upstream when `--column` is set without direction flags, matching pre-Arc-1 behaviour.
    */
   direction: string;
+  /**
+   * Every downstream column that transitively consumes `(model, column)`, deduplicated and deterministically sorted. An author-time "what does changing this column affect" signal, always populated regardless of `direction` so the default (upstream) trace still carries the blast radius. Inspection only — this never feeds a build/skip/reuse decision. Empty when the column has no consumers.
+   */
+  downstream_consumers?: LineageQualifiedColumn[];
   model: string;
   trace: LineageEdgeRecord[];
   version: string;
+  [k: string]: unknown;
+}
+export interface LineageQualifiedColumn {
+  column: string;
+  model: string;
   [k: string]: unknown;
 }
 export interface LineageEdgeRecord {
@@ -27,10 +36,5 @@ export interface LineageEdgeRecord {
    * Transform kind: "direct", "cast", "expression", etc. Stringified from `rocky_sql::lineage::TransformKind` to avoid pulling schemars into rocky-sql.
    */
   transform: string;
-  [k: string]: unknown;
-}
-export interface LineageQualifiedColumn {
-  column: string;
-  model: string;
   [k: string]: unknown;
 }
