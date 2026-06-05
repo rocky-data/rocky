@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.49.0] — 2026-06-05
+
+### Added
+
+- **`rocky run --defer` / `--defer-to <schema>`.** Build only the models you changed locally and resolve unbuilt upstream `ref()`s against an existing (production) schema — the dbt-Core-style dev-against-prod-upstreams convenience. Inert on a full run; meaningful when a subset is built. (#817, #819)
+- **`rocky run --skip-unchanged` — an opt-in, default-off model-skip gate.** Skips re-materializing a transformation model when its logic (a cosmetic-invariant IR hash) **and** every upstream's data (`MAX(ts)` watermark, or `COUNT(*)` with `skip_rowcount_fallback`) both appear unchanged since the last successful build. A best-effort cost optimization, **not** a result-equivalence guarantee: it fails safe to BUILD, and models with CTEs/subqueries/`PIVOT`/set operations or non-deterministic SQL always rebuild. Tunable via `[run]`; `--force-rebuild` bypasses it. (#823, #828, #831)
+- **Per-namespace state files — `--state-namespace <key>` / `[state] namespacing`.** Route each pipeline/client to its own `<models>/.rocky-state/<key>.redb` so independent fan-out runs don't serialize on a single redb writer lock. Opt-in and default-off — byte-identical to before when unset. (#829)
+- **AI authoring over MCP.** The `rocky mcp` server now exposes the AI generators (`draft_contract`, `generate_tests`, `explain_model`), on-demand dialect lint, authoring prompt-trajectories, and read-only `governance_preview` / `drift_preview`, so a connected agent can draft → typecheck → preview governance/drift → propose behind the human-gate. (#816, #824)
+- **`rocky load` gated on a typed data contract**, with native BigQuery load jobs and Databricks staged-file `COPY INTO` (CSV cast to the declared schema), and create-the-target-table-from-the-file-schema when it is missing. (#820, #821, #822, #826, #833, #834)
+- **Cross-source collision detection at discover time.** `rocky discover` flags tables that collide across sources (`cross_source_overlap`) and reports first-seen tables via a `new_sources` diff. (#847, #850)
+- **`unique_expr` assertion** for derived-key uniqueness, plus row-level assertions at replication time. (#842)
+- **Auditable-reuse spine — experimental, dormant, default-off.** With `[reuse]` enabled, a successful run records per model an input-match index entry and an offline-verifiable provenance record (logic key, upstream identities, output BLAKE3, proof class). **The live point-to reuse path is gated and not yet enabled** (Databricks-Iceberg content-addressed only, pending live verification); with `[reuse]` off — the default — `rocky run` is byte- and cost-identical. (#835, #838, #840, #841)
+- **Versioned graph-export contract.** `rocky dag --output json` carries a `schema_version` so orchestrators can consume the typed graph across releases. (#818)
+
+### Changed
+
+- Contract type-matching is widening-aware and recognizes BigQuery type names and hyphenated catalog identifiers. (#827, #836, #837)
+- Refreshed workspace dependencies to their latest Rust-1.88-compatible versions.
+
+### Fixed
+
+- **`--skip-unchanged` now works on the full-DAG transformation path.** It previously only skipped on the `--model`-scoped path: the full-DAG run executed against a non-canonical state path and never persisted a run record, so the gate had no baseline and silently rebuilt everything. The full-DAG and `--dag` paths now thread the canonical resolved state path and persist the run, so the gate skips correctly. (#849)
+- `rocky` writes a `.gitignore` into `.rocky/` so the working directory stays out of users' repositories. (#832)
+
 ## [1.48.0] — 2026-06-02
 
 ### Added

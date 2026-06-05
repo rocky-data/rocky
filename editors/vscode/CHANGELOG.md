@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.32.0] — 2026-06-05
+
+### Changed
+
+- Migrated the React webviews from Tailwind CSS v3 to v4. (#813)
+- Regenerated the TypeScript bindings for the engine 1.49 output schemas (`discover`, `dag`, `load`, `run`, project).
+- Bumped dependencies to their latest minor versions and refreshed the lockfile (0 vulnerabilities). (#812)
+
 ## [1.31.2] — 2026-06-02
 
 ### Changed

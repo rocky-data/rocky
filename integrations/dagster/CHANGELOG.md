@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.45.0] — 2026-06-05
+
+### Added
+
+- **`RockyResource.state_namespace` (and the matching `RockyComponent` field).** Exposes the engine's `--state-namespace`: set it to a SQL identifier and this resource's commands route run state to `<models>/.rocky-state/<namespace>.redb` instead of the single global state file, so independent fan-out runs (e.g. one resource per client/tenant) don't serialize on a single redb writer lock. Mutually exclusive with `state_path` — when set, `--state-namespace` is sent and the explicit `--state-path` is omitted, because an explicit `--state-path` disables namespacing engine-side.
+- **`defer` / `defer_to` on `run` / `run_streaming` / `run_pipes`.** Pass `--defer` / `--defer-to <schema>` so unbuilt upstream `ref()`s resolve against a production schema instead of being rebuilt. Inert on a full build; meaningful when a subset is materialized.
+- Regenerated the Pydantic bindings for the engine 1.49 output schemas (`discover`, `dag`, `load`, `run`, project).
+
+### Changed
+
+- Raised the `dagster` floor `>=1.13.7` → `>=1.13.8` (the current latest) and refreshed the locked Python dependencies within-major (`pydantic` 2.13.4, `pytest` 9.0.3, `ruff` 0.15.16, plus transitives). No caps added; the full suite passes.
+
 ## [1.44.0] — 2026-06-02
 
 ### Changed
