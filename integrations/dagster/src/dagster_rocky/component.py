@@ -265,6 +265,9 @@ class _GroupBuild:
     partitions_def: dg.PartitionsDefinition | None = None
     tenant_component: str | None = None
     partition_key_to_filter_value: dict[str, str] = field(default_factory=dict)
+    #: table name → collapsed asset key, the run-time fallback for engine
+    #: materialization keys whose tenant is not yet in the load-time map.
+    collapsed_key_by_table: dict[str, dg.AssetKey] = field(default_factory=dict)
 
 
 @dataclass
@@ -1499,6 +1502,29 @@ def _union_member_tables(members: list[SourceInfo]) -> list[TableInfo]:
     return tables
 
 
+def _unique_collapsed_group_name(representative: SourceInfo, used: set[str]) -> str:
+    """Return a unique op-name stem for a collapsed group.
+
+    Built from ``source_type`` + every (non-tenant) component value — i.e.
+    the collapsed asset-key prefix — so it is 1:1 with the group key, unlike
+    ``get_group_name`` (only the first string component), which collides
+    across groups that share that component and crashes the implicit
+    ``__ASSET_JOB`` on duplicate op names. ``used`` guards the residual
+    separator-collision edge by appending an index.
+    """
+    parts = [representative.source_type]
+    for value in representative.components.values():
+        parts.append("__".join(value) if isinstance(value, list) else str(value))
+    base = "_".join(parts)
+    name = base
+    suffix = 2
+    while name in used:
+        name = f"{base}_{suffix}"
+        suffix += 1
+    used.add(name)
+    return name
+
+
 def _neutralize_tenant_metadata(spec: dg.AssetSpec) -> dg.AssetSpec:
     """Drop per-tenant metadata keys from a collapsed spec (FR §4.2 n1).
 
@@ -1544,10 +1570,13 @@ def _build_collapsed_group_contexts(
     model_policies = model_policies or {}
     default_policy = freshness_policy_from_checks(discover.checks)
 
-    # Group by the frozen set of non-tenant components. Sorted items make
-    # the key deterministic regardless of dict ordering.
-    grouped: dict[tuple[tuple[str, str | tuple[str, ...]], ...], list[SourceInfo]] = defaultdict(
-        list
+    # Group by (source_type, non-tenant components). source_type MUST be in
+    # the key: the collapsed asset key is [source_type, *non_tenant, table],
+    # so two sources that share components but differ in source_type are
+    # genuinely distinct assets and must not collapse together. Sorted items
+    # make the key deterministic regardless of dict ordering.
+    grouped: dict[tuple[str, tuple[tuple[str, str | tuple[str, ...]], ...]], list[SourceInfo]] = (
+        defaultdict(list)
     )
     for source in discover.sources:
         tenant_value = source.components.get(tenant.component)
@@ -1561,15 +1590,22 @@ def _build_collapsed_group_contexts(
             )
             continue
         non_tenant = {k: v for k, v in source.components.items() if k != tenant.component}
-        group_key = tuple(
+        component_key = tuple(
             sorted((k, tuple(v) if isinstance(v, list) else v) for k, v in non_tenant.items())
         )
-        grouped[group_key].append(source)
+        grouped[(source.source_type, component_key)].append(source)
 
+    # Op names must be unique across the location: the implicit __ASSET_JOB
+    # rejects two ops with the same name. The default path keys groups *by*
+    # get_group_name (unique by construction), but the collapse keys by the
+    # full (source_type, non-tenant) tuple — get_group_name (first string
+    # component) is NOT unique across those, so derive a name from the whole
+    # group key and disambiguate defensively.
+    used_names: set[str] = set()
     groups: list[_GroupBuild] = []
     for members in grouped.values():
         representative = strip_tenant_component(members[0], tenant.component)
-        group = _GroupBuild(name=translator.get_group_name(representative))
+        group = _GroupBuild(name=_unique_collapsed_group_name(representative, used_names))
         group.partitions_def = partitions_def
         group.tenant_component = tenant.component
         group.source_ids = {m.id for m in members}
@@ -1581,7 +1617,23 @@ def _build_collapsed_group_contexts(
         for member in members:
             raw_value = member.components[tenant.component]
             assert isinstance(raw_value, str)  # guarded above
-            partition_key = translator.get_partition_key(member) or raw_value
+            override = translator.get_partition_key(member)
+            partition_key = raw_value if override is None else override
+            existing = group.partition_key_to_filter_value.get(partition_key)
+            if existing is not None and existing != raw_value:
+                # A custom get_partition_key folded two distinct catalogs onto
+                # one key — the second would silently shadow the first and make
+                # its catalog unreachable. Surface it instead of dropping data.
+                _log.warning(
+                    "Tenant collapse: partition key %r maps to multiple catalog "
+                    "values (%r and %r); get_partition_key must be 1:1 with the "
+                    "tenant component. Keeping %r.",
+                    partition_key,
+                    existing,
+                    raw_value,
+                    existing,
+                )
+                continue
             group.partition_key_to_filter_value[partition_key] = raw_value
 
         seen_keys: set[dg.AssetKey] = set()
@@ -1609,6 +1661,11 @@ def _build_collapsed_group_contexts(
             seen_keys.add(spec.key)
             group.specs.append(spec)
             spec_key_by_table[table.name] = spec.key
+
+        # Run-time fallback for a tenant the sensor added after the last state
+        # refresh (absent from the with-tenant map below): table-name leaf →
+        # collapsed key. Unique per table within a group, so unambiguous.
+        group.collapsed_key_by_table = dict(spec_key_by_table)
 
         # Map every member's WITH-tenant native key back to the collapsed
         # spec key. The engine runs the *real* (un-collapsed) source under
@@ -1703,12 +1760,20 @@ def _build_check_specs(
 
     When ``partitions_def`` is provided, every emitted check spec is
     partitioned by it. This is the tenant-as-partition path: with the
-    collapsed asset's tenant ``DynamicPartitionsDefinition`` attached,
-    check verdicts are recorded per partition (per tenant) instead of
-    collapsing to one last-writer-wins result on the shared
-    ``(asset_key, check_name)``. Must equal the collapsed asset's
-    ``partitions_def`` (Dagster enforces the match). Defaults to ``None``
-    — the unpartitioned, byte-identical-to-prior path.
+    collapsed asset's tenant ``DynamicPartitionsDefinition`` attached, each
+    check *evaluation* is recorded against its tenant partition, so the
+    per-partition execution **history** (``get_asset_check_execution_history``
+    with a partition filter) retains a distinct verdict per tenant rather
+    than the unpartitioned shared ``(asset_key, check_name)`` row.
+
+    Caveat (Dagster 1.13.x): ``AssetCheckSpec(partitions_def=...)`` is a
+    **preview** API, and the *latest/summary* status that drives the UI
+    check badge (``AssetCheckSummaryRecord``) is still last-writer-wins
+    across partitions — only the raw history is per-partition. In-run
+    blocking-check gating is unaffected (it reads the yielded result, not
+    storage). Must equal the collapsed asset's ``partitions_def`` (Dagster
+    enforces the match). Defaults to ``None`` — the unpartitioned,
+    byte-identical-to-prior path.
     """
     contract_rules_by_model = contract_rules_by_model or {}
     specs: list[dg.AssetCheckSpec] = []
@@ -2059,6 +2124,7 @@ def _make_rocky_asset(
                 selected_keys=selected_keys,
                 rocky_key_to_dagster_key=group.rocky_key_to_dagster_key,
                 extra_yielded_checks=compliance_yielded,
+                collapsed_key_by_table=group.collapsed_key_by_table or None,
             )
 
             # If a filter surfaced the Fivetran-storm signal, raise the
@@ -2424,6 +2490,7 @@ def _emit_results(
     selected_keys: set[dg.AssetKey],
     rocky_key_to_dagster_key: dict[tuple[str, ...], dg.AssetKey],
     extra_yielded_checks: set[tuple[dg.AssetKey, str]] | None = None,
+    collapsed_key_by_table: dict[str, dg.AssetKey] | None = None,
 ) -> Iterator[dg.MaterializeResult | dg.AssetCheckResult | dg.AssetObservation]:
     """Yield Dagster events for every materialization, check, drift event and anomaly.
 
@@ -2451,7 +2518,22 @@ def _emit_results(
     """
 
     def remap(raw_key: list[str]) -> dg.AssetKey:
-        return rocky_key_to_dagster_key.get(tuple(raw_key)) or dg.AssetKey(raw_key)
+        exact = rocky_key_to_dagster_key.get(tuple(raw_key))
+        if exact is not None:
+            return exact
+        # Tenant-collapse fallback: the engine emits keys WITH the tenant
+        # component, and the load-time map is built from cached discover
+        # state — so a tenant the sensor added *after* the last state refresh
+        # (the self-service-onboarding flow) is absent from the map and its
+        # materialization would otherwise be dropped. Within a collapsed
+        # group the table-name leaf is 1:1 with the collapsed key, so fall
+        # back to it. Only collapsed groups pass this map; the default path
+        # is unchanged.
+        if collapsed_key_by_table and raw_key:
+            collapsed = collapsed_key_by_table.get(raw_key[-1])
+            if collapsed is not None:
+                return collapsed
+        return dg.AssetKey(raw_key)
 
     selected_resolver = _build_table_resolver(rocky_key_to_dagster_key, selected_keys)
 

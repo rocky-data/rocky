@@ -270,7 +270,7 @@ def rocky_source_sensor(
         # processed). Supersedes per_source/per_group granularity.
         dynamic_partitions_requests: list[dg.AddDynamicPartitionsRequest] = []
         if tenant_component is not None and tenant_partitions_name is not None:
-            request_pairs, dynamic_partitions_requests = _tenant_request_pairs(
+            request_pairs, dynamic_partitions_requests, skipped_ids = _tenant_request_pairs(
                 triggered,
                 translator,
                 tenant_component=tenant_component,
@@ -278,6 +278,15 @@ def rocky_source_sensor(
                 sync_partitions=sync_partitions_from_discover,
                 context=context,
             )
+            # Roll back the cursor for sources we did NOT emit (skipped because
+            # their partition doesn't exist yet under sync-off, or a non-scalar
+            # tenant). Advancing their cursor would silently drop this sync —
+            # the source would not re-fire until a strictly-newer last_sync_at.
+            for sid in skipped_ids:
+                if sid in cursor_data:
+                    new_cursor[sid] = cursor_data[sid]
+                else:
+                    new_cursor.pop(sid, None)
         elif granularity == "per_source":
             request_pairs: list[tuple[dg.RunRequest, tuple[SourceInfo, ...]]] = [
                 (_per_source_request(source, translator), (source,)) for source in triggered
@@ -463,6 +472,7 @@ def _tenant_request_pairs(
 ) -> tuple[
     list[tuple[dg.RunRequest, tuple[SourceInfo, ...]]],
     list[dg.AddDynamicPartitionsRequest],
+    set[str],
 ]:
     """Build tenant-partition ``RunRequest``s + the dynamic-partition adds.
 
@@ -473,11 +483,16 @@ def _tenant_request_pairs(
     the run requests) when ``sync_partitions`` is on; when off, sources
     whose partition does not yet exist are skipped (the partition set is
     managed out-of-band).
+
+    Returns ``(request_pairs, add_requests, skipped_source_ids)``. The
+    caller MUST NOT advance the cursor for ``skipped_source_ids`` — those
+    sources emitted no run, so advancing would silently drop the sync.
     """
     existing = set(context.instance.get_dynamic_partitions(tenant_partitions_name))
     pairs: list[tuple[dg.RunRequest, tuple[SourceInfo, ...]]] = []
     keys_to_add: list[str] = []
     queued_new: set[str] = set()
+    skipped_ids: set[str] = set()
 
     for source in triggered:
         raw_value = source.components.get(tenant_component)
@@ -487,8 +502,10 @@ def _tenant_request_pairs(
                 f"tenant component {tenant_component!r} is "
                 f"{'missing' if raw_value is None else 'list-valued'}."
             )
+            skipped_ids.add(source.id)
             continue
-        partition_key = translator.get_partition_key(source) or raw_value
+        override = translator.get_partition_key(source)
+        partition_key = raw_value if override is None else override
         is_known = partition_key in existing or partition_key in queued_new
         if not is_known:
             if not sync_partitions:
@@ -497,6 +514,7 @@ def _tenant_request_pairs(
                     f"'{tenant_partitions_name}' and sync_partitions_from_discover is off — "
                     f"skipping source id={source.id}."
                 )
+                skipped_ids.add(source.id)
                 continue
             keys_to_add.append(partition_key)
             queued_new.add(partition_key)
@@ -514,4 +532,4 @@ def _tenant_request_pairs(
                 keys_to_add
             )
         )
-    return pairs, add_requests
+    return pairs, add_requests, skipped_ids

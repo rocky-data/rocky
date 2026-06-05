@@ -1,9 +1,9 @@
 """Regression coverage for per-tenant (partitioned) asset checks under the
-tenant-as-partition collapse.  Drop into ``integrations/dagster/tests/`` in the FR PR.
+tenant-as-partition collapse.
 
 Two groups:
 
-GROUP B — behavioral guards, run TODAY (public Dagster APIs only):
+GROUP B — behavioral guards (public Dagster APIs only):
   * ``test_partitioned_check_specs_retain_per_partition_verdicts`` is the
     TRIPWIRE for a PREVIEW feature. On dagster 1.13.8, setting ``partitions_def``
     on an ``AssetCheckSpec`` is explicitly flagged: *"currently in preview, may
@@ -15,30 +15,19 @@ GROUP B — behavioral guards, run TODAY (public Dagster APIs only):
     verdict, so per-tenant signal must come from the event axis (run tag +
     result metadata), not the check badge.
 
-GROUP A — unit coverage for the dagster-rocky threading change (REVIEW §10,
-  Edits 1-2: ``_build_check_specs`` / ``contract_check_specs_for_model`` gain a
-  ``partitions_def`` kwarg). Skipped until that change lands; the skip MUST be
-  gone in the merged PR.
+GROUP A — unit coverage for the ``partitions_def`` threading through
+  ``_build_check_specs`` / ``contract_check_specs_for_model``.
 """
 
 from __future__ import annotations
 
-import inspect
-
 import dagster as dg
-import pytest
 from dagster import AssetCheckKey, AssetKey
 
 from dagster_rocky import DiscoverResult, SourceInfo, TableInfo
 from dagster_rocky.component import _build_check_specs, _build_group_contexts
 from dagster_rocky.contracts import ContractRules, contract_check_specs_for_model
 from dagster_rocky.translator import RockyDagsterTranslator
-
-# Activates GROUP A once Edits 1-2 add the `partitions_def` kwarg.
-_THREADED = "partitions_def" in inspect.signature(_build_check_specs).parameters
-requires_threading = pytest.mark.skipif(
-    not _THREADED, reason="Edits 1-2 (partitions_def threading) not yet applied — see REVIEW §10"
-)
 
 
 def _status(rec) -> str:
@@ -119,11 +108,10 @@ def test_unpartitioned_collapsed_checks_clobber():
 
 
 # --------------------------------------------------------------------------- #
-# GROUP A — threading unit tests (land with Edits 1-2)
+# GROUP A — partitions_def threading unit tests
 # --------------------------------------------------------------------------- #
 
 
-@requires_threading
 def test_build_check_specs_threads_partitions_def_to_every_spec():
     groups = _build_group_contexts(_discover_two_tables(), RockyDagsterTranslator())
     pdef = dg.DynamicPartitionsDefinition(name="tenants")
@@ -134,7 +122,6 @@ def test_build_check_specs_threads_partitions_def_to_every_spec():
     assert all(s.partitions_def is pdef for s in specs)
 
 
-@requires_threading
 def test_build_check_specs_defaults_to_unpartitioned():
     groups = _build_group_contexts(_discover_two_tables(), RockyDagsterTranslator())
 
@@ -144,7 +131,6 @@ def test_build_check_specs_defaults_to_unpartitioned():
     assert all(s.partitions_def is None for s in specs)
 
 
-@requires_threading
 def test_contract_check_specs_thread_partitions_def():
     pdef = dg.DynamicPartitionsDefinition(name="tenants")
     rules = ContractRules(has_required=True, has_protected=True, has_column_constraints=True)

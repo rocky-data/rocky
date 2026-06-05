@@ -189,11 +189,13 @@ def contract_check_specs_for_model(
             emitted check spec. Must equal the ``partitions_def`` of the
             asset the checks target (Dagster enforces this — see
             :class:`dagster.AssetCheckSpec`). When set to a tenant
-            ``DynamicPartitionsDefinition``, check verdicts are recorded
-            and queryable per partition (per tenant) rather than collapsing
-            to a single last-writer-wins result. Defaults to ``None``
-            (unpartitioned check), which is byte-identical to prior
-            behaviour.
+            ``DynamicPartitionsDefinition``, each check evaluation is
+            recorded against its tenant partition, so the per-partition
+            execution *history* retains a distinct verdict per tenant.
+            Note (Dagster 1.13.x): this is a **preview** API and the UI
+            summary/badge status remains last-writer-wins across partitions
+            — only the raw history is per-partition. Defaults to ``None``
+            (unpartitioned check), byte-identical to prior behaviour.
 
     Yields:
         ``dg.AssetCheckSpec`` instances. Empty when ``rules.is_empty``.

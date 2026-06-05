@@ -535,7 +535,15 @@ def test_component_entry_builds_collapsed_defs_with_optimize_and_sensor(tmp_path
     assert dg.AssetKey(["fivetran", "usa", "facebookads", "orders"]) in all_keys
     assert not any("coca_cola" in k.to_user_string() for k in all_keys)
 
-    # partitions_def survived the optimize-metadata merge on every spec + check.
+    # The optimize merge actually RAN on the collapsed spec (not vacuous):
+    # the recommendation keyed to leaf "orders" landed as metadata.
+    collapsed_key = dg.AssetKey(["fivetran", "usa", "facebookads", "orders"])
+    collapsed_spec = next(spec for a in asset_defs for spec in a.specs if spec.key == collapsed_key)
+    assert "rocky/recommended_strategy" in (collapsed_spec.metadata or {}), (
+        "optimize metadata did not merge onto the collapsed spec — the "
+        "partitions-survive-the-merge guard would be vacuous"
+    )
+    # …and partitions_def survived that merge on every spec + check.
     for a in asset_defs:
         for spec in a.specs:
             assert spec.partitions_def is not None and spec.partitions_def.name == "rocky_clients"
@@ -545,3 +553,153 @@ def test_component_entry_builds_collapsed_defs_with_optimize_and_sensor(tmp_path
     assert defs.sensors
     # Whole graph resolves (asset/check partition-match invariant holds).
     defs.resolve_asset_graph().get_all_asset_keys()
+
+
+# --------------------------------------------------------------------------- #
+# Regression: op-name uniqueness across connectors (code-location load crash)
+# --------------------------------------------------------------------------- #
+
+
+def test_collapse_op_names_unique_across_connectors(tmp_path):
+    """Two connectors under the same first-string component (region=usa) must
+    not collide on the multi_asset op name. get_group_name returns only the
+    first string component, so naming ops by it produced duplicate
+    'rocky_usa' ops → DagsterInvalidDefinitionError when the implicit
+    __ASSET_JOB builds (the code-location load path)."""
+    discover = {
+        "version": "0.3.0",
+        "command": "discover",
+        "sources": [
+            {
+                "id": f"cc_{s}",
+                "source_type": "fivetran",
+                "components": {"client": "coca_cola", "region": "usa", "source": s},
+                "tables": [{"name": "orders"}],
+            }
+            for s in ("facebookads", "googleads")
+        ],
+    }
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"discover": discover}))
+    component = RockyComponent(
+        config_path="rocky.toml",
+        tenant=TenantConfig(component="client", partitions_name="rocky_clients"),
+    )
+    defs = component.build_defs_from_state(context=None, state_path=state_file)
+    # Forcing all job defs builds the implicit __ASSET_JOB, where duplicate op
+    # names raise. No exception = unique op names.
+    jobs = defs.get_repository_def().get_all_jobs()
+    assert jobs
+
+
+def test_collapse_does_not_merge_distinct_source_types():
+    """Sources with identical components but different source_type are distinct
+    assets ([source_type, *components, table]) and must not collapse together."""
+    a = SourceInfo(
+        id="a",
+        source_type="fivetran",
+        components={"client": "coca_cola", "region": "usa", "source": "shopify"},
+        tables=[TableInfo(name="orders")],
+    )
+    b = SourceInfo(
+        id="b",
+        source_type="airbyte",
+        components={"client": "coca_cola", "region": "usa", "source": "shopify"},
+        tables=[TableInfo(name="orders")],
+    )
+    groups, _ = _collapse(_discover(a, b))
+    assert len(groups) == 2
+    assert {g.name for g in groups} == {"fivetran_usa_shopify", "airbyte_usa_shopify"}
+
+
+def test_collapsed_execution_new_tenant_falls_back_to_table_leaf(tmp_path):
+    """A tenant the sensor added AFTER the last state refresh is absent from the
+    load-time with-tenant map; its engine materialization must still remap to
+    the collapsed key via the table-leaf fallback, not be dropped."""
+    discover = {
+        "version": "0.3.0",
+        "command": "discover",
+        "sources": [
+            {
+                "id": "src_coca_cola",
+                "source_type": "fivetran",
+                "components": {"client": "coca_cola", "region": "usa", "source": "facebookads"},
+                "tables": [{"name": "orders"}],
+            }
+        ],
+    }
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"discover": discover}))
+    component = RockyComponent(
+        config_path="rocky.toml",
+        tenant=TenantConfig(component="client", partitions_name="rocky_clients"),
+    )
+    defs = component.build_defs_from_state(context=None, state_path=state_file)
+    asset_defs = [a for a in (defs.assets or []) if isinstance(a, dg.AssetsDefinition)]
+    collapsed_key = dg.AssetKey(["fivetran", "usa", "facebookads", "orders"])
+
+    # Engine emits a brand-new tenant 'zara' (NOT in the cached discover state).
+    run_result = RunResult.model_validate(
+        {
+            "version": "0.3.0",
+            "command": "run",
+            "filter": "client=zara",
+            "duration_ms": 100,
+            "tables_copied": 1,
+            "tables_failed": 0,
+            "materializations": [
+                {
+                    "asset_key": ["fivetran", "zara", "usa", "facebookads", "orders"],
+                    "rows_copied": 10,
+                    "duration_ms": 50,
+                    "metadata": {"strategy": "full_refresh"},
+                }
+            ],
+            "check_results": [],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 1, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+    instance = dg.DagsterInstance.ephemeral()
+    instance.add_dynamic_partitions("rocky_clients", ["zara"])
+
+    with (
+        patch.object(RockyResource, "run", return_value=run_result),
+        patch.object(RockyResource, "run_streaming", return_value=run_result),
+    ):
+        result = dg.materialize(
+            asset_defs,
+            resources={"rocky": RockyResource(config_path="rocky.toml")},
+            selection=[collapsed_key],
+            partition_key="zara",
+            instance=instance,
+            raise_on_error=False,
+        )
+
+    assert result.success
+    mat_events = list(result.get_asset_materialization_events())
+    assert len(mat_events) == 1
+    assert mat_events[0].asset_key == collapsed_key
+    assert mat_events[0].materialization.partition == "zara"
+
+
+def test_sensor_tenant_mode_sync_off_does_not_advance_cursor_for_skipped():
+    """Cursor must NOT advance for a source the tenant branch skipped (sync off
+    + partition not yet created): advancing would permanently drop that sync —
+    the source would only re-fire on a strictly-newer last_sync_at."""
+    rocky = RockyResource()
+    discover = _discover(_synced("coca_cola", datetime(2026, 4, 8, 10, tzinfo=UTC)))
+    instance = dg.DagsterInstance.ephemeral()  # partition set empty
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = _tenant_sensor(rocky, sync=False)
+        result = sensor(dg.build_sensor_context(cursor=None, instance=instance))
+
+    assert result.run_requests == []
+    # The skipped source's cursor stays absent → it re-fires next tick.
+    cursor = json.loads(result.cursor)
+    assert "src_coca_cola" not in cursor
