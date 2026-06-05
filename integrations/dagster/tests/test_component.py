@@ -14,9 +14,16 @@ import pydantic
 import pytest
 
 from dagster_rocky import component as component_module
-from dagster_rocky.component import RockyComponent, _load_state
+from dagster_rocky.component import (
+    _SUPPORTED_DAG_SCHEMA_VERSION,
+    RockyComponent,
+    _load_state,
+    _warn_discover_signals,
+    _warn_if_dag_schema_newer,
+)
 from dagster_rocky.translator import RockyDagsterTranslator
 from dagster_rocky.types import (
+    DagResult,
     DiscoverResult,
     LineageEdge,
     ModelLineageResult,
@@ -639,6 +646,13 @@ def test_write_state_emits_alias_keys_and_round_trips(
                     "message": "transient fetch failure",
                 }
             ],
+            "collision_candidates": [
+                {
+                    "external_object_id": "ad_account_42",
+                    "sources": ["acme_shopify", "globex_stripe"],
+                }
+            ],
+            "new_sources": ["globex_stripe"],
         }
     )
     stub = _StubResource(discover_result=discover)
@@ -658,10 +672,16 @@ def test_write_state_emits_alias_keys_and_round_trips(
     # On-disk JSON carries the canonical alias key, not the Python attribute.
     assert "schema" in failed_source
     assert "schema_" not in failed_source
+    # The new onboarding-signal fields survive the discover() → model_dump_json
+    # write hop (not just the read hop) so the warning has data in production.
+    assert state["discover"]["collision_candidates"][0]["external_object_id"] == "ad_account_42"
+    assert state["discover"]["new_sources"] == ["globex_stripe"]
 
     # The persisted discover slot round-trips cleanly back through the model.
     round_tripped = DiscoverResult.model_validate(state["discover"])
     assert round_tripped.failed_sources[0].schema_ == "raw_shopify"
+    assert round_tripped.collision_candidates[0].sources == ["acme_shopify", "globex_stripe"]
+    assert round_tripped.new_sources == ["globex_stripe"]
 
 
 # ---------------------------------------------------------------------------
@@ -1586,3 +1606,158 @@ def test_strict_build_write_state_optimize_slot_stays_best_effort(
     state = json.loads(state_path.read_text())
     assert "discover" in state
     assert "optimize" not in state
+
+
+# ---------------------------------------------------------------------------
+# Discover signal surfacing — cross-source collisions + new sources
+# ---------------------------------------------------------------------------
+
+
+def test_warn_discover_signals_logs_collisions_and_new_sources(
+    discover_with_collisions_json: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``_warn_discover_signals`` logs one warning per collision and one for
+    the new-source batch."""
+    discover = DiscoverResult.model_validate_json(discover_with_collisions_json)
+    with caplog.at_level("WARNING", logger=component_module._log.name):
+        _warn_discover_signals(discover)
+
+    messages = [r.getMessage() for r in caplog.records]
+    collision_msgs = [m for m in messages if "cross-source collision" in m]
+    new_source_msgs = [m for m in messages if "new source schema" in m]
+    assert len(collision_msgs) == 1
+    assert len(new_source_msgs) == 1
+    # The collision warning names the shared external object id and the
+    # colliding source schemas.
+    assert "ad_account_42" in collision_msgs[0]
+    assert "acme_us_west_shopify" in collision_msgs[0]
+    assert "globex_eu_central_stripe" in collision_msgs[0]
+    assert "globex_eu_central_stripe" in new_source_msgs[0]
+
+
+def test_warn_discover_signals_silent_without_signals(
+    discover_json: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A plain discover payload (no collision/new-source fields) logs nothing."""
+    discover = DiscoverResult.model_validate_json(discover_json)
+    with caplog.at_level("WARNING", logger=component_module._log.name):
+        _warn_discover_signals(discover)
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+
+def test_build_defs_from_discover_surfaces_collision_warnings(
+    discover_with_collisions_json: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The discover build path surfaces the onboarding signals as warnings
+    while still building the asset graph."""
+    state_file = _write_state(discover_with_collisions_json, tmp_path)
+    component = RockyComponent(config_path="rocky.toml")
+
+    with caplog.at_level("WARNING", logger=component_module._log.name):
+        defs = component.build_defs_from_state(context=None, state_path=state_file)
+
+    # Assets still built — surfacing is additive, not a gate.
+    assert len(list(defs.assets or [])) > 0
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("cross-source collision" in m for m in messages)
+    assert any("new source schema" in m for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# Graph-export schema_version validation
+# ---------------------------------------------------------------------------
+
+
+def _make_dag_result(schema_version: str | None) -> DagResult:
+    """Build a minimal one-node DagResult, optionally pinning schema_version."""
+    payload: dict[str, Any] = {
+        "version": "1.0.0",
+        "command": "dag",
+        "nodes": [
+            {
+                "id": "transformation:m1",
+                "kind": "transformation",
+                "label": "m1",
+                "target": {"catalog": "w", "schema": "s", "table": "m1"},
+            }
+        ],
+        "edges": [],
+        "execution_layers": [],
+        "summary": {
+            "total_nodes": 1,
+            "total_edges": 0,
+            "execution_layers": 0,
+            "counts_by_kind": {},
+        },
+    }
+    if schema_version is not None:
+        payload["schema_version"] = schema_version
+    return DagResult.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [None, "1", _SUPPORTED_DAG_SCHEMA_VERSION, "abc"],
+)
+def test_warn_if_dag_schema_newer_silent_for_supported_or_unparseable(
+    schema_version: str | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No warning for absent / supported / non-numeric schema_version — the
+    last must not crash (forward-compat for a future non-integer scheme)."""
+    dag_result = _make_dag_result(schema_version)
+    with caplog.at_level("WARNING", logger=component_module._log.name):
+        _warn_if_dag_schema_newer(dag_result)
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+
+def test_warn_if_dag_schema_newer_warns_for_newer_version(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A schema_version numerically greater than the supported one warns."""
+    dag_result = _make_dag_result("2")
+    with caplog.at_level("WARNING", logger=component_module._log.name):
+        _warn_if_dag_schema_newer(dag_result)
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "schema_version=2" in warnings[0]
+
+
+def test_warn_if_dag_schema_newer_uses_numeric_compare_not_lexical(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``"10"`` is newer than ``"1"`` numerically — a lexical compare would
+    miss double-digit majors entirely."""
+    dag_result = _make_dag_result("10")
+    with caplog.at_level("WARNING", logger=component_module._log.name):
+        _warn_if_dag_schema_newer(dag_result)
+    assert any(
+        r.levelname == "WARNING" and "schema_version=10" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_dag_mode_build_warns_on_newer_schema_version(
+    discover_json: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``dag_mode`` build path tolerantly warns (never fails) on a newer
+    graph-export schema_version and still builds the asset graph."""
+    dag_payload = _make_dag_result("2").model_dump(by_alias=True, mode="json")
+    state = {
+        "discover": json.loads(discover_json),
+        "dag": dag_payload,
+    }
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+
+    component = RockyComponent(config_path="rocky.toml", dag_mode=True)
+    with caplog.at_level("WARNING", logger=component_module._log.name):
+        defs = component.build_defs_from_state(context=None, state_path=state_file)
+
+    assert len(list(defs.assets or [])) > 0
+    assert any("schema_version=2" in r.getMessage() for r in caplog.records)

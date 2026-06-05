@@ -118,6 +118,17 @@ _FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS: int = 300
 #: Matches the codegen'd ``FailureKind5.quota_exceeded`` value.
 _QUOTA_EXCEEDED_FAILURE_KIND: str = "quota-exceeded"
 
+#: Graph-export ``schema_version`` this build of ``dagster-rocky`` was
+#: generated against (matches the ``DagOutput.schema_version`` default in
+#: ``types_generated/dag_schema.py``). ``rocky dag --output json`` carries
+#: its own ``schema_version`` identifying the *shape* of the graph export.
+#: When the engine bumps it on a backward-incompatible change,
+#: :func:`_warn_if_dag_schema_newer` logs a tolerant warning so an older
+#: integration loading a newer graph degrades gracefully instead of
+#: hard-failing — additive field additions never bump it, so a matching or
+#: older version is always safe to consume.
+_SUPPORTED_DAG_SCHEMA_VERSION: str = "1"
+
 
 def _engine_schema_mismatch_failure(command: str, exc: ValidationError) -> dg.Failure:
     """Build a ``dg.Failure`` for a Pydantic schema-mismatch on ``rocky <command>``.
@@ -817,6 +828,8 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         # (e.g., "from" → from_, "schema" → schema_).
         dag_result = DagResult.model_validate_json(json.dumps(raw["dag"]))
         discover_result = DiscoverResult.model_validate_json(json.dumps(raw["discover"]))
+        _warn_if_dag_schema_newer(dag_result)
+        _warn_discover_signals(discover_result)
         translator = self._get_translator()
         rocky = self._get_rocky_resource()
 
@@ -1008,6 +1021,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         DAG mode (no ``"dag"`` key).
         """
         discover, compile_result, optimize_result = _load_state(state_path)
+        _warn_discover_signals(discover)
         if self.strict_build and not discover.sources:
             raise dg.Failure(
                 description=(
@@ -1123,6 +1137,88 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             assets=assets,
             sensors=sensors or None,
             resources={"rocky": rocky},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Discover / DAG signal surfacing
+# ---------------------------------------------------------------------------
+
+
+def _warn_discover_signals(discover: DiscoverResult) -> None:
+    """Log build-time warnings for cross-source collisions and new sources.
+
+    ``rocky discover`` surfaces two onboarding signals that the component
+    would otherwise parse and drop:
+
+    * ``collision_candidates`` — groups of ≥2 sources sharing the SAME
+      external object id but resolving to DIFFERENT target paths (the same
+      underlying object onboarded twice under different schemas). Populated
+      only when discovery's ``on_collision`` is ``warn``/``error``.
+    * ``new_sources`` — source schemas seen for the first time relative to
+      the prior persisted discover snapshot (the catch-a-duplicate-at-
+      onboarding signal). Populated only when ``report_new_sources`` is set.
+
+    Both are *build-time* discover data, not ``rocky run`` output, so they
+    surface as module-logger warnings here (called from both the discover
+    and DAG build paths) rather than as run-time asset checks. They are
+    deliberately not attached as per-asset metadata: ``SourceOutput``
+    decomposes the source schema into ``components`` and carries no raw
+    schema-name field, so a collision/new-source schema string cannot be
+    reliably mapped back to a specific Dagster asset key.
+    """
+    collisions = discover.collision_candidates or []
+    for collision in collisions:
+        _log.warning(
+            "rocky discover: cross-source collision — external object id %r "
+            "resolves to %d sources (%s). The same underlying object appears "
+            "to be onboarded more than once under different schemas; review "
+            "the listed sources for a duplicate.",
+            collision.external_object_id,
+            len(collision.sources),
+            ", ".join(collision.sources),
+        )
+
+    new_sources = discover.new_sources or []
+    if new_sources:
+        _log.warning(
+            "rocky discover: %d new source schema(s) seen for the first time "
+            "since the last discover snapshot (%s). Confirm these are "
+            "intentional onboardings and not duplicates of existing sources.",
+            len(new_sources),
+            ", ".join(new_sources),
+        )
+
+
+def _warn_if_dag_schema_newer(dag_result: DagResult) -> None:
+    """Warn (never fail) when the graph-export ``schema_version`` is newer.
+
+    ``rocky dag --output json`` carries a ``schema_version`` identifying the
+    *shape* of the graph export. This integration was generated against
+    :data:`_SUPPORTED_DAG_SCHEMA_VERSION`. Forward-compat contract: an older
+    integration must still load a newer graph (additive field additions
+    don't bump the version), so a newer ``schema_version`` is surfaced as a
+    tolerant warning, never a hard failure.
+
+    The comparison is numeric — a lexical string compare would order
+    ``"10"`` before ``"2"``. A non-numeric or absent value is treated as
+    "no newer signal" and silently ignored so a future non-integer scheme
+    can't crash an older integration.
+    """
+    try:
+        payload_version = int(dag_result.schema_version or _SUPPORTED_DAG_SCHEMA_VERSION)
+        supported_version = int(_SUPPORTED_DAG_SCHEMA_VERSION)
+    except (TypeError, ValueError):
+        return
+    if payload_version > supported_version:
+        _log.warning(
+            "rocky dag schema_version=%s is newer than the version this "
+            "dagster-rocky build was generated against (%s). The asset graph "
+            "was built tolerantly and may not reflect newer graph-export "
+            "fields — upgrade dagster-rocky to match the rocky binary to pick "
+            "them up.",
+            dag_result.schema_version,
+            _SUPPORTED_DAG_SCHEMA_VERSION,
         )
 
 

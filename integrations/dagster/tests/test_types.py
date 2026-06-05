@@ -50,6 +50,20 @@ def test_parse_discover(discover_json: str):
     assert globex.components["tenant"] == "globex"
     assert len(globex.tables) == 3
     assert globex.tables[2].row_count is None
+    # A plain discover payload carries no onboarding signals.
+    assert result.collision_candidates == []
+    assert result.new_sources == []
+
+
+def test_parse_discover_collision_and_new_source_signals(discover_with_collisions_json: str):
+    """``DiscoverResult`` retains the cross-source collision and new-source
+    onboarding signals instead of silently dropping them at parse time."""
+    result = DiscoverResult.model_validate_json(discover_with_collisions_json)
+    assert len(result.collision_candidates) == 1
+    collision = result.collision_candidates[0]
+    assert collision.external_object_id == "ad_account_42"
+    assert collision.sources == ["acme_us_west_shopify", "globex_eu_central_stripe"]
+    assert result.new_sources == ["globex_eu_central_stripe"]
 
 
 def test_parse_discover_multi_source_type(discover_multi_source_type_json: str):

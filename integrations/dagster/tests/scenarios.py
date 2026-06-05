@@ -69,6 +69,30 @@ DISCOVER: dict[str, Any] = {
 }
 
 # ---------------------------------------------------------------------------
+# discover — cross-source collision + new-source onboarding signals
+#
+# Same two sources as DISCOVER above, plus the two onboarding signals the
+# component surfaces as build-time warnings: ``collision_candidates`` (one
+# external object id resolving to ≥2 source schemas — the same object
+# onboarded twice) and ``new_sources`` (schemas seen for the first time
+# since the last discover snapshot). Used by test_component to assert the
+# warning surfacing without reconstructing per-asset metadata.
+# ---------------------------------------------------------------------------
+
+DISCOVER_WITH_COLLISIONS: dict[str, Any] = {
+    "version": "0.1.0",
+    "command": "discover",
+    "sources": DISCOVER["sources"],
+    "collision_candidates": [
+        {
+            "external_object_id": "ad_account_42",
+            "sources": ["acme_us_west_shopify", "globex_eu_central_stripe"],
+        },
+    ],
+    "new_sources": ["globex_eu_central_stripe"],
+}
+
+# ---------------------------------------------------------------------------
 # discover — multi-source-type coverage
 #
 # Exercises the generic shape of DiscoverResult: the engine may emit
