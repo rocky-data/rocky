@@ -8,6 +8,277 @@ from enum import StrEnum
 from pydantic import AwareDatetime, BaseModel, conint
 
 
+class Kind(StrEnum):
+    model_removed = "model_removed"
+
+
+class BreakingChange(BaseModel):
+    """
+    A model present on the base side is absent on the head side.
+    """
+
+    kind: Kind
+    model: str
+
+
+class Kind39(StrEnum):
+    model_added = "model_added"
+
+
+class BreakingChange36(BaseModel):
+    """
+    A model present on the head side is absent on the base side.
+    """
+
+    kind: Kind39
+    model: str
+
+
+class Kind40(StrEnum):
+    column_dropped = "column_dropped"
+
+
+class BreakingChange37(BaseModel):
+    """
+    A column present on the base side is absent on the head side.
+    """
+
+    column: str
+    data_type: str
+    kind: Kind40
+    model: str
+
+
+class Kind41(StrEnum):
+    column_added = "column_added"
+
+
+class BreakingChange38(BaseModel):
+    """
+    A column was added.
+    """
+
+    column: str
+    data_type: str
+    kind: Kind41
+    model: str
+    nullable: bool
+
+
+class Kind42(StrEnum):
+    column_type_changed = "column_type_changed"
+
+
+class BreakingChange39(BaseModel):
+    """
+    A column's data type changed.
+    """
+
+    column: str
+    kind: Kind42
+    model: str
+    narrowing: bool
+    """
+    `true` when the new type cannot represent every value of the old type (Int64 → Int32, Decimal precision shrink, Timestamp → Date).
+    """
+    new_type: str
+    old_type: str
+
+
+class Kind43(StrEnum):
+    column_nullability_changed = "column_nullability_changed"
+
+
+class BreakingChange40(BaseModel):
+    """
+    A column's nullability flipped.
+    """
+
+    column: str
+    kind: Kind43
+    model: str
+    new_nullable: bool
+    old_nullable: bool
+
+
+class Kind44(StrEnum):
+    column_reordered = "column_reordered"
+
+
+class BreakingChange41(BaseModel):
+    """
+    A column's position in the output schema changed. `SELECT *` downstream consumers see different positional projection.
+    """
+
+    column: str
+    kind: Kind44
+    model: str
+    new_index: conint(ge=0)
+    old_index: conint(ge=0)
+
+
+class Kind45(StrEnum):
+    materialization_strategy_changed = "materialization_strategy_changed"
+
+
+class BreakingChange42(BaseModel):
+    """
+    The materialization strategy switched between top-level variants (e.g. `FullRefresh` → `Incremental`).
+    """
+
+    kind: Kind45
+    model: str
+    new_strategy: str
+    old_strategy: str
+
+
+class Kind46(StrEnum):
+    materialization_key_changed = "materialization_key_changed"
+
+
+class BreakingChange43(BaseModel):
+    """
+    Materialization-specific key columns changed without the top-level variant changing (e.g. `Merge` `unique_key` rewritten, `Incremental` `timestamp_column` swapped).
+    """
+
+    key_kind: str
+    """
+    Which key changed: `unique_key`, `timestamp_column`, `partition_by`, `time_column`, `granularity`, `target_lag`, `update_columns`, `storage_prefix`, or `partition_columns`.
+    """
+    kind: Kind46
+    model: str
+    new: list[str]
+    old: list[str]
+
+
+class Kind47(StrEnum):
+    replication_columns_changed = "replication_columns_changed"
+
+
+class BreakingChange44(BaseModel):
+    """
+    Replication column-selection mode flipped between `All` and `Explicit(...)` or the explicit list changed.
+    """
+
+    kind: Kind47
+    model: str
+    new: list[str]
+    old: list[str]
+
+
+class Kind48(StrEnum):
+    partition_by_changed = "partition_by_changed"
+
+
+class BreakingChange45(BaseModel):
+    """
+    `LakehouseOptions::partition_by` changed without the strategy changing. Distinct from `MaterializationKeyChanged` since this lives on `format_options` rather than the strategy enum.
+    """
+
+    kind: Kind48
+    model: str
+    new: list[str]
+    old: list[str]
+
+
+class Kind49(StrEnum):
+    target_renamed = "target_renamed"
+
+
+class BreakingChange46(BaseModel):
+    """
+    Target table reference renamed (catalog, schema, or table component).
+    """
+
+    kind: Kind49
+    model: str
+    new: str
+    old: str
+
+
+class Kind50(StrEnum):
+    source_changed = "source_changed"
+
+
+class BreakingChange47(BaseModel):
+    """
+    Source reference rebound to a different table.
+    """
+
+    kind: Kind50
+    model: str
+    new: list[str]
+    old: list[str]
+
+
+class Kind51(StrEnum):
+    column_mask_changed = "column_mask_changed"
+
+
+class BreakingChange48(BaseModel):
+    """
+    A column mask was added, removed, or its strategy changed.
+    """
+
+    column: str
+    kind: Kind51
+    model: str
+    new_strategy: str | None = None
+    old_strategy: str | None = None
+
+
+class Kind52(StrEnum):
+    lakehouse_format_changed = "lakehouse_format_changed"
+
+
+class BreakingChange49(BaseModel):
+    """
+    Lakehouse format switched (e.g. `DeltaTable` → `IcebergTable`).
+    """
+
+    kind: Kind52
+    model: str
+    new: str
+    old: str
+
+
+class Kind53(StrEnum):
+    sql_body_changed = "sql_body_changed"
+
+
+class BreakingChange50(BaseModel):
+    """
+    SQL body changed without any other detectable structural change. Surfaced as `Info` because the typed-output shape is unchanged, but runtime row contents may differ.
+    """
+
+    kind: Kind53
+    model: str
+
+
+class BreakingSeverity7(StrEnum):
+    """
+    Will break a downstream consumer that reads the model's prior shape.
+    """
+
+    breaking = "breaking"
+
+
+class BreakingSeverity8(StrEnum):
+    """
+    May break consumers depending on usage; e.g. nullable → NOT NULL, column reordered.
+    """
+
+    warning = "warning"
+
+
+class BreakingSeverity9(StrEnum):
+    """
+    Informational only — purely additive or backwards-compatible.
+    """
+
+    info = "info"
+
+
 class ClassificationAction(BaseModel):
     """
     Classification-tag application row in `PlanOutput.classification_actions`.
@@ -97,6 +368,40 @@ class SourceSpan(BaseModel):
     line: conint(ge=0)
 
 
+class BreakingFinding(BaseModel):
+    """
+    A classified finding produced by [`diff_project_ir`].
+    """
+
+    change: (
+        BreakingChange
+        | BreakingChange36
+        | BreakingChange37
+        | BreakingChange38
+        | BreakingChange39
+        | BreakingChange40
+        | BreakingChange41
+        | BreakingChange42
+        | BreakingChange43
+        | BreakingChange44
+        | BreakingChange45
+        | BreakingChange46
+        | BreakingChange47
+        | BreakingChange48
+        | BreakingChange49
+        | BreakingChange50
+    )
+    """
+    A single typed semantic change between two `ProjectIr` snapshots.
+
+    Each variant carries the minimum identifying context (model + column + before/after values) needed for a CLI / PR-preview surface to render a useful message without re-loading either IR.
+    """
+    severity: BreakingSeverity7 | BreakingSeverity8 | BreakingSeverity9
+    """
+    Severity classification for a single semantic change.
+    """
+
+
 class Diagnostic(BaseModel):
     """
     A compiler diagnostic (error, warning, or informational message).
@@ -130,6 +435,33 @@ class Diagnostic(BaseModel):
     """
 
 
+class SemanticPlanVerdict(BaseModel):
+    """
+    Decision-support verdict from the typed-IR breaking-change classifier, attached to `PlanOutput` when `rocky plan --semantic` runs against a usable baseline.
+
+    # Scope and blindness
+
+    The classifier diffs the typed **output schema** of each model between the baseline git ref and the working tree (column drop/add/type narrowing, nullability, materialization keys, masks, target rename). It is **blind to schema-stable value changes**: a `WHERE` / `JOIN`-key / `CASE` rewrite that changes every output row but leaves the column list and types untouched produces **no finding**. An empty `findings` list therefore means "no output-schema change was detected" — it is **not** a completeness or safety signal that the data is unchanged. The [`Self::caveat`] field carries this statement verbatim so a consumer that only reads the JSON cannot miss it.
+
+    # Reporting-only
+
+    This verdict never gates the plan. Even a `breaking`-severity finding leaves the planned statements and the process exit code unchanged. The hard gate (which blocks on `breaking`) lives on `rocky plan promote`.
+    """
+
+    base_ref: str
+    """
+    The git ref the working tree was diffed against (the `--base` value, default `"main"`).
+    """
+    caveat: str
+    """
+    Verbatim statement of what the classifier does and does not see. Always populated — present even when `findings` is empty, because "no findings" is the case most easily misread as "safe". See the type-level docs for why this is load-bearing.
+    """
+    findings: list[BreakingFinding]
+    """
+    Classified output-schema findings (one per detected change), including `info`-severity entries. Each finding carries its own `model`, tagged `change.kind`, and `severity` (`breaking` / `warning` / `info`). Empty when no output-schema change was detected — which, per `caveat`, is not a safety signal.
+    """
+
+
 class PlanOutput(BaseModel):
     """
     JSON output for `rocky plan`.
@@ -141,6 +473,10 @@ class PlanOutput(BaseModel):
     `plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers` are additive — all have `skip_serializing_if` so existing fixtures and consumers that do not include a compile step remain byte-stable. When `rocky plan` runs against a project with a `models/` directory, these fields are populated and the plan is persisted to `.rocky/plans/`.
     """
 
+    breaking_verdict: SemanticPlanVerdict | None = None
+    """
+    Semantic change-impact verdict from the typed-IR breaking-change classifier, surfaced as decision-support at plan time. Present only when `--semantic` ran with a usable baseline. See [`SemanticPlanVerdict`] — note its `caveat`: the classifier diffs OUTPUT SCHEMA only and is blind to schema-stable value changes.
+    """
     budget_diagnostics: list[Diagnostic] | None = None
     """
     Per-model E027 budget-exceeded diagnostics produced at plan time using real catalog statistics. Severity reflects the model's `on_breach` policy (`"warn"` or `"error"`). Empty when no ceiling was exceeded or no real stats were available.

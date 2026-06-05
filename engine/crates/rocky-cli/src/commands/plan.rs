@@ -53,12 +53,28 @@ pub struct PlanRunOptions {
 /// re-deriving the `ProjectIr` by recompiling. Full IR persistence is
 /// deferred — the operational-metadata approach covers the deterministic
 /// re-application requirement at acceptable cost.
+///
+/// ## Semantic verdict (decision-support)
+///
+/// When `semantic` is set, `rocky plan` additionally compiles the project at
+/// `base_ref` (default `"main"`), diffs the typed output schema against the
+/// working tree via the [`rocky_core::breaking_change`] classifier, and
+/// attaches the classified findings to `output.breaking_verdict`. This is
+/// **reporting-only**: it never gates, skips, or reorders the planned
+/// statements, and a `breaking` finding does not change the exit code. The
+/// hard gate lives on `rocky plan promote`. When no baseline is available
+/// (the `base_ref` models do not compile, or there is no `models/`
+/// directory) the verdict is omitted — never fabricated.
+#[allow(clippy::too_many_arguments)]
 pub async fn plan(
     config_path: &Path,
     filter: Option<&str>,
     pipeline_name: Option<&str>,
     env: Option<&str>,
     run_options: &PlanRunOptions,
+    semantic: bool,
+    base_ref: &str,
+    state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
@@ -312,6 +328,22 @@ pub async fn plan(
         output.has_budget_errors = has_errors;
     }
 
+    // --- Semantic breaking-change verdict (D3 — decision-support) --------
+    //
+    // REPORTING ONLY. Computed AFTER the budget check and BEFORE plan
+    // persistence so the classifier's findings live on `output` but never
+    // enter the persisted `RunPlan` / `ReplicationPlan` payloads (those are
+    // content-hashed into `plan_id`; including findings would shift the id).
+    // The verdict never gates: planned statements and the exit code are
+    // unchanged regardless of severity. The hard gate is `rocky plan
+    // promote`. Skipped (verdict omitted) unless `--semantic` is set; on
+    // `--semantic` with no usable baseline the verdict is omitted rather
+    // than fabricated.
+    if semantic {
+        output.breaking_verdict =
+            compute_semantic_verdict(config_path, &models_dir, base_ref, state_path);
+    }
+
     // --- Plan-spine persistence (Cluster 3 B, Phase 2 + Phase 5b) ---------
     //
     // Persist a `RunPlan` when the project has compiled models, or a
@@ -401,6 +433,7 @@ pub async fn plan(
         }
         render_governance_preview_text(&output);
         render_budget_diagnostics_text(&output);
+        render_semantic_verdict_text(&output);
         if let Some(ref plan_id) = output.plan_id {
             println!();
             match output.plan_kind.as_deref() {
@@ -1211,6 +1244,129 @@ fn render_budget_diagnostics_text(output: &PlanOutput) {
             println!("  hint: {suggestion}");
         }
     }
+}
+
+/// Compute the decision-support semantic verdict for `rocky plan --semantic`.
+///
+/// Compiles the **working tree** (head) and the project as it stood at
+/// `base_ref` (the same baseline mechanism `rocky ci-diff` /
+/// `rocky plan promote` use — [`super::ci_diff::extract_base_compile`]),
+/// lowers both to [`rocky_ir::ProjectIr`] via
+/// [`super::ci_diff::project_ir_from_compile`], and runs
+/// [`rocky_core::breaking_change::diff_project_ir`].
+///
+/// Returns `None` (verdict omitted) when there is no baseline to diff
+/// against — no `models/` directory, the working tree fails to compile, or
+/// the `base_ref` models cannot be materialized / do not compile. A `None`
+/// is the honest "nothing to report" outcome; the caller never fabricates a
+/// verdict.
+///
+/// Both compiles are seeded with the **current** cached source schemas so
+/// the per-model type diff measures real schema drift rather than
+/// `Unknown`-vs-`Unknown` noise — identical to the seeding `ci-diff` and the
+/// promote gate use. The returned verdict's `findings` is the full
+/// classified list (including `info`-severity entries); it always carries
+/// the [`SEMANTIC_VERDICT_CAVEAT`] so a JSON-only consumer sees that the
+/// classifier is blind to schema-stable value changes.
+fn compute_semantic_verdict(
+    config_path: &Path,
+    models_dir: &Path,
+    base_ref: &str,
+    state_path: &Path,
+) -> Option<SemanticPlanVerdict> {
+    use rocky_compiler::compile::{self, CompilerConfig};
+
+    if !models_dir.is_dir() {
+        tracing::debug!(
+            models_dir = %models_dir.display(),
+            "plan --semantic: no models directory — verdict omitted"
+        );
+        return None;
+    }
+
+    // Seed both compiles from the current warehouse schema cache so the IR
+    // carries real leaf types. Degrade to an empty map on config / cache
+    // failure rather than blocking the preview.
+    let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(cfg) => {
+            let schema_cfg = cfg.cache.schemas.with_ttl_override(None);
+            crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
+        }
+        Err(_) => std::collections::HashMap::new(),
+    };
+
+    let head_compile = {
+        let config = CompilerConfig {
+            models_dir: models_dir.to_path_buf(),
+            contracts_dir: None,
+            source_schemas: source_schemas.clone(),
+            source_column_info: std::collections::HashMap::new(),
+            ..Default::default()
+        };
+        match compile::compile(&config) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "plan --semantic: working-tree compile failed — verdict omitted"
+                );
+                return None;
+            }
+        }
+    };
+
+    let base_compile =
+        match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
+            Ok(r) => r,
+            Err(reason) => {
+                tracing::debug!(
+                    reason = %reason,
+                    "plan --semantic: base ref '{base_ref}' compile unavailable — verdict omitted"
+                );
+                return None;
+            }
+        };
+
+    let base_ir = super::ci_diff::project_ir_from_compile(&base_compile);
+    let head_ir = super::ci_diff::project_ir_from_compile(&head_compile);
+    let findings = rocky_core::breaking_change::diff_project_ir(&base_ir, &head_ir);
+
+    Some(SemanticPlanVerdict {
+        caveat: SEMANTIC_VERDICT_CAVEAT.to_string(),
+        base_ref: base_ref.to_string(),
+        findings,
+    })
+}
+
+/// Render the semantic verdict under the text output mode.
+///
+/// Prints the per-finding severity + change, then the caveat verbatim. The
+/// caveat is printed even when `findings` is empty, mirroring the JSON
+/// payload: "no findings" is the case most easily misread as "safe".
+fn render_semantic_verdict_text(output: &PlanOutput) {
+    let Some(verdict) = &output.breaking_verdict else {
+        return;
+    };
+    use rocky_core::breaking_change::BreakingSeverity;
+
+    println!();
+    println!(
+        "-- semantic verdict (vs {base}, decision-support) --",
+        base = verdict.base_ref
+    );
+    if verdict.findings.is_empty() {
+        println!("no output-schema changes detected");
+    } else {
+        for f in &verdict.findings {
+            let sev = match f.severity {
+                BreakingSeverity::Breaking => "BREAKING",
+                BreakingSeverity::Warning => "WARNING",
+                BreakingSeverity::Info => "INFO",
+            };
+            println!("[{sev}] {:?}", f.change);
+        }
+    }
+    println!("note: {}", verdict.caveat);
 }
 
 // ---------------------------------------------------------------------------
@@ -2052,5 +2208,127 @@ table = "m"
         assert_eq!(json[0]["source_type"], "duckdb");
         assert_eq!(json[0]["tables"][0]["name"], "t1");
         assert_eq!(json[0]["tables"][0]["row_count"], 10);
+    }
+
+    // ------------------------------------------------------------------
+    // Semantic verdict (D3 — decision-support)
+    // ------------------------------------------------------------------
+
+    /// The caveat constant must plainly state that the classifier diffs
+    /// OUTPUT SCHEMA and is blind to schema-stable value changes, and that
+    /// an empty finding list is not a completeness signal. This guards the
+    /// disclaimer text — required by the task's second hard constraint —
+    /// against a silent edit that would weaken it.
+    #[test]
+    fn caveat_states_output_schema_scope_and_value_blindness() {
+        let c = SEMANTIC_VERDICT_CAVEAT;
+        assert!(
+            c.contains("OUTPUT SCHEMA"),
+            "caveat must name OUTPUT SCHEMA"
+        );
+        assert!(c.contains("BLIND"), "caveat must state the blindness");
+        // The canonical value-change example the constraint calls out.
+        assert!(
+            c.contains("WHERE") && c.contains("JOIN") && c.contains("CASE"),
+            "caveat must give the WHERE/JOIN/CASE value-rewrite example",
+        );
+        assert!(
+            c.contains("NOT") && c.to_lowercase().contains("unchanged"),
+            "caveat must deny that an empty result means the data is unchanged",
+        );
+    }
+
+    /// The verdict's `caveat` is carried even when `findings` is empty —
+    /// the case most easily misread as "safe". A JSON-only consumer must
+    /// still see the disclaimer. This encodes the second hard constraint.
+    #[test]
+    fn empty_findings_verdict_still_serializes_the_caveat() {
+        let verdict = SemanticPlanVerdict {
+            caveat: SEMANTIC_VERDICT_CAVEAT.to_string(),
+            base_ref: "main".to_string(),
+            findings: vec![],
+        };
+        let json = serde_json::to_value(&verdict).expect("verdict serializes");
+        assert_eq!(json["base_ref"], "main");
+        assert!(
+            json["findings"]
+                .as_array()
+                .expect("findings array")
+                .is_empty(),
+            "findings must be present and empty",
+        );
+        let caveat = json["caveat"].as_str().expect("caveat is a string");
+        assert!(caveat.contains("OUTPUT SCHEMA"));
+        assert!(caveat.contains("BLIND"));
+    }
+
+    /// A populated verdict round-trips: severity + change kind reach the
+    /// JSON exactly as the classifier emits them, alongside the caveat.
+    #[test]
+    fn populated_verdict_carries_findings_and_caveat() {
+        use rocky_core::breaking_change::{BreakingChange, BreakingFinding, BreakingSeverity};
+        let verdict = SemanticPlanVerdict {
+            caveat: SEMANTIC_VERDICT_CAVEAT.to_string(),
+            base_ref: "origin/main".to_string(),
+            findings: vec![BreakingFinding {
+                change: BreakingChange::ColumnDropped {
+                    model: "c.s.orders".to_string(),
+                    column: "legacy_flag".to_string(),
+                    data_type: "String".to_string(),
+                },
+                severity: BreakingSeverity::Breaking,
+            }],
+        };
+        let json = serde_json::to_value(&verdict).expect("verdict serializes");
+        assert_eq!(json["findings"][0]["severity"], "breaking");
+        assert_eq!(json["findings"][0]["change"]["kind"], "column_dropped");
+        assert_eq!(json["findings"][0]["change"]["column"], "legacy_flag");
+        assert!(json["caveat"].as_str().unwrap().contains("OUTPUT SCHEMA"));
+    }
+
+    /// No `models/` directory ⇒ no baseline ⇒ verdict omitted (`None`).
+    /// The verdict is never fabricated when there is nothing to diff.
+    #[test]
+    fn no_models_dir_yields_no_verdict() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("rocky.toml");
+        fs::write(&cfg_path, "[adapter.default]\ntype = \"duckdb\"\n").unwrap();
+        let missing_models = tmp.path().join("models"); // not created
+        let state_path = tmp.path().join("state.redb");
+        let verdict = compute_semantic_verdict(&cfg_path, &missing_models, "main", &state_path);
+        assert!(
+            verdict.is_none(),
+            "absent models directory must omit the verdict, not fabricate one",
+        );
+    }
+
+    /// A models directory that exists but whose base ref cannot be
+    /// materialized from git (the temp project is not a committed tree at
+    /// `no-such-ref`) ⇒ no baseline ⇒ verdict omitted. Reuses the same
+    /// `extract_base_compile` baseline mechanism as `ci-diff`, so a missing
+    /// base ref degrades to `None` rather than erroring.
+    #[test]
+    fn unresolvable_base_ref_yields_no_verdict() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            "[adapter.default]\ntype = \"duckdb\"\n",
+            &[(
+                "orders",
+                "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"orders\"\n",
+            )],
+        );
+        let state_path = tmp.path().join("state.redb");
+        let verdict = compute_semantic_verdict(
+            &cfg_path,
+            &models_dir,
+            "definitely-not-a-real-ref-xyz",
+            &state_path,
+        );
+        assert!(
+            verdict.is_none(),
+            "an unresolvable base ref must omit the verdict (no fabricated baseline)",
+        );
     }
 }

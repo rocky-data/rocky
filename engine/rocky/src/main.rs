@@ -504,6 +504,27 @@ enum Command {
         /// Applies to the default plan subcommand only.
         #[arg(long, global = false)]
         env: Option<String>,
+
+        /// Also run the typed-IR breaking-change classifier against `--base`
+        /// and attach the change-impact verdict under `breaking_verdict` in
+        /// the JSON output (and a `-- semantic verdict --` block in text
+        /// mode).
+        ///
+        /// Decision-support only: the verdict NEVER gates the plan — planned
+        /// statements and the exit code are unchanged even on a `breaking`
+        /// finding, and the verdict is omitted (never fabricated) when no
+        /// baseline is available. The classifier diffs OUTPUT SCHEMA and is
+        /// blind to schema-stable value changes (a WHERE / JOIN-key / CASE
+        /// rewrite that changes values but not the schema). The hard gate
+        /// lives on `rocky plan promote`.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, global = false)]
+        semantic: bool,
+        /// Git ref the working tree is diffed against for `--semantic`
+        /// (default: main). Ignored unless `--semantic` is set.
+        /// Applies to the default plan subcommand only.
+        #[arg(long, default_value = "main", global = false)]
+        base: String,
     },
 
     /// Execute the full pipeline in one step: discover → drift → create → copy → check.
@@ -2268,6 +2289,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             dag,
             idempotency_key,
             env,
+            semantic,
+            base,
         } => match subcommand {
             None => {
                 // Mirror the `rocky run` guard: --idempotency-key is mutually
@@ -2320,6 +2343,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     pipeline.as_deref(),
                     env.as_deref(),
                     &run_options,
+                    semantic,
+                    &base,
+                    &state_path,
                     json,
                 )
                 .await
@@ -3660,6 +3686,12 @@ mod tests {
                 dag,
                 idempotency_key,
                 env,
+                // `--semantic` / `--base` are decision-support flags (D3) and
+                // are exercised by their own tests in
+                // `crates/rocky-cli/src/commands/plan.rs`; this run/plan
+                // flag-parity helper does not thread them.
+                semantic: _,
+                base: _,
             } => extract(
                 filter,
                 pipeline,
