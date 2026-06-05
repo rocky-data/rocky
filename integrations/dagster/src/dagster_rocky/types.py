@@ -87,6 +87,21 @@ class DiscoverResult(BaseModel):
     #: round 9 bridge block below — ``from __future__ import annotations``
     #: defers evaluation so the forward reference resolves at runtime.
     failed_sources: list[FailedSourceOutput] = []
+    #: Groups of ≥2 discovered sources sharing the SAME external object id
+    #: but resolving to DIFFERENT target paths — the same underlying object
+    #: onboarded twice under different schemas. Populated only when
+    #: discovery's ``on_collision`` is ``warn``/``error`` and the adapter
+    #: supplies an ``external_object_id``; empty otherwise. Forward-references
+    #: :class:`CollisionCandidate` (defined with the run-output classes
+    #: below); ``from __future__ import annotations`` defers evaluation so
+    #: the reference resolves at runtime.
+    collision_candidates: list[CollisionCandidate] = []
+    #: Source schemas seen for the first time relative to the prior persisted
+    #: ``discover`` snapshot — the catch-a-duplicate-at-onboarding signal.
+    #: Populated only when the pipeline's discovery config sets
+    #: ``report_new_sources``; empty otherwise. The first-ever discover of a
+    #: pipeline establishes the baseline and reports none.
+    new_sources: list[str] = []
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +295,25 @@ class ExcludedTable(BaseModel):
     #: kept open so future causes (disabled, sync_paused, ...) can be
     #: added without a schema break.
     reason: str
+
+
+class CollisionCandidate(BaseModel):
+    """A cross-source collision: one external object id that resolves to
+    more than one target path (the same underlying object onboarded twice
+    under different schemas).
+
+    Surfaced on :attr:`DiscoverResult.collision_candidates` when discovery's
+    ``on_collision`` is ``warn``/``error`` and the adapter supplies an
+    ``external_object_id``. Mirrors the engine-side
+    ``CollisionCandidateOutput`` shape.
+    """
+
+    #: The shared external object id (e.g. a Fivetran ad-account id) that
+    #: more than one discovered source resolves to.
+    external_object_id: str
+    #: The distinct source schemas (≥2, sorted) that resolve to the shared
+    #: object id. Review these for a duplicate onboarding.
+    sources: list[str]
 
 
 class ExecutionSummary(BaseModel):

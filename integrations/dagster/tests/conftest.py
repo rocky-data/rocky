@@ -32,6 +32,14 @@ def discover_json() -> str:
 
 
 @pytest.fixture
+def discover_with_collisions_json() -> str:
+    """DiscoverResult carrying the cross-source ``collision_candidates`` and
+    ``new_sources`` onboarding signals. Used to assert the component surfaces
+    them as build-time warnings."""
+    return json.dumps(scenarios.DISCOVER_WITH_COLLISIONS)
+
+
+@pytest.fixture
 def discover_multi_source_type_json() -> str:
     """DiscoverResult with three source types (fivetran, airbyte, manual)
     and three different component hierarchies. Used by translator and
