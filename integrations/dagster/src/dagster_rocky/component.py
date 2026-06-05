@@ -1432,6 +1432,7 @@ def _build_check_specs(
     contract_rules_by_model: dict[str, ContractRules] | None = None,
     *,
     surface_compliance: bool = False,
+    partitions_def: dg.PartitionsDefinition | None = None,
 ) -> list[dg.AssetCheckSpec]:
     """Pre-declare check specs for every asset in every group.
 
@@ -1450,6 +1451,15 @@ def _build_check_specs(
     pattern (check exists even if the current run produces no exceptions,
     in which case :func:`_emit_placeholder_checks` emits a passing
     placeholder).
+
+    When ``partitions_def`` is provided, every emitted check spec is
+    partitioned by it. This is the tenant-as-partition path: with the
+    collapsed asset's tenant ``DynamicPartitionsDefinition`` attached,
+    check verdicts are recorded per partition (per tenant) instead of
+    collapsing to one last-writer-wins result on the shared
+    ``(asset_key, check_name)``. Must equal the collapsed asset's
+    ``partitions_def`` (Dagster enforces the match). Defaults to ``None``
+    — the unpartitioned, byte-identical-to-prior path.
     """
     contract_rules_by_model = contract_rules_by_model or {}
     specs: list[dg.AssetCheckSpec] = []
@@ -1482,17 +1492,27 @@ def _build_check_specs(
         for spec in group.specs:
             # Default checks (4 per asset)
             for check_name in DEFAULT_CHECK_NAMES:
-                _add(dg.AssetCheckSpec(name=check_name, asset=spec.key))
+                _add(
+                    dg.AssetCheckSpec(
+                        name=check_name, asset=spec.key, partitions_def=partitions_def
+                    )
+                )
 
             # Governance compliance check (Wave B, opt-in)
             if surface_compliance:
-                _add(dg.AssetCheckSpec(name=COMPLIANCE_CHECK_NAME, asset=spec.key))
+                _add(
+                    dg.AssetCheckSpec(
+                        name=COMPLIANCE_CHECK_NAME, asset=spec.key, partitions_def=partitions_def
+                    )
+                )
 
             # Contract checks (per declared rule kind, when matched)
             table_name = spec.key.path[-1]
             rules = contract_rules_by_model.get(table_name)
             if rules is not None:
-                for contract_spec in contract_check_specs_for_model(spec.key, rules):
+                for contract_spec in contract_check_specs_for_model(
+                    spec.key, rules, partitions_def=partitions_def
+                ):
                     _add(contract_spec)
 
     return specs

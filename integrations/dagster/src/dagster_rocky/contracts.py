@@ -173,6 +173,8 @@ def _parse_contract_rules(path: Path) -> ContractRules:
 def contract_check_specs_for_model(
     asset_key: dg.AssetKey,
     rules: ContractRules,
+    *,
+    partitions_def: dg.PartitionsDefinition | None = None,
 ) -> Iterator[dg.AssetCheckSpec]:
     """Yield one ``AssetCheckSpec`` per rule kind present in the contract.
 
@@ -183,6 +185,15 @@ def contract_check_specs_for_model(
     Args:
         asset_key: The Dagster asset key the checks belong to.
         rules: ContractRules describing which rule kinds are present.
+        partitions_def: Optional ``PartitionsDefinition`` to attach to each
+            emitted check spec. Must equal the ``partitions_def`` of the
+            asset the checks target (Dagster enforces this — see
+            :class:`dagster.AssetCheckSpec`). When set to a tenant
+            ``DynamicPartitionsDefinition``, check verdicts are recorded
+            and queryable per partition (per tenant) rather than collapsing
+            to a single last-writer-wins result. Defaults to ``None``
+            (unpartitioned check), which is byte-identical to prior
+            behaviour.
 
     Yields:
         ``dg.AssetCheckSpec`` instances. Empty when ``rules.is_empty``.
@@ -192,12 +203,14 @@ def contract_check_specs_for_model(
             name=CONTRACT_REQUIRED_COLUMNS_CHECK,
             asset=asset_key,
             description="Required columns from .contract.toml are present in model output",
+            partitions_def=partitions_def,
         )
     if rules.has_protected:
         yield dg.AssetCheckSpec(
             name=CONTRACT_PROTECTED_COLUMNS_CHECK,
             asset=asset_key,
             description="Protected columns from .contract.toml have not been removed",
+            partitions_def=partitions_def,
         )
     if rules.has_column_constraints:
         yield dg.AssetCheckSpec(
@@ -206,6 +219,7 @@ def contract_check_specs_for_model(
             description=(
                 "Column types and nullability constraints from .contract.toml are satisfied"
             ),
+            partitions_def=partitions_def,
         )
 
 
