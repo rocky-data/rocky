@@ -8,11 +8,13 @@ default (tenant unset) path is unchanged.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
+from unittest.mock import patch
 
 import dagster as dg
 import pytest
 
-from dagster_rocky import DiscoverResult, RockyResource, SourceInfo, TableInfo
+from dagster_rocky import DiscoverResult, RockyResource, SourceInfo, TableInfo, rocky_source_sensor
 from dagster_rocky.component import (
     TenantConfig,
     _build_check_specs,
@@ -256,3 +258,86 @@ def test_default_path_unchanged_keeps_tenant_in_key():
     assert "fivetran/coca_cola/usa/facebookads/orders" in keys
     assert "fivetran/pepsi/usa/facebookads/orders" in keys
     assert all(g.partitions_def is None for g in groups)
+
+
+# --------------------------------------------------------------------------- #
+# Sensor: tenant-partition mode (Layer 6)
+# --------------------------------------------------------------------------- #
+
+
+def _synced(client: str, when: datetime, tables: list[str] | None = None) -> SourceInfo:
+    return SourceInfo(
+        id=f"src_{client}",
+        components={"client": client, "region": "usa", "source": "facebookads"},
+        source_type="fivetran",
+        last_sync_at=when,
+        tables=[TableInfo(name=t) for t in (tables or ["orders"])],
+    )
+
+
+def _tenant_sensor(rocky: RockyResource, *, sync: bool = True) -> dg.SensorDefinition:
+    return rocky_source_sensor(
+        rocky_resource=rocky,
+        target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "usa", "facebookads", "orders"])),
+        minimum_interval_seconds=60,
+        tenant_component="client",
+        tenant_partitions_name="rocky_clients",
+        sync_partitions_from_discover=sync,
+    )
+
+
+def test_sensor_tenant_mode_adds_partitions_and_emits_partitioned_requests():
+    rocky = RockyResource()
+    discover = _discover(
+        _synced("coca_cola", datetime(2026, 4, 8, 10, tzinfo=UTC)),
+        _synced("pepsi", datetime(2026, 4, 8, 11, tzinfo=UTC)),
+    )
+    instance = dg.DagsterInstance.ephemeral()
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = _tenant_sensor(rocky)
+        result = sensor(dg.build_sensor_context(cursor=None, instance=instance))
+
+    # One partitioned RunRequest per triggered tenant.
+    assert len(result.run_requests) == 2
+    by_pk = {rr.partition_key: rr for rr in result.run_requests}
+    assert set(by_pk) == {"coca_cola", "pepsi"}
+    # Collapsed (tenant-agnostic) asset selection.
+    assert by_pk["coca_cola"].asset_selection == [
+        dg.AssetKey(["fivetran", "usa", "facebookads", "orders"])
+    ]
+    # Tenant value rides a run tag too (governance fallback).
+    assert by_pk["coca_cola"].tags["rocky/client"] == "coca_cola"
+    # New tenant values added to the partition set, atomically with the runs.
+    assert result.dynamic_partitions_requests is not None
+    added = {k for req in result.dynamic_partitions_requests for k in req.partition_keys}
+    assert added == {"coca_cola", "pepsi"}
+
+
+def test_sensor_tenant_mode_only_adds_unseen_partitions():
+    rocky = RockyResource()
+    discover = _discover(
+        _synced("coca_cola", datetime(2026, 4, 8, 10, tzinfo=UTC)),
+        _synced("pepsi", datetime(2026, 4, 8, 11, tzinfo=UTC)),
+    )
+    instance = dg.DagsterInstance.ephemeral()
+    instance.add_dynamic_partitions("rocky_clients", ["coca_cola"])  # already known
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = _tenant_sensor(rocky)
+        result = sensor(dg.build_sensor_context(cursor=None, instance=instance))
+
+    added = {k for req in (result.dynamic_partitions_requests or []) for k in req.partition_keys}
+    assert added == {"pepsi"}  # coca_cola already present, not re-added
+    assert len(result.run_requests) == 2  # both still get a run
+
+
+def test_sensor_tenant_mode_sync_off_skips_unknown_partition():
+    rocky = RockyResource()
+    discover = _discover(_synced("coca_cola", datetime(2026, 4, 8, 10, tzinfo=UTC)))
+    instance = dg.DagsterInstance.ephemeral()  # partition set empty
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = _tenant_sensor(rocky, sync=False)
+        result = sensor(dg.build_sensor_context(cursor=None, instance=instance))
+
+    # sync off + partition doesn't exist → no run, no add.
+    assert result.run_requests == []
+    assert not result.dynamic_partitions_requests

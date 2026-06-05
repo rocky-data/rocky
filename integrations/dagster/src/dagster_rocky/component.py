@@ -71,7 +71,7 @@ from .observability import (
 )
 from .resource import DEFAULT_TIMEOUT_SECONDS, Resolver, RockyResource
 from .sensor import rocky_source_sensor
-from .translator import RockyDagsterTranslator
+from .translator import RockyDagsterTranslator, strip_tenant_component
 from .types import (
     CompileResult,
     DagResult,
@@ -1202,6 +1202,14 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
                     translator=translator,
                     name=f"rocky_source_sensor_{_safe_asset_name(self.config_path)}",
                     minimum_interval_seconds=self.sensor_interval_seconds,
+                    # Tenant-as-partition mode: when configured, the sensor
+                    # adds new tenant values to the partition set and emits
+                    # one partitioned RunRequest per triggered source.
+                    tenant_component=self.tenant.component if self.tenant else None,
+                    tenant_partitions_name=(self.tenant.partitions_name if self.tenant else None),
+                    sync_partitions_from_discover=(
+                        self.tenant.sync_partitions_from_discover if self.tenant else True
+                    ),
                 )
             )
 
@@ -1473,18 +1481,6 @@ _PER_TENANT_METADATA_KEYS: frozenset[str] = frozenset(
 )
 
 
-def _strip_tenant_component(source: SourceInfo, tenant_component: str) -> SourceInfo:
-    """Return a copy of ``source`` with the tenant component removed.
-
-    The collapsed key/group/tags fall out of the *stock* translator with
-    no API change: every translator method reads ``source.components``, so
-    dropping the tenant entry yields ``[source_type, *non_tenant, table]``
-    and omits the per-tenant ``rocky/{component}`` tag automatically.
-    """
-    remaining = {k: v for k, v in source.components.items() if k != tenant_component}
-    return source.model_copy(update={"components": remaining})
-
-
 def _union_member_tables(members: list[SourceInfo]) -> list[TableInfo]:
     """Union the tables across all members of a collapsed group, by name.
 
@@ -1572,7 +1568,7 @@ def _build_collapsed_group_contexts(
 
     groups: list[_GroupBuild] = []
     for members in grouped.values():
-        representative = _strip_tenant_component(members[0], tenant.component)
+        representative = strip_tenant_component(members[0], tenant.component)
         group = _GroupBuild(name=translator.get_group_name(representative))
         group.partitions_def = partitions_def
         group.tenant_component = tenant.component

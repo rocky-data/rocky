@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple
 import dagster as dg
 
 from .resource import RockyResource
-from .translator import RockyDagsterTranslator
+from .translator import RockyDagsterTranslator, strip_tenant_component
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -116,6 +116,9 @@ def rocky_source_sensor(
     on_run_request_emitted: Callable[[EmitContext], None] | None = None,
     on_failed_sources: Callable[[FailedSourcesContext], None] | None = None,
     on_skip: Callable[[SkipContext], None] | None = None,
+    tenant_component: str | None = None,
+    tenant_partitions_name: str | None = None,
+    sync_partitions_from_discover: bool = True,
 ) -> dg.SensorDefinition:
     """Build a Dagster sensor that watches Rocky sources for new syncs.
 
@@ -259,7 +262,23 @@ def rocky_source_sensor(
                 skip_reason=dg.SkipReason(skip_reason),
             )
 
-        if granularity == "per_source":
+        # Tenant-as-partition mode: one RunRequest per triggered source,
+        # carrying the tenant partition key + the collapsed (tenant-agnostic)
+        # asset selection, and adding any newly-seen tenant values to the
+        # DynamicPartitionsDefinition in the same SensorResult (so a
+        # brand-new tenant self-heals: the add applies before its run is
+        # processed). Supersedes per_source/per_group granularity.
+        dynamic_partitions_requests: list[dg.AddDynamicPartitionsRequest] = []
+        if tenant_component is not None and tenant_partitions_name is not None:
+            request_pairs, dynamic_partitions_requests = _tenant_request_pairs(
+                triggered,
+                translator,
+                tenant_component=tenant_component,
+                tenant_partitions_name=tenant_partitions_name,
+                sync_partitions=sync_partitions_from_discover,
+                context=context,
+            )
+        elif granularity == "per_source":
             request_pairs: list[tuple[dg.RunRequest, tuple[SourceInfo, ...]]] = [
                 (_per_source_request(source, translator), (source,)) for source in triggered
             ]
@@ -326,6 +345,7 @@ def rocky_source_sensor(
         return dg.SensorResult(
             run_requests=run_requests,
             cursor=json.dumps(new_cursor),
+            dynamic_partitions_requests=dynamic_partitions_requests or None,
         )
 
     return _sensor
@@ -391,3 +411,107 @@ def _per_group_request_pairs(
             },
         )
         yield rr, tuple(sources)
+
+
+# ---------------------------------------------------------------------------
+# Tenant-as-partition mode
+# ---------------------------------------------------------------------------
+
+
+def _tenant_partition_request(
+    source: SourceInfo,
+    translator: RockyDagsterTranslator,
+    tenant_component: str,
+    partition_key: str,
+) -> dg.RunRequest:
+    """Build one ``RunRequest`` materialising a tenant partition of the
+    collapsed asset.
+
+    ``asset_selection`` is the *collapsed* (tenant-agnostic) keys for this
+    source's tables — derived via :func:`strip_tenant_component` + the stock
+    translator, the same path the component uses to build the specs, so the
+    selection always lines up. ``partition_key`` carries the tenant; the raw
+    tenant value is also stamped as a ``rocky/{component}`` run tag, and the
+    execution body re-derives ``--filter {component}={value}`` from the
+    partition key, so governance resolvers keyed on the run (tag or
+    ``--filter``) keep working.
+    """
+    stripped = strip_tenant_component(source, tenant_component)
+    asset_keys = [translator.get_asset_key(stripped, table) for table in source.tables]
+    sync_iso = source.last_sync_at.isoformat() if source.last_sync_at else ""
+    raw_value = source.components[tenant_component]
+    return dg.RunRequest(
+        run_key=f"{source.id}-{sync_iso}",
+        asset_selection=asset_keys,
+        partition_key=partition_key,
+        tags={
+            f"rocky/{tenant_component}": str(raw_value),
+            "rocky/source_id": source.id,
+            "rocky/sync_at": sync_iso,
+        },
+    )
+
+
+def _tenant_request_pairs(
+    triggered: Sequence[SourceInfo],
+    translator: RockyDagsterTranslator,
+    *,
+    tenant_component: str,
+    tenant_partitions_name: str,
+    sync_partitions: bool,
+    context: dg.SensorEvaluationContext,
+) -> tuple[
+    list[tuple[dg.RunRequest, tuple[SourceInfo, ...]]],
+    list[dg.AddDynamicPartitionsRequest],
+]:
+    """Build tenant-partition ``RunRequest``s + the dynamic-partition adds.
+
+    For each triggered source, derives the tenant partition key via the
+    single chokepoint (:meth:`RockyDagsterTranslator.get_partition_key`,
+    default = raw component value). Newly-seen keys are batched into one
+    :class:`dagster.AddDynamicPartitionsRequest` (applied atomically with
+    the run requests) when ``sync_partitions`` is on; when off, sources
+    whose partition does not yet exist are skipped (the partition set is
+    managed out-of-band).
+    """
+    existing = set(context.instance.get_dynamic_partitions(tenant_partitions_name))
+    pairs: list[tuple[dg.RunRequest, tuple[SourceInfo, ...]]] = []
+    keys_to_add: list[str] = []
+    queued_new: set[str] = set()
+
+    for source in triggered:
+        raw_value = source.components.get(tenant_component)
+        if not isinstance(raw_value, str):
+            context.log.warning(
+                f"rocky_source_sensor (tenant mode): skipping source id={source.id} — "
+                f"tenant component {tenant_component!r} is "
+                f"{'missing' if raw_value is None else 'list-valued'}."
+            )
+            continue
+        partition_key = translator.get_partition_key(source) or raw_value
+        is_known = partition_key in existing or partition_key in queued_new
+        if not is_known:
+            if not sync_partitions:
+                context.log.warning(
+                    f"rocky_source_sensor (tenant mode): partition {partition_key!r} not in "
+                    f"'{tenant_partitions_name}' and sync_partitions_from_discover is off — "
+                    f"skipping source id={source.id}."
+                )
+                continue
+            keys_to_add.append(partition_key)
+            queued_new.add(partition_key)
+        pairs.append(
+            (
+                _tenant_partition_request(source, translator, tenant_component, partition_key),
+                (source,),
+            )
+        )
+
+    add_requests: list[dg.AddDynamicPartitionsRequest] = []
+    if keys_to_add:
+        add_requests.append(
+            dg.DynamicPartitionsDefinition(name=tenant_partitions_name).build_add_request(
+                keys_to_add
+            )
+        )
+    return pairs, add_requests

@@ -21,6 +21,22 @@ def _sanitize_key_part(s: str) -> str:
     return _INVALID_CHARS.sub("_", s)
 
 
+def strip_tenant_component(source: SourceInfo, tenant_component: str) -> SourceInfo:
+    """Return a copy of ``source`` with the tenant component removed.
+
+    Single source of truth for the tenant-as-partition collapse key shape:
+    the component (when building collapsed specs) and the sensor (when
+    selecting collapsed assets for a tenant partition) both derive keys by
+    calling the *stock* translator on the stripped source, so they can
+    never disagree on which collapsed asset a tenant maps to. Dropping the
+    tenant entry yields ``[source_type, *non_tenant, table]`` and omits the
+    per-tenant ``rocky/{component}`` tag automatically — no translator API
+    change required.
+    """
+    remaining = {k: v for k, v in source.components.items() if k != tenant_component}
+    return source.model_copy(update={"components": remaining})
+
+
 class RockyDagsterTranslator:
     """Translates Rocky source/table/model info into Dagster asset keys, tags, and groups.
 
