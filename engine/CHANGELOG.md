@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Auditable reuse is now live-verified end-to-end (4/4) on Databricks-Iceberg.** The fail-closed *fall-back-to-BUILD when a prior run's file is no longer live* safety path — previously the one un-runnable leg of the reuse live suite — is now exercised by a self-contained live test. It tombstones the prior run's file with a `DELETE` of that run's rows (the append-only UniForm writer never lets `VACUUM RETAIN 0 HOURS` remove the live current version, and the test refuses to mutate shared warehouse config), so `add_path_is_live` returns false and the run correctly builds instead of pointing at a removed file. Reuse stays **experimental and default-off**; with `[reuse]` unset, `rocky run` is byte- and cost-identical. (#860)
+- Corrected stale "Stage-1 / dormant / ONLY-BUILD" doc-comments across the reuse path (the `[reuse]` config, the reuse decision, and the content-addressed runner) that still described an earlier slice where a positive reuse verdict was only *logged*. With `[reuse]` enabled, an eligible input-match against a prior **strong** run now performs a real zero-copy point-to and skips the model's SQL. The `[reuse]` descriptions in `rocky-project.schema.json` and the regenerated Dagster / VS Code bindings were updated to match. (#860)
+
 ## [1.50.0] — 2026-06-06
 
 ### Added

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Regenerated the `rocky_project` Pydantic bindings to pick up the corrected `[reuse]` config descriptions (auditable reuse performs a real zero-copy point-to when enabled, not a no-op). (#860)
+
 ## [1.46.0] — 2026-06-06
 
 ### Added

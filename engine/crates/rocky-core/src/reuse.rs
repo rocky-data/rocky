@@ -1,5 +1,5 @@
 //! Input-match spine for auditable reuse — warehouse-agnostic, additive,
-//! and **dormant**.
+//! and opt-in.
 //!
 //! This module builds the *input* side of reuse: a pre-execution-style key
 //! that identifies a model build by its **declared inputs** rather than by
@@ -46,14 +46,15 @@
 //! auditable-reuse claim is carried separately by the output blake3 recorded
 //! in the ledger, not by this key.
 //!
-//! ## Dormant in Stage 1
+//! ## Input side only
 //!
-//! Nothing in this module changes run behavior. The index it backs (see
-//! [`crate::state::StateStore`]) is *populated* on a successful run and
-//! *read back* only by a future reuse decision — no skip, point-to, or clone
-//! happens in Stage 1. Population is gated behind the opt-in `[reuse]` config
-//! ([`crate::config::ReuseConfig`]) so the default run path is byte- and
-//! cost-identical to before this module existed.
+//! This module just builds and folds the key; it makes no reuse decision. The
+//! index it backs (see [`crate::state::StateStore`]) is *populated* on a
+//! successful run and *read back* by the runner's fail-closed reuse decision,
+//! which acts on a match by pointing-to a prior run's parquet. Population —
+//! and therefore reuse — is gated behind the opt-in `[reuse]` config
+//! ([`crate::config::ReuseConfig`]); with it off the default run path is byte-
+//! and cost-identical to before this module existed.
 
 use serde::{Deserialize, Serialize};
 

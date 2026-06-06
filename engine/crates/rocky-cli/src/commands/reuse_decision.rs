@@ -34,15 +34,16 @@
 //!    `remove`. If the file is gone or the log can't be read, BUILD.
 //!    ([`ReuseInputs::add_is_live`].)
 //!
-//! # Stage-1 posture — ONLY-BUILD
+//! # Posture — wired to the live point-to
 //!
-//! The runner computes the full verdict and, on a positive
-//! [`ReuseVerdict::WouldReuse`], **logs** the candidate but **still executes
-//! the SQL**. A decision that can only BUILD cannot produce a wrong output, so
-//! this is the provably-safe first slice. Wiring the live
-//! `commit_pointer_with_state` invocation behind the same verdict is the next
-//! step (tracked as a follow-up); the verdict shape here is already what that
-//! step consumes.
+//! On a positive [`ReuseVerdict::WouldReuse`] the runner performs a real
+//! **zero-copy point-to**: it commits a pointer to `R`'s existing parquet via
+//! `commit_pointer_with_state` and **skips the model's SQL entirely**. Any
+//! doubt while recovering or re-confirming `R`'s bytes (the commit-time
+//! liveness re-check, a basename or blake3 mismatch) falls closed to BUILD, so
+//! a wrong point-to can never reach production. Gated default-OFF behind
+//! `[reuse]` (clause 1); see `run_content_addressed::attempt_point_to_reuse`
+//! for the point-to itself.
 
 use rocky_core::state::{ArtifactRecord, InputIndexEntry};
 
@@ -128,9 +129,9 @@ pub struct ReuseCandidate {
 pub enum ReuseVerdict {
     /// Execute the SQL. Carries the reason for observability.
     Build(BuildReason),
-    /// Every clause passed — `R`'s bytes are reusable. In the Stage-1
-    /// ONLY-BUILD posture the runner logs this and **still builds**; the live
-    /// point-to invocation is wired behind the same verdict next.
+    /// Every clause passed — `R`'s bytes are reusable. The runner acts on this
+    /// by committing a zero-copy point-to to `R`'s parquet and skipping the
+    /// SQL, falling closed to BUILD on any recovery/re-confirmation doubt.
     WouldReuse(ReuseCandidate),
 }
 

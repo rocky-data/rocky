@@ -613,17 +613,18 @@ async fn evaluate_reuse_decision(
 /// partitioned (one `write_partitioned_batch` commit per partition tuple)
 /// targets.
 ///
-/// # Reuse decision (Stage 1 — ONLY-BUILD)
+/// # Reuse decision
 ///
 /// When `reuse_ctx` is `Some`, the **fail-closed reuse decision** runs after
 /// `discover()` and *before* `execute_query`: if every clause holds (enabled,
 /// eligible shape, input-hash match to a STRONG prior run `R`, `R`'s artifact
 /// resolves with a sane refcount, and `R`'s file is still live in the target's
-/// `_delta_log`), the model *could* point-to `R`'s bytes. In this slice the
-/// decision is **ONLY-BUILD**: a positive verdict is *logged* (`would-reuse
-/// R`) and the model is **still built**. A decision that can only BUILD is
-/// incapable of producing a wrong output, which is the safe first step before
-/// the live point-to invocation is wired behind the same verdict.
+/// `_delta_log`), the model **points-to** `R`'s bytes — `attempt_point_to_reuse`
+/// commits a pointer to `R`'s parquet (zero-copy) and the SQL is **not
+/// executed**. Any doubt while recovering or re-confirming `R`'s bytes (a
+/// commit-time liveness re-check, a basename or blake3 mismatch) falls closed
+/// to a normal BUILD, so a wrong point-to can never reach production. Gated
+/// default-OFF behind `[reuse]`; absent a context, this is a plain build.
 pub async fn execute_content_addressed_model(
     model_ir: &ModelIr,
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
@@ -2647,14 +2648,22 @@ mod live_tests {
         );
     }
 
-    /// (b) VACUUM R's file then re-run ⇒ BUILD. A point-to into a removed file
-    /// would be a silent wrong reuse; the liveness clause (and the commit-time
-    /// re-check that closes the TOCTOU window) must catch the removal and fall
-    /// back to a build. `VACUUM ... RETAIN 0 HOURS` physically removes R's
-    /// no-longer-referenced bytes, making its `add` not-live.
+    /// (b) Remove R's file from the table, then re-run with reuse on ⇒ BUILD.
+    /// A point-to into a removed file would be a silent wrong reuse, so the
+    /// decision's liveness clause must catch the `remove` and fall back to a
+    /// build. We force the removal deterministically with a `DELETE` of exactly
+    /// R's rows: the UniForm writer is append-only, so the only way R's `add`
+    /// becomes not-live is a later `remove` commit landing in the `_delta_log`
+    /// — which is precisely what a `DELETE` (or a VACUUM/compaction) emits.
+    ///
+    /// We deliberately do *not* use `VACUUM ... RETAIN 0 HOURS` here: it needs
+    /// `delta.retentionDurationCheck.enabled = false` set on the warehouse
+    /// (out-of-band, shared state we refuse to mutate from a test), and an
+    /// append-only writer never tombstones the live current version for VACUUM
+    /// to collect anyway, so that premise can't make R's own `add` not-live.
     #[tokio::test]
     #[ignore]
-    async fn reuse_falls_back_to_build_when_file_vacuumed() {
+    async fn reuse_falls_back_to_build_when_file_not_live() {
         let Some(env) = try_load_env() else {
             eprintln!("skipping: ROCKY_TEST_* env vars not set");
             return;
@@ -2671,42 +2680,46 @@ mod live_tests {
         let store = rocky_core::state::StateStore::open(&dir.path().join("state.redb")).unwrap();
 
         // Run 1 — build R.
-        let model_ir = reuse_model(&env, 9071);
+        let seed = 9071;
+        let model_ir = reuse_model(&env, seed);
         let r_summary = execute_content_addressed_model(&model_ir, warehouse_dyn, None)
             .await
             .expect("first build must succeed");
         let input_hash = record_r_build(&store, &model_ir, "run-R", &r_summary);
 
-        // VACUUM the table with retention 0 so R's add is no longer live.
-        // (Requires `spark.databricks.delta.retentionDurationCheck.enabled =
-        // false` on the sandbox; the sandbox is configured for it.)
+        // Tombstone R's file: a DELETE of exactly R's rows lands a `remove` of
+        // R's `add` in the `_delta_log`, making it not-live. (IcebergCompatV2
+        // is incompatible with deletion vectors, so this is a real copy-on-
+        // write file removal, not a DV — R's `add` is genuinely superseded.)
         warehouse_dyn
-            .execute_statement(&format!("VACUUM {fqtn} RETAIN 0 HOURS"))
+            .execute_statement(&format!(
+                "DELETE FROM {fqtn} WHERE id IN ({seed}01, {seed}02, {seed}03)"
+            ))
             .await
-            .expect("VACUUM must succeed on the sandbox");
+            .expect("DELETE of R's rows must succeed on the sandbox");
 
         let count_before_reuse = count_rows(warehouse_dyn, &fqtn).await;
 
-        // Run 2 — reuse on, but R's file is gone ⇒ the decision's liveness
-        // clause (or the commit-time re-check) fails ⇒ BUILD.
+        // Run 2 — reuse on, but R's file is no longer live ⇒ the decision's
+        // liveness clause fails ⇒ BUILD (never point-to a removed file).
         let ctx = ReuseDecisionCtx {
             input_hash: Some(input_hash),
             state_store: &store,
-            run_id: "run-after-vacuum",
+            run_id: "run-after-remove",
         };
         let summary = execute_content_addressed_model(&model_ir, warehouse_dyn, Some(ctx))
             .await
             .expect("the run must succeed as a BUILD");
         assert!(
             summary.reused_from.is_none(),
-            "with R's file VACUUM'd, the run must BUILD, never point-to a missing file"
+            "with R's file removed, the run must BUILD, never point-to a missing file"
         );
-        // A fresh build wrote 3 rows back.
+        // A fresh build re-materialized R's 3 rows.
         let count_after = count_rows(warehouse_dyn, &fqtn).await;
         assert_eq!(
             count_after,
             count_before_reuse + 3,
-            "the fallback BUILD must re-materialize the 3 rows"
+            "the fallback BUILD must re-materialize R's 3 rows"
         );
     }
 
