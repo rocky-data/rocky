@@ -7,9 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`RockyComponent.op_tags`.** Dagster `op_tags` applied to every generated rocky-executing op, so a host can place rocky ops in a Dagster pool and bound how many `rocky run` invocations hit a shared (e.g. pod-local) `.rocky-state.redb` at once. The engine takes an exclusive single-writer lock per state file and fails fast on contention, and run-queue `tag_concurrency_limits` only serialize *across* runs — so this is the host-side knob for cross-run serialization (the complement to the tenant-collapse coalescing below and to `state_namespace`'s per-resource isolation). (#861)
+
 ### Changed
 
 - Regenerated the `rocky_project` Pydantic bindings to pick up the corrected `[reuse]` config descriptions (auditable reuse performs a real zero-copy point-to when enabled, not a no-op). (#860)
+
+### Fixed
+
+- **Tenant-collapse now materialises a tenant in one op.** A collapsed tenant with several connectors previously produced one partitioned `multi_asset` op per `(source_type, non-tenant components)` group, and each op ran the byte-identical full-tenant `rocky run`. Selecting the whole graph in one run fanned them out as parallel ops that collided on the engine's single-writer state lock (`state store … is locked by another process`) and did N× redundant work. The collapse path now builds a single partitioned op that issues one `rocky run` per `(run, partition)` and demuxes the result across all the tenant's collapsed keys. Asset keys are unchanged (materialisation/check history is preserved); the op name changes from `rocky_<connector>` to `rocky_tenant_<partitions_name>`. With `surface_derived_models=True` the source op and derived-model ops can still contend within a run — use the new `op_tags` to pool them. (#861)
+- **Tenant-collapse no longer double-emits when two results fold onto one key.** When a tenant had a duplicate source record for a single `(tenant, table)` (e.g. a dead + live connector replicating the same table), `rocky run` returned two results that remapped to the same collapsed asset key and the op crashed with `DagsterInvariantViolationError` after the copy ran. `_emit_results` now dedups materialisations on emit (first wins, with a warning), mirroring the existing check/anomaly guards. (#861)
 
 ## [1.46.0] — 2026-06-06
 
