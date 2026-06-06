@@ -429,6 +429,51 @@ def test_run_filters_pipes_falls_back_to_last_segment_for_drift_events():
     assert fn(["orders"]) == dagster_key
 
 
+def test_run_filters_pipes_last_segment_ambiguous_across_connectors_drops(caplog):
+    """After the tenant coalesce the merged map spans connectors, so a bare
+    table name can match several collapsed keys. The pipes asset_key_fn must
+    refuse to guess (return None) rather than misattribute — mirroring the
+    streaming-path table-leaf guard."""
+    import logging
+
+    from dagster_rocky.component import _GroupBuild, _run_filters_pipes
+
+    fb = dg.AssetKey(["fivetran", "usa", "facebookads", "orders"])
+    gg = dg.AssetKey(["fivetran", "usa", "googleads", "orders"])
+    # Two connectors, same table leaf "orders", DISTINCT collapsed keys.
+    group = _GroupBuild(
+        name="tenant_clients",
+        rocky_key_to_dagster_key={
+            ("fivetran", "coca_cola", "usa", "facebookads", "orders"): fb,
+            ("fivetran", "coca_cola", "usa", "googleads", "orders"): gg,
+        },
+    )
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    context.log = MagicMock()
+    rocky = MagicMock(spec=RockyResource)
+    fake_invocation = MagicMock()
+    fake_invocation.get_results = MagicMock(return_value=iter([]))
+    rocky.run_pipes = MagicMock(return_value=fake_invocation)
+
+    list(
+        _run_filters_pipes(
+            context=context,
+            rocky=rocky,
+            filters=["client=coca_cola"],
+            group=group,
+            selected_keys={fb, gg},
+        )
+    )
+
+    fn = rocky.run_pipes.call_args.kwargs["asset_key_fn"]
+    # Exact native keys still resolve deterministically.
+    assert fn(["fivetran", "coca_cola", "usa", "facebookads", "orders"]) == fb
+    # Bare ambiguous leaf → refuse to guess + warn.
+    with caplog.at_level(logging.WARNING, logger="dagster_rocky.component"):
+        assert fn(["orders"]) is None
+    assert any("Ambiguous Rocky table identifier" in r.message for r in caplog.records)
+
+
 def test_run_filters_pipes_yields_get_results_unchanged():
     """The asset body yields whatever `.get_results()` produces — the
     wrapper is pure plumbing, not a transform."""

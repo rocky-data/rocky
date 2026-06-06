@@ -466,6 +466,23 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     #:   single source of truth for run events, so running both would
     #:   double-emit.
     execution_mode: Literal["streaming", "pipes"] = "streaming"
+    #: Optional Dagster ``op_tags`` applied to every generated rocky-executing
+    #: op (the source-replication multi-assets and, when surfaced, the
+    #: derived-model multi-assets). The intended use is op-level concurrency:
+    #: each ``rocky run`` opens the engine's single-writer state store
+    #: (``.rocky-state.redb``) for the watermark write and *fails fast* if
+    #: another writer holds the exclusive lock, so two rocky ops executing
+    #: concurrently against the same state file collide. Run-queue
+    #: ``tag_concurrency_limits`` only serialize *across* runs; to bound rocky
+    #: ops within and across runs, place them in a Dagster pool — e.g.
+    #: ``op_tags={"dagster/concurrency_key": "rocky"}`` (or the newer
+    #: ``{"dagster/pool": "rocky"}``) — and cap that pool at 1 in the
+    #: instance's concurrency config. The tenant-collapse path already
+    #: coalesces a run's per-tenant work into one op (see
+    #: :func:`_coalesce_collapsed_groups`), so within-run contention does not
+    #: arise there; this knob covers cross-run contention on a shared (e.g.
+    #: pod-local) state file. Empty (default) sets no tags.
+    op_tags: dict[str, str] = {}
     #: When ``True``, run ``rocky doctor`` at resource startup and fail
     #: fast on critical checks. Forwarded to
     #: :attr:`RockyResource.strict_doctor`. Default ``False`` preserves
@@ -1119,6 +1136,16 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
                 model_policies,
                 translation=self.translation,
             )
+            # Coalesce all of a tenant's collapsed connector-groups into ONE
+            # partitioned op. Every group derives the same tenant --filter and
+            # runs the byte-identical full-tenant `rocky run`, so running them
+            # as parallel ops in one run (a) collides on the engine's
+            # single-writer state lock and (b) does N× redundant work. One op
+            # issues one `rocky run` per (run, partition) and demuxes the
+            # result across all the tenant's collapsed keys.
+            groups = _coalesce_collapsed_groups(
+                groups, name=f"tenant_{_safe_asset_name(self.tenant.partitions_name)}"
+            )
         else:
             groups = _build_group_contexts(
                 discover,
@@ -1171,6 +1198,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
                 execution_mode=self.execution_mode,
                 surface_compliance=self.surface_compliance,
                 surface_retention_status=self.surface_retention_status,
+                op_tags=self.op_tags or None,
             )
             for group in groups
         ]
@@ -1193,6 +1221,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
                         models_dir=self.models_dir,
                         fallback_filter=_first_source_filter(discover),
                         compile_state=compile_state,
+                        op_tags=self.op_tags or None,
                     )
                 )
 
@@ -1697,6 +1726,132 @@ def _build_collapsed_group_contexts(
     return groups
 
 
+def _coalesce_collapsed_groups(
+    groups: list[_GroupBuild],
+    *,
+    name: str,
+) -> list[_GroupBuild]:
+    """Merge every tenant-collapsed group of a location into ONE ``_GroupBuild``.
+
+    :func:`_build_collapsed_group_contexts` keys groups by
+    ``(source_type, non-tenant components)``, so a tenant with several
+    connectors yields several groups — and, left as-is, several Dagster
+    ``multi_asset`` ops. Each op derives the *same* tenant ``--filter``
+    (:func:`_tenant_partition_filters` is group-agnostic) and runs the
+    byte-identical ``rocky run --filter {tenant}={value}`` over the whole
+    tenant, then filters the result down to its own keys. That is doubly
+    wrong against the engine's single-writer state store:
+
+    * **Lock contention** — every op opens ``.rocky-state.redb`` for the
+      watermark write (and the idempotency claim, if keyed); the store takes an
+      exclusive advisory lock and *fails fast* (``StateError::LockHeldByOther``),
+      so concurrent ops in one run collide rather than serialize.
+    * **Redundant work** — N ops re-run the identical full-tenant command, an
+      N× wall-clock and engine-work regression.
+
+    Collapsing them into one op issues exactly one ``rocky run`` per
+    ``(run, partition)`` and demuxes its results across all the tenant's
+    collapsed keys via the merged ``rocky_key_to_dagster_key``. Every
+    collapsed group already shares the tenant ``DynamicPartitionsDefinition``,
+    so the union is a single partitioned op — the natural shape for
+    "one run materialises one tenant".
+
+    The merge is collision-aware:
+
+    * **specs / native-key map** — unioned; a duplicate collapsed spec key or
+      native key (only reachable when two groups' component *values* coincide)
+      keeps the first and warns, mirroring :func:`_build_group_contexts`.
+    * **collapsed_key_by_table** (the new-tenant table-leaf fallback) — table
+      names are NOT unique across connectors, so any name mapping to more than
+      one collapsed key is *ambiguous* and is dropped from the merged fallback
+      (with a warning). The exact ``rocky_key_to_dagster_key`` lookup still
+      resolves every *known* tenant; only a tenant onboarded after the last
+      state refresh AND carrying a cross-connector duplicate table name loses
+      the fallback — and is then dropped by :func:`_emit_results` rather than
+      misattributed, the same fail-safe-over-guess stance as
+      :func:`_build_table_resolver`.
+
+    Returns ``[]`` for an empty input and ``[merged]`` otherwise (always one
+    op on the collapse path, so the op name stays stable as connectors come
+    and go).
+    """
+    if not groups:
+        return []
+
+    merged = _GroupBuild(name=name)
+    merged.partitions_def = groups[0].partitions_def
+    merged.tenant_component = groups[0].tenant_component
+
+    spec_keys: set[dg.AssetKey] = set()
+    # table name → its single collapsed key, or None once a second distinct key
+    # is seen (ambiguous across connectors → excluded from the fallback).
+    table_to_key: dict[str, dg.AssetKey | None] = {}
+
+    for group in groups:
+        merged.source_ids |= group.source_ids
+
+        for spec in group.specs:
+            if spec.key in spec_keys:
+                _log.warning(
+                    "Tenant coalesce: dropping duplicate collapsed spec %s across "
+                    "connectors; the first occurrence wins.",
+                    spec.key.to_user_string(),
+                )
+                continue
+            spec_keys.add(spec.key)
+            merged.specs.append(spec)
+
+        for asset_key, source_id in group.key_to_source_id.items():
+            merged.key_to_source_id.setdefault(asset_key, source_id)
+
+        for native_key, dagster_key in group.rocky_key_to_dagster_key.items():
+            existing = merged.rocky_key_to_dagster_key.get(native_key)
+            if existing is not None and existing != dagster_key:
+                _log.warning(
+                    "Tenant coalesce: native key %s maps to multiple collapsed keys "
+                    "across connectors (%s, %s); keeping the first.",
+                    native_key,
+                    existing.to_user_string(),
+                    dagster_key.to_user_string(),
+                )
+                continue
+            merged.rocky_key_to_dagster_key[native_key] = dagster_key
+
+        for partition_key, filter_value in group.partition_key_to_filter_value.items():
+            existing_value = merged.partition_key_to_filter_value.get(partition_key)
+            if existing_value is not None and existing_value != filter_value:
+                _log.warning(
+                    "Tenant coalesce: partition key %r maps to multiple filter values "
+                    "across connectors (%r, %r); keeping the first.",
+                    partition_key,
+                    existing_value,
+                    filter_value,
+                )
+                continue
+            merged.partition_key_to_filter_value[partition_key] = filter_value
+
+        for table_name, collapsed_key in group.collapsed_key_by_table.items():
+            if table_name not in table_to_key:
+                table_to_key[table_name] = collapsed_key
+            elif table_to_key[table_name] != collapsed_key:
+                table_to_key[table_name] = None  # ambiguous across connectors
+
+    merged.collapsed_key_by_table = {t: k for t, k in table_to_key.items() if k is not None}
+    ambiguous = sorted(t for t, k in table_to_key.items() if k is None)
+    if ambiguous:
+        _log.warning(
+            "Tenant coalesce: table name(s) %s map to more than one collapsed key "
+            "across connectors; excluded from the new-tenant table-leaf fallback. "
+            "Known tenants resolve via the exact native-key map; a tenant onboarded "
+            "after the last state refresh carrying one of these table names will be "
+            "dropped by _emit_results rather than misattributed. Refresh discover "
+            "state to register it.",
+            ambiguous,
+        )
+
+    return [merged]
+
+
 def _build_asset_spec(
     source: SourceInfo,
     table: TableInfo,
@@ -1879,6 +2034,7 @@ def _make_derived_model_asset(
     models_dir: str,
     fallback_filter: str,
     compile_state: _CompileState,
+    op_tags: dict[str, str] | None = None,
 ) -> dg.AssetsDefinition:
     """Build a multi-asset that runs every derived model in a partition shape group.
 
@@ -1907,6 +2063,7 @@ def _make_derived_model_asset(
         specs=group.specs,
         can_subset=False,
         partitions_def=group.partitions_def,
+        op_tags=op_tags,
     )
     def _asset(context):
         _log_compile_diagnostics(context, compile_state)
@@ -2002,6 +2159,7 @@ def _make_rocky_asset(
     execution_mode: Literal["streaming", "pipes"] = "streaming",
     surface_compliance: bool = False,
     surface_retention_status: bool = False,
+    op_tags: dict[str, str] | None = None,
 ) -> dg.AssetsDefinition:
     """Create a multi-asset that executes ``rocky run`` for one group.
 
@@ -2035,6 +2193,7 @@ def _make_rocky_asset(
         check_specs=check_specs,
         can_subset=True,
         partitions_def=group.partitions_def,
+        op_tags=op_tags,
     )
     def _asset(context):
         _log_compile_diagnostics(context, compile_state)
@@ -2188,10 +2347,30 @@ def _run_filters_pipes(
         key = rocky_key_to_dagster_key.get(tuple(path))
         if key is not None:
             return key
+        # Last-segment fallback — but only when unambiguous. After the tenant
+        # coalesce the map spans connectors, so a bare table name can match
+        # several collapsed keys; returning an arbitrary dict-iteration winner
+        # would misattribute the event (and Pipes' ``include_keys`` can't catch
+        # it, since the wrong key is also selected). Distinct native keys that
+        # fold onto the *same* collapsed key stay unambiguous (set of one).
+        # Mirror :func:`_build_table_resolver`: refuse to guess.
         last = path[-1]
-        for tup, candidate in rocky_key_to_dagster_key.items():
-            if tup and tup[-1] == last:
-                return candidate
+        candidates = {
+            candidate
+            for tup, candidate in rocky_key_to_dagster_key.items()
+            if tup and tup[-1] == last
+        }
+        if len(candidates) == 1:
+            return next(iter(candidates))
+        if len(candidates) > 1:
+            _log.warning(
+                "Ambiguous Rocky table identifier %r in a pipes event: matched %d "
+                "collapsed keys via the last-segment fallback. Refusing to guess; "
+                "dropping the event. Emit the schema- or catalog-qualified form to "
+                "resolve deterministically.",
+                "/".join(path),
+                len(candidates),
+            )
         return None
 
     for f in filters:
@@ -2554,6 +2733,28 @@ def _emit_results(
     for mat in materializations:
         asset_key = remap(mat.asset_key)
         if asset_key not in selected_keys:
+            continue
+        if asset_key in materialized_keys:
+            # Two engine results remapped to the same Dagster key in one op.
+            # The tenant-collapse fold (every member's with-tenant native key
+            # → one collapsed key) makes this reachable whenever a tenant has
+            # duplicate source records for a single (tenant, table) — e.g. a
+            # dead + live Fivetran connector both replicating the same table.
+            # Dagster rejects a second MaterializeResult for the same key with
+            # DagsterInvariantViolationError, so dedup on emit, mirroring the
+            # yielded_checks / anomaly guards below. Safe at run time: only one
+            # partition's tenant is active per run, so each collapsed key has
+            # exactly one legitimate result and any repeat is a true duplicate
+            # — this does NOT re-introduce the build-time N-sources→1-spec fold
+            # the collapse path deliberately keeps (that is a spec-dedup axis,
+            # not a run-time emission one).
+            _log.warning(
+                "Skipping duplicate MaterializeResult for %s — two Rocky results "
+                "mapped to the same asset key in this op (likely a duplicate "
+                "source record for one collapsed (tenant, table)); the first "
+                "occurrence wins.",
+                asset_key.to_user_string(),
+            )
             continue
         materialized_keys.add(asset_key)
         # Emit BOTH the rocky-namespaced metadata (via RockyMetadataSet) AND
