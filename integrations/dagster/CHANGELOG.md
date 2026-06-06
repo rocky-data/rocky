@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.46.1] — 2026-06-06
+
 ### Added
 
 - **`RockyComponent.op_tags`.** Dagster `op_tags` applied to every generated rocky-executing op, so a host can place rocky ops in a Dagster pool and bound how many `rocky run` invocations hit a shared (e.g. pod-local) `.rocky-state.redb` at once. The engine takes an exclusive single-writer lock per state file and fails fast on contention, and run-queue `tag_concurrency_limits` only serialize *across* runs — so this is the host-side knob for cross-run serialization (the complement to the tenant-collapse coalescing below and to `state_namespace`'s per-resource isolation). (#861)

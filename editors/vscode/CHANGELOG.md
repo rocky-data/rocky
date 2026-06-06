@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.32.1] — 2026-06-06
+
 ### Changed
 
 - Regenerated the `rocky-project` schema + TypeScript bindings to pick up the corrected `[reuse]` config descriptions (auditable reuse performs a real zero-copy point-to when enabled, not a no-op). (#860)
