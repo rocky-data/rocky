@@ -234,3 +234,117 @@ def test_emit_results_dedupes_same_key_table_check():
         e for e in events if isinstance(e, dg.AssetCheckResult) and e.check_name == "row_count"
     ]
     assert len(row_count_results) == 1
+
+
+# ---------------------------------------------------------------------------
+# Part C — _emit_results materialization dedup-on-yield (tenant collapse)
+# ---------------------------------------------------------------------------
+
+
+def _run_result_with_materializations(materializations: list[dict]) -> RunResult:
+    return RunResult.model_validate(
+        {
+            "version": "0.3.0",
+            "command": "run",
+            "filter": "client=acme",
+            "duration_ms": 100,
+            "tables_copied": len(materializations),
+            "tables_failed": 0,
+            "materializations": materializations,
+            "check_results": [],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+
+
+def test_emit_results_dedupes_same_key_materialization(caplog):
+    """Two engine results that remap to the same collapsed key materialize once.
+
+    The tenant-collapse fold maps every member's with-tenant native key to one
+    collapsed key, so a tenant with a duplicate source record for a single
+    (tenant, table) — e.g. a dead + live Fivetran connector replicating the
+    same table — yields two RunResult materializations whose remapped key
+    collides. Without dedup, Dagster rejects the second MaterializeResult with
+    ``DagsterInvariantViolationError`` after the copy already ran.
+    """
+    collapsed = dg.AssetKey(["fivetran", "usa", "facebookads", "orders"])
+    # Two distinct engine-native keys (live + dead connector) → one collapsed key.
+    mapping = {
+        ("fivetran", "acme", "usa", "facebookads", "orders"): collapsed,
+        ("fivetran", "acme_dead", "usa", "facebookads", "orders"): collapsed,
+    }
+    run_result = _run_result_with_materializations(
+        [
+            {
+                "asset_key": ["fivetran", "acme", "usa", "facebookads", "orders"],
+                "rows_copied": 10,
+                "duration_ms": 50,
+                "metadata": {"strategy": "full_refresh"},
+            },
+            {
+                "asset_key": ["fivetran", "acme_dead", "usa", "facebookads", "orders"],
+                "rows_copied": 7,
+                "duration_ms": 30,
+                "metadata": {"strategy": "full_refresh"},
+            },
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="dagster_rocky.component"):
+        events = list(
+            _emit_results(
+                results=[run_result],
+                check_specs=[],
+                selected_keys={collapsed},
+                rocky_key_to_dagster_key=mapping,
+            )
+        )
+
+    mats = [e for e in events if isinstance(e, dg.MaterializeResult)]
+    assert len(mats) == 1
+    assert mats[0].asset_key == collapsed
+    assert any("duplicate MaterializeResult" in r.message for r in caplog.records)
+
+
+def test_emit_results_materialization_yields_when_unique():
+    """Regression: the materialization dedup guard doesn't suppress distinct keys."""
+    orders = dg.AssetKey(["fivetran", "usa", "facebookads", "orders"])
+    leads = dg.AssetKey(["fivetran", "usa", "googleads", "leads"])
+    mapping = {
+        ("fivetran", "acme", "usa", "facebookads", "orders"): orders,
+        ("fivetran", "acme", "usa", "googleads", "leads"): leads,
+    }
+    run_result = _run_result_with_materializations(
+        [
+            {
+                "asset_key": ["fivetran", "acme", "usa", "facebookads", "orders"],
+                "rows_copied": 10,
+                "duration_ms": 50,
+                "metadata": {"strategy": "full_refresh"},
+            },
+            {
+                "asset_key": ["fivetran", "acme", "usa", "googleads", "leads"],
+                "rows_copied": 5,
+                "duration_ms": 20,
+                "metadata": {"strategy": "full_refresh"},
+            },
+        ]
+    )
+
+    events = list(
+        _emit_results(
+            results=[run_result],
+            check_specs=[],
+            selected_keys={orders, leads},
+            rocky_key_to_dagster_key=mapping,
+        )
+    )
+
+    mat_keys = {e.asset_key for e in events if isinstance(e, dg.MaterializeResult)}
+    assert mat_keys == {orders, leads}

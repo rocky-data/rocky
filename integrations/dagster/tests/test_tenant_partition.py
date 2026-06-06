@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import dagster as dg
 import pytest
@@ -28,6 +28,7 @@ from dagster_rocky.component import (
     _build_check_specs,
     _build_collapsed_group_contexts,
     _build_group_contexts,
+    _coalesce_collapsed_groups,
     _CompileState,
     _make_rocky_asset,
     _tenant_partition_filters,
@@ -723,3 +724,226 @@ def test_sensor_tenant_mode_requires_both_args():
         )
     # Both unset is fine (default non-tenant sensor).
     assert rocky_source_sensor(rocky_resource=rocky, target=target) is not None
+
+
+# --------------------------------------------------------------------------- #
+# Coalesce: a tenant's collapsed connector-groups → ONE op (Gap 1)
+# --------------------------------------------------------------------------- #
+
+
+def _connector(client: str, source: str, tables: list[str]) -> SourceInfo:
+    return SourceInfo(
+        id=f"{client}_{source}",
+        source_type="fivetran",
+        components={"client": client, "region": "usa", "source": source},
+        tables=[TableInfo(name=t) for t in tables],
+    )
+
+
+def test_coalesce_merges_connectors_into_one_group():
+    """The builder still returns one group per connector; coalesce folds them
+    into a single ``_GroupBuild`` so the location materialises as one op."""
+    discover = _discover(
+        _connector("coca_cola", "facebookads", ["orders"]),
+        _connector("coca_cola", "googleads", ["leads"]),
+    )
+    groups, _ = _collapse(discover)
+    assert len(groups) == 2  # one per (source_type, non-tenant) connector group
+
+    merged = _coalesce_collapsed_groups(groups, name="tenant_rocky_clients")
+    assert len(merged) == 1
+    m = merged[0]
+    assert m.name == "tenant_rocky_clients"
+    assert {s.key.to_user_string() for s in m.specs} == {
+        "fivetran/usa/facebookads/orders",
+        "fivetran/usa/googleads/leads",
+    }
+    # Every connector's with-tenant native key remaps to its collapsed key.
+    assert m.rocky_key_to_dagster_key[
+        ("fivetran", "coca_cola", "usa", "facebookads", "orders")
+    ] == dg.AssetKey(["fivetran", "usa", "facebookads", "orders"])
+    assert m.rocky_key_to_dagster_key[
+        ("fivetran", "coca_cola", "usa", "googleads", "leads")
+    ] == dg.AssetKey(["fivetran", "usa", "googleads", "leads"])
+    # Partition mapping + tenant metadata carried over; distinct table names
+    # both keep their new-tenant fallback entry.
+    assert m.partition_key_to_filter_value == {"coca_cola": "coca_cola"}
+    assert m.tenant_component == "client"
+    assert m.partitions_def is not None
+    assert set(m.collapsed_key_by_table) == {"orders", "leads"}
+
+
+def test_coalesce_empty_returns_empty():
+    assert _coalesce_collapsed_groups([], name="t") == []
+
+
+def test_coalesce_excludes_ambiguous_table_from_fallback(caplog):
+    """Two connectors sharing a table NAME map it to two distinct collapsed
+    keys → the name is ambiguous and dropped from the new-tenant table-leaf
+    fallback, but both KNOWN tenants still resolve via the exact native map."""
+    discover = _discover(
+        _connector("coca_cola", "facebookads", ["orders"]),
+        _connector("coca_cola", "googleads", ["orders"]),
+    )
+    groups, _ = _collapse(discover)
+    with caplog.at_level(logging.WARNING, logger="dagster_rocky.component"):
+        merged = _coalesce_collapsed_groups(groups, name="t")[0]
+
+    # Ambiguous "orders" excluded from the leaf fallback + warned.
+    assert "orders" not in merged.collapsed_key_by_table
+    assert any("more than one collapsed key" in r.message for r in caplog.records)
+    # Exact native-key lookup still resolves both connectors unambiguously.
+    assert merged.rocky_key_to_dagster_key[
+        ("fivetran", "coca_cola", "usa", "facebookads", "orders")
+    ] == dg.AssetKey(["fivetran", "usa", "facebookads", "orders"])
+    assert merged.rocky_key_to_dagster_key[
+        ("fivetran", "coca_cola", "usa", "googleads", "orders")
+    ] == dg.AssetKey(["fivetran", "usa", "googleads", "orders"])
+
+
+def _two_connector_state(tmp_path):
+    discover = {
+        "version": "0.3.0",
+        "command": "discover",
+        "sources": [
+            {
+                "id": "cc_fb",
+                "source_type": "fivetran",
+                "components": {"client": "coca_cola", "region": "usa", "source": "facebookads"},
+                "tables": [{"name": "orders"}],
+            },
+            {
+                "id": "cc_gg",
+                "source_type": "fivetran",
+                "components": {"client": "coca_cola", "region": "usa", "source": "googleads"},
+                "tables": [{"name": "leads"}],
+            },
+        ],
+    }
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"discover": discover}))
+    return state_file
+
+
+def test_coalesce_runs_rocky_once_and_demuxes_across_connectors(tmp_path):
+    """End-to-end: a two-connector tenant builds ONE op that issues a single
+    ``rocky run`` per (run, partition) and demuxes the result across both
+    collapsed keys — fixing the lock contention + N× redundant-work regression.
+    """
+    state_file = _two_connector_state(tmp_path)
+    component = RockyComponent(
+        config_path="rocky.toml",
+        tenant=TenantConfig(component="client", partitions_name="rocky_clients"),
+    )
+    defs = component.build_defs_from_state(context=None, state_path=state_file)
+    asset_defs = [a for a in (defs.assets or []) if isinstance(a, dg.AssetsDefinition)]
+
+    # Coalesced: exactly ONE rocky multi-asset for the whole tenant.
+    assert len(asset_defs) == 1
+    fb = dg.AssetKey(["fivetran", "usa", "facebookads", "orders"])
+    gg = dg.AssetKey(["fivetran", "usa", "googleads", "leads"])
+    assert {fb, gg} <= {k for a in asset_defs for k in a.keys}
+
+    # One engine run returns materializations for BOTH connectors' tables,
+    # keyed WITH the tenant (as the engine emits them).
+    run_result = RunResult.model_validate(
+        {
+            "version": "0.3.0",
+            "command": "run",
+            "filter": "client=coca_cola",
+            "duration_ms": 100,
+            "tables_copied": 2,
+            "tables_failed": 0,
+            "materializations": [
+                {
+                    "asset_key": ["fivetran", "coca_cola", "usa", "facebookads", "orders"],
+                    "rows_copied": 10,
+                    "duration_ms": 50,
+                    "metadata": {"strategy": "full_refresh"},
+                },
+                {
+                    "asset_key": ["fivetran", "coca_cola", "usa", "googleads", "leads"],
+                    "rows_copied": 5,
+                    "duration_ms": 20,
+                    "metadata": {"strategy": "full_refresh"},
+                },
+            ],
+            "check_results": [],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 2, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+
+    instance = dg.DagsterInstance.ephemeral()
+    instance.add_dynamic_partitions("rocky_clients", ["coca_cola"])
+
+    mock_run = MagicMock(return_value=run_result)
+    with (
+        patch.object(RockyResource, "run_streaming", mock_run),
+        patch.object(RockyResource, "run", return_value=run_result),
+    ):
+        result = dg.materialize(
+            asset_defs,
+            resources={"rocky": RockyResource(config_path="rocky.toml")},
+            selection=[fb, gg],
+            partition_key="coca_cola",
+            instance=instance,
+            raise_on_error=False,
+        )
+
+    assert result.success
+    # The whole tenant ran in ONE `rocky run` — not one per connector.
+    assert mock_run.call_count == 1
+    mat_keys = {e.asset_key for e in result.get_asset_materialization_events()}
+    assert mat_keys == {fb, gg}
+
+    # Subset selection still works on the coalesced op (can_subset=True): pick
+    # one connector's table → one tenant run, only the selected key emitted.
+    mock_run_subset = MagicMock(return_value=run_result)
+    with (
+        patch.object(RockyResource, "run_streaming", mock_run_subset),
+        patch.object(RockyResource, "run", return_value=run_result),
+    ):
+        subset = dg.materialize(
+            asset_defs,
+            resources={"rocky": RockyResource(config_path="rocky.toml")},
+            selection=[fb],
+            partition_key="coca_cola",
+            instance=instance,
+            raise_on_error=False,
+        )
+    assert subset.success
+    assert mock_run_subset.call_count == 1
+    assert {e.asset_key for e in subset.get_asset_materialization_events()} == {fb}
+
+
+def test_op_tags_threaded_to_collapsed_op(tmp_path):
+    """``RockyComponent.op_tags`` reaches the generated multi-asset op so the
+    host can place rocky ops in a concurrency pool."""
+    state_file = _two_connector_state(tmp_path)
+    component = RockyComponent(
+        config_path="rocky.toml",
+        tenant=TenantConfig(component="client", partitions_name="rocky_clients"),
+        op_tags={"dagster/concurrency_key": "rocky"},
+    )
+    defs = component.build_defs_from_state(context=None, state_path=state_file)
+    asset_defs = [a for a in (defs.assets or []) if isinstance(a, dg.AssetsDefinition)]
+    assert len(asset_defs) == 1
+    assert asset_defs[0].op.tags.get("dagster/concurrency_key") == "rocky"
+
+
+def test_op_tags_absent_by_default(tmp_path):
+    """No op_tags set → no concurrency-key tag injected (zero behaviour change)."""
+    state_file = _two_connector_state(tmp_path)
+    component = RockyComponent(
+        config_path="rocky.toml",
+        tenant=TenantConfig(component="client", partitions_name="rocky_clients"),
+    )
+    defs = component.build_defs_from_state(context=None, state_path=state_file)
+    asset_defs = [a for a in (defs.assets or []) if isinstance(a, dg.AssetsDefinition)]
+    assert "dagster/concurrency_key" not in asset_defs[0].op.tags
