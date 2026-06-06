@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.46.0] — 2026-06-06
+
+### Added
+
+- **Surface `discover` cross-source collisions + new sources.** `RockyComponent` / the discover-parsing path now expose the engine's cross-source collision detection (tables that collide across sources) and the `new_sources` first-seen diff, so an operator sees ambiguous or newly-appeared source tables in Dagster instead of only in the CLI. (#852)
+- **Validate the graph-export `schema_version`.** The integration now checks the versioned `rocky dag` graph-export contract's `schema_version` and fails fast on an incompatible engine rather than silently mis-parsing. (#852)
+- **Tenant-as-partition collapse for `RockyComponent`.** Collapse per-tenant assets onto a single partitioned definition (tenant = partition key) with per-partition asset-check history, instead of one asset per tenant. (#858)
+
+### Changed
+
+- Regenerated the Pydantic bindings for the engine 1.50 decision-support output schemas — `RunOutput.model_decisions` and the `rocky plan --semantic` verdict. (#853, #856, #857)
+
 ## [1.45.0] — 2026-06-05
 
 ### Added

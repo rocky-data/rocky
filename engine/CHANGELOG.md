@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.50.0] — 2026-06-06
+
+### Added
+
+- **Decision-support output for `plan` and `run` — reporting-only, opt-in, default-inert.** New surfaces explain *why* the engine made each build decision and what a schema change touches downstream. They are purely informational and **never change build behavior**; a default `rocky run` / `rocky plan` is byte-identical to before.
+  - **`rocky run` per-model decision + reason.** `RunOutput.model_decisions` reports, for each transformation model, the **build / skip / reused** verdict the engine reached plus a short human-readable reason (e.g. "logic and upstream data unchanged since last build", "reused prior run's bytes (strong proof)"). Populated only when the `--skip-unchanged` gate is active or `[reuse]` is enabled; omitted entirely on a default run. Lets orchestrators (Dagster) and the VS Code extension explain skip/reuse decisions. (#853)
+  - **`rocky plan --semantic` column-level impact + breaking-change verdict.** When `--semantic` is passed and a baseline ref is available, `plan` attaches a semantic verdict describing the changes vs. the baseline at column granularity — added/removed models, added/dropped columns, column type changes (with a `narrowing` flag), nullability changes, reordering, and materialization-strategy changes — i.e. a downstream-impact preview (#856) and a breaking-change verdict (#857). Omitted on a default `rocky plan` or when no usable baseline exists.
+
 ## [1.49.0] — 2026-06-05
 
 ### Added
