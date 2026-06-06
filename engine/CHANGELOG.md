@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.50.1] — 2026-06-06
+
 ### Changed
 
 - **Auditable reuse is now live-verified end-to-end (4/4) on Databricks-Iceberg.** The fail-closed *fall-back-to-BUILD when a prior run's file is no longer live* safety path — previously the one un-runnable leg of the reuse live suite — is now exercised by a self-contained live test. It tombstones the prior run's file with a `DELETE` of that run's rows (the append-only UniForm writer never lets `VACUUM RETAIN 0 HOURS` remove the live current version, and the test refuses to mutate shared warehouse config), so `add_path_is_live` returns false and the run correctly builds instead of pointing at a removed file. Reuse stays **experimental and default-off**; with `[reuse]` unset, `rocky run` is byte- and cost-identical. (#860)
