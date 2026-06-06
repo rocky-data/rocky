@@ -4212,11 +4212,12 @@ pub(crate) async fn execute_models(
     // the gate is inert and this function builds every selected model
     // exactly as before — no extra state reads or warehouse queries.
     skip_gate: SkipGateConfig,
-    // Opt-in `[reuse]` spine population. When `false` (the default) no
-    // input-match index entry or provenance record is written and no
-    // per-model spine hashing cost is paid — the run is byte- and
-    // cost-identical. Dormant even when `true`: it only records the index,
-    // it makes no reuse decision and skips nothing.
+    // Opt-in `[reuse]` (= `[reuse].enabled && !--no-reuse`). When `false`
+    // (the default) no input-match index entry or provenance record is
+    // written and no per-model spine hashing cost is paid — the run is byte-
+    // and cost-identical, and no model reuses. When `true`, the spine is
+    // populated AND an eligible model whose inputs match a prior strong run
+    // points-to that run's parquet instead of executing its SQL.
     reuse_enabled: bool,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
@@ -4306,11 +4307,12 @@ pub(crate) async fn execute_models(
 
     let dialect = warehouse.dialect();
 
-    // Auditable-reuse spine accumulator (dormant). When `[reuse]` is enabled,
-    // each successfully-built content-addressed model contributes an
-    // input-match index entry + an offline-verifiable provenance record,
-    // flushed in one transaction at end-of-run. Empty (and never touched)
-    // when reuse is off, so the default path pays nothing.
+    // Auditable-reuse spine accumulator. When `[reuse]` is enabled, each
+    // successfully-built content-addressed model contributes an input-match
+    // index entry + an offline-verifiable provenance record, flushed in one
+    // transaction at end-of-run; that index is what a later run's reuse
+    // decision reads to point-to a prior run. Empty (and never touched) when
+    // reuse is off, so the default path pays nothing.
     //
     // `reuse_outputs` maps a built model's fully-qualified target identity to
     // its output blake3 keyed by its target identity, so a *downstream*
@@ -4815,11 +4817,11 @@ pub(crate) async fn execute_models(
                                 );
                             }
                         }
-                        // Auditable-reuse spine (dormant). When `[reuse]` is
-                        // enabled, accumulate this model's input-match index
-                        // entry + provenance record. Stage 1 indexes a model
-                        // only when EVERY table it reads resolves to a STRONG
-                        // content hash produced earlier in this run — no extra
+                        // Auditable-reuse spine. When `[reuse]` is enabled,
+                        // accumulate this model's input-match index entry +
+                        // provenance record. A model is indexed only when
+                        // EVERY table it reads resolves to a STRONG content
+                        // hash produced earlier in this run — no extra
                         // warehouse query. A read of a raw source, a model not
                         // written content-addressed, or a model not built this
                         // run means the chain is not byte-verifiable
@@ -5016,7 +5018,7 @@ pub(crate) async fn execute_models(
 
     // Flush the auditable-reuse spine in one transaction at end-of-run, only
     // on the success path (a failed run returns early above and discards the
-    // accumulator — dormant Stage-1 indexes only fully-successful builds).
+    // accumulator — only fully-successful builds are indexed).
     // Best-effort: a write failure logs and continues, mirroring the
     // `record_artifact` posture — the run itself is already durable.
     if reuse_enabled
@@ -5033,7 +5035,7 @@ pub(crate) async fn execute_models(
         } else {
             info!(
                 entries = reuse_index_entries.len(),
-                "recorded auditable-reuse input-match spine (dormant)"
+                "recorded auditable-reuse input-match spine"
             );
         }
     }
