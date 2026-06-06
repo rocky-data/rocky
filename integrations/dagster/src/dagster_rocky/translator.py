@@ -21,6 +21,22 @@ def _sanitize_key_part(s: str) -> str:
     return _INVALID_CHARS.sub("_", s)
 
 
+def strip_tenant_component(source: SourceInfo, tenant_component: str) -> SourceInfo:
+    """Return a copy of ``source`` with the tenant component removed.
+
+    Single source of truth for the tenant-as-partition collapse key shape:
+    the component (when building collapsed specs) and the sensor (when
+    selecting collapsed assets for a tenant partition) both derive keys by
+    calling the *stock* translator on the stripped source, so they can
+    never disagree on which collapsed asset a tenant maps to. Dropping the
+    tenant entry yields ``[source_type, *non_tenant, table]`` and omits the
+    per-tenant ``rocky/{component}`` tag automatically — no translator API
+    change required.
+    """
+    remaining = {k: v for k, v in source.components.items() if k != tenant_component}
+    return source.model_copy(update={"components": remaining})
+
+
 class RockyDagsterTranslator:
     """Translates Rocky source/table/model info into Dagster asset keys, tags, and groups.
 
@@ -123,6 +139,33 @@ class RockyDagsterTranslator:
         Default: no dependencies.
         """
         return []
+
+    def get_partition_key(self, source: SourceInfo) -> str | None:
+        """Returns the tenant partition key for a source, or ``None``.
+
+        Only consulted on the tenant-as-partition collapse path (when
+        ``RockyComponent.tenant`` is configured). It is the **single
+        chokepoint** for deriving a source's tenant partition key: the
+        component, the sensor (dynamic-partition sync + ``RunRequest``),
+        and the execution ``--filter`` all route through it, so a custom
+        derivation can never drift between "which partition" and "which
+        tenant gets materialized."
+
+        Default: ``None`` — meaning "use the raw value of the configured
+        tenant component verbatim" (the component supplies
+        ``source.components[tenant.component]``). Rocky's ``discover``
+        already emits component values as clean, lowercased SQL
+        identifiers, which are valid Dagster partition keys, so the raw
+        value is correct out of the box.
+
+        Override **only** when the raw component value is not a valid /
+        canonical partition key — e.g. to fold case variants onto a
+        canonical client code. If you do, the component keeps a
+        ``partition_key → original component value`` map so the execution
+        ``--filter`` still targets the real per-tenant catalog; your
+        returned key is what the partition set and ``RunRequest`` use.
+        """
+        return None
 
     # ------------------------------------------------------------------ #
     # Derived-model translation (T-derived-models)                       #
