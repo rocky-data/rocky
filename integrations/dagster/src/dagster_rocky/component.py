@@ -159,7 +159,16 @@ def _engine_schema_mismatch_failure(command: str, exc: ValidationError) -> dg.Fa
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
+
+#: Metadata key stamped on the zero-row ``MaterializeResult`` that the
+#: ``satisfy_empty_outputs`` mode emits for a *selected* output Rocky did
+#: not copy in a subset / partition run. ``True`` marks the materialization
+#: as a dependency-satisfying placeholder — the table was absent or empty
+#: for this partition, not really copied — so downstream consumers (and the
+#: Dagster UI) can tell it apart from a genuine copy. See
+#: :attr:`RockyComponent.satisfy_empty_outputs`.
+EMPTY_FOR_PARTITION_METADATA_KEY: str = "rocky/empty_for_partition"
 
 #: Built-in Rocky check names. Pre-declared as ``AssetCheckSpec`` so the
 #: Dagster UI knows about them before any execution happens. The
@@ -661,6 +670,41 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     #: ``None`` (default) is byte-identical to today's one-spec-per-source
     #: behaviour. See :class:`TenantConfig`.
     tenant: TenantConfig | None = None
+    #: When ``True``, a subset / partition run that copies only *some* of the
+    #: selected outputs additionally emits a lightweight zero-row
+    #: :class:`dg.MaterializeResult` for every *selected-but-uncopied* asset
+    #: key (marked with ``rocky/empty_for_partition=True``).
+    #:
+    #: **Why this exists.** Rocky runs at source granularity, so a single
+    #: ``rocky run --filter <tenant>`` materialises only the tables that have
+    #: data for that partition. Dagster's executor treats a selected output
+    #: that yields no event as *skipped*, and ``can_subset=True`` does **not**
+    #: prune: a single unyielded dependency makes the executor wholesale-skip
+    #: any *same-run* downstream ``@multi_asset`` that depends on it — its own
+    #: ``can_subset`` + runtime filter never get to run. For a sparse
+    #: ``(partition × connector)`` whose data is a strict subset of the
+    #: connector's table set, the downstream consolidation layer then never
+    #: materialises and the run still reports SUCCESS — silent data loss.
+    #:
+    #: Emitting a zero-row result for the absent keys *produces* the output,
+    #: so the dependency is satisfied and the downstream step runs and applies
+    #: its own subset logic. **Failed** tables are deliberately *excluded*
+    #: from this — a copy that errored keeps skipping its downstream so the
+    #: failure stays visible and retriable, rather than being papered over
+    #: with a fake-green zero.
+    #:
+    #: **Trade-off.** Producing an output emits an ``ASSET_MATERIALIZATION``
+    #: event, so a sparse partition records many zero-row materialisations per
+    #: run. They are clearly marked via ``rocky/empty_for_partition`` and give
+    #: per-partition table-presence visibility, but they are noise — hence
+    #: opt-in, default ``False`` (behaviour byte-for-byte unchanged when off).
+    #:
+    #: Only the default ``execution_mode="streaming"`` non-``dag_mode`` path
+    #: is supported: over Dagster Pipes the integration cannot distinguish an
+    #: absent table from a failed one, and ``dag_mode`` uses a separate
+    #: emission path. ``build_defs`` raises if the flag is combined with
+    #: either, rather than silently no-op'ing or masking a failure.
+    satisfy_empty_outputs: bool = False
 
     @property
     def defs_state_config(self) -> DefsStateConfig:
@@ -931,11 +975,56 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         ``surface_column_lineage``) and default to off, so the fast path
         is unchanged from :meth:`StateBackedComponent.build_defs`.
         """
+        self._validate_satisfy_empty_outputs()
         self._maybe_cold_start_discover(context)
         defs = super().build_defs(context)
         if self.surface_column_lineage:
             defs = self._attach_column_lineage(defs)
         return defs
+
+    def _validate_satisfy_empty_outputs(self) -> None:
+        """Fail fast on ``satisfy_empty_outputs`` in an unsupported mode.
+
+        The empty-output emission only lives on the streaming
+        ``_emit_results`` path and depends on telling an *absent* table
+        apart from a *failed* one (``RunResult.errors`` carries the failed
+        keys). Neither holds for:
+
+        * ``execution_mode="pipes"`` — the engine reports only what it
+          copied over the Pipes wire, so the integration cannot exclude a
+          failed table from the empty-emit, and a zero-row success on a
+          table that actually errored is *worse* than today's skip.
+        * ``dag_mode=True`` — the connected-graph assets are built by
+          :func:`dag_assets.build_dag_multi_assets`, a separate emission
+          path the flag is not wired into, so it would silently no-op.
+
+        The flag is opt-in and new, so raising here cannot regress an
+        existing deployment — and a clear load-time error beats a silent
+        no-op (footgun) or a masked failure (the very thing the flag
+        exists to prevent).
+        """
+        if not self.satisfy_empty_outputs:
+            return
+        if self.execution_mode == "pipes":
+            raise dg.DagsterInvalidConfigError(
+                "satisfy_empty_outputs=True is not supported with "
+                'execution_mode="pipes": over Dagster Pipes the integration '
+                "cannot distinguish a table that was absent for the partition "
+                "from one that failed to copy, so it would stamp a zero-row "
+                'success on a failed table. Use execution_mode="streaming" '
+                "(the default).",
+                errors=[],
+                config_value="pipes",
+            )
+        if self.dag_mode:
+            raise dg.DagsterInvalidConfigError(
+                "satisfy_empty_outputs=True is not supported with dag_mode=True: "
+                "the connected-graph assets are built by a separate emission "
+                "path that the empty-output mode is not wired into. Unset one "
+                "of the two.",
+                errors=[],
+                config_value=True,
+            )
 
     def _maybe_cold_start_discover(self, context: dg.ComponentLoadContext) -> None:
         """Run :meth:`write_state_to_path` synchronously when state is absent.
@@ -1198,6 +1287,7 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
                 execution_mode=self.execution_mode,
                 surface_compliance=self.surface_compliance,
                 surface_retention_status=self.surface_retention_status,
+                satisfy_empty_outputs=self.satisfy_empty_outputs,
                 op_tags=self.op_tags or None,
             )
             for group in groups
@@ -2159,6 +2249,7 @@ def _make_rocky_asset(
     execution_mode: Literal["streaming", "pipes"] = "streaming",
     surface_compliance: bool = False,
     surface_retention_status: bool = False,
+    satisfy_empty_outputs: bool = False,
     op_tags: dict[str, str] | None = None,
 ) -> dg.AssetsDefinition:
     """Create a multi-asset that executes ``rocky run`` for one group.
@@ -2292,6 +2383,7 @@ def _make_rocky_asset(
                 rocky_key_to_dagster_key=group.rocky_key_to_dagster_key,
                 extra_yielded_checks=compliance_yielded,
                 collapsed_key_by_table=group.collapsed_key_by_table or None,
+                satisfy_empty_outputs=satisfy_empty_outputs,
             )
 
             # If a filter surfaced the Fivetran-storm signal, raise the
@@ -2678,6 +2770,7 @@ def _emit_results(
     rocky_key_to_dagster_key: dict[tuple[str, ...], dg.AssetKey],
     extra_yielded_checks: set[tuple[dg.AssetKey, str]] | None = None,
     collapsed_key_by_table: dict[str, dg.AssetKey] | None = None,
+    satisfy_empty_outputs: bool = False,
 ) -> Iterator[dg.MaterializeResult | dg.AssetCheckResult | dg.AssetObservation]:
     """Yield Dagster events for every materialization, check, drift event and anomaly.
 
@@ -2702,6 +2795,17 @@ def _emit_results(
     * :class:`dg.AssetObservation` — one per drift action (ALTER COLUMN,
       DROP+RECREATE, etc.). Drift is a structural change, not pass/fail,
       so observation is the right primitive.
+
+    When ``satisfy_empty_outputs`` is set, a final pass emits a zero-row
+    :class:`dg.MaterializeResult` (marked
+    :data:`EMPTY_FOR_PARTITION_METADATA_KEY`) for every *selected* key that
+    got neither a real materialization nor an error — i.e. a table that was
+    absent or empty for this partition. This *produces* the output so a
+    same-run downstream that depends on it is not wholesale-skipped by the
+    executor (``can_subset`` does not prune unyielded deps). **Errored**
+    keys are excluded so a failed copy keeps its downstream skipped — a
+    failure must stay visible, not be masked by a fake-green zero. See
+    :attr:`RockyComponent.satisfy_empty_outputs`.
     """
 
     def remap(raw_key: list[str]) -> dg.AssetKey:
@@ -2836,12 +2940,71 @@ def _emit_results(
             yielded_checks.add(spec_key)
             yield anomaly_result
 
+    # Empty-output satisfaction (opt-in). For a subset / partition run, emit
+    # a zero-row MaterializeResult for every selected key that was neither
+    # copied nor errored, so a same-run downstream depending on it isn't
+    # wholesale-skipped by the executor. Errored keys are subtracted so a
+    # failed copy stays a visible, retriable skip rather than a fake-green
+    # zero. Computed AFTER the dedup'd materialization loop, so it only ever
+    # covers keys with no real result (preserving the first-wins guard).
+    #
+    # Safety guard: the no-fake-green guarantee rests on the engine itemising
+    # *every* failed table in ``errors`` (with an ``asset_key``) so it can be
+    # subtracted — the current engine sets ``tables_failed = errors.len()``
+    # from one source (run.rs). If a result reports more failures than it
+    # itemises (e.g. an older binary that emits the ``tables_failed`` count
+    # but not per-table ``errors``), we cannot tell which absent key is
+    # actually a hidden failure — so we skip the empty-emit for that whole
+    # batch and let the downstream skip exactly as today. A visible skip
+    # beats a zero-row success that masks a failure.
+    if satisfy_empty_outputs:
+        unattributable = any(r.tables_failed > len(r.errors) for r in results)
+        if unattributable:
+            _log.warning(
+                "satisfy_empty_outputs: a rocky run reported more failures "
+                "(tables_failed) than it itemised in `errors`, so failed tables "
+                "cannot be excluded from the empty-output emission. Skipping the "
+                "empty-output pass for this op — same-run downstreams will skip "
+                "as before — rather than risk stamping a zero-row success on a "
+                "table that actually failed. Upgrade the rocky engine to a build "
+                "that itemises every failed table."
+            )
+        else:
+            errored_keys = {remap(err.asset_key) for r in results for err in r.errors}
+            empty_keys = selected_keys - materialized_keys - errored_keys
+            yield from _empty_output_results(empty_keys)
+
     yield from _emit_placeholder_checks(
         check_specs=check_specs,
         selected_keys=selected_keys,
         yielded_checks=yielded_checks,
         materialized_keys=materialized_keys,
     )
+
+
+def _empty_output_results(
+    empty_keys: Iterable[dg.AssetKey],
+) -> Iterator[dg.MaterializeResult]:
+    """Yield a zero-row, dependency-satisfying result per absent key.
+
+    Each carries :data:`EMPTY_FOR_PARTITION_METADATA_KEY` ``=True`` (and a
+    human-readable reason) so consumers and the Dagster UI can tell it apart
+    from a real copy, plus ``dagster/row_count=0`` for Insights. Keys are
+    yielded in a deterministic (sorted) order so the emitted event stream
+    doesn't depend on set-iteration order. The caller is responsible for
+    having already removed copied and errored keys from ``empty_keys``.
+    """
+    for key in sorted(empty_keys, key=lambda k: k.to_user_string()):
+        yield dg.MaterializeResult(
+            asset_key=key,
+            metadata={
+                EMPTY_FOR_PARTITION_METADATA_KEY: dg.MetadataValue.bool(True),
+                "rocky/reason": dg.MetadataValue.text(
+                    "no rows copied for this partition (table absent or empty in the filtered run)"
+                ),
+                "dagster/row_count": dg.MetadataValue.int(0),
+            },
+        )
 
 
 def _build_table_resolver(
