@@ -16,7 +16,13 @@ from .checks import (
     emit_materializations,
 )
 from .column_lineage import build_column_lineage
-from .component import RockyComponent, RockyMetadataSet, RockyTableProps, TenantConfig
+from .component import (
+    EMPTY_FOR_PARTITION_METADATA_KEY,
+    RockyComponent,
+    RockyMetadataSet,
+    RockyTableProps,
+    TenantConfig,
+)
 from .contracts import (
     CONTRACT_COLUMN_CONSTRAINTS_CHECK,
     CONTRACT_PROTECTED_COLUMNS_CHECK,
@@ -160,6 +166,7 @@ __all__ = [
     "RockyMetadataSet",
     "RockyTableProps",
     "TenantConfig",
+    "EMPTY_FOR_PARTITION_METADATA_KEY",
     "RockyResource",
     "MIN_ROCKY_VERSION",
     "Resolver",
