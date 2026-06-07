@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.33.0] — 2026-06-08
+
+### Changed
+
+- Regenerated the `rocky-project` schema + TypeScript bindings for engine 1.51.0's state-schema deploy-safety work: the `state` output (`rocky state show`) gains `schema_version_supported` + `schema_version_on_disk`, and the config schema gains `[state] on_schema_mismatch`. (#865)
+
 ## [1.32.1] — 2026-06-06
 
 ### Changed
