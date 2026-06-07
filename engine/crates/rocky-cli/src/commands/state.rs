@@ -9,27 +9,59 @@ use rocky_core::state::StateStore;
 use crate::output::*;
 
 /// Execute `rocky state show`.
+///
+/// Reports the watermark set plus both schema versions (the version this
+/// binary supports and the version stamped in the on-disk file). The schema
+/// versions are read via [`StateStore::peek_schema_version`] so they are
+/// reported even when the on-disk store is **forward-incompatible** (newer
+/// than this binary) — that is exactly when an operator most needs the
+/// numbers. A forward-incompatible store still prints its versions with an
+/// empty watermark list and a warning, rather than failing outright.
 pub fn state_show(state_path: &Path, output_json: bool) -> Result<()> {
-    let store = StateStore::open_read_only(state_path).context(format!(
-        "failed to open state store at {}",
-        state_path.display()
-    ))?;
-    let watermarks = store
-        .list_watermarks()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let schema_version_on_disk =
+        StateStore::peek_schema_version(state_path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let entries: Vec<WatermarkEntry> = watermarks
-        .into_iter()
-        .map(|(table, wm)| WatermarkEntry {
-            table,
-            last_value: wm.last_value,
-            updated_at: wm.updated_at,
-        })
-        .collect();
+    let entries: Vec<WatermarkEntry> = match StateStore::open_read_only(state_path) {
+        Ok(store) => store
+            .list_watermarks()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .into_iter()
+            .map(|(table, wm)| WatermarkEntry {
+                table,
+                last_value: wm.last_value,
+                updated_at: wm.updated_at,
+            })
+            .collect(),
+        // Forward-incompatible store: still report the version fields (the
+        // point of this command for an orchestrator startup hook) but skip the
+        // watermark read — this binary can't safely parse the newer layout.
+        Err(rocky_core::state::StateError::SchemaMismatch {
+            found, expected, ..
+        }) => {
+            eprintln!(
+                "warning: on-disk state schema v{found} is newer than this binary supports \
+                 (v{expected}); watermarks are not shown. Upgrade rocky to read this state."
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("{e}").context(format!(
+                "failed to open state store at {}",
+                state_path.display()
+            )));
+        }
+    };
 
     if output_json {
-        print_json(&StateOutput::new(entries))?;
+        print_json(&StateOutput::new(entries, schema_version_on_disk))?;
     } else {
+        println!(
+            "schema version: binary supports v{}, on disk {}",
+            rocky_core::state::current_schema_version(),
+            schema_version_on_disk
+                .map(|v| format!("v{v}"))
+                .unwrap_or_else(|| "none".to_string()),
+        );
         for e in &entries {
             println!("{} | {} | {}", e.table, e.last_value, e.updated_at);
         }
@@ -264,6 +296,39 @@ mod tests {
 
         // Must not have been created as a side effect.
         assert!(!path.exists(), "clear must not create state.redb");
+    }
+
+    #[test]
+    fn state_output_json_carries_both_schema_versions() {
+        // Acceptance (D): `rocky state show --output json` must carry both the
+        // supported and on-disk schema versions as structured fields, so an
+        // orchestrator startup hook never has to parse a human error string.
+        let out = StateOutput::new(Vec::new(), Some(9));
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(
+            json["schema_version_supported"],
+            serde_json::json!(rocky_core::state::current_schema_version())
+        );
+        assert_eq!(json["schema_version_on_disk"], serde_json::json!(9));
+
+        // A missing on-disk version serializes to null (not omitted).
+        let out_none = StateOutput::new(Vec::new(), None);
+        let json_none = serde_json::to_value(&out_none).unwrap();
+        assert!(json_none["schema_version_on_disk"].is_null());
+    }
+
+    #[test]
+    fn state_show_reports_versions_on_a_fresh_store() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        // Both the human and JSON render paths succeed with the new fields.
+        state_show(&path, false).unwrap();
+        state_show(&path, true).unwrap();
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(rocky_core::state::current_schema_version())
+        );
     }
 
     #[test]

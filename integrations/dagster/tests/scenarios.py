@@ -412,6 +412,11 @@ STATE: dict[str, Any] = {
             "updated_at": "2026-03-29T10:01:00Z",
         },
     ],
+    # State-schema deploy-safety: `rocky state show` reports both the version
+    # this binary supports and the version on disk so an orchestrator startup
+    # hook can decide compatibility structurally. In sync here (matching store).
+    "schema_version_supported": 9,
+    "schema_version_on_disk": 9,
 }
 
 # ---------------------------------------------------------------------------

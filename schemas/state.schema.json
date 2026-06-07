@@ -28,6 +28,21 @@
     "command": {
       "type": "string"
     },
+    "schema_version_on_disk": {
+      "description": "redb state-schema version stamped in the on-disk state file, or `null` when no state file exists yet or it predates schema versioning.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "schema_version_supported": {
+      "description": "redb state-schema version this binary supports. Pair with `schema_version_on_disk` to make a compatibility decision without parsing a human error string: `on_disk > supported` means the file was written by a newer engine (forward-incompatible). See the state-schema-deploy-safety contract.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
     "version": {
       "type": "string"
     },
@@ -40,6 +55,7 @@
   },
   "required": [
     "command",
+    "schema_version_supported",
     "version",
     "watermarks"
   ],

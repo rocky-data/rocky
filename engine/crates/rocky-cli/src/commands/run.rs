@@ -490,12 +490,16 @@ async fn try_claim_idempotency(
         | IdempotencyBackend::Valkey {
             mirror_to_redb: true,
             ..
-        } => Some(StateStore::open(state_path).with_context(|| {
-            format!(
-                "failed to open state store at {} for idempotency claim",
-                state_path.display()
-            )
-        })?),
+        } => Some(
+            StateStore::open_with_policy(state_path, state_cfg.on_schema_mismatch).with_context(
+                || {
+                    format!(
+                        "failed to open state store at {} for idempotency claim",
+                        state_path.display()
+                    )
+                },
+            )?,
+        ),
         _ => None,
     };
 
@@ -1097,7 +1101,11 @@ pub async fn run(
         // disabled state persistence (lost watermarks, missing run history)
         // whenever the state file was corrupted or unreadable.
         let state_store = Some(
-            rocky_core::state::StateStore::open(state_path).context(format!(
+            rocky_core::state::StateStore::open_with_policy(
+                state_path,
+                rocky_cfg.state.on_schema_mismatch,
+            )
+            .context(format!(
                 "failed to open state store at {}",
                 state_path.display()
             ))?,
@@ -1345,10 +1353,18 @@ pub async fn run(
     let governance_catalog_client: Option<std::sync::Arc<dyn GovernanceCatalogClient>> =
         adapter_registry.governance_catalog_client(&pipeline.target.adapter);
 
-    let state_store = StateStore::open(state_path).context(format!(
-        "failed to open state store at {}",
-        state_path.display()
-    ))?;
+    let state_store = StateStore::open_with_policy(state_path, rocky_cfg.state.on_schema_mismatch)
+        .context(format!(
+            "failed to open state store at {}",
+            state_path.display()
+        ))?;
+
+    // When the on-disk state was forward-incompatible (newer schema than this
+    // binary) and `on_schema_mismatch = recreate`, the store was bootstrapped
+    // fresh locally. We must NOT write that downgraded state back to a shared
+    // remote tier — doing so would clobber the newer state that already-upgraded
+    // pods depend on. Suppress both the periodic and the end-of-run upload.
+    let suppress_state_upload = state_store.was_recreated_for_forward_incompat();
 
     // Discover sources
     let discovery_result = async {
@@ -2179,7 +2195,7 @@ pub async fn run(
     // exposure for long runs. Runs shorter than ~1 minute skip it entirely.
     let estimated_run_secs =
         (tables_to_process.len() as u64).saturating_mul(3) / (concurrency.max(1) as u64);
-    let state_sync_handle = if estimated_run_secs < 60 {
+    let state_sync_handle = if estimated_run_secs < 60 || suppress_state_upload {
         None
     } else {
         // Target one upload per quarter of the estimated run, capped at 30s.
@@ -3571,8 +3587,18 @@ pub async fn run(
     )
     .await;
 
-    // Upload state to remote storage
-    if let Err(e) = rocky_core::state_sync::upload_state(&rocky_cfg.state, state_path).await {
+    // Upload state to remote storage — unless this store was bootstrapped
+    // fresh from a forward-incompatible on-disk schema. In that case the local
+    // state is a downgrade; persisting it back would clobber the newer state
+    // that already-upgraded pods depend on, so we deliberately skip the upload.
+    if suppress_state_upload {
+        info!(
+            outcome = "skipped_forward_incompat_recreate",
+            "skipping end-of-run state upload: local state was recreated after a \
+             forward-incompatible schema mismatch (on_schema_mismatch = recreate); \
+             leaving the newer shared state intact"
+        );
+    } else if let Err(e) = rocky_core::state_sync::upload_state(&rocky_cfg.state, state_path).await {
         warn!(error = %e, "state upload failed");
     }
 

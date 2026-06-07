@@ -220,6 +220,61 @@ async fn collect_health_checks(
         }
     }
 
+    // 2b. State-schema compatibility. A deploy-time gate for rolling upgrades
+    //     that cross a redb schema version: return Critical when the on-disk
+    //     state is *newer* than this binary supports (forward-incompatible), so
+    //     an orchestrator can put `state_schema` in its strict-startup checks
+    //     and fail an incompatible pod fast and visibly at boot — instead of
+    //     after a per-run, hour-long retry spiral. Uses `peek_schema_version`
+    //     so it reports the on-disk version precisely when it is newer (the
+    //     normal open path hard-fails there). A missing/unversioned store, or
+    //     one older than this binary (which auto-migrates forward), is healthy.
+    if should_run("state_schema", check_filter) {
+        let start = Instant::now();
+        let supported = rocky_core::state::current_schema_version();
+        match rocky_core::state::StateStore::peek_schema_version(state_path) {
+            Ok(on_disk) => {
+                let details = if verbose {
+                    vec![
+                        ("supported".into(), format!("v{supported}")),
+                        (
+                            "on_disk".into(),
+                            on_disk
+                                .map(|v| format!("v{v}"))
+                                .unwrap_or_else(|| "none".into()),
+                        ),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let (status, message) = classify_state_schema(on_disk, supported);
+                if matches!(status, HealthStatus::Critical) {
+                    suggestions.push(
+                        "state_schema: an incompatible pod met newer on-disk state — complete the \
+                         rollout or roll this pod forward to the newer engine"
+                            .into(),
+                    );
+                }
+                checks.push(HealthCheck {
+                    name: "state_schema".into(),
+                    status,
+                    message,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    details,
+                });
+            }
+            Err(e) => {
+                checks.push(HealthCheck {
+                    name: "state_schema".into(),
+                    status: HealthStatus::Warning,
+                    message: format!("Cannot read on-disk state schema version: {e}"),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    details: Vec::new(),
+                });
+            }
+        }
+    }
+
     // 3. Adapter configuration checks (without actual connectivity)
     if should_run("adapters", check_filter) {
         let start = Instant::now();
@@ -549,6 +604,37 @@ fn should_run(name: &str, filter: Option<&str>) -> bool {
     filter.is_none_or(|f| f == name)
 }
 
+/// Classify on-disk-vs-supported state-schema compatibility for the
+/// `state_schema` check.
+///
+/// `Critical` **iff** the on-disk schema is *newer* than this binary supports
+/// (forward-incompatible — the deploy-safety signal). An on-disk schema that is
+/// older (auto-migrates forward), exactly equal, or absent is `Healthy`.
+fn classify_state_schema(on_disk: Option<u32>, supported: u32) -> (HealthStatus, String) {
+    match on_disk {
+        Some(found) if found > supported => (
+            HealthStatus::Critical,
+            format!(
+                "on-disk state schema v{found} is newer than this binary supports \
+                 (v{supported}); this pod is forward-incompatible. Upgrade rocky, or \
+                 set [state] on_schema_mismatch = recreate to run a full refresh."
+            ),
+        ),
+        Some(found) if found < supported => (
+            HealthStatus::Healthy,
+            format!("on-disk state schema v{found} will auto-migrate forward to v{supported}"),
+        ),
+        Some(found) => (
+            HealthStatus::Healthy,
+            format!("state schema v{found} matches this binary"),
+        ),
+        None => (
+            HealthStatus::Healthy,
+            format!("no on-disk state schema (binary supports v{supported})"),
+        ),
+    }
+}
+
 /// Build a Critical `HealthCheck` for a check whose config could not be
 /// loaded, and record a remediation suggestion.
 ///
@@ -661,6 +747,71 @@ mod tests {
                 .any(|c| matches!(c.status, HealthStatus::Critical)),
             "doctor must report at least one Critical so it exits non-zero"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // state_schema check — forward-incompat is Critical, everything else OK
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_state_schema_forward_incompat_is_critical() {
+        // On-disk NEWER than supported → Critical, with both versions named.
+        let (status, msg) = classify_state_schema(Some(9), 7);
+        assert!(matches!(status, HealthStatus::Critical));
+        assert!(msg.contains("v9") && msg.contains("v7"), "got: {msg}");
+    }
+
+    #[test]
+    fn classify_state_schema_older_equal_or_absent_is_healthy() {
+        // Older auto-migrates forward; equal matches; absent is fine.
+        assert!(matches!(
+            classify_state_schema(Some(6), 9).0,
+            HealthStatus::Healthy
+        ));
+        assert!(matches!(
+            classify_state_schema(Some(9), 9).0,
+            HealthStatus::Healthy
+        ));
+        assert!(matches!(
+            classify_state_schema(None, 9).0,
+            HealthStatus::Healthy
+        ));
+    }
+
+    #[tokio::test]
+    async fn state_schema_check_healthy_when_no_state_file() {
+        // A fresh pod (no state file yet) is healthy under `state_schema` — the
+        // check must not fail a pod merely because state hasn't been written.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb"); // does not exist
+        let (checks, _suggestions) =
+            collect_health_checks(&config_path, &state_path, Some("state_schema"), false).await;
+        let check = checks
+            .iter()
+            .find(|c| c.name == "state_schema")
+            .expect("state_schema check must be emitted");
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "missing state file must be healthy, got {:?}",
+            check.status
+        );
+    }
+
+    #[tokio::test]
+    async fn state_schema_check_healthy_on_current_version_store() {
+        // A freshly-created store stamped at the current version is healthy.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+        let (checks, _suggestions) =
+            collect_health_checks(&config_path, &state_path, Some("state_schema"), true).await;
+        let check = checks
+            .iter()
+            .find(|c| c.name == "state_schema")
+            .expect("state_schema check must be emitted");
+        assert!(matches!(check.status, HealthStatus::Healthy));
     }
 
     #[test]
