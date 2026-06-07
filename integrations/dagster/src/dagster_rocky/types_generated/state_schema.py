@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from pydantic import AwareDatetime, BaseModel
+from pydantic import AwareDatetime, BaseModel, conint
 
 
 class WatermarkEntry(BaseModel):
@@ -18,5 +18,13 @@ class StateOutput(BaseModel):
     """
 
     command: str
+    schema_version_on_disk: conint(ge=0) | None = None
+    """
+    redb state-schema version stamped in the on-disk state file, or `null` when no state file exists yet or it predates schema versioning.
+    """
+    schema_version_supported: conint(ge=0)
+    """
+    redb state-schema version this binary supports. Pair with `schema_version_on_disk` to make a compatibility decision without parsing a human error string: `on_disk > supported` means the file was written by a newer engine (forward-incompatible). See the state-schema-deploy-safety contract.
+    """
     version: str
     watermarks: list[WatermarkEntry]

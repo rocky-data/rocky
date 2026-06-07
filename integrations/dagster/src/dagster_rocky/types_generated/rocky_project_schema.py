@@ -1138,6 +1138,22 @@ class SchemaEvolutionConfig(BaseModel):
     """
 
 
+class SchemaMismatchPolicy1(StrEnum):
+    """
+    Treat a forward-incompatible store as cold: log a single `WARN`, bootstrap a fresh local state, and **never write the downgraded state back** to the shared tier (so the newer state upgraded pods depend on is left intact). The run proceeds as a full refresh. Default — it turns a hard, run-stranding failure into a graceful one-time full refresh during the mixed-version window of a schema-changing upgrade.
+    """
+
+    recreate = "recreate"
+
+
+class SchemaMismatchPolicy2(StrEnum):
+    """
+    Abort the open with a clear error (the historical behaviour). Appropriate when an operator would rather an incompatible pod fail loudly than do a full refresh against newer shared state.
+    """
+
+    fail = "fail"
+
+
 class SchemaPatternConfig(BaseModel):
     """
     Schema pattern configuration from TOML, converted to [`SchemaPattern`] at runtime.
@@ -2766,6 +2782,12 @@ class StateConfig(BaseModel):
     """
     Per-pipeline / per-client state-file namespacing. Defaults to [`StateNamespacing::None`] (one global state file — byte-identical to a project that omits this key). Set `namespacing = "pipeline"` to give each pipeline its own `<models>/.rocky-state/<pipeline>.redb` so independent fan-out runs don't serialize on one advisory lock. The per-invocation `--state-namespace <key>` flag overrides this; an explicit `--state-path` disables namespacing for that run.
     """
+    on_schema_mismatch: SchemaMismatchPolicy1 | SchemaMismatchPolicy2 | None = (
+        "recreate"
+    )
+    """
+    What to do when the engine opens a state store whose schema version is **newer** than this binary supports (a forward-incompatibility, which happens during a rolling upgrade that crosses a redb schema version). Defaults to [`SchemaMismatchPolicy::Recreate`] — the old pod bootstraps fresh, does one full-refresh run, and never clobbers the newer shared state. Set to `fail` to keep the historical hard-abort behaviour. Only the run path honours this; inspection/branch commands still hard-fail on a forward-incompatible store. See [`SchemaMismatchPolicy`].
+    """
     on_upload_failure: StateUploadFailureMode1 | StateUploadFailureMode2 | None = "skip"
     """
     What to do when state upload exhausts retries + circuit-breaker. Defaults to `skip` — rocky continues the run and the next run re-derives state from target-table metadata. See [`StateUploadFailureMode`].
@@ -3278,6 +3300,7 @@ class RockyConfig(BaseModel):
                 "retention_days": 30,
             },
             "namespacing": "none",
+            "on_schema_mismatch": "recreate",
             "on_upload_failure": "skip",
             "retention": {
                 "applies_to": ["history", "lineage", "audit"],

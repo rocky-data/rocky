@@ -520,6 +520,45 @@ pub enum StateUploadFailureMode {
     Fail,
 }
 
+/// Policy applied when the engine opens a state store whose schema version is
+/// **newer** than the binary supports (a *forward*-incompatibility).
+///
+/// This is the deploy-safety knob for rolling upgrades that cross a redb
+/// schema version. During a rolling bump, pods on the *old* binary can read
+/// state written by *already-upgraded* pods through a shared tiered backend.
+/// The default ([`Recreate`][Self::Recreate]) degrades that window instead of
+/// breaking it: the old pod does one full-refresh run and succeeds, rather than
+/// stranding the orchestrated run in an hour-long retry spiral.
+///
+/// Only the *forward* case (on-disk newer than binary) is governed here.
+/// *Backward*-compatibility — a newer binary reading older state — always
+/// auto-migrates forward as before; there is no knob for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SchemaMismatchPolicy {
+    /// Treat a forward-incompatible store as cold: log a single `WARN`,
+    /// bootstrap a fresh local state, and **never write the downgraded state
+    /// back** to the shared tier (so the newer state upgraded pods depend on is
+    /// left intact). The run proceeds as a full refresh. Default — it turns a
+    /// hard, run-stranding failure into a graceful one-time full refresh during
+    /// the mixed-version window of a schema-changing upgrade.
+    #[default]
+    Recreate,
+    /// Abort the open with a clear error (the historical behaviour).
+    /// Appropriate when an operator would rather an incompatible pod fail
+    /// loudly than do a full refresh against newer shared state.
+    Fail,
+}
+
+impl std::fmt::Display for SchemaMismatchPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaMismatchPolicy::Recreate => write!(f, "recreate"),
+            SchemaMismatchPolicy::Fail => write!(f, "fail"),
+        }
+    }
+}
+
 /// Per-pipeline / per-client state-file namespacing policy.
 ///
 /// redb permits one writer per file, so fanning out one `rocky run` process
@@ -617,6 +656,16 @@ pub struct StateConfig {
     /// explicit `--state-path` disables namespacing for that run.
     #[serde(default)]
     pub namespacing: StateNamespacing,
+    /// What to do when the engine opens a state store whose schema version is
+    /// **newer** than this binary supports (a forward-incompatibility, which
+    /// happens during a rolling upgrade that crosses a redb schema version).
+    /// Defaults to [`SchemaMismatchPolicy::Recreate`] — the old pod bootstraps
+    /// fresh, does one full-refresh run, and never clobbers the newer shared
+    /// state. Set to `fail` to keep the historical hard-abort behaviour. Only
+    /// the run path honours this; inspection/branch commands still hard-fail on
+    /// a forward-incompatible store. See [`SchemaMismatchPolicy`].
+    #[serde(default)]
+    pub on_schema_mismatch: SchemaMismatchPolicy,
 }
 
 impl Default for StateConfig {
@@ -635,6 +684,7 @@ impl Default for StateConfig {
             idempotency: IdempotencyConfig::default(),
             retention: crate::retention::StateRetentionConfig::default(),
             namespacing: StateNamespacing::default(),
+            on_schema_mismatch: SchemaMismatchPolicy::default(),
         }
     }
 }

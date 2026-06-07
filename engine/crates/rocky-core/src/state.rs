@@ -5,6 +5,7 @@ use fs4::FileExt;
 use redb::{Database, ReadableTable, TableDefinition};
 use thiserror::Error;
 
+use crate::config::SchemaMismatchPolicy;
 use crate::schema_cache::SchemaCacheEntry;
 use rocky_ir::WatermarkState;
 
@@ -270,6 +271,33 @@ pub struct StateStore {
     // Held exclusive advisory lock on `<path>.lock`. `None` for read-only opens.
     // Released automatically when the `File` is dropped.
     _lock_file: Option<File>,
+    // `true` when this store was opened against a forward-incompatible on-disk
+    // schema under [`SchemaMismatchPolicy::Recreate`] and the local file was
+    // bootstrapped fresh. The run path reads this via
+    // [`StateStore::was_recreated_for_forward_incompat`] to suppress the
+    // end-of-run upload, so a downgraded state is never written back over the
+    // newer state that upgraded pods depend on.
+    recreated_for_forward_incompat: bool,
+}
+
+/// The schema version this binary supports.
+///
+/// Exposed so callers (state-sync key qualification, `rocky doctor`,
+/// `rocky state show`) can reason about forward/backward compatibility without
+/// opening a store. See [`CURRENT_SCHEMA_VERSION`].
+pub fn current_schema_version() -> u32 {
+    CURRENT_SCHEMA_VERSION
+}
+
+/// Outcome of [`StateStore::init_db`].
+enum InitOutcome {
+    /// The version was stamped/upgraded and tables were created; the store is
+    /// ready to use.
+    Ready,
+    /// The on-disk schema is newer than this binary supports and the policy is
+    /// [`SchemaMismatchPolicy::Recreate`]; the caller must delete and recreate
+    /// the file. Carries the on-disk version for the WARN message.
+    RecreateForwardIncompat { found: u32 },
 }
 
 impl StateStore {
@@ -290,7 +318,26 @@ impl StateStore {
     /// binary (stored > current) an error is returned immediately so that the
     /// caller can surface a clear message rather than silently misreading data.
     pub fn open(path: &Path) -> Result<Self, StateError> {
-        Self::open_inner(path, true)
+        Self::open_inner(path, true, SchemaMismatchPolicy::Fail)
+    }
+
+    /// Opens or creates a state store for **writing** with an explicit
+    /// forward-incompatibility policy.
+    ///
+    /// Identical to [`StateStore::open`] except that the caller chooses what
+    /// happens when the on-disk schema is *newer* than this binary supports.
+    /// [`SchemaMismatchPolicy::Fail`] (what bare [`open`][Self::open] uses)
+    /// aborts with [`StateError::SchemaMismatch`]; [`SchemaMismatchPolicy::Recreate`]
+    /// logs a `WARN`, bootstraps a fresh local state, and sets the
+    /// [`was_recreated_for_forward_incompat`][Self::was_recreated_for_forward_incompat]
+    /// flag so the caller can suppress writing the downgraded state back to a
+    /// shared tier.
+    ///
+    /// Only the `rocky run` path threads a non-default policy here (from
+    /// `[state] on_schema_mismatch`); every other caller uses the hard-fail
+    /// default via [`open`][Self::open].
+    pub fn open_with_policy(path: &Path, policy: SchemaMismatchPolicy) -> Result<Self, StateError> {
+        Self::open_inner(path, true, policy)
     }
 
     /// Opens an existing state store for **read-only** access.
@@ -310,10 +357,68 @@ impl StateStore {
     /// millisecond-scale collisions the LSP creates on every debounced
     /// keystroke.
     pub fn open_read_only(path: &Path) -> Result<Self, StateError> {
-        Self::open_inner(path, false)
+        Self::open_inner(path, false, SchemaMismatchPolicy::Fail)
     }
 
-    fn open_inner(path: &Path, lock: bool) -> Result<Self, StateError> {
+    /// Reads the schema version stamped in an on-disk state file **without**
+    /// opening it for use, stamping it, creating tables, or recreating it.
+    ///
+    /// Returns:
+    /// - `Ok(None)` if the file does not exist, has no `metadata` table, or has
+    ///   no `schema_version` key (a pre-versioning store).
+    /// - `Ok(Some(v))` with the stored version otherwise.
+    ///
+    /// Unlike [`open`][Self::open] / [`open_read_only`][Self::open_read_only],
+    /// this never fails on a forward-incompatible store — it is the primitive
+    /// behind `rocky doctor --check state_schema` and the version fields in
+    /// `rocky state show`, both of which must report the on-disk version
+    /// precisely when it is newer than this binary supports. It takes redb's
+    /// shared open path (with the same lock-contention retry) but never Rocky's
+    /// advisory write lock.
+    pub fn peek_schema_version(path: &Path) -> Result<Option<u32>, StateError> {
+        // Side-effect-free for a missing file: do not let the redb open path
+        // create an empty database as a probe artifact.
+        if !path.exists() {
+            return Ok(None);
+        }
+        let db = open_redb_with_retry(path)?;
+        let txn = db.begin_read()?;
+        let metadata = match txn.open_table(METADATA) {
+            Ok(table) => table,
+            // A store written before the metadata table existed (or an empty
+            // freshly-created file) carries no version — treat as unversioned.
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(StateError::Table(e)),
+        };
+        match metadata.get("schema_version")? {
+            Some(guard) => {
+                let raw = guard.value().to_string();
+                let version = raw
+                    .parse::<u32>()
+                    .map_err(|_| StateError::VersionParse(raw))?;
+                Ok(Some(version))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Whether this store was bootstrapped fresh because the on-disk schema was
+    /// forward-incompatible (newer than this binary) and the open policy was
+    /// [`SchemaMismatchPolicy::Recreate`].
+    ///
+    /// When `true`, the caller must **not** persist this store back to a shared
+    /// remote tier — doing so would clobber the newer state that already-upgraded
+    /// pods depend on. The `rocky run` path checks this before its end-of-run
+    /// `upload_state`.
+    pub fn was_recreated_for_forward_incompat(&self) -> bool {
+        self.recreated_for_forward_incompat
+    }
+
+    fn open_inner(
+        path: &Path,
+        lock: bool,
+        policy: SchemaMismatchPolicy,
+    ) -> Result<Self, StateError> {
         // Acquire the advisory lock BEFORE opening the database — otherwise two
         // concurrent writers could both pass `Database::create` before either
         // of them reaches the lock check.
@@ -345,9 +450,82 @@ impl StateStore {
 
         let db = open_redb_with_retry(path)?;
 
-        // Single write transaction: check/write schema version AND ensure all
-        // tables exist. Committing them together means the version stamp and
-        // the table layout are always consistent.
+        match Self::init_db(&db, path, policy)? {
+            InitOutcome::Ready => Ok(StateStore {
+                db,
+                _lock_file: lock_file,
+                recreated_for_forward_incompat: false,
+            }),
+            InitOutcome::RecreateForwardIncompat { found } => {
+                // Forward-incompatible store under `SchemaMismatchPolicy::Recreate`.
+                // Treat it as cold: drop the handle, delete the local file, and
+                // bootstrap fresh. The caller (run path) reads the
+                // `recreated_for_forward_incompat` flag and skips the end-of-run
+                // upload, so the newer shared state is never clobbered.
+                tracing::warn!(
+                    target: "rocky::state",
+                    found,
+                    expected = CURRENT_SCHEMA_VERSION,
+                    path = %path.display(),
+                    "state schema version mismatch: database has v{found}, binary expects \
+                     v{CURRENT_SCHEMA_VERSION}. on_schema_mismatch = recreate: bootstrapping \
+                     fresh local state and running a full refresh. The newer shared state is \
+                     left intact (not overwritten) for already-upgraded pods."
+                );
+                drop(db);
+                // If we cannot remove the forward-incompatible file, reopening
+                // would just re-read the same newer version and loop. Degrade to
+                // the hard-fail error so the operator gets the actionable
+                // "delete or migrate" message rather than a silent spin.
+                if let Err(source) = std::fs::remove_file(path) {
+                    tracing::warn!(
+                        target: "rocky::state",
+                        error = %source,
+                        path = %path.display(),
+                        "could not delete forward-incompatible state file to recreate it; \
+                         falling back to hard failure"
+                    );
+                    return Err(StateError::SchemaMismatch {
+                        found,
+                        expected: CURRENT_SCHEMA_VERSION,
+                        path: path.display().to_string(),
+                    });
+                }
+                let db = open_redb_with_retry(path)?;
+                match Self::init_db(&db, path, policy)? {
+                    InitOutcome::Ready => Ok(StateStore {
+                        db,
+                        _lock_file: lock_file,
+                        recreated_for_forward_incompat: true,
+                    }),
+                    // A file we just created cannot carry a newer schema version.
+                    InitOutcome::RecreateForwardIncompat { found } => {
+                        Err(StateError::SchemaMismatch {
+                            found,
+                            expected: CURRENT_SCHEMA_VERSION,
+                            path: path.display().to_string(),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stamp the schema version and ensure every table exists, in a single
+    /// write transaction so the version stamp and table layout always commit
+    /// together.
+    ///
+    /// Returns [`InitOutcome::RecreateForwardIncompat`] (without committing)
+    /// when the on-disk version is newer than this binary supports **and** the
+    /// policy is [`SchemaMismatchPolicy::Recreate`]; under
+    /// [`SchemaMismatchPolicy::Fail`] the same condition returns
+    /// [`StateError::SchemaMismatch`]. Otherwise stamps/upgrades the version,
+    /// creates the tables, commits, and returns [`InitOutcome::Ready`].
+    fn init_db(
+        db: &Database,
+        path: &Path,
+        policy: SchemaMismatchPolicy,
+    ) -> Result<InitOutcome, StateError> {
         let txn = db.begin_write()?;
         {
             let mut metadata = txn.open_table(METADATA)?;
@@ -365,11 +543,18 @@ impl StateStore {
                         .parse::<u32>()
                         .map_err(|_| StateError::VersionParse(version_str.clone()))?;
                     if found > CURRENT_SCHEMA_VERSION {
-                        return Err(StateError::SchemaMismatch {
-                            found,
-                            expected: CURRENT_SCHEMA_VERSION,
-                            path: path.display().to_string(),
-                        });
+                        // Dropping the uncommitted `txn` here aborts it, so no
+                        // partial stamp/table write survives the early return.
+                        return match policy {
+                            SchemaMismatchPolicy::Fail => Err(StateError::SchemaMismatch {
+                                found,
+                                expected: CURRENT_SCHEMA_VERSION,
+                                path: path.display().to_string(),
+                            }),
+                            SchemaMismatchPolicy::Recreate => {
+                                Ok(InitOutcome::RecreateForwardIncompat { found })
+                            }
+                        };
                     }
                     // Upgrade stamp so future migrations can branch on
                     // the actual version stored on disk.
@@ -402,11 +587,7 @@ impl StateStore {
             let _table = txn.open_table(DISCOVER_SNAPSHOTS)?;
         }
         txn.commit()?;
-
-        Ok(StateStore {
-            db,
-            _lock_file: lock_file,
-        })
+        Ok(InitOutcome::Ready)
     }
 
     /// Gets the watermark for a table (keyed by `catalog.schema.table`).
@@ -5763,6 +5944,162 @@ mod tests {
             .map(|g| g.value().to_string())
             .unwrap();
         assert_eq!(stored, CURRENT_SCHEMA_VERSION.to_string());
+    }
+
+    // -----------------------------------------------------------------------
+    // Forward-incompat / schema-mismatch policy (deploy safety)
+    // -----------------------------------------------------------------------
+
+    /// Stamp an arbitrary `schema_version` onto an existing store file, then
+    /// release the lock. Used to simulate a store written by a *newer* binary.
+    fn force_schema_version(path: &Path, version: &str) {
+        let store = StateStore::open(path).unwrap();
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut metadata = txn.open_table(METADATA).unwrap();
+            metadata.insert("schema_version", version).unwrap();
+        }
+        txn.commit().unwrap();
+        // `store` drops here, releasing the advisory lock.
+    }
+
+    fn sample_watermark() -> WatermarkState {
+        let now = Utc::now();
+        WatermarkState {
+            last_value: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn open_hard_fails_on_forward_incompat_by_default() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        let future = (CURRENT_SCHEMA_VERSION + 1).to_string();
+        force_schema_version(&path, &future);
+
+        // Bare `open` keeps today's behaviour: a hard SchemaMismatch.
+        // (`StateStore` is not `Debug`, so match instead of `unwrap_err`.)
+        let err = match StateStore::open(&path) {
+            Ok(_) => panic!("expected SchemaMismatch on a forward-incompatible store"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, StateError::SchemaMismatch { found, expected, .. }
+                if found == CURRENT_SCHEMA_VERSION + 1 && expected == CURRENT_SCHEMA_VERSION),
+            "got {err:?}"
+        );
+        // Explicit `Fail` policy is identical.
+        let err = match StateStore::open_with_policy(&path, SchemaMismatchPolicy::Fail) {
+            Ok(_) => panic!("expected SchemaMismatch under Fail policy"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, StateError::SchemaMismatch { .. }),
+            "got {err:?}"
+        );
+        // The file still carries the newer stamp — Fail does not mutate it.
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION + 1)
+        );
+    }
+
+    #[test]
+    fn open_with_policy_recreate_bootstraps_fresh_on_forward_incompat() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        // Seed a watermark, then stamp the file as written by a newer binary.
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .set_watermark("cat.sch.tbl", &sample_watermark())
+                .unwrap();
+        }
+        let future = (CURRENT_SCHEMA_VERSION + 2).to_string();
+        force_schema_version(&path, &future);
+
+        // Recreate: opens fresh, flags the recreate, and the old watermark is gone.
+        let store = StateStore::open_with_policy(&path, SchemaMismatchPolicy::Recreate).unwrap();
+        assert!(store.was_recreated_for_forward_incompat());
+        assert!(
+            store.list_watermarks().unwrap().is_empty(),
+            "recreate must discard the forward-incompatible state"
+        );
+        drop(store);
+        // The file is now re-stamped at the version this binary supports.
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
+    fn open_with_policy_recreate_is_noop_on_compatible_store() {
+        // A current-version store is never recreated; its data is preserved and
+        // the flag stays false even under the Recreate policy.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .set_watermark("cat.sch.tbl", &sample_watermark())
+                .unwrap();
+        }
+        let store = StateStore::open_with_policy(&path, SchemaMismatchPolicy::Recreate).unwrap();
+        assert!(!store.was_recreated_for_forward_incompat());
+        assert_eq!(store.list_watermarks().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_with_policy_recreate_upgrades_older_store_without_recreating() {
+        // Backward-compat (on-disk OLDER than binary) must still auto-migrate
+        // forward in place — Recreate is only for the forward case.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .set_watermark("cat.sch.tbl", &sample_watermark())
+                .unwrap();
+        }
+        force_schema_version(&path, "6");
+        let store = StateStore::open_with_policy(&path, SchemaMismatchPolicy::Recreate).unwrap();
+        assert!(
+            !store.was_recreated_for_forward_incompat(),
+            "an older store auto-migrates, it is not recreated"
+        );
+        assert_eq!(store.list_watermarks().unwrap().len(), 1, "data preserved");
+    }
+
+    #[test]
+    fn peek_schema_version_reports_on_disk_without_mutating() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        // Missing file → None, and peek must NOT create it as a side effect.
+        assert_eq!(StateStore::peek_schema_version(&path).unwrap(), None);
+        assert!(!path.exists(), "peek must not create a missing state file");
+
+        // Fresh store → the current version.
+        drop(StateStore::open(&path).unwrap());
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+
+        // A forward-stamped file is reported precisely (no error, no recreate).
+        let future = CURRENT_SCHEMA_VERSION + 3;
+        force_schema_version(&path, &future.to_string());
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(future)
+        );
+        // Peeking again leaves the stamp untouched.
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(future)
+        );
     }
 
     // -----------------------------------------------------------------------

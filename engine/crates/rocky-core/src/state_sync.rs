@@ -91,6 +91,39 @@ fn remote_state_key(local_path: &Path) -> String {
     STATE_FILE.to_string()
 }
 
+/// Schema-version path segment for remote state keys (e.g. `"v9"`).
+///
+/// Every remote state key is qualified by the engine's **schema** version so
+/// two engine versions that disagree on the redb schema never read or write
+/// each other's state through a shared tiered / object / Valkey backend. This
+/// is the durable fix for the rolling-upgrade strand: during a schema-changing
+/// bump, an old-binary pod resolves its keys under `vN` while already-upgraded
+/// pods use `vN+1`, so they never collide.
+///
+/// Qualifying by **schema** version, not binary version or hash, is
+/// deliberate: a patch bump that leaves the redb schema unchanged keeps the
+/// same segment and so keeps sharing state (no fleet-wide watermark reset).
+/// Only a schema-changing bump shifts the segment, after which the new version
+/// finds no state under its key and bootstraps once via the existing
+/// incremental-bootstrap path.
+fn schema_version_segment() -> String {
+    format!("v{}", crate::state::current_schema_version())
+}
+
+/// Schema-qualified object-store key: `v9/state.redb` (under the configured
+/// `<prefix>`). The version segment is a path component so the full object
+/// path reads `<prefix>/v9/state.redb`.
+fn object_store_state_key(remote_key: &str) -> String {
+    format!("{}/{remote_key}", schema_version_segment())
+}
+
+/// Schema-qualified Valkey key: `<prefix>v9:state.redb` (e.g.
+/// `rocky:state:v9:state.redb`). The version segment is colon-delimited to
+/// match the Valkey prefix convention.
+fn valkey_state_key(prefix: &str, remote_key: &str) -> String {
+    format!("{prefix}{}:{remote_key}", schema_version_segment())
+}
+
 /// Build an `ObjectStoreProvider` rooted at `<scheme>://<bucket>/<prefix>`.
 fn cloud_provider(
     scheme: &str,
@@ -473,7 +506,10 @@ async fn download_from_object_store(
     timeout: Duration,
 ) -> Result<(), StateSyncError> {
     let provider = cloud_provider(scheme, bucket, prefix)?;
-    let key = remote_state_key(local_path);
+    // Qualify the object key by schema version so a v7 pod and a v9 pod never
+    // collide on the same object — `<prefix>/v9/state.redb`, not
+    // `<prefix>/state.redb`.
+    let key = object_store_state_key(&remote_state_key(local_path));
     let span = info_span!(
         "state.download",
         backend = %provider.scheme(),
@@ -529,6 +565,10 @@ async fn upload_to_object_store(
     retry: &RetryConfig,
 ) -> Result<(), StateSyncError> {
     let provider = cloud_provider(scheme, bucket, prefix)?;
+    // Mirror `download_from_object_store`: qualify the object key by schema
+    // version so the upload lands at the same `<prefix>/v9/state.redb` the
+    // download reads, and never over a different version's object.
+    let key = object_store_state_key(key);
     let size_bytes = local_path.metadata().map(|m| m.len()).unwrap_or(0);
     let span = info_span!(
         "state.upload",
@@ -544,7 +584,7 @@ async fn upload_to_object_store(
         let retries = with_transfer_timeout(timeout, async {
             retry_transient(retry, "state.upload.object_store", || async {
                 provider
-                    .upload_file(local_path, key)
+                    .upload_file(local_path, &key)
                     .await
                     .map_err(StateSyncError::from)
             })
@@ -608,7 +648,9 @@ async fn download_from_valkey(
         .as_deref()
         .unwrap_or(DEFAULT_VALKEY_PREFIX)
         .to_string();
-    let key = format!("{prefix}{}", remote_state_key(local_path));
+    // Qualify by schema version: `rocky:state:v9:state.redb`, not
+    // `rocky:state:state.redb`, so a v7 reader and a v9 writer never share a key.
+    let key = valkey_state_key(&prefix, &remote_state_key(local_path));
     let local_path_owned = local_path.to_path_buf();
     let timeout = transfer_timeout(config);
 
@@ -681,7 +723,9 @@ async fn upload_to_valkey(
         .as_deref()
         .unwrap_or(DEFAULT_VALKEY_PREFIX)
         .to_string();
-    let key = format!("{prefix}{remote_key}");
+    // Mirror `download_from_valkey`: qualify by schema version so the upload
+    // key matches the download key (`rocky:state:v9:<remote_key>`).
+    let key = valkey_state_key(&prefix, remote_key);
     let data = std::fs::read(local_path)?;
     let size_bytes = data.len() as u64;
     let timeout = transfer_timeout(config);
@@ -1099,6 +1143,56 @@ mod tests {
         assert_ne!(remote_state_key(acme), remote_state_key(globex));
     }
 
+    // Schema-version qualification: remote keys carry the engine's *schema*
+    // version so two engine versions with different schemas never share a key.
+    #[test]
+    fn schema_version_segment_matches_current_schema() {
+        assert_eq!(
+            schema_version_segment(),
+            format!("v{}", crate::state::current_schema_version())
+        );
+    }
+
+    #[test]
+    fn object_store_key_is_schema_qualified() {
+        let seg = schema_version_segment();
+        // Global file → `v9/state.redb`; namespaced → `v9/acme.redb`.
+        assert_eq!(
+            object_store_state_key("state.redb"),
+            format!("{seg}/state.redb")
+        );
+        assert_eq!(
+            object_store_state_key("acme.redb"),
+            format!("{seg}/acme.redb")
+        );
+    }
+
+    #[test]
+    fn valkey_key_is_schema_qualified() {
+        let seg = schema_version_segment();
+        // Default prefix already ends in `:`, so the result is
+        // `rocky:state:v9:state.redb` — matching the FR's wire format.
+        assert_eq!(
+            valkey_state_key(DEFAULT_VALKEY_PREFIX, "state.redb"),
+            format!("rocky:state:{seg}:state.redb")
+        );
+    }
+
+    // Two engine versions with different schema versions must never resolve to
+    // the same remote key. We can't change `CURRENT_SCHEMA_VERSION` at runtime,
+    // so assert the version segment is load-bearing in the composed key: a key
+    // built with a different segment differs at the version position only.
+    #[test]
+    fn distinct_schema_versions_yield_distinct_keys() {
+        let here = object_store_state_key("state.redb");
+        let other = format!("v{}/state.redb", crate::state::current_schema_version() + 1);
+        assert_ne!(here, other);
+        // The local file stem maps to the same trailing object regardless of
+        // version — only the version segment changes — so a patch bump (same
+        // schema version) keeps sharing state.
+        assert!(here.ends_with("/state.redb") && other.ends_with("/state.redb"));
+    }
+
     // R8 (part 2) — no clobber. Two namespaced files round-trip through a real
     // object store at distinct keys and do not overwrite each other.
     #[tokio::test]
@@ -1175,12 +1269,21 @@ mod tests {
 
         test_support::clear();
 
-        // The namespaced object exists at `acme.redb`...
+        // The namespaced object exists at the schema-qualified key
+        // `v<N>/acme.redb` (the version segment keeps different-schema engines
+        // from sharing the object)...
+        let qualified = object_store_state_key("acme.redb");
         assert!(
-            provider.exists("acme.redb").await.unwrap(),
-            "{label} upload must land at the namespaced key `acme.redb`"
+            provider.exists(&qualified).await.unwrap(),
+            "{label} upload must land at the schema-qualified namespaced key `{qualified}`"
         );
-        // ...and the legacy shared key was NOT written (the clobber).
+        // ...and neither the *unqualified* namespaced key nor the legacy shared
+        // key was written (the version segment is load-bearing; the clobber is
+        // avoided).
+        assert!(
+            !provider.exists("acme.redb").await.unwrap(),
+            "{label} upload must NOT write the unqualified namespaced key `acme.redb`"
+        );
         assert!(
             !provider.exists("state.redb").await.unwrap(),
             "{label} upload must NOT write the shared legacy `state.redb` for a namespaced file"
