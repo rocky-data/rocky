@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.51.0] — 2026-06-08
+
+### Added
+
+- **State-schema deploy safety for rolling upgrades.** A rolling engine upgrade that crosses a redb state-schema version no longer strands orchestrated runs (an old-binary pod that read newer state through a shared backend used to hard-fail deterministically, burning an orchestrator's retry budget for ~an hour before failing with no work done). Four parts:
+  - **Version-qualified remote state keys.** The tiered / S3 / GCS / Valkey state keys now carry the engine's *schema* version (`rocky:state:v9:…`, `rocky/state/v9/…`), so two engine versions that disagree on the schema never read or write each other's state through a shared backend. Qualified by **schema** version, not binary version — a patch bump that leaves the schema unchanged keeps sharing state, so watermarks are not reset on every upgrade. After a schema-changing bump the new version finds no state under its key and bootstraps once via the existing incremental path (one full refresh). (#865)
+  - **`[state] on_schema_mismatch` — `"recreate"` (default) `| "fail"`.** When the engine opens a state store whose schema is *newer* than it supports, `recreate` logs a single WARN, bootstraps fresh local state (one full refresh), and **never writes the downgraded state back** to the shared tier — so the newer state that already-upgraded pods depend on stays intact and an old-binary pod degrades gracefully instead of stranding the run. `"fail"` preserves the prior hard-abort. Backward-compatibility (a newer binary reading older state) still auto-migrates forward as before. (#865)
+  - **`rocky doctor --check state_schema`.** Returns `critical` (with both the supported and on-disk versions in the message) when the on-disk schema is newer than the binary supports — a deploy-time boot gate an orchestrator can add to its strict-startup checks so an incompatible pod fails fast and visibly at boot instead of mid-run. (#865)
+  - **`rocky state show --output json` schema versions.** Adds `schema_version_supported` and `schema_version_on_disk` so external tooling can make a compatibility decision structurally instead of parsing the human error string. (#865)
+
 ## [1.50.1] — 2026-06-06
 
 ### Changed

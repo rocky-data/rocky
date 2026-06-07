@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.48.0] — 2026-06-08
+
+### Changed
+
+- Regenerated the Pydantic bindings for engine 1.51.0's state-schema deploy-safety work: `StateOutput` (`rocky state show`) gains `schema_version_supported` + `schema_version_on_disk`, and the `rocky-project` config schema gains `[state] on_schema_mismatch`. No integration code change is needed to use the new engine `state_schema` doctor check — a `RockyResource` with `strict_doctor_checks=["state_rw", "state_schema"]` matches the engine's critical check by name and blocks the run from launching when a pod meets forward-incompatible on-disk state. (#865)
+
 ## [1.47.0] — 2026-06-07
 
 ### Added
