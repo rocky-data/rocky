@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.47.0] — 2026-06-07
+
 ### Added
 
 - **`RockyComponent.satisfy_empty_outputs`.** Opt-in (default `False`) mode for subset / partition runs. Rocky runs at source granularity, so a partition run (e.g. a tenant-collapse `rocky run --filter client=<X>`) copies only the tables that have data for that partition. Dagster treats a *selected* output that yields no event as skipped, and `can_subset=True` does **not** prune — a single unyielded dependency makes the executor wholesale-skip any *same-run* downstream `@multi_asset` that depends on it, so the consolidation layer for a sparse `(partition × connector)` never materialised while the run still reported SUCCESS (silent data loss). With the flag on, the op additionally emits a zero-row `MaterializeResult` (marked `rocky/empty_for_partition=True`, exported as `EMPTY_FOR_PARTITION_METADATA_KEY`) for every selected-but-uncopied key, so the dependency is satisfied and the downstream runs and applies its own subset logic. **Failed** tables are excluded — a copy that errored keeps its downstream skipped so the failure stays visible and retriable rather than being papered over with a fake-green zero. Supported only on the default `execution_mode="streaming"`, non-`dag_mode` path; `build_defs` raises a clear error if combined with `execution_mode="pipes"` (can't distinguish absent from failed over the Pipes wire) or `dag_mode=True` (separate emission path).
