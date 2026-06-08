@@ -986,7 +986,7 @@
     "vscode:prepublish": "npm run compile && npm run bundle"
   },
   "dependencies": {
-    "vscode-languageclient": "^9.0.1"
+    "vscode-languageclient": "^10.0.0"
   },
   "devDependencies": {
     "@dagrejs/dagre": "^3.0.0",
