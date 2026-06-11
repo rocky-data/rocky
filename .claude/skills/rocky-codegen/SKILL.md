@@ -1,6 +1,6 @@
 ---
 name: rocky-codegen
-description: Rocky CLI JSON-output schema cascade. Use when editing any `*Output` struct in `engine/crates/rocky-cli/src/output.rs` (or `commands/doctor.rs`), adding a new CLI command schema, or when a change could affect `schemas/*.schema.json`, `integrations/dagster/src/dagster_rocky/types_generated/`, or `editors/vscode/src/types/generated/`. Also use when CI reports `codegen-drift`.
+description: Rocky CLI JSON-output schema cascade. Use when editing any `*Output` struct in `engine/crates/rocky-cli/src/output.rs` (or `commands/doctor.rs`), adding a new CLI command schema, or when a change could affect `schemas/*.schema.json`, `sdk/python/src/rocky_sdk/types_generated/`, or `editors/vscode/src/types/generated/`. Also use when CI reports `codegen-drift`.
 ---
 
 # Rocky codegen cascade
@@ -24,7 +24,7 @@ engine/crates/rocky-cli/src/output.rs       (Rust source of truth)
         ▼  cargo run -- export-schemas schemas/
 schemas/*.schema.json                        (60 JSON Schemas, committed)
         │
-        ├──▶  integrations/dagster/src/dagster_rocky/types_generated/   (Pydantic v2)
+        ├──▶  sdk/python/src/rocky_sdk/types_generated/   (Pydantic v2)
         └──▶  editors/vscode/src/types/generated/                       (TypeScript)
 ```
 
@@ -60,10 +60,10 @@ Three recipes in `justfile`, runnable individually:
 | Recipe | What it does |
 |---|---|
 | `just codegen-rust` | `cargo run --release --bin rocky -- export-schemas schemas/` — rebuilds engine in release mode (shared with `regen-fixtures`), then writes the JSON schemas to `schemas/` (currently 60; run `ls schemas/*.schema.json | wc -l` to verify). |
-| `just codegen-dagster` | Runs `datamodel-codegen` over `schemas/*.schema.json` into `integrations/dagster/src/dagster_rocky/types_generated/`. Self-heals the curated `__init__.py` barrel via `git checkout`. |
+| `just codegen-sdk` | Runs `datamodel-codegen` over `schemas/*.schema.json` into `sdk/python/src/rocky_sdk/types_generated/`. Self-heals the curated `__init__.py` barrel via `git checkout`. |
 | `just codegen-vscode` | Runs `json2ts` per schema into `editors/vscode/src/types/generated/`. Self-heals the curated `index.ts` barrel via `git checkout`. |
 
-Both `codegen-dagster` and `codegen-vscode` intentionally overwrite the output directory and then `git checkout HEAD -- <barrel>` to restore the curated re-export files. **Do not hand-edit** files under `types_generated/` or `types/generated/` other than those two barrels — the next codegen run nukes them.
+Both `codegen-sdk` and `codegen-vscode` intentionally overwrite the output directory and then `git checkout HEAD -- <barrel>` to restore the curated re-export files. **Do not hand-edit** files under `types_generated/` or `types/generated/` other than those two barrels — the next codegen run nukes them.
 
 ## Adding a new CLI command schema
 

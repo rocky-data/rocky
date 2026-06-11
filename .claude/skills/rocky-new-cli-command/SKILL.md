@@ -64,7 +64,7 @@ From the monorepo root:
 just codegen
 ```
 
-This rebuilds the engine in release mode, writes `schemas/diff.schema.json`, regenerates `integrations/dagster/src/dagster_rocky/types_generated/diff_schema.py`, and regenerates `editors/vscode/src/types/generated/diff.ts`. See the `rocky-codegen` skill for the details of what each sub-recipe does.
+This rebuilds the engine in release mode, writes `schemas/diff.schema.json`, regenerates `sdk/python/src/rocky_sdk/types_generated/diff_schema.py`, and regenerates `editors/vscode/src/types/generated/diff.ts`. See the `rocky-codegen` skill for the details of what each sub-recipe does.
 
 ## Step 5 — Dagster: consume the output
 
@@ -72,7 +72,7 @@ This rebuilds the engine in release mode, writes `schemas/diff.schema.json`, reg
 
 1. `*Output` struct exists (step 2 above). ✓
 2. Registered in `export_schemas.rs::schemas()`. ✓
-3. `just codegen-dagster` ran. ✓
+3. `just codegen-sdk` ran. ✓
 4. Re-export the new type from `integrations/dagster/src/dagster_rocky/types.py` in the round 9 bridge section near the bottom — both the generated name (`DiffOutput`) and a legacy Python-flavored alias (`DiffResult`) for forward-compat.
 5. Add a route in `parse_rocky_output()` to dispatch `"diff"` → `DiffOutput`.
 6. `just regen-fixtures` from the monorepo root to capture a fresh fixture — or hand-write one at `integrations/dagster/tests/fixtures/diff.json` if the playground POC doesn't produce that command naturally.

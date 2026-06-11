@@ -1,0 +1,83 @@
+name: sdk-release
+
+# Publishes rocky-sdk to PyPI via OIDC and ensures a GitHub Release exists when
+# an sdk-v* tag is pushed. Supports both workflows:
+#   1. CI-only: push tag → this workflow creates the GH Release + publishes to PyPI
+#   2. Local-first: scripts/release.sh creates the GH Release, push tag → CI publishes to PyPI
+# The ensure-release job is idempotent — it skips if the release already exists.
+#
+# Ordering note: rocky-sdk must publish BEFORE any dagster-rocky release that
+# raises its `rocky-sdk>=…` floor — dagster-rocky's published wheel resolves the
+# SDK from PyPI, not the monorepo path source.
+
+on:
+  push:
+    tags: ["sdk-v*"]
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: sdk/python
+
+jobs:
+  # Create the GitHub Release if it doesn't already exist (supports both
+  # CI-only releases and the local scripts/release.sh workflow where the
+  # release is created before the tag push).
+  ensure-release:
+    name: Ensure GitHub Release exists
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists (created by scripts/release.sh)"
+          else
+            echo "Creating release $TAG"
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --generate-notes \
+              --title "$TAG"
+          fi
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: ensure-release
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - run: uv build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: sdk/python/dist/
+
+      - name: Attach wheel and sdist to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Guard the glob so an empty dist/ (uv build silently produced no
+          # artifacts) doesn't send the literal string `dist/*` to the
+          # upload command.
+          shopt -s nullglob
+          artifacts=( dist/* )
+          shopt -u nullglob
+          if (( ${#artifacts[@]} == 0 )); then
+            echo "ERROR: no artifacts found under dist/" >&2
+            ls -la dist/ || true
+            exit 1
+          fi
+          gh release upload "${GITHUB_REF_NAME}" "${artifacts[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber

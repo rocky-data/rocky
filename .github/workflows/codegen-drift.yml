@@ -10,7 +10,7 @@ on:
     paths:
       - 'engine/**'
       - 'schemas/**'
-      - 'integrations/dagster/src/dagster_rocky/types_generated/**'
+      - 'sdk/python/src/rocky_sdk/types_generated/**'
       - 'integrations/dagster/tests/fixtures_generated/**'
       - 'editors/vscode/src/types/generated/**'
       - 'editors/vscode/schemas/rocky-project.schema.json'
@@ -23,7 +23,7 @@ on:
     paths:
       - 'engine/**'
       - 'schemas/**'
-      - 'integrations/dagster/src/dagster_rocky/types_generated/**'
+      - 'sdk/python/src/rocky_sdk/types_generated/**'
       - 'integrations/dagster/tests/fixtures_generated/**'
       - 'editors/vscode/src/types/generated/**'
       - 'editors/vscode/schemas/rocky-project.schema.json'
@@ -85,6 +85,12 @@ jobs:
           install -m 0755 "$tmp/duckdb/duckdb" "$HOME/.duckdb/cli/latest/duckdb"
           echo "$HOME/.duckdb/cli/latest" >> "$GITHUB_PATH"
 
+      - name: uv sync (sdk)
+        # `just codegen` runs datamodel-codegen inside sdk/python to regenerate
+        # the Pydantic models, so the SDK env must be present.
+        run: uv sync --dev
+        working-directory: sdk/python
+
       - name: uv sync (dagster)
         run: uv sync --dev
         working-directory: integrations/dagster
@@ -114,7 +120,7 @@ jobs:
       - name: Fail if anything drifted
         run: |
           if ! git diff --exit-code schemas/ \
-                                    integrations/dagster/src/dagster_rocky/types_generated/ \
+                                    sdk/python/src/rocky_sdk/types_generated/ \
                                     integrations/dagster/tests/fixtures_generated/ \
                                     editors/vscode/src/types/generated/ \
                                     editors/vscode/schemas/rocky-project.schema.json; then

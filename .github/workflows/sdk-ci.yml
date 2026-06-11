@@ -1,24 +1,22 @@
-name: dagster-ci
+name: sdk-ci
 
 on:
   push:
     branches: [main]
     paths:
-      - 'integrations/dagster/**'
       - 'sdk/python/**'
       - 'schemas/**'
-      - '.github/workflows/dagster-ci.yml'
+      - '.github/workflows/sdk-ci.yml'
   pull_request:
     branches: [main]
     paths:
-      - 'integrations/dagster/**'
       - 'sdk/python/**'
       - 'schemas/**'
-      - '.github/workflows/dagster-ci.yml'
+      - '.github/workflows/sdk-ci.yml'
 
 defaults:
   run:
-    working-directory: integrations/dagster
+    working-directory: sdk/python
 
 jobs:
   test:
