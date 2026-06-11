@@ -69,7 +69,7 @@ vendor-dagster:
 # or output shapes that show up in dagster fixtures — use `just codegen-all`
 # instead, which also runs `regen-fixtures`. Release CI fails
 # (codegen-drift.yml) if either side is stale.
-codegen: codegen-rust codegen-dagster codegen-vscode codegen-vscode-project-schema
+codegen: codegen-rust codegen-sdk codegen-vscode codegen-vscode-project-schema
 
 # Bundle `codegen` + `regen-fixtures` for release cuts and any change that
 # alters the shape of command output (e.g. new fields on MaterializationOutput,
@@ -87,25 +87,26 @@ codegen-all: codegen regen-fixtures
 codegen-rust:
     cd engine && cargo run --quiet --release --bin rocky -- export-schemas ../schemas
 
-# Regenerate Pydantic v2 models in integrations/dagster from schemas/
-# (writes to integrations/dagster/src/dagster_rocky/types_generated/)
+# Regenerate Pydantic v2 models in the rocky-sdk package from schemas/
+# (writes to sdk/python/src/rocky_sdk/types_generated/). dagster-rocky
+# re-exports these via its dagster_rocky.types shim.
 #
 # Self-healing: datamodel-code-generator overwrites __init__.py with an
 # empty stub on every run. We restore the committed curated barrel via
 # `git checkout` after the codegen step so the package's public API
 # survives regenerations.
-codegen-dagster:
+codegen-sdk:
     #!/usr/bin/env bash
     set -euo pipefail
     TMP=$(mktemp -d)
     trap 'rm -rf "$TMP"' EXIT
     cp schemas/*.schema.json "$TMP/"
-    cd integrations/dagster
-    rm -rf src/dagster_rocky/types_generated
+    cd sdk/python
+    rm -rf src/rocky_sdk/types_generated
     uv run datamodel-codegen \
         --input "$TMP" \
         --input-file-type jsonschema \
-        --output src/dagster_rocky/types_generated \
+        --output src/rocky_sdk/types_generated \
         --output-model-type pydantic_v2.BaseModel \
         --use-standard-collections \
         --use-union-operator \
@@ -118,7 +119,7 @@ codegen-dagster:
     # Restore the curated __init__.py barrel from git (datamodel-codegen
     # overwrote it with a stub).
     cd ../..
-    git checkout HEAD -- integrations/dagster/src/dagster_rocky/types_generated/__init__.py
+    git checkout HEAD -- sdk/python/src/rocky_sdk/types_generated/__init__.py
 
 # Regenerate TypeScript interfaces in editors/vscode from schemas/
 # (writes to editors/vscode/src/types/generated/)
