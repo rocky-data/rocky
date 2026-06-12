@@ -55,6 +55,10 @@ export default defineConfig({
           items: [{ autogenerate: { directory: "reference" } }],
         },
         {
+          label: "Python SDK",
+          items: [{ autogenerate: { directory: "python-sdk" } }],
+        },
+        {
           label: "Dagster Integration",
           items: [{ autogenerate: { directory: "dagster" } }],
         },

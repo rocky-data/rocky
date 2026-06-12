@@ -6,6 +6,7 @@
 </p>
 
 [![Engine CI](https://github.com/rocky-data/rocky/actions/workflows/engine-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/engine-ci.yml)
+[![SDK CI](https://github.com/rocky-data/rocky/actions/workflows/sdk-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/sdk-ci.yml)
 [![Dagster CI](https://github.com/rocky-data/rocky/actions/workflows/dagster-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/dagster-ci.yml)
 [![VS Code CI](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -166,7 +167,7 @@ The trust primitives (compiler, branches, replay, lineage, contracts, cost attri
 - **AI is a growing surface, not a finished product.** The compile-validate loop (generate, type-check, auto-fix, then land) is shipped. The broader story (mass refactor across the DAG, auto-migration from a column-type change, schema-aware assertion generation) is on the roadmap.
 - **Iceberg.** REST-catalog source discovery is Beta. Content-addressed writes round-trip as Iceberg through Delta UniForm, shipped end-to-end. First-class Iceberg-native writes without the Delta intermediate are on the 2026 roadmap.
 - **No built-in semantic layer.** Rocky's typed IR is the right home for one. Today, integrate with Cube, the dbt Semantic Layer, or your existing metric store.
-- **Orchestration: Dagster is first-class.** A `rocky serve` standalone path exists; native Airflow and Prefect integrations are not yet shipped, so they're called from the CLI like any other binary.
+- **Orchestration: Dagster is first-class.** For other Python callers, the [`rocky-sdk`](sdk/python/) typed client drives Rocky from notebooks, scripts, or any orchestrator. A `rocky serve` standalone path exists too; native Airflow and Prefect integrations are not yet shipped, so they're called from the CLI like any other binary.
 
 If those gaps are blockers for your team, [open a discussion](https://github.com/rocky-data/rocky/discussions). The roadmap is shaped by where production pipelines are actually getting hurt.
 
@@ -192,7 +193,8 @@ dbt Core defined this category, and `rocky import-dbt` converts a vanilla dbt pr
 | Path | Artifact | Language | Description |
 |---|---|---|---|
 | [`engine/`](engine/) | `rocky` CLI binary | Rust | Core SQL transformation engine, 23-crate Cargo workspace |
-| [`integrations/dagster/`](integrations/dagster/) | `dagster-rocky` PyPI wheel | Python | Dagster resource and component wrapping the Rocky CLI |
+| [`sdk/python/`](sdk/python/) | `rocky-sdk` PyPI wheel | Python | Typed Python client (`RockyClient`) wrapping the Rocky CLI |
+| [`integrations/dagster/`](integrations/dagster/) | `dagster-rocky` PyPI wheel | Python | Dagster resource and component, built on `rocky-sdk` |
 | [`editors/vscode/`](editors/vscode/) | Rocky VSIX | TypeScript | VS Code extension; LSP client + commands for AI features |
 | [`examples/playground/`](examples/playground/) | (config only) | TOML / SQL | Self-contained DuckDB sample pipeline used for smoke tests and benchmarks |
 
