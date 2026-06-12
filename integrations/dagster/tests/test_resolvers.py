@@ -17,14 +17,37 @@ the resource. These tests pin down the design contract:
 from __future__ import annotations
 
 import json
+import subprocess
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import dagster as dg
 import pytest
+from rocky_sdk import RockyClient
 
 from dagster_rocky import RockyResource
 from dagster_rocky.resource import ResolverContext
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _stub_version_check():
+    """Make the client's lazy version gate hermetic for every test.
+
+    The resource builds a ``RockyClient`` lazily; the client shells out to
+    ``rocky --version`` on first use. Patch that one-shot ``subprocess.run`` so
+    no real binary is needed. Tests that drive the version gate explicitly can
+    override this with their own inner patch (which wins while active).
+    """
+    with patch(
+        "rocky_sdk.client.subprocess.run",
+        return_value=subprocess.CompletedProcess(["rocky"], 0, "rocky 1.99.0\n", ""),
+    ):
+        yield
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -65,11 +88,13 @@ def _plan_json(plan_id: str = "a" * 64) -> str:
 def _capture_run_args() -> tuple[list[list[str]], Any]:
     """Captor for ``rocky.run()``'s single fused ``rocky run`` spawn.
 
-    Resolver tests assert against ``captured[0]`` (the run argv).
+    Resolver tests assert against ``captured[0]`` (the run argv). The fake
+    stands in for :meth:`RockyClient.run_cli`, since ``rocky.run`` now delegates
+    resource -> client -> ``run_cli``.
     """
     captured: list[list[str]] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(args)
         return _empty_run_json()
 
@@ -131,7 +156,7 @@ def test_shadow_suffix_resolver_fires_when_caller_omits_kwarg():
     rocky = RockyResource(shadow_suffix_fn=fn)
     captured, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme")
 
     assert len(calls) == 1
@@ -154,7 +179,7 @@ def test_shadow_suffix_resolver_skipped_when_caller_supplies_value():
     rocky = RockyResource(shadow_suffix_fn=fn)
     captured, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", shadow_suffix="_caller_set")
 
     assert calls == []  # resolver never fired
@@ -167,7 +192,7 @@ def test_shadow_suffix_resolver_none_return_is_noop():
     rocky = RockyResource(shadow_suffix_fn=lambda _rc: None)
     captured, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme")
 
     assert "--shadow-suffix" not in captured[0]
@@ -189,7 +214,7 @@ def test_governance_override_resolver_fires_when_caller_omits_kwarg():
     rocky = RockyResource(governance_override_fn=fn)
     captured, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme")
 
     assert len(calls) == 1
@@ -208,7 +233,7 @@ def test_governance_override_resolver_skipped_when_caller_supplies_value():
     rocky = RockyResource(governance_override_fn=fn)
     captured, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", governance_override={"workspace_ids": [1, 2]})
 
     assert calls == []
@@ -220,7 +245,7 @@ def test_governance_override_resolver_none_return_is_noop():
     rocky = RockyResource(governance_override_fn=lambda _rc: None)
     captured, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme")
 
     assert "--governance-override" not in captured[0]
@@ -241,7 +266,7 @@ def test_idempotency_key_resolver_fires_when_caller_omits_kwarg():
     rocky = RockyResource(idempotency_key_fn=fn)
     captured, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme")
 
     assert len(calls) == 1
@@ -259,7 +284,7 @@ def test_idempotency_key_resolver_skipped_when_caller_supplies_value():
     rocky = RockyResource(idempotency_key_fn=fn)
     captured, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", idempotency_key="caller-key")
 
     assert calls == []
@@ -271,7 +296,7 @@ def test_idempotency_key_resolver_none_return_is_noop():
     rocky = RockyResource(idempotency_key_fn=lambda _rc: None)
     captured, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme")
 
     assert "--idempotency-key" not in captured[0]
@@ -292,7 +317,7 @@ def test_run_passes_none_context_to_resolver():
     rocky = RockyResource(shadow_suffix_fn=fn)
     _, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme")
 
     assert captured_contexts == [None]
@@ -314,7 +339,7 @@ def test_run_streaming_passes_context_to_resolver():
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=run_proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=run_proc),
     ):
         rocky.run_streaming(context, filter="tenant=acme")
 
@@ -356,7 +381,7 @@ def test_resolver_exception_surfaces_as_dg_failure_with_qualname():
     rocky = RockyResource(shadow_suffix_fn=my_named_resolver)
 
     with (
-        patch.object(RockyResource, "_run_rocky", autospec=True),
+        patch.object(RockyClient, "run_cli", autospec=True),
         pytest.raises(dg.Failure) as excinfo,
     ):
         rocky.run(filter="tenant=acme")
@@ -379,7 +404,7 @@ def test_resolver_raising_dg_failure_is_preserved():
     rocky = RockyResource(governance_override_fn=fn)
 
     with (
-        patch.object(RockyResource, "_run_rocky", autospec=True),
+        patch.object(RockyClient, "run_cli", autospec=True),
         pytest.raises(dg.Failure) as excinfo,
     ):
         rocky.run(filter="tenant=acme")
@@ -415,7 +440,7 @@ def test_supplied_kwargs_includes_filter_and_caller_values():
     rocky = RockyResource(shadow_suffix_fn=fn)
     _, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(
             filter="tenant=acme",
             governance_override={"workspace_ids": [1]},
@@ -436,7 +461,7 @@ def test_each_resolver_wired_independently():
     rocky = RockyResource(idempotency_key_fn=lambda _rc: "only-idem")
     captured, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme")
 
     assert "--idempotency-key" in captured[0]
@@ -493,7 +518,7 @@ def test_shadow_suffix_resolver_wired_into_resource(monkeypatch):
     rocky = RockyResource(shadow_suffix_fn=shadow_suffix_resolver())
     captured, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme")
 
     idx = captured[0].index("--shadow-suffix")
@@ -521,7 +546,7 @@ def test_governance_override_empty_dict_from_caller_skips_resolver():
     rocky = RockyResource(governance_override_fn=fn)
     captured, fake_run = _capture_run_args()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", governance_override={})
 
     assert calls == []  # resolver skipped — caller supplied {}
@@ -551,7 +576,7 @@ def test_resolvers_survive_dagster_materialize_lifecycle():
 
     captured: list[list[str]] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(args)
         if args[0] == "plan":
             return _plan_json()
@@ -561,7 +586,7 @@ def test_resolvers_survive_dagster_materialize_lifecycle():
     def my_asset(rocky: RockyResource) -> None:
         rocky.run(filter="tenant=acme")
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         result = dg.materialize([my_asset], resources={"rocky": rocky})
 
     assert result.success

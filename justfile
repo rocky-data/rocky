@@ -6,10 +6,14 @@ default:
 # --- Build ---
 
 # Build all subprojects (release mode)
-build: build-engine build-dagster build-vscode
+build: build-engine build-sdk build-dagster build-vscode
 
 build-engine:
     cd engine && cargo build --release
+
+# rocky-sdk is built before dagster-rocky, which depends on it.
+build-sdk:
+    cd sdk/python && uv build --wheel
 
 build-dagster:
     cd integrations/dagster && uv build --wheel
@@ -20,10 +24,13 @@ build-vscode:
 # --- Test ---
 
 # Run all test suites
-test: test-engine test-dagster test-vscode
+test: test-engine test-sdk test-dagster test-vscode
 
 test-engine:
     cd engine && cargo test
+
+test-sdk:
+    cd sdk/python && uv run pytest
 
 test-dagster:
     cd integrations/dagster && uv run pytest
@@ -39,10 +46,13 @@ test-vscode-electron:
 
 # --- Lint ---
 
-lint: lint-engine lint-dagster lint-vscode
+lint: lint-engine lint-sdk lint-dagster lint-vscode
 
 lint-engine:
     cd engine && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+
+lint-sdk:
+    cd sdk/python && uv run ruff check && uv run ruff format --check
 
 lint-dagster:
     cd integrations/dagster && uv run ruff check && uv run ruff format --check
@@ -69,7 +79,7 @@ vendor-dagster:
 # or output shapes that show up in dagster fixtures — use `just codegen-all`
 # instead, which also runs `regen-fixtures`. Release CI fails
 # (codegen-drift.yml) if either side is stale.
-codegen: codegen-rust codegen-dagster codegen-vscode codegen-vscode-project-schema
+codegen: codegen-rust codegen-sdk codegen-vscode codegen-vscode-project-schema
 
 # Bundle `codegen` + `regen-fixtures` for release cuts and any change that
 # alters the shape of command output (e.g. new fields on MaterializationOutput,
@@ -87,25 +97,26 @@ codegen-all: codegen regen-fixtures
 codegen-rust:
     cd engine && cargo run --quiet --release --bin rocky -- export-schemas ../schemas
 
-# Regenerate Pydantic v2 models in integrations/dagster from schemas/
-# (writes to integrations/dagster/src/dagster_rocky/types_generated/)
+# Regenerate Pydantic v2 models in the rocky-sdk package from schemas/
+# (writes to sdk/python/src/rocky_sdk/types_generated/). dagster-rocky
+# re-exports these via its dagster_rocky.types shim.
 #
 # Self-healing: datamodel-code-generator overwrites __init__.py with an
 # empty stub on every run. We restore the committed curated barrel via
 # `git checkout` after the codegen step so the package's public API
 # survives regenerations.
-codegen-dagster:
+codegen-sdk:
     #!/usr/bin/env bash
     set -euo pipefail
     TMP=$(mktemp -d)
     trap 'rm -rf "$TMP"' EXIT
     cp schemas/*.schema.json "$TMP/"
-    cd integrations/dagster
-    rm -rf src/dagster_rocky/types_generated
+    cd sdk/python
+    rm -rf src/rocky_sdk/types_generated
     uv run datamodel-codegen \
         --input "$TMP" \
         --input-file-type jsonschema \
-        --output src/dagster_rocky/types_generated \
+        --output src/rocky_sdk/types_generated \
         --output-model-type pydantic_v2.BaseModel \
         --use-standard-collections \
         --use-union-operator \
@@ -118,7 +129,7 @@ codegen-dagster:
     # Restore the curated __init__.py barrel from git (datamodel-codegen
     # overwrote it with a stub).
     cd ../..
-    git checkout HEAD -- integrations/dagster/src/dagster_rocky/types_generated/__init__.py
+    git checkout HEAD -- sdk/python/src/rocky_sdk/types_generated/__init__.py
 
 # Regenerate TypeScript interfaces in editors/vscode from schemas/
 # (writes to editors/vscode/src/types/generated/)
@@ -126,7 +137,7 @@ codegen-dagster:
 # Self-healing:
 #   1. Auto-runs `npm install` if editors/vscode/node_modules is missing.
 #      Without this guard the recipe used to fail silently on fresh
-#      worktrees and release PR merges — codegen-rust + codegen-dagster
+#      worktrees and release PR merges — codegen-rust + codegen-sdk
 #      had already written their outputs by the time json2ts failed, so
 #      a partial codegen would leak into main and trigger
 #      codegen-drift.yml on the next PR. The install is ~15s on a warm
@@ -175,6 +186,11 @@ regen-fixtures *args:
 # Release the engine binary (all platforms built in CI; local fallback via scripts/release.sh)
 release-engine version:
     ./scripts/release.sh engine {{version}}
+
+# Release rocky-sdk wheel (pass --publish to also push to PyPI). Release the SDK
+# before any dagster-rocky release that raises its rocky-sdk floor.
+release-sdk version *args:
+    ./scripts/release.sh sdk {{version}} {{args}}
 
 # Release dagster-rocky wheel (pass --publish to also push to PyPI)
 release-dagster version *args:

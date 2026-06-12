@@ -98,7 +98,7 @@ The dagster integration's `allow_partial=True` path mirrors this tolerance in pr
 For a new CLI command whose output the dagster tests need to parse:
 
 1. **Rust schema exists** (from the `rocky-codegen` skill).
-2. **Pydantic binding exists** (from `just codegen-dagster`).
+2. **Pydantic binding exists** (from `just codegen-sdk`).
 3. **Add a `scenarios.py` entry** with a representative output dict, then expose it via a `*_json` pytest fixture in `conftest.py`.
 4. **Add a parsing test in `test_types.py`** that loads the fixture and asserts on key fields.
 5. **Optionally, add a `capture` call in `scripts/regen_fixtures.sh`** so the playground POC contributes a live-binary sample under `fixtures_generated/`. Run `just regen-fixtures` afterwards.

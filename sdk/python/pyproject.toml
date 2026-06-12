@@ -1,0 +1,59 @@
+[project]
+name = "rocky-sdk"
+version = "0.1.0"
+description = "Typed Python client for the Rocky SQL transformation engine"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "Hugo Correia", email = "hello@rocky-data.dev" }]
+keywords = ["rocky", "data-engineering", "sql", "transformation", "client", "sdk"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "pydantic>=2.0",
+]
+
+[project.urls]
+Homepage = "https://rocky-data.dev/"
+Repository = "https://github.com/rocky-data/rocky"
+Documentation = "https://rocky-data.dev/"
+"Bug Tracker" = "https://github.com/rocky-data/rocky/issues"
+
+[dependency-groups]
+dev = [
+    "datamodel-code-generator>=0.56.0",
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rocky_sdk"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# Generated code is produced by datamodel-code-generator from
+# ../../schemas/*.schema.json via `just codegen-sdk`. Hand-editing is
+# forbidden (it gets clobbered on next regen) and the generator's output
+# style doesn't align with our ruff ruleset — linting it produces noise
+# without fixable signal. Exclude from both lint and format.
+extend-exclude = ["src/rocky_sdk/types_generated"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

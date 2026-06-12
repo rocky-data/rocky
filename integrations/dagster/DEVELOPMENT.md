@@ -200,7 +200,7 @@ Tests use JSON fixtures in `tests/fixtures/` that represent real Rocky CLI outpu
 
 1. Add the typed `*Output` struct in `engine/crates/rocky-cli/src/output.rs` deriving `JsonSchema`.
 2. Register it in `engine/crates/rocky-cli/src/commands/export_schemas.rs::schemas()`.
-3. From the monorepo root, run `just codegen-dagster`. This regenerates `types_generated/<command>_schema.py`.
+3. From the monorepo root, run `just codegen-sdk`. This regenerates `types_generated/<command>_schema.py`.
 4. Re-export the new type from `types.py` (in the bridge section near the bottom).
 5. Add a route in `parse_rocky_output()` to dispatch the new command.
 6. Run `just regen-fixtures` to capture a fresh fixture into `tests/fixtures_generated/`.

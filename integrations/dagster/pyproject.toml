@@ -19,6 +19,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
 dependencies = [
+    # The typed result models + RockyClient now live in the standalone rocky-sdk
+    # package; RockyResource is a thin Dagster adapter over RockyClient. In-repo
+    # dev/CI resolves this from the local path (see [tool.uv.sources]); the
+    # published wheel floors on the released SDK.
+    "rocky-sdk>=0.1.0",
     # Floor matches the version CI actually resolves and tests (uv.lock). The
     # RockyComponent path uses dagster.components.* APIs from preview namespaces,
     # so we advertise a tested floor rather than an older, never-exercised one.
@@ -35,10 +40,15 @@ Documentation = "https://rocky-data.dev/"
 
 [dependency-groups]
 dev = [
-    "datamodel-code-generator>=0.56.0",
     "pytest>=8.0",
     "ruff>=0.4",
 ]
+
+# Resolve rocky-sdk from the monorepo path for dev + CI so the two packages
+# build and test together without a PyPI round-trip. The published dagster-rocky
+# wheel ignores this table and uses the `rocky-sdk>=…` version floor above.
+[tool.uv.sources]
+rocky-sdk = { path = "../../sdk/python", editable = true }
 
 # Register dagster_rocky as a `dg` registry module so `dg list components`,
 # `dg scaffold defs dagster_rocky.RockyComponent ...`, and other dg
@@ -56,12 +66,6 @@ packages = ["src/dagster_rocky"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-# Generated code is produced by datamodel-code-generator from
-# ../../schemas/*.schema.json via `just codegen-dagster`. Hand-editing is
-# forbidden (it gets clobbered on next regen) and the generator's output
-# style doesn't align with our ruff ruleset — trying to lint it produces
-# noise without any fixable signal. Exclude from both lint and format.
-extend-exclude = ["src/dagster_rocky/types_generated"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM"]

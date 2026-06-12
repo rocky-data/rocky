@@ -165,7 +165,7 @@ def test_generated_source_output_exposes_metadata():
     downstream code that uses the codegen-tracked type directly
     (instead of the hand-written ``SourceInfo``) sees the same surface.
     """
-    from dagster_rocky.types_generated.discover_schema import SourceOutput
+    from rocky_sdk.types_generated.discover_schema import SourceOutput
 
     src = SourceOutput.model_validate(
         {

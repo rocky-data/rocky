@@ -161,6 +161,51 @@ release_dagster() {
     [[ "$publish" == "--publish" ]] && info "Published to PyPI." || info "Skipped PyPI publish (pass --publish to enable)."
 }
 
+# --- SDK ---------------------------------------------------------------------
+
+release_sdk() {
+    local version="$1"
+    local publish="${2:-}"
+    local tag="sdk-v${version}"
+
+    require_cmd uv
+    require_cmd gh
+
+    confirm_tag "$tag"
+    mkdir -p "$DIST_DIR"
+
+    # 1. Build wheel + sdist
+    info "Building rocky-sdk wheel"
+    (cd "$WORKSPACE_ROOT/sdk/python" && uv build)
+
+    # Copy artifacts to dist/
+    cp "$WORKSPACE_ROOT/sdk/python/dist/"* "$DIST_DIR/"
+    info "Built: $(ls "$WORKSPACE_ROOT/sdk/python/dist/")"
+
+    # 2. Publish to PyPI (optional). Publish the SDK BEFORE any dagster-rocky
+    # release that raises its rocky-sdk floor — the published dagster wheel
+    # resolves the SDK from PyPI, not the monorepo path source.
+    if [[ "$publish" == "--publish" ]]; then
+        info "Publishing to PyPI"
+        (cd "$WORKSPACE_ROOT/sdk/python" && uv publish)
+    fi
+
+    # 3. Tag and push.
+    info "Creating and pushing tag $tag"
+    git -C "$WORKSPACE_ROOT" tag -a "$tag" -m "Release $tag" \
+        || die "git tag -a $tag failed — aborting before push"
+    git -C "$WORKSPACE_ROOT" push origin "$tag" \
+        || die "git push origin $tag failed"
+
+    # 4. Create GitHub Release
+    create_release "$tag" \
+        "$WORKSPACE_ROOT/sdk/python/dist/"*
+
+    echo
+    info "SDK release $tag created."
+    [[ "$publish" == "--publish" ]] && info "Published to PyPI." || info "Skipped PyPI publish (pass --publish to enable)."
+}
+
 # --- VS Code -----------------------------------------------------------------
 
 release_vscode() {
@@ -220,13 +265,18 @@ Usage: ./scripts/release.sh <component> <version> [--publish]
 
 Components:
   engine  <version>              Build macOS + Linux, create GH release (Windows via CI)
+  sdk     <version> [--publish]  Build wheel, create GH release, optionally publish to PyPI
   dagster <version> [--publish]  Build wheel, create GH release, optionally publish to PyPI
   vscode  <version> [--publish]  Build VSIX, create GH release, optionally publish to Marketplace
 
 Examples:
   ./scripts/release.sh engine  0.2.0
+  ./scripts/release.sh sdk     0.1.0 --publish
   ./scripts/release.sh dagster 0.4.0 --publish
   ./scripts/release.sh vscode  0.3.0 --publish
+
+Note: release the SDK before any dagster-rocky release that raises its
+rocky-sdk floor — the published dagster wheel resolves rocky-sdk from PyPI.
 EOF
     exit 1
 }
@@ -239,7 +289,8 @@ shift 2
 
 case "$component" in
     engine)  release_engine  "$version" ;;
+    sdk)     release_sdk     "$version" "${1:-}" ;;
     dagster) release_dagster "$version" "${1:-}" ;;
     vscode)  release_vscode  "$version" "${1:-}" ;;
-    *)       die "Unknown component: $component. Use engine, dagster, or vscode." ;;
+    *)       die "Unknown component: $component. Use engine, sdk, dagster, or vscode." ;;
 esac

@@ -21,16 +21,42 @@ from unittest.mock import MagicMock, patch
 
 import dagster as dg
 import pytest
+from rocky_sdk import RockyClient
+from rocky_sdk._subprocess import redact_argv as _redact_argv
+from rocky_sdk.client import (
+    DEFAULT_HTTP_TIMEOUT_SECONDS,
+    _parse_run_or_apply,
+)
+from rocky_sdk.exceptions import RockyOutputParseError, RockyServerError
 
 from dagster_rocky.resource import (
-    DEFAULT_HTTP_TIMEOUT_SECONDS,
     MIN_ROCKY_VERSION,
     RockyResource,
-    _parse_run_or_apply,
-    _redact_argv,
     _truncate_stderr_for_metadata,
     _validate_governance_override,
 )
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _stub_version_check():
+    """Make the client's lazy version gate hermetic for every test.
+
+    The resource builds a ``RockyClient`` lazily; the client shells out to
+    ``rocky --version`` on first use to enforce :data:`MIN_ROCKY_VERSION`. Patch
+    that one-shot ``subprocess.run`` so no real binary is needed. Tests that
+    drive the version gate explicitly override this with their own inner
+    ``patch("rocky_sdk.client.subprocess.run", ...)``, which wins while active.
+    """
+    with patch(
+        "rocky_sdk.client.subprocess.run",
+        return_value=subprocess.CompletedProcess(["rocky"], 0, "rocky 1.99.0\n", ""),
+    ):
+        yield
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,7 +73,7 @@ def _completed(stdout: str = "{}", stderr: str = "", returncode: int = 0):
 
 
 def _patched_run(**kwargs: Any):
-    return patch("dagster_rocky.resource.subprocess.run", **kwargs)
+    return patch("rocky_sdk.client.subprocess.run", **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -137,10 +163,8 @@ def test_binary_path_resolved_once_and_cached():
         args=["rocky", "--version"], returncode=0, stdout="rocky 99.0.0", stderr=""
     )
     with (
-        patch(
-            "dagster_rocky.resource.shutil.which", return_value="/resolved/bin/rocky"
-        ) as which_mock,
-        patch("dagster_rocky.resource.subprocess.run", return_value=fake_version),
+        patch("rocky_sdk.client.shutil.which", return_value="/resolved/bin/rocky") as which_mock,
+        patch("rocky_sdk.client.subprocess.run", return_value=fake_version),
     ):
         # Version check (one consumer) plus several _build_cmd spawns (the
         # per-invocation consumer that previously rescanned $PATH each time).
@@ -163,7 +187,7 @@ def test_binary_path_falls_back_to_configured_value_when_not_on_path():
     subprocess ``FileNotFoundError`` catch still raises the install-hint
     failure — preserving the prior ``which(...) or binary_path`` behavior."""
     rocky = RockyResource(binary_path="/nope/rocky")
-    with patch("dagster_rocky.resource.shutil.which", return_value=None):
+    with patch("rocky_sdk.client.shutil.which", return_value=None):
         assert rocky._resolve_binary() == "/nope/rocky"
         # Cached, so a second resolve does not rescan.
         assert rocky._resolve_binary() == "/nope/rocky"
@@ -212,7 +236,7 @@ def test_run_rocky_returns_stdout_on_success():
     proc = _popen_mock(stdout='{"hello": "world"}')
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
     ):
         out = rocky._run_rocky(["discover"])
     assert out == '{"hello": "world"}'
@@ -225,7 +249,7 @@ def test_run_rocky_partial_success_returns_stdout():
     proc = _popen_mock(stdout=payload, returncode=1)
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
     ):
         out = rocky._run_rocky(["run", "--filter", "x=y"], allow_partial=True)
     assert out == payload
@@ -237,7 +261,7 @@ def test_run_rocky_partial_success_disallowed_raises():
     proc = _popen_mock(stdout="{}", stderr_lines=["boom"], returncode=1)
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
         pytest.raises(dg.Failure, match="exit 1"),
     ):
         rocky._run_rocky(["discover"])
@@ -249,7 +273,7 @@ def test_run_rocky_partial_success_only_when_json():
     proc = _popen_mock(stdout="not json", stderr_lines=["boom"], returncode=2)
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
         pytest.raises(dg.Failure),
     ):
         rocky._run_rocky(["run", "--filter", "x=y"], allow_partial=True)
@@ -259,7 +283,7 @@ def test_run_rocky_missing_binary_raises_failure():
     rocky = RockyResource(binary_path="/nope/rocky")
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", side_effect=FileNotFoundError),
+        patch("rocky_sdk.client.subprocess.Popen", side_effect=FileNotFoundError),
         pytest.raises(dg.Failure, match="not found"),
     ):
         rocky._run_rocky(["discover"])
@@ -275,7 +299,7 @@ def test_run_rocky_failure_metadata_carries_stderr_tail():
     )
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
         pytest.raises(dg.Failure) as excinfo,
     ):
         rocky._run_rocky(["discover"])
@@ -312,7 +336,7 @@ def test_run_rocky_forwards_stderr_to_step_process_fd(capfd: pytest.CaptureFixtu
     )
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
         pytest.raises(dg.Failure),
     ):
         rocky._run_rocky(["discover"])
@@ -342,7 +366,7 @@ def test_run_rocky_streams_stderr_to_module_logger(caplog: pytest.LogCaptureFixt
     with (
         caplog.at_level(logging.INFO, logger="dagster_rocky.resource"),
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
     ):
         rocky._run_rocky(["discover"])
     streamed = [
@@ -365,7 +389,7 @@ def test_run_rocky_skips_empty_stderr_lines(caplog: pytest.LogCaptureFixture):
     with (
         caplog.at_level(logging.INFO, logger="dagster_rocky.resource"),
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
     ):
         rocky._run_rocky(["discover"])
     streamed = [rec.getMessage() for rec in caplog.records if rec.getMessage().startswith("rocky:")]
@@ -384,7 +408,7 @@ def test_run_rocky_redacts_argv_in_startup_log(caplog: pytest.LogCaptureFixture)
     with (
         caplog.at_level(logging.INFO, logger="dagster_rocky.resource"),
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
     ):
         rocky._run_rocky(["run", "--idempotency-key", "secret-token-123"])
     startup_lines = [
@@ -425,9 +449,9 @@ def test_run_rocky_timeout_kills_proc_and_raises():
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
-        patch("dagster_rocky.resource.os.killpg", killpg_mock),
-        patch("dagster_rocky.resource.os.getpgid", return_value=proc.pid),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk._subprocess.os.killpg", killpg_mock),
+        patch("rocky_sdk._subprocess.os.getpgid", return_value=proc.pid),
         pytest.raises(dg.Failure) as excinfo,
     ):
         rocky._run_rocky(["discover"])
@@ -449,7 +473,7 @@ def test_run_passes_governance_override_as_json():
     captured: list[list[str]] = []
     plan_id = "a" * 64
 
-    def fake_run(*, args, **_):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None, **_):
         captured.append(args)
         if args[0] == "plan":
             # Phase 5b: plan emits a real plan_id even for
@@ -475,12 +499,11 @@ def test_run_passes_governance_override_as_json():
             '"tables_drifted":0,"actions_taken":[]}}'
         )
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True) as run_mock:
-        run_mock.side_effect = lambda self, args, allow_partial=False: fake_run(args=args)
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", governance_override={"workspace_ids": [1, 2]})
 
-    # `rocky plan` is invoked first; the governance override flag must
-    # land on its argv (the persisted plan stamps the override).
+    # The fused ``rocky run`` is the single spawn; the governance override
+    # flag must land on its argv.
     assert "--governance-override" in captured[0]
     idx = captured[0].index("--governance-override")
     assert '"workspace_ids"' in captured[0][idx + 1]
@@ -495,11 +518,13 @@ def _capture_discover_args(rocky: RockyResource, discover_json: str, **kwargs: A
     """
     captured: list[list[str]] = []
 
-    def fake_run(self: RockyResource, args: list[str], allow_partial: bool = False) -> str:
+    def fake_run(
+        self: RockyResource, args: list[str], *, allow_partial: bool = False, log_callback=None
+    ) -> str:
         captured.append(args)
         return discover_json
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True) as run_mock:
+    with patch.object(RockyClient, "run_cli", autospec=True) as run_mock:
         run_mock.side_effect = fake_run
         rocky.discover(**kwargs)
     assert captured, "_run_rocky was not called"
@@ -616,7 +641,7 @@ def test_run_rejects_empty_workspace_ids_before_subprocess():
     """End-to-end: `rocky.run(...)` raises before `_run_rocky` is called."""
     rocky = RockyResource()
     with (
-        patch.object(RockyResource, "_run_rocky", autospec=True) as run_mock,
+        patch.object(RockyClient, "run_cli", autospec=True) as run_mock,
         pytest.raises(dg.Failure, match="revoke every workspace binding"),
     ):
         rocky.run(filter="tenant=acme", governance_override={"workspace_ids": []})
@@ -629,7 +654,7 @@ def test_run_with_run_models_appends_models_and_all():
     captured: list[list[str]] = []
     plan_id = "a" * 64
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(args)
         if args[0] == "plan":
             return json.dumps(
@@ -651,7 +676,7 @@ def test_run_with_run_models_appends_models_and_all():
             '"tables_drifted":0,"actions_taken":[]}}'
         )
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", run_models=True)
 
     # `--models <dir> --all` lands on the plan argv (the persisted plan
@@ -682,7 +707,7 @@ def _capture_run_args() -> tuple[list[list[str]], Any]:
     """
     captured: list[list[str]] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(args)
         return _empty_run_json()
 
@@ -692,7 +717,7 @@ def _capture_run_args() -> tuple[list[list[str]], Any]:
 def test_run_with_partition_appends_partition_flag():
     rocky = RockyResource()
     captured, fake_run = _capture_run_args()
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", partition="2026-04-08")
     assert "--partition" in captured[0]
     idx = captured[0].index("--partition")
@@ -702,7 +727,7 @@ def test_run_with_partition_appends_partition_flag():
 def test_run_with_partition_range_appends_from_and_to():
     rocky = RockyResource()
     captured, fake_run = _capture_run_args()
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(
             filter="tenant=acme",
             partition_from="2026-04-01",
@@ -720,7 +745,7 @@ def test_run_with_partition_from_only_omits_both():
     """Both --from and --to must be set; otherwise neither is emitted."""
     rocky = RockyResource()
     captured, fake_run = _capture_run_args()
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", partition_from="2026-04-01")
     assert "--from" not in captured[0]
     assert "--to" not in captured[0]
@@ -729,7 +754,7 @@ def test_run_with_partition_from_only_omits_both():
 def test_run_with_latest_appends_latest_flag():
     rocky = RockyResource()
     captured, fake_run = _capture_run_args()
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", latest=True)
     assert "--latest" in captured[0]
 
@@ -737,7 +762,7 @@ def test_run_with_latest_appends_latest_flag():
 def test_run_with_missing_appends_missing_flag():
     rocky = RockyResource()
     captured, fake_run = _capture_run_args()
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", missing=True)
     assert "--missing" in captured[0]
 
@@ -745,7 +770,7 @@ def test_run_with_missing_appends_missing_flag():
 def test_run_with_lookback_appends_lookback_flag():
     rocky = RockyResource()
     captured, fake_run = _capture_run_args()
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", lookback=3)
     assert "--lookback" in captured[0]
     idx = captured[0].index("--lookback")
@@ -755,7 +780,7 @@ def test_run_with_lookback_appends_lookback_flag():
 def test_run_with_parallel_appends_parallel_flag():
     rocky = RockyResource()
     captured, fake_run = _capture_run_args()
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", parallel=4)
     assert "--parallel" in captured[0]
     idx = captured[0].index("--parallel")
@@ -874,7 +899,7 @@ def test_run_streaming_forwards_stderr_to_context_log():
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=run_proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=run_proc),
     ):
         result = rocky.run_streaming(context, filter="tenant=acme")
 
@@ -899,7 +924,7 @@ def test_run_streaming_skips_empty_stderr_lines():
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=run_proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=run_proc),
     ):
         rocky.run_streaming(context, filter="tenant=acme")
 
@@ -940,7 +965,7 @@ def test_run_streaming_returns_parsed_run_result():
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=run_proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=run_proc),
     ):
         result = rocky.run_streaming(context, filter="tenant=acme")
 
@@ -962,7 +987,7 @@ def test_run_streaming_partial_success_returns_result_on_nonzero_exit():
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=run_proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=run_proc),
     ):
         result = rocky.run_streaming(context, filter="tenant=acme")
 
@@ -982,7 +1007,7 @@ def test_run_streaming_failure_raises_with_stderr_tail():
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
         pytest.raises(dg.Failure) as excinfo,
     ):
         rocky.run_streaming(context, filter="tenant=acme")
@@ -1055,9 +1080,9 @@ def test_run_streaming_timeout_kills_proc_and_raises():
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
-        patch("dagster_rocky.resource.os.killpg", killpg_mock),
-        patch("dagster_rocky.resource.os.getpgid", return_value=proc.pid),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk._subprocess.os.killpg", killpg_mock),
+        patch("rocky_sdk._subprocess.os.getpgid", return_value=proc.pid),
         pytest.raises(dg.Failure) as excinfo,
     ):
         rocky.run_streaming(context, filter="tenant=acme")
@@ -1177,7 +1202,7 @@ def test_run_streaming_timeout_fires_natively_without_daemon_reader(
     cause of the prior hangs.
     """
 
-    def _noop_forwarder(stderr, log_line, sink):
+    def _noop_forwarder(stderr, log_line, sink, **_):
         # Drain stderr quickly to avoid filling the pipe buffer (which
         # would block the subprocess after a few KB). We don't call
         # ``log_line`` — this is the "no daemon reader" simulation.
@@ -1193,7 +1218,7 @@ def test_run_streaming_timeout_fires_natively_without_daemon_reader(
             return
 
     monkeypatch.setattr(
-        "dagster_rocky.resource._forward_stderr_to_sink",
+        "rocky_sdk.client.forward_stderr_to_sink",
         _noop_forwarder,
     )
 
@@ -1272,7 +1297,7 @@ def test_run_streaming_threads_partition_flags():
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", side_effect=fake_popen),
+        patch("rocky_sdk.client.subprocess.Popen", side_effect=fake_popen),
     ):
         rocky.run_streaming(
             context,
@@ -1308,7 +1333,7 @@ def test_run_streaming_default_omits_partition_flags():
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", side_effect=fake_popen),
+        patch("rocky_sdk.client.subprocess.Popen", side_effect=fake_popen),
     ):
         rocky.run_streaming(context, filter="tenant=acme")
 
@@ -1453,7 +1478,7 @@ def test_run_default_omits_all_partition_flags():
     """Plain rocky.run() with no partition kwargs emits no partition flags."""
     rocky = RockyResource()
     captured, fake_run = _capture_run_args()
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme")
     args = captured[0]
     partition_flags = (
@@ -1478,7 +1503,7 @@ def test_run_with_shadow_suffix_appends_shadow_flags():
     """shadow_suffix enables shadow mode and passes the suffix to the CLI."""
     rocky = RockyResource()
     captured, fake_run = _capture_run_args()
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme", shadow_suffix="_dagster_pr_42")
     args = captured[0]
     assert "--shadow" in args
@@ -1490,7 +1515,7 @@ def test_run_without_shadow_suffix_omits_shadow_flags():
     """When shadow_suffix is None, no --shadow flags appear."""
     rocky = RockyResource()
     captured, fake_run = _capture_run_args()
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme")
     args = captured[0]
     assert "--shadow" not in args
@@ -1511,7 +1536,7 @@ def test_run_streaming_with_shadow_suffix():
 
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", side_effect=fake_popen),
+        patch("rocky_sdk.client.subprocess.Popen", side_effect=fake_popen),
     ):
         rocky.run_streaming(
             context,
@@ -1560,7 +1585,7 @@ def test_compile_uses_http_when_server_url_is_set():
         '{"version":"0.1.0","command":"compile","models":0,"execution_layers":0,'
         '"diagnostics":[],"has_errors":false}'
     )
-    with patch.object(RockyResource, "_http_get", return_value=payload) as http_mock:
+    with patch.object(RockyClient, "_http_get", return_value=payload) as http_mock:
         result = rocky.compile()
     http_mock.assert_called_once_with("/api/v1/compile")
     assert result.command == "compile"
@@ -1576,7 +1601,7 @@ def test_lineage_uses_http_when_server_url_is_set():
         '{"version":"0.1.0","command":"lineage","model":"orders","column":"total","trace":[]}'
     )
 
-    with patch.object(RockyResource, "_http_get") as http_mock:
+    with patch.object(RockyClient, "_http_get") as http_mock:
         http_mock.return_value = model_payload
         result = rocky.lineage("orders")
         assert result.model == "orders"
@@ -1591,7 +1616,7 @@ def test_lineage_uses_http_when_server_url_is_set():
 def test_metrics_uses_http_when_server_url_is_set():
     rocky = RockyResource(server_url="http://localhost:8080")
     payload = '{"version":"0.3.0","command":"metrics","model":"orders","snapshots":[],"count":0}'
-    with patch.object(RockyResource, "_http_get", return_value=payload) as http_mock:
+    with patch.object(RockyClient, "_http_get", return_value=payload) as http_mock:
         result = rocky.metrics("orders")
     http_mock.assert_called_once_with("/api/v1/models/orders/metrics")
     assert result.model == "orders"
@@ -1606,8 +1631,14 @@ def test_parse_run_or_apply_raises_on_success_false_envelope():
     """Engine emits ``success: false`` with a parseable ``result`` even
     when the apply did not actually succeed. Silently unwrapping the
     inner ``RunResult`` would surface a green materialization on top of
-    a failed apply, so ``_parse_run_or_apply`` must raise ``dg.Failure``
-    in that case.
+    a failed apply, so ``_parse_run_or_apply`` must raise in that case.
+
+    The parse helper moved into the SDK and now raises the typed
+    :class:`RockyOutputParseError` (the resource's ``_translating()``
+    boundary is what converts it to ``dg.Failure`` end-to-end). The
+    structured fields the resource later renders into ``dg.Failure``
+    metadata (plan_id / plan_kind / inner_result_preview) live as
+    attributes on the exception.
     """
     inner = json.loads(_run_json())
     envelope = json.dumps(
@@ -1621,17 +1652,17 @@ def test_parse_run_or_apply_raises_on_success_false_envelope():
         }
     )
 
-    with pytest.raises(dg.Failure) as excinfo:
+    with pytest.raises(RockyOutputParseError) as excinfo:
         _parse_run_or_apply(envelope, command="run")
 
-    desc = excinfo.value.description or ""
-    assert "success=false" in desc
-    metadata = excinfo.value.metadata or {}
-    assert metadata["plan_id"].text == "b" * 64
-    assert metadata["plan_kind"].text == "run"
+    exc = excinfo.value
+    assert exc.kind == "envelope"
+    assert "success=false" in exc.parse_error
+    assert exc.plan_id == "b" * 64
+    assert exc.plan_kind == "run"
     # The inner payload preview is surfaced so operators can triage the
     # underlying engine result without grepping the run viewer log.
-    assert "inner_result_preview" in metadata
+    assert exc.inner_result_preview is not None
 
 
 def test_parse_run_or_apply_unwraps_on_success_true_envelope():
@@ -1654,11 +1685,11 @@ def test_run_dispatches_single_rocky_run_spawn():
     rocky = RockyResource()
     captured: list[list[str]] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(list(args))
         return _run_json()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         result = rocky.run(filter="tenant=acme")
 
     # Exactly one spawn: rocky run with the user-supplied flags. No
@@ -1676,11 +1707,11 @@ def test_run_passes_partial_success_through_single_spawn():
     rocky = RockyResource()
     captured_allow_partial: list[bool] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured_allow_partial.append(allow_partial)
         return _run_json()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.run(filter="tenant=acme")
 
     assert captured_allow_partial == [True]
@@ -1908,11 +1939,11 @@ def test_cost_defaults_to_latest():
     rocky = RockyResource()
     captured: list[list[str]] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(args)
         return _cost_json()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         result = rocky.cost()
 
     assert captured[0] == ["cost", "latest"]
@@ -1928,11 +1959,11 @@ def test_cost_passes_explicit_run_id():
     rocky = RockyResource()
     captured: list[list[str]] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(args)
         return _cost_json(run_id="run-xyz789")
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         result = rocky.cost("run-xyz789")
 
     assert captured[0] == ["cost", "run-xyz789"]
@@ -1951,8 +1982,8 @@ def test_http_get_returns_decoded_body():
     response.__enter__.return_value = response
     response.__exit__.return_value = False
 
-    with patch("dagster_rocky.resource.urllib.request.urlopen", return_value=response) as mock:
-        body = rocky._http_get("/path")
+    with patch("rocky_sdk.client.urllib.request.urlopen", return_value=response) as mock:
+        body = rocky._get_client()._http_get("/path")
 
     assert body == "hello"
     mock.assert_called_once()
@@ -1960,21 +1991,34 @@ def test_http_get_returns_decoded_body():
 
 
 def test_http_get_raises_failure_on_url_error():
+    """A failed HTTP fallback surfaces as ``dg.Failure`` through the resource.
+
+    The HTTP fallback now lives on the SDK client (raising ``RockyServerError``);
+    the resource's ``_translating()`` boundary converts it to ``dg.Failure`` with
+    the same operator-facing description. Drive it through the public ``compile``
+    method (which uses the HTTP path when ``server_url`` is set) so the
+    translation is exercised end-to-end.
+    """
     rocky = RockyResource(server_url="http://localhost:8080")
     with (
         patch(
-            "dagster_rocky.resource.urllib.request.urlopen",
+            "rocky_sdk.client.urllib.request.urlopen",
             side_effect=urllib.error.URLError("nope"),
         ),
         pytest.raises(dg.Failure, match="Rocky server request failed"),
     ):
-        rocky._http_get("/path")
+        rocky.compile()
 
 
 def test_http_get_without_server_url_raises():
-    rocky = RockyResource()
-    with pytest.raises(dg.Failure, match="server_url is not configured"):
-        rocky._http_get("/path")
+    """The HTTP fallback guard moved into the client and is unreachable through
+    a public resource method (no ``server_url`` routes to the CLI path), so this
+    asserts the client-level ``RockyServerError`` directly. The "not set" reason
+    lives on ``exc.error``, not the exception message."""
+    client = RockyResource()._get_client()
+    with pytest.raises(RockyServerError) as exc:
+        client._http_get("/path")
+    assert "server_url is not set" in exc.value.error
 
 
 # ---------------------------------------------------------------------------
@@ -2126,14 +2170,14 @@ def test_verify_version_semver_comparison_logic():
         rocky._verify_engine_version()
 
     # Reset for next check
-    object.__setattr__(rocky, "_version_checked", False)
+    object.__setattr__(rocky._get_client(), "_version_checked", False)
 
     # Major version ahead — should pass
     with _patched_run(return_value=_version_completed("rocky 99.0.0")):
         rocky._verify_engine_version()
 
     # Reset for next check
-    object.__setattr__(rocky, "_version_checked", False)
+    object.__setattr__(rocky._get_client(), "_version_checked", False)
 
     # One patch above the floor (same major+minor) — should pass.
     min_major, min_minor, min_patch = (int(p) for p in MIN_ROCKY_VERSION.split("."))
@@ -2142,7 +2186,7 @@ def test_verify_version_semver_comparison_logic():
         rocky._verify_engine_version()
 
     # Reset for next check
-    object.__setattr__(rocky, "_version_checked", False)
+    object.__setattr__(rocky._get_client(), "_version_checked", False)
 
     # Below minimum — should fail. ``1.0.0`` is the pre-Cluster 3 B
     # release line that triggered this floor bump (no content-addressed
@@ -2166,7 +2210,7 @@ def test_verify_version_called_by_run_rocky():
 
     with (
         _patched_run(return_value=_version_completed(f"rocky {MIN_ROCKY_VERSION}")) as run_mock,
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc) as popen_mock,
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc) as popen_mock,
     ):
         rocky._run_rocky(["discover"])
 
@@ -2186,7 +2230,7 @@ def test_verify_version_called_by_run_rocky_streaming():
 
     with (
         _patched_run(return_value=_version_completed(f"rocky {MIN_ROCKY_VERSION}")),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
     ):
         rocky._run_rocky_streaming(["run", "--filter", "x=y"], context)
 
@@ -2216,11 +2260,11 @@ def test_doctor_without_check_kwarg_omits_check_flag():
     rocky = RockyResource()
     captured: list[list[str]] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(args)
         return _doctor_json()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.doctor()
 
     assert captured[0] == ["doctor"]
@@ -2232,11 +2276,11 @@ def test_doctor_with_check_kwarg_appends_check_flag():
     rocky = RockyResource()
     captured: list[list[str]] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(args)
         return _doctor_json()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.doctor(check="state_rw")
 
     assert captured[0] == ["doctor", "--check", "state_rw"]
@@ -2247,11 +2291,11 @@ def test_doctor_with_check_kwarg_forwards_arbitrary_id():
     rocky = RockyResource()
     captured: list[list[str]] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(args)
         return _doctor_json()
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.doctor(check="totally-made-up-id")
 
     assert captured[0] == ["doctor", "--check", "totally-made-up-id"]
@@ -2267,11 +2311,11 @@ def test_compliance_builds_argv_without_env(compliance_json: str):
     rocky = RockyResource()
     captured: list[list[str]] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(args)
         return compliance_json
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         result = rocky.compliance()
 
     assert captured[0] == ["compliance", "--output", "json"]
@@ -2283,11 +2327,11 @@ def test_compliance_forwards_env_flag(compliance_json: str):
     rocky = RockyResource()
     captured: list[list[str]] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(args)
         return compliance_json
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.compliance(env="prod")
 
     assert captured[0] == ["compliance", "--output", "json", "--env", "prod"]
@@ -2298,11 +2342,11 @@ def test_retention_status_builds_argv_without_env(retention_status_json: str):
     rocky = RockyResource()
     captured: list[list[str]] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(args)
         return retention_status_json
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         result = rocky.retention_status()
 
     assert captured[0] == ["retention-status", "--output", "json"]
@@ -2314,11 +2358,11 @@ def test_retention_status_forwards_env_flag(retention_status_json: str):
     rocky = RockyResource()
     captured: list[list[str]] = []
 
-    def fake_run(self, args, allow_partial=False):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None):
         captured.append(args)
         return retention_status_json
 
-    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run):
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.retention_status(env="prod")
 
     assert captured[0] == ["retention-status", "--output", "json", "--env", "prod"]
@@ -2460,7 +2504,7 @@ def test_run_rocky_failure_truncates_oversize_stderr_in_metadata():
     proc = _popen_mock(stdout="", stderr_lines=huge_stderr_lines, returncode=2)
     with (
         patch.object(RockyResource, "_verify_engine_version"),
-        patch("dagster_rocky.resource.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
         pytest.raises(dg.Failure) as excinfo,
     ):
         rocky._run_rocky(["discover"])

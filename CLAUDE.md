@@ -7,7 +7,8 @@ Single repository for the Rocky data platform — a typed-program layer above th
 | Path | Language | What it is |
 |---|---|---|
 | `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. 23-crate Cargo workspace. |
-| `integrations/dagster/` | Python | Dagster integration — wraps the `rocky` binary as a `ConfigurableResource`, parses JSON output into Pydantic models. |
+| `sdk/python/` | Python | `rocky-sdk` — standalone typed Python client (`RockyClient`) over the `rocky` CLI. Owns the generated Pydantic models. For notebooks, scripts, and orchestrators. |
+| `integrations/dagster/` | Python | Dagster integration — a thin `ConfigurableResource` adapter over `rocky-sdk`'s `RockyClient`; maps results to assets/checks. Depends on `rocky-sdk`. |
 | `editors/vscode/` | TypeScript | VS Code extension — LSP client (stdio to `rocky lsp`), syntax highlighting, commands for AI features. |
 | `examples/playground/` | Config only | Self-contained DuckDB sample pipeline. Used as a smoke test and a benchmark fixture. No credentials needed. |
 
@@ -17,11 +18,13 @@ Each subproject has its own `CLAUDE.md` with build commands, coding standards, a
 
 ```
 editors/vscode  ──(LSP stdio)──▶  engine (rocky lsp)
-integrations/dagster ──(subprocess)──▶  engine (rocky discover/plan/run/...)
+sdk/python (rocky-sdk) ──(subprocess)──▶  engine (rocky discover/plan/run/...)
+integrations/dagster ──(RockyClient)──▶  sdk/python ──▶  engine
 examples/playground ──(config)──▶  engine (rocky run --config rocky.toml)
 ```
 
-- `integrations/dagster` invokes the `rocky` CLI via subprocess and parses JSON output. The Python side does not depend on Rust source — only on the binary on `$PATH` (or vendored under `vendor/`).
+- `sdk/python` (`rocky-sdk`) invokes the `rocky` CLI via subprocess and parses JSON output into Pydantic models. The Python side does not depend on Rust source — only on the binary on `$PATH`.
+- `integrations/dagster` depends on `rocky-sdk`: `RockyResource` is a thin Dagster adapter that delegates to `RockyClient` and translates the SDK's `RockyError` hierarchy into `dagster.Failure`. In-repo dev/CI resolves the SDK via a `[tool.uv.sources]` path dependency; the published `dagster-rocky` wheel floors on `rocky-sdk>=…` from PyPI.
 - `editors/vscode` spawns `rocky lsp` as a language server over stdio. The TypeScript side does not depend on Rust source either.
 - `examples/playground` is read by `engine` at runtime; it has no code dependency on the engine source.
 
@@ -57,13 +60,13 @@ Every Rocky CLI command that emits `--output json` is backed by a typed Rust out
 1. Edit the relevant `*Output` struct in `engine/crates/rocky-cli/src/output.rs`.
 2. Run `just codegen` from the monorepo root. This:
    - exports JSON schemas via `cargo run --bin rocky -- export-schemas schemas/`,
-   - regenerates Pydantic v2 models in `integrations/dagster/src/dagster_rocky/types_generated/`,
+   - regenerates Pydantic v2 models in `sdk/python/src/rocky_sdk/types_generated/` (re-exported by `dagster_rocky.types` for backward compatibility),
    - regenerates TypeScript interfaces in `editors/vscode/src/types/generated/`.
 3. Commit the schema and the regenerated bindings together with the Rust change.
 
 The `codegen-drift` CI workflow (`.github/workflows/codegen-drift.yml`) fails any PR where the committed bindings drift from what `just codegen` produces locally.
 
-**Status:** The codegen migration is complete — all 63 CLI JSON schemas are backed by typed Rust structs deriving `JsonSchema`. The pipeline runs end-to-end via `just codegen`, enforced by `codegen-drift.yml` CI. The vscode `rockyJson.ts` is a type-alias shim over generated TypeScript. The dagster `types.py` re-exports generated Pydantic models — see [`integrations/dagster/CLAUDE.md`](integrations/dagster/CLAUDE.md). `just regen-fixtures` captures fresh dagster test fixtures from the live binary.
+**Status:** The codegen migration is complete — all 63 CLI JSON schemas are backed by typed Rust structs deriving `JsonSchema`. The pipeline runs end-to-end via `just codegen` (recipe `codegen-sdk`), enforced by `codegen-drift.yml` CI. The vscode `rockyJson.ts` is a type-alias shim over generated TypeScript. The generated Pydantic models live in `rocky-sdk` (`sdk/python/`); the dagster `types.py` re-exports them from `rocky_sdk.types` — see [`sdk/python/CLAUDE.md`](sdk/python/CLAUDE.md) and [`integrations/dagster/CLAUDE.md`](integrations/dagster/CLAUDE.md). `just regen-fixtures` captures fresh dagster test fixtures from the live binary.
 
 **When modifying Rocky DSL syntax (`.rocky` files):**
 1. `engine/crates/rocky-lang/` (parser + lexer)
@@ -89,8 +92,11 @@ Each subproject's tools (`cargo`, `uv`, `npm`) work directly from inside the sub
 Tag-namespaced — each artifact ships independently:
 
 - `engine-v0.1.0` → CLI binary on GitHub Releases
+- `sdk-v0.1.0` → `rocky-sdk` wheel on PyPI
 - `dagster-v0.1.0` → `dagster-rocky` wheel on PyPI
 - `vscode-v0.1.0` → Rocky VSIX on VS Code Marketplace
+
+Release **`rocky-sdk` before any `dagster-rocky` release that raises its `rocky-sdk>=…` floor** — the published `dagster-rocky` wheel resolves the SDK from PyPI, not the monorepo path source.
 
 **Release workflow:** Tagging `engine-v*` triggers `engine-release.yml`, which builds all 5 platform targets (macOS ARM64/Intel, Linux x86_64/ARM64, Windows x86_64) via a CI matrix and attaches them to the GitHub Release. `scripts/release.sh` remains as a local-build hotfix fallback. Convenience recipes: `just release-engine <version>`, `just release-dagster <version> [--publish]`, `just release-vscode <version> [--publish]`.
 
