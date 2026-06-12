@@ -116,4 +116,6 @@ def kill_process_group(proc: subprocess.Popen[str]) -> None:
         else:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (ProcessLookupError, OSError):
+        # Process already reaped, pgid lookup raced with exit, or the kernel
+        # refused — nothing useful to do from the watchdog. Swallow and move on.
         pass

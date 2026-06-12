@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar
+from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -78,9 +78,6 @@ from rocky_sdk.types import (
     TestResult,
     ValidateMigrationResult,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable  # noqa: F401
 
 # Default subprocess timeout for any single Rocky CLI invocation. One hour is
 # generous enough for full pipeline runs but still bounds runaway processes.
