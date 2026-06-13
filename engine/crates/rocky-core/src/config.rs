@@ -607,10 +607,13 @@ pub struct StateConfig {
     pub gcs_bucket: Option<String>,
     /// GCS key prefix (default: "rocky/state/")
     pub gcs_prefix: Option<String>,
-    /// Valkey/Redis URL for state persistence
-    // SECURITY: may embed credentials (`redis://:password@host`). Never log
-    // this value; redact it if it ever reaches an error/trace message.
-    pub valkey_url: Option<String>,
+    // Wrapped in `RedactedString`: serializes to "***" (e.g. in the plan
+    // config snapshot) and prints as `***` in Debug/logs, so the embedded
+    // credential never lands in the on-disk plan or a trace. Call `.expose()`
+    // at the point of use (state sync / idempotency) for the real URL.
+    /// Valkey/Redis URL for state persistence. May embed credentials, so the
+    /// value is redacted in serialized config and logs.
+    pub valkey_url: Option<RedactedString>,
     /// Valkey key prefix (default: "rocky:state:")
     pub valkey_prefix: Option<String>,
     /// Wall-clock budget (seconds) for each state transfer operation
@@ -7322,6 +7325,42 @@ pat = "pat_LEAKED_HERE"
         assert!(
             serialized.contains("client_123"),
             "client_id missing from snapshot"
+        );
+    }
+
+    /// Companion guard for the `config_snapshot` leak: a populated
+    /// `[state].valkey_url` (which may embed a redis password) must serialize
+    /// to `"***"` through the same `serde_json` path `rocky plan` snapshots
+    /// into the replication plan. Regression for the field being a plain
+    /// `String` outside the redaction model — that left the credential
+    /// cleartext in the on-disk plan file and in `Debug` output.
+    #[test]
+    fn rocky_config_serde_json_redacts_state_valkey_url() {
+        let cfg = parse(
+            r#"
+[adapter.default]
+type = "duckdb"
+path = ":memory:"
+
+[state]
+backend = "valkey"
+valkey_url = "rediss://default:VALKEY_PASSWORD_SECRET@valkey.example:6379"
+"#,
+        );
+
+        let serialized =
+            serde_json::to_string(&cfg).expect("RockyConfig must serialize via serde_json");
+        assert!(
+            !serialized.contains("VALKEY_PASSWORD_SECRET"),
+            "state.valkey_url password leaked into serde_json output: {serialized}"
+        );
+        assert!(serialized.contains("***"), "missing *** in {serialized}");
+
+        // Debug must also redact (StateConfig derives Debug).
+        let dbg = format!("{:?}", cfg.state);
+        assert!(
+            !dbg.contains("VALKEY_PASSWORD_SECRET"),
+            "state.valkey_url password leaked into Debug: {dbg}"
         );
     }
 

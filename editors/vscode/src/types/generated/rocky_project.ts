@@ -1875,9 +1875,9 @@ export interface StateConfig {
    */
   valkey_prefix?: string | null;
   /**
-   * Valkey/Redis URL for state persistence
+   * Valkey/Redis URL for state persistence. May embed credentials, so the value is redacted in serialized config and logs.
    */
-  valkey_url?: string | null;
+  valkey_url?: RedactedString | null;
 }
 /**
  * Config for `rocky run --idempotency-key` dedup.
