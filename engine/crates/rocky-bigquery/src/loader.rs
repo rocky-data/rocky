@@ -44,6 +44,7 @@ use rocky_core::arrow_loader::{
     CsvBatchReader, RowBatch, generate_batch_insert_sql, infer_column_types,
 };
 use rocky_core::traits::WarehouseAdapter;
+use rocky_sql::validation::{validate_gcp_project_id, validate_identifier};
 
 use crate::BigQueryAdapter;
 use crate::connector::{
@@ -86,14 +87,24 @@ fn resolve_format(source: &LoadSource, options: &LoadOptions) -> AdapterResult<F
 
 /// Render a BigQuery target as `` `project`.`dataset`.`table` `` for the
 /// SQL (INSERT-fallback) path. Mirrors how the connector formats refs.
-fn format_target(target: &TableRef) -> String {
+///
+/// Every segment is validated before interpolation — the dataset and table as
+/// SQL identifiers, the project (catalog) as a GCP project id — so a malicious
+/// target (e.g. a discovered filename stem containing a backtick) can never
+/// break out of the identifier. Backtick-wrapping alone does not escape an
+/// embedded backtick, so validation is the guard, matching the Databricks and
+/// Snowflake loaders.
+fn format_target(target: &TableRef) -> AdapterResult<String> {
+    validate_identifier(&target.schema).map_err(AdapterError::new)?;
+    validate_identifier(&target.table).map_err(AdapterError::new)?;
     if target.catalog.is_empty() {
-        format!("`{}`.`{}`", target.schema, target.table)
+        Ok(format!("`{}`.`{}`", target.schema, target.table))
     } else {
-        format!(
+        validate_gcp_project_id(&target.catalog).map_err(AdapterError::new)?;
+        Ok(format!(
             "`{}`.`{}`.`{}`",
             target.catalog, target.schema, target.table
-        )
+        ))
     }
 }
 
@@ -127,9 +138,9 @@ fn build_create_table_sql(
     target_ref: &str,
     column_names: &[String],
     batches: &[RowBatch],
-) -> Option<String> {
+) -> AdapterResult<Option<String>> {
     if column_names.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Inferred types keyed by column name; absent columns (e.g. a
@@ -139,18 +150,24 @@ fn build_create_table_sql(
         .map(|c| (c.name, c.data_type))
         .collect();
 
+    // Validate every header-derived column name before backtick-wrapping it.
+    // CSV headers are file content (the most plausibly untrusted input on this
+    // path), and a backtick in a header would otherwise break out of the
+    // identifier into arbitrary DDL — the Databricks and Snowflake CSV loaders
+    // validate here too.
     let col_defs: Vec<String> = column_names
         .iter()
         .map(|name| {
+            validate_identifier(name).map_err(AdapterError::new)?;
             let generic = inferred.get(name).map_or("STRING", String::as_str);
-            format!("`{name}` {}", bq_column_type(generic))
+            Ok(format!("`{name}` {}", bq_column_type(generic)))
         })
-        .collect();
+        .collect::<AdapterResult<Vec<String>>>()?;
 
-    Some(format!(
+    Ok(Some(format!(
         "CREATE TABLE IF NOT EXISTS {target_ref} ({})",
         col_defs.join(", ")
-    ))
+    )))
 }
 
 /// Map the SDK [`FileFormat`] to the BigQuery load-job source format.
@@ -269,7 +286,7 @@ impl LoaderAdapter for BigQueryLoaderAdapter {
                     )));
                 }
 
-                let target_ref = format_target(target);
+                let target_ref = format_target(target)?;
                 let file_size = std::fs::metadata(local_path)
                     .map(|m| m.len())
                     .unwrap_or_default();
@@ -307,7 +324,7 @@ impl LoaderAdapter for BigQueryLoaderAdapter {
                 // declared `id INT64`. Idempotent via IF NOT EXISTS — no
                 // DESCRIBE / existence round-trip.
                 if options.create_table
-                    && let Some(sql) = build_create_table_sql(&target_ref, &column_names, &batches)
+                    && let Some(sql) = build_create_table_sql(&target_ref, &column_names, &batches)?
                 {
                     debug!(sql = %sql, "ensuring target table exists with inferred types");
                     self.adapter
@@ -364,11 +381,11 @@ mod tests {
     #[test]
     fn test_format_target_fully_qualified() {
         let t = TableRef {
-            catalog: "proj".into(),
+            catalog: "my-proj".into(),
             schema: "ds".into(),
             table: "tbl".into(),
         };
-        assert_eq!(format_target(&t), "`proj`.`ds`.`tbl`");
+        assert_eq!(format_target(&t).unwrap(), "`my-proj`.`ds`.`tbl`");
     }
 
     #[test]
@@ -378,7 +395,29 @@ mod tests {
             schema: "ds".into(),
             table: "tbl".into(),
         };
-        assert_eq!(format_target(&t), "`ds`.`tbl`");
+        assert_eq!(format_target(&t).unwrap(), "`ds`.`tbl`");
+    }
+
+    #[test]
+    fn format_target_rejects_backtick_injection() {
+        // A discovered filename stem like `t`); DROP TABLE x; --` must not
+        // break out of the backtick-quoted identifier.
+        let t = TableRef {
+            catalog: String::new(),
+            schema: "ds".into(),
+            table: "t`); DROP TABLE x; --".into(),
+        };
+        assert!(format_target(&t).is_err());
+    }
+
+    #[test]
+    fn format_target_rejects_bad_project() {
+        let t = TableRef {
+            catalog: "proj`.`evil".into(),
+            schema: "ds".into(),
+            table: "tbl".into(),
+        };
+        assert!(format_target(&t).is_err());
     }
 
     #[test]
@@ -524,7 +563,9 @@ mod tests {
             row_count: 2,
         }];
         let cols = batches[0].column_names.clone();
-        let sql = build_create_table_sql("`p`.`d`.`t`", &cols, &batches).unwrap();
+        let sql = build_create_table_sql("`p`.`d`.`t`", &cols, &batches)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             sql,
             "CREATE TABLE IF NOT EXISTS `p`.`d`.`t` \
@@ -548,7 +589,9 @@ mod tests {
         // nothing, so every column falls back to STRING — but all columns
         // are still present (no regression from the old header-derived path).
         let cols = vec!["id".to_string(), "name".to_string()];
-        let sql = build_create_table_sql("`p`.`d`.`t`", &cols, &[]).unwrap();
+        let sql = build_create_table_sql("`p`.`d`.`t`", &cols, &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(
             sql,
             "CREATE TABLE IF NOT EXISTS `p`.`d`.`t` (`id` STRING, `name` STRING)"
@@ -557,7 +600,19 @@ mod tests {
 
     #[test]
     fn build_create_table_sql_no_columns_is_none() {
-        assert!(build_create_table_sql("`p`.`d`.`t`", &[], &[]).is_none());
+        assert!(
+            build_create_table_sql("`p`.`d`.`t`", &[], &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn build_create_table_sql_rejects_backtick_header() {
+        // A CSV header column containing a backtick would otherwise break out
+        // of the `col` identifier into arbitrary DDL.
+        let cols = vec!["id".to_string(), "x` STRING); DROP TABLE y; --".to_string()];
+        assert!(build_create_table_sql("`p`.`d`.`t`", &cols, &[]).is_err());
     }
 
     #[test]

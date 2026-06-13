@@ -23,6 +23,7 @@ use rocky_adapter_sdk::{
     AdapterError, AdapterResult, FileFormat, LoadOptions, LoadResult, LoadSource, LoaderAdapter,
     TableRef,
 };
+use rocky_sql::validation::validate_identifier;
 
 use crate::DuckDbConnector;
 
@@ -71,11 +72,18 @@ fn resolve_format(source: &LoadSource, options: &LoadOptions) -> AdapterResult<F
 
 /// Build a two-part DuckDB table reference (`schema.table`), falling back to
 /// just the table name when schema is empty.
-fn format_target(target: &TableRef) -> String {
+///
+/// Both identifiers are validated before interpolation. The target table is
+/// derived from `--table`, config, or a discovered filename stem, so a file
+/// named e.g. `evil; DROP TABLE x; --.csv` must not be able to drive arbitrary
+/// SQL. Matches the validation the Databricks and Snowflake loaders apply.
+fn format_target(target: &TableRef) -> AdapterResult<String> {
+    validate_identifier(&target.table).map_err(AdapterError::new)?;
     if target.schema.is_empty() {
-        target.table.clone()
+        Ok(target.table.clone())
     } else {
-        format!("{}.{}", target.schema, target.table)
+        validate_identifier(&target.schema).map_err(AdapterError::new)?;
+        Ok(format!("{}.{}", target.schema, target.table))
     }
 }
 
@@ -88,6 +96,36 @@ fn source_path_str(source: &LoadSource) -> String {
     }
 }
 
+/// Reject a `FROM '<path>'` literal that would break out of the surrounding
+/// `'...'` SQL string literal. Used for both local paths and cloud URIs.
+/// Rocky never escapes embedded quotes — instead we refuse to build the SQL,
+/// matching the Databricks and Snowflake loaders.
+fn validate_sql_path_literal(path: &str) -> AdapterResult<&str> {
+    if path.is_empty() {
+        return Err(AdapterError::msg("load source path cannot be empty"));
+    }
+    if path.contains(['\'', '\n', '\r', '\\']) {
+        return Err(AdapterError::msg(format!(
+            "invalid load source path {path:?}: must not contain quotes, backslashes, or newlines"
+        )));
+    }
+    Ok(path)
+}
+
+/// Reject CSV delimiters that would break out of the `'...'` SQL string
+/// literal. Allows printable ASCII plus tab; rejects quotes, backslash, and
+/// control characters. Matches the Databricks and Snowflake loaders.
+fn validate_csv_delimiter(c: char) -> AdapterResult<char> {
+    let ok = c == '\t' || (c.is_ascii() && !c.is_ascii_control() && c != '\'' && c != '\\');
+    if ok {
+        Ok(c)
+    } else {
+        Err(AdapterError::msg(format!(
+            "invalid CSV delimiter {c:?}: must be a printable ASCII char (or tab), not a quote, backslash, or control character"
+        )))
+    }
+}
+
 /// Build the COPY/read SQL for loading a source into a target table.
 ///
 /// The caller is responsible for handling `create_table` and `truncate_first`
@@ -97,8 +135,9 @@ fn load_sql(
     target_ref: &str,
     format: FileFormat,
     options: &LoadOptions,
-) -> String {
+) -> AdapterResult<String> {
     let path_str = source_path_str(source);
+    let path_str = validate_sql_path_literal(&path_str)?;
     match format {
         FileFormat::Csv => {
             let header = if options.csv_has_header {
@@ -106,34 +145,43 @@ fn load_sql(
             } else {
                 "HEADER false"
             };
-            let delim = options.csv_delimiter;
-            format!("COPY {target_ref} FROM '{path_str}' (DELIMITER '{delim}', {header})")
+            let delim = validate_csv_delimiter(options.csv_delimiter)?;
+            Ok(format!(
+                "COPY {target_ref} FROM '{path_str}' (DELIMITER '{delim}', {header})"
+            ))
         }
-        FileFormat::Parquet => {
-            format!("COPY {target_ref} FROM '{path_str}' (FORMAT PARQUET)")
-        }
+        FileFormat::Parquet => Ok(format!(
+            "COPY {target_ref} FROM '{path_str}' (FORMAT PARQUET)"
+        )),
         FileFormat::JsonLines => {
             // COPY ... FROM does not support JSONL; use read_json_auto which
             // handles newline-delimited JSON natively.
-            format!("INSERT INTO {target_ref} SELECT * FROM read_json_auto('{path_str}')")
+            Ok(format!(
+                "INSERT INTO {target_ref} SELECT * FROM read_json_auto('{path_str}')"
+            ))
         }
     }
 }
 
 /// Build a `CREATE TABLE ... AS SELECT` statement that infers the schema from
 /// the source itself, used when `create_table` is true.
-fn create_table_sql(source: &LoadSource, target_ref: &str, format: FileFormat) -> String {
+fn create_table_sql(
+    source: &LoadSource,
+    target_ref: &str,
+    format: FileFormat,
+) -> AdapterResult<String> {
     let path_str = source_path_str(source);
+    let path_str = validate_sql_path_literal(&path_str)?;
     match format {
-        FileFormat::Csv => {
-            format!("CREATE TABLE {target_ref} AS SELECT * FROM read_csv_auto('{path_str}')")
-        }
-        FileFormat::Parquet => {
-            format!("CREATE TABLE {target_ref} AS SELECT * FROM read_parquet('{path_str}')")
-        }
-        FileFormat::JsonLines => {
-            format!("CREATE TABLE {target_ref} AS SELECT * FROM read_json_auto('{path_str}')")
-        }
+        FileFormat::Csv => Ok(format!(
+            "CREATE TABLE {target_ref} AS SELECT * FROM read_csv_auto('{path_str}')"
+        )),
+        FileFormat::Parquet => Ok(format!(
+            "CREATE TABLE {target_ref} AS SELECT * FROM read_parquet('{path_str}')"
+        )),
+        FileFormat::JsonLines => Ok(format!(
+            "CREATE TABLE {target_ref} AS SELECT * FROM read_json_auto('{path_str}')"
+        )),
     }
 }
 
@@ -146,7 +194,7 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
         options: &LoadOptions,
     ) -> AdapterResult<LoadResult> {
         let format = resolve_format(source, options)?;
-        let target_ref = format_target(target);
+        let target_ref = format_target(target)?;
         // Only local files have filesystem metadata; cloud sources report 0.
         let file_size = match source {
             LoadSource::LocalFile(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or_default(),
@@ -178,7 +226,7 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
 
             if !table_exists && create_table {
                 // Let DuckDB infer the schema from the source.
-                let sql = create_table_sql(&source, &target_ref, format);
+                let sql = create_table_sql(&source, &target_ref, format)?;
                 debug!(sql = %sql, "creating table from source");
                 conn.execute_statement(&sql).map_err(AdapterError::new)?;
             } else {
@@ -189,7 +237,7 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
                     conn.execute_statement(&sql).map_err(AdapterError::new)?;
                 }
 
-                let sql = load_sql(&source, &target_ref, format, &options);
+                let sql = load_sql(&source, &target_ref, format, &options)?;
                 debug!(sql = %sql, "loading source into existing table");
                 conn.execute_statement(&sql).map_err(AdapterError::new)?;
             }
@@ -476,7 +524,7 @@ mod tests {
             schema: "main".into(),
             table: "tbl".into(),
         };
-        assert_eq!(format_target(&t), "main.tbl");
+        assert_eq!(format_target(&t).unwrap(), "main.tbl");
     }
 
     #[test]
@@ -486,13 +534,35 @@ mod tests {
             schema: String::new(),
             table: "tbl".into(),
         };
-        assert_eq!(format_target(&t), "tbl");
+        assert_eq!(format_target(&t).unwrap(), "tbl");
+    }
+
+    #[test]
+    fn format_target_rejects_injecting_table_name() {
+        // A discovered filename stem like `evil; DROP TABLE x; --` must error,
+        // not flow into the table reference.
+        let t = TableRef {
+            catalog: String::new(),
+            schema: "main".into(),
+            table: "evil; DROP TABLE x; --".into(),
+        };
+        assert!(format_target(&t).is_err());
+    }
+
+    #[test]
+    fn format_target_rejects_injecting_schema_name() {
+        let t = TableRef {
+            catalog: String::new(),
+            schema: "main; DROP SCHEMA s".into(),
+            table: "tbl".into(),
+        };
+        assert!(format_target(&t).is_err());
     }
 
     #[test]
     fn test_load_sql_csv() {
         let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.csv"));
-        let sql = load_sql(&src, "main.t", FileFormat::Csv, &LoadOptions::default());
+        let sql = load_sql(&src, "main.t", FileFormat::Csv, &LoadOptions::default()).unwrap();
         assert!(sql.contains("COPY main.t FROM '/tmp/data.csv'"));
         assert!(sql.contains("HEADER"));
         assert!(sql.contains("DELIMITER ','"));
@@ -501,7 +571,7 @@ mod tests {
     #[test]
     fn test_load_sql_parquet() {
         let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.parquet"));
-        let sql = load_sql(&src, "main.t", FileFormat::Parquet, &LoadOptions::default());
+        let sql = load_sql(&src, "main.t", FileFormat::Parquet, &LoadOptions::default()).unwrap();
         assert_eq!(sql, "COPY main.t FROM '/tmp/data.parquet' (FORMAT PARQUET)");
     }
 
@@ -513,7 +583,8 @@ mod tests {
             "main.t",
             FileFormat::JsonLines,
             &LoadOptions::default(),
-        );
+        )
+        .unwrap();
         assert!(sql.contains("read_json_auto"));
         assert!(sql.contains("INSERT INTO main.t"));
     }
@@ -521,7 +592,7 @@ mod tests {
     #[test]
     fn test_load_sql_cloud_uri() {
         let src = LoadSource::CloudUri("s3://bucket/data.parquet".into());
-        let sql = load_sql(&src, "main.t", FileFormat::Parquet, &LoadOptions::default());
+        let sql = load_sql(&src, "main.t", FileFormat::Parquet, &LoadOptions::default()).unwrap();
         assert_eq!(
             sql,
             "COPY main.t FROM 's3://bucket/data.parquet' (FORMAT PARQUET)"
@@ -529,24 +600,47 @@ mod tests {
     }
 
     #[test]
+    fn load_sql_rejects_quote_bearing_path() {
+        // A path containing a single quote would break out of the '...' literal.
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/a'); DROP TABLE x; --.csv"));
+        assert!(load_sql(&src, "main.t", FileFormat::Csv, &LoadOptions::default()).is_err());
+    }
+
+    #[test]
+    fn load_sql_rejects_quote_bearing_delimiter() {
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/data.csv"));
+        let opts = LoadOptions {
+            csv_delimiter: '\'',
+            ..Default::default()
+        };
+        assert!(load_sql(&src, "main.t", FileFormat::Csv, &opts).is_err());
+    }
+
+    #[test]
     fn test_create_table_sql_csv() {
         let src = LoadSource::LocalFile(PathBuf::from("/tmp/d.csv"));
-        let sql = create_table_sql(&src, "main.t", FileFormat::Csv);
+        let sql = create_table_sql(&src, "main.t", FileFormat::Csv).unwrap();
         assert!(sql.contains("CREATE TABLE main.t AS SELECT * FROM read_csv_auto"));
     }
 
     #[test]
     fn test_create_table_sql_parquet() {
         let src = LoadSource::LocalFile(PathBuf::from("/tmp/d.parquet"));
-        let sql = create_table_sql(&src, "main.t", FileFormat::Parquet);
+        let sql = create_table_sql(&src, "main.t", FileFormat::Parquet).unwrap();
         assert!(sql.contains("read_parquet"));
     }
 
     #[test]
     fn test_create_table_sql_jsonl() {
         let src = LoadSource::LocalFile(PathBuf::from("/tmp/d.jsonl"));
-        let sql = create_table_sql(&src, "main.t", FileFormat::JsonLines);
+        let sql = create_table_sql(&src, "main.t", FileFormat::JsonLines).unwrap();
         assert!(sql.contains("read_json_auto"));
+    }
+
+    #[test]
+    fn create_table_sql_rejects_quote_bearing_path() {
+        let src = LoadSource::LocalFile(PathBuf::from("/tmp/a'.csv"));
+        assert!(create_table_sql(&src, "main.t", FileFormat::Csv).is_err());
     }
 
     #[test]

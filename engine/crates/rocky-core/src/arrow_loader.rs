@@ -56,6 +56,9 @@ pub enum BatchLoaderError {
 
     #[error("batch is empty — cannot generate INSERT SQL")]
     EmptyBatch,
+
+    #[error("invalid column name in CSV header: {0}")]
+    InvalidColumnName(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +256,16 @@ pub fn generate_batch_insert_sql(
 ) -> Result<String, BatchLoaderError> {
     if batch.rows.is_empty() {
         return Err(BatchLoaderError::EmptyBatch);
+    }
+
+    // Column names come from the CSV header (file content). Validate each as a
+    // SQL identifier before interpolating it into the column list, so a header
+    // like `id) VALUES (1); DROP TABLE x; --` cannot inject. This is the shared
+    // INSERT generator for the local-file fallback paths (e.g. BigQuery), so
+    // guarding here covers every caller.
+    for name in &batch.column_names {
+        rocky_sql::validation::validate_identifier(name)
+            .map_err(|e| BatchLoaderError::InvalidColumnName(format!("{name:?}: {e}")))?;
     }
 
     let col_list = batch.column_names.join(", ");
@@ -700,6 +713,20 @@ mod tests {
         assert!(sql.starts_with("INSERT INTO cat.sch.tbl (id, name) VALUES"));
         assert!(sql.contains("(1, 'Alice')"));
         assert!(sql.contains("(2, 'Bob')"));
+    }
+
+    #[test]
+    fn insert_sql_rejects_injecting_column_name() {
+        // A CSV header column that tries to break out of the column list must
+        // be rejected rather than interpolated.
+        let batch = RowBatch {
+            column_names: vec!["id".into(), "x) VALUES (1); DROP TABLE y; --".into()],
+            rows: vec![vec!["1".into(), "2".into()]],
+            row_count: 1,
+        };
+
+        let err = generate_batch_insert_sql(&batch, "t", &TestDialect).unwrap_err();
+        assert!(matches!(err, BatchLoaderError::InvalidColumnName(_)));
     }
 
     #[test]

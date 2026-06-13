@@ -164,11 +164,11 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
     }
 
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
-        let table_ref = if table.catalog.is_empty() {
-            format!("{}.{}", table.schema, table.table)
-        } else {
-            format!("{}.{}.{}", table.catalog, table.schema, table.table)
-        };
+        // Route through the dialect's validated formatter so identifiers are
+        // checked before interpolation, rather than building the ref inline.
+        let table_ref =
+            self.dialect()
+                .format_table_ref(&table.catalog, &table.schema, &table.table)?;
 
         let conn = Arc::clone(&self.connector);
         spawn_blocking(move || {
