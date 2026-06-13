@@ -245,10 +245,21 @@ pub fn build_semantic_graph(
         }
     }
 
+    // Index models by name once. `build_semantic_graph` runs on every compile
+    // (and every LSP recompile); resolving each model with the linear
+    // `Project::model` scan inside this per-model loop made the phase O(M²) in
+    // the project's model count — the `cold_compile` bench exercises it at 10k
+    // models. Mirrors the lookup map in `typecheck.rs`.
+    let model_by_name: HashMap<&str, &rocky_core::models::Model> = project
+        .models
+        .iter()
+        .map(|m| (m.config.name.as_str(), m))
+        .collect();
+
     // Process models in topological order
     for model_name in &project.execution_order {
-        let model = match project.model(model_name) {
-            Some(m) => m,
+        let model = match model_by_name.get(model_name.as_str()) {
+            Some(m) => *m,
             None => continue,
         };
 

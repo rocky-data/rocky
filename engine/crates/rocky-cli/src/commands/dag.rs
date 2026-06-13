@@ -128,16 +128,25 @@ fn build_dag_output(
 
     let seed_map: HashMap<&str, &SeedFile> = seeds.iter().map(|s| (s.name.as_str(), s)).collect();
 
+    // Index incoming edges by target node once. The per-node
+    // `UnifiedDag::incoming_edges` call scanned every edge (O(nodes × edges));
+    // a single pass builds the same lookup in O(nodes + edges). Edge order
+    // within a node is preserved, so `depends_on` ordering is unchanged.
+    let mut incoming_by_node: HashMap<&unified_dag::NodeId, Vec<&unified_dag::UnifiedEdge>> =
+        HashMap::new();
+    for edge in &dag.edges {
+        incoming_by_node.entry(&edge.to).or_default().push(edge);
+    }
+
     // Project nodes.
     let nodes: Vec<DagNodeOutput> = dag
         .nodes
         .iter()
         .map(|node| {
-            let depends_on: Vec<String> = dag
-                .incoming_edges(&node.id)
-                .iter()
-                .map(|e| e.from.0.clone())
-                .collect();
+            let depends_on: Vec<String> = incoming_by_node
+                .get(&node.id)
+                .map(|edges| edges.iter().map(|e| e.from.0.clone()).collect())
+                .unwrap_or_default();
 
             let (target, strategy, freshness, partition_shape) = match node.kind {
                 NodeKind::Transformation => {
