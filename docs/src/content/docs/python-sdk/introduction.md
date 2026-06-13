@@ -7,7 +7,7 @@ sidebar:
 
 `rocky-sdk` is a typed Python client for the Rocky engine. `RockyClient` wraps the `rocky` binary (subprocess plus `--output json`) behind one method per CLI command, parses the output into Pydantic models, and raises typed errors. It is for human Python callers: notebooks, scripts, and orchestrators other than Dagster.
 
-It is also the foundation the [`dagster-rocky`](/dagster/introduction/) integration is built on. `RockyResource` is a thin Dagster adapter over `RockyClient` that translates its errors into `dagster.Failure`. For AI agents, use `rocky mcp`; to call Rocky from another language over HTTP, use `rocky serve`.
+It is also the foundation the [`dagster-rocky`](/dagster/introduction/) integration is built on: `RockyResource` is a thin Dagster adapter over `RockyClient`. Dagster is the one *turnkey* integration — every other orchestrator (Airflow, Prefect, Flyte, a cron script) integrates with Rocky by wrapping this client in a task. See [Recipes](/python-sdk/recipes/) for streaming, error handling, `rocky serve` mode, and Airflow/Prefect examples. For AI agents, use `rocky mcp`; to call Rocky from another language over HTTP, use `rocky serve`.
 
 ## Install
 
@@ -93,6 +93,8 @@ except RockyCommandError as exc:
 - **Diagnostics:** `doctor`, `validate_migration`, `test_adapter`, `hooks_list`, `hooks_test`
 
 `run()` accepts a `log_callback` that receives the engine's stderr line by line, so you can stream progress wherever you want. Setting `server_url` routes `compile`, `lineage`, and `metrics` through a running `rocky serve` instead of a subprocess.
+
+Each method's full signature, parameters, and return type are in the [`RockyResource` reference](/dagster/resource/) — `RockyClient` exposes the same methods and configuration, since the Dagster resource delegates to it. Output model shapes are in the [JSON output reference](/reference/json-output/), and the `filter=` syntax in [Filters](/reference/filters/).
 
 ## Requirements
 
