@@ -2662,9 +2662,13 @@ fn find_column_line_in_sql(sql: &str, column_name: &str) -> u32 {
         let target = column_name.to_lowercase();
         // Check for column as identifier (not inside a string)
         if lower.contains(&target) {
-            // Verify it's not inside quotes
+            // Verify it's not inside quotes. `pos` is a byte offset into
+            // `lower`, so slice `lower` (not `line`): `to_lowercase` can change
+            // byte length, making the offset land mid-char in `line` and panic.
+            // Single quotes are ASCII and unaffected by lowercasing, so the
+            // parity count is identical to counting in the original line.
             let pos = lower.find(&target).unwrap_or(0);
-            let before = &line[..pos];
+            let before = &lower[..pos];
             let single_quotes = before.chars().filter(|c| *c == '\'').count();
             if single_quotes % 2 == 0 {
                 return i as u32;
@@ -4057,10 +4061,14 @@ fn extract_rocky_pipeline_steps(text: &str) -> Vec<RockyPipelineStep> {
                 let detail = if detail.is_empty() {
                     None
                 } else {
-                    // Truncate long details
+                    // Truncate long details by characters, not bytes — a
+                    // multibyte char straddling byte 57 would panic on a
+                    // non-char-boundary slice. The buffer text is attacker/
+                    // user-controlled (any LSP client), so this must not crash
+                    // the server. Mirrors the char-based intent truncation above.
                     let d = detail.trim_end_matches('{').trim();
-                    if d.len() > 60 {
-                        Some(format!("{}...", &d[..57]))
+                    if d.chars().count() > 60 {
+                        Some(format!("{}...", d.chars().take(57).collect::<String>()))
                     } else {
                         Some(d.to_string())
                     }
@@ -5939,5 +5947,34 @@ mod tests {
         // Should detect the macro name without panicking.
         let m = RockyLsp::macro_at_position(text, 0, utf16_col);
         assert_eq!(m.as_deref(), Some("my_macro"));
+    }
+
+    /// `document_symbol` truncates long pipeline-step details. A multibyte char
+    /// straddling the truncation point must not panic on a non-char-boundary
+    /// byte slice — the buffer text is fully client-controlled.
+    #[test]
+    fn extract_pipeline_steps_truncates_multibyte_detail_without_panic() {
+        // 56 ASCII bytes, then a 3-byte char whose middle byte is offset 57,
+        // then more — old `&d[..57]` sliced mid-char and panicked.
+        let detail = format!("{}€yyyy", "x".repeat(56));
+        let text = format!("where {detail}");
+        let steps = extract_rocky_pipeline_steps(&text);
+        assert_eq!(steps.len(), 1);
+        let truncated = steps[0].detail.as_ref().unwrap();
+        assert!(truncated.ends_with("..."));
+        // Truncated by characters (57) + the "..." marker.
+        assert_eq!(truncated.chars().count(), 60);
+    }
+
+    /// `find_column_line_in_sql` derives a byte offset from a lowercased copy
+    /// of the line. Slicing the original line by that offset can land mid-char
+    /// when lowercasing changes byte length; this must not panic and must still
+    /// find the column's line.
+    #[test]
+    fn find_column_line_handles_multibyte_line_without_panic() {
+        // 'İ' (U+0130, 2 bytes) lowercases to 'i' + combining dot (3 bytes),
+        // so the lowercased copy is longer than the original line.
+        let sql = "SELECT\n  İstanbul_total\nFROM events";
+        assert_eq!(find_column_line_in_sql(sql, "total"), 1);
     }
 }
