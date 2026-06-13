@@ -167,7 +167,7 @@ The trust primitives (compiler, branches, replay, lineage, contracts, cost attri
 - **AI is a growing surface, not a finished product.** The compile-validate loop (generate, type-check, auto-fix, then land) is shipped. The broader story (mass refactor across the DAG, auto-migration from a column-type change, schema-aware assertion generation) is on the roadmap.
 - **Iceberg.** REST-catalog source discovery is Beta. Content-addressed writes round-trip as Iceberg through Delta UniForm, shipped end-to-end. First-class Iceberg-native writes without the Delta intermediate are on the 2026 roadmap.
 - **No built-in semantic layer.** Rocky's typed IR is the right home for one. Today, integrate with Cube, the dbt Semantic Layer, or your existing metric store.
-- **Orchestration: Dagster is first-class.** For other Python callers, the [`rocky-sdk`](sdk/python/) typed client drives Rocky from notebooks, scripts, or any orchestrator. A `rocky serve` standalone path exists too; native Airflow and Prefect integrations are not yet shipped, so they're called from the CLI like any other binary.
+- **Orchestration: Dagster is the one turnkey integration ([`dagster-rocky`](integrations/dagster/)).** Every other orchestrator — Airflow, Prefect, Flyte, a cron script — integrates by wrapping the typed [`rocky-sdk`](sdk/python/) client (`RockyClient`) in a task; a `rocky serve` HTTP path exists too. Prebuilt operators/hooks beyond Dagster aren't shipped yet, but the SDK is the building block for them.
 
 If those gaps are blockers for your team, [open a discussion](https://github.com/rocky-data/rocky/discussions). The roadmap is shaped by where production pipelines are actually getting hurt.
 
