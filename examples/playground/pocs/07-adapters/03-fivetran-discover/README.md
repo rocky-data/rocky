@@ -7,7 +7,7 @@
 
 ## What it shows
 
-`rocky discover` against the Fivetran source adapter — calls Fivetran's
+`rocky discover` against the Fivetran source adapter: calls Fivetran's
 REST API to list connectors and their enabled tables, with no warehouse
 write. The API key only needs read access.
 

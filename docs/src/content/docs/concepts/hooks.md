@@ -66,7 +66,7 @@ Events are organized into five phases:
 | `circuit_breaker_tripped` | Adapter circuit breaker moves `Closed → Open` after consecutive transient failures | Mute retries; notify oncall that a warehouse endpoint is unhealthy |
 | `circuit_breaker_recovered` | Half-open trial request succeeds and the breaker closes | Clear the alert; record recovery latency |
 
-Circuit-breaker behaviour is configured per-adapter via [`[adapter.NAME.retry]`](/reference/configuration/#adapternameretry) — `circuit_breaker_threshold` sets the failure count that trips it, and `circuit_breaker_recovery_timeout_secs` enables timed auto-recovery through the half-open state.
+Circuit-breaker behaviour is configured per-adapter via [`[adapter.NAME.retry]`](/reference/configuration/#adapternameretry): `circuit_breaker_threshold` sets the failure count that trips it, and `circuit_breaker_recovery_timeout_secs` enables timed auto-recovery through the half-open state.
 
 ## Shell hooks
 
@@ -106,9 +106,9 @@ Use `abort` for gating hooks (deploy freeze, approval gates). Use `warn` or `ign
 
 ### Security: trust the `command` source
 
-The `command` string is passed to `sh -c` verbatim. The event context is delivered to the script as JSON on **stdin** — it is not interpolated into the command line — so the runtime values Rocky exposes (`run_id`, `event`, etc.) cannot inject shell metacharacters into your command.
+The `command` string is passed to `sh -c` verbatim. The event context is delivered to the script as JSON on **stdin** (it is not interpolated into the command line), so the runtime values Rocky exposes (`run_id`, `event`, etc.) cannot inject shell metacharacters into your command.
 
-That said, **never build a hook `command` by string-formatting untrusted input** (a webhook payload, a Fivetran response, a value pulled from a row, anything you don't fully control). Use only static commands or commands templated from values you control yourself. If you need to react to dynamic input, hand it off through the JSON context to a script you wrote, and let that script decide what to do with quoting / validation.
+Still, **never build a hook `command` by string-formatting untrusted input** (a webhook payload, a Fivetran response, a value pulled from a row, anything you don't fully control). Use only static commands or commands templated from values you control yourself. If you need to react to dynamic input, hand it off through the JSON context to a script you wrote, and let that script decide what to do with quoting / validation.
 
 ## Webhooks
 

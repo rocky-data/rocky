@@ -15,8 +15,8 @@ prod", and the soundness property that ties an approval to your code:
 1. `rocky branch approve <name>` writes a content-addressed approval
    artifact under `./.rocky/approvals/<branch>/<id>.json`. The artifact
    binds the approver's git identity to the branch's current
-   `branch_state_hash` — a blake3 digest over the branch metadata, the
-   project config, **and the bytes of every file under `models/`**.
+   `branch_state_hash` (a blake3 digest over the branch metadata, the
+   project config, **and the bytes of every file under `models/`**).
 2. `rocky branch promote <name>` enumerates the replication pipeline's
    prod targets, validates the on-disk approvals against the
    `[branch.approval]` policy, then dispatches one
@@ -34,7 +34,7 @@ You can't sneak a SQL change past a green approval.
 - **Cryptographic gate, not a process gate.** The approval artifact is
   signed against a state hash; if the branch changes after approval, the
   hash drifts and `promote` rejects the now-stale signature.
-- **No external service.** Approvals are files on disk — easy to commit,
+- **No external service.** Approvals are files on disk, easy to commit,
   easy to mirror to another store, easy to inspect.
 - **Audit trail in the same JSON output as the operation itself.** No
   separate event log to wire up.
@@ -86,7 +86,7 @@ You can't sneak a SQL change past a green approval.
    appends an extra `AND amount > 0`).
 8. **Promote is rejected** — the edit drifted `branch_state_hash`, so the
    step-6 approval no longer matches: `state_hash_mismatch`, exit 1. This
-   is the soundness property — the approval was bound to the *exact* model
+   is the soundness property: the approval was bound to the *exact* model
    bytes that were reviewed.
 9. **Re-approve + promote** — a fresh approval matches the current hash, so
    the gate is satisfied. Rocky emits `PromoteStarted`, dispatches the

@@ -5,16 +5,16 @@ Trino warehouse adapter for [Rocky](https://rocky-data.dev/).
 Implements `rocky_core::traits::WarehouseAdapter` and
 `rocky_core::traits::SqlDialect` against Trino's
 [`POST /v1/statement`](https://trino.io/docs/current/develop/client-protocol.html)
-HTTP API. Hand-rolled over `reqwest` — no high-level Trino client crate
+HTTP API. Hand-rolled over `reqwest`, with no high-level Trino client crate
 dependency.
 
-## Status — beta
+## Status: beta
 
-Coverage is intentionally narrow but the supported surface is exercised
+Coverage is intentionally narrow, but the supported surface is exercised
 end-to-end by the Docker conformance harness behind the
 `trino-conformance` cargo feature (see [Conformance harness](#conformance-harness)
-below). Unsupported gaps — MERGE, OAuth/Kerberos, governance, loader,
-batch-checks — fail loudly at validate time rather than emitting broken
+below). Unsupported gaps (MERGE, OAuth/Kerberos, governance, loader,
+batch-checks) fail loudly at validate time rather than emitting broken
 SQL silently.
 
 ## Configuration (`rocky.toml`)
@@ -22,7 +22,7 @@ SQL silently.
 The Trino coordinator URL goes in `host`; auth is selected by which
 credential field is set. Internally the registry reuses the shared
 `AdapterConfig` slots (`host`, `username`, `password`, `token`,
-`database`, `timeout_secs`) — there is no Trino-specific TOML schema.
+`database`, `timeout_secs`); there is no Trino-specific TOML schema.
 
 ```toml
 # Basic auth — the 90% case for self-hosted Trino with the
@@ -52,14 +52,14 @@ Notes the registry enforces (see `engine/crates/rocky-cli/src/registry.rs`):
 - `host` is required (the error message names it the *coordinator URL*).
 - For Basic auth, both `username` and `password` are required.
 - For JWT auth, `token` selects JWT mode and `username` is still required
-  to populate the `X-Trino-User` header — Trino requires that header on
+  to populate the `X-Trino-User` header: Trino requires that header on
   every request, and the JWT path doesn't infer it from the token's
   `sub` claim.
 - `database` maps to Trino's *catalog*, surfaced via the `X-Trino-Catalog`
   request header. A pipeline-level default schema is not currently
   threaded through the registry, so model SQL should reference fully
   qualified `<catalog>.<schema>.<table>` names.
-- `auto_create_catalogs = true` is incompatible with this adapter — OSS
+- `auto_create_catalogs = true` is incompatible with this adapter: OSS
   Trino has no `CREATE CATALOG` SQL (catalogs are server-side connector
   instances), and `TrinoDialect::create_catalog_sql` returns `None`. The
   validate-time capability check trips before any SQL runs.
@@ -128,7 +128,7 @@ segment batches with `arrow::compute::concat_batches`, and best-effort
 acks each segment via its `ackUri` so the coordinator can release it.
 
 **Version gate.** Apache Arrow IPC is a **proposed** spooled-protocol
-encoding — see upstream PR
+encoding; see upstream PR
 [`trinodb/trino#26365`](https://github.com/trinodb/trino/pull/26365)
 (closed stale Nov 2025, revival discussion ongoing). The shipping Trino
 release (481 as of May 2026) advertises only `json`, `json+lz4`, and
@@ -167,7 +167,7 @@ output and surfaces `(name, data_type, nullable=true)` per column. The
 `data_type` column is propagated verbatim (e.g. `bigint`, `varchar(64)`,
 `timestamp(6)`, `decimal(18,2)`) so downstream drift detection compares
 on Trino's native type signatures. v0 reports `nullable = true`
-unconditionally — strict nullability lives on `information_schema.columns`,
+unconditionally: strict nullability lives on `information_schema.columns`,
 not in `DESCRIBE`. Wiring `information_schema` is a follow-up; until
 then the drift planner errs on the side of widening rather than
 DropAndRecreate.
@@ -196,7 +196,7 @@ DropAndRecreate.
 - **True `INSERT OVERWRITE`.** Iceberg-backed catalogs support it
   natively; v0 falls back to `DELETE` + `INSERT`.
 - **`information_schema`-backed nullability** in `describe_table`.
-- **Arrow record batches** from the connector — `fetch_arrow_batch` is
+- **Arrow record batches** from the connector: `fetch_arrow_batch` is
   implemented via the spooled-protocol Arrow path (see [Wire protocol](#wire-protocol)
   above), but the path is version-gated on upstream Trino merging
   Arrow IPC as a supported spooling encoding (PR
@@ -211,7 +211,7 @@ Unit tests live alongside the source. They use
 coordinator mock and assert against:
 
 - the `Authorization: Basic ...` header *structure* (decoded round-trip
-  rather than a base64 literal — committing the encoded form trips
+  rather than a base64 literal, since committing the encoded form trips
   GitHub's secret scanner regardless of whether the value is real;
   see `auth.rs::tests::basic_auth_encodes_user_password`);
 - `X-Trino-User`, `X-Trino-Catalog`, `X-Trino-Schema` header propagation;
@@ -223,7 +223,7 @@ coordinator mock and assert against:
 - `Debug` redaction for both `Basic` (password) and `Jwt` (token);
 - the `DESCRIBE` response parsing path through `WarehouseAdapter::describe_table`.
 
-Basic-auth fixtures are centralised in `src/test_helpers.rs` —
+Basic-auth fixtures are centralised in `src/test_helpers.rs`:
 `test_basic_auth()` and `test_basic_auth_inputs()` read through
 `std::env::var(...).unwrap_or_else(...)` so CodeQL's
 `rust/hard-coded-cryptographic-value` rule doesn't fire on every test
@@ -236,7 +236,7 @@ cargo test -p rocky-trino
 ```
 
 No live Trino is required for the unit suite. The Docker-backed
-harness lives behind the `trino-conformance` Cargo feature — see
+harness lives behind the `trino-conformance` Cargo feature; see
 [Conformance harness](#conformance-harness) below.
 
 ## Conformance harness
@@ -247,7 +247,7 @@ adapter against a real Trino coordinator. It's off by default so the
 default `cargo test -p rocky-trino` invocation stays credential- and
 network-free. The two network-dependent tests are also marked
 `#[ignore]` so they stay skipped under `cargo test --all-features` (as
-CI runs) — execution requires both the feature flag and `-- --ignored`.
+CI runs); execution requires both the feature flag and `-- --ignored`.
 
 What it covers:
 
@@ -264,8 +264,8 @@ What it covers:
 The harness reads the coordinator URL from `${TRINO_HOST:-localhost}`
 and `${TRINO_PORT:-8080}` and authenticates via the JWT-bearer path
 with a dummy token. (The upstream `trinodb/trino:latest` image rejects
-non-empty Basic-auth passwords over plain HTTP — *"Password not
-allowed for insecure authentication"* — but doesn't validate JWT
+non-empty Basic-auth passwords over plain HTTP, *"Password not
+allowed for insecure authentication"*, but doesn't validate JWT
 bearers against a JWKS in the default config, so any non-empty token
 threads through. `X-Trino-User` is supplied explicitly via
 `TrinoClientConfig::with_user` because JWT auth doesn't infer one,
@@ -314,4 +314,4 @@ the connector output.
 
 ## License
 
-Apache 2.0 — same as the rest of the Rocky engine workspace.
+Apache 2.0, same as the rest of the Rocky engine workspace.

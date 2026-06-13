@@ -7,7 +7,7 @@
 
 ## What it shows
 
-Stores Rocky's `.rocky-state.redb` in S3 — except instead of real AWS,
+Stores Rocky's `.rocky-state.redb` in S3, except instead of real AWS
 this POC runs MinIO via docker-compose so you can verify the upload/download
 flow without an account.
 

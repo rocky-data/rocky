@@ -9,7 +9,7 @@
 ## What it shows
 
 The semantic breaking-change classifier introduced in `rocky-core`
-diffs two compiled `ProjectIr` snapshots — base ref vs HEAD — and
+diffs two compiled `ProjectIr` snapshots (base ref vs HEAD) and
 classifies each structural delta into `Info` / `Warning` / `Breaking`
 severities. Two CLI surfaces consume the classifier:
 
@@ -34,7 +34,7 @@ gate is a clean no-op.
 ## Why it's distinctive
 
 - **Typed-IR semantics, not text diff.** A column rename + retype is
-  more than two text edits — the classifier treats it as a structural
+  more than two text edits; the classifier treats it as a structural
   delta and tags it `Breaking` regardless of how the SQL was edited.
 - **Fail-open on stale base refs.** If the base ref doesn't compile
   under today's Rocky (a parser change happened in between), the gate
@@ -102,7 +102,7 @@ it's safe to re-run.
 2. **Replication on main.** Seed `raw__orders.orders` and run
    `rocky run --filter source=orders` so the prod target
    `poc.prod__orders.orders` exists. (The breaking-change gate doesn't
-   need this — `branch promote` does.)
+   need this; `branch promote` does.)
 3. **`branch create fix_orders` + `run --branch fix_orders`.** Creates
    the shadow target `poc.prod__orders_rocky_shadow__fix_orders.orders`
    that `promote` will copy from.
@@ -136,9 +136,9 @@ The promote output's `audit[]` array carries one or more of:
 
 - Engine source: `engine/crates/rocky-cli/src/commands/branch.rs`,
   `engine/crates/rocky-core/src/breaking_change.rs`
-- Sibling POC: [`00-foundations/08-branch-approve-promote`](../../00-foundations/08-branch-approve-promote/)
-  — the approval-gate side of `branch promote`; this POC is the
+- Sibling POC: [`00-foundations/08-branch-approve-promote`](../../00-foundations/08-branch-approve-promote/),
+  the approval-gate side of `branch promote`; this POC is the
   semantic-gate counterpart.
-- Sibling POC: [`10-pr-preview-and-data-diff`](../10-pr-preview-and-data-diff/)
-  — preview-branch data diff; complementary to the structural diff this
+- Sibling POC: [`10-pr-preview-and-data-diff`](../10-pr-preview-and-data-diff/),
+  preview-branch data diff; complementary to the structural diff this
   POC exercises.

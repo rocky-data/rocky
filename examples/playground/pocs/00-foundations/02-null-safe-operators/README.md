@@ -8,7 +8,7 @@
 ## What it shows
 
 Demonstrates that Rocky's `!=` operator compiles to `IS DISTINCT FROM`, which
-treats NULL as a regular value. SQL's standard `!=` does not — it returns
+treats NULL as a regular value. SQL's standard `!=` does not: it returns
 `UNKNOWN` for NULL comparisons, so rows with NULL on either side are dropped
 by `WHERE col != value`.
 

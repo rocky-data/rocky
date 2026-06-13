@@ -9,8 +9,8 @@ matches the vendored snapshot).
 
 ## Why it's distinctive
 
-Most data stacks discover a producer's breaking change at runtime — a query
-errors in production, or a downstream table silently goes null. Rocky lets a
+Most data stacks discover a producer's breaking change at runtime, when a query
+errors in production or a downstream table silently goes null. Rocky lets a
 producer team publish a typed snapshot of their compiled project, and a
 consumer team vendor it and compile against it. The producer dropping a column
 the consumer still selects becomes a **compile error in the consumer's repo**,
@@ -89,6 +89,6 @@ This POC's consumer is the clean single-source, explicit-column case, so E030
 is **filtered**: only columns the consumer's SQL actually references are
 flagged. When a consumer model uses `SELECT *` (columns can't be enumerated) or
 joins multiple sources (an unqualified column can't be attributed to one
-producer), the check falls back to **unfiltered** — every dropped producer
+producer), the check falls back to **unfiltered**: every dropped producer
 column is flagged against that model. That over-reports rather than letting a
 breaking change slip through silently.

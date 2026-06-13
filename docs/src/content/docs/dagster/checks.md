@@ -18,7 +18,7 @@ Each materialization includes metadata:
 - `rows_copied` -- number of rows copied
 - `watermark` -- the new high watermark value
 
-An optional `translator` can be passed to control asset key mapping, ensuring consistency with how assets were discovered via `load_rocky_assets()`.
+Pass an optional `translator` to control asset key mapping so it matches how assets were discovered via `load_rocky_assets()`.
 
 ## `emit_check_results(result) -> list[AssetCheckResult]`
 

@@ -12,8 +12,8 @@ that real:
 
 1. **Schema grounding.** Before the LLM sees the prompt, Rocky
    compiles the models directory and packs the result into a
-   `ValidationContext` — project models, source column schemas, and
-   column-level info. The LLM sees typed columns, not a blank page,
+   `ValidationContext` (project models, source column schemas, and
+   column-level info). The LLM sees typed columns, not a blank page,
    so it can't invent `order_total` when the real column is `amount`.
 2. **Compile-verify retry.** Each LLM response is fed through the
    Rocky compiler; on failure the compiler errors are appended to the
@@ -27,7 +27,7 @@ that real:
   `ValidationContext` makes that impossible; the compile gate catches
   whatever slips through.
 - **The compiler is the spec.** There's no separate "verify that the
-  AI output is valid" pass — if `rocky compile` passes, the model is
+  AI output is valid" pass: if `rocky compile` passes, the model is
   valid. The gate and the dev-loop use the same tool.
 
 ## Layout
@@ -62,7 +62,7 @@ export ANTHROPIC_API_KEY=sk-...
 2. `rocky ai` calls the Anthropic API with a prompt that embeds the
    typed schema. The response is a candidate `.rocky` model.
 3. The candidate is compiled. On failure, the compiler errors are
-   added to the next prompt and the LLM is re-asked — up to 3 times.
+   added to the next prompt and the LLM is re-asked, up to 3 times.
 4. The final clean output is written to `expected/generation.log`.
 
 ## Related

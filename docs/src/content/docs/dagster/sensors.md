@@ -10,8 +10,8 @@ Dagster [`SensorDefinition`](https://docs.dagster.io/api/dagster/sensors#dagster
 that polls `rocky discover` and emits a `RunRequest` for any source whose
 upstream connector has produced new data since the previous tick.
 
-This unblocks pipelines that should kick off as soon as Fivetran finishes a
-sync, instead of waiting for the next scheduled run.
+This lets pipelines kick off as soon as Fivetran finishes a sync, instead of
+waiting for the next scheduled run.
 
 ## Quickstart
 

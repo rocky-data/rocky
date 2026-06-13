@@ -7,7 +7,7 @@
 
 ## What it shows
 
-Rocky's snapshot pipeline type — a dedicated SCD Type 2 slowly-changing dimension tracker. Unlike replication (bulk copy) or transformation (model execution), the snapshot pipeline:
+Rocky's snapshot pipeline type is a dedicated SCD Type 2 slowly-changing dimension tracker. Unlike replication (bulk copy) or transformation (model execution), the snapshot pipeline:
 
 1. Compares source rows against the latest snapshot using `unique_key` + `updated_at`
 2. Inserts new versions with `valid_from` / `valid_to` columns
@@ -16,7 +16,7 @@ Rocky's snapshot pipeline type — a dedicated SCD Type 2 slowly-changing dimens
 
 ## Why it's distinctive
 
-- **First-class pipeline type** — not a strategy on a model, but a dedicated `type = "snapshot"` pipeline
+- **Dedicated pipeline type** — not a strategy on a model, but a `type = "snapshot"` pipeline
 - **Single-table focus** — explicit source/target table refs (not pattern-based discovery)
 - **Hard delete tracking** — `invalidate_hard_deletes = true` closes records when rows disappear from source
 - **dbt comparison:** dbt snapshots require Jinja macros and source freshness; Rocky uses declarative TOML

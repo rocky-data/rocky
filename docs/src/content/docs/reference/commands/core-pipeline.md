@@ -1,6 +1,6 @@
 ---
 title: Core Pipeline Commands
-description: Commands for the main Rocky pipeline lifecycle — init, validate, discover, plan, run, state
+description: "Commands for the main Rocky pipeline lifecycle: init, validate, discover, plan, run, state"
 sidebar:
   order: 1
 ---
@@ -247,7 +247,7 @@ rocky plan --filter <key=value> [flags]
 | `--semantic` | `bool` | `false` | Also run the breaking-change classifier against `--base` and attach the change-impact verdict under `breaking_verdict`. Decision-support only — never gates the plan and never changes the exit code. |
 | `--base <ref>` | `string` | `main` | Git ref the working tree is diffed against for `--semantic`. Ignored without `--semantic`. |
 
-> The `--semantic` verdict diffs **output schema** only and is **blind to schema-stable value changes** (a `WHERE` / `JOIN`-key / `CASE` rewrite that changes values but not the schema). An empty `findings` list is not a safety signal — the verdict's `caveat` field states this verbatim. See the [CI/CD guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate) for the full flow and the [`plan` schema](https://github.com/rocky-data/rocky/blob/main/schemas/plan.schema.json) for the `SemanticPlanVerdict` shape.
+> The `--semantic` verdict diffs **output schema** only and is **blind to schema-stable value changes** (a `WHERE` / `JOIN`-key / `CASE` rewrite that changes values but not the schema). An empty `findings` list is not a safety signal: the verdict's `caveat` field states this verbatim. See the [CI/CD guide](/guides/ci-cd/#semantic-breaking-change-findings-and-the-promote-gate) for the full flow and the [`plan` schema](https://github.com/rocky-data/rocky/blob/main/schemas/plan.schema.json) for the `SemanticPlanVerdict` shape.
 
 ### Examples
 
@@ -343,7 +343,7 @@ rocky run --filter <key=value> [flags]
 | `--force-rebuild` | `bool` | `false` | Force every selected model to build, bypassing the `--skip-unchanged` gate entirely. The escape hatch for a guaranteed rebuild after a non-logic change the IR hash can't see (a UDF redefinition, a session-setting change). |
 
 :::caution[`--defer` SQL-rewrite limitation]
-`--defer` rewrites each selected model's SQL to qualify deferred upstream references, and the rewrite parses the model with the Databricks dialect. Constructs the parser does not support — `SELECT * EXCEPT (...)`, trailing-comma select lists, and `STRUCT(...)` literals — cannot be rewritten and fail with a clear error. Build those models without `--defer`. With `--defer` off (the default), runs are byte-identical to before the flag existed.
+`--defer` rewrites each selected model's SQL to qualify deferred upstream references, and the rewrite parses the model with the Databricks dialect. Constructs the parser does not support (`SELECT * EXCEPT (...)`, trailing-comma select lists, and `STRUCT(...)` literals) cannot be rewritten and fail with a clear error. Build those models without `--defer`. With `--defer` off (the default), runs are byte-identical to before the flag existed.
 :::
 
 ### Pipeline Stages
@@ -417,20 +417,20 @@ rocky run --filter client=acme --shadow
 rocky compare --filter client=acme
 ```
 
-Or run against a named branch — the persistent, named analogue of `--shadow`:
+Or run against a named branch (the persistent, named analogue of `--shadow`):
 
 ```bash
 rocky branch create fix-price --description "testing reprice migration"
 rocky run --filter client=acme --branch fix-price
 ```
 
-Run in watch mode for the inner-loop developer workflow — every save re-materializes the pipeline against the local DuckDB warehouse:
+Run in watch mode for the inner-loop developer workflow, where every save re-materializes the pipeline against the local DuckDB warehouse:
 
 ```bash
 rocky run --watch
 ```
 
-`--watch` watches the parent directory of `rocky.toml` (filtered to `rocky.toml` itself) plus the resolved `models/` directory recursively. The directory watch is FSEvents-safe on macOS — atomic-rename saves (vim's `:w`, VSCode's default) trigger correctly where a file-level watch can miss the new inode. Banner / "detected change" lines go to `stderr` so `stdout` stays parseable; with `--output json`, each iteration emits one `RunOutput` JSON object on `stdout` (newline-delimited).
+`--watch` watches the parent directory of `rocky.toml` (filtered to `rocky.toml` itself) plus the resolved `models/` directory recursively. The directory watch is FSEvents-safe on macOS: atomic-rename saves (vim's `:w`, VSCode's default) trigger correctly where a file-level watch can miss the new inode. Banner / "detected change" lines go to `stderr` so `stdout` stays parseable; with `--output json`, each iteration emits one `RunOutput` JSON object on `stdout` (newline-delimited).
 
 ### Related Commands
 
@@ -546,7 +546,7 @@ Writes a content-addressed approval artifact that binds the approver's git ident
 
 Enumerates the pipeline's production targets and promotes each one. A replication pipeline discovers the source connector's tables through the schema-pattern templates; a transformation pipeline walks the configured `models` glob and promotes one target per model, skipping ephemeral models. It then runs the optional `[branch.approval]` gate, runs the semantic breaking-change gate against `--base-ref`, and dispatches `CREATE OR REPLACE TABLE prod.<x> AS SELECT * FROM branch__<name>.<x>` per target. Quality and snapshot pipelines are not supported and return a clear error.
 
-The breaking-change gate vetoes the promote (exit nonzero) when any finding has `severity == "breaking"` unless `--allow-breaking` is passed. Every gate decision — block, allow-via-override, or fail-open when the gate couldn't run — is recorded in the audit trail. See [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff) to surface the same findings informationally on every PR.
+The breaking-change gate vetoes the promote (exit nonzero) when any finding has `severity == "breaking"` unless `--allow-breaking` is passed. Every gate decision (block, allow-via-override, or fail-open when the gate couldn't run) is recorded in the audit trail. See [`rocky ci-diff --semantic`](/reference/commands/modeling/#rocky-ci-diff) to surface the same findings informationally on every PR.
 
 ### Examples
 
@@ -597,7 +597,7 @@ Diff a branch's materialized tables against production (row counts + schemas):
 rocky branch compare fix-price
 ```
 
-Internally this is `rocky compare` pointed at the branch's `schema_prefix` via `ShadowConfig.schema_override` — the same mechanism `rocky run --branch` uses for writes, so compare always hits exactly the tables the branch produced. Accepts the shared [`--filter`](/reference/filters/) flag.
+Internally this is `rocky compare` pointed at the branch's `schema_prefix` via `ShadowConfig.schema_override`, the same mechanism `rocky run --branch` uses for writes, so compare always hits exactly the tables the branch produced. Accepts the shared [`--filter`](/reference/filters/) flag.
 
 ### Related Commands
 

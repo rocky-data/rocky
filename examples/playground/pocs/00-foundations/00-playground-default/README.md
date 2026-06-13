@@ -7,7 +7,7 @@
 
 ## What it shows
 
-This is the **exact output** of `rocky playground my-project` — a small, runnable
+This is the **exact output** of `rocky playground my-project`, a small, runnable
 transformation DAG you can materialize locally and inspect end-to-end. It doubles as
 the known-good baseline for the catalog: if `rocky run` or `rocky test` ever fails here
 after a binary upgrade, the playground generator regressed.
@@ -27,7 +27,7 @@ the execution order.
 ## Why it's distinctive
 
 - **The only POC that intentionally mirrors the binary's stock output.** Every other POC covers a feature the generator doesn't show.
-- Materializes a real multi-model DAG with `rocky run`, then `rocky preview rows` / `rocky profile` (and the VS Code Inspector) read the materialized tables — the simplest end-to-end "see your data" loop.
+- Materializes a real multi-model DAG with `rocky run`, then `rocky preview rows` / `rocky profile` (and the VS Code Inspector) read the materialized tables, the simplest end-to-end "see your data" loop.
 
 ## Layout
 
@@ -76,7 +76,7 @@ test result: 3 passed, 0 failed
 
 1. `duckdb … < data/seed.sql` seeds the `raw__orders.orders` source.
 2. `rocky run` materializes the three models in DAG order into `playground.main`.
-3. `rocky preview rows` / `rocky profile` read those materialized tables — the same data the VS Code Inspector surfaces.
+3. `rocky preview rows` / `rocky profile` read those materialized tables (the same data the VS Code Inspector surfaces).
 4. `rocky test` re-executes the models against an in-memory DuckDB and verifies the `revenue_summary` contract.
 
 ## Related

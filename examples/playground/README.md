@@ -4,7 +4,7 @@ A curated catalog of small POCs that showcase the distinctive capabilities of [R
 
 This catalog is a **learning / reference** companion to the official [rocky/engine/examples/](https://github.com/rocky-data/rocky/tree/main/engine/examples) starter projects. The starters show you the shape of a Rocky project; the POCs here show you *what Rocky can do that other tools can't*.
 
-To start your own project, run `rocky playground my-project` — it scaffolds a throwaway DuckDB project you can iterate on freely (the recommended starting point). The [`quickstart`](https://github.com/rocky-data/rocky/tree/main/engine/examples/quickstart) example below is the same shape, checked into the repo as a fixed reference to read rather than scaffold.
+To start your own project, run `rocky playground my-project`: it scaffolds a throwaway DuckDB project you can iterate on freely (the recommended starting point). The [`quickstart`](https://github.com/rocky-data/rocky/tree/main/engine/examples/quickstart) example below is the same shape, checked into the repo as a fixed reference to read rather than scaffold.
 
 ## When to look here vs `engine/examples/`
 
@@ -207,4 +207,4 @@ See the monorepo [CONTRIBUTING.md](../../CONTRIBUTING.md) for conventions.
 
 ## License
 
-Apache 2.0 — see [LICENSE](../../LICENSE).
+Apache 2.0, see [LICENSE](../../LICENSE).

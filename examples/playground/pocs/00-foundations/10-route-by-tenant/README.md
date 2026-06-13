@@ -14,13 +14,13 @@ accounts and routes each account's rows into its own DuckDB schema:
    staging table at `main.events` (20 rows mixing 3 accounts: `acme`, `beta`,
    `ceres`).
 2. **Route** (`type = "transformation"`, `depends_on = ["ingest"]`) runs three
-   SQL models — one per account — that filter `WHERE account_id = '<id>'` and
+   SQL models (one per account) that filter `WHERE account_id = '<id>'` and
    each materialize to its own schema: `account_acme.events`,
    `account_beta.events`, `account_ceres.events`.
 
 The per-tenant target is set in each model's sidecar `.toml` (`target.schema =
 "account_<id>"`), not in `rocky.toml`. The transformation pipeline doesn't
-know or care how many tenants exist — it just runs every model under
+know or care how many tenants exist; it just runs every model under
 `models/`.
 
 ## Why it's distinctive
@@ -29,7 +29,7 @@ know or care how many tenants exist — it just runs every model under
   ordering explicit; `rocky dag` shows the connected graph end-to-end
   (`load → events_acme + events_beta + events_ceres`).
 - **Per-model `target.schema` override** is just two lines of TOML next to the
-  SQL — no Jinja, no `{% if tenant == ... %}` branching.
+  SQL, no Jinja, no `{% if tenant == ... %}` branching.
 - The same shape extends to N tenants by adding more `models/events_<id>.{sql,toml}`
   files (each ~5 lines). For dynamic-N production, generate the model files
   from a tenant registry as a build step.
@@ -91,7 +91,7 @@ know or care how many tenants exist — it just runs every model under
 2. `rocky load --pipeline ingest` writes all 20 rows into `main.events` via the
    DuckDB adapter's native `read_parquet()` + `CREATE TABLE`.
 3. `run.sh` pre-creates `account_acme`, `account_beta`, `account_ceres`
-   schemas — transformation pipelines don't auto-create schemas at run time
+   schemas; transformation pipelines don't auto-create schemas at run time
    today.
 4. `rocky run --pipeline route` compiles the three models, resolves their
    `[target]` from the sidecar `.toml`, and executes a per-model

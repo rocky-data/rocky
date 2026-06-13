@@ -26,7 +26,7 @@ in one go and verifies the importer handles each one cleanly:
 
 The POC's `run.sh` asserts each of these end-to-end. The emitted SQL
 deliberately contains TODO-replaced fragments that won't `rocky compile`
-cleanly — the whole point is that out-of-scope dbt features need a
+cleanly; the whole point is that out-of-scope dbt features need a
 manual follow-up pass. The happy-path counterpart that does compile
 end-to-end is [`03-import-dbt-validate`](../03-import-dbt-validate/).
 

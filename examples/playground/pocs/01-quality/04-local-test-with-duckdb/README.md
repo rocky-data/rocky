@@ -9,7 +9,7 @@
 
 The fastest feedback loop in Rocky: `rocky test` compiles every model,
 executes it against an in-memory DuckDB instance, and validates the output
-against any contracts — all without ever touching a real warehouse.
+against any contracts, all without ever touching a real warehouse.
 
 This POC ships 2 models (raw → mart) with no contracts attached, since the
 strict-contracts diagnostic surface is covered separately in
@@ -19,7 +19,7 @@ strict-contracts diagnostic surface is covered separately in
 
 - **No warehouse required.** No Databricks token, no Snowflake key, no
   network calls. Cargo-style sub-30-second feedback for SQL.
-- `data/seed.sql` is loaded automatically — no manual setup script.
+- `data/seed.sql` is loaded automatically, with no manual setup script.
 - Failure messages cite the offending column with diagnostic codes (`E012` etc.).
 
 ## Layout

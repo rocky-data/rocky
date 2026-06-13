@@ -20,7 +20,7 @@ The Wave A + Wave B governance surface shipped in `engine-v1.16.0`:
    specific environments.
 3. **`rocky compliance`** is a static resolver that answers
    _"are all classified columns masked wherever policy says they
-   should be?"_ — no warehouse I/O, pure resolver over the config +
+   should be?"_ with no warehouse I/O, as a pure resolver over the config +
    sidecars.
 4. **`--fail-on exception`** turns the rollup into a CI gate: exit 1
    when any classified column has no resolved strategy and isn't on the
@@ -49,11 +49,11 @@ actually emits the UC DDL.
 ## Why it's distinctive
 
 - Classification lives in the **model sidecar**, right next to the SQL
-  that produced the columns — not in an external catalog. Reviewable in
+  that produced the columns, not in an external catalog. Reviewable in
   PRs like any other code.
 - One `[mask]` block governs the workspace; per-env overrides tighten
   without loosening. No duplicate policy files per environment.
-- `rocky compliance` is a **thin resolver with zero warehouse calls** —
+- `rocky compliance` is a **thin resolver with zero warehouse calls**,
   safe to run in CI on every PR, fast enough to block merges, and
   honest about what it does (static config check, not live enforcement
   probe).
@@ -115,7 +115,7 @@ POC complete:
 
 ## Suppressing a known exception
 
-`audit_note` is tagged `audit_only` — a classification the team has
+`audit_note` is tagged `audit_only`, a classification the team has
 decided not to mask (lineage/discovery tag, not a confidentiality
 tag). To silence the exception without pretending the column is
 enforced, add the tag to the advisory list in `rocky.toml`:
@@ -140,8 +140,8 @@ merges without hiding the fact that the column is unmasked.
 | `audit_only` | **unresolved (exception)** | **unresolved (exception)** |
 
 `none` is an **explicit policy decision** (the team has decided this
-tag does not require masking) and counts as masked in the summary —
-it is not the same as "no strategy resolved."
+tag does not require masking) and counts as masked in the summary.
+It is not the same as "no strategy resolved."
 
 ## Apply the masks for real on Databricks
 
@@ -164,7 +164,7 @@ multi-column DDL):
 
 All three governance applies (classification, masking, retention) run
 in a single post-DAG loop, best-effort: a failure emits `warn!` and
-the pipeline continues — same semantics as `apply_grants`.
+the pipeline continues, matching the semantics of `apply_grants`.
 
 `rocky compliance` still works unchanged on the Databricks adapter;
 it remains a static config check regardless of backend. The rollup
@@ -178,4 +178,4 @@ answers "is the config right?" not "is the warehouse in sync?"
 - Governance adapter trait:
   `engine/crates/rocky-core/src/traits.rs` (`GovernanceAdapter::apply_column_tags`,
   `apply_masking_policy`)
-- CHANGELOG: `engine/CHANGELOG.md` — `[1.16.0]` Wave A + Wave B entries.
+- CHANGELOG: `engine/CHANGELOG.md`, the `[1.16.0]` Wave A + Wave B entries.

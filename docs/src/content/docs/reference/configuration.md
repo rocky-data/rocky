@@ -9,7 +9,7 @@ Rocky reads a single `rocky.toml` file for all configuration. The file uses **na
 
 ## Config Inference and Defaults
 
-Rocky applies sensible defaults to minimize boilerplate. Many fields can be omitted:
+Rocky applies defaults to minimize boilerplate. Many fields can be omitted:
 
 | What | Default | When to omit |
 |---|---|---|
@@ -539,7 +539,7 @@ type = "unique_expr"
 key_expr = "md5(tenant_id || '-' || order_id)"
 ```
 
-Use `unique_expr` when the meaningful identity is a *computed* value rather than any stored column — for example a surrogate key built to be stable across a multi-tenant union, which neither `unique` (single column) nor `composite` (column tuple) can express.
+Use `unique_expr` when the meaningful identity is a *computed* value rather than any stored column, for example a surrogate key built to be stable across a multi-tenant union, which neither `unique` (single column) nor `composite` (column tuple) can express.
 
 #### `[pipeline.NAME.checks.quarantine]`
 
@@ -555,9 +555,9 @@ Set-based and table-level assertions (`unique`, `unique_expr`, `composite`, `row
 
 #### Cross-source duplicate detection
 
-The assertions above (especially `unique` / `unique_expr` / `composite`) also run on **replication** pipelines, not just transformation/quality ones — so a target table that's silently doubled by the same source arriving twice is caught at load time, not three models downstream.
+The assertions above (especially `unique` / `unique_expr` / `composite`) also run on **replication** pipelines, not just transformation/quality ones, so a target table that's silently doubled by the same source arriving twice is caught at load time, not three models downstream.
 
-For the cross-*table* case — the same business key arriving through two **sibling** sources that later get `UNION`-ed into one consolidation target — use `[pipeline.NAME.checks.cross_source_overlap]`. A per-table `unique` check passes on each table individually; only an overlap check spanning the siblings sees the duplication.
+For the cross-*table* case (the same business key arriving through two **sibling** sources that later get `UNION`-ed into one consolidation target), use `[pipeline.NAME.checks.cross_source_overlap]`. A per-table `unique` check passes on each table individually; only an overlap check spanning the siblings sees the duplication.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -790,7 +790,7 @@ resource "google_storage_bucket" "rocky_state" {
 
 ### State namespacing
 
-redb permits **one writer per state file**. Fanning out one `rocky run` process per pipeline or client against the single global state file (`<models>/.rocky-state.redb`) forces those independent runs to serialize on one advisory lock. Namespacing gives each pipeline (or each client/tenant) its own state file — its own lock, its own redb handle, its own remote object key — so runs on distinct namespaces proceed concurrently with zero shared corruption surface.
+redb permits **one writer per state file**. Fanning out one `rocky run` process per pipeline or client against the single global state file (`<models>/.rocky-state.redb`) forces those independent runs to serialize on one advisory lock. Namespacing gives each pipeline (or each client/tenant) its own state file, with its own lock, its own redb handle, and its own remote object key, so runs on distinct namespaces proceed concurrently with zero shared corruption surface.
 
 Namespacing is **opt-in and default-off**. With `namespacing = "none"` (or the key omitted), behavior is **byte-identical** to a project that never set it.
 
@@ -811,7 +811,7 @@ To fan out by **client/tenant** rather than by pipeline name, use the per-invoca
 2. Otherwise `--state-namespace <key>` wins over the `[state] namespacing` config.
 3. Neither set ⇒ the single global state file (default).
 
-`<key>` must be a SQL identifier (`^[a-zA-Z0-9_]+$`) — it becomes a path segment. Namespaced files start fresh; the legacy global file is never moved or auto-seeded, so carry watermarks forward manually if needed (copy the global file to `<models>/.rocky-state/<key>.redb`, or point `--state-path` at it for the first run).
+`<key>` must be a SQL identifier (`^[a-zA-Z0-9_]+$`): it becomes a path segment. Namespaced files start fresh; the legacy global file is never moved or auto-seeded, so carry watermarks forward manually if needed (copy the global file to `<models>/.rocky-state/<key>.redb`, or point `--state-path` at it for the first run).
 
 ---
 
@@ -841,7 +841,7 @@ lag_tolerance_seconds = 0        # default; any MAX(ts) movement rebuilds
 A model is skipped only when **both** of these hold; otherwise it always rebuilds (fail-safe):
 
 - **(B) Eligible.** The model uses a plain materialization strategy (**not** `content_addressed` / `time_interval`), its `[skip] eligible` is not `false`, and its SQL is provably deterministic. Non-deterministic SQL is **always rebuilt**: `CURRENT_TIMESTAMP` / `NOW()`, `RANDOM()`, `UUID()`, `CURRENT_USER`, `CURRENT_CATALOG`, `ANY_VALUE`, `ARRAY_AGG`, an unordered `LIMIT`, or any unresolved/unknown function. `full_refresh` **is** eligible (a deterministic full-refresh whose logic and inputs are unchanged is safe to skip).
-- **(G) Upstreams provably unchanged.** Every upstream's data must be provably stable, which requires the model's lineage to be **provably complete**. Only a single plain `SELECT` over bare tables qualifies. Models that use a **CTE**, a subquery in `FROM`, an `IN (SELECT …)` / `EXISTS` / scalar sub-select, a `PIVOT` / `UNNEST` / nested-join table-factor, or a **set operation** (`UNION` / `INTERSECT` / `EXCEPT`) are **never skipped** — their lineage is not provably complete, so Rocky cannot prove it examined every upstream.
+- **(G) Upstreams provably unchanged.** Every upstream's data must be provably stable, which requires the model's lineage to be **provably complete**. Only a single plain `SELECT` over bare tables qualifies. Models that use a **CTE**, a subquery in `FROM`, an `IN (SELECT …)` / `EXISTS` / scalar sub-select, a `PIVOT` / `UNNEST` / nested-join table-factor, or a **set operation** (`UNION` / `INTERSECT` / `EXCEPT`) are **never skipped**: their lineage is not provably complete, so Rocky cannot prove it examined every upstream.
 
 `--force-rebuild` plus `full_refresh` always builds.
 
@@ -867,7 +867,7 @@ deterministic = true   # owner asserts the SQL is pure → re-eligible
 
 ## `[reuse]`
 
-:::caution[Experimental — not live-verified; do not enable in production]
+:::caution[Experimental: not live-verified; do not enable in production]
 `[reuse]` is a **preview** surface. It applies **only** to the Databricks–Iceberg content-addressed write path (no DuckDB, Snowflake, or BigQuery), and it has **not yet been live-verified against a warehouse**. Do not enable it in production. This is a config-reference entry only; there is no how-to guide for it yet.
 :::
 
@@ -876,7 +876,7 @@ When `enabled = true`, a successful run records, per model, an input-match index
 1. an **input-logic match** — the model's logic key plus its upstreams' input identities; and
 2. **byte-identity of the bytes Rocky recorded** for that build.
 
-It does **not** attest that a fresh re-run would reproduce those bytes. Even when enabled, the reuse decision path only ever resolves to **BUILD** today (an ONLY-BUILD posture) — a fail-closed verdict is computed but nothing is reused; the live point-to reuse is not yet wired/verified. The spine only *populates* the index.
+It does **not** attest that a fresh re-run would reproduce those bytes. Even when enabled, the reuse decision path only ever resolves to **BUILD** today (an ONLY-BUILD posture): a fail-closed verdict is computed but nothing is reused; the live point-to reuse is not yet wired/verified. The spine only *populates* the index.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

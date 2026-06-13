@@ -21,7 +21,7 @@ That runs the full three-step pipeline:
 2. `just codegen-sdk` — runs `datamodel-codegen` over `schemas/*.schema.json` into `sdk/python/src/rocky_sdk/types_generated/`.
 3. `just codegen-vscode` — runs `json2ts` per schema into `editors/vscode/src/types/generated/`.
 
-Drift is enforced by the `codegen-drift.yml` CI workflow: any PR where the committed bindings diverge from what `just codegen` produces locally will fail CI. The same check runs locally via the `.git-hooks/pre-commit` hook — enable once with `just install-hooks`.
+Drift is enforced by the `codegen-drift.yml` CI workflow: any PR where the committed bindings diverge from what `just codegen` produces locally will fail CI. The same check runs locally via the `.git-hooks/pre-commit` hook; enable it once with `just install-hooks`.
 
 To regenerate only the schemas (skip the downstream bindings):
 
@@ -73,7 +73,7 @@ Every schema file in this directory maps to a typed Rust output struct. The full
    ```
 2. Register it in `engine/crates/rocky-cli/src/commands/export_schemas.rs::schemas()`.
 3. From the monorepo root, run `just codegen`.
-4. Review the diff — you should see changes in `schemas/`, `sdk/python/src/rocky_sdk/types_generated/`, and `editors/vscode/src/types/generated/`.
+4. Review the diff: you should see changes in `schemas/`, `sdk/python/src/rocky_sdk/types_generated/`, and `editors/vscode/src/types/generated/`.
 5. Wire the new command into the dagster consumer per the 9-step checklist in `integrations/dagster/CLAUDE.md`.
 6. Commit the Rust source, the schema, and the regenerated bindings in one commit.
 

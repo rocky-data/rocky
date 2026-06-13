@@ -13,7 +13,7 @@ staging copy of `seeds.customers`; `dim_customers` reads from it with
 `update_columns = ["name", "email", "tier"]`. The first `rocky run`
 materializes the dim table; between runs we mutate the seed (update one
 row's tier, rename another, insert a new customer); the second `rocky run`
-issues a MERGE that upserts the changes — existing rows updated in place,
+issues a MERGE that upserts the changes: existing rows updated in place,
 new rows inserted, untouched rows untouched.
 
 ```toml
@@ -30,9 +30,7 @@ update_columns = ["name", "email", "tier"]
   warehouse.
 - **Update column list is explicit** so unrelated columns aren't
   overwritten when the source schema grows.
-- **End-to-end against DuckDB.** Every other Rocky strategy POC also
-  materializes against DuckDB; this one closes the loop by exercising
-  MERGE semantics on a real warehouse, not just sql-gen string assertions.
+- **End-to-end against DuckDB.** Exercises MERGE semantics on a real warehouse, not just sql-gen string assertions.
 
 ## Layout
 
@@ -52,7 +50,7 @@ update_columns = ["name", "email", "tier"]
 ## Prerequisites
 
 - `rocky` on PATH
-- `duckdb` CLI (`brew install duckdb`) — seeds the source table, applies
+- `duckdb` CLI (`brew install duckdb`), which seeds the source table, applies
   the delta, and verifies post-MERGE row counts
 - Engine ≥ 1.29 (or this branch). The two enabling fixes shipped in PRs
   [#448](https://github.com/rocky-data/rocky/pull/448)
@@ -98,7 +96,7 @@ customer_id |     name              |     email                       | tier
 2. First `rocky run --pipeline transform`:
    - `auto_create_schemas` materializes `poc.staging` and `poc.demo`.
    - `raw_customers` runs first (full_refresh CTAS).
-   - `dim_customers` runs second — Rocky sees the target doesn't exist, so
+   - `dim_customers` runs second: Rocky sees the target doesn't exist, so
      it bootstraps an empty `poc.demo.dim_customers` from the model schema
      and then issues the MERGE (which inserts all 50 rows on the first
      pass).
@@ -119,5 +117,5 @@ customer_id |     name              |     email                       | tier
 - Transformation MERGE codegen:
   [`engine/crates/rocky-core/src/sql_gen.rs`](../../../../engine/crates/rocky-core/src/sql_gen.rs)
   (`generate_transformation_sql` MERGE arm)
-- Sibling: [`01-incremental-watermark`](../01-incremental-watermark) —
+- Sibling: [`01-incremental-watermark`](../01-incremental-watermark),
   watermark-based incremental writes (no MERGE, append only)

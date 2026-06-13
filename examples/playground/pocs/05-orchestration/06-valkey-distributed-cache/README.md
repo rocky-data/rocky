@@ -7,7 +7,7 @@
 
 ## What it shows
 
-Rocky's distributed caching layer — a three-tier fallback chain that reduces warehouse API calls across multiple Rocky instances:
+Rocky's distributed caching layer is a three-tier fallback chain that reduces warehouse API calls across multiple Rocky instances:
 
 1. **Tier 1: Memory** — In-process LRU cache with TTL (sub-millisecond)
 2. **Tier 2: Valkey** — Shared Redis-compatible cache (cross-instance)
@@ -68,7 +68,7 @@ POC complete.
 
 1. Started Valkey via docker-compose (port 6379)
 2. `rocky validate` checked `[cache]` and `[state]` config blocks
-3. Pipeline ran with cache enabled — schema discovery results cached in Valkey
+3. Pipeline ran with cache enabled; schema discovery results were cached in Valkey
 4. Watermarks stored in both `.rocky-state.redb` (local) and Valkey (shared)
 5. Subsequent runs by any Rocky instance hit Valkey first, skipping warehouse calls
 

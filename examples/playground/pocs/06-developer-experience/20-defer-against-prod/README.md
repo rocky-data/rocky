@@ -15,14 +15,14 @@ The run script builds the whole pipeline once into `poc.main`, publishes the
 upstream into a `poc.prod` schema (standing in for "prod already built this"),
 then drops the local `main.stg_events` to simulate a fresh checkout. A
 downstream-only build **without** `--defer` fails (the local upstream is gone);
-the same build **with** `--defer --defer-to prod` succeeds — `user_counts`
+the same build **with** `--defer --defer-to prod` succeeds: `user_counts`
 materializes alone, reading its `stg_events` ref from `poc.prod`.
 
 ## Why it's distinctive
 
 - `--defer` is **default-off** and changes nothing unless you both pass it and
   scope the run with `--model`. A plain `rocky run` builds every model and has
-  nothing to defer, so the flag is inert — behavior is byte-identical when off.
+  nothing to defer, so the flag is inert; behavior is byte-identical when off.
 - Only the selected model is materialized; the deferred upstream is **not**
   rebuilt (the POC asserts `main.stg_events` stays absent afterward).
 
@@ -38,7 +38,7 @@ handful of constructs cannot be rewritten and fail with a clear error:
 
 For models using those, run without `--defer` (build the upstream locally). The
 models in this POC deliberately use plain bare-name `ref()`s so the rewrite
-applies cleanly. `--defer` is a **dev convenience** — a CI / production run
+applies cleanly. `--defer` is a **dev convenience**: a CI / production run
 should build the real DAG, not defer it.
 
 ## Layout
@@ -82,7 +82,7 @@ POC complete: only the selected model built locally; its ref resolved to prod.
 
 1. `rocky run` builds `stg_events` + `user_counts` into `poc.main`.
 2. `stg_events` is snapshotted into `poc.prod` (its "production home").
-3. The local `main.stg_events` is dropped — a fresh dev checkout.
+3. The local `main.stg_events` is dropped (a fresh dev checkout).
 4. `rocky run --model user_counts` (no defer) **fails**: the bare `stg_events`
    ref has no local table to resolve to.
 5. `rocky run --model user_counts --defer --defer-to prod` **succeeds**: only

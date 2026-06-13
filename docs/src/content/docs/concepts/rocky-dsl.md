@@ -5,10 +5,10 @@ sidebar:
   order: 8
 ---
 
-Rocky's DSL is a pipeline-oriented alternative to SQL for transformation models. `.rocky` files lower to standard SQL before execution — the warehouse only sees SQL.
+Rocky's DSL is a pipeline-oriented alternative to SQL for transformation models. `.rocky` files lower to standard SQL before execution; the warehouse only sees SQL.
 
 :::note[The DSL is optional]
-Rocky is **SQL-first**. Every feature works with plain `.sql` files. The DSL exists for teams that want a more readable shape for multi-step transformations. Mix and match freely — a DSL model can depend on a SQL model and vice versa.
+Rocky is **SQL-first**. Every feature works with plain `.sql` files. The DSL exists for teams that want a more readable shape for multi-step transformations. Mix and match freely: a DSL model can depend on a SQL model and vice versa.
 :::
 
 ## Why a DSL
@@ -258,6 +258,6 @@ DSL files go through two phases before the compiler sees them:
 1. **Parse** — tokens → typed AST (one variant per pipeline step).
 2. **Lower** — AST → single SQL string, walked step by step with an accumulating clause context (`FROM`, joins, `WHERE`, `SELECT`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`).
 
-The lowered SQL then flows into the compiler for type checking and dependency resolution — exactly as if you'd written it by hand. There's no runtime indirection; `.rocky` and `.sql` reach the warehouse identically.
+The lowered SQL then flows into the compiler for type checking and dependency resolution, exactly as if you'd written it by hand. There's no runtime indirection; `.rocky` and `.sql` reach the warehouse identically.
 
 For the full language grammar, see the [Rocky language spec](https://github.com/rocky-data/rocky/blob/main/docs/rocky-lang-spec.md).

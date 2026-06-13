@@ -1,30 +1,30 @@
 # 07-freshness-sla — model-level freshness SLAs + the W005 coverage diagnostic
 
 > **Category:** 01-quality
-> **Credentials:** none (compile-time only — no warehouse)
+> **Credentials:** none (compile-time only, no warehouse)
 > **Runtime:** < 5s
 > **Rocky features:** `[freshness]` config block (per-model + project default), `expected_lag_seconds` alias, **W005** freshness-coverage diagnostic
 
 ## What it shows
 
-A model can declare a freshness SLA — a TTL after which it's considered stale —
+A model can declare a freshness SLA (a TTL after which it's considered stale)
 via a per-model `[freshness]` sidecar block (`expected_lag_seconds`, optional
 `time_column`, optional `severity`), or project-wide via a top-level
 `[freshness]` block in `rocky.toml`. The compiler raises the soft-warn **W005**
 for any model that emits a temporal output column (DATE / TIMESTAMP) but has no
-freshness declaration in scope — neither a per-model block nor a project-level
+freshness declaration in scope, neither a per-model block nor a project-level
 default. This POC has three models that exercise all three outcomes, then shows
 the project-level default silencing the warning globally.
 
 `rocky compile --with-seed` loads `data/seed.sql` so the leaf models get
 concrete column types (W005 only fires on a column the compiler knows is
-temporal — without source types it would degrade to `Unknown` and stay silent).
+temporal; without source types it would degrade to `Unknown` and stay silent).
 
 ## Why it's distinctive
 
 - Freshness is a **first-class, type-aware compile-time concern**, not a
   runtime-only check bolted on after the fact. W005 only fires on models that
-  actually emit a temporal column, so the nudge is targeted — no noise on pure
+  actually emit a temporal column, so the nudge is targeted: no noise on pure
   dimensions like `dim_customer`.
 - `expected_lag_seconds` matches the dbt/SQLMesh public field name while
   aliasing Rocky's legacy `max_lag_seconds`, so the declaration is portable and
@@ -53,7 +53,7 @@ temporal — without source types it would degrade to `Unknown` and stay silent)
 
 ## Prerequisites
 
-- `rocky` on PATH (≥ 1.43.0 — `[freshness]` + W005 shipped in 1.43.0)
+- `rocky` on PATH (≥ 1.43.0; `[freshness]` + W005 shipped in 1.43.0)
 
 ## Run
 
@@ -83,8 +83,8 @@ temporal — without source types it would degrade to `Unknown` and stay silent)
    auto-loads `rocky.toml`; keeping the `[freshness]` block out of it is exactly
    what lets W005 fire here.)
 2. `stg_shipments` emits `shipped_at TIMESTAMP` but its sidecar already carries a
-   `[freshness]` block, so it's silent — per-model coverage.
-3. `dim_customer` has no temporal output column, so W005 never applies — the
+   `[freshness]` block, so it's silent: per-model coverage.
+3. `dim_customer` has no temporal output column, so W005 never applies; the
    diagnostic is targeted, not blanket.
 4. **Step 2** points `rocky compile` at `rocky-project-freshness.toml`, whose
    top-level `[freshness]` block declares `expected_lag_seconds`. That marks the

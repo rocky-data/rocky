@@ -8,7 +8,7 @@
 ## What it shows
 
 `rocky run` writes a single `RunRecord` to the state store. Three read
-commands — `rocky trace`, `rocky cost`, `rocky replay` — each project
+commands (`rocky trace`, `rocky cost`, `rocky replay`) each project
 that record from a different angle:
 
 | Command | Question it answers |
@@ -25,15 +25,15 @@ stitched together in a UI.
 
 - **One artefact, three projections.** A bundled stack (ingest + transform
   + quality, each with its own observability surface) reconstructs the
-  cross-stage picture from N data sources — pipeline logs from one tool,
+  cross-stage picture from N data sources: pipeline logs from one tool,
   artifact metadata from another, warehouse query history from a third.
   Rocky emits a single typed `RunRecord` and reads it three ways.
-- **Cost is a first-class projection.** Per-model warehouse spend is
+- **Cost is a direct projection.** Per-model warehouse spend is
   computed via the same formula `rocky run` uses for the live summary
   (`compute_observed_cost_usd`), not pulled from a billing dashboard
   after the fact.
 - **Replay handle on the same run.** `rocky replay latest` reads the
-  same `RunRecord` — same SQL hashes, same timings, same model graph.
+  same `RunRecord` (same SQL hashes, same timings, same model graph).
   Re-execution with pinned inputs follows in the content-addressed
   write path (in flight); the inspection surface is live today.
 
@@ -79,7 +79,7 @@ models (3):
 DuckDB doesn't publish per-statement byte/cost telemetry, so those
 columns are empty in this POC. The same command against a Databricks /
 Snowflake / BigQuery pipeline populates the real numbers. The
-*structure* — one RunRecord, one cost projection — is identical
+*structure* (one RunRecord, one cost projection) is identical
 regardless of adapter.
 
 ## What happened
@@ -90,20 +90,20 @@ regardless of adapter.
    `.rocky-state.redb` with per-model SQL hashes, row counts, and
    timings.
 3. `rocky trace latest` reads that `RunRecord` and emits the timeline
-   shape — per-model offsets, durations, concurrency lanes.
+   shape: per-model offsets, durations, concurrency lanes.
 4. `rocky cost latest` reads the same record and re-derives per-model
-   cost via `compute_observed_cost_usd` — the projection a tracing UI
+   cost via `compute_observed_cost_usd`, the projection a tracing UI
    would hang cost annotations off span attributes from.
 5. `rocky replay latest` reads the same record as the reproducibility
    artefact: the SQL that ran, the rows produced, the timings observed.
 
 ## Related
 
-- Sibling POC: [`07-run-trace-gantt`](../07-run-trace-gantt/) — the
+- Sibling POC: [`07-run-trace-gantt`](../07-run-trace-gantt/), the
   Gantt-shape view of `rocky trace` in isolation.
-- Sibling POC: [`00-foundations/06-branches-replay-lineage`](../../00-foundations/06-branches-replay-lineage/)
-  — branches + replay primitives.
+- Sibling POC: [`00-foundations/06-branches-replay-lineage`](../../00-foundations/06-branches-replay-lineage/),
+  the branches + replay primitives.
 - Engine source: `engine/crates/rocky-cli/src/commands/{cost,trace,replay}.rs`
 - OpenTelemetry export: `engine/crates/rocky-cli/src/otlp.rs`
-  (feature-gated — the same `RunRecord` flows as OTel spans to any
+  (feature-gated; the same `RunRecord` flows as OTel spans to any
   collector).

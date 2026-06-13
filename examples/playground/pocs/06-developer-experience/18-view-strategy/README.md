@@ -7,7 +7,7 @@ in its sidecar compiles, types, and the SQL generator emits
 ## Why distinctive
 
 The materialization-strategy catalog Rocky ships covers FullRefresh, Incremental,
-Merge, TimeInterval / Microbatch, Ephemeral, DeleteInsert, ContentAddressed —
+Merge, TimeInterval / Microbatch, Ephemeral, DeleteInsert, ContentAddressed,
 and the warehouse-managed `view`, `materialized_view`, and `dynamic_table`
 variants. This POC pins the cheapest of those: a plain SQL view that every
 target warehouse supports.
@@ -28,6 +28,6 @@ models/
 
 ## Expected output
 
-`rocky compile --models models` reports two models — `dim_customers`
+`rocky compile --models models` reports two models: `dim_customers`
 (`full_refresh`) and `active_customers` (`view`). The compile pass surfaces no
 diagnostics; the model output's `strategy.type` is `"view"`.

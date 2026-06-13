@@ -53,8 +53,6 @@ defs = dg.Definitions(assets=[acme_orders], resources={"rocky": rocky})
 
 ## Architecture
 
-The integration follows a simple pattern:
-
 1. Dagster calls the `rocky` binary via subprocess (e.g., `rocky discover --output json`).
 2. Rocky executes against your warehouse and sources, returning structured JSON.
 3. `dagster-rocky` parses that JSON into Pydantic models.

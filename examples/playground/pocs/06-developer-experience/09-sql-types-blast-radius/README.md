@@ -13,7 +13,7 @@ Raw `.sql` models become first-class in Rocky's semantic graph.
    in-memory DuckDB, introspect `information_schema`, and use the
    result as the source of truth for raw source schemas. Leaf `.sql`
    models that read from `raw__*` tables go from `Unknown` columns to
-   concrete types — which cascades into incrementality hints, cost
+   concrete types, which cascades into incrementality hints, cost
    estimates, and downstream type inference.
 2. **Semantic-graph-aware blast-radius lint** — `SELECT *` from a
    table inside the project's DAG triggers a diagnostic with the
@@ -28,7 +28,7 @@ Raw `.sql` models become first-class in Rocky's semantic graph.
   schemas, and makes the result first-class. The DSL is one surface
   over the same semantic graph; `.sql` is not a second-class citizen.
 - **The lint is semantic-graph aware.** A `SELECT *` from a CTE with a
-  fully-determined shape wouldn't fire — only `SELECT *` from a table
+  fully-determined shape wouldn't fire; only `SELECT *` from a table
   inside the DAG, where blast radius is real, will.
 
 ## Layout

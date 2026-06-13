@@ -7,8 +7,8 @@
 
 ## What it shows
 
-A single `type = "load"` pipeline ingests three different file formats — Parquet,
-CSV, and JSONL — from one `data/` directory in one `rocky load` invocation.
+A single `type = "load"` pipeline ingests three different file formats (Parquet,
+CSV, and JSONL) from one `data/` directory in one `rocky load` invocation.
 No `format = ...` is set, so each file is dispatched by extension: `.parquet`
 goes through DuckDB's `read_parquet()`, `.csv` through `read_csv_auto()`, and
 `.jsonl` through `read_json_auto()`. Each file becomes a DuckDB table named

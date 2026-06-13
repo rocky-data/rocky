@@ -16,13 +16,13 @@ config layers, with `${VAR}` / `${VAR:-default}` substitution at every layer:
 3. **`models/<name>.toml`** — per-model sidecar, overrides anything from the
    layers above.
 
-This POC runs `rocky compile` twice over the same source tree — once with
-no env vars set, once with overrides — and prints the resolved targets so
+This POC runs `rocky compile` twice over the same source tree (once with
+no env vars set, once with overrides) and prints the resolved targets so
 the precedence rules are visible side-by-side.
 
 ## Why it's distinctive
 
-- Env-var substitution works at **every** config layer — including per-model
+- Env-var substitution works at **every** config layer, including per-model
   sidecars, which closes a dbt-migration ergonomics gap (FR-001 Option A).
   A Dagster asset factory can now point each asset at its own
   catalog/schema/table by setting env vars on the rocky subprocess.
@@ -72,7 +72,7 @@ For a sidecar field (e.g. `target.catalog`):
 3. Otherwise, filename inference for `name` and `target.table` (defaults to
    the SQL file's stem).
 
-`${VAR}` is **required** — an unset var is a load-time error. `${VAR:-default}`
+`${VAR}` is **required**: an unset var is a load-time error. `${VAR:-default}`
 falls back to `default` when the var is unset or empty.
 
 ## Related

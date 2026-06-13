@@ -5,7 +5,7 @@ sidebar:
   order: 10
 ---
 
-Rocky manages **Databricks Unity Catalog** permissions declaratively. Define grants inline in `rocky.toml` and Rocky reconciles them during each `rocky apply` — there is no separate permissions command. Permissions are applied as part of the governance setup phase, before parallel table processing begins.
+Rocky manages **Databricks Unity Catalog** permissions declaratively. Define grants inline in `rocky.toml` and Rocky reconciles them during each `rocky apply`; there is no separate permissions command. Permissions are applied as part of the governance setup phase, before parallel table processing begins.
 
 ## Inline Grants (Recommended)
 
@@ -67,7 +67,7 @@ binding_type = "READ_ONLY"
 1. Binds each managed catalog to the specified workspaces with their declared access level
 2. Sets the catalog's isolation mode to `ISOLATED`
 
-This prevents other workspaces from accessing the catalog. Workspace binding and isolation are applied as best-effort — failures are logged but don't block the run.
+This prevents other workspaces from accessing the catalog. Workspace binding and isolation are applied as best-effort: failures are logged but don't block the run.
 
 ## Managed Permissions
 

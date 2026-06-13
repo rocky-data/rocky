@@ -1,6 +1,6 @@
 ---
 title: Fivetran state cache
-description: Pluggable persistent cache for Rocky's Fivetran state envelope — share one fetcher per org across processes.
+description: Pluggable persistent cache for Rocky's Fivetran state envelope, sharing one fetcher per org across processes.
 sidebar:
   order: 11
 ---
@@ -39,7 +39,7 @@ valkey_url = "rediss://valkey.internal:6379/"
 valkey_ttl_seconds = 600
 ```
 
-When the `[adapter.<name>.cache]` block is absent the cache layer defaults to `backend = "none"` and the adapter behaves exactly as it did before the cache layer landed — every fetch goes straight to the Fivetran API.
+When the `[adapter.<name>.cache]` block is absent the cache layer defaults to `backend = "none"` and the adapter behaves exactly as it did before the cache layer landed: every fetch goes straight to the Fivetran API.
 
 ## Backends
 
@@ -49,7 +49,7 @@ No persistent cache. Every fetch goes to the Fivetran API. Useful for local deve
 
 ### `file`
 
-Local-filesystem JSON files under `file_root`. Cheapest backend — no external dependency, no credentials. Suitable for single-process deployments and CI runs that want to dedupe a single discover across multiple Rocky invocations on the same host.
+Local-filesystem JSON files under `file_root`. Cheapest backend: no external dependency, no credentials. Suitable for single-process deployments and CI runs that want to dedupe a single discover across multiple Rocky invocations on the same host.
 
 ```toml
 [adapter.fivetran_main.cache]
@@ -57,7 +57,7 @@ backend = "file"
 file_root = ".rocky/fivetran-state/"
 ```
 
-The directory layout under `file_root` is `<account_hash>/<destination_id>.json`. `account_hash` is a short SHA-256-derived token of the Fivetran API key — different orgs sharing one root never collide on a destination id.
+The directory layout under `file_root` is `<account_hash>/<destination_id>.json`. `account_hash` is a short SHA-256-derived token of the Fivetran API key, so different orgs sharing one root never collide on a destination id.
 
 ### `object_store`
 
@@ -78,9 +78,9 @@ Supported URL schemes:
 | `az://container/prefix/` | Azure Blob Storage |
 | `file:///absolute/path/` | Local filesystem (mainly for testing) |
 
-**Credentials** are resolved through each SDK's default provider chain — `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / IAM role / `~/.aws/credentials` for S3, `GOOGLE_APPLICATION_CREDENTIALS` for GCS, and so on. Rocky doesn't introduce its own credential surface for cloud storage.
+**Credentials** are resolved through each SDK's default provider chain: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / IAM role / `~/.aws/credentials` for S3, `GOOGLE_APPLICATION_CREDENTIALS` for GCS, and so on. Rocky doesn't introduce its own credential surface for cloud storage.
 
-The backend writes single-part PUTs and uses the response ETag (MD5 for single-part) to dedupe re-writes of identical envelopes — no PUT goes over the wire when the bytes haven't changed. The serialized envelope is capped at 5 MB to keep dedupe safe; real envelopes for a 57-connector tenant land around 60-120 KB.
+The backend writes single-part PUTs and uses the response ETag (MD5 for single-part) to dedupe re-writes of identical envelopes: no PUT goes over the wire when the bytes haven't changed. The serialized envelope is capped at 5 MB to keep dedupe safe; real envelopes for a 57-connector tenant land around 60-120 KB.
 
 ### `valkey`
 
@@ -107,7 +107,7 @@ valkey_url = "rediss://valkey.internal:6379/"
 valkey_ttl_seconds = 600
 ```
 
-This is the recommended production configuration — Valkey gives operators fast hot-path reads while S3 keeps the canonical envelope durable across Valkey outages and pod restarts.
+This is the recommended production configuration: Valkey gives operators fast hot-path reads while S3 keeps the canonical envelope durable across Valkey outages and pod restarts.
 
 ## `--no-cache` flag
 
@@ -142,10 +142,10 @@ Every cache decision emits an OTLP span event on the active trace, also publishe
 | `fivetran.cache_write_skipped` | `backend`, `key`, `reason` (`"hash-match"`) |
 | `fivetran.cache_write_failed` | `backend`, `key`, `error` |
 
-Cache failures are fail-open — the HTTP path runs regardless. Failures show up as `cache_write_failed` events plus a `warn!` log line so ops can alert on a pathologically failing backend.
+Cache failures are fail-open: the HTTP path runs regardless. Failures show up as `cache_write_failed` events plus a `warn!` log line so ops can alert on a pathologically failing backend.
 
 ## Volume reduction
 
-The cache layer dedupes correctness — it prevents redundant writes when the bytes haven't changed. The cold-start herd reduction depends on the per-host rate-limit budget (shipped in engine-v1.37.0) serializing concurrent fetches so the first process pays the API cost and subsequent processes see the populated cache.
+The cache layer dedupes correctness. It prevents redundant writes when the bytes haven't changed. The cold-start herd reduction depends on the per-host rate-limit budget (shipped in engine-v1.37.0) serializing concurrent fetches so the first process pays the API cost and subsequent processes see the populated cache.
 
 For a 57-connector tenant with 5 active processes and 2-8 sensor triggers per hour, the combined effect cuts steady-state Fivetran call volume from ~600-2400 calls/hour to ~80 calls/hour.

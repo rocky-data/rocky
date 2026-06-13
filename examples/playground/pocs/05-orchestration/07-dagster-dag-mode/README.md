@@ -92,7 +92,7 @@ Open http://localhost:3000 and verify:
 2. `rocky run` replicates the source table via the `ingest` pipeline
 3. `rocky dag` produces the full unified DAG: 4 nodes, 3 edges, 4 execution layers
 4. `rocky compile` verifies model dependencies (`fct_customer_revenue` depends on `stg_orders`)
-5. `definitions.py` uses `RockyComponent(dag_mode=True, surface_column_lineage=True)` — Dagster reads the cached DAG and builds a connected asset graph automatically; at component-load time it also calls `rocky lineage` per derived model and merges `TableColumnLineage` into each `AssetSpec`'s `metadata["dagster/column_lineage"]` slot, so the Dagster UI's Column lineage tab renders without any hand-written wiring
+5. `definitions.py` uses `RockyComponent(dag_mode=True, surface_column_lineage=True)`. Dagster reads the cached DAG and builds a connected asset graph automatically; at component-load time it also calls `rocky lineage` per derived model and merges `TableColumnLineage` into each `AssetSpec`'s `metadata["dagster/column_lineage"]` slot, so the Dagster UI's Column lineage tab renders without any hand-written wiring
 
 ## Related
 

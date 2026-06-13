@@ -76,7 +76,7 @@ rocky compile --model fct_revenue --contracts contracts/
 }
 ```
 
-Every diagnostic carries a severity (`"error"`, `"warning"`, `"info"`), a code (`E###` errors, `W###` warnings, `P###` portability lints, or `V###` validation), the owning model, and — when the compiler can locate it — a `span` and `suggestion`.
+Every diagnostic carries a severity (`"error"`, `"warning"`, `"info"`), a code (`E###` errors, `W###` warnings, `P###` portability lints, or `V###` validation), the owning model, and (when the compiler can locate it) a `span` and `suggestion`.
 
 Compile models from a non-default directory:
 
@@ -108,7 +108,7 @@ rocky compile --target-dialect bq
 }
 ```
 
-Both the `--target-dialect` flag and the `[portability]` config block (see [Configuration](/reference/configuration/)) drive the same check; the flag wins when both are set. Project-wide allow-lists and per-model `-- rocky-allow: …` pragmas exempt specific constructs — see [Portability linting](/concepts/linters/#p001--dialect-portability).
+Both the `--target-dialect` flag and the `[portability]` config block (see [Configuration](/reference/configuration/)) drive the same check; the flag wins when both are set. Project-wide allow-lists and per-model `-- rocky-allow: …` pragmas exempt specific constructs. See [Portability linting](/concepts/linters/#p001--dialect-portability).
 
 Compile with seeded source schemas so leaf `.sql` models pick up real types:
 
@@ -190,7 +190,7 @@ rocky lineage fct_revenue
 }
 ```
 
-Tracing a single column returns a flat trace shape instead — use either `--column` or `model.column` syntax:
+Tracing a single column returns a flat trace shape instead. Use either `--column` or `model.column` syntax:
 
 ```bash
 rocky lineage fct_revenue --column revenue_amount
@@ -226,7 +226,7 @@ Use the dot syntax shorthand:
 rocky lineage fct_revenue.revenue_amount --format dot | dot -Tpng -o lineage.png
 ```
 
-Walk downstream to see every consumer of a column — the answer to "what breaks if I change this?":
+Walk downstream to see every consumer of a column (the answer to "what breaks if I change this?"):
 
 ```bash
 rocky lineage stg_orders.customer_id --downstream
@@ -323,7 +323,7 @@ rocky catalog --out build/catalog
 
 - JSON only. Parquet output (`edges.parquet` + `assets.parquet`) lands in a follow-up release.
 - `last_run_id` and `last_materialized_at` are unset. State-store enrichment lands in a follow-up release.
-- Lineage extraction inherits the existing extractor's coverage — window functions, CTEs, set operations, `CASE WHEN` projections, and join keys are not yet surfaced as edges. Asset-level partial lineage is flagged via `stats.assets_with_star`.
+- Lineage extraction inherits the existing extractor's coverage: window functions, CTEs, set operations, `CASE WHEN` projections, and join keys are not yet surfaced as edges. Asset-level partial lineage is flagged via `stats.assets_with_star`.
 
 ### Related Commands
 
@@ -435,7 +435,7 @@ rocky ci
 }
 ```
 
-Run CI with contracts in a GitHub Actions workflow. On a compile error, `tests_passed` / `tests_failed` are `0` because tests don't run — CI short-circuits and returns a non-zero `exit_code`:
+Run CI with contracts in a GitHub Actions workflow. On a compile error, `tests_passed` / `tests_failed` are `0` because tests don't run, and CI short-circuits and returns a non-zero `exit_code`:
 
 ```bash
 rocky ci --models src/models --contracts src/contracts
@@ -569,7 +569,7 @@ rocky ci-diff --semantic
 
 The `breaking_findings` array is omitted from JSON output when empty or when `--semantic` is not set. Each finding carries a tagged `change` object (`kind` discriminator) and a `severity` (`breaking` / `warning` / `info`). Use `--semantic` in `ci-diff` to surface findings on every PR; rely on [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) to block promotion when `severity == "breaking"`.
 
-The `breaking_findings` field is JSON-only — `--output table` still renders the structural diff but does not print the semantic findings list. Use `--output json` (and pipe through `jq`) to inspect them.
+The `breaking_findings` field is JSON-only: `--output table` still renders the structural diff but does not print the semantic findings list. Use `--output json` (and pipe through `jq`) to inspect them.
 
 ### Related Commands
 
@@ -584,7 +584,7 @@ The `breaking_findings` field is JSON-only — `--output table` still renders th
 
 Run a PR-time preview of model changes: prune-and-copy substrate that re-executes only changed models and their downstream column lineage on a per-PR branch, copying everything else from the base ref. Three subcommands compose into a single review artifact: `preview create` runs the workflow, `preview diff` reports the structural and sampled row-level diff, and `preview cost` reports the cost delta vs. base.
 
-For the design — why CTAS today and warehouse-native clones tomorrow, how the column-level pruner works, what the sampling window's correctness ceiling is — see the [How Preview Works](/concepts/preview-internals/) concept page. For a step-by-step walkthrough on a feature branch, see the [Preview a PR](/guides/preview-a-pr/) how-to.
+For the design (why CTAS today and warehouse-native clones tomorrow, how the column-level pruner works, what the sampling window's correctness ceiling is), see the [How Preview Works](/concepts/preview-internals/) concept page. For a step-by-step walkthrough on a feature branch, see the [Preview a PR](/guides/preview-a-pr/) how-to.
 
 ```bash
 rocky preview create --base <ref> [--name <branch_name>]
@@ -651,7 +651,7 @@ Sampled row-level diff plus structural (column-level) diff for every model in th
 rocky preview diff --name preview-fix-price --output markdown
 ```
 
-The JSON shape (`PreviewDiffOutput`) carries the same data plus the per-model `sampling_window` block with `coverage_warning`. The `markdown` field embeds the rendered report verbatim — `rocky preview diff --output json | jq -r .markdown` is equivalent to `--output markdown`.
+The JSON shape (`PreviewDiffOutput`) carries the same data plus the per-model `sampling_window` block with `coverage_warning`. The `markdown` field embeds the rendered report verbatim, so `rocky preview diff --output json | jq -r .markdown` is equivalent to `--output markdown`.
 
 ### `rocky preview cost`
 
@@ -678,7 +678,7 @@ Wire contracts for all three subcommands are exported by `rocky export-schemas`:
 - `schemas/preview_diff.schema.json`
 - `schemas/preview_cost.schema.json`
 
-These back the autogenerated Pydantic and TypeScript bindings — see [JSON Output](/reference/json-output/) for the codegen pipeline and version compatibility contract.
+These back the autogenerated Pydantic and TypeScript bindings. See [JSON Output](/reference/json-output/) for the codegen pipeline and version compatibility contract.
 
 ### Related Commands
 

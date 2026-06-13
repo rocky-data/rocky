@@ -87,7 +87,7 @@ The script creates the `hc_phase4_poc` dataset, runs `rocky run --output json`, 
 
 `GCP_PROJECT_ID` is templated into the staged `live.rocky.toml` and model files at runtime via a `__GCP_PROJECT__` placeholder; no project ID is checked into the repo. See [`live/README.md`](./live/README.md) for details.
 
-Full BigQuery surface tour — one scenario at a time:
+Full BigQuery surface tour, one scenario at a time:
 
 ```bash
 ./live/run.sh                   # full-refresh
@@ -104,7 +104,7 @@ Each driver creates its own `hc_phase*_*` dataset, runs end-to-end, and cleans u
 
 The live tour is a recorded demo. [`RECORDING.md`](./RECORDING.md) is the standalone shooting script: a seven-shot order (compile smoke → full-refresh → discover → merge → time-interval → drift → cost cross-check), each with the command, what it proves, and a caption, plus the pre-flight env vars and binary setup.
 
-The recording is recorder-agnostic on purpose — the repo's `cli-recording/` vhs tapes are local-DuckDB and no-creds, and vhs's fixed `Sleep` pacing can't track multi-minute live BigQuery jobs — so capture with asciinema, a screen recorder, or whatever you prefer. The env vars are the same as the live run:
+The recording is recorder-agnostic on purpose: the repo's `cli-recording/` vhs tapes are local-DuckDB and no-creds, and vhs's fixed `Sleep` pacing can't track multi-minute live BigQuery jobs, so capture with asciinema, a screen recorder, or whatever you prefer. The env vars are the same as the live run:
 
 ```bash
 export GCP_PROJECT_ID="<your-gcp-project-id>"          # BIGQUERY_TEST_PROJECT also accepted
@@ -127,7 +127,7 @@ The live demo prints a subset of the run receipt for fast inspection:
     status          : Success
 ```
 
-`bytes_scanned` and `cost_usd` are zero because the full-refresh model is a constant `SELECT` literal with no source — BigQuery exempts such queries from the 10 MB minimum bill. Real scans surface non-zero figures; see `live/merge/run.sh` and `live/cost-cross-check/run.sh` for runs that exercise the cost path.
+`bytes_scanned` and `cost_usd` are zero because the full-refresh model is a constant `SELECT` literal with no source; BigQuery exempts such queries from the 10 MB minimum bill. Real scans surface non-zero figures; see `live/merge/run.sh` and `live/cost-cross-check/run.sh` for runs that exercise the cost path.
 
 ## Conformance audit
 

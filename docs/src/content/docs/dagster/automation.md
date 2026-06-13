@@ -47,8 +47,8 @@ Returns `dg.AutomationCondition.on_cron(cron_schedule, timezone)`, which fires o
 the cron schedule, but only after upstream dependencies have updated since
 the previous tick.
 
-This is more intelligent than a plain `ScheduleDefinition` because it waits
-for fresh upstream data before firing.
+Unlike a plain `ScheduleDefinition`, it waits for fresh upstream data before
+firing.
 
 ```python
 from dagster_rocky import rocky_cron_automation

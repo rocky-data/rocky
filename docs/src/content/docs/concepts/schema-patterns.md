@@ -141,7 +141,7 @@ Target table: `acme_warehouse.staging__us_west__shopify.<table_name>`
 
 ### Pinning the join separator at the use site
 
-By default, multi-valued components (`{regions}`) are joined with the caller-supplied separator. Different call sites supply different separators: target rendering uses `target.separator` while `metadata_columns.value` uses `pattern.separator`. The same placeholder can therefore resolve to different strings depending on which TOML field it appears in — a footgun for templates that hash or compare the rendered value (RLS keys, audit hashes).
+By default, multi-valued components (`{regions}`) are joined with the caller-supplied separator. Different call sites supply different separators: target rendering uses `target.separator` while `metadata_columns.value` uses `pattern.separator`. The same placeholder can therefore resolve to different strings depending on which TOML field it appears in, a footgun for templates that hash or compare the rendered value (RLS keys, audit hashes).
 
 Use `{name:SEP}` to pin the join separator at the use site:
 
@@ -200,7 +200,7 @@ schema_template = "{department}__{system}"
 
 ## Filtering by parsed component
 
-Once your sources are parsed into components, you can scope `rocky plan` and `rocky compare` (and the `rocky run` alias) to a subset via the `--filter` flag. The filter key is one of the component names you declared above (or the reserved `id`), and the value is matched against the parsed value — with containment semantics for multi-valued (`...`) components:
+Once your sources are parsed into components, you can scope `rocky plan` and `rocky compare` (and the `rocky run` alias) to a subset via the `--filter` flag. The filter key is one of the component names you declared above (or the reserved `id`), and the value is matched against the parsed value, with containment semantics for multi-valued (`...`) components:
 
 ```sh
 # Plan everything for tenant "acme" (then `rocky apply <plan-id>` to execute)

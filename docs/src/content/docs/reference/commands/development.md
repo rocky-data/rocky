@@ -1,6 +1,6 @@
 ---
 title: Development Commands
-description: Commands for local development — playground, dbt import, HTTP server, LSP, and adapter scaffolding
+description: "Commands for local development: playground, dbt import, HTTP server, LSP, and adapter scaffolding"
 sidebar:
   order: 4
 ---
@@ -111,8 +111,8 @@ Connection secrets (passwords, API tokens, service-account JSON) are emitted as 
 
 Listed in every emitted `MIGRATION-NOTES.md`:
 
-- Singular dbt tests (custom SQL files in `tests/`) — not translated.
-- Macros and `dbt_packages/` — skipped. The [hybrid-dbt-packages POC](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/06-hybrid-dbt-packages) is the documented escape hatch.
+- Singular dbt tests (custom SQL files in `tests/`): not translated.
+- Macros and `dbt_packages/`: skipped. The [hybrid-dbt-packages POC](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/06-hybrid-dbt-packages) is the documented escape hatch.
 
 The four built-in dbt generic tests (`unique`, `not_null`, `accepted_values`, `relationships`) translate to native Rocky `[[checks]]` on the matching per-model sidecar (shipped in engine v1.27.0). Tests referencing columns Rocky didn't translate are listed in `MIGRATION-NOTES.md` under "Not Translated" rather than silently dropped.
 
@@ -164,7 +164,7 @@ Re-run after fixing the dbt source, replacing the previous emit:
 rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --overwrite
 ```
 
-End-to-end migration in one shot — emit, then compile to verify the result is loadable:
+End-to-end migration in one shot (emit, then compile to verify the result is loadable):
 
 ```bash
 rocky import-dbt --dbt-project ~/projects/acme-dbt --output-dir ./acme-rocky --overwrite \
@@ -512,7 +512,7 @@ The `auth` check pings each registered warehouse adapter (via `SELECT 1` or an a
 
 The `state_rw` check (v1.13.0+) runs a put → get → delete probe against the configured state backend so IAM and reachability problems surface at cold start rather than at end-of-run upload. Local backend is a no-op; tiered probes both legs.
 
-The `--verbose` flag (v1.20.0+) prints extra per-check context inline: config path, state file size, adapter type and credential signal (`token`, `oauth_client`, `oauth_token`, `key_pair`, `password`, `service_account`, `adc`, `env`, `none`), pipeline kind (`replication` / `transformation` / `quality` / `snapshot`), and state backend. JSON output is unchanged when `--verbose` is not passed — the new `details` array on each `HealthCheck` only serializes when populated, so existing consumers see byte-stable envelopes.
+The `--verbose` flag (v1.20.0+) prints extra per-check context inline: config path, state file size, adapter type and credential signal (`token`, `oauth_client`, `oauth_token`, `key_pair`, `password`, `service_account`, `adc`, `env`, `none`), pipeline kind (`replication` / `transformation` / `quality` / `snapshot`), and state backend. JSON output is unchanged when `--verbose` is not passed: the new `details` array on each `HealthCheck` only serializes when populated, so existing consumers see byte-stable envelopes.
 
 See the [CLI Reference](/reference/cli/#rocky-doctor) for the full check list and JSON output format.
 
