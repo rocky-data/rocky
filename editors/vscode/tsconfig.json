@@ -10,7 +10,8 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true
+    "resolveJsonModule": true,
+    "types": ["node", "vscode", "mocha"]
   },
   "include": ["src"],
   "exclude": ["node_modules", "out", "src/__tests__"]
