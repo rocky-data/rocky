@@ -1,7 +1,6 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import { getConfig } from "./config";
-import { shellQuote } from "./shell";
 
 const SUPPORTED_EXTENSIONS = new Set([".rocky", ".sql"]);
 
@@ -130,34 +129,63 @@ function makeLens(
 }
 
 /**
- * Runs `rocky run --filter name=<model>` in the integrated terminal.
+ * Build the argv for `rocky run --filter name=<model> --output json`.
+ *
+ * The model name is a discrete argv element, never spliced into a shell command
+ * string. Exported so the security invariant (the model name reaches the CLI as
+ * one literal argument, with zero shell interpretation) can be unit-tested.
  */
-function runModelInTerminal(modelName: string): void {
-  const cfg = getConfig();
-  // Quote the entire `name=<model>` token together so the `name=` prefix sits
-  // inside the same shell-quoted argv slot as the value — keeps it a single
-  // argv element even if the model name contains shell metacharacters.
-  const cmd = `${shellQuote(cfg.serverPath)} run --filter ${shellQuote(`name=${modelName}`)} --output json`;
-  const terminal = vscode.window.createTerminal({
-    name: `Rocky: run ${modelName}`,
-    iconPath: new vscode.ThemeIcon("play"),
-  });
-  terminal.show();
-  terminal.sendText(cmd);
+export function buildRunModelArgs(modelName: string): string[] {
+  return ["run", "--filter", `name=${modelName}`, "--output", "json"];
 }
 
 /**
- * Runs `rocky compile --model <model>` in the integrated terminal.
+ * Build the argv for `rocky compile --model <model> --output json`. See
+ * [`buildRunModelArgs`] for the literal-argv-element invariant.
+ */
+export function buildCompileModelArgs(modelName: string): string[] {
+  return ["compile", "--model", modelName, "--output", "json"];
+}
+
+/**
+ * Execute a model-scoped rocky command as a VS Code task.
+ *
+ * Uses [`vscode.ProcessExecution`] with an argv array rather than a shell
+ * command string passed to `Terminal.sendText`, so the model name (derived from
+ * a workspace file name an attacker could control via a cloned repo) is passed
+ * as a single literal argument the shell never parses. Mirrors `taskProvider.ts`.
+ * The task terminal still streams live output, matching the previous UX.
+ */
+function runModelTask(args: string[], label: string): void {
+  const cfg = getConfig();
+  const exec = new vscode.ProcessExecution(cfg.serverPath, args);
+  const task = new vscode.Task(
+    { type: "rocky", command: args[0] },
+    vscode.TaskScope.Workspace,
+    label,
+    "rocky",
+    exec,
+  );
+  task.presentationOptions = {
+    reveal: vscode.TaskRevealKind.Always,
+    panel: vscode.TaskPanelKind.Dedicated,
+    clear: true,
+  };
+  void vscode.tasks.executeTask(task);
+}
+
+/**
+ * Runs `rocky run --filter name=<model>` as a task (argv, no shell).
+ */
+function runModelInTerminal(modelName: string): void {
+  runModelTask(buildRunModelArgs(modelName), `run ${modelName}`);
+}
+
+/**
+ * Runs `rocky compile --model <model>` as a task (argv, no shell).
  */
 function compileModelInTerminal(modelName: string): void {
-  const cfg = getConfig();
-  const cmd = `${shellQuote(cfg.serverPath)} compile --model ${shellQuote(modelName)} --output json`;
-  const terminal = vscode.window.createTerminal({
-    name: `Rocky: compile ${modelName}`,
-    iconPath: new vscode.ThemeIcon("file-code"),
-  });
-  terminal.show();
-  terminal.sendText(cmd);
+  runModelTask(buildCompileModelArgs(modelName), `compile ${modelName}`);
 }
 
 export function registerCodeLensProvider(
