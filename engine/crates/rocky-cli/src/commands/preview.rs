@@ -83,6 +83,10 @@ pub async fn run_preview_create(
 ) -> Result<()> {
     let start = Instant::now();
 
+    // `base_ref` is operator-/CI-supplied and flows into `git` as a positional
+    // argument; reject option-looking values before any git invocation.
+    crate::commands::ci_diff::validate_base_ref(base_ref)?;
+
     let head_ref = git_head_sha().unwrap_or_else(|_| "HEAD".to_string());
 
     // Step 1+2: identify changed model files between base and HEAD.

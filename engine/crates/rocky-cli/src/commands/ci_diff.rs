@@ -34,6 +34,28 @@ struct ChangedFile {
     status: char,
 }
 
+/// Reject a `base_ref` that git would interpret as an option rather than a
+/// revision.
+///
+/// `base_ref` is operator- or CI-supplied (commonly wired from a PR/branch
+/// variable such as `${{ github.base_ref }}`). The diff helpers below pass it
+/// to `git diff` / `git ls-tree` / `git show` as a positional argument, so a
+/// value beginning with `-` could smuggle flags into those invocations
+/// (argument injection). Refs that begin with `-` are never valid revisions,
+/// and an empty ref is meaningless here, so rejecting both fully closes the
+/// vector without constraining legitimate refs (`origin/main`, `HEAD~3`, a SHA).
+pub(crate) fn validate_base_ref(base_ref: &str) -> Result<()> {
+    if base_ref.is_empty() {
+        anyhow::bail!("base ref must not be empty");
+    }
+    if base_ref.starts_with('-') {
+        anyhow::bail!(
+            "invalid base ref '{base_ref}': must not begin with '-' (git would read it as an option)"
+        );
+    }
+    Ok(())
+}
+
 /// Run `git diff --name-status` between `base_ref` and HEAD to find changed files.
 ///
 /// Uses three-dot syntax (`base...HEAD`) for merge-base semantics — this matches
@@ -480,6 +502,8 @@ pub(crate) fn compute_ci_diff(
     models_dir: &Path,
     cache_ttl_override: Option<u64>,
 ) -> Result<CiDiffData> {
+    validate_base_ref(base_ref)?;
+
     // Load cached source schemas once and seed both compiles (current
     // tree + base ref) with the same map so the resulting per-model
     // type diffs measure real schema drift rather than
@@ -724,6 +748,19 @@ pub fn run_ci_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_base_ref_rejects_option_injection() {
+        // A leading-dash ref would otherwise smuggle flags into the git
+        // invocations (e.g. via ${{ github.base_ref }} in CI).
+        assert!(validate_base_ref("--upload-pack=touch /tmp/pwned").is_err());
+        assert!(validate_base_ref("-foo").is_err());
+        assert!(validate_base_ref("").is_err());
+        // Legitimate revisions still pass.
+        assert!(validate_base_ref("origin/main").is_ok());
+        assert!(validate_base_ref("HEAD~3").is_ok());
+        assert!(validate_base_ref("abc1234").is_ok());
+    }
 
     // -----------------------------------------------------------------------
     // parse_name_status
