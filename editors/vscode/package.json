@@ -1002,7 +1002,7 @@
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.9.1",
     "@xyflow/react": "^12.11.0",
-    "esbuild": "^0.28.0",
+    "esbuild": "^0.28.1",
     "eslint": "^10.4.1",
     "glob": "^13.0.6",
     "jsdom": "^29.1.1",
