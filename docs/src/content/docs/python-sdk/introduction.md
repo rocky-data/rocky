@@ -40,6 +40,8 @@ run = client.run(filter="tenant=acme", log_callback=print)
 print(f"{run.tables_copied} copied, {run.tables_failed} failed, {run.duration_ms} ms")
 ```
 
+A complete runnable version lives in the repo at [`sdk/python/examples/quickstart.py`](https://github.com/rocky-data/rocky/blob/main/sdk/python/examples/quickstart.py). It spins up a throwaway DuckDB playground (no credentials) and walks through compile, lineage, a real run, and typed error handling.
+
 ## Errors
 
 Failures raise a `RockyError` subclass carrying structured fields, so you branch on the cause instead of parsing a message.

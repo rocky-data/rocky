@@ -31,5 +31,21 @@ jobs:
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       - run: uv sync --dev
       - run: uv run python -m pytest -v
-      - run: uv run python -m ruff check src/ tests/
-      - run: uv run python -m ruff format --check src/ tests/
+      - run: uv run python -m ruff check src/ tests/ examples/
+      - run: uv run python -m ruff format --check src/ tests/ examples/
+
+  smoke:
+    name: Example smoke (real binary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - name: Install the rocky binary (latest engine release)
+        # The unit tests mock the binary; this job drives the SDK against a real
+        # rocky to catch breakage the mocks can't (argv, exit codes, JSON shapes).
+        run: |
+          bash "$GITHUB_WORKSPACE/engine/install.sh"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: uv sync
+      - name: Run the SDK quickstart against a generated playground
+        run: uv run python examples/quickstart.py

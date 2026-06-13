@@ -74,6 +74,16 @@ except RockyCommandError as exc:
 | `RockyServerError` | a `rocky serve` HTTP request failed |
 | `RockyGovernanceError` | a `governance_override` would silently full-revoke |
 
+## Example
+
+A runnable end-to-end script lives at [`examples/quickstart.py`](examples/quickstart.py). With the `rocky` binary on your `PATH`:
+
+```bash
+python examples/quickstart.py
+```
+
+It spins up a throwaway DuckDB playground (no credentials) and walks through compile, DAG, lineage, a real run, and typed error handling.
+
 ## License
 
 Apache-2.0
