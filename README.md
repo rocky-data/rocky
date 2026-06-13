@@ -221,7 +221,7 @@ Building a warehouse Rocky doesn't ship in-tree (ClickHouse, Redshift, …)? See
 ```bash
 git clone https://github.com/rocky-data/rocky.git
 cd rocky
-just build       # builds engine + dagster wheel + vscode extension
+just build       # builds engine + sdk + dagster wheels + vscode extension
 just test        # runs all test suites
 just lint        # cargo clippy/fmt + ruff + eslint
 ```
@@ -233,6 +233,7 @@ just lint        # cargo clippy/fmt + ruff + eslint
 Each artifact is released independently using a tag-namespaced scheme:
 
 - `engine-v*` → Rocky CLI binary (cross-compiled, on GitHub Releases)
+- `sdk-v*` → `rocky-sdk` wheel (publish before a `dagster-v*` that raises its `rocky-sdk` floor)
 - `dagster-v*` → `dagster-rocky` wheel
 - `vscode-v*` → Rocky VSIX
 
@@ -240,7 +241,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md#releases) for the full release flow.
 
 ## Documentation
 
-Full documentation lives at **[rocky-data.dev](https://rocky-data.dev)**: concepts, guides, CLI reference, Dagster integration, and the adapter SDK.
+Full documentation lives at **[rocky-data.dev](https://rocky-data.dev)**: concepts, guides, CLI reference, the Python SDK, Dagster integration, and the adapter SDK.
 
 ## Contributing
 
