@@ -1,7 +1,7 @@
 # 08-portability-lint — Trust arc 6: compile-time portability gate
 
 > **Category:** 06-developer-experience
-> **Credentials:** none (no warehouse needed — lint is AST-based)
+> **Credentials:** none (no warehouse needed, lint is AST-based)
 > **Runtime:** < 2s
 > **Rocky features:** `--target-dialect`, P001 `NonPortableConstruct`, `[portability]` block, `-- rocky-allow` pragma
 
@@ -10,7 +10,7 @@
 Compile-time rejection of dialect-divergent SQL. `rocky compile
 --target-dialect bq` parses every model with `sqlparser-rs`, walks the
 AST, and emits error-severity **P001** diagnostics for any construct
-that the target warehouse doesn't support (NVL, QUALIFY, DATEADD, etc —
+that the target warehouse doesn't support (NVL, QUALIFY, DATEADD, etc.,
 20 known constructs).
 
 Three escape hatches:
@@ -30,7 +30,7 @@ Three escape hatches:
   at the construct's exact byte range for editor squiggles.
 - **Polyglot correctness at compile time.** dbt packages you hope
   travel; Rocky rejects the non-portable construct at compile-time
-  with a targeted suggestion — before the warehouse sees it.
+  with a targeted suggestion, before the warehouse sees it.
 
 ## Layout
 
@@ -68,5 +68,5 @@ Three escape hatches:
 - Engine source: `engine/crates/rocky-compiler/src/portability.rs`,
   `engine/crates/rocky-sql/src/pragma.rs`
 - CLI surface: `rocky compile --target-dialect {dbx,sf,bq,duckdb}`
-- Companion arc: Arc 7 blast-radius lint (P002 `SELECT *`) — see
+- Companion arc: Arc 7 blast-radius lint (P002 `SELECT *`); see
   [`09-sql-types-blast-radius/`](../09-sql-types-blast-radius/)

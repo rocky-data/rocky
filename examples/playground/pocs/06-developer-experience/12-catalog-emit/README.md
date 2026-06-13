@@ -79,10 +79,10 @@ self-contained, machine-consumable lineage artefact under
 
 - Engine source: `engine/crates/rocky-cli/src/commands/catalog.rs`
 - Sibling POC:
-  [`01-lineage-column-level/`](../01-lineage-column-level/) — `rocky
+  [`01-lineage-column-level/`](../01-lineage-column-level/), which runs `rocky
   lineage` for interactive single-model lineage queries (the catalog is
   the bulk-export equivalent).
 - Sibling POC:
-  [`11-lineage-diff/`](../11-lineage-diff/) — `rocky lineage-diff` for
+  [`11-lineage-diff/`](../11-lineage-diff/), which runs `rocky lineage-diff` for
   PR-time blast radius (compares two refs at compile time, doesn't
   persist).

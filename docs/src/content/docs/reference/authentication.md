@@ -5,7 +5,7 @@ sidebar:
   order: 9
 ---
 
-Rocky supports two authentication methods for connecting to **Databricks** warehouses. They are auto-detected based on which credentials are available. These apply to all Databricks API calls — SQL Statement Execution, Unity Catalog operations, and workspace bindings.
+Rocky supports two authentication methods for connecting to **Databricks** warehouses. They are auto-detected based on which credentials are available. These apply to all Databricks API calls: SQL Statement Execution, Unity Catalog operations, and workspace bindings.
 
 ## PAT (Personal Access Token)
 
@@ -45,7 +45,7 @@ token = "${DATABRICKS_TOKEN}"
 
 ## Environment Variable Substitution
 
-Rocky substitutes `${VAR_NAME}` references in `rocky.toml` at parse time. This means you can keep secrets out of your config files and inject them from the environment, CI/CD variables, or a secrets manager.
+Rocky substitutes `${VAR_NAME}` references in `rocky.toml` at parse time. Keep secrets out of your config files and inject them from the environment, CI/CD variables, or a secrets manager.
 
 ## Detection Order
 

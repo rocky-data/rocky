@@ -1,6 +1,6 @@
 # 06-schema-drift-recover — Drift detection on incremental runs
 
-![Two rocky run invocations sandwiching an ALTER TABLE — the second run reports "Drift: 1/1 tables drifted"](../../../../../docs/public/demo-drift-recover.gif)
+![Two rocky run invocations sandwiching an ALTER TABLE, the second run reports "Drift: 1/1 tables drifted"](../../../../../docs/public/demo-drift-recover.gif)
 
 > **Category:** 02-performance
 > **Credentials:** none (DuckDB)
@@ -12,9 +12,9 @@
 Two `rocky run` invocations against the same source, with the source's
 column type changed in between:
 
-1. Run 1 — `amount` is `DECIMAL(10,2)`, full refresh succeeds, watermark recorded.
+1. Run 1: `amount` is `DECIMAL(10,2)`, full refresh succeeds, watermark recorded.
 2. Source schema mutated: `ALTER TABLE raw__orders.orders ALTER COLUMN amount TYPE VARCHAR`.
-3. Run 2 — drift detection runs as part of the incremental path, detects an
+3. Run 2: drift detection runs as part of the incremental path, detects an
    unsafe type change (`DECIMAL → VARCHAR`), drops the target, and full-refreshes.
 
 ## Why it's distinctive

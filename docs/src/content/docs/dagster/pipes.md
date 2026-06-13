@@ -12,11 +12,10 @@ Rust `tracing` layer writes `info!()` / `warn!()` macros) to
 `context.log.info` line-by-line as the run progresses, and parses the
 final stdout JSON into a `RunResult` after the subprocess exits.
 
-This unblocks **live progress visibility** for long-running pipelines.
-Without it, the Dagster run viewer shows nothing for the duration of a
-30-minute `rocky run` and dumps the entire log at the end. With it,
-users see each model copy / contract check / drift action as it
-happens.
+This gives long-running pipelines live progress visibility. Without it,
+the Dagster run viewer shows nothing for the duration of a 30-minute
+`rocky run` and dumps the entire log at the end. With it, users see each
+model copy / contract check / drift action as it happens.
 
 ## Quickstart
 
@@ -203,7 +202,7 @@ cannot persist a plan, so `run_pipes` falls back to a single
 `rocky run` Pipes invocation. No `plan_id` is attached to `extras` in
 that case.
 
-**This is the canonical Dagster Pipes integration pattern.**
+This is the canonical Dagster Pipes integration pattern.
 
 ## Engine-side: Dagster Pipes message emission
 

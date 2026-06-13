@@ -5,7 +5,7 @@ sidebar:
   order: 6
 ---
 
-Rocky uses an embedded key-value store to track watermarks and run history. No external database is required — state is stored in a local file that Rocky manages automatically.
+Rocky uses an embedded key-value store to track watermarks and run history. No external database is required; state is stored in a local file that Rocky manages automatically.
 
 ## Backend
 
@@ -22,7 +22,7 @@ rocky --state-path /var/lib/rocky/state.redb apply "$plan_id"
 
 ## Per-namespace state files
 
-redb permits **one writer per state file**. When you fan out one `rocky run` per pipeline or per client against the single global `.rocky-state.redb`, those independent runs serialize on one advisory lock — even though they touch unrelated watermarks. Namespacing gives each run its own state file so they proceed concurrently.
+redb permits **one writer per state file**. When you fan out one `rocky run` per pipeline or per client against the single global `.rocky-state.redb`, those independent runs serialize on one advisory lock, even though they touch unrelated watermarks. Namespacing gives each run its own state file so they proceed concurrently.
 
 This is **opt-in and default-off**: with neither knob set, Rocky uses the single global state file, byte-identical to before.
 
@@ -42,10 +42,10 @@ Or make each pipeline namespace itself by default in `rocky.toml`:
 namespacing = "pipeline"   # each pipeline → <models>/.rocky-state/<pipeline>.redb
 ```
 
-The per-invocation `--state-namespace` flag overrides the config (use it to fan out by client/tenant rather than by pipeline name). An explicit `--state-path` is a hard override that **disables** namespacing for that invocation — it always wins, so a `--state-namespace` typo can't error out a run the explicit path already pins.
+The per-invocation `--state-namespace` flag overrides the config (use it to fan out by client/tenant rather than by pipeline name). An explicit `--state-path` is a hard override that **disables** namespacing for that invocation; it always wins, so a `--state-namespace` typo can't error out a run the explicit path already pins.
 
 :::note[Namespaced files start fresh]
-A new namespace's file starts empty — the legacy global file is never moved or auto-seeded. Carry watermarks forward manually if you need them (copy the global file to `<models>/.rocky-state/<key>.redb`, or point `--state-path` at it for the first run). See the [`[state]` configuration reference](/reference/configuration/#state) for the full field.
+A new namespace's file starts empty; the legacy global file is never moved or auto-seeded. Carry watermarks forward manually if you need them (copy the global file to `<models>/.rocky-state/<key>.redb`, or point `--state-path` at it for the first run). See the [`[state]` configuration reference](/reference/configuration/#state) for the full field.
 :::
 
 ## What it stores
@@ -88,7 +88,7 @@ At the start of each table's replication, Rocky reads the watermark from the sta
 
 ### 2. No watermark (first run)
 
-If no watermark exists for a table, Rocky performs a full refresh — it copies all rows from the source.
+If no watermark exists for a table, Rocky performs a full refresh: it copies all rows from the source.
 
 ### 3. Watermark exists (incremental run)
 
@@ -199,7 +199,7 @@ If download fails, Rocky logs a warning and starts fresh from target-table metad
 
 ### Retry and Failure Policy
 
-Every remote transfer (upload *or* download) runs inside a wall-clock budget with exponential-backoff retries and a three-state circuit breaker — the same machinery the Databricks and Snowflake adapters already use. Configuration lives under `[state.retry]` in `rocky.toml`; the full field list is in the [configuration reference](/reference/configuration/#stateretry).
+Every remote transfer (upload *or* download) runs inside a wall-clock budget with exponential-backoff retries and a three-state circuit breaker, the same machinery the Databricks and Snowflake adapters already use. Configuration lives under `[state.retry]` in `rocky.toml`; the full field list is in the [configuration reference](/reference/configuration/#stateretry).
 
 ```toml
 [state]

@@ -27,7 +27,7 @@ Each driver:
 
 - Incremental strategy as a transformation pipeline (the
   transformation incremental path has no callers in the repo and
-  `sql_gen` ignores `timestamp_column` — separate design call).
+  `sql_gen` ignores `timestamp_column`, a separate design call).
 - Time-interval failure-path (forced mid-transaction error → BQ
   auto-rollback). The script-as-transaction shape proves the happy
   path; rollback semantics are a separate property worth its own test.
@@ -53,7 +53,7 @@ Each script exits 0 on success after dropping its target dataset.
 Model sidecar TOMLs (and the time-interval / merge / cost-cross-check
 model SQL, which references source tables by 3-part name) need a
 project-qualified reference. Model files don't honor `${VAR}` env
-substitution today (only `rocky.toml` does — see finding 2 below), so
+substitution today (only `rocky.toml` does; see finding 2 below), so
 each driver writes a `__GCP_PROJECT__` placeholder into its committed
 files and substitutes it at runtime by staging the config + models
 into a temp dir, running `sed -i "s|__GCP_PROJECT__|${GCP_PROJECT_ID}|g"`
@@ -71,7 +71,7 @@ means that path is unchanged.
 
 Adapter-side gaps to revisit separately:
 
-1. ~~No `BigQueryDiscoveryAdapter`~~ — **shipped**. BQ now
+1. ~~No `BigQueryDiscoveryAdapter`~~: **shipped**. BQ now
    supports both `WarehouseAdapter` and `DiscoveryAdapter` traits;
    `adapter_capability.rs` reports `BOTH`. Replication-from-BQ
    pipelines work end-to-end (see `discover/run.sh`).
@@ -82,7 +82,7 @@ Adapter-side gaps to revisit separately:
    work; it doesn't.
 3. **`auto_create_schemas` is unwired in the transformation run path.**
    `engine/crates/rocky-cli/src/commands/run_local.rs::run_transformation`
-   never reads `pipeline.target.governance.auto_create_schemas` — only
+   never reads `pipeline.target.governance.auto_create_schemas`; only
    the replication path (`run.rs:1350`) does. As a result, `rocky run`
    on a transformation pipeline errors with 404 unless the dataset
    already exists. The drivers pre-create the dataset via `bq mk` to
@@ -97,12 +97,12 @@ Adapter-side gaps to revisit separately:
 5. **MERGE requires explicit `update_columns` on BigQuery.** When the
    model TOML omits the list, the dialect emits the shorthand
    `UPDATE SET target = source` (`dialect.rs:54`). BigQuery rejects
-   this with `UPDATE ... SET does not support updating the entire row`
-   — it needs explicit per-column assignments. The merge model
+   this with `UPDATE ... SET does not support updating the entire row`,
+   requiring explicit per-column assignments. The merge model
    declares `update_columns = ["name", "amount"]` to sidestep it.
    Snowflake/DuckDB may accept the shorthand; not verified.
-6. ~~`bytes_scanned` is `totalBytesProcessed`, not `totalBytesBilled`~~
-   — **fixed**. `execute_statement_with_stats` now follows up
+6. ~~`bytes_scanned` is `totalBytesProcessed`, not `totalBytesBilled`~~:
+   **fixed**. `execute_statement_with_stats` now follows up
    `jobs.query` with a `jobs.get` call to enrich the response with
    the full `statistics` block (where `totalBytesBilled` lives, with
    the 10 MB minimum-bill floor applied). The merge and time-interval
@@ -114,12 +114,12 @@ Adapter-side gaps to revisit separately:
    cost wire-up runs but the figure is `0` rather than missing. Real
    models that scan source tables produce non-zero values (verified
    via `live/merge/run.sh` and `live/time-interval/run.sh`).
-8. ~~`detect_drift` ignores added columns~~ — **fixed**.
+8. ~~`detect_drift` ignores added columns~~: **fixed**.
    `detect_drift` now populates `added_columns: Vec<ColumnInfo>` for
    source columns missing from the target, and the runtime issues
    `ALTER TABLE ADD COLUMN` for each before the next INSERT. The
    drift smoke test exercises this in stage 2 (`add_columns` action).
-9. ~~`alter_column_types` drift action is detected but not wired~~ —
+9. ~~`alter_column_types` drift action is detected but not wired~~:
    **fixed**. `is_safe_type_widening` and `alter_column_type_sql` now
    live on the `SqlDialect` trait so each adapter declares its own
    widening semantics + SQL emit. The BigQuery dialect override
@@ -127,7 +127,7 @@ Adapter-side gaps to revisit separately:
    `ALTER COLUMN SET DATA TYPE`: `INT64 → NUMERIC`, `INT64 →
    BIGNUMERIC`, `NUMERIC → BIGNUMERIC`. Lossy conversions (`… →
    FLOAT64`) and unsupported targets (`… → STRING`, despite being
-   lossless at the value level — BQ's ALTER rejects this with
+   lossless at the value level, since BQ's ALTER rejects this with
    `existing column type X is not assignable to STRING`) are
    excluded; drift involving them falls through to
    `drop_and_recreate`. Stage 4 of `drift/run.sh` exercises the path

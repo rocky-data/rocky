@@ -11,7 +11,7 @@ A transformation pipeline materialises two models into a target schema (`poc.mar
 
 ## Why it's distinctive
 
-- **Engine v1.29.0 fix.** Pre-v1.29.0 the setting was silently a no-op on transformation pipelines — only the replication path honoured it. Runs failed at execute time with `Catalog Error: Schema with name mart does not exist`. This POC is the regression guard: the pre-condition asserts the target schema is absent, and the run succeeds end-to-end.
+- **Engine v1.29.0 fix.** Pre-v1.29.0 the setting was silently a no-op on transformation pipelines; only the replication path honoured it. Runs failed at execute time with `Catalog Error: Schema with name mart does not exist`. This POC is the regression guard: the pre-condition asserts the target schema is absent, and the run succeeds end-to-end.
 - **One config knob, zero `CREATE SCHEMA` boilerplate.** Without `auto_create_schemas`, users hand-author the schema before every fresh deploy.
 
 ## Layout
@@ -62,7 +62,7 @@ stg_orders
 
 1. `seeds/seed.sql` populates `raw__orders.orders` with 8 rows; the `poc.mart` target schema is intentionally not pre-created.
 2. The precondition query against `information_schema.schemata` confirms `poc.mart` is absent.
-3. `rocky run` compiles the two models, then — because `auto_create_schemas = true` is set on `[pipeline.transform.target.governance]` — pre-creates the unique `(catalog, schema)` pairs declared by the model set (here, just `poc.mart`) before executing per-model SQL.
+3. `rocky run` compiles the two models, then (because `auto_create_schemas = true` is set on `[pipeline.transform.target.governance]`) pre-creates the unique `(catalog, schema)` pairs declared by the model set (here, just `poc.mart`) before executing per-model SQL.
 4. Both models materialise: `stg_orders` filters the cancelled orders out (6 of 8 rows), `order_revenue_by_customer` aggregates by `customer_id` (4 distinct customers).
 5. The postcondition queries show the schema now exists and contains both tables.
 

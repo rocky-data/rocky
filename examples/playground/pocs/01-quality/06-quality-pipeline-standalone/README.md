@@ -7,7 +7,7 @@
 
 ## What it shows
 
-Rocky's quality pipeline type — a dedicated pipeline that runs data quality checks against existing tables **without any data movement**. Unlike inline checks (which run during replication), the quality pipeline is:
+Rocky's quality pipeline type is a dedicated pipeline that runs data quality checks against existing tables **without any data movement**. Unlike inline checks (which run during replication), the quality pipeline is:
 
 - A standalone pipeline with its own schedule
 - Targeted at specific schemas/tables
@@ -35,7 +35,7 @@ Rocky's quality pipeline type — a dedicated pipeline that runs data quality ch
   an `_error_<assertion>` label column identifying which assertion it
   violated. Warning-severity assertions stay observational and do not drive
   the split.
-- **dbt comparison:** dbt tests are tightly coupled to models; Rocky quality pipelines are standalone
+- **dbt comparison:** dbt tests are coupled to models; Rocky quality pipelines run independently
 
 ## Layout
 
@@ -86,21 +86,21 @@ fail_on_error = false → pipeline exits 0 even with error-severity failures.
 
 ## What happened
 
-1. `rocky validate` checked both pipelines — replication + quality
+1. `rocky validate` checked both pipelines: replication + quality
 2. `ingest` pipeline replicated orders and customers into staging schemas
 3. `nightly_dq` pipeline ran standalone checks against the staged tables:
    - **row_count:** verified tables are non-empty
    - **column_match (warning):** verified schema consistency between source and target
    - **freshness (warning):** verified data is less than 24h old
-   - **`[[checks.assertions]]`:** unified `TestDecl`-style row-level checks —
-     `not_null`, `accepted_values`, `expression`, `unique`, `row_count_range` —
+   - **`[[checks.assertions]]`:** unified `TestDecl`-style row-level checks
+     (`not_null`, `accepted_values`, `expression`, `unique`, `row_count_range`),
      each with its own `severity`
 4. `fail_on_error = false` suppresses the non-zero exit so the POC stays green.
    Remove it (or set `true`) to wire the quality pipeline into CI as a gate.
 5. **Row quarantine on `orders`:** `[checks.quarantine] mode = "split"` writes
    `orders__valid` (197 rows) and `orders__quarantine` (3 rows). The
    quarantine table carries `_error_orders_customer_id_required` /
-   `_error_orders_status_allowed` label columns — only the assertion that
+   `_error_orders_status_allowed` label columns; only the assertion that
    each row violated is non-NULL. The warning-severity `amount >= 0`
    assertion (row 99) is **not** lowered into the predicate and stays in
    `orders__valid`.

@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-You don't need to convert your dbt packages to use Rocky. Packages like [fivetran/facebook_ads](https://hub.getdbt.com/fivetran/facebook_ads/latest/) or [fivetran/stripe](https://hub.getdbt.com/fivetran/stripe/latest/) produce tables in your warehouse that Rocky can reference directly as external sources. This lets you keep battle-tested staging packages while writing your custom analytics in Rocky.
+You don't need to convert your dbt packages to use Rocky. Packages like [fivetran/facebook_ads](https://hub.getdbt.com/fivetran/facebook_ads/latest/) or [fivetran/stripe](https://hub.getdbt.com/fivetran/stripe/latest/) produce tables in your warehouse that Rocky can reference directly as external sources. This lets you keep vendor-maintained staging packages while writing your custom analytics in Rocky.
 
 ## How it works
 

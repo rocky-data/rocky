@@ -122,34 +122,34 @@ If an upstream schema change only affects the `status` column, Rocky determines:
 
 This is a `PropagationDecision`: either `Recompute` or `Skip { reason }`. The skip reason is logged so you can verify the decision.
 
-Column propagation works with any incremental strategy. It adds a layer of intelligence on top of watermarks or checksums by pruning the DAG execution to only what actually needs to change.
+Column propagation works with any incremental strategy. On top of watermarks or checksums, it prunes the DAG execution to only what actually needs to change.
 
 ## Skipping unchanged models
 
 The strategies above decide *how* a model rebuilds. The opt-in `--skip-unchanged` gate decides *whether* a transformation model needs to rebuild at all: it skips re-materializing a model when both its logic and its upstream data look unchanged since the model's last successful build. It is a best-effort cost-saving optimization, **not** a guarantee that two runs produce identical rows.
 
-The gate is **default-off** — a plain `rocky run` is byte-identical to one without it. Turn it on per invocation with `--skip-unchanged`, or project-wide with `[run] skip_unchanged = true`.
+The gate is **default-off**: a plain `rocky run` is byte-identical to one without it. Turn it on per invocation with `--skip-unchanged`, or project-wide with `[run] skip_unchanged = true`.
 
 ### The two gates: logic and data
 
-A model is skipped only when **both** of these hold (skipping on logic alone — ignoring whether upstream data changed — is precisely the staleness bug the gate exists to prevent):
+A model is skipped only when **both** of these hold (skipping on logic alone, ignoring whether upstream data changed, is precisely the staleness bug the gate exists to prevent):
 
 - **B2 — logic unchanged.** The model's cosmetic-invariant logic key (a hash of its normalised SQL plus typed structural facts) matches the one recorded on the prior successful build. Reformatting the SQL is not a change; altering what it computes is.
 - **B3 — upstream data unchanged.** Every upstream is provably stable: an upstream Rocky model that was *skipped* this run (its output is unchanged by definition), or a raw source whose `MAX(<timestamp>)` (and, behind the `skip_rowcount_fallback` opt-in, `COUNT(*)`) matches the signature recorded on the prior build.
 
 ### Fail-safe to *build*
 
-A wrong skip is silent production staleness — the worst failure a transformation engine can have. So the gate has exactly one code path that yields a skip, and every missing, unreadable, or ambiguous input resolves the other way: **build**. A flaky freshness probe, a model with no prior successful build, an unparseable SQL body — all force a rebuild rather than risk a wrong skip. `--force-rebuild` always rebuilds.
+A wrong skip is silent production staleness, the worst failure a transformation engine can have. So the gate has exactly one code path that yields a skip, and every missing, unreadable, or ambiguous input resolves the other way: **build**. A flaky freshness probe, a model with no prior successful build, an unparseable SQL body: all force a rebuild rather than risk a wrong skip. `--force-rebuild` always rebuilds.
 
 ### Models that are never skip-eligible
 
 Eligibility is a conservative static check. These always rebuild:
 
-- **Non-deterministic SQL** — any model calling a volatile builtin (`CURRENT_TIMESTAMP`, `NOW`, `RANDOM`, `UUID`, `CURRENT_USER`, `CURRENT_CATALOG`, …) or any function not on Rocky's pure-function allowlist. The order/tie-break-unstable aggregates `ANY_VALUE`, `ARRAY_AGG`, `COLLECT_LIST`, `COLLECT_SET`, and `MODE` are deliberately excluded too — without a `WITHIN GROUP (ORDER BY …)` their output can differ run to run.
+- **Non-deterministic SQL** — any model calling a volatile builtin (`CURRENT_TIMESTAMP`, `NOW`, `RANDOM`, `UUID`, `CURRENT_USER`, `CURRENT_CATALOG`, …) or any function not on Rocky's pure-function allowlist. The order/tie-break-unstable aggregates `ANY_VALUE`, `ARRAY_AGG`, `COLLECT_LIST`, `COLLECT_SET`, and `MODE` are deliberately excluded too, since without a `WITHIN GROUP (ORDER BY …)` their output can differ run to run.
 - **Models whose lineage isn't provably complete** — anything beyond a single plain `SELECT` over bare tables. CTEs, sub-queries in `FROM`, `PIVOT` / `UNNEST` / nested-join table factors, `IN (SELECT …)` / `EXISTS` / scalar sub-selects, and set operations (`UNION` / `INTERSECT` / `EXCEPT`) could read an upstream the freshness walk never examined, so the model rebuilds.
 - **`content_addressed` and `time_interval` strategies** — these use the content-addressed and per-partition paths, not the skip gate. A `full_refresh` model **is** eligible.
 
-A model owner can override the automatic decision per model with a `[skip]` sidecar block (`eligible` / `deterministic`). The full how-to — flags, the `[run]` knobs, and the `[skip]` overrides — is in [Skip Unchanged Models and Defer to Prod](/guides/skip-and-defer/).
+A model owner can override the automatic decision per model with a `[skip]` sidecar block (`eligible` / `deterministic`). The full how-to (flags, the `[run]` knobs, and the `[skip]` overrides) is in [Skip Unchanged Models and Defer to Prod](/guides/skip-and-defer/).
 
 ## Time-interval processing
 

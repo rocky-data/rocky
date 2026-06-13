@@ -16,13 +16,13 @@ strategy.
 ## Why it's distinctive
 
 - **First Rocky POC against Trino.** v0 of the adapter (engine PR #427)
-  ships the `WarehouseAdapter` trait surface — `dialect`,
-  `execute_statement`, `execute_query`, `describe_table` — driven by the
+  ships the `WarehouseAdapter` trait surface (`dialect`,
+  `execute_statement`, `execute_query`, `describe_table`), driven by the
   hand-rolled `/v1/statement` polling client in `rocky-trino/src/connector.rs`.
 - **Zero seed-data wiring.** Trino's `tpch` connector is registered by
   default in `trinodb/trino` and exposes deterministic sample tables
   (`tpch.tiny.nation` = 25 rows). No `CREATE TABLE` / `INSERT` init
-  script — the model just `SELECT`s from `tpch.tiny.nation`.
+  script. The model just `SELECT`s from `tpch.tiny.nation`.
 - **Skip-on-no-Docker fallback.** `run.sh` runs `rocky validate` +
   `rocky compile` unconditionally and only attempts the live tour when
   the Docker daemon is reachable. Same pattern as
@@ -31,17 +31,17 @@ strategy.
 
 ## Status — what works, what doesn't
 
-The adapter is marked `is_experimental: true` — the runtime logs a
+The adapter is marked `is_experimental: true`; the runtime logs a
 warning when it's selected. v0 coverage:
 
 - **Works:** `full_refresh` (CTAS), `incremental` (INSERT + watermark
   WHERE), `DESCRIBE`-based drift, double-quoted three-part identifiers
   (`"catalog"."schema"."table"`), `CREATE SCHEMA IF NOT EXISTS`, HTTP
   Basic + JWT bearer auth.
-- **Not in v0:** `MERGE` (`strategy = "merge"` errors at validate time —
+- **Not in v0:** `MERGE` (`strategy = "merge"` errors at validate time,
   Trino MERGE is connector-dependent), OAuth 2.0 / Kerberos / SPNEGO
   auth, governance / loader / batch checks, `row_hash_expr` for
-  checksum-bisection diff, `CREATE CATALOG` (Trino has no SQL for it —
+  checksum-bisection diff, `CREATE CATALOG` (Trino has no SQL for it,
   catalogs are server-side connector instances).
 
 ## Layout
@@ -62,7 +62,7 @@ warning when it's selected. v0 coverage:
 - `rocky` on PATH
 - `docker` + `docker compose` on PATH (live tour)
 - `python3` on PATH (used by `run.sh` to parse Trino's `/v1/statement`
-  JSON for the row-count assertion — the same shape `rocky-trino`'s
+  JSON for the row-count assertion, using the same shape `rocky-trino`'s
   connector polls in Rust)
 
 When Docker isn't installed or the daemon is down, `run.sh` falls back

@@ -74,7 +74,7 @@ The `.toml` file specifies the model name, dependencies, materialization strateg
 | `partition_columns` | list of strings | `[]` | Logical partition columns for content-addressed tables. Empty for unpartitioned tables. Optional for `"content_addressed"`. |
 
 :::note[Lakehouse formats]
-Warehouse-managed table shapes — **Delta tables**, **Iceberg tables**, **materialized views**, **streaming tables**, **plain views** — are modeled as a separate `format` axis on the `LakehouseFormat` enum. `[strategy]` controls how Rocky writes data into the table; `format` controls the physical table shape. The two are orthogonal. The engine-side DDL generator (`rocky-core::lakehouse::generate_lakehouse_ddl`) handles each format; end-to-end TOML wiring varies by adapter, so consult the per-adapter guides before committing to one.
+Warehouse-managed table shapes (**Delta tables**, **Iceberg tables**, **materialized views**, **streaming tables**, **plain views**) are modeled as a separate `format` axis on the `LakehouseFormat` enum. `[strategy]` controls how Rocky writes data into the table; `format` controls the physical table shape. The two are orthogonal. The engine-side DDL generator (`rocky-core::lakehouse::generate_lakehouse_ddl`) handles each format; end-to-end TOML wiring varies by adapter, so consult the per-adapter guides before committing to one.
 :::
 
 **`[target]`** -- Output table:
@@ -118,8 +118,8 @@ deterministic = true    # owner asserts the SQL is pure → re-eligible despite 
 
 **Fail-safe rules.** The gate exists to avoid silent production staleness, so it builds on any doubt. Beyond `[skip]`, a model is **never** auto-skip-eligible (it always rebuilds) when:
 
-- its SQL is **non-deterministic** — it calls a volatile builtin (`CURRENT_TIMESTAMP`, `NOW`, `RANDOM`, `UUID`, `CURRENT_USER`, `CURRENT_CATALOG`, …), an order/tie-break-unstable aggregate (`ANY_VALUE`, `ARRAY_AGG`, `COLLECT_LIST`, `COLLECT_SET`, `MODE`), an unordered `LIMIT`/`TOP`/`FETCH`, or any function not on Rocky's pure-function allowlist;
-- its **lineage isn't provably complete** — anything beyond a single plain `SELECT` over bare tables (CTEs, sub-queries in `FROM`, `PIVOT`/`UNNEST`/nested joins, `IN (SELECT …)`/`EXISTS`/scalar sub-selects, or set operations) forces a rebuild;
+- its SQL is **non-deterministic**: it calls a volatile builtin (`CURRENT_TIMESTAMP`, `NOW`, `RANDOM`, `UUID`, `CURRENT_USER`, `CURRENT_CATALOG`, …), an order/tie-break-unstable aggregate (`ANY_VALUE`, `ARRAY_AGG`, `COLLECT_LIST`, `COLLECT_SET`, `MODE`), an unordered `LIMIT`/`TOP`/`FETCH`, or any function not on Rocky's pure-function allowlist;
+- its **lineage isn't provably complete**: anything beyond a single plain `SELECT` over bare tables (CTEs, sub-queries in `FROM`, `PIVOT`/`UNNEST`/nested joins, `IN (SELECT …)`/`EXISTS`/scalar sub-selects, or set operations) forces a rebuild;
 - it uses a `content_addressed` or `time_interval` strategy (a `full_refresh` model **is** eligible).
 
 `deterministic = true` overrides only the first bullet. Even an eligible model is skipped only when its logic and every upstream's data are both unchanged. See [Skip Unchanged Models and Defer to Prod](/guides/skip-and-defer/) for the full workflow and the `[run]` tuning knobs.
@@ -156,10 +156,10 @@ phone = "pii"
 ssn = "confidential"
 ```
 
-Tags are free-form strings — no enum — so teams can coin new classifications without touching the engine. See [Governance](/guides/governance/) for the end-to-end story (classify → mask → audit → compliance rollup) and [`[mask]`](/reference/configuration/#mask) for the resolver semantics.
+Tags are free-form strings (no enum), so teams can coin new classifications without touching the engine. See [Governance](/guides/governance/) for the end-to-end story (classify → mask → audit → compliance rollup) and [`[mask]`](/reference/configuration/#mask) for the resolver semantics.
 
 :::note[Adapter support]
-Classification tags + masking policies are applied today against **Databricks** Unity Catalog (column tags + `CREATE MASK` / `SET MASKING POLICY`, one statement per column). Snowflake, BigQuery, and DuckDB default-unsupported until demand. Best-effort — failures emit `warn!` and don't abort the run.
+Classification tags + masking policies are applied today against **Databricks** Unity Catalog (column tags + `CREATE MASK` / `SET MASKING POLICY`, one statement per column). Snowflake, BigQuery, and DuckDB default-unsupported until demand. Best-effort: failures emit `warn!` and don't abort the run.
 :::
 
 ### Retention
@@ -412,7 +412,7 @@ When `update_columns` is omitted, Rocky updates all non-key columns.
 
 ### Ephemeral
 
-An ephemeral model is never materialized — Rocky inlines it as a CTE in every downstream consumer. Useful for lightweight intermediate transformations you don't want to persist.
+An ephemeral model is never materialized; Rocky inlines it as a CTE in every downstream consumer. Useful for lightweight intermediate transformations you don't want to persist.
 
 **Config** (`models/stg_recent_orders.toml`):
 
@@ -480,7 +480,7 @@ table = "fct_hourly_events"
 
 ### Content-Addressed
 
-Writes the model's SELECT result to a Delta UniForm table as content-addressed Parquet (blake3-hashed file names) plus a Delta log commit. Designed for cross-engine reads from DuckDB, Trino, Spark, and any Iceberg-compatible reader — Rocky owns the writer, the consumers read directly from the object store. See [Content-Addressed Materialization](/concepts/content-addressed/) for the why and when.
+Writes the model's SELECT result to a Delta UniForm table as content-addressed Parquet (blake3-hashed file names) plus a Delta log commit. Designed for cross-engine reads from DuckDB, Trino, Spark, and any Iceberg-compatible reader: Rocky owns the writer, and the consumers read directly from the object store. See [Content-Addressed Materialization](/concepts/content-addressed/) for the why and when.
 
 **Config** (`models/fct_events.toml`):
 

@@ -7,9 +7,9 @@
 
 ## What it shows
 
-A comprehensive exercise of every generic adapter capability using a local
-DuckDB file as the warehouse. This POC proves the end-to-end flow without
-any external credentials or cloud services.
+An exercise of every generic adapter capability using a local DuckDB file
+as the warehouse. This POC proves the end-to-end flow without any external
+credentials or cloud services.
 
 The pipeline:
 

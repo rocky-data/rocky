@@ -1,11 +1,11 @@
 ---
 title: Performance Benchmarks
-description: Rocky vs dbt-core vs dbt-fusion — compilation speed, memory usage, and cost analysis
+description: "Rocky vs dbt-core vs dbt-fusion: compilation speed, memory usage, and cost analysis"
 sidebar:
   order: 4.6
 ---
 
-Rocky compiles 10,000 models in **1.00 second** — **34x faster** than dbt-core and **38x faster** than dbt-fusion, while using **4-7x less memory**.
+Rocky compiles 10,000 models in **1.00 second**, **34x faster** than dbt-core and **38x faster** than dbt-fusion, while using **4-7x less memory**.
 
 ## Headline Numbers (10k models)
 
@@ -24,9 +24,9 @@ Benchmarked on Apple Silicon (12-core, 36 GB RAM) with a synthetic 4-layer medal
 
 ## Why Rocky Is Faster Than dbt
 
-Rocky doesn't make the warehouse faster — it makes everything *around* the warehouse faster. The actual SQL execution time is the same. What's different is the compile-plan-execute overhead.
+Rocky doesn't make the warehouse faster. It makes everything *around* the warehouse faster. The actual SQL execution time is the same. What's different is the compile-plan-execute overhead.
 
-A note on which dbt: the per-tool numbers below compare against **dbt Core 1.x** (Python). dbt-fusion — the Rust runtime now open-sourced as dbt Core v2.0 — closes the startup gap (it is in the table above at ~12 ms), but at 10k models it still trails Rocky on compile (~38×) and memory (~7×). The Python-specific overheads called out below (interpreter load, GC, dict duplication) are dbt Core 1.x; the remaining gap to the Rust fusion engine comes from Rocky's own design — parallel-by-layer compilation, string interning, and no on-disk manifest.
+A note on which dbt: the per-tool numbers below compare against **dbt Core 1.x** (Python). dbt-fusion (the Rust runtime now open-sourced as dbt Core v2.0) closes the startup gap (it is in the table above at ~12 ms), but at 10k models it still trails Rocky on compile (~38×) and memory (~7×). The Python-specific overheads called out below (interpreter load, GC, dict duplication) are dbt Core 1.x; the remaining gap to the Rust fusion engine comes from Rocky's own design: parallel-by-layer compilation, string interning, and no on-disk manifest.
 
 **No Jinja, no manifest, no parse step.** dbt's core loop is: parse Jinja templates, build a manifest JSON (often 50MB+), resolve the DAG, generate SQL. Rocky replaces all of that with a single compiled Rust binary that goes straight from TOML + SQL to an execution plan. There's no templating engine sitting between you and your SQL. This is why startup is 64x faster and config validation is 146x faster.
 
@@ -34,23 +34,23 @@ A note on which dbt: the per-tool numbers below compare against **dbt Core 1.x**
 
 **Compile-time analysis, not runtime discovery.** Type checking, lineage extraction, schema drift detection, and contract validation all happen at compile time. dbt discovers many of these issues only at runtime, which means slower feedback loops and wasted warehouse compute on runs that were going to fail anyway.
 
-**SQL-native incrementals.** Rocky generates watermark-based `WHERE` clauses directly in SQL, pushing the filter to the warehouse. dbt merges state in Python, then builds the `INSERT` — an extra round-trip.
+**SQL-native incrementals.** Rocky generates watermark-based `WHERE` clauses directly in SQL, pushing the filter to the warehouse. dbt merges state in Python, then builds the `INSERT`, an extra round-trip.
 
 ## Why Rocky Needs Less CPU and Memory
 
 This is the more interesting story, because it's about architectural choices, not just "Rust is faster than Python."
 
-**No Python runtime overhead.** dbt loads the entire Python interpreter, its dependency tree (Jinja2, agate, networkx, protobuf, etc.), and the adapter plugin system before it does anything useful. Rocky is a single ~15 MB static binary compiled with `opt-level = 3`, thin LTO, and `panic = "abort"` — startup is 14ms with no interpreter, no GC, no import chain.
+**No Python runtime overhead.** dbt loads the entire Python interpreter, its dependency tree (Jinja2, agate, networkx, protobuf, etc.), and the adapter plugin system before it does anything useful. Rocky is a single ~15 MB static binary compiled with `opt-level = 3`, thin LTO, and `panic = "abort"`. Startup is 14ms with no interpreter, no GC, no import chain.
 
-**String interning.** In a large project, identifiers like `catalog.schema.table` and column names repeat thousands of times across model metadata. Rocky interns them via [lasso](https://github.com/Kixiron/lasso) — each unique string is stored once, and every reference is a cheap integer handle. dbt duplicates these strings across Python dicts and dataclass instances, ballooning memory proportionally to project size. This is why Rocky uses 4.3x less memory.
+**String interning.** In a large project, identifiers like `catalog.schema.table` and column names repeat thousands of times across model metadata. Rocky interns them via [lasso](https://github.com/Kixiron/lasso): each unique string is stored once, and every reference is a cheap integer handle. dbt duplicates these strings across Python dicts and dataclass instances, ballooning memory proportionally to project size. This is why Rocky uses 4.3x less memory.
 
 **Memory-mapped file I/O.** For projects with thousands of SQL files, Rocky uses `mmap` for files larger than 4 KB, letting the OS handle page-level scheduling. Python's buffered `read()` allocates a new string per file, all resident in the GC heap.
 
-**No manifest file.** dbt writes and re-reads a serialized manifest (JSON or msgpack) that grows with your project — 50 MB+ is common at scale. This is pure I/O and memory overhead that Rocky eliminates entirely. Rocky's `Project` struct lives in-process memory with pre-computed execution layers; nothing is serialized to disk between phases.
+**No manifest file.** dbt writes and re-reads a serialized manifest (JSON or msgpack) that grows with your project; 50 MB+ is common at scale. This is pure I/O and memory overhead that Rocky eliminates entirely. Rocky's `Project` struct lives in-process memory with pre-computed execution layers; nothing is serialized to disk between phases.
 
-**Embedded state store instead of YAML files.** Rocky tracks incremental state in an embedded [redb](https://github.com/cberner/redb) transactional database. dbt uses YAML/JSON files that must be fully loaded and parsed — more memory, more I/O, no atomicity. Atomic reads from redb are why warm compiles (0.72s) are 28% faster than cold compiles.
+**Embedded state store instead of YAML files.** Rocky tracks incremental state in an embedded [redb](https://github.com/cberner/redb) transactional database. dbt uses YAML/JSON files that must be fully loaded and parsed: more memory, more I/O, no atomicity. Atomic reads from redb are why warm compiles (0.72s) are 28% faster than cold compiles.
 
-**No GC pressure.** Python's garbage collector must periodically scan and collect dbt's in-memory graph. Rocky uses Rust's ownership model — memory is freed deterministically at scope exit. No GC pauses, no memory fragmentation over long runs.
+**No GC pressure.** Python's garbage collector must periodically scan and collect dbt's in-memory graph. Rocky uses Rust's ownership model: memory is freed deterministically at scope exit. No GC pauses, no memory fragmentation over long runs.
 
 > dbt's resource consumption scales with project size (more models → bigger manifest → more memory → slower parsing). Rocky's resource consumption scales with execution complexity (more parallel layers → more threads, but memory stays flat because of interning and mmap). A 10,000-model Rocky project compiles in roughly the same memory as a 100-model one.
 
@@ -58,10 +58,10 @@ This matters most in CI (where you're paying per vCPU-minute) and in orchestrato
 
 ## How Does SQLMesh Compare?
 
-SQLMesh is architecturally closer to Rocky than dbt — it uses [SQLGlot](https://github.com/tobymao/sqlglot) for static SQL analysis instead of Jinja templates. But it's still Python-bound:
+SQLMesh is architecturally closer to Rocky than dbt: it uses [SQLGlot](https://github.com/tobymao/sqlglot) for static SQL analysis instead of Jinja templates. But it's still Python-bound:
 
 - **Single-threaded analysis.** SQLGlot parses and type-checks models sequentially in Python. Rocky parallelizes type checking across DAG layers via rayon, using all available CPU cores.
-- **Python AST overhead.** SQLGlot represents every SQL AST node as a Python object with full string attributes. Rocky interns identifiers and uses Rust's zero-cost abstractions — same analysis, a fraction of the memory.
+- **Python AST overhead.** SQLGlot represents every SQL AST node as a Python object with full string attributes. Rocky interns identifiers and uses Rust's zero-cost abstractions, for the same analysis at a fraction of the memory.
 - **Snapshot state.** SQLMesh maintains "snapshots" (similar to dbt's manifest) that track environment state and grow with project size. Rocky keeps the project graph in-memory with no serialization step, and persists only incremental watermarks in an embedded redb database.
 - **Runtime overhead.** SQLMesh loads the Python interpreter, SQLGlot, and its dependency tree on every invocation. Rocky's static binary starts in 14ms.
 
@@ -93,7 +93,7 @@ Rocky enables 60-second Dagster sensor intervals. dbt-core needs 2-5 minute inte
 
 ### For Iterative Development
 
-Rocky's warm compile (after changing 1 file) takes **0.72 seconds** — 28% faster than a cold compile. dbt-core and dbt-fusion show no warm compile benefit (their partial parse doesn't help because the bottleneck is SQL generation, not parsing).
+Rocky's warm compile (after changing 1 file) takes **0.72 seconds**, 28% faster than a cold compile. dbt-core and dbt-fusion show no warm compile benefit (their partial parse doesn't help because the bottleneck is SQL generation, not parsing).
 
 ## Scaling Behavior
 
@@ -113,7 +113,7 @@ Memory also scales linearly:
 | dbt-core | 629 MB | ~3,145 MB |
 | dbt-fusion | 1,063 MB | ~5,315 MB |
 
-At 50k models, Rocky stays well under 1 GB. dbt-fusion would need ~5 GB — exceeding standard EKS pod limits.
+At 50k models, Rocky stays well under 1 GB. dbt-fusion would need ~5 GB, exceeding standard EKS pod limits.
 
 ## Annual Cost Model (10k models, 10 engineers)
 
@@ -165,4 +165,4 @@ python visualize.py results/benchmark_*.json
 | Rocky 0.3.0 (optimized) | 1.00 s | 100 µs | 147 MB |
 | Rocky 1.0.3 | **1.00 s** | **100 µs** | 147 MB |
 
-Cumulative: **25% faster** compile since v0.1.0. The compile path has held through the 1.x series — features shipped in 1.1–1.6 (warehouse loaders, Dagster DAG mode, DQX parity phases 1–4, adapter-kind diagnostics) added surface area without regressing compile. The memory increase (116 → 147 MB) is a deliberate tradeoff: caching and pre-allocation that trade ~31 MB for 39% faster warm compiles. Re-run the suite against your current engine (`engine/target/release/rocky`) to get numbers pinned to your release.
+Cumulative: **25% faster** compile since v0.1.0. The compile path has held through the 1.x series: features shipped in 1.1–1.6 (warehouse loaders, Dagster DAG mode, DQX parity phases 1–4, adapter-kind diagnostics) added surface area without regressing compile. The memory increase (116 → 147 MB) is a deliberate tradeoff: caching and pre-allocation that trade ~31 MB for 39% faster warm compiles. Re-run the suite against your current engine (`engine/target/release/rocky`) to get numbers pinned to your release.

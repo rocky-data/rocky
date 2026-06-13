@@ -27,7 +27,7 @@ rocky test-adapter --command "$PWD/rocky-echo"
 ## What the adapter does
 
 * Returns a fixed manifest from `initialize`.
-* Accepts every `execute_statement` and replies `{ok: true}` — it does
+* Accepts every `execute_statement` and replies `{ok: true}`; it does
   **not** talk to a real warehouse, it just confirms the protocol.
 * Pretends `main.demo.events` exists with three columns, so
   `describe_table` and `table_exists` return something useful.

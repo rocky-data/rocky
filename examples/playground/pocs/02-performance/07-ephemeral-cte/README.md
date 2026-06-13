@@ -7,7 +7,7 @@
 
 ## What it shows
 
-The `ephemeral` materialization strategy — a model that is never persisted as a table. Instead, its SQL is inlined as a CTE in every downstream model that references it. This is useful for:
+The `ephemeral` materialization strategy is a model that is never persisted as a table. Instead, its SQL is inlined as a CTE in every downstream model that references it. This is useful for:
 
 - Lightweight staging transformations (filters, renames, type casts)
 - Reducing table count and storage costs
@@ -16,7 +16,7 @@ The `ephemeral` materialization strategy — a model that is never persisted as 
 ## Why it's distinctive
 
 - **No table created** — `stg_events` exists only as a CTE inside `user_metrics`
-- **Compile-time optimization** — Rocky resolves the dependency graph and inlines the SQL
+- **Compile-time inlining** — Rocky resolves the dependency graph and inlines the SQL
 - **Storage savings** — intermediate results don't consume warehouse storage
 - **dbt comparison:** dbt supports `materialized='ephemeral'` but requires Jinja; Rocky uses declarative TOML
 
@@ -63,7 +63,7 @@ POC complete.
 ## What happened
 
 1. `rocky compile` parsed both models and resolved the dependency: `user_metrics → stg_events`
-2. Since `stg_events` is ephemeral, its SQL is inlined as a CTE — the compiled SQL for `user_metrics` looks like:
+2. Since `stg_events` is ephemeral, its SQL is inlined as a CTE, so the compiled SQL for `user_metrics` looks like:
    ```sql
    WITH stg_events AS (
      SELECT event_id, user_id, ... FROM seeds.raw_events WHERE event_type != 'page_view'

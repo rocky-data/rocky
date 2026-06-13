@@ -35,7 +35,7 @@ rocky ai <intent> [flags]
 | `--overwrite` | `bool` | `false` | Overwrite an existing body or sidecar file at the destination. Without this flag, the command fails loudly rather than silently clobber user-authored models. |
 
 :::note[Merge limitation]
-`--materialization merge` v1 is incomplete: there is no `--unique-key` flag yet, so the emitted sidecar is missing the merge key and must be hand-edited before `rocky apply` will accept it. `time_interval`, `delete_insert`, `microbatch`, `materialized_view`, `dynamic_table`, and `content_addressed` are intentionally not exposed by `--materialization` — they need richer flag plumbing or live in the IR-only surface.
+`--materialization merge` v1 is incomplete: there is no `--unique-key` flag yet, so the emitted sidecar is missing the merge key and must be hand-edited before `rocky apply` will accept it. `time_interval`, `delete_insert`, `microbatch`, `materialized_view`, `dynamic_table`, and `content_addressed` are intentionally not exposed by `--materialization`: they need richer flag plumbing or live in the IR-only surface.
 :::
 
 ### Examples
@@ -104,7 +104,7 @@ ORDER BY lifetime_value DESC
 LIMIT 10
 ```
 
-Rocky generates plain SQL — no Jinja, no templating. `stg_orders` is resolved by the compiler to the project model of that name.
+Rocky generates plain SQL: no Jinja, no templating. `stg_orders` is resolved by the compiler to the project model of that name.
 
 ### Related Commands
 
@@ -162,7 +162,7 @@ Sync a specific model and apply changes:
 rocky ai-sync --model fct_revenue --apply
 ```
 
-Same output shape — `--apply` writes `proposed_source` to disk after the proposal passes the compile-verify loop.
+Same output shape. `--apply` writes `proposed_source` to disk after the proposal passes the compile-verify loop.
 
 Only check models that have intent metadata:
 
@@ -314,7 +314,7 @@ rocky ai-test fct_revenue
 }
 ```
 
-Each test is an assertion query — it passes when the query returns 0 rows. Rocky's test SQL references models by bare name (no Jinja), matching how the compiler resolves refs.
+Each test is an assertion query: it passes when the query returns 0 rows. Rocky's test SQL references models by bare name (no Jinja), matching how the compiler resolves refs.
 
 Generate and save tests for all models (`saved: true` per model, full test bodies elided here):
 
@@ -334,7 +334,7 @@ rocky ai-test --all --save
 }
 ```
 
-With `--save`, each assertion is written out as a `.sql` file under `tests/` — one file per model — so `rocky test` picks them up.
+With `--save`, each assertion is written out as a `.sql` file under `tests/` (one file per model) so `rocky test` picks them up.
 
 Generate tests from a custom models directory:
 
@@ -373,13 +373,13 @@ The server is **stateless**: every tool call resolves the project from the confi
 - Warehouse-touching tools hit **your own warehouse** with the credentials in your `rocky.toml`.
 - The draft generators call the Anthropic API using **your own `ANTHROPIC_API_KEY`** from the server environment. There is no Rocky vendor in the loop. Without the key set, those tools return a null/empty draft and a `message` explaining why.
 
-What leaves your machine is bounded: warehouse queries go to your warehouse; the generators send your model's SQL and schema — and, for `draft_contract`, aggregate column counts (row / null / distinct) — to **your own** Anthropic key. **No generator sends raw cell values**; `draft_contract` profiles columns to counts only.
+What leaves your machine is bounded: warehouse queries go to your warehouse; the generators send your model's SQL and schema (and, for `draft_contract`, aggregate column counts: row / null / distinct) to **your own** Anthropic key. **No generator sends raw cell values**; `draft_contract` profiles columns to counts only.
 
 ### Safety model: read-only and propose-only
 
 The server **never materializes anything**. Materialization stays human-gated:
 
-- The generators (`draft_contract`, `generate_tests`, `explain_model`) return **drafts** and mutate nothing — you save them to disk and run `compile` / `test` yourself.
+- The generators (`draft_contract`, `generate_tests`, `explain_model`) return **drafts** and mutate nothing; you save them to disk and run `compile` / `test` yourself.
 - `governance_preview` and `drift_preview` are **read-only** previews.
 - The `propose` tool only writes an **AI-authored plan**; a human runs `rocky review <plan_id> --approve` then `rocky apply <plan_id>`. The server never approves on the user's behalf.
 
@@ -415,7 +415,7 @@ The server **never materializes anything**. Materialization stays human-gated:
 | `explain_model` | Draft an intent description for a model from its SQL and schema. |
 | `suggest_freshness_block` | Draft a `[freshness]` TOML block for a model with temporal columns. |
 
-**Propose** (the one write — a plan, not a materialization; no Anthropic key required):
+**Propose** (the one write: a plan, not a materialization; no Anthropic key required):
 
 | Tool | What it does |
 |---|---|
@@ -423,7 +423,7 @@ The server **never materializes anything**. Materialization stays human-gated:
 
 ### Prompts (guided trajectories)
 
-The server also exposes MCP prompts that orchestrate the tools above into a guided workflow. Every trajectory **stops at the propose / human-gate step** — it never applies.
+The server also exposes MCP prompts that orchestrate the tools above into a guided workflow. Every trajectory **stops at the propose / human-gate step**; it never applies.
 
 | Prompt | What it guides |
 |---|---|

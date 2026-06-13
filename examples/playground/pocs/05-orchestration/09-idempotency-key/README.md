@@ -13,7 +13,7 @@ below whatever driver pressed "go":
 
 1. First invocation with a new key runs normally and stamps the key →
    `run_id` mapping in the state store on success.
-2. Second invocation with the same key short-circuits — returns
+2. Second invocation with the same key short-circuits, returning
    `status: "skipped_idempotent"` and `skipped_by_run_id: <prior_run_id>`
    without touching the warehouse.
 3. A different key starts fresh.
@@ -33,7 +33,7 @@ services are required.
 
 Dagster sensors dedup at the `RunRequest` layer via `run_key`, but once a
 run launches the pod body has no second guard. Pod retries, Kafka
-re-delivery, webhook duplicates, cron races — all re-execute today. A
+re-delivery, webhook duplicates, cron races: all re-execute today. A
 key at the `rocky run` boundary catches them after `run_key` already let
 them through, and works for non-Dagster callers (cron, CI, webhooks,
 custom orchestrators) too.
@@ -69,5 +69,5 @@ You should see three JSON outputs showing `status = "success"` →
   any terminal status.
 - **30-day retention default.** Entries swept during the next state
   upload (the existing post-run cadence).
-- **`--idempotency-key` + `--resume` is rejected** — resume is an
+- **`--idempotency-key` + `--resume` is rejected** because resume is an
   explicit override and should never be short-circuited by dedup.

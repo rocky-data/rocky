@@ -17,7 +17,7 @@ The expensive failures in modern data platforms aren't slow queries. They're tru
 - Warehouse spend doubles in a month and nobody can attribute which model caused it.
 - An auditor asks who changed `fct_revenue.amount`, when, and why, and the answer involves `git blame` and screenshots.
 
-Rocky turns each of these into a compile error or a blocked PR before it ships: a column-type change is `E013` at compile, a rename's blast radius is a `rocky lineage-diff` comment, an unbudgeted cost spike is a `[budget]` block that fails the run, and unmasked classified data fails `rocky compliance`. These failures are invisible to the warehouse and out of scope for the templating layer above it; Rocky is the typed graph in between — real type inference and diagnostic codes, not text macros or runtime checks. For how Rocky compares to dbt Core, dbt Fusion, and SQLMesh, see the [comparison page](https://rocky-data.dev/getting-started/comparison/).
+Rocky turns each of these into a compile error or a blocked PR before it ships: a column-type change is `E013` at compile, a rename's blast radius is a `rocky lineage-diff` comment, an unbudgeted cost spike is a `[budget]` block that fails the run, and unmasked classified data fails `rocky compliance`. These failures are invisible to the warehouse and out of scope for the templating layer above it. Rocky is the typed graph in between: real type inference and diagnostic codes, not text macros or runtime checks. For how Rocky compares to dbt Core, dbt Fusion, and SQLMesh, see the [comparison page](https://rocky-data.dev/getting-started/comparison/).
 
 ## Scope on the ELT spectrum
 

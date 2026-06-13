@@ -32,4 +32,4 @@ you don't write the format yourself.
 ./run.sh
 ```
 
-The default `url` is `https://webhook.site/00000000-0000-0000-0000-000000000000` — replace it with your own webhook.site URL to see the POSTed payload.
+The default `url` is `https://webhook.site/00000000-0000-0000-0000-000000000000`; replace it with your own webhook.site URL to see the POSTed payload.

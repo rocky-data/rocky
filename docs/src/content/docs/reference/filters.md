@@ -14,7 +14,7 @@ Several Rocky commands accept a `--filter` flag to scope execution to a subset o
 | `rocky plan` | yes | Which sources have SQL statements generated. The plan is then executed with `rocky apply <plan-id>`, which materializes only those sources end-to-end (drift → create → copy → check). |
 | `rocky compare` | yes | Which shadow-vs-prod tables are compared |
 
-`rocky discover` does NOT take a filter — it always reports every source the pipeline's adapter returns. Filtering is a **consumer-side** concern: discover produces the catalog, the other commands narrow it.
+`rocky discover` does NOT take a filter: it always reports every source the pipeline's adapter returns. Filtering is a **consumer-side** concern: discover produces the catalog, the other commands narrow it.
 
 ## Syntax
 
@@ -35,7 +35,7 @@ rocky plan --filter name=a=b
 
 Matches against the **connector's unique identifier** as reported by the source adapter. For Fivetran this is the connector id (e.g. `conn_abc123`); for other adapters it's whatever that adapter's SDK calls the primary key.
 
-Bypasses schema parsing — the source doesn't even need a parseable schema for this filter to match. Useful when you want to pin a run to a specific connector regardless of its naming convention.
+Bypasses schema parsing: the source doesn't even need a parseable schema for this filter to match. Useful when you want to pin a run to a specific connector regardless of its naming convention.
 
 ```sh
 rocky plan --filter id=conn_abc123
@@ -52,7 +52,7 @@ separator = "__"
 components = ["tenant", "regions...", "source"]
 ```
 
-With that pattern, the valid filter keys are `tenant`, `regions`, `source`, or the reserved `id`. Filtering on an unknown key — e.g. `--filter department=finance` against the pattern above — silently matches nothing (no error; the command just reports "0 sources after filter").
+With that pattern, the valid filter keys are `tenant`, `regions`, `source`, or the reserved `id`. Filtering on an unknown key (e.g. `--filter department=finance` against the pattern above) silently matches nothing (no error; the command just reports "0 sources after filter").
 
 ## Matching semantics
 
@@ -126,7 +126,7 @@ key         = "id" | <component name from schema_pattern>
 value       = any non-empty string
 ```
 
-The filter flag is mandatory for `plan` and `compare` (and the `run` alias) — these commands require explicit scoping so a typo like `--filter tenat=acme` surfaces as "0 sources matched", not as "oh, I ran everything by accident".
+The filter flag is mandatory for `plan` and `compare` (and the `run` alias). These commands require explicit scoping so a typo like `--filter tenat=acme` surfaces as "0 sources matched", not as "oh, I ran everything by accident".
 
 ## What's NOT supported today
 
@@ -139,7 +139,7 @@ These are frequent requests; none of them work yet:
 - **Partial match / substring.** Value matching is strict equality (or containment for multi-valued).
 - **Filtering by table name within a source.** `--filter` scopes to the source level; table-level selection lives in the model layer, not the replication layer.
 
-If any of these bite you, [open an issue](https://github.com/rocky-data/rocky/issues) — several of them are on the roadmap.
+If any of these bite you, [open an issue](https://github.com/rocky-data/rocky/issues); several of them are on the roadmap.
 
 ## Error messages
 
@@ -150,7 +150,7 @@ Rocky produces actionable errors for invalid filter input:
 | `rocky plan --filter noequalssign` | `invalid filter 'noequalssign': expected key=value (e.g., client=acme)` |
 | `rocky run` (flag missing) | clap: `the following required arguments were not provided: --filter <FILTER>` |
 
-A filter that parses correctly but matches zero sources is **not** an error — the command reports "0 sources after filter" and exits successfully. This is deliberate: empty match is valid orchestration output (e.g. "no tenants had new data this tick").
+A filter that parses correctly but matches zero sources is **not** an error. The command reports "0 sources after filter" and exits successfully. This is deliberate: empty match is valid orchestration output (e.g. "no tenants had new data this tick").
 
 ## Related
 

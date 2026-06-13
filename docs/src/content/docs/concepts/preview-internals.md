@@ -5,17 +5,17 @@ sidebar:
   order: 15
 ---
 
-`rocky preview` is the workflow you reach for when reviewing a PR that touches transformation models. It runs only the models the PR's diff actually changed, against a per-PR branch pre-populated from the base ref, and produces three artifacts you can attach to the PR: a structural diff, a sampled row-level data diff, and a cost delta vs. base. The point is to make a reviewer's question — *"what does this PR change in the warehouse, and what does it cost?"* — answerable before merge, on a small fraction of a full run's bytes.
+`rocky preview` is the workflow you reach for when reviewing a PR that touches transformation models. It runs only the models the PR's diff actually changed, against a per-PR branch pre-populated from the base ref, and produces three artifacts you can attach to the PR: a structural diff, a sampled row-level data diff, and a cost delta vs. base. The point is to make a reviewer's question (*"what does this PR change in the warehouse, and what does it cost?"*) answerable before merge, on a small fraction of a full run's bytes.
 
 ## The prune-and-copy substrate
 
 `rocky preview create` orchestrates four existing Rocky primitives into a single workflow:
 
-1. **Identify the change set.** Rocky shells out to `git diff --name-only <base_ref> HEAD` against the models directory — the same plumbing [`rocky ci-diff`](/reference/commands/modeling/#rocky-ci-diff) uses. Output: the set of model files that changed between `--base` and `HEAD`.
+1. **Identify the change set.** Rocky shells out to `git diff --name-only <base_ref> HEAD` against the models directory, the same plumbing [`rocky ci-diff`](/reference/commands/modeling/#rocky-ci-diff) uses. Output: the set of model files that changed between `--base` and `HEAD`.
 
-2. **Compute the prune set from the compiler IR.** Loading the working-tree models into the [compiler](/concepts/compiler/) gives a column-level dependency graph. The prune set is every changed model **plus** every model that transitively depends on a changed column. Models downstream of an *unchanged* column on a changed model are not pulled in — column-level pruning is strictly tighter than git-diff alone.
+2. **Compute the prune set from the compiler IR.** Loading the working-tree models into the [compiler](/concepts/compiler/) gives a column-level dependency graph. The prune set is every changed model **plus** every model that transitively depends on a changed column. Models downstream of an *unchanged* column on a changed model are not pulled in; column-level pruning is strictly tighter than git-diff alone.
 
-3. **Compute the copy set.** Every working-DAG model not in the prune set is a copy candidate: it's logically identical to its counterpart on `--base`, so re-running it would produce the same bytes. For each copy-set model, Rocky issues `CREATE TABLE <branch_schema>.<model> AS SELECT * FROM <base_schema>.<model>` against the configured adapter — the portable copy substrate, with per-adapter overrides described below.
+3. **Compute the copy set.** Every working-DAG model not in the prune set is a copy candidate: it's logically identical to its counterpart on `--base`, so re-running it would produce the same bytes. For each copy-set model, Rocky issues `CREATE TABLE <branch_schema>.<model> AS SELECT * FROM <base_schema>.<model>` against the configured adapter, the portable copy substrate, with per-adapter overrides described below.
 
 4. **Run the prune set.** Rocky calls the existing branch run path ([`rocky plan --branch <name>`](/reference/commands/core-pipeline/#rocky-run) + `rocky apply <plan-id>`, with the single-step `rocky run --branch <name>` alias doing the same in one invocation) with a model selector limited to the prune set. The branch is registered via [`rocky branch create`](/reference/commands/core-pipeline/#rocky-branch); the run writes into the branch's `schema_prefix`.
 
@@ -45,7 +45,7 @@ The closest published commercial analogue is Fivetran's [Smart Run for dbt Core]
 | Data diff | Not surfaced in the article | First-class output ([`PreviewDiffOutput`](#output-shapes)) |
 | PR comment | Not described in the article | Pre-rendered Markdown in every output |
 
-The article does not document Smart Run's internal mechanism beyond the conceptual diagram and the "manifest-independent" claim, so the rows above hedge accordingly. The structural advantages — column-level pruning, compile-time type-equivalence detection, warehouse-native clones — are reachable because Rocky has its own compiler. They are unreachable from inside dbt without rewriting dbt's compiler.
+The article does not document Smart Run's internal mechanism beyond the conceptual diagram and the "manifest-independent" claim, so the rows above hedge accordingly. The structural advantages (column-level pruning, compile-time type-equivalence detection, warehouse-native clones) are reachable because Rocky has its own compiler. They are unreachable from inside dbt without rewriting dbt's compiler.
 
 ## Two diff algorithms
 
@@ -58,7 +58,7 @@ ORDER BY <primary_key>     -- or first column if no PK declared
 LIMIT <sample_size>        -- default 1000, override with --sample-size
 ```
 
-Fast, deterministic, bounded — but with a known false-negative mode: a row that changed outside the sampling window appears as no-change. The diff layer flags this risk explicitly. Each per-model `Sampled` variant carries a `sampling_window` block:
+Fast, deterministic, bounded, but with a known false-negative mode: a row that changed outside the sampling window appears as no-change. The diff layer flags this risk explicitly. Each per-model `Sampled` variant carries a `sampling_window` block:
 
 ```jsonc
 {
@@ -73,7 +73,7 @@ Fast, deterministic, bounded — but with a known false-negative mode: a row tha
 }
 ```
 
-`coverage_warning: true` means the row count outside the sampling window is non-trivial — a clean sample does not imply "no change".
+`coverage_warning: true` means the row count outside the sampling window is non-trivial; a clean sample does not imply "no change".
 
 ### `--algorithm bisection`
 
@@ -87,7 +87,7 @@ Exhaustive checksum-bisection over a single-column integer / numeric primary key
 
 Two properties make this a step-change over sampling:
 
-- **Bounded scan cost.** A no-op diff bottoms out at `K=32` chunk checksums per side. A single-row change recurses to the row in `O(K · log_K(N))` chunks examined — for a 1B-row table at `K=32`, that's ~128 chunk reads.
+- **Bounded scan cost.** A no-op diff bottoms out at `K=32` chunk checksums per side. A single-row change recurses to the row in `O(K · log_K(N))` chunks examined: for a 1B-row table at `K=32`, that's ~128 chunk reads.
 - **Exhaustive coverage.** Every row hashes into exactly one chunk; if any row differs, the chunk it lives in is guaranteed to mismatch and the recursion is guaranteed to find it. No `coverage_warning` hedge.
 
 Each per-model `Bisection` variant carries a `bisection_stats` block:

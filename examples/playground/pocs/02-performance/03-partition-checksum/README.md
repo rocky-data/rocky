@@ -8,20 +8,20 @@
 ## What it shows
 
 How Rocky's `time_interval` materialization handles late-arriving corrections
-to historical partitions — the class of bug that silently corrupts marts in
+to historical partitions, the class of bug that silently corrupts marts in
 dbt's watermark-incremental pattern.
 
 The POC builds a daily aggregate model (`marts.fct_daily_orders`) over a
 raw orders table, using Rocky's `time_interval` strategy with `@start_date`
 / `@end_date` placeholders. Each daily partition is computed atomically
-via DELETE + INSERT — so re-running the same partition picks up any rows
+via DELETE + INSERT, so re-running the same partition picks up any rows
 that have shown up since.
 
 ## Why it's distinctive
 
 - **Watermark-blind correctness.** Pure timestamp-based incremental cannot
   catch a row whose timestamp doesn't advance the watermark. `time_interval`
-  catches it on re-run because it doesn't track a watermark — it scopes by
+  catches it on re-run because it doesn't track a watermark; it scopes by
   the partition's `[start, end)` window.
 - **Idempotent re-runs.** Running the same partition twice produces the same
   result. Watermark-incremental has divergent behavior depending on whether
@@ -53,10 +53,10 @@ that have shown up since.
 
 The script runs three steps:
 
-1. **Single partition:** `rocky run --partition 2026-04-07` — only 04-07 is
-   computed; the other 4 days remain empty in `marts.fct_daily_orders`.
-2. **Backfill range:** `rocky run --from 2026-04-04 --to 2026-04-08` — all
-   5 days are computed in chronological order. 04-07 is recomputed and
+1. **Single partition:** `rocky run --partition 2026-04-07` computes only
+   04-07; the other 4 days remain empty in `marts.fct_daily_orders`.
+2. **Backfill range:** `rocky run --from 2026-04-04 --to 2026-04-08` computes
+   all 5 days in chronological order. 04-07 is recomputed and
    produces the same rows as Step 1 (idempotency proof).
 3. **Late correction:** A new order for customer 3 dated `2026-04-07 22:00`
    is inserted into the raw table AFTER the partition was already computed.

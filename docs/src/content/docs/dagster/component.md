@@ -5,7 +5,7 @@ sidebar:
   order: 7
 ---
 
-`RockyComponent` is a state-backed Dagster component that caches `rocky discover` output. It avoids calling external APIs on every Dagster code location reload, making asset discovery fast and reliable.
+`RockyComponent` is a state-backed Dagster component that caches `rocky discover` output, so it avoids calling external APIs on every Dagster code location reload.
 
 ## How it works
 
@@ -68,7 +68,7 @@ Hook exceptions are logged and swallowed so a failing side-effect (typically the
 
 ## State storage
 
-By default, the component stores its state on the local filesystem. This is configurable via the `defs_state` mechanism in Dagster, allowing you to use alternative storage backends if needed.
+By default, the component stores its state on the local filesystem. The `defs_state` mechanism in Dagster makes this configurable for alternative storage backends.
 
 ## Benefits
 

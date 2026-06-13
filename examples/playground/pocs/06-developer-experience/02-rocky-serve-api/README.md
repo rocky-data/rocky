@@ -8,8 +8,8 @@
 ## What it shows
 
 `rocky serve` exposes the compiler's semantic graph + lineage over HTTP
-on port 8080. With `--watch`, it auto-recompiles when model files change,
-making it easy to embed Rocky into custom dashboards or IDE plugins.
+on port 8080. With `--watch`, it auto-recompiles when model files change.
+Embed it into custom dashboards or IDE plugins via the REST API.
 
 ## Endpoints
 

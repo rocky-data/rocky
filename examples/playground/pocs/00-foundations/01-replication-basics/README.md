@@ -9,7 +9,7 @@
 
 A **replication** pipeline: Rocky discovers source schemas matching a pattern
 (`raw__<source>`) and copies each source table to a templated target schema
-(`staging__<source>`). No transformation models run — replication moves data, it
+(`staging__<source>`). No transformation models run; replication moves data, it
 doesn't reshape it.
 
 ```
@@ -24,7 +24,7 @@ source schemas into a consistent target layout.
 
 The folder also ships the three sample models (`raw_orders`, `customer_orders`,
 `revenue_summary`) so `rocky compile` / `rocky test` / `rocky lineage` have a model
-graph to exercise — but `rocky run` here replicates the *source*, it does not
+graph to exercise, but `rocky run` here replicates the *source*, it does not
 materialize those models. For a runnable, materializing model DAG see the companion
 [`00-playground-default`](../00-playground-default).
 

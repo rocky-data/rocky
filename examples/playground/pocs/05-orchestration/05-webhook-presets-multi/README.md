@@ -17,16 +17,15 @@ All five built-in webhook presets configured on different pipeline lifecycle eve
 | `on_drift_detected` | **Datadog** | Event pushed to Datadog Events API |
 | `on_anomaly_detected` | **Generic** | Custom Mustache JSON template |
 
-Each preset provides sensible defaults (headers, body format) — you only need to set the `url`.
+Each preset provides sensible defaults (headers, body format); you only need to set the `url`.
 
 ## Why it's distinctive
 
-- **5 presets in one config** — shows the full webhook ecosystem, not just Slack
-- **Event-specific routing** — different services for different severity levels
+- **5 presets in one config** — all five webhook targets (Slack, Teams, PagerDuty, Datadog, Generic) in a single `rocky.toml`
+- **Event-specific routing** — different services per event type (success vs. error vs. drift)
 - **Custom templates** — `generic` preset with Mustache variables (`{{event}}`, `{{pipeline}}`, `{{table}}`, `{{duration_ms}}`)
 - **Retry + timeout** — per-webhook retry_count, retry_delay_ms, timeout_ms
 - **HMAC signing** — optional `secret` field for webhook signature verification
-- Existing POC [`02-webhook-slack-preset`](../02-webhook-slack-preset/) only shows Slack; this covers all presets
 
 ## Layout
 
@@ -77,7 +76,7 @@ POC complete: 5 webhook presets configured across different event types.
    - **PagerDuty:** Events API v2 format with `routing_key`
    - **Datadog:** Events API format with `title`, `text`, `tags`
    - **Generic:** Raw JSON context (or custom `body_template`)
-4. Webhooks fire during actual pipeline execution — this demo uses placeholder URLs
+4. Webhooks fire during actual pipeline execution (this demo uses placeholder URLs)
 
 ## Related
 

@@ -28,7 +28,7 @@ just lint        # cargo clippy/fmt + ruff + eslint
 just --list      # see all available recipes
 ```
 
-You can also build a single subproject directly without `just` — see the per-subproject sections below.
+You can also build a single subproject directly without `just`; see the per-subproject sections below.
 
 ### Engine (`engine/`)
 
@@ -40,7 +40,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The engine is a Cargo workspace with 25 members — 23 library crates plus the `rocky` and `rocky-lsp` binaries (Rust edition 2024, MSRV 1.88). Run a single crate's tests with `cargo test -p rocky-core`. End-to-end tests in `crates/rocky-core/tests/e2e.rs` use DuckDB and need no credentials.
+The engine is a Cargo workspace with 25 members: 23 library crates plus the `rocky` and `rocky-lsp` binaries (Rust edition 2024, MSRV 1.88). Run a single crate's tests with `cargo test -p rocky-core`. End-to-end tests in `crates/rocky-core/tests/e2e.rs` use DuckDB and need no credentials.
 
 ### Python SDK (`sdk/python/`)
 
@@ -51,7 +51,7 @@ uv run pytest -v
 uv run ruff check src/ tests/ examples/ && uv run ruff format --check src/ tests/ examples/
 ```
 
-`rocky-sdk` is the standalone typed client (`RockyClient`) that `dagster-rocky` is built on. Unit tests mock the binary and need no credentials; `examples/quickstart.py` runs against a real `rocky` (the `sdk-ci` smoke job installs one). The generated Pydantic models in `src/rocky_sdk/types_generated/` come from `just codegen` — don't hand-edit them.
+`rocky-sdk` is the standalone typed client (`RockyClient`) that `dagster-rocky` is built on. Unit tests mock the binary and need no credentials; `examples/quickstart.py` runs against a real `rocky` (the `sdk-ci` smoke job installs one). The generated Pydantic models in `src/rocky_sdk/types_generated/` come from `just codegen`; don't hand-edit them.
 
 ### Dagster integration (`integrations/dagster/`)
 
@@ -62,7 +62,7 @@ uv run pytest -v
 uv run ruff check && uv run ruff format --check
 ```
 
-All tests run without the Rocky binary or credentials — they use JSON fixtures in `tests/fixtures/`.
+All tests run without the Rocky binary or credentials; they use JSON fixtures in `tests/fixtures/`.
 
 ### VS Code extension (`editors/vscode/`)
 
@@ -93,7 +93,7 @@ The single biggest reason Rocky is a monorepo: changes to the engine's CLI JSON 
 3. Commit the regenerated bindings together with your Rust change.
 4. The `codegen-drift` CI workflow will fail any PR where the committed bindings don't match what the engine produces, so this is enforced.
 
-The generated Pydantic models live in the `rocky-sdk` package. `dagster_rocky.types` (and `dagster_rocky.types_generated`) re-export them from `rocky_sdk`, and `editors/vscode/src/types/rockyJson.ts` is a re-export shim over the generated TypeScript — both providing backward-compat aliases for the renamed class names.
+The generated Pydantic models live in the `rocky-sdk` package. `dagster_rocky.types` (and `dagster_rocky.types_generated`) re-export them from `rocky_sdk`, and `editors/vscode/src/types/rockyJson.ts` is a re-export shim over the generated TypeScript, both providing backward-compat aliases for the renamed class names.
 
 **When modifying Rocky DSL syntax** (`.rocky` files), update in lockstep:
 1. `engine/crates/rocky-lang/` (parser + lexer)
@@ -103,7 +103,7 @@ The generated Pydantic models live in the `rocky-sdk` package. `dagster_rocky.ty
 
 ## Releases
 
-Each artifact is released independently using a tag-namespaced scheme. Releases are **CI-driven** — land a release PR (version bump + CHANGELOG entry), tag the merged commit, push the tag, and the matching release workflow does the rest:
+Each artifact is released independently using a tag-namespaced scheme. Releases are **CI-driven**, so land a release PR (version bump + CHANGELOG entry), tag the merged commit, push the tag, and the matching release workflow does the rest:
 
 | Artifact | Tag pattern | CI workflow (on tag push) |
 |---|---|---|
@@ -112,7 +112,7 @@ Each artifact is released independently using a tag-namespaced scheme. Releases 
 | dagster-rocky wheel | `dagster-v*` | `dagster-release.yml` — build + PyPI publish via OIDC |
 | Rocky VSIX | `vscode-v*` | `vscode-release.yml` — build + VS Code Marketplace publish |
 
-`dagster-rocky` depends on `rocky-sdk`, so when a `dagster-v*` release raises its `rocky-sdk` floor, publish the `sdk-v*` tag first — the published dagster wheel resolves the SDK from PyPI, not the monorepo path source.
+`dagster-rocky` depends on `rocky-sdk`, so when a `dagster-v*` release raises its `rocky-sdk` floor, publish the `sdk-v*` tag first; the published dagster wheel resolves the SDK from PyPI, not the monorepo path source.
 
 Canonical flow for each artifact:
 
@@ -123,7 +123,7 @@ git tag engine-v1.7.0
 git push origin engine-v1.7.0
 ```
 
-For convenience, the monorepo exposes `just release-engine <version>`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]` — these wrap the local-build path below. The `rocky-release` Claude skill in `.claude/skills/rocky-release/SKILL.md` walks the full checklist.
+For convenience, the monorepo exposes `just release-engine <version>`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]`; these wrap the local-build path below. The `rocky-release` Claude skill in `.claude/skills/rocky-release/SKILL.md` walks the full checklist.
 
 `scripts/release.sh engine|dagster|vscode <version>` remains as a **local-build fallback** for hotfix scenarios where CI is unavailable. It builds what it can locally (macOS natively, Linux via Docker) and attaches those artifacts to the GitHub Release. Prefer the CI-driven flow for normal releases.
 
@@ -137,7 +137,7 @@ For convenience, the monorepo exposes `just release-engine <version>`, `just rel
 
 ### Merge strategy
 
-GitHub lets you pick a merge strategy per-PR via the dropdown on the merge button. Rocky's default is **squash and merge**, but choose deliberately — the right choice depends on the PR's shape:
+GitHub lets you pick a merge strategy per-PR via the dropdown on the merge button. Rocky's default is **squash and merge**, but choose deliberately; the right choice depends on the PR's shape:
 
 | PR shape | Strategy | Why |
 |---|---|---|
@@ -147,9 +147,9 @@ GitHub lets you pick a merge strategy per-PR via the dropdown on the merge butto
 | Refactor series where intermediate states build meaningfully | **Rebase** | Preserves the step-by-step narrative and keeps `git bisect` granular for debugging future regressions |
 | WIP-heavy branches with "fix typo" / "oops" commits | **Squash** (or clean up via interactive rebase before opening the PR) | Collapses noise into one coherent commit |
 
-**Heuristic**: if every commit in your PR has a distinct meaningful conventional-commit scope, **rebase** — squashing would collapse those scopes into one megacommit and you'd lose the grep-by-crate affordance. Otherwise **squash**.
+**Heuristic**: if every commit in your PR has a distinct meaningful conventional-commit scope, **rebase**: squashing would collapse those scopes into one megacommit and you'd lose the grep-by-crate affordance. Otherwise **squash**.
 
-Avoid the third option (create a merge commit) for normal PRs — it adds a branching structure to trunk-based linear history for no practical benefit in a solo-scale project.
+Avoid the third option (create a merge commit) for normal PRs; it adds a branching structure to trunk-based linear history for no practical benefit in a solo-scale project.
 
 ## Code style
 

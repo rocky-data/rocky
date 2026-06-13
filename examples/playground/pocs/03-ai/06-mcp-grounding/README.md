@@ -32,7 +32,7 @@ It ships two transformation models over the same source:
 
 Five completed orders sum to `12500 + 7500 + 30000 + 5000 + 45000 = 100000` cents = **$1000.00**.
 
-- `revenue_naive` produces `revenue_usd = NULL` — the `'completed'` filter matches nothing, so `SUM` over zero rows is NULL. A confidently shipped zero.
+- `revenue_naive` produces `revenue_usd = NULL`, because the `'completed'` filter matches nothing, so `SUM` over zero rows is NULL. A confidently shipped zero.
 - `revenue_correct` produces `revenue_usd = 1000.00`.
 
 ## Layout
@@ -65,7 +65,7 @@ Five completed orders sum to `12500 + 7500 + 30000 + 5000 + 45000 = 100000` cent
 
 The script is deterministic and needs no credentials. It compiles both models (both pass), shows the source data so the traps are visible, materializes both models, reconciles them side by side, and runs `rocky test --declarative` so the grounded model's assertion goes green.
 
-> Note: the value assertion runs under `rocky test --declarative`, which executes the sidecar `[[tests]]` against the materialized target table. The default `rocky test` (no flag) only checks that a model's SQL executes — it does not evaluate `[[tests]]`. That is why `run.sh` materializes the tables first, then runs the declarative path.
+> Note: the value assertion runs under `rocky test --declarative`, which executes the sidecar `[[tests]]` against the materialized target table. The default `rocky test` (no flag) only checks that a model's SQL executes; it does not evaluate `[[tests]]`. That is why `run.sh` materializes the tables first, then runs the declarative path.
 
 ## Expected output
 
@@ -101,7 +101,7 @@ The MCP grounding tools read the **warehouse**, so the source data must exist in
 ### Expected agent trajectory
 
 1. **`inspect_schema`** — lists `seeds.orders` under `sources` with its typed columns: `order_id`, `customer_id`, `status`, `amount_cents`, `ordered_at`. (Physical warehouse tables the project never declared as a Rocky source are discovered here too, so the agent can find what to ground against.)
-2. **`sample_rows`** on `seeds.orders` — sees real rows. The `status` values are `'COMPLETE'` (uppercase), never `'completed'`. With no `percent`, the first rows come back deterministically — the right default for a small table. This is the step a schema-only agent skips.
+2. **`sample_rows`** on `seeds.orders` — sees real rows. The `status` values are `'COMPLETE'` (uppercase), never `'completed'`. With no `percent`, the first rows come back deterministically, the right default for a small table. This is the step a schema-only agent skips.
 3. **`profile_column`** on `seeds.orders` / `amount_cents` — sees the scale: values like 12500, 30000, 45000. Integer cents, not dollars. On `status`, the result's `top_values` lists the exact literals (`COMPLETE`, `PENDING`, `CANCELLED`) that a `min`/`max` pair would hide.
 4. **Writes the model** — `WHERE status = 'COMPLETE'`, `SUM(amount_cents) / 100.0 AS revenue_usd`. Equivalent to `revenue_correct.sql`.
 5. **`compile`** — type-checks clean. So would the naive model; compile is necessary, not sufficient.

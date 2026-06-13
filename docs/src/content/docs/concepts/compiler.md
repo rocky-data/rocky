@@ -116,7 +116,7 @@ c.id → b.id → a.id → source.raw.users.id
 
 **Star expansion.** When a model uses `SELECT *`, the compiler expands it using the upstream model's inferred schema or known source schemas. This means downstream models always see the full column list, even through star selects.
 
-**Intent propagation.** Each model's `intent` field (from its TOML config) is stored in the semantic graph, making it available for AI-powered features like sync and explain.
+**Intent propagation.** Each model's `intent` field (from its TOML config) is stored in the semantic graph, where the AI features (sync, explain) read it.
 
 ## Diagnostics
 

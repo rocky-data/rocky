@@ -6,7 +6,7 @@
 
 ## Executive summary
 
-The Rocky codebase shows mature security discipline. There are **no critical findings** and the warehouse-adapter SQL paths — the largest blast-radius surface — are systematically gated by a centralized `validate_identifier()` regex check before interpolation. Hardened defaults observed across `rocky-server` (loopback-only without a Bearer token, constant-time token compare, empty-CORS default), redacted credential wrappers, `execFile`-style subprocess invocation, and CSP+nonce in webviews.
+The Rocky codebase shows mature security discipline. There are **no critical findings** and the warehouse-adapter SQL paths (the largest blast-radius surface) are systematically gated by a centralized `validate_identifier()` regex check before interpolation. Hardened defaults observed across `rocky-server` (loopback-only without a Bearer token, constant-time token compare, empty-CORS default), redacted credential wrappers, `execFile`-style subprocess invocation, and CSP+nonce in webviews.
 
 The findings below are **mostly Medium or Low**. The two highest-impact ones are operational rather than structural:
 
@@ -35,7 +35,7 @@ The findings below are **mostly Medium or Low**. The two highest-impact ones are
 
 The Trino connector polls follow-up pages by GETting the server-supplied `nextUri` with the same headers (`headers.clone()` includes the `Authorization` Bearer/Basic header). The Airbyte client iterates pagination with the server-supplied `next` URL and re-issues `bearer_auth(...)` per request via the shared client.
 
-If the configured coordinator/API host is compromised, on-path (TLS MITM with a misconfigured trust store or downgraded host), or simply mis-typed in `rocky.toml` to point at an attacker, the server can hand back a `nextUri`/`next` pointing at any host on the internet — and the credential is forwarded.
+If the configured coordinator/API host is compromised, on-path (TLS MITM with a misconfigured trust store or downgraded host), or simply mis-typed in `rocky.toml` to point at an attacker, the server can hand back a `nextUri`/`next` pointing at any host on the internet, and the credential is forwarded.
 
 **Remediation:**
 - Validate that `next` is on the same scheme + host as `base_url` / `coordinator_url`. Reject otherwise.
@@ -98,7 +98,7 @@ The realistic threat is **less** "attacker exploits config" (they wrote their ow
 The BigQuery adapter reads the service-account JSON from the path in `GOOGLE_APPLICATION_CREDENTIALS` without warning if it's group/world-readable. On shared CI runners this is the most common foot-gun for SA-key leakage.
 
 **Remediation:**
-- On Unix, `tracing::warn!` if `metadata.permissions().mode() & 0o077 != 0`. Don't refuse — just warn loudly.
+- On Unix, `tracing::warn!` if `metadata.permissions().mode() & 0o077 != 0`. Don't refuse, just warn loudly.
 - Document the recommended `chmod 600` in `rocky-bigquery` README.
 
 ---
@@ -129,7 +129,7 @@ Affects schema-validation tooling at build time. No runtime exposure. **Remediat
 | File | `engine/crates/rocky-fivetran/src/client.rs:217-231` |
 | Severity | Low (Fivetran error docs don't contain credentials) |
 
-Same shape as L-2 — defensive truncation is cheap insurance.
+Same shape as L-2; defensive truncation is cheap insurance.
 
 ### L-4 — Webhook `secret` field is `String`, not `RedactedString`
 
@@ -157,14 +157,14 @@ Setting `ANTHROPIC_API_KEY` is the only gate. The prompt sends model SQL, table 
 | Files | `engine/crates/rocky-cli/src/pipes.rs:188-193`, `commands/run_audit.rs`, `rocky-core/src/models.rs` |
 | Severity | Low (test-only, no runtime impact) |
 
-Aligns with the [`rust-unsafe`](../engine/.claude/skills/rust-unsafe/SKILL.md) skill — the two legitimate unsafe sites today are mmap + test env-var mutation. Consider centralizing the env-mutation `unsafe` into a single `ScopedEnvGuard` helper to make future audits cheaper.
+Aligns with the [`rust-unsafe`](../engine/.claude/skills/rust-unsafe/SKILL.md) skill: the two legitimate unsafe sites today are mmap + test env-var mutation. Consider centralizing the env-mutation `unsafe` into a single `ScopedEnvGuard` helper to make future audits cheaper.
 
 ### L-8 — BigQuery `describe_table_sql` interpolation bug (functional, not security)
 
 | File | `engine/crates/rocky-bigquery/src/dialect.rs:107-114` |
 | Severity | Low (correctness; **not** an injection — identifier validation is upstream) |
 
-Interpolates a backtick-quoted FQTN into a WHERE clause matching `INFORMATION_SCHEMA.COLUMNS.table_name`. The system column is unquoted, so the query returns zero rows. Track as a bug, not a vulnerability — flagged here only because the SQL audit passed through it.
+Interpolates a backtick-quoted FQTN into a WHERE clause matching `INFORMATION_SCHEMA.COLUMNS.table_name`. The system column is unquoted, so the query returns zero rows. Track as a bug, not a vulnerability; flagged here only because the SQL audit passed through it.
 
 ### L-9 — `rocky-core/src/mmap.rs` `unsafe { Mmap::map }` over project files
 

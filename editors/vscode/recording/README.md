@@ -25,7 +25,7 @@ launched VS Code inherits it, so the LSP connects automatically).
 
 ## E2E tests
 
-The same launch infrastructure backs Playwright **end-to-end tests** — for the
+The same launch infrastructure backs Playwright **end-to-end tests**, for the
 things the in-process `@vscode/test-electron` suite can't reach, chiefly webview
 DOM. These reach into the out-of-process webview iframe and assert real
 behavior (DOM, not pixels).
@@ -36,13 +36,13 @@ npm run test:e2e        # editors/vscode/recording/, runs e2e/*.spec.mjs
 
 `e2e/lineage.spec.mjs` opens the lineage webview, asserts the graph rendered,
 and verifies it re-fits when the viewport widens. Tests build the extension
-bundle first (global-setup) and launch without video. Keep this layer thin —
+bundle first (global-setup) and launch without video. Keep this layer thin:
 reserve it for webview/UI behavior; unit (vitest) and in-process integration
 (`@vscode/test-electron`) cover the rest more cheaply.
 
 ## Requirements
 
-- `ffmpeg` and `gifski` (`brew install ffmpeg gifski`) — gifski is preferred.
+- `ffmpeg` and `gifski` (`brew install ffmpeg gifski`). gifski is preferred.
   Without gifski it falls back to an ffmpeg palette pipeline, plus a
   `gifsicle --lossy` pass if `gifsicle` is installed.
 - VS Code is downloaded on first run via `@vscode/test-electron` (reuses the
@@ -71,7 +71,7 @@ export default {
 };
 ```
 
-The driver (`lib/driver.mjs`) is deliberately **keyboard-only** — Playwright's
+The driver (`lib/driver.mjs`) is deliberately **keyboard-only**: Playwright's
 Electron video has no visible mouse cursor, so click flows look broken. Available
 actions: `openFile`, `palette`, `command`, `key`, `type`, `escape`, `pause`.
 

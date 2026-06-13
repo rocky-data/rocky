@@ -18,7 +18,7 @@ rocky-core (engine)
     └── GovernanceAdapter trait   ► your-custom-adapter
 ```
 
-The core engine calls trait methods without knowing which adapter is behind them. This means Rocky can support any SQL warehouse — Databricks, Snowflake, BigQuery, Redshift, DuckDB — through the same interface.
+The core engine calls trait methods without knowing which adapter is behind them. This means Rocky can support any SQL warehouse (Databricks, Snowflake, BigQuery, Redshift, DuckDB) through the same interface.
 
 ## Adapter traits
 
@@ -63,7 +63,7 @@ pub trait SqlDialect {
 | `BatchCheckAdapter` | Batched quality checks | `batch_row_counts()`, `batch_freshness()` |
 | `TypeMapper` | Type normalization | `normalize_type()`, `types_compatible()` |
 
-`DiscoveryAdapter::discover` returns `DiscoveryResult { connectors, failed }` so adapters that fan out per-source metadata fetches (per-connector REST calls, per-namespace `list_tables`) can surface partial failures instead of silently dropping them — protecting downstream diff-based reconcilers from misreading a transient fetch failure as "removed upstream". Adapters that complete in a single shot return `DiscoveryResult::ok(connectors)`. Each `FailedSource` carries an `error_class` (`transient` / `timeout` / `rate_limit` / `auth` / `unknown`) so consumers can branch on operating-mode without parsing free-form messages.
+`DiscoveryAdapter::discover` returns `DiscoveryResult { connectors, failed }` so adapters that fan out per-source metadata fetches (per-connector REST calls, per-namespace `list_tables`) can surface partial failures instead of silently dropping them, protecting downstream diff-based reconcilers from misreading a transient fetch failure as "removed upstream". Adapters that complete in a single shot return `DiscoveryResult::ok(connectors)`. Each `FailedSource` carries an `error_class` (`transient` / `timeout` / `rate_limit` / `auth` / `unknown`) so consumers can branch on operating-mode without parsing free-form messages.
 
 ## AdapterManifest
 
@@ -111,7 +111,7 @@ rocky test-adapter --adapter bigquery
 
 ## Process adapter protocol
 
-Adapters can be built in **any language** using the process adapter protocol — JSON-RPC 2.0 over stdio.
+Adapters can be built in **any language** using the process adapter protocol: JSON-RPC 2.0 over stdio.
 
 Rocky spawns the adapter as a child process and communicates via stdin/stdout:
 

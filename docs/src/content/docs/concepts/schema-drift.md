@@ -7,7 +7,7 @@ sidebar:
 
 Rocky automatically detects schema drift between source and target tables and resolves it using **graduated evolution** -- safe type widenings are handled with `ALTER TABLE` (preserving data), while unsafe changes trigger a full refresh.
 
-![Two rocky run invocations sandwiching an ALTER TABLE — the second run reports "Drift: 1/1 tables drifted"](/demo-drift-recover.gif)
+![Two rocky run invocations sandwiching an ALTER TABLE; the second run reports "Drift: 1/1 tables drifted"](/demo-drift-recover.gif)
 
 ## What It Detects
 
@@ -81,4 +81,4 @@ Use `rocky plan` to preview the SQL Rocky would emit (including any drop stateme
 rocky plan --filter client=acme --output json
 ```
 
-Today, only `drop_and_recreate` and `add_column` actions are surfaced in the run output. The engine also classifies all-safe type widenings as `AlterColumnTypes` in `rocky-core`, but the `ALTER TABLE ALTER COLUMN` execution path isn't wired through `rocky apply` yet — safe-widening drift currently falls through without action.
+Today, only `drop_and_recreate` and `add_column` actions are surfaced in the run output. The engine also classifies all-safe type widenings as `AlterColumnTypes` in `rocky-core`, but the `ALTER TABLE ALTER COLUMN` execution path isn't wired through `rocky apply` yet, so safe-widening drift currently falls through without action.

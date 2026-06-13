@@ -69,7 +69,7 @@ A deterministic, reviewable record of what a run will do: compiled SQL, drift ac
 
 ### Replay
 
-Inspecting and verifying a past run against its [content-addressed](#content-addressed) record — per-model SQL hashes, row counts, and bytes. `rocky replay <run_id>` checks the record against the ledger; re-executing a run bit-for-bit from the pinned record is on the roadmap. See [Roadmap](/getting-started/roadmap/).
+Inspecting and verifying a past run against its [content-addressed](#content-addressed) record: per-model SQL hashes, row counts, and bytes. `rocky replay <run_id>` checks the record against the ledger; re-executing a run bit-for-bit from the pinned record is on the roadmap. See [Roadmap](/getting-started/roadmap/).
 
 ### Shadow mode
 

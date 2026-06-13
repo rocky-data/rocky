@@ -8,7 +8,7 @@
 ## What it shows
 
 `rocky plan` generates the SQL for a pipeline run and persists it as a
-content-addressed plan to `.rocky/plans/<plan_id>.json` — without touching the
+content-addressed plan to `.rocky/plans/<plan_id>.json`, without touching the
 warehouse. `rocky apply <plan_id>` reads that exact plan back and executes it.
 This separates the decision ("here is what I am about to change") from the
 execution ("now do it"), so the unit of deployment is something you can review,
@@ -21,7 +21,7 @@ re-plans the same intent and shows the `plan_id` is byte-for-byte identical.
 ## Why it's distinctive
 
 - The `plan_id` is a blake3 hash of the plan payload, so re-planning the same
-  intent produces the **same** id. Plans are idempotent and diffable — the id
+  intent produces the **same** id. Plans are idempotent and diffable: the id
   alone tells you whether two plans are the same change.
 - Apply is decoupled from plan: you can plan in CI, review the persisted JSON,
   and apply the approved plan id in a separate deploy step. dbt has no

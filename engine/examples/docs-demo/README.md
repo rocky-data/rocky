@@ -65,4 +65,3 @@ The `.toml` sidecars drive the documentation content:
 | `[target]` | Where the model materializes (catalog, schema, table) |
 | `[[tests]]` | Data quality assertions listed on the model detail page |
 
-Richer sidecar metadata produces a more useful documentation catalog.

@@ -8,8 +8,8 @@
 ## What it shows
 
 `rocky estimate` runs each compiled model's `SELECT` through the warehouse's
-native `EXPLAIN` and returns the planner's projection — estimated rows, scan
-strategy, join type, filter pushdown — **without materializing any table**.
+native `EXPLAIN` and returns the planner's projection (estimated rows, scan
+strategy, join type, filter pushdown) **without materializing any table**.
 On DuckDB this is the real DuckDB query planner; on a cloud warehouse it is
 that engine's `EXPLAIN`. It answers "what will this model cost to build?"
 before you spend the compute to build it.
@@ -20,7 +20,7 @@ the target schema is still empty.
 
 ## Why it's distinctive
 
-- The estimate comes from the **warehouse's own planner**, not a Rocky guess —
+- The estimate comes from the **warehouse's own planner**, not a Rocky guess:
   row counts, the `HASH_JOIN` node, and the `status='completed'` filter pushdown
   in the plan are exactly what the engine will execute.
 - It is a true dry-run: no table is created, so you can estimate the cost of a
@@ -77,10 +77,10 @@ the target schema is still empty.
 3. `rocky estimate` sends each model's `SELECT` to DuckDB's `EXPLAIN`. The join
    model's plan shows the planner expects ~2,500 completed orders after filter
    pushdown, a hash join against 200 customers, and ~2,192 joined rows.
-4. A direct DuckDB check confirms the target schema is empty — `estimate` never
+4. A direct DuckDB check confirms the target schema is empty; `estimate` never
    wrote anything.
 
 ## Related
 
-- Companion: [`02-performance/05-optimize-recommendations`](../05-optimize-recommendations) — `rocky optimize` recommends strategy changes from run history
-- Companion: [`02-performance/10-cost-budgets`](../10-cost-budgets) — `[budget]` blocks + per-run `cost_summary` after execution
+- Companion: [`02-performance/05-optimize-recommendations`](../05-optimize-recommendations), where `rocky optimize` recommends strategy changes from run history
+- Companion: [`02-performance/10-cost-budgets`](../10-cost-budgets), with `[budget]` blocks + per-run `cost_summary` after execution

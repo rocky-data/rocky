@@ -168,7 +168,7 @@ cd editors/vscode && npm test
 
 ## Releases
 
-Tag-namespaced — each artifact ships independently. All three are **CI-driven**: land a release PR (version bump + CHANGELOG entry), tag the merged commit, push the tag.
+Tag-namespaced: each artifact ships independently. All three are **CI-driven**: land a release PR (version bump + CHANGELOG entry), tag the merged commit, push the tag.
 
 | Artifact | Tag | Workflow |
 |---|---|---|

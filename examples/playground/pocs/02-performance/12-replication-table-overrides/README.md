@@ -131,7 +131,7 @@ pipeline default (`full_refresh`) because no rule overrides its strategy.
    `incremental` respectively. `order_items` keeps `full_refresh` (no strategy rule
    matches it). Per-field most-specific-match-wins applies: Rule 1 supplies
    `merge_keys = ["order_id"]` to `orders`; Rule 2 supplies `strategy` and
-   `timestamp_column` to the same table — both rules contribute their fields.
+   `timestamp_column` to the same table, and both rules contribute their fields.
 6. `--filter table=orders` shows the CLI literal filter running only the `orders` table
    across all connectors (literal match only; globs are TOML-side only).
 

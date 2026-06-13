@@ -15,7 +15,7 @@ The five governance pillars live on the pipeline target and across project-level
 4. **Role-graph reconciliation** -- hierarchical `[role.<name>]` declarations flattened and reconciled.
 5. **Data retention** -- model-sidecar `retention = "<N>[dy]"` applied as adapter-native TBLPROPERTIES.
 
-This guide walks through each governance feature with practical configuration examples.
+This guide walks through each governance feature with configuration examples.
 
 ## 1. Schema Patterns
 
@@ -984,7 +984,7 @@ The gate exits `0` when every classified column has a resolved strategy (or is l
 rocky compliance --env prod --exceptions-only
 ```
 
-When everything is compliant, this prints the summary counters and an empty exceptions list. When exceptions exist, the `per_column` table is filtered to just the rows that produced them, making it easy to see what needs attention without scrolling through the full classified-column inventory.
+When everything is compliant, this prints the summary counters and an empty exceptions list. When exceptions exist, the `per_column` table is filtered to just the rows that produced them, so you see what needs attention without scrolling through the full classified-column inventory.
 
 ### Machine-readable gate
 

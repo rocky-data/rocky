@@ -1,13 +1,13 @@
 # 06-rust-native-adapter-skeleton — Rust-native warehouse adapter starter
 
 > **Category:** 07-adapters
-> **Credentials:** none (Rust toolchain only — `cargo` 1.88+)
+> **Credentials:** none (Rust toolchain only, `cargo` 1.88+)
 > **Runtime:** ~10s on a warm cache
 > **Rocky features:** `rocky-adapter-sdk` traits (`WarehouseAdapter`, `SqlDialect`), in-process testing
 
 ## Feature
 
-A copy-and-edit Rust crate that implements Rocky's adapter SDK trait surface against an in-memory mock backend. The crate is shaped like a ClickHouse adapter — backtick quoting, two-part names, no `MERGE`, partition replace via `ALTER TABLE ... DELETE` + `INSERT` — but the file structure is the same one you'd use for Trino, Redshift, StarRocks, or any other SQL warehouse Rocky doesn't ship in-tree.
+A copy-and-edit Rust crate that implements Rocky's adapter SDK trait surface against an in-memory mock backend. The crate is shaped like a ClickHouse adapter (backtick quoting, two-part names, no `MERGE`, partition replace via `ALTER TABLE ... DELETE` + `INSERT`), but the file structure is the same one you'd use for Trino, Redshift, StarRocks, or any other SQL warehouse Rocky doesn't ship in-tree.
 
 ## Why it's distinctive
 
@@ -20,7 +20,7 @@ For an out-of-process adapter shape (any language, JSON-RPC over stdio), see the
 ## Status — what works, what doesn't
 
 - **Works:** SDK trait impls, dialect SQL generation, identifier validation, in-process testing pattern, `AdapterManifest` shape, capability declaration.
-- **Not wired yet:** out-of-tree adapter registration. To make a real ClickHouse adapter ship today, you fork `rocky-data/rocky` and add the crate to `engine/Cargo.toml` plus the CLI's adapter dispatch — the SDK pins the trait shape so the fork stays small and upstreamable. The forward-looking `[adapter.skeleton]` block in `rocky.toml` shows what dynamic registration will look like once it lands.
+- **Not wired yet:** out-of-tree adapter registration. To make a real ClickHouse adapter ship today, you fork `rocky-data/rocky` and add the crate to `engine/Cargo.toml` plus the CLI's adapter dispatch; the SDK pins the trait shape so the fork stays small and upstreamable. The forward-looking `[adapter.skeleton]` block in `rocky.toml` shows what dynamic registration will look like once it lands.
 
 See `docs/src/content/docs/guides/adapter-sdk.md` for the full walkthrough.
 
@@ -37,7 +37,7 @@ See `docs/src/content/docs/guides/adapter-sdk.md` for the full walkthrough.
     └── examples/demo.rs      # End-to-end driver — prints generated SQL
 ```
 
-The `adapter/` crate is **not** a member of the rocky workspace. That is intentional — it models exactly what an out-of-tree consumer's repo looks like.
+The `adapter/` crate is **not** a member of the rocky workspace. That is intentional. It models exactly what an out-of-tree consumer's repo looks like.
 
 ## Run
 

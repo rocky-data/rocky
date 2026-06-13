@@ -6,7 +6,7 @@ file is the tracked source; the GIF is generated output (gitignored under
 `out/`).
 
 This records the *CLI/terminal*. The VS Code *extension* demos are a separate
-harness — Playwright drives a real VS Code instance — under
+harness (Playwright drives a real VS Code instance) under
 [`editors/vscode/recording/`](../editors/vscode/recording/).
 
 ## Usage
@@ -23,7 +23,7 @@ just publish-cli-demo quickstart   # copy out/quickstart.gif -> docs/public/demo
 
 `record.sh` calls `prepare.sh <demo>` first to build a clean scratch workspace
 under `scratch/<demo>/`, then runs `vhs tapes/<demo>.tape`. `rocky` must be on
-`$PATH`. Everything runs against local DuckDB — no credentials.
+`$PATH`. Everything runs against local DuckDB, no credentials.
 
 ## How a tape is structured
 

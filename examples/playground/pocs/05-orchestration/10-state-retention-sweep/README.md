@@ -8,7 +8,7 @@
 
 ## What it shows
 
-Rocky tracks every run in `state.redb` — `run_history`, `dag_snapshots`,
+Rocky tracks every run in `state.redb`: `run_history`, `dag_snapshots`,
 and `quality_history` grow monotonically until something prunes them.
 The `[state.retention]` config block governs that prune, with two
 delivery paths exercised by this POC:
@@ -32,7 +32,7 @@ are **never** swept regardless of configuration.
   so the dry-run JSON's `runs_deleted` is exactly what the apply path
   will remove (modulo concurrent writers).
 - **Operational tables are explicitly off-limits.** Retention only ever
-  touches history domains — the schema cache and watermark map stay
+  touches history domains; the schema cache and watermark map stay
   intact, so the next run isn't paying a cold-cache penalty.
 
 ## Layout

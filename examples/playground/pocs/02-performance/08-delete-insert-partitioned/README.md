@@ -7,7 +7,7 @@
 
 ## What it shows
 
-The `delete_insert` materialization strategy — an alternative to MERGE for partition-level updates. Instead of row-by-row matching (MERGE), delete+insert:
+The `delete_insert` materialization strategy is an alternative to MERGE for partition-level updates. Instead of row-by-row matching (MERGE), delete+insert:
 
 1. Deletes all rows in the target matching the partition key(s)
 2. Inserts fresh data for those partitions
@@ -19,7 +19,7 @@ This is ideal for late-arriving data, daily/regional aggregates, and scenarios w
 - **No duplicate risk** — unlike incremental INSERT, delete+insert clears the partition first
 - **Simpler than MERGE** — no `WHEN MATCHED / WHEN NOT MATCHED` logic
 - **Partition-scoped** — only touches rows matching `partition_by` keys, not the entire table
-- **dbt comparison:** dbt's `incremental` with `delete+insert` strategy requires Jinja config blocks; Rocky uses `partition_by` in declarative TOML
+- **dbt comparison:** dbt's `incremental` with `delete+insert` strategy requires Jinja config blocks; Rocky uses `partition_by` in TOML
 
 ## Layout
 
@@ -69,7 +69,7 @@ POC complete.
    SELECT sale_date, region, COUNT(*), SUM(amount), AVG(amount)
    FROM seeds.daily_sales GROUP BY sale_date, region;
    ```
-3. Only affected partitions are touched — unmodified regions remain untouched
+3. Only affected partitions are touched; unmodified regions remain untouched
 
 ## Related
 

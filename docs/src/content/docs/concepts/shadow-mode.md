@@ -5,7 +5,7 @@ sidebar:
   order: 14
 ---
 
-Shadow mode writes pipeline output to shadow tables instead of (or alongside) production tables. This lets you validate changes — new logic, schema migrations, adapter upgrades — without affecting production data.
+Shadow mode writes pipeline output to shadow tables instead of (or alongside) production tables. This lets you validate changes (new logic, schema migrations, adapter upgrades) without affecting production data.
 
 ## How it works
 

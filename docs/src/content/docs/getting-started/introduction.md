@@ -18,7 +18,7 @@ The expensive failures in modern data platforms aren't slow queries. They're tru
 - Warehouse spend doubles in a month and nobody can attribute which model caused it.
 - An auditor asks who changed `fct_revenue.amount`, when, and why, and the honest answer is `git blame` and screenshots.
 
-**Rocky's answer is to make each of these failures a compile error or a CI gate**, caught before it ships. A column-type change is `E013` at compile; a rename's blast radius is a `rocky lineage-diff` comment on the PR; an unbudgeted cost spike is a `[budget]` block that fails the run; classified PII with no mask strategy fails `rocky compliance`. These are failures the warehouse can't see and the templating layer above it can't catch at compile time — the gap Rocky fills as the typed graph between your code and your data. For how Rocky stacks up against dbt Core, dbt Fusion, and SQLMesh, see the [comparison](/getting-started/comparison/).
+**Rocky's answer is to make each of these failures a compile error or a CI gate**, caught before it ships. A column-type change is `E013` at compile; a rename's blast radius is a `rocky lineage-diff` comment on the PR; an unbudgeted cost spike is a `[budget]` block that fails the run; classified PII with no mask strategy fails `rocky compliance`. These are failures the warehouse can't see and the templating layer above it can't catch at compile time, the gap Rocky fills as the typed graph between your code and your data. For how Rocky stacks up against dbt Core, dbt Fusion, and SQLMesh, see the [comparison](/getting-started/comparison/).
 
 ## Who Rocky is for
 
@@ -86,7 +86,7 @@ See the [Roadmap](/getting-started/roadmap/) for the full breakdown of what's sh
 | Cost attribution | — | Per-model, every run |
 | Replay | — | Content-addressed run record (re-execution on the roadmap) |
 
-**Evaluating SQLMesh?** SQLMesh is the tool Rocky most resembles — it also analyzes SQL statically (via SQLGlot, no Jinja), and its virtual environments, plan/apply, and column-level lineage are mature primitives Rocky shares rather than beats. Rocky keeps SQL as the default (SQLMesh leans Python-first) and differentiates on the enforcement plane: declarative OSS governance and `[budget]` blocks that fail the build (neither in SQLMesh OSS), plus source-schema-drift detection and a dialect-portability lint at PR time (where SQLMesh instead transpiles dialects via SQLGlot). SQLMesh is more mature in years, funding, and adoption, and ships native Python models and an OSS CI/CD bot.
+**Evaluating SQLMesh?** SQLMesh is the tool Rocky most resembles: it also analyzes SQL statically (via SQLGlot, no Jinja), and its virtual environments, plan/apply, and column-level lineage are mature primitives Rocky shares rather than beats. Rocky keeps SQL as the default (SQLMesh leans Python-first) and differentiates on the enforcement plane: declarative OSS governance and `[budget]` blocks that fail the build (neither in SQLMesh OSS), plus source-schema-drift detection and a dialect-portability lint at PR time (where SQLMesh instead transpiles dialects via SQLGlot). SQLMesh is more mature in years, funding, and adoption, and ships native Python models and an OSS CI/CD bot.
 
 Full side-by-side comparison: [features/comparison](/getting-started/comparison/).
 

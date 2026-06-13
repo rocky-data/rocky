@@ -15,7 +15,7 @@ on every save. The POC runs non-interactively by:
 
 1. Launching `rocky run --watch` in the background, redirected to a log.
 2. Waiting for the first run to land (`"command":"run"` in the log).
-3. Touching `rocky.toml` — same shape as a `:w` from vim or a save in
+3. Touching `rocky.toml`, the same shape as a `:w` from vim or a save in
    VSCode.
 4. Waiting for the second run to land.
 5. Sending SIGINT; the watch loop completes the in-flight run and exits 0.
@@ -63,7 +63,7 @@ change` notices.
 1. **Seed** `raw__orders.orders` into DuckDB (50 rows).
 2. **Launch watch** — `rocky run --watch -c rocky.toml --filter source=orders` runs in the background, prints a watching banner on stderr, runs the pipeline once on startup.
 3. **Touch `rocky.toml`** — fires a filesystem event; the 200 ms debounce window collects any related events; one re-run is dispatched.
-4. **Two `RunOutput` records** land in `expected/watch.log` — one per iteration, newline-delimited.
+4. **Two `RunOutput` records** land in `expected/watch.log`, one per iteration, newline-delimited.
 5. **SIGINT** completes the in-flight run, then the watch loop exits 0.
 
 ## Related

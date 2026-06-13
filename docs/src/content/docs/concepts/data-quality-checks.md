@@ -5,16 +5,16 @@ sidebar:
   order: 11.5
 ---
 
-Rocky ships two complementary quality surfaces, both executed inline against the warehouse — there is no separate testing step like `dbt test`:
+Rocky ships two complementary quality surfaces, both executed inline against the warehouse. There is no separate testing step like `dbt test`:
 
 1. **Pipeline-level checks** — configured per pipeline in `rocky.toml` under `[pipeline.<name>.checks]`. These run after each table is replicated: row count, column match, freshness, null rate, anomaly detection, custom SQL.
 2. **Model-level declarative assertions** — configured per model in the model's sidecar TOML (or directly under `[pipeline.<name>.checks]`) via repeated `[[assertions]]` blocks. These cover the DQX parity surface: `not_null`, `unique`, `unique_expr`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, plus the time-window sugar `not_in_future` and `older_than_n_days`.
 
-Assertions run on **every** pipeline type — including **replication**, not just transformation/quality — so a target table doubled by the same source arriving twice is caught at load time. For the cross-*table* variant (the same key arriving through two sibling sources that later get `UNION`-ed together), see [Cross-source overlap](#cross-source-overlap).
+Assertions run on **every** pipeline type (including **replication**, not just transformation/quality), so a target table doubled by the same source arriving twice is caught at load time. For the cross-*table* variant (the same key arriving through two sibling sources that later get `UNION`-ed together), see [Cross-source overlap](#cross-source-overlap).
 
 Both surfaces share the same JSON output shape (`check_results[]`) and the same severity / quarantine plumbing, so orchestrators don't need to distinguish between them.
 
-Compile-time contract diagnostics run even earlier — before any check executes — so a model that violates its contract never reaches the warehouse:
+Compile-time contract diagnostics run even earlier, before any check executes, so a model that violates its contract never reaches the warehouse:
 
 ![rocky compile surfaces E010 and E013 contract diagnostic codes on a broken model](/demo-data-contracts.gif)
 
@@ -34,7 +34,7 @@ freshness = { threshold_seconds = 86400 }
 
 Compares `COUNT(*)` between source and target tables. The check passes if counts match.
 
-Rocky uses batched queries with `UNION ALL` for efficiency. Instead of running one query per table (5N queries for N tables), it batches up to 200 tables per query, reducing the total to roughly 3 queries for a typical pipeline.
+Rocky uses batched queries with `UNION ALL`. Instead of running one query per table (5N queries for N tables), it batches up to 200 tables per query, reducing the total to roughly 3 queries for a typical pipeline.
 
 ```json
 {
@@ -79,7 +79,7 @@ Samples the table using `TABLESAMPLE` and calculates the null percentage per col
 null_rate = { columns = ["email"], threshold = 0.05 }
 ```
 
-The generated SQL uses `TABLESAMPLE (N PERCENT)` for efficiency, making it practical even on very large tables.
+The generated SQL uses `TABLESAMPLE (N PERCENT)`, so it stays practical on large tables.
 
 ### Custom SQL
 
@@ -95,7 +95,7 @@ The check passes if the query result is less than or equal to the threshold.
 
 ### Batched execution
 
-Row count and freshness checks use batched `UNION ALL` queries in groups of 200 tables. This minimizes round trips to the warehouse and keeps execution fast even when replicating hundreds of tables in a single run.
+Row count and freshness checks use batched `UNION ALL` queries in groups of 200 tables. This minimizes round trips to the warehouse even when replicating hundreds of tables in a single run.
 
 ## Model-level declarative assertions (DQX parity)
 
@@ -166,7 +166,7 @@ severity = "warning"  # unknown status reports but doesn't fail
 
 ### Per-assertion `filter`
 
-Every assertion kind accepts an optional `filter` — a SQL boolean predicate that scopes the check to a subset of rows. Rows where `(filter)` evaluates to `TRUE` are subject to the assertion; rows where it's `FALSE` or `NULL` pass unconditionally.
+Every assertion kind accepts an optional `filter`, a SQL boolean predicate that scopes the check to a subset of rows. Rows where `(filter)` evaluates to `TRUE` are subject to the assertion; rows where it's `FALSE` or `NULL` pass unconditionally.
 
 ```toml
 [[assertions]]
@@ -176,7 +176,7 @@ min = "0"
 filter = "region = 'US' AND status != 'cancelled'"
 ```
 
-Filter is user-supplied SQL — the caller is responsible for valid SQL in the target dialect. Rocky validates identifiers inside structured parameters (columns, values) but passes the filter expression through verbatim.
+Filter is user-supplied SQL: the caller is responsible for valid SQL in the target dialect. Rocky validates identifiers inside structured parameters (columns, values) but passes the filter expression through verbatim.
 
 ### Row quarantine
 
@@ -193,7 +193,7 @@ mode = "split"   # or "tag" or "drop"
 | `tag` | A `__dqx_valid` boolean column is added to `<target>`; failing rows stay in the table with `__dqx_valid = FALSE`. Useful for observation without rewiring downstream. |
 | `drop` | Failing rows are dropped from `<target>`. Quarantine count is still reported in `check_results[]`. |
 
-Set-based and table-level assertions are not quarantinable — they run as post-hoc checks regardless of mode.
+Set-based and table-level assertions are not quarantinable; they run as post-hoc checks regardless of mode.
 
 The quarantine predicate is built from every quarantinable assertion, combined with AND. Filters compose via `CASE WHEN (filter) THEN base_valid_pred ELSE TRUE END`, so out-of-scope rows stay on the valid side even when the base predicate would fail them.
 
@@ -212,11 +212,11 @@ Every assertion produces a `check_results[]` entry in the `rocky apply` JSON out
 }
 ```
 
-Consumers (dagster-rocky, the VS Code lineage view, custom scripts) parse this shape via the generated Pydantic / TypeScript bindings — see the [JSON Output](/reference/json-output/) reference.
+Consumers (dagster-rocky, the VS Code lineage view, custom scripts) parse this shape via the generated Pydantic / TypeScript bindings (see the [JSON Output](/reference/json-output/) reference).
 
 ## Cross-source overlap
 
-The assertions above check one table at a time. They can't catch a subtler duplication: the **same business key arriving through two different sources** that later get `UNION`-ed into one consolidation target. Each source table is internally unique — every per-table `unique` check passes — yet the consolidation double-counts every shared key.
+The assertions above check one table at a time. They can't catch a subtler duplication: the **same business key arriving through two different sources** that later get `UNION`-ed into one consolidation target. Each source table is internally unique (every per-table `unique` check passes), yet the consolidation double-counts every shared key.
 
 This is the classic "same account onboarded twice under two paths" failure. `cross_source_overlap` is the cross-table check that sees it.
 
@@ -228,9 +228,9 @@ max_overlap_rows = 0          # any overlap fails; raise to tolerate a known set
 sample = 20                   # overlapping keys attached to the result for triage
 ```
 
-Exactly one of `keys` (a column tuple) or `key_expr` (a derived SQL expression, passed through verbatim) is required — mirroring `unique` / `unique_expr`.
+Exactly one of `keys` (a column tuple) or `key_expr` (a derived SQL expression, passed through verbatim) is required, mirroring `unique` / `unique_expr`.
 
-**How it works.** The runner buckets the pipeline's managed source tables into **sibling groups** — tables with the same source type and table name that landed in more than one target schema (the tenant/region fan-out that gets unioned downstream). It tags each sibling's rows with its source identity and runs:
+**How it works.** The runner buckets the pipeline's managed source tables into **sibling groups**: tables with the same source type and table name that landed in more than one target schema (the tenant/region fan-out that gets unioned downstream). It tags each sibling's rows with its source identity and runs:
 
 ```sql
 SELECT order_id, COUNT(DISTINCT _src) AS _n_src
@@ -244,7 +244,7 @@ GROUP BY order_id
 HAVING COUNT(DISTINCT _src) > 1
 ```
 
-The `COUNT(DISTINCT _src)` is the crux: it counts how many *distinct sources* a key appears in, so a single source's own internal duplicates never false-flag — only a key spanning two or more siblings does. (With a `key_expr` or multi-column `keys`, the projected key list changes accordingly.) A key appearing under more than one source is an overlap. Sibling tables whose key can't be evaluated (missing column / keyless) are **skipped with a logged reason** rather than failing the check. The result is a `check_results[]` entry named `cross_source_overlap:<source_type>.<table>`, carrying the overlap count, the contributing tables, and a bounded `sample` of overlapping keys (the detail fields are flattened onto the result, consistent with every other check):
+The `COUNT(DISTINCT _src)` is the crux: it counts how many *distinct sources* a key appears in, so a single source's own internal duplicates never false-flag; only a key spanning two or more siblings does. (With a `key_expr` or multi-column `keys`, the projected key list changes accordingly.) A key appearing under more than one source is an overlap. Sibling tables whose key can't be evaluated (missing column / keyless) are **skipped with a logged reason** rather than failing the check. The result is a `check_results[]` entry named `cross_source_overlap:<source_type>.<table>`, carrying the overlap count, the contributing tables, and a bounded `sample` of overlapping keys (the detail fields are flattened onto the result, consistent with every other check):
 
 ```json
 {
@@ -266,4 +266,4 @@ Rocky catches cross-source duplication at two points:
 | **Preventive** | `on_collision` | `rocky discover` — before a stray catalog is even created | `[pipeline.NAME.source.discovery] on_collision` → `collision_candidates` |
 | **Detective** | `cross_source_overlap` | `rocky run` — after the sibling tables are materialized | `[pipeline.NAME.checks.cross_source_overlap]` |
 
-The preventive layer needs an adapter that resolves external object ids (e.g. Fivetran) and inspects connector metadata; the detective layer works on any warehouse by querying the materialized tables directly. They're complementary — use both for defense in depth, or just the detective check if your sources don't expose object ids at discover time. See [discovery configuration](/reference/configuration/#pipelinenamesourcediscovery) for `on_collision`.
+The preventive layer needs an adapter that resolves external object ids (e.g. Fivetran) and inspects connector metadata; the detective layer works on any warehouse by querying the materialized tables directly. They're complementary: use both for defense in depth, or just the detective check if your sources don't expose object ids at discover time. See [discovery configuration](/reference/configuration/#pipelinenamesourcediscovery) for `on_collision`.

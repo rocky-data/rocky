@@ -11,7 +11,7 @@ Rocky models consuming tables produced by dbt packages (Fivetran facebook_ads, F
 
 ## Why it's distinctive
 
-- Demonstrates the **pragmatic migration path**: keep battle-tested dbt packages, write new business logic in Rocky.
+- Demonstrates the migration path: keep existing dbt packages, write new business logic in Rocky.
 - Shows that Rocky's resolver automatically classifies two-part table references as external (no DAG dependency), while bare model references create proper DAG edges.
 
 ## Layout
@@ -49,7 +49,7 @@ dbt_stripe.stg_stripe__charges   ─(external)─▶ stripe_revenue_daily
                                               combined_marketing_revenue
 ```
 
-External sources do **not** appear in `depends_on` — Rocky knows they exist but does not try to build or refresh them.
+External sources do **not** appear in `depends_on`; Rocky knows they exist but does not try to build or refresh them.
 
 ## Prerequisites
 
@@ -65,7 +65,7 @@ External sources do **not** appear in `depends_on` — Rocky knows they exist bu
 ## Expected output
 
 - `validate` reports 4 transformation models, DAG valid, no errors
-- `compile` type-checks all models — external source columns are `Unknown` type (no warehouse introspection in DuckDB mode)
+- `compile` type-checks all models (external source columns are `Unknown` type with no warehouse introspection in DuckDB mode)
 - `lineage` traces column-level edges from `stripe_revenue_daily` and `facebook_daily_trends` into `combined_marketing_revenue`
 
 ## What happened
@@ -87,7 +87,7 @@ In production, the CI pipeline runs both tools:
   run: rocky -c rocky.toml run
 ```
 
-dbt owns the package-generated staging layer. Rocky owns the analytics layer on top. Each tool manages its own models — no conversion needed.
+dbt owns the package-generated staging layer. Rocky owns the analytics layer on top. Each tool manages its own models, with no conversion needed.
 
 ## Related
 

@@ -10,7 +10,7 @@
 ## What it shows
 
 The four primitives that make up Rocky's branch / replay / lineage
-surface — all on a single 3-model DuckDB pipeline:
+surface, all on a single 3-model DuckDB pipeline:
 
 1. **Named branches** — `rocky branch create fix-revenue` registers a
    virtual branch in the state store; runs written against the branch
@@ -37,8 +37,8 @@ surface — all on a single 3-model DuckDB pipeline:
 - **The DAG is the primitive.** Warehouses don't own it; Rocky does.
   That's why branches, replay, and column lineage are all one command
   away here and wouldn't be in any warehouse.
-- **Replay captures SQL hashes and row counts** at the time of the run
-  — the same `run_id` answers both *"what ran at 03:15 UTC?"* and
+- **Replay captures SQL hashes and row counts** at the time of the run,
+  so the same `run_id` answers both *"what ran at 03:15 UTC?"* and
   *"are you sure it was deterministic?"* (content-addressed re-run
   comes next; inspection already works).
 - **Column lineage is semantic-graph aware** (compiler-driven, not

@@ -9,7 +9,7 @@
 
 `rocky doctor` aggregates health checks across config, local state, adapters,
 pipelines, state backend config (`state_sync`), live state read/write
-(`state_rw`, v1.13.0+), and auth (`auth` + per-adapter `auth/<name>`) — all
+(`state_rw`, v1.13.0+), and auth (`auth` + per-adapter `auth/<name>`), all
 in one JSON output. `rocky ci` is a combined `compile + test` command with
 proper exit codes for CI.
 

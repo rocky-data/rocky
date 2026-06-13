@@ -14,7 +14,7 @@ With `--save`, the assertions are written to a `tests/` directory.
 ## Why it's distinctive
 
 - **Generation, not just hand-written tests.** Different from
-  `rocky/examples/ai-intent` which ships *pre-generated* assertions —
+  `rocky/examples/ai-intent` which ships *pre-generated* assertions;
   this POC generates them live.
 
 ## Run

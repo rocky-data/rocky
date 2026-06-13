@@ -33,7 +33,7 @@ Rejects SQL constructs that don't exist on the chosen warehouse dialect. Detecti
 | `ILIKE` | Snowflake, Databricks, DuckDB, BigQuery |
 | `FLATTEN` | Snowflake |
 
-The catalog is conservative — anything not in it is assumed portable. False negatives (non-portable SQL that slips through) are expected; false positives (portable SQL flagged as non-portable) are not.
+The catalog is conservative: anything not in it is assumed portable. False negatives (non-portable SQL that slips through) are expected; false positives (portable SQL flagged as non-portable) are not.
 
 ### How to enable
 
@@ -71,7 +71,7 @@ Every P001 diagnostic names the construct, the supported dialects, and a one-lin
 
 ## P002 — blast-radius `SELECT *`
 
-Warns when a model uses `SELECT *` **and** at least one downstream model references specific columns of its output. The lint is blast-radius-aware: a leaf model with `SELECT *` is intentionally **not** flagged — a leaf projection's columns are never consumed by a named reference, so an upstream schema change can't silently leak past the `SELECT *`.
+Warns when a model uses `SELECT *` **and** at least one downstream model references specific columns of its output. The lint is blast-radius-aware: a leaf model with `SELECT *` is intentionally **not** flagged, because a leaf projection's columns are never consumed by a named reference, so an upstream schema change can't silently leak past the `SELECT *`.
 
 ### What it protects against
 
@@ -105,7 +105,7 @@ The diagnostic caps each consumer's listed columns at 3 for legibility on wide s
 
 ### Always on
 
-P002 runs on every `rocky compile` and `rocky ci` invocation without any flag or config. Detection uses the semantic graph (`ModelSchema::has_star` + `column_consumers`), not a re-parse — the cost is a single pass over the already-compiled graph, so it's cheap enough to run by default.
+P002 runs on every `rocky compile` and `rocky ci` invocation without any flag or config. Detection uses the semantic graph (`ModelSchema::has_star` + `column_consumers`), not a re-parse: the cost is a single pass over the already-compiled graph, so it's cheap enough to run by default.
 
 ---
 
@@ -138,7 +138,7 @@ Pragmas:
 
 - Accept a comma-separated list of construct labels.
 - Are case-insensitive (`nvl`, `NVL`, `Nvl` all work).
-- Apply only to the model whose SQL contains them — they are not hoisted to the project.
+- Apply only to the model whose SQL contains them; they are not hoisted to the project.
 - Are silently ignored if the label doesn't match any known construct, so adding a new lint later doesn't require removing stale pragmas.
 
 Prefer the pragma for targeted exemptions over expanding `[portability] allow`. The pragma lives next to the offending expression, which makes the decision reviewable in code.
@@ -157,7 +157,7 @@ Both lints emit the same diagnostic envelope as every other compiler check, so e
 - `rocky compile --output json` includes them in the `diagnostics` array.
 - The VS Code extension surfaces them as inline squiggles via the LSP.
 
-P001 diagnostics are errors — they fail `rocky compile` and `rocky ci`. P002 diagnostics are warnings — they show up in the output but do not fail the run.
+P001 diagnostics are errors: they fail `rocky compile` and `rocky ci`. P002 diagnostics are warnings: they show up in the output but do not fail the run.
 
 ## Related
 

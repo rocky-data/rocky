@@ -8,9 +8,8 @@
 ## What it shows
 
 The end-to-end `rocky preview` workflow that turns a PR into a single
-review surface — *"this PR will change these N rows / these M
-columns, costs $X more or less to run, here's the diff"* — on a 5-model
-DuckDB transformation pipeline:
+review surface (changed rows, affected columns, cost delta, data diff) on a
+5-model DuckDB transformation pipeline:
 
 1. **`rocky preview create --base <ref>`** — git-diff identifies changed
    model files between `<ref>` and HEAD; the compiler IR computes a
@@ -21,9 +20,9 @@ DuckDB transformation pipeline:
    changed) plus row-level diff between branch and base for every
    model in the prune set. Each per-model entry carries an
    `algorithm` tagged enum picking which row-level technique ran:
-   `kind: "sampled"` (default — `LIMIT N` rows ordered by primary
+   `kind: "sampled"` (default: `LIMIT N` rows ordered by primary
    key, with `sampling_window.coverage_warning`) or `kind:
-   "bisection"` (`--algorithm bisection` — exhaustive
+   "bisection"` (`--algorithm bisection`: exhaustive
    checksum-bisection over a single-column integer / numeric
    `unique_key`). The POC runs both invocations to demonstrate the
    discriminator shape.
@@ -49,24 +48,23 @@ without rewriting dbt's compiler:
 
 - **Column-level pruning > model-level.** Compiler IR knows column-level
   dependencies. A column added to an unused tail of a wide table prunes
-  to zero downstream — Smart Run has to re-run the whole subtree.
+  to zero downstream; Smart Run has to re-run the whole subtree.
 - **Branches are the substrate.** Schema-prefix branches everywhere;
   warehouse-native clones slot into the same API via the
-  `WarehouseAdapter::clone_table_for_branch` trait method — Databricks
+  `WarehouseAdapter::clone_table_for_branch` trait method: Databricks
   `SHALLOW CLONE` and BigQuery `CREATE TABLE … COPY` (both metadata-only)
   are live as of `engine-v1.19.1`. DuckDB and Snowflake use the portable
   CTAS default; Snowflake's native `CLONE` lands when a Snowflake
   consumer drives the integration test.
 - **Compile-time change detection > git-diff alone.** `rocky ci-diff`
   already does git-diff between refs and produces a structural diff;
-  the next step — *"this textual change is type-equivalent and produces
-  no output diff"* — is something only a compiled engine can do.
+  the next step (*"this textual change is type-equivalent and produces
+  no output diff"*) is something only a compiled engine can do.
 - **Cost delta as a state-store query, not a fresh measurement.**
   `rocky cost latest` already rolls per-run cost from adapter telemetry;
   `preview cost` is the diff layer over that machinery.
-- **Single artefact for the reviewer.** The composite GitHub Action
-  stitches all three outputs into one PR comment that answers *"should
-  I merge this?"* with row counts, columns, and dollars — not log lines.
+- **Single PR comment.** The composite GitHub Action stitches all three
+  outputs into one comment: row counts, columns, and cost delta in one place.
 
 Compare:
 
@@ -105,7 +103,7 @@ Compare:
 
 ## Note on model surfaces
 
-The 5-model DAG is all SQL. Raw SQL stays first-class in Rocky — the
+The 5-model DAG is all SQL. Raw SQL stays first-class in Rocky; the
 preview workflow's prune set, copy set, and data diff are surface-agnostic
 (they care about a model's compiled output, not which DSL produced it).
 A `.rocky` DSL variant of this POC will be added once cross-model
@@ -116,7 +114,7 @@ run` for both DSL and SQL surfaces.
 
 Production path as of **engine-v1.18.0**. Earlier revisions of `run.sh`
 wrapped each preview call in a stub-tolerating helper while the engine
-handlers were still scaffolding; that scaffolding is gone — the script
+handlers were still scaffolding; that scaffolding is gone, and the script
 now treats `preview create / diff / cost` like any other production CLI
 command (`set -e` enforces failure).
 
@@ -144,7 +142,7 @@ cd examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
 4. Runs the pipeline on `main` state.
 5. Captures the current git HEAD as the `--base` ref (or a sentinel
    string when not in a git checkout).
-6. Swaps `models/fct_revenue.sql` for `fct_revenue.sql.changed` — adds a
+6. Swaps `models/fct_revenue.sql` for `fct_revenue.sql.changed`, adding a
    `WHERE s.amount > 25` filter that produces a real row-level diff.
 7. `rocky preview create --base <ref> --name pr-preview-poc-10` —
    materializes the per-PR branch schema and copies unchanged upstream
@@ -158,11 +156,11 @@ cd examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
 
 ## Related
 
-- Sibling POC: [`00-foundations/06-branches-replay-lineage/`](../../00-foundations/06-branches-replay-lineage/)
-  — the four trust-arc primitives (branches, replay, column lineage,
+- Sibling POC: [`00-foundations/06-branches-replay-lineage/`](../../00-foundations/06-branches-replay-lineage/),
+  covering the four trust-arc primitives (branches, replay, column lineage,
   state store) that `preview` composes.
-- Sibling POC: [`06-developer-experience/04-shadow-mode-compare/`](../04-shadow-mode-compare/)
-  — the precursor `rocky compare` kernel that `preview diff` extends.
+- Sibling POC: [`06-developer-experience/04-shadow-mode-compare/`](../04-shadow-mode-compare/),
+  the precursor `rocky compare` kernel that `preview diff` extends.
 - Engine source: `engine/crates/rocky-cli/src/commands/preview.rs`,
   `engine/crates/rocky-cli/src/output.rs`
   (`PreviewCreateOutput`, `PreviewDiffOutput`, `PreviewCostOutput`).

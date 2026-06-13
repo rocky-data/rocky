@@ -26,7 +26,7 @@ some run history:
 
 These commands are implemented and parse rocky.toml + state. They work
 against any populated state store, including the local one. With an
-empty state store the recommendations are minimal — the POC documents
+empty state store the recommendations are minimal, so the POC documents
 the commands and shows they run without error.
 
 ## Run

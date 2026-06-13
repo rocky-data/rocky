@@ -9,7 +9,7 @@ Rocky integrates AI as a development accelerator, not a runtime dependency. The 
 
 ## Three levels of AI
 
-Rocky's AI features operate at three levels of increasing sophistication:
+Rocky's AI features operate at three levels:
 
 ### Level 1: Generate from scratch
 
@@ -40,7 +40,7 @@ This means the compiler acts as a type-safe guardrail. The LLM operates freely w
 
 ### Level 3: Intent as metadata
 
-The most powerful level stores natural language intent as first-class metadata in model configuration. This intent travels through the compiler's semantic graph and enables automated maintenance:
+The third level stores natural language intent as metadata in model configuration. This intent travels through the compiler's semantic graph and enables automated maintenance:
 
 ```toml
 # orders_summary.toml

@@ -7,22 +7,22 @@
 
 ## What it shows
 
-Rocky's adaptive concurrency control — an AIMD (Additive Increase, Multiplicative Decrease) algorithm that dynamically adjusts parallelism based on warehouse feedback:
+Rocky's adaptive concurrency control is an AIMD (Additive Increase, Multiplicative Decrease) algorithm that dynamically adjusts parallelism based on warehouse feedback:
 
 - **Start:** `concurrency` tables in parallel (e.g., 16)
 - **Rate-limit (429) or transient error:** Halve concurrency (multiplicative decrease)
 - **N consecutive successes:** Increase by 1 (additive increase)
 - **Floor:** Never go below `min_concurrency` (default: 1)
 
-This prevents overwhelming warehouse APIs while maximizing throughput — the same algorithm TCP uses for congestion control.
+This prevents overwhelming warehouse APIs while maximizing throughput, using the same algorithm TCP uses for congestion control.
 
 ## Why it's distinctive
 
-- **Self-tuning** — no manual concurrency tuning needed; Rocky adapts to warehouse capacity
-- **AIMD algorithm** — proven approach (TCP congestion control) applied to warehouse parallelism
+- **No manual tuning** — Rocky adjusts concurrency automatically based on warehouse feedback
+- **AIMD algorithm** — the same algorithm TCP uses for congestion control, applied to warehouse parallelism
 - **Lock-free** — uses atomic operations for concurrent updates (no mutex contention)
 - **Guardrails** — `error_rate_abort_pct` aborts when too many tables fail; `table_retries` retries individually
-- **dbt comparison:** dbt uses fixed `threads` count; Rocky dynamically adjusts based on warehouse feedback
+- **dbt comparison:** dbt uses a fixed `threads` count; Rocky adjusts dynamically based on warehouse feedback
 
 ## Layout
 
@@ -89,7 +89,7 @@ concurrency
 
 ## What happened
 
-1. Seeded 20 small tables in DuckDB (local execution — no real rate-limiting)
+1. Seeded 20 small tables in DuckDB (local execution, no real rate-limiting)
 2. `rocky validate` checked the execution config (concurrency, retries, abort threshold)
 3. Pipeline replicated all 20 tables with up to 16 in parallel
 4. With a real warehouse (Databricks/Snowflake), the AIMD throttle in `throttle.rs` would dynamically adjust parallelism based on HTTP response codes

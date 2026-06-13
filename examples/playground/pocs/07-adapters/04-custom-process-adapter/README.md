@@ -14,12 +14,11 @@ language as long as they implement the required methods (`initialize`,
 `shutdown`). This POC ships an ~120-line Python adapter wrapping SQLite (stdlib
 `sqlite3`, zero deps), then **discovers it through the engine**: dropped on
 `$PATH` as an executable named `rocky-sqlite`, Rocky registers it as the adapter
-`sqlite` — the same cargo-subcommand convention `cargo-foo` uses.
+`sqlite`, following the same cargo-subcommand convention `cargo-foo` uses.
 
 ## Why it's distinctive
 
-- **Adapters in any language**, not just Rust — the most differentiated part of
-  Rocky's adapter SDK.
+- **Adapters in any language**, not just Rust: the adapter SDK is language-agnostic.
 - **Zero-config discovery.** No registry edit, no recompile: name your executable
   `rocky-<x>`, put it on `$PATH`, and `rocky adapter list` finds it. `rocky
   adapter info <x>` prints its manifest; `rocky test-adapter --adapter <x>` runs
@@ -42,7 +41,7 @@ language as long as they implement the required methods (`initialize`,
 ```
 
 `run.sh` copies `adapter.py` to a throwaway temp dir as `rocky-sqlite`, prepends
-that dir to `$PATH`, and lets the engine find it — nothing is installed on your
+that dir to `$PATH`, and lets the engine find it; nothing is installed on your
 real `$PATH`.
 
 ## Expected output

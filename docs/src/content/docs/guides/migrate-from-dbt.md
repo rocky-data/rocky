@@ -5,7 +5,7 @@ sidebar:
   order: 2
 ---
 
-**The migration is the conversion path.** Most teams adopting Rocky have a dbt project today; the day-one question is "how much rewriting?" The answer: little to none. Run `rocky import-dbt` against your existing repo, get a Rocky project on disk in seconds, and adopt the trust primitives (typed compile, contracts, column-level lineage, branches, cost) incrementally.
+Most teams adopting Rocky have a dbt project today, so the day-one question is "how much rewriting?" The answer: little to none. Run `rocky import-dbt` against your existing repo, get a Rocky project on disk in seconds, and adopt the trust primitives (typed compile, contracts, column-level lineage, branches, cost) incrementally.
 
 The wedge in five steps:
 
@@ -15,7 +15,7 @@ The wedge in five steps:
 4. **Adopt `rocky lineage-diff` in PR review.** Per-changed-column downstream blast radius. Drops into a PR comment. This is the moment your team stops reviewing changes blind.
 5. **Turn on `rocky preview cost`.** Per-PR cost projection: catch expensive plans before they ship instead of explaining them after.
 
-Everything below is the mechanics. The strategic point is above: you don't rewrite, you import and adopt.
+Everything below is the mechanics. The point holds throughout: you don't rewrite, you import and adopt.
 
 ## Prerequisites
 
@@ -269,7 +269,7 @@ By design, the importer does not translate the following. Rocky has no Jinja run
 - **Custom Jinja macros emitting SQL** (e.g. `{{ generate_schema_name() }}`, dynamic `UNION ALL` macros): surfaced as failed models with the macro name in the reason.
 - **Python dbt models** (`.py` files): not SQL; rewrite manually.
 
-The remainder of this guide walks each phase in detail (mapping `profiles.yml` to `rocky.toml`, handling unsupported Jinja, converting tests to contracts, cutover strategy). It is structured to read top-to-bottom as a migration playbook; the walkthrough above grounds it.
+The remainder of this guide walks each phase in detail (mapping `profiles.yml` to `rocky.toml`, handling unsupported Jinja, converting tests to contracts, cutover strategy), reading top-to-bottom as a migration playbook.
 
 ## 1. Import the dbt Project
 

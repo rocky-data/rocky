@@ -8,7 +8,7 @@ the JSON output, and returns a Pydantic model. Failures surface as `RockyError`
 subclasses carrying structured fields (exit code, stderr tail, version strings)
 rather than opaque messages.
 
-It is for **human Python callers** — notebooks, scripts, and orchestrators. The
+It is for **human Python callers**: notebooks, scripts, and orchestrators. The
 [`dagster-rocky`](https://pypi.org/project/dagster-rocky/) integration is a thin
 Dagster adapter built on this client. For AI agents, use `rocky mcp`; for a
 language-agnostic HTTP surface, use `rocky serve`.
@@ -19,7 +19,7 @@ language-agnostic HTTP surface, use `rocky serve`.
 pip install rocky-sdk
 ```
 
-The `rocky` binary is not bundled — install it separately and put it on `$PATH`
+The `rocky` binary is not bundled. Install it separately and put it on `$PATH`
 (or pass `binary_path=`). See the
 [releases page](https://github.com/rocky-data/rocky/releases). The SDK requires
 engine **v1.34.0 or newer**.

@@ -33,7 +33,7 @@ Each AI command runs a compile-verify retry loop (up to 3 attempts). To bound th
 max_tokens = 8192
 ```
 
-`max_tokens` doubles as the per-request cap on the Anthropic Messages API and as the cumulative output-token ceiling — when the running total of `output_tokens` across retry attempts exceeds this value, Rocky fail-stops with a `TokenBudgetExceeded` error instead of paying for another retry. See [`[ai]`](/reference/configuration/#ai) in the configuration reference.
+`max_tokens` doubles as the per-request cap on the Anthropic Messages API and as the cumulative output-token ceiling: when the running total of `output_tokens` across retry attempts exceeds this value, Rocky fail-stops with a `TokenBudgetExceeded` error instead of paying for another retry. See [`[ai]`](/reference/configuration/#ai) in the configuration reference.
 
 ### Verify the setup
 
@@ -111,7 +111,7 @@ schema  = "marts"
 table   = "fct_orders_daily"
 ```
 
-Pass `--overwrite` to replace an existing body or sidecar at the destination — without it, the command fails loudly rather than silently clobber user-authored models. See [`rocky ai`](/reference/commands/ai/#rocky-ai) for the full flag table, including the v1 `--materialization merge` limitation.
+Pass `--overwrite` to replace an existing body or sidecar at the destination. Without it, the command fails loudly rather than silently clobber user-authored models. See [`rocky ai`](/reference/commands/ai/#rocky-ai) for the full flag table, including the v1 `--materialization merge` limitation.
 
 ### JSON output
 
@@ -137,13 +137,13 @@ rocky ai "monthly revenue by category" -o json
 
 ## 3. Schema-Grounded Prompts
 
-Before sending your intent to the LLM, `rocky ai` compiles the project and injects the resulting typed schemas into the prompt. The LLM sees the real column names, types, and model graph — so generated code references columns that actually exist, with the types they actually have.
+Before sending your intent to the LLM, `rocky ai` compiles the project and injects the resulting typed schemas into the prompt. The LLM sees the real column names, types, and model graph, so generated code references columns that actually exist, with the types they actually have.
 
 ```bash
 rocky ai "monthly revenue by category" --models models
 ```
 
-`--models <PATH>` points at the directory to compile for grounding (default `models`). If the directory doesn't exist or fails to compile, `rocky ai` degrades gracefully to unschema'd generation rather than failing outright — the compile-verify loop (next section) still guards the output.
+`--models <PATH>` points at the directory to compile for grounding (default `models`). If the directory doesn't exist or fails to compile, `rocky ai` degrades gracefully to unschema'd generation rather than failing outright; the compile-verify loop (next section) still guards the output.
 
 A second mechanism runs after generation: `rocky ai`'s `ValidationContext` typechecks the candidate SQL against the live project graph. If the LLM references a model or column that doesn't exist, the diagnostic flows back into the compile-verify loop as retry feedback instead of reaching your files.
 
@@ -399,7 +399,7 @@ When using the [VS Code extension](/guides/ide-setup/), models with intent get e
 
 ## 9. Best Practices for Intent Descriptions
 
-Good intent descriptions make `ai-sync` and `ai-test` significantly more effective. Here are guidelines:
+Good intent descriptions make `ai-sync` and `ai-test` more effective:
 
 ### State the grain
 

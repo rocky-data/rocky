@@ -7,7 +7,7 @@
 
 ## What it shows
 
-Every `rocky run` now emits a `cost_summary` block in its JSON output —
+Every `rocky run` now emits a `cost_summary` block in its JSON output:
 per-model durations, aggregate wall-clock, and (on adapters that wire
 `bytes_scanned`) a USD estimate.
 
@@ -19,9 +19,9 @@ non-zero exit code; the `on_budget_breach` hook fires either way.
 
 ## Why it's distinctive
 
-- **Cost is a first-class run artefact**, not a separate billing
-  export. The same JSON that carries row counts and timings now carries
-  cost — one artefact, one run, one source of truth.
+- **Cost appears in the run output**, not a separate billing export. The
+  same JSON that carries row counts and timings carries cost: one
+  artefact, one run, one source of truth.
 - **PR-time cost projection** is the natural next step (Arc 2 wave 2):
   a GitHub Action that runs `rocky estimate` against the diffed models
   and posts the projected delta as a check. The plumbing here is the
@@ -51,7 +51,7 @@ non-zero exit code; the `on_budget_breach` hook fires either way.
 
 ## What happened
 
-1. `rocky validate` parses the `[budget]` block — `max_duration_ms =
+1. `rocky validate` parses the `[budget]` block: `max_duration_ms =
    1`, `on_breach = "warn"`.
 2. `rocky run` replicates the 500-row orders table; the run exceeds the
    1ms budget, so a `budget_breach` event is pushed onto the run's

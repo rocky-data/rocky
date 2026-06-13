@@ -25,7 +25,7 @@ each pipeline's section of `rocky.toml`.
 
 ## Why it's distinctive
 
-- One config, three strategies, one source — see the differential behavior
+- One config, three strategies, one source: see the differential behavior
   on the same dataset rather than reading three separate POCs.
 - Surfaces the watermark-incremental tradeoff: `incremental` is fast and
   cheap but can't catch in-place UPDATEs to existing rows. `merge` and
@@ -67,7 +67,7 @@ each pipeline's section of `rocky.toml`.
 ## Prerequisites
 
 - `rocky` on PATH
-- `duckdb` CLI (`brew install duckdb`) — seeds the source, applies the
+- `duckdb` CLI (`brew install duckdb`), which seeds the source, applies the
   delta, and runs the side-by-side verification queries
 - Engine ≥ 1.29 (or this branch). `auto_create_schemas` for transformation
   pipelines landed in PR #448; if your binary predates it, either pre-create
@@ -100,7 +100,7 @@ order_id |  status    | amount
 ```
 
 Row counts after the second run are identical (120) across all three
-strategies — the differential is *which existing rows changed*, not the
+strategies; the differential is *which existing rows changed*, not the
 total count.
 
 ## What happened
@@ -110,7 +110,7 @@ total count.
    - `pipeline.fr` does a CTAS into `poc.fr.orders` (100 rows).
    - `pipeline.inc` does the same for the first run (the watermark is
      unset so the full source is copied) into `poc.inc.orders`.
-   - `pipeline.merge` runs the transformation model — Rocky bootstraps an
+   - `pipeline.merge` runs the transformation model: Rocky bootstraps an
      empty `poc.merge.orders` from the model schema and MERGE-inserts all
      100 rows.
 3. `data/delta.sql` mutates the source: change `status` on order 5,

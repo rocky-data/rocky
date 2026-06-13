@@ -7,8 +7,8 @@ sidebar:
 
 The `time_interval` materialization strategy lets you partition a model by a
 time column with a fixed granularity (`hour`, `day`, `month`, or `year`).
-Each run targets specific partitions rather than appending past a watermark
-— so re-running the same partition is idempotent, late-arriving rows are
+Each run targets specific partitions rather than appending past a watermark,
+so re-running the same partition is idempotent, late-arriving rows are
 picked up automatically, and backfills walk the range chronologically.
 
 This is the strategy you reach for when:
@@ -165,7 +165,7 @@ WHERE order_at >= '2026-04-07 00:00:00'
 GROUP BY 1, 2
 ```
 
-Works on un-partitioned tables too — `REPLACE WHERE` doesn't require physical
+Works on un-partitioned tables too; `REPLACE WHERE` doesn't require physical
 partitioning.
 
 ### Snowflake
@@ -185,7 +185,7 @@ COMMIT;
 
 ### DuckDB
 
-Same shape as Snowflake — keeps the abstraction symmetric across warehouses:
+Same shape as Snowflake; keeps the abstraction symmetric across warehouses:
 
 ```sql
 BEGIN;
