@@ -3263,11 +3263,15 @@
           ]
         },
         "valkey_url": {
-          "description": "Valkey/Redis URL for state persistence",
-          "type": [
-            "string",
-            "null"
-          ]
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RedactedString"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Valkey/Redis URL for state persistence. May embed credentials, so the value is redacted in serialized config and logs."
         }
       },
       "type": "object"

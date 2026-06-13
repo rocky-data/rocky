@@ -17,6 +17,7 @@ use tracing::{Instrument, debug, info, info_span, warn};
 use crate::circuit_breaker::TransitionOutcome;
 use crate::config::{RetryConfig, StateBackend, StateConfig, StateUploadFailureMode};
 use crate::object_store::{ObjectStoreError, ObjectStoreProvider};
+use crate::redacted::RedactedString;
 use crate::retry::compute_backoff;
 use crate::retry_budget::RetryBudget;
 
@@ -640,7 +641,8 @@ async fn download_from_valkey(
 ) -> Result<(), StateSyncError> {
     let url = config
         .valkey_url
-        .as_deref()
+        .as_ref()
+        .map(RedactedString::expose)
         .ok_or_else(|| StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into()))?
         .to_string();
     let prefix = config
@@ -715,7 +717,8 @@ async fn upload_to_valkey(
 ) -> Result<(), StateSyncError> {
     let url = config
         .valkey_url
-        .as_deref()
+        .as_ref()
+        .map(RedactedString::expose)
         .ok_or_else(|| StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into()))?
         .to_string();
     let prefix = config
@@ -881,7 +884,8 @@ async fn probe_object_store(
 async fn probe_valkey(config: &StateConfig) -> Result<(), StateSyncError> {
     let url = config
         .valkey_url
-        .as_deref()
+        .as_ref()
+        .map(RedactedString::expose)
         .ok_or_else(|| StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into()))?
         .to_string();
     let prefix = config

@@ -2839,7 +2839,7 @@ class StateConfig(BaseModel):
     """
     valkey_url: str | None = None
     """
-    Valkey/Redis URL for state persistence
+    Valkey/Redis URL for state persistence. May embed credentials, so the value is redacted in serialized config and logs.
     """
 
 

@@ -227,7 +227,11 @@ impl IdempotencyBackend {
         match state_config.backend {
             StateBackend::Local => IdempotencyBackend::Local,
             StateBackend::Valkey => IdempotencyBackend::Valkey {
-                url: state_config.valkey_url.clone().unwrap_or_default(),
+                url: state_config
+                    .valkey_url
+                    .as_ref()
+                    .map(|s| s.expose().to_string())
+                    .unwrap_or_default(),
                 prefix: state_config
                     .valkey_prefix
                     .clone()
@@ -235,7 +239,11 @@ impl IdempotencyBackend {
                 mirror_to_redb: false,
             },
             StateBackend::Tiered => IdempotencyBackend::Valkey {
-                url: state_config.valkey_url.clone().unwrap_or_default(),
+                url: state_config
+                    .valkey_url
+                    .as_ref()
+                    .map(|s| s.expose().to_string())
+                    .unwrap_or_default(),
                 prefix: state_config
                     .valkey_prefix
                     .clone()
@@ -1097,7 +1105,9 @@ mod tests {
     fn tiered_backend_mirrors_to_redb() {
         let sc = StateConfig {
             backend: StateBackend::Tiered,
-            valkey_url: Some("redis://localhost:6379".into()),
+            valkey_url: Some(crate::redacted::RedactedString::new(
+                "redis://localhost:6379".into(),
+            )),
             ..StateConfig::default()
         };
         let backend = IdempotencyBackend::from_state_config(&sc);
