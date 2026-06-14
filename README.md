@@ -51,26 +51,6 @@ The next ring out: **Snowflake and BigQuery shops** evaluating SQLMesh, who want
 
 Each demo is a self-contained POC in [`examples/playground/pocs/`](examples/playground/): `cd` in, run `./run.sh`, reproduce it locally.
 
-### Detects schema drift the moment it happens
-
-A source column type changes upstream. On the next run, Rocky diffs source against target, drops the target, and recreates it. No silent data corruption.
-
-<p align="center">
-  <img src="docs/public/demo-drift-recover.gif" alt="rocky run detects source type change and recreates the target" width="900" />
-</p>
-
-[POC: `02-performance/06-schema-drift-recover`](examples/playground/pocs/02-performance/06-schema-drift-recover/)
-
-### Enforces data contracts at compile time
-
-Missing required columns, protected columns being removed, or unsafe type changes surface as diagnostic codes (`E010`, `E013`) before a single row is written.
-
-<p align="center">
-  <img src="docs/public/demo-data-contracts.gif" alt="rocky compile flags E010 and E013 contract violations on broken_metrics" width="900" />
-</p>
-
-[POC: `01-quality/01-data-contracts-strict`](examples/playground/pocs/01-quality/01-data-contracts-strict/)
-
 ### PR-time blast-radius with `rocky lineage-diff`
 
 Compare two git refs and get a per-changed-column readout of downstream consumers; the pre-rendered Markdown drops straight into a GitHub PR comment. CODEOWNERS-style review tooling can't reach this granularity without a compiled engine.
@@ -81,18 +61,11 @@ Compare two git refs and get a per-changed-column readout of downstream consumer
 
 [POC: `06-developer-experience/11-lineage-diff`](examples/playground/pocs/06-developer-experience/11-lineage-diff/)
 
-### Native BigQuery: materialize live, cost to the byte
-
-Swap the adapter to BigQuery and the same models materialize against the live warehouse. The run receipt reports `bytes_scanned` and `cost_usd`, and a cross-check confirms `bytes_scanned` matches BigQuery's own `totalBytesBilled` for the job, to the byte. The same models run on Snowflake or Databricks by changing only the adapter.
-
-<p align="center">
-  <img src="docs/public/demo-bigquery.gif" alt="rocky run materializes a full-refresh table in BigQuery with a cost receipt, then a cross-check shows bytes_scanned equals BigQuery's totalBytesBilled" width="900" />
-</p>
-
-[POC: `07-adapters/05-bigquery-native-queries`](examples/playground/pocs/07-adapters/05-bigquery-native-queries/) (live path requires BigQuery credentials)
-
 ### More demos
 
+- [Schema drift recovery](examples/playground/pocs/02-performance/06-schema-drift-recover/): a source column type changes upstream; Rocky diffs source against target and recreates it, no silent corruption.
+- [Data contracts at compile time](examples/playground/pocs/01-quality/01-data-contracts-strict/): missing required columns, removed protected columns, or unsafe type changes surface as `E010` / `E013` before a row is written.
+- [Native BigQuery, cost to the byte](examples/playground/pocs/07-adapters/05-bigquery-native-queries/): the same models materialize live; the run receipt's `bytes_scanned` matches BigQuery's own `totalBytesBilled`, to the byte (live path requires credentials).
 - [Named branches + replay](examples/playground/pocs/00-foundations/06-branches-replay-lineage/): run against an isolated schema, inspect, then drop or promote.
 - [Column-level lineage](examples/playground/pocs/06-developer-experience/01-lineage-column-level/): trace a single column from a downstream fact back to the seed.
 - [Incremental loads with watermark state](examples/playground/pocs/02-performance/01-incremental-watermark/): set `strategy = "incremental"` and a `timestamp_column`; run 2 copies only the delta.
@@ -101,13 +74,7 @@ Swap the adapter to BigQuery and the same models materialize against the live wa
 
 ## In your editor
 
-The same compiler runs as a language server inside VS Code, so you catch drift, type errors, and contract violations where you write the code, not just in CI.
-
-Your `.rocky` models compile to SQL live as you type, with type-aware hover, inline column types, and go-to-definition across the graph.
-
-<p align="center">
-  <img src="editors/vscode/media/demo-compiledSql.gif" alt="A Rocky DSL model on the left and its compiled SQL on the right, updating live as you type" width="900" />
-</p>
+The same compiler runs as a language server inside VS Code, so you catch drift, type errors, and contract violations where you write the code, not just in CI. Your `.rocky` models compile to SQL live as you type, with type-aware hover, inline column types, and go-to-definition across the graph.
 
 The Inspector turns any model into a trust dashboard: schema, column-level lineage, tests, per-model cost, and a governance card that flags classified columns and unmasked PII.
 
@@ -144,7 +111,9 @@ If those gaps are blockers for your team, [open a discussion](https://github.com
 
 Each row is a real failure mode and a Rocky command that turns it into a non-event. The same primitives back every row: typed compiler, content-addressed state, column-level lineage, per-model cost.
 
-dbt Core defined this category, and `rocky import-dbt` converts a vanilla dbt project to Rocky in one command. In June 2026 dbt Labs open-sourced the Fusion runtime as dbt Core v2.0 (Rust, Apache 2.0, alpha); the recommended **Fusion** distribution adds SQL type-checking and column-level lineage on top, though it still templates with Jinja and its build-failing strict checks are opt-in. Neither dbt Core v2.0 nor Fusion ships named branches, a content-addressed run record, per-model cost as a first-class column, a cross-warehouse dialect lint, or declarative RBAC and masking; dbt's governance and cost features live in its paid platform, while Rocky's are open source under Apache 2.0.
+dbt Core defined this category, and `rocky import-dbt` converts a vanilla dbt project in one command. In June 2026 dbt Labs open-sourced the Fusion runtime as dbt Core v2.0 (Rust, Apache 2.0, alpha); the **Fusion** distribution adds SQL type-checking and column-level lineage, though it still templates with Jinja and its build-failing checks are opt-in.
+
+What neither dbt Core v2.0 nor Fusion ships: named branches, a content-addressed run record, per-model cost as a first-class column, a cross-warehouse dialect lint, or declarative RBAC and masking. dbt's governance and cost features live in its paid platform; Rocky's are Apache 2.0.
 
 ## Subprojects
 
