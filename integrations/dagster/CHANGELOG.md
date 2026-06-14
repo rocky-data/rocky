@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.49.0] — 2026-06-14
+
+### Changed
+
+- **`dagster-rocky` now delegates to the standalone `rocky-sdk`.** The typed result models and the `RockyClient` they back moved into the `rocky-sdk` package; `dagster-rocky` is now a thin Dagster adapter over it and floors on `rocky-sdk>=0.1.0`. `dagster_rocky.types` and `dagster_rocky.types_generated` re-export the SDK's surface, so existing `from dagster_rocky import RunResult` / `parse_rocky_output` imports keep working unchanged. (#874)
+- Refreshed locked dependencies (dagster 1.13.9, ruff 0.15.17, structlog 26.1.0). (#884)
+
 ## [1.48.0] — 2026-06-08
 
 ### Changed

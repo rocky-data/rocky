@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.51.1] — 2026-06-14
+
+### Security
+
+- **The BigQuery and DuckDB loaders validate SQL identifiers before interpolating them.** Table and column names that reach the bulk-load path are now checked against an allowlist rather than being formatted directly into the generated SQL. (#887)
+- **`state.valkey_url` is redacted from the plan snapshot.** The Valkey/Redis connection string (which can carry a password) is masked in serialized plan output, so the credential never lands in the snapshot on disk or in logs. (#892)
+- **`ci-diff`, `lineage-diff`, and `preview` reject an option-injecting `base_ref`.** A `base_ref` beginning with `-` can no longer be smuggled through to git as an option. (#893)
+
+### Fixed
+
+- **The LSP no longer panics on multi-byte UTF-8.** Truncation and indexing in the language server are now char-boundary-safe, so a document containing non-ASCII text doesn't crash `rocky lsp`. (#891)
+
+### Changed
+
+- **Compile and DAG model lookups are hash-map-backed.** Replacing the previous linear scans removes O(M²) behavior on large projects. (#890)
+
 ## [1.51.0] — 2026-06-08
 
 ### Added

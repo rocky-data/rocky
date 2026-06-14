@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.33.1] — 2026-06-14
+
+### Security
+
+- **Run and compile code lenses spawn `rocky` via argv instead of a shell command string.** A workspace path containing shell metacharacters can no longer trigger command execution when a code lens runs. (#889)
+
+### Changed
+
+- Bumped `vscode-languageclient` to 10 and `@vscode/test-electron` to 3.0.0, with CI on Node 22, plus assorted dev-dependency refreshes. (#882, #888)
+- Regenerated the `rocky-project` schema + TypeScript bindings for the `state.valkey_url` redaction. (#892)
+
 ## [1.33.0] — 2026-06-08
 
 ### Changed
