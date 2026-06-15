@@ -182,7 +182,7 @@ logos = "0.16"
 # for Rocky's parse pipeline. Not yet wired into the main compile flow —
 # follow-up PRs migrate call sites once the framework's API surface is
 # pinned for Rocky's needs.
-salsa = "0.26"
+salsa = "0.27"
 
 # Web server
 axum = "0.8"
