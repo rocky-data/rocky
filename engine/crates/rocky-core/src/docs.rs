@@ -28,6 +28,9 @@ pub struct DocColumn {
     pub data_type: String,
     /// Whether the column accepts NULLs.
     pub nullable: bool,
+    /// Human-readable description from the sidecar `[columns]` table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// A single model entry in the documentation catalog.
@@ -91,6 +94,9 @@ pub fn build_doc_index(
     models: &[Model],
     config: &RockyConfig,
     column_map: Option<&std::collections::HashMap<String, Vec<ColumnInfo>>>,
+    column_docs: Option<
+        &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    >,
 ) -> DocIndex {
     let mut doc_models: Vec<DocModel> = models
         .iter()
@@ -99,6 +105,7 @@ pub fn build_doc_index(
                 "{}.{}.{}",
                 m.config.target.catalog, m.config.target.schema, m.config.target.table
             );
+            let model_docs = column_docs.and_then(|cd| cd.get(&m.config.name));
             let columns = column_map
                 .and_then(|cm| cm.get(&m.config.name))
                 .map(|cols| {
@@ -107,6 +114,7 @@ pub fn build_doc_index(
                             name: c.name.clone(),
                             data_type: c.data_type.clone(),
                             nullable: c.nullable,
+                            description: model_docs.and_then(|md| md.get(&c.name)).cloned(),
                         })
                         .collect()
                 })
@@ -306,9 +314,16 @@ pub fn generate_index_html(index: &DocIndex) -> String {
 "#,
             );
             for col in &model.columns {
+                let desc = col.description.as_deref().map_or_else(String::new, |d| {
+                    format!(
+                        "<div style=\"color:#8b949e;font-size:12px;\">{}</div>",
+                        html_escape(d)
+                    )
+                });
                 html.push_str(&format!(
-                    "            <tr><td>{}</td><td class=\"col-type\">{}</td><td class=\"col-nullable\">{}</td></tr>\n",
+                    "            <tr><td>{}{}</td><td class=\"col-type\">{}</td><td class=\"col-nullable\">{}</td></tr>\n",
                     html_escape(&col.name),
+                    desc,
                     html_escape(&col.data_type),
                     if col.nullable { "yes" } else { "no" },
                 ));
@@ -438,16 +453,19 @@ mod tests {
                             name: "order_id".into(),
                             data_type: "BIGINT".into(),
                             nullable: false,
+                            description: None,
                         },
                         DocColumn {
                             name: "customer_id".into(),
                             data_type: "BIGINT".into(),
                             nullable: true,
+                            description: None,
                         },
                         DocColumn {
                             name: "status".into(),
                             data_type: "STRING".into(),
                             nullable: false,
+                            description: None,
                         },
                     ],
                     tests: vec![
@@ -786,7 +804,7 @@ mod tests {
             },
         ];
 
-        let index = build_doc_index(&models, &config, None);
+        let index = build_doc_index(&models, &config, None, None);
         assert_eq!(index.models[0].name, "a_model");
         assert_eq!(index.models[1].name, "z_model");
     }
@@ -866,14 +884,28 @@ mod tests {
             ],
         );
 
-        let index = build_doc_index(&models, &config, Some(&col_map));
+        let mut column_docs = HashMap::new();
+        column_docs.insert(
+            "my_model".to_string(),
+            HashMap::from([("id".to_string(), "Primary key".to_string())]),
+        );
+
+        let index = build_doc_index(&models, &config, Some(&col_map), Some(&column_docs));
         assert_eq!(index.models.len(), 1);
         assert_eq!(index.models[0].columns.len(), 2);
         assert_eq!(index.models[0].columns[0].name, "id");
         assert_eq!(index.models[0].columns[1].data_type, "STRING");
         assert!(!index.models[0].columns[0].nullable);
         assert!(index.models[0].columns[1].nullable);
+        // Per-column description flows onto the matching column only.
+        assert_eq!(
+            index.models[0].columns[0].description.as_deref(),
+            Some("Primary key")
+        );
+        assert!(index.models[0].columns[1].description.is_none());
         assert_eq!(index.models[0].description.as_deref(), Some("Test model"));
+        // The rendered HTML surfaces the per-column description.
+        assert!(generate_index_html(&index).contains("Primary key"));
     }
 
     #[test]
@@ -903,7 +935,7 @@ mod tests {
             reuse: Default::default(),
         };
 
-        let index = build_doc_index(&[], &config, None);
+        let index = build_doc_index(&[], &config, None, None);
         assert_eq!(index.pipeline_count, 0);
         assert_eq!(index.adapter_count, 0);
         assert!(index.models.is_empty());

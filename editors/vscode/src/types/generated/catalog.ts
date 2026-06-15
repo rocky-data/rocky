@@ -83,6 +83,10 @@ export interface CatalogColumn {
    * Declared or inferred type of the column, when known.
    */
   data_type?: string | null;
+  /**
+   * Human-readable description from the sidecar `[columns]` table, when set.
+   */
+  description?: string | null;
   name: string;
   /**
    * Whether the column accepts nulls, when known.
