@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel, Field, conint
 
 
@@ -58,6 +60,30 @@ class DeclarativeTestSummary(BaseModel):
     warned: conint(ge=0)
 
 
+class MismatchKind1(StrEnum):
+    """
+    Row exists in expected but not in actual.
+    """
+
+    missing = "missing"
+
+
+class MismatchKind2(StrEnum):
+    """
+    Row exists in actual but not in expected.
+    """
+
+    extra = "extra"
+
+
+class MismatchKind3(StrEnum):
+    """
+    Row exists in both but values differ.
+    """
+
+    value_diff = "value_diff"
+
+
 class ModelTestResult(BaseModel):
     """
     One per-model outcome from the local model-execution test.
@@ -73,6 +99,20 @@ class ModelTestResult(BaseModel):
     """
 
 
+class RowMismatch(BaseModel):
+    """
+    A single row mismatch between expected and actual output.
+    """
+
+    actual: str | None = None
+    expected: str
+    kind: MismatchKind1 | MismatchKind2 | MismatchKind3
+    """
+    Type of row mismatch.
+    """
+    row_index: conint(ge=0)
+
+
 class TestFailure(BaseModel):
     """
     One failed test, mirroring the (name, error) tuple in `rocky_engine::test_runner::TestResult::failures` but with named fields because schemars/JSON Schema can't represent positional tuples cleanly.
@@ -80,6 +120,44 @@ class TestFailure(BaseModel):
 
     error: str
     name: str
+
+
+class UnitTestResult(BaseModel):
+    """
+    Result of running a single unit test.
+    """
+
+    error: str | None = None
+    """
+    Error message if failed.
+    """
+    mismatches: list[RowMismatch] | None = Field([], validate_default=True)
+    """
+    Mismatched rows (for diagnostics).
+    """
+    model: str
+    """
+    Model name.
+    """
+    passed: bool
+    """
+    Whether the test passed.
+    """
+    test: str
+    """
+    Test name.
+    """
+
+
+class UnitTestSummary(BaseModel):
+    """
+    Summary of fixture-driven unit-test execution (from `[[test]]` blocks in model sidecars). The per-test `results` reuse the engine's [`rocky_core::unit_test::UnitTestResult`] shape (model, test, passed, error, and row-level mismatches).
+    """
+
+    failed: conint(ge=0)
+    passed: conint(ge=0)
+    results: list[UnitTestResult]
+    total: conint(ge=0)
 
 
 class TestOutput(BaseModel):
@@ -100,4 +178,8 @@ class TestOutput(BaseModel):
     """
     passed: conint(ge=0)
     total: conint(ge=0)
+    unit_tests: UnitTestSummary | None = None
+    """
+    Results from fixture-driven `[[test]]` unit tests in model sidecars. Present only when at least one model declares a `[[test]]` block.
+    """
     version: str

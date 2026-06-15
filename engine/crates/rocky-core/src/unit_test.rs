@@ -17,7 +17,7 @@
 //!     { id = 3, amount = 200.0, status = "cancelled" },
 //! ]
 //!
-//! [[test.expect]]
+//! [test.expect]
 //! rows = [
 //!     { id = 1, amount = 150.0, is_high_value = true },
 //!     { id = 3, amount = 200.0, is_high_value = true },
@@ -99,6 +99,21 @@ pub enum MismatchKind {
     Extra,
     /// Row exists in both but values differ.
     ValueDiff,
+}
+
+/// Render a JSON scalar to a DuckDB SQL literal.
+///
+/// Strings are single-quote escaped; numbers and bools pass through their
+/// canonical text form; anything else (including `null`, arrays, objects) is
+/// rendered as `NULL`. Shared by [`fixture_to_sql`] and the unit-test runner's
+/// expected-table builder so both stringify values identically.
+pub fn json_to_sql_literal(value: &JsonValue) -> String {
+    match value {
+        JsonValue::String(s) => format!("'{}'", s.replace('\'', "''")),
+        JsonValue::Number(n) => n.to_string(),
+        JsonValue::Bool(b) => b.to_string(),
+        _ => "NULL".to_string(),
+    }
 }
 
 /// Generate DuckDB SQL to create a temporary table from fixture rows.

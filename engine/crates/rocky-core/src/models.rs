@@ -10,6 +10,7 @@ use crate::config::{ModelBudgetConfig, substitute_env_vars};
 use crate::lakehouse::{LakehouseFormat, LakehouseOptions};
 use crate::retention::{RetentionParseError, RetentionPolicy};
 use crate::tests::TestDecl;
+use crate::unit_test::UnitTestDef;
 use rocky_ir::dag::DagNode;
 use rocky_ir::{
     CostBudget, GovernanceConfig, MaterializationStrategy, ModelIr, SourceRef, TargetRef, TimeGrain,
@@ -1010,6 +1011,71 @@ pub fn load_models_from_dir(dir: &Path) -> Result<Vec<Model>, ModelError> {
 
     models.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(models)
+}
+
+/// Minimal sidecar view capturing only the model `name` and its fixture-driven
+/// unit tests (`[[test]]` blocks), ignoring all other config keys.
+#[derive(Deserialize)]
+struct UnitTestSidecar {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    test: Vec<UnitTestDef>,
+}
+
+/// Load fixture-driven unit tests (`[[test]]` blocks) declared across a models
+/// directory, keyed by model name.
+///
+/// Loaded independently of [`load_models_from_dir`] — but matching its flat,
+/// sidecar-preferred discovery — so the test runner can pair each model's unit
+/// tests with its compiled SQL without threading them through the compiler IR.
+/// A model's name is its sidecar `name` field, or the file stem. Files that
+/// declare no `[[test]]` blocks are omitted from the map.
+pub fn load_unit_tests_from_dir(
+    dir: &Path,
+) -> Result<std::collections::HashMap<String, Vec<UnitTestDef>>, ModelError> {
+    let mut out = std::collections::HashMap::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Sidecar `.toml` is preferred; fall back to inline `---toml` frontmatter.
+        let toml_path = path.with_extension("toml");
+        let toml_src = if toml_path.exists() {
+            std::fs::read_to_string(&toml_path)?
+        } else {
+            let content = std::fs::read_to_string(&path)?;
+            match split_frontmatter(&content) {
+                Some((frontmatter, _)) => frontmatter.to_string(),
+                None => continue,
+            }
+        };
+
+        let substituted =
+            substitute_env_vars(&toml_src).map_err(|source| ModelError::EnvSubstitution {
+                path: path.display().to_string(),
+                source: Box::new(source),
+            })?;
+        let sidecar: UnitTestSidecar =
+            toml::from_str(&substituted).map_err(|e| ModelError::ParseFrontmatter {
+                path: path.display().to_string(),
+                source: e,
+            })?;
+        if sidecar.test.is_empty() {
+            continue;
+        }
+        out.insert(sidecar.name.unwrap_or(stem), sidecar.test);
+    }
+    Ok(out)
 }
 
 fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
