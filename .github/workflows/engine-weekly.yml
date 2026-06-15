@@ -100,6 +100,15 @@ jobs:
           sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
           sudo chmod +x /usr/local/bin/duckdb
           duckdb --version
+      # The branch-approve POC (00-foundations/08) calls `rocky branch approve`,
+      # which records the approver from `git config user.email` and errors out
+      # if it's unset — and a fresh runner has no git identity. Set one (exactly
+      # what the CLI's own error message instructs) so the gated-promotion POC
+      # can sign its approval artifact.
+      - name: Configure git identity for rocky branch approve
+        run: |
+          git config --global user.email "engine-weekly@rocky.invalid"
+          git config --global user.name "rocky weekly CI"
       - name: Run POC smoke tests
         working-directory: ${{ github.workspace }}
         run: bash examples/playground/scripts/run-all-duckdb.sh
