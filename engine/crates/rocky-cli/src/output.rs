@@ -2400,6 +2400,9 @@ pub struct CatalogColumn {
     /// Whether the column accepts nulls, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nullable: Option<bool>,
+    /// Human-readable description from the sidecar `[columns]` table, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// A single column-level lineage edge.

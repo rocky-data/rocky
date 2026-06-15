@@ -39,8 +39,10 @@ pub fn run_docs(
         "generating documentation"
     );
 
+    // Per-column descriptions from sidecar `[columns]` tables (best-effort).
+    let column_docs = rocky_core::models::load_column_docs_from_dir(models_dir).unwrap_or_default();
     // Build the documentation index (no column map — would need warehouse connection).
-    let index = build_doc_index(&models, &rocky_cfg, None);
+    let index = build_doc_index(&models, &rocky_cfg, None, Some(&column_docs));
 
     // Render HTML.
     let html = generate_index_html(&index);

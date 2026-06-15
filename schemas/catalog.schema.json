@@ -91,6 +91,13 @@
             "null"
           ]
         },
+        "description": {
+          "description": "Human-readable description from the sidecar `[columns]` table, when set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "name": {
           "type": "string"
         },

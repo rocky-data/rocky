@@ -1078,6 +1078,83 @@ pub fn load_unit_tests_from_dir(
     Ok(out)
 }
 
+/// Per-column documentation entry from a sidecar `[columns.<name>]` table.
+#[derive(Deserialize)]
+struct ColumnDoc {
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// Minimal sidecar view capturing only the model `name` and its per-column
+/// `[columns]` documentation, ignoring all other config keys.
+#[derive(Deserialize)]
+struct ColumnDocsSidecar {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    columns: std::collections::HashMap<String, ColumnDoc>,
+}
+
+/// Load per-column documentation (`[columns.<name>] description = "…"`) declared
+/// across a models directory, keyed by model name then column name.
+///
+/// Loaded independently of [`load_models_from_dir`] — matching its flat,
+/// sidecar-preferred discovery — so `rocky docs` / `rocky catalog` can attach
+/// descriptions without threading them through the compiler IR. A model's name
+/// is its sidecar `name` field, or the file stem. Files declaring no column
+/// descriptions are omitted from the map.
+pub fn load_column_docs_from_dir(
+    dir: &Path,
+) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, String>>, ModelError>
+{
+    let mut out = std::collections::HashMap::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let toml_path = path.with_extension("toml");
+        let toml_src = if toml_path.exists() {
+            std::fs::read_to_string(&toml_path)?
+        } else {
+            let content = std::fs::read_to_string(&path)?;
+            match split_frontmatter(&content) {
+                Some((frontmatter, _)) => frontmatter.to_string(),
+                None => continue,
+            }
+        };
+
+        let substituted =
+            substitute_env_vars(&toml_src).map_err(|source| ModelError::EnvSubstitution {
+                path: path.display().to_string(),
+                source: Box::new(source),
+            })?;
+        let sidecar: ColumnDocsSidecar =
+            toml::from_str(&substituted).map_err(|e| ModelError::ParseFrontmatter {
+                path: path.display().to_string(),
+                source: e,
+            })?;
+        let descriptions: std::collections::HashMap<String, String> = sidecar
+            .columns
+            .into_iter()
+            .filter_map(|(col, doc)| doc.description.map(|d| (col, d)))
+            .collect();
+        if descriptions.is_empty() {
+            continue;
+        }
+        out.insert(sidecar.name.unwrap_or(stem), descriptions);
+    }
+    Ok(out)
+}
+
 fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     let content = content.trim_start();
 
@@ -2156,6 +2233,52 @@ ssn = "confidential"
             m.config.classification.get("ssn"),
             Some(&"confidential".to_string())
         );
+    }
+
+    #[test]
+    fn load_column_docs_reads_sidecar_columns_table() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            r#"
+[target]
+catalog = "wh"
+schema = "main"
+
+[columns.order_id]
+description = "Unique order identifier"
+
+[columns.amount]
+description = "Order total in USD"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("orders.sql"),
+            "SELECT order_id, amount FROM upstream",
+        )
+        .unwrap();
+        // A model with no `[columns]` table is omitted from the map.
+        std::fs::write(
+            dir.path().join("plain.toml"),
+            "[target]\ncatalog = \"wh\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("plain.sql"), "SELECT 1 AS x").unwrap();
+
+        let docs = load_column_docs_from_dir(dir.path()).unwrap();
+        assert_eq!(docs.len(), 1);
+        let orders = docs.get("orders").unwrap();
+        assert_eq!(
+            orders.get("order_id").map(String::as_str),
+            Some("Unique order identifier")
+        );
+        assert_eq!(
+            orders.get("amount").map(String::as_str),
+            Some("Order total in USD")
+        );
+        assert!(!docs.contains_key("plain"));
     }
 
     /// FR-001 Option A: `${VAR}` and `${VAR:-default}` placeholders in a

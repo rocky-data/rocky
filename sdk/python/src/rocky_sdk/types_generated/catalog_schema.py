@@ -28,6 +28,10 @@ class CatalogColumn(BaseModel):
     """
     Declared or inferred type of the column, when known.
     """
+    description: str | None = None
+    """
+    Human-readable description from the sidecar `[columns]` table, when set.
+    """
     name: str
     nullable: bool | None = None
     """
