@@ -29,8 +29,12 @@ jobs:
         # Pin to a specific version + --locked so a regression in a newer
         # cargo-audit release can't silently change the weekly CI signal.
         # Bump deliberately alongside any MSRV or advisory-db change.
-        run: cargo install cargo-audit --version 0.21.1 --locked
+        # 0.21.1 could no longer parse newer advisory-db entries (the TOML
+        # schema drifted under it); 0.22.x reads the current database.
+        run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Run cargo audit
+        # Advisory ignores (with rationale) live in engine/.cargo/audit.toml,
+        # which cargo-audit reads from this working directory.
         run: cargo audit
 
   coverage:
@@ -51,7 +55,13 @@ jobs:
         # Pinned + --locked for the same reason as cargo-audit above.
         run: cargo install cargo-tarpaulin --version 0.31.2 --locked
       - name: Run coverage
-        run: cargo tarpaulin --all-targets --timeout 600 --out xml --output-dir coverage/
+        # No --all-targets: that pulls the criterion benches into the run, and
+        # the `binary_startup` bench shells out to `cargo run` on every
+        # iteration. Under tarpaulin's ptrace instrumentation that subprocess
+        # never returns (it contends on the target/ lock) and the bench blows
+        # the --timeout, failing the whole job. tarpaulin's default target set
+        # (lib + bins + tests) is what we want coverage for anyway.
+        run: cargo tarpaulin --timeout 600 --out xml --output-dir coverage/
       - name: Upload coverage report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -77,6 +87,19 @@ jobs:
         run: cargo build --release
       - name: Add rocky binary to PATH
         run: echo "$GITHUB_WORKSPACE/engine/target/release" >> $GITHUB_PATH
+      # The playground POC run.sh scripts shell out to the standalone `duckdb`
+      # CLI to seed data and inspect Parquet companions. The runner doesn't
+      # ship it, so without this step every DuckDB-seeding POC fails with
+      # `duckdb: command not found`. Pin to 1.5.3 to match the DuckDB version
+      # the engine bundles (libduckdb-sys 1.10503.1) so seeded .duckdb files
+      # round-trip through `rocky`.
+      - name: Install DuckDB CLI
+        working-directory: ${{ github.workspace }}
+        run: |
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.3/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
+          sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/duckdb
+          duckdb --version
       - name: Run POC smoke tests
         working-directory: ${{ github.workspace }}
         run: bash examples/playground/scripts/run-all-duckdb.sh

@@ -1,0 +1,14 @@
+# cargo-audit configuration — read from the working directory's
+# `.cargo/audit.toml` when `cargo audit` runs (the weekly security audit in
+# `../.github/workflows/engine-weekly.yml` runs with `working-directory: engine`).
+
+[advisories]
+# RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel in the `rsa` crate.
+# No fixed upgrade is available (the maintainers have no constant-time fix yet),
+# so there is nothing to bump to. It reaches us transitively through
+# `rocky-snowflake`, which uses `rsa` only to sign RS256 key-pair JWTs for
+# Snowflake auth — a client-side signing operation, not a server decrypting
+# attacker-supplied ciphertext, so the timing oracle the advisory describes is
+# not reachable in our usage. Re-evaluate (and drop this entry) once `rsa`
+# ships a patched release. See crates/rocky-snowflake/src/auth.rs.
+ignore = ["RUSTSEC-2023-0071"]
