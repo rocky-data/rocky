@@ -12,7 +12,7 @@ use rocky_core::traits::WarehouseAdapter;
 
 use crate::output::{
     DeclarativeTestResult, DeclarativeTestSummary, ModelTestResult, TestFailure, TestOutput,
-    print_json,
+    UnitTestSummary, print_json,
 };
 use crate::registry::{self, AdapterRegistry};
 
@@ -32,6 +32,20 @@ fn to_output_results(
             error: r.error.clone(),
         })
         .collect()
+}
+
+/// Build the JSON-output unit-test summary from the engine runner, or `None`
+/// when the project declares no `[[test]]` blocks.
+fn unit_summary(run: &rocky_engine::test_runner::UnitTestRun) -> Option<UnitTestSummary> {
+    if run.results.is_empty() {
+        return None;
+    }
+    Some(UnitTestSummary {
+        total: run.total(),
+        passed: run.passed(),
+        failed: run.total() - run.passed(),
+        results: run.results.clone(),
+    })
 }
 
 /// Side-effect-free core of `rocky test` (DuckDB-based local tests): run the
@@ -56,7 +70,13 @@ pub fn test_output(
         })
         .collect();
     let model_results = to_output_results(&result.model_results);
-    Ok(TestOutput::new(result.total, result.passed, failures).with_model_results(model_results))
+    let mut output =
+        TestOutput::new(result.total, result.passed, failures).with_model_results(model_results);
+    let unit_run = rocky_engine::test_runner::run_unit_tests(models_dir, model_filter)?;
+    if let Some(summary) = unit_summary(&unit_run) {
+        output = output.with_unit_tests(summary);
+    }
+    Ok(output)
 }
 
 /// Execute `rocky test` (DuckDB-based local tests).
@@ -67,6 +87,8 @@ pub fn run_test(
     output_json: bool,
 ) -> Result<()> {
     let result = rocky_engine::test_runner::run_tests(models_dir, contracts_dir, model_filter)?;
+    let unit_run = rocky_engine::test_runner::run_unit_tests(models_dir, model_filter)?;
+    let unit_failed = unit_run.total() - unit_run.passed();
 
     if output_json {
         let failures: Vec<TestFailure> = result
@@ -78,8 +100,11 @@ pub fn run_test(
             })
             .collect();
         let model_results = to_output_results(&result.model_results);
-        let output = TestOutput::new(result.total, result.passed, failures)
+        let mut output = TestOutput::new(result.total, result.passed, failures)
             .with_model_results(model_results);
+        if let Some(summary) = unit_summary(&unit_run) {
+            output = output.with_unit_tests(summary);
+        }
         print_json(&output)?;
     } else {
         let scope = match model_filter {
@@ -114,9 +139,27 @@ pub fn run_test(
             result.passed,
             result.failures.len()
         );
+
+        if unit_run.total() > 0 {
+            println!();
+            println!(
+                "  Unit tests: {} passed, {unit_failed} failed",
+                unit_run.passed()
+            );
+            for r in &unit_run.results {
+                if !r.passed {
+                    println!(
+                        "  \u{2717} {}::{} — {}",
+                        r.model,
+                        r.test,
+                        r.error.as_deref().unwrap_or("output mismatch")
+                    );
+                }
+            }
+        }
     }
 
-    if !result.failures.is_empty() {
+    if !result.failures.is_empty() || unit_failed > 0 {
         anyhow::bail!("test failures detected");
     }
 

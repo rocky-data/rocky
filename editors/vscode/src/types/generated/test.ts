@@ -6,6 +6,11 @@
  */
 
 /**
+ * Type of row mismatch.
+ */
+export type MismatchKind = "missing" | "extra" | "value_diff";
+
+/**
  * JSON output for `rocky test`.
  */
 export interface TestOutput {
@@ -22,6 +27,10 @@ export interface TestOutput {
   model_results?: ModelTestResult[];
   passed: number;
   total: number;
+  /**
+   * Results from fixture-driven `[[test]]` unit tests in model sidecars. Present only when at least one model declares a `[[test]]` block.
+   */
+  unit_tests?: UnitTestSummary | null;
   version: string;
   [k: string]: unknown;
 }
@@ -95,5 +104,51 @@ export interface ModelTestResult {
    * `"pass"` or `"fail"`.
    */
   status: string;
+  [k: string]: unknown;
+}
+/**
+ * Summary of fixture-driven unit-test execution (from `[[test]]` blocks in model sidecars). The per-test `results` reuse the engine's [`rocky_core::unit_test::UnitTestResult`] shape (model, test, passed, error, and row-level mismatches).
+ */
+export interface UnitTestSummary {
+  failed: number;
+  passed: number;
+  results: UnitTestResult[];
+  total: number;
+  [k: string]: unknown;
+}
+/**
+ * Result of running a single unit test.
+ */
+export interface UnitTestResult {
+  /**
+   * Error message if failed.
+   */
+  error?: string | null;
+  /**
+   * Mismatched rows (for diagnostics).
+   */
+  mismatches?: RowMismatch[];
+  /**
+   * Model name.
+   */
+  model: string;
+  /**
+   * Whether the test passed.
+   */
+  passed: boolean;
+  /**
+   * Test name.
+   */
+  test: string;
+  [k: string]: unknown;
+}
+/**
+ * A single row mismatch between expected and actual output.
+ */
+export interface RowMismatch {
+  actual?: string | null;
+  expected: string;
+  kind: MismatchKind;
+  row_index: number;
   [k: string]: unknown;
 }

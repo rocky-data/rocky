@@ -1476,6 +1476,10 @@ pub struct TestOutput {
     /// Present only when `--declarative` is used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declarative: Option<DeclarativeTestSummary>,
+    /// Results from fixture-driven `[[test]]` unit tests in model sidecars.
+    /// Present only when at least one model declares a `[[test]]` block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit_tests: Option<UnitTestSummary>,
 }
 
 /// One failed test, mirroring the (name, error) tuple in
@@ -1536,6 +1540,18 @@ pub struct DeclarativeTestResult {
     pub sql: String,
 }
 
+/// Summary of fixture-driven unit-test execution (from `[[test]]` blocks in
+/// model sidecars). The per-test `results` reuse the engine's
+/// [`rocky_core::unit_test::UnitTestResult`] shape (model, test, passed,
+/// error, and row-level mismatches).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct UnitTestSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub results: Vec<rocky_core::unit_test::UnitTestResult>,
+}
+
 impl TestOutput {
     pub fn new(total: usize, passed: usize, failures: Vec<TestFailure>) -> Self {
         TestOutput {
@@ -1547,6 +1563,7 @@ impl TestOutput {
             failures,
             model_results: Vec::new(),
             declarative: None,
+            unit_tests: None,
         }
     }
 
@@ -1554,6 +1571,12 @@ impl TestOutput {
     /// so callers can chain it onto `new(...)`.
     pub fn with_model_results(mut self, results: Vec<ModelTestResult>) -> Self {
         self.model_results = results;
+        self
+    }
+
+    /// Attach fixture-driven unit-test results. Returns `self` for chaining.
+    pub fn with_unit_tests(mut self, summary: UnitTestSummary) -> Self {
+        self.unit_tests = Some(summary);
         self
     }
 }

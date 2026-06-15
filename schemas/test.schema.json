@@ -98,6 +98,32 @@
       ],
       "type": "object"
     },
+    "MismatchKind": {
+      "description": "Type of row mismatch.",
+      "oneOf": [
+        {
+          "description": "Row exists in expected but not in actual.",
+          "enum": [
+            "missing"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Row exists in actual but not in expected.",
+          "enum": [
+            "extra"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Row exists in both but values differ.",
+          "enum": [
+            "value_diff"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "ModelTestResult": {
       "description": "One per-model outcome from the local model-execution test.\n\n`status` is `\"pass\"` or `\"fail\"`. `error` is set only when `status = \"fail\"`. Mirrors `rocky_engine::test_runner::ModelTestResult` with the status flattened to a string so consumers (Pydantic, TypeScript) get a stable, JSON-Schema-friendly shape.",
       "properties": {
@@ -121,6 +147,34 @@
       ],
       "type": "object"
     },
+    "RowMismatch": {
+      "description": "A single row mismatch between expected and actual output.",
+      "properties": {
+        "actual": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expected": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/MismatchKind"
+        },
+        "row_index": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "expected",
+        "kind",
+        "row_index"
+      ],
+      "type": "object"
+    },
     "TestFailure": {
       "description": "One failed test, mirroring the (name, error) tuple in `rocky_engine::test_runner::TestResult::failures` but with named fields because schemars/JSON Schema can't represent positional tuples cleanly.",
       "properties": {
@@ -134,6 +188,78 @@
       "required": [
         "error",
         "name"
+      ],
+      "type": "object"
+    },
+    "UnitTestResult": {
+      "description": "Result of running a single unit test.",
+      "properties": {
+        "error": {
+          "default": null,
+          "description": "Error message if failed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mismatches": {
+          "default": [],
+          "description": "Mismatched rows (for diagnostics).",
+          "items": {
+            "$ref": "#/definitions/RowMismatch"
+          },
+          "type": "array"
+        },
+        "model": {
+          "description": "Model name.",
+          "type": "string"
+        },
+        "passed": {
+          "description": "Whether the test passed.",
+          "type": "boolean"
+        },
+        "test": {
+          "description": "Test name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model",
+        "passed",
+        "test"
+      ],
+      "type": "object"
+    },
+    "UnitTestSummary": {
+      "description": "Summary of fixture-driven unit-test execution (from `[[test]]` blocks in model sidecars). The per-test `results` reuse the engine's [`rocky_core::unit_test::UnitTestResult`] shape (model, test, passed, error, and row-level mismatches).",
+      "properties": {
+        "failed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "passed": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "results": {
+          "items": {
+            "$ref": "#/definitions/UnitTestResult"
+          },
+          "type": "array"
+        },
+        "total": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "failed",
+        "passed",
+        "results",
+        "total"
       ],
       "type": "object"
     }
@@ -182,6 +308,17 @@
       "format": "uint",
       "minimum": 0.0,
       "type": "integer"
+    },
+    "unit_tests": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UnitTestSummary"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Results from fixture-driven `[[test]]` unit tests in model sidecars. Present only when at least one model declares a `[[test]]` block."
     },
     "version": {
       "type": "string"
