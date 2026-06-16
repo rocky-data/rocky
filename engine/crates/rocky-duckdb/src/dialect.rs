@@ -286,6 +286,15 @@ mod tests {
     }
 
     #[test]
+    fn surrogate_key_uses_dbt_default_form() {
+        let d = dialect();
+        assert_eq!(
+            d.surrogate_key_expr(&["a", "b"]),
+            "md5(cast(coalesce(cast(a as VARCHAR), '_dbt_utils_surrogate_key_null_') || '-' || coalesce(cast(b as VARCHAR), '_dbt_utils_surrogate_key_null_') as VARCHAR))"
+        );
+    }
+
+    #[test]
     fn test_create_table_as() {
         let d = dialect();
         let sql = d.create_table_as("sch.tbl", "SELECT * FROM src");
