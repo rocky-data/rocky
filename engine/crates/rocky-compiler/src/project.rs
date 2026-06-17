@@ -215,15 +215,15 @@ fn load_rocky_models_with_db(
     } else {
         None
     };
-    // Config groups apply to `.rocky` DSL models too — they resolve their
-    // sidecar config through the same `load_model_pair` path, so load the
-    // groups here and thread them in (the `.sql` loader does this in
+    // Config groups and named test definitions apply to `.rocky` DSL models
+    // too — they resolve their sidecar config through the same `load_model_pair`
+    // path, so load them here and thread them in (the `.sql` loader does this in
     // `load_models_from_dir`).
     let groups = models::load_groups_from_dir(dir)?;
-    let groups = if groups.is_empty() {
-        None
-    } else {
-        Some(&groups)
+    let test_defs = models::load_test_definitions_from_dir(dir)?;
+    let ctx = models::ModelLoadContext {
+        groups: (!groups.is_empty()).then_some(&groups),
+        test_defs: (!test_defs.is_empty()).then_some(&test_defs),
     };
 
     let rocky_paths: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -247,7 +247,7 @@ fn load_rocky_models_with_db(
         models.push(load_single_rocky_model_with_db(
             path,
             defaults.as_ref(),
-            groups,
+            &ctx,
             db,
         )?);
     }
@@ -264,7 +264,7 @@ fn load_rocky_models_with_db(
 fn load_single_rocky_model_with_db(
     path: &Path,
     defaults: Option<&models::DirDefaults>,
-    groups: Option<&std::collections::HashMap<String, models::GroupConfig>>,
+    ctx: &models::ModelLoadContext,
     db: &mut crate::salsa_compile::RockyDatabase,
 ) -> Result<Model, ProjectError> {
     let name = path
@@ -315,7 +315,7 @@ fn load_single_rocky_model_with_db(
     // non-salsa path.
     let toml_path = path.with_extension("toml");
     let config = if toml_path.exists() {
-        models::load_model_pair_with_groups(path, &toml_path, defaults, groups)?.config
+        models::load_model_pair_with_context(path, &toml_path, defaults, ctx)?.config
     } else {
         let catalog = defaults
             .as_ref()
@@ -592,6 +592,40 @@ mod tests {
         assert_eq!(
             flow.config.target.schema, "mart_emea",
             "the group's schema_template must route the .rocky model"
+        );
+    }
+
+    /// Regression: a `.rocky` DSL model resolves a `[[use_test]]` reference
+    /// against `test_definitions.toml` through the salsa loader, like a `.sql`
+    /// model does via `load_models_from_dir`.
+    #[test]
+    fn rocky_model_resolves_named_test() {
+        let _guard = crate::salsa_compile::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(
+            d.join("test_definitions.toml"),
+            "[positive]\ntype = \"expression\"\nexpression = \"amount > 0\"\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("flow.rocky"), "from orders\nselect { id }\n").unwrap();
+        std::fs::write(
+            d.join("flow.toml"),
+            "[target]\ncatalog = \"wh\"\nschema = \"s\"\n\n[[use_test]]\nname = \"positive\"\n",
+        )
+        .unwrap();
+
+        let models = load_dir_models(d).unwrap();
+        let flow = models
+            .iter()
+            .find(|m| m.config.name == "flow")
+            .expect("rocky model loaded");
+        assert_eq!(
+            flow.config.tests.len(),
+            1,
+            "the named test must resolve onto the .rocky model"
         );
     }
 }

@@ -164,6 +164,41 @@ values = ["pending", "shipped", "delivered"]
 severity = "warning"  # unknown status reports but doesn't fail
 ```
 
+### Reusable named tests
+
+When the same assertion is applied across many models, define it once in `models/test_definitions.toml` and reference it by name. A definition is any assertion `type` plus its parameters and an optional default `column`:
+
+```toml
+# models/test_definitions.toml
+[positive_amount]
+type = "expression"
+expression = "amount > 0"
+
+[known_status]
+type = "accepted_values"
+column = "status"
+values = ["pending", "shipped", "delivered"]
+```
+
+A model applies one with a `[[use_test]]` block, optionally binding or overriding the column, severity, and filter at the use site. Inline `[[tests]]` and `[[use_test]]` references coexist:
+
+```toml
+# models/fct_orders.toml
+[[tests]]
+type = "unique"
+column = "order_id"
+
+[[use_test]]
+name = "positive_amount"
+column = "amount"
+
+[[use_test]]
+name = "known_status"   # uses the definition's default column
+severity = "warning"
+```
+
+References resolve into ordinary assertions at load, so they run identically to inline ones. A `[[use_test]]` naming no definition fails the load with a clear error, so a typo can't silently drop a check.
+
 ### Per-assertion `filter`
 
 Every assertion kind accepts an optional `filter`, a SQL boolean predicate that scopes the check to a subset of rows. Rows where `(filter)` evaluates to `TRUE` are subject to the assertion; rows where it's `FALSE` or `NULL` pass unconditionally.
