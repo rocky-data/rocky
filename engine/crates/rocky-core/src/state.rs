@@ -827,6 +827,17 @@ const REDB_OPEN_RETRY_ATTEMPTS: u32 = 5;
 /// Linear backoff between retry attempts.
 const REDB_OPEN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only retry observer. When an opener thread arms this, every flock
+    /// collision in [`open_redb_with_retry`] bumps the counter. A test can then
+    /// release a competing lock the moment it sees the retry path has been
+    /// entered, instead of sleeping a fixed duration and racing the retry
+    /// budget — see `open_read_only_retries_and_succeeds_after_brief_hold`.
+    static REDB_RETRY_OBSERVER: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Open the redb database file, retrying briefly on the transient
 /// [`redb::DatabaseError::DatabaseAlreadyOpen`] flock collision.
 ///
@@ -850,6 +861,12 @@ fn open_redb_with_retry(path: &Path) -> Result<Database, StateError> {
         match Database::create(path) {
             Ok(db) => return Ok(db),
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                #[cfg(test)]
+                REDB_RETRY_OBSERVER.with(|o| {
+                    if let Some(counter) = o.borrow().as_ref() {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
                 if attempt + 1 < REDB_OPEN_RETRY_ATTEMPTS {
                     std::thread::sleep(REDB_OPEN_RETRY_DELAY);
                 }
@@ -5326,10 +5343,20 @@ mod tests {
 
     /// When another process briefly holds the redb flock, `open_read_only`
     /// must retry and ultimately succeed instead of leaking the raw
-    /// `DatabaseAlreadyOpen` error. Coordinated with a barrier (no
-    /// time-based race), per the advisor's "no sleep-and-pray" rule.
+    /// `DatabaseAlreadyOpen` error.
+    ///
+    /// The release is driven by *observed retry progress*, not a wall-clock
+    /// sleep: the holder keeps the flock until the opener reports its first
+    /// collision (via [`REDB_RETRY_OBSERVER`]), then drops it. So the opener
+    /// always hits contention at least once and the lock always frees a
+    /// bounded couple of attempts in — regardless of how the two threads are
+    /// scheduled. The earlier version held the lock for a fixed `sleep(120ms)`
+    /// and raced the opener's 5×50ms≈250ms budget; under uneven CI load the
+    /// holder thread could be starved past the opener's last attempt, so the
+    /// opener gave up with `Busy` and the test flaked.
     #[test]
     fn open_read_only_retries_and_succeeds_after_brief_hold() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Barrier};
         use std::thread;
         use std::time::Duration;
@@ -5341,29 +5368,44 @@ mod tests {
         StateStore::open(&path).unwrap();
 
         let lock_acquired = Arc::new(Barrier::new(2));
-        let release_now = Arc::new(Barrier::new(2));
+        let retries = Arc::new(AtomicUsize::new(0));
 
-        let path_holder = path.clone();
-        let lock_acquired_clone = Arc::clone(&lock_acquired);
-        let release_now_clone = Arc::clone(&release_now);
-        let holder = thread::spawn(move || {
-            let db = Database::create(&path_holder).unwrap();
-            lock_acquired_clone.wait();
-            // Hold for ~120ms — well within the 250ms retry budget but
-            // long enough that the first 1–2 retry attempts will fail.
-            thread::sleep(Duration::from_millis(120));
-            release_now_clone.wait();
-            drop(db);
-        });
+        let holder = {
+            let path = path.clone();
+            let lock_acquired = Arc::clone(&lock_acquired);
+            let retries = Arc::clone(&retries);
+            thread::spawn(move || {
+                let db = Database::create(&path).unwrap();
+                lock_acquired.wait();
+                // Hold the flock until the opener has provably entered its
+                // retry loop, then release. Bounded so a logic regression
+                // fails loudly instead of hanging CI — the opener hits the
+                // held lock within a millisecond or two in practice.
+                let mut waited = Duration::ZERO;
+                while retries.load(Ordering::SeqCst) == 0 {
+                    thread::sleep(Duration::from_millis(1));
+                    waited += Duration::from_millis(1);
+                    assert!(
+                        waited < Duration::from_secs(5),
+                        "opener never hit lock contention"
+                    );
+                }
+                drop(db);
+            })
+        };
 
         lock_acquired.wait();
-        // Open while the holder is still mid-sleep. Retry should mask the
-        // collision and eventually succeed once the holder drops.
-        let opener_path = path.clone();
-        let opener = thread::spawn(move || StateStore::open_read_only(&opener_path));
-        // Tell the holder it can drop after a beat — the opener is now
-        // looping through its retries.
-        release_now.wait();
+        // Open while the holder still owns the flock: the first attempt
+        // collides (bumping `retries`, which prompts the holder to drop), and
+        // a later retry then succeeds.
+        let opener = {
+            let path = path.clone();
+            let retries = Arc::clone(&retries);
+            thread::spawn(move || {
+                REDB_RETRY_OBSERVER.with(|o| *o.borrow_mut() = Some(retries));
+                StateStore::open_read_only(&path)
+            })
+        };
 
         let result = opener.join().unwrap();
         holder.join().unwrap();
@@ -5372,6 +5414,10 @@ mod tests {
             result.is_ok(),
             "open_read_only should retry past brief redb-lock contention, got error: {}",
             result.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+        assert!(
+            retries.load(Ordering::SeqCst) >= 1,
+            "the retry path should have been exercised at least once"
         );
     }
 
