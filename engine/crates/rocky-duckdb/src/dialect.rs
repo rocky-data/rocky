@@ -298,16 +298,48 @@ mod tests {
     fn surrogate_key_metadata_columns_resolves_via_dialect() {
         let d = dialect();
         let specs = vec![rocky_core::models::SurrogateKeySpec {
-            name: "permission_key".into(),
-            columns: vec!["advertiser_id".into()],
+            name: "order_key".into(),
+            columns: vec!["order_id".into()],
         }];
         let cols = rocky_core::models::surrogate_key_metadata_columns(&specs, &d);
         assert_eq!(cols.len(), 1);
-        assert_eq!(cols[0].name, "permission_key");
+        assert_eq!(cols[0].name, "order_key");
         assert_eq!(cols[0].data_type, "VARCHAR");
         assert_eq!(
             cols[0].value,
-            "md5(cast(coalesce(cast(advertiser_id as VARCHAR), '_dbt_utils_surrogate_key_null_') as VARCHAR))"
+            "md5(cast(coalesce(cast(order_id as VARCHAR), '_dbt_utils_surrogate_key_null_') as VARCHAR))"
+        );
+    }
+
+    #[test]
+    fn apply_surrogate_keys_wraps_select_via_dialect() {
+        let d = dialect();
+        let mut ir = rocky_core::models::parse_model_inline(
+            "---toml\n[target]\ncatalog = \"wh\"\nschema = \"marts\"\n---\n\nSELECT order_id FROM upstream",
+            "fct_orders.sql",
+            None,
+        )
+        .unwrap()
+        .to_model_ir();
+
+        // No specs ⇒ the SQL is left byte-for-byte unchanged (preserves the
+        // unkeyed model's skip-hash).
+        let original = ir.sql.clone();
+        rocky_core::models::apply_surrogate_keys(&mut ir, &[], &d);
+        assert_eq!(ir.sql, original);
+
+        // One spec ⇒ the SELECT is wrapped and the dbt-form hash appended as a
+        // top-level column.
+        let specs = vec![rocky_core::models::SurrogateKeySpec {
+            name: "order_key".into(),
+            columns: vec!["order_id".into()],
+        }];
+        rocky_core::models::apply_surrogate_keys(&mut ir, &specs, &d);
+        assert_eq!(
+            ir.sql,
+            "SELECT *, CAST(md5(cast(coalesce(cast(order_id as VARCHAR), \
+             '_dbt_utils_surrogate_key_null_') as VARCHAR)) AS VARCHAR) AS order_key\n\
+             FROM (\nSELECT order_id FROM upstream\n) AS __rocky_keyed"
         );
     }
 
