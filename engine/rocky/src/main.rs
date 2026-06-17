@@ -882,6 +882,28 @@ enum Command {
         column_lineage: bool,
     },
 
+    /// Emit the runnable SQL each transformation model would produce.
+    ///
+    /// Compiles the project offline (no warehouse connection, no engine to
+    /// run it) and renders the dialect-correct SQL — the same SQL `rocky run`
+    /// would execute, including declared surrogate-key columns. The dialect is
+    /// the configured target adapter (from `rocky.toml`), defaulting to DuckDB.
+    /// This is the tested exit path: a project always reduces to plain SQL
+    /// files you can run directly or hand to a dbt / hand-SQL fallback, so
+    /// depending on Rocky is never a one-way door.
+    EmitSql {
+        /// Models directory
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
+        /// Filter to a single model
+        #[arg(long)]
+        model: Option<String>,
+        /// Write one `<model>.sql` file per model into this directory.
+        /// When omitted, the concatenated SQL is printed to stdout.
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+    },
+
     /// Emit a project-wide column-level lineage snapshot.
     ///
     /// Walks the SemanticGraph and writes a persisted catalog artifact
@@ -2652,6 +2674,16 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             column_lineage,
             json,
             cli.cache_ttl,
+        ),
+        Command::EmitSql {
+            models,
+            model,
+            out_dir,
+        } => rocky_cli::commands::run_emit_sql(
+            Some(cli.config.as_path()),
+            &models,
+            model.as_deref(),
+            out_dir.as_deref(),
         ),
         Command::Catalog {
             models,
