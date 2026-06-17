@@ -213,11 +213,11 @@ SHOW SCHEMAS IN <catalog>
 
 ```sql
 -- Full refresh
-SELECT *, CAST(NULL AS STRING) AS permission_key
+SELECT *, CAST(NULL AS STRING) AS audit_key
 FROM <source_catalog>.<source_schema>.<table>
 
 -- Incremental (append new rows since last watermark)
-SELECT *, CAST(NULL AS STRING) AS permission_key
+SELECT *, CAST(NULL AS STRING) AS audit_key
 FROM <source_catalog>.<source_schema>.<table>
 WHERE _fivetran_synced > (
     SELECT COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01')

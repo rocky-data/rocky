@@ -472,7 +472,7 @@ fn dedup_schemas(connectors: &[rocky_core::source::DiscoveredConnector]) -> Vec<
 ///
 /// Grouping is keyed by `(source_type, id)`, not the bare id: two *different*
 /// services that happen to reuse the same id string (e.g. a Google `customer_id`
-/// and a numeric advertiser id elsewhere) are distinct objects in distinct id
+/// and a numeric account id elsewhere) are distinct objects in distinct id
 /// namespaces, so conflating them would be a false collision. Within any one
 /// reported collision every source shares a source_type, so the bare
 /// `external_object_id` in the output is unambiguous.
@@ -1087,7 +1087,7 @@ mod tests {
     fn detect_collisions_does_not_conflate_across_source_types() {
         // The SAME id string under two DIFFERENT services in two schemas is NOT
         // a collision — the ids live in separate namespaces (e.g. a Google
-        // `customer_id` vs a numeric advertiser id elsewhere). This is the whole
+        // `customer_id` vs a numeric account id elsewhere). This is the whole
         // reason grouping is keyed by (source_type, id), not the bare id.
         let connectors = vec![
             discovered_with("src__a__google", "google_ads", &["1234567890"]),

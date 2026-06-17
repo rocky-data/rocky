@@ -238,7 +238,7 @@ pub fn check_row_count(source_count: u64, target_count: u64) -> CheckResult {
 /// Compares source and target column sets.
 ///
 /// Columns in `exclude` are ignored in both source and target (case-insensitive).
-/// This is used to skip metadata columns added by Rocky (e.g., `permission_key`)
+/// This is used to skip metadata columns added by Rocky (e.g., `_rocky_loaded_at`)
 /// that exist only in the target.
 pub fn check_column_match(
     source_columns: &[ColumnInfo],
@@ -496,12 +496,12 @@ mod tests {
     #[test]
     fn test_column_match_exclude_metadata_columns() {
         let source = vec![col("id"), col("name")];
-        let target = vec![col("id"), col("name"), col("permission_key")];
-        // Without exclude: fails (permission_key is extra)
+        let target = vec![col("id"), col("name"), col("_rocky_loaded_at")];
+        // Without exclude: fails (_rocky_loaded_at is extra)
         let r = check_column_match(&source, &target, &[]);
         assert!(!r.passed);
-        // With exclude: passes (permission_key is ignored)
-        let r = check_column_match(&source, &target, &["permission_key".into()]);
+        // With exclude: passes (_rocky_loaded_at is ignored)
+        let r = check_column_match(&source, &target, &["_rocky_loaded_at".into()]);
         assert!(r.passed);
     }
 

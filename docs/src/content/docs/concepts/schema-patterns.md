@@ -148,7 +148,7 @@ Use `{name:SEP}` to pin the join separator at the use site:
 ```toml
 [pipeline.bronze]
 metadata_columns = [
-    { name = "permission_key", type = "STRING",
+    { name = "audit_key", type = "STRING",
       value = "md5('fivetran_{client}_{regions:_}_{source}')" }
     #                              ^^^ join `regions` with "_" regardless of caller default
 ]
