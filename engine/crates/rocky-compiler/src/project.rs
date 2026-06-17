@@ -215,6 +215,16 @@ fn load_rocky_models_with_db(
     } else {
         None
     };
+    // Config groups apply to `.rocky` DSL models too — they resolve their
+    // sidecar config through the same `load_model_pair` path, so load the
+    // groups here and thread them in (the `.sql` loader does this in
+    // `load_models_from_dir`).
+    let groups = models::load_groups_from_dir(dir)?;
+    let groups = if groups.is_empty() {
+        None
+    } else {
+        Some(&groups)
+    };
 
     let rocky_paths: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(models::ModelError::ReadFile)?
@@ -237,6 +247,7 @@ fn load_rocky_models_with_db(
         models.push(load_single_rocky_model_with_db(
             path,
             defaults.as_ref(),
+            groups,
             db,
         )?);
     }
@@ -253,6 +264,7 @@ fn load_rocky_models_with_db(
 fn load_single_rocky_model_with_db(
     path: &Path,
     defaults: Option<&models::DirDefaults>,
+    groups: Option<&std::collections::HashMap<String, models::GroupConfig>>,
     db: &mut crate::salsa_compile::RockyDatabase,
 ) -> Result<Model, ProjectError> {
     let name = path
@@ -303,7 +315,7 @@ fn load_single_rocky_model_with_db(
     // non-salsa path.
     let toml_path = path.with_extension("toml");
     let config = if toml_path.exists() {
-        models::load_model_pair(path, &toml_path, defaults)?.config
+        models::load_model_pair_with_groups(path, &toml_path, defaults, groups)?.config
     } else {
         let catalog = defaults
             .as_ref()
@@ -546,5 +558,40 @@ mod tests {
         let names: Vec<_> = models.iter().map(|m| m.config.name.as_str()).collect();
         assert!(names.contains(&"stg"), "sql model loaded: {names:?}");
         assert!(names.contains(&"agg"), "rocky DSL model loaded: {names:?}");
+    }
+
+    /// Regression: a `.rocky` DSL model resolves a config group through the
+    /// salsa loader, just like a `.sql` model does via `load_models_from_dir`.
+    /// Guards the wiring gap where the `.rocky` path used the bare
+    /// `load_model_pair` and silently ignored groups.
+    #[test]
+    fn rocky_model_resolves_config_group() {
+        let _guard = crate::salsa_compile::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("groups")).unwrap();
+        std::fs::write(
+            d.join("groups/daily_marts.toml"),
+            "schema_template = \"mart_{region}\"\n\n[strategy]\ntype = \"full_refresh\"\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("flow.rocky"), "from orders\nselect { id }\n").unwrap();
+        std::fs::write(
+            d.join("flow.toml"),
+            "group = \"daily_marts\"\n\n[target]\ncatalog = \"wh\"\n\n[args]\nregion = \"emea\"\n",
+        )
+        .unwrap();
+
+        let models = load_dir_models(d).unwrap();
+        let flow = models
+            .iter()
+            .find(|m| m.config.name == "flow")
+            .expect("rocky model loaded");
+        assert_eq!(
+            flow.config.target.schema, "mart_emea",
+            "the group's schema_template must route the .rocky model"
+        );
     }
 }
