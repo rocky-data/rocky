@@ -295,6 +295,23 @@ mod tests {
     }
 
     #[test]
+    fn surrogate_key_metadata_columns_resolves_via_dialect() {
+        let d = dialect();
+        let specs = vec![rocky_core::models::SurrogateKeySpec {
+            name: "permission_key".into(),
+            columns: vec!["advertiser_id".into()],
+        }];
+        let cols = rocky_core::models::surrogate_key_metadata_columns(&specs, &d);
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "permission_key");
+        assert_eq!(cols[0].data_type, "VARCHAR");
+        assert_eq!(
+            cols[0].value,
+            "md5(cast(coalesce(cast(advertiser_id as VARCHAR), '_dbt_utils_surrogate_key_null_') as VARCHAR))"
+        );
+    }
+
+    #[test]
     fn test_create_table_as() {
         let d = dialect();
         let sql = d.create_table_as("sch.tbl", "SELECT * FROM src");

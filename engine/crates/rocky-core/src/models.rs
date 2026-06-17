@@ -1155,6 +1155,101 @@ pub fn load_column_docs_from_dir(
     Ok(out)
 }
 
+/// A surrogate-key computed column declared in a model sidecar
+/// `[[surrogate_key]]` block: an output column `name` whose value is a
+/// deterministic hash of `columns`, injected into the materialized SELECT.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SurrogateKeySpec {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+/// Minimal sidecar view capturing the model `name` and its `[[surrogate_key]]`
+/// blocks, ignoring all other config keys.
+#[derive(Deserialize)]
+struct SurrogateKeySidecar {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    surrogate_key: Vec<SurrogateKeySpec>,
+}
+
+/// Load surrogate-key specs (`[[surrogate_key]]` blocks) declared across a
+/// models directory, keyed by model name.
+///
+/// Loaded independently of [`load_models_from_dir`] — matching its flat,
+/// sidecar-preferred discovery — so the materialization path can pair each
+/// model with its key columns without threading them through the compiler IR.
+/// A model's name is its sidecar `name` field, or the file stem. Files that
+/// declare no `[[surrogate_key]]` blocks are omitted from the map.
+pub fn load_surrogate_keys_from_dir(
+    dir: &Path,
+) -> Result<std::collections::HashMap<String, Vec<SurrogateKeySpec>>, ModelError> {
+    let mut out = std::collections::HashMap::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let toml_path = path.with_extension("toml");
+        let toml_src = if toml_path.exists() {
+            std::fs::read_to_string(&toml_path)?
+        } else {
+            let content = std::fs::read_to_string(&path)?;
+            match split_frontmatter(&content) {
+                Some((frontmatter, _)) => frontmatter.to_string(),
+                None => continue,
+            }
+        };
+
+        let substituted =
+            substitute_env_vars(&toml_src).map_err(|source| ModelError::EnvSubstitution {
+                path: path.display().to_string(),
+                source: Box::new(source),
+            })?;
+        let sidecar: SurrogateKeySidecar =
+            toml::from_str(&substituted).map_err(|e| ModelError::ParseFrontmatter {
+                path: path.display().to_string(),
+                source: e,
+            })?;
+        if sidecar.surrogate_key.is_empty() {
+            continue;
+        }
+        out.insert(sidecar.name.unwrap_or(stem), sidecar.surrogate_key);
+    }
+    Ok(out)
+}
+
+/// Resolve surrogate-key specs into dialect-correct [`rocky_ir::MetadataColumn`]s
+/// for injection into a model's SELECT. Each spec becomes a metadata column
+/// whose value is the dialect's `surrogate_key_expr` over the spec columns and
+/// whose type is the dialect's string type — rendered by `select_clause` as
+/// `CAST(<hash> AS <str>) AS <name>`.
+pub fn surrogate_key_metadata_columns(
+    specs: &[SurrogateKeySpec],
+    dialect: &dyn crate::traits::SqlDialect,
+) -> Vec<rocky_ir::MetadataColumn> {
+    specs
+        .iter()
+        .map(|spec| {
+            let cols: Vec<&str> = spec.columns.iter().map(String::as_str).collect();
+            rocky_ir::MetadataColumn {
+                name: spec.name.clone(),
+                data_type: dialect.string_type_name().to_string(),
+                value: dialect.surrogate_key_expr(&cols),
+            }
+        })
+        .collect()
+}
+
 fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     let content = content.trim_start();
 
@@ -2279,6 +2374,45 @@ description = "Order total in USD"
             Some("Order total in USD")
         );
         assert!(!docs.contains_key("plain"));
+    }
+
+    #[test]
+    fn load_surrogate_keys_reads_sidecar_blocks() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("keyed.toml"),
+            r#"
+[target]
+catalog = "wh"
+schema = "main"
+
+[[surrogate_key]]
+name = "permission_key"
+columns = ["advertiser_id"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("keyed.sql"),
+            "SELECT advertiser_id FROM upstream",
+        )
+        .unwrap();
+        // A model with no `[[surrogate_key]]` block is omitted from the map.
+        std::fs::write(
+            dir.path().join("plain.toml"),
+            "[target]\ncatalog = \"wh\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("plain.sql"), "SELECT 1 AS x").unwrap();
+
+        let specs = load_surrogate_keys_from_dir(dir.path()).unwrap();
+        assert_eq!(specs.len(), 1);
+        let keyed = specs.get("keyed").unwrap();
+        assert_eq!(keyed.len(), 1);
+        assert_eq!(keyed[0].name, "permission_key");
+        assert_eq!(keyed[0].columns, vec!["advertiser_id".to_string()]);
+        assert!(!specs.contains_key("plain"));
     }
 
     /// FR-001 Option A: `${VAR}` and `${VAR:-default}` placeholders in a
