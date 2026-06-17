@@ -366,6 +366,10 @@ pub(crate) struct ExecutionContext<'a> {
     /// Per-model compile cost (currently `typecheck_ms` only).
     pub model_timings:
         &'a std::collections::HashMap<String, rocky_compiler::compile::ModelCompileTimings>,
+    /// Per-model surrogate-key specs (`[[surrogate_key]]` sidecar blocks),
+    /// resolved into injected metadata columns at materialization time.
+    pub surrogate_keys:
+        &'a std::collections::HashMap<String, Vec<rocky_core::models::SurrogateKeySpec>>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -4401,9 +4405,13 @@ pub(crate) async fn execute_models(
     // execution path. Future compile-time fields (semantic info, optimize
     // results, contract diagnostics) ride on this struct without further
     // signature churn.
+    // Per-model surrogate-key specs, loaded once and threaded via the context.
+    let surrogate_keys =
+        rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap_or_default();
     let exec_ctx = ExecutionContext {
         typed_models: &compile_result.type_check.typed_models,
         model_timings: &compile_result.model_timings,
+        surrogate_keys: &surrogate_keys,
     };
 
     // Intra-layer concurrency is strictly opt-in via `--parallel N`.
@@ -5279,7 +5287,24 @@ async fn execute_one_plain_model(
     // breaks the `Send` bound on the boxed `run()` future.
     exec_ctx: ExecutionContext<'_>,
 ) -> Result<MaterializationOutput> {
-    let model_ir = model.to_model_ir();
+    let mut model_ir = model.to_model_ir();
+    // Inject declared surrogate-key columns (config-driven, dialect-resolved) by
+    // wrapping the model's SELECT:
+    //   `SELECT *, CAST(<hash> AS <str>) AS <name> FROM (<sql>) __rocky_keyed`.
+    // Transformation models materialize their raw SQL directly (it never flows
+    // through the replication-only metadata-column path), so wrapping is what
+    // surfaces the computed column into the CTAS / merge-source schema.
+    if let Some(specs) = exec_ctx.surrogate_keys.get(model_name)
+        && !specs.is_empty()
+    {
+        let additions = rocky_core::models::surrogate_key_metadata_columns(specs, dialect)
+            .iter()
+            .map(|m| format!("CAST({} AS {}) AS {}", m.value, m.data_type, m.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let inner = model_ir.sql.trim().trim_end_matches(';');
+        model_ir.sql = format!("SELECT *, {additions}\nFROM (\n{inner}\n) AS __rocky_keyed");
+    }
     let target_ref = dialect
         .format_table_ref(
             &model_ir.target.catalog,
@@ -7130,9 +7155,11 @@ mod tests {
             },
         );
 
+        let surrogate_keys = HashMap::new();
         let ctx = ExecutionContext {
             typed_models: &typed_models,
             model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
         };
 
         assert_eq!(ctx.column_count_for("fct_orders"), Some(3));
@@ -7150,9 +7177,11 @@ mod tests {
 
         let typed_models = IndexMap::new();
         let model_timings: HashMap<String, ModelCompileTimings> = HashMap::new();
+        let surrogate_keys = HashMap::new();
         let ctx = ExecutionContext {
             typed_models: &typed_models,
             model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
         };
 
         assert_eq!(ctx.column_count_for("raw__shopify__orders"), None);
@@ -8663,6 +8692,34 @@ merge_keys = ["id"]
             "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
         )
         .expect("write model toml");
+    }
+
+    /// End-to-end: a model declaring a `[[surrogate_key]]` block materializes a
+    /// table that carries the injected, dialect-resolved hash column.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn surrogate_key_column_is_materialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("keyed.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("keyed.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n\n[[surrogate_key]]\nname = \"sk\"\ncolumns = [\"id\"]\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("t.duckdb");
+        let (_out, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("run should succeed");
+
+        // The materialized table carries the injected surrogate-key column.
+        let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("open db");
+        let r = conn
+            .execute_sql("SELECT sk FROM main.keyed")
+            .expect("query sk");
+        assert_eq!(r.rows.len(), 1);
+        let sk = r.rows[0][0].as_str().unwrap_or_default();
+        assert_eq!(sk.len(), 32, "md5 hex should be 32 chars, got {sk:?}");
     }
 
     /// Materialize all models in `models_dir` against a fresh DuckDB file,
