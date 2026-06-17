@@ -49,6 +49,14 @@ pub enum ModelError {
     #[error("model '{model}' has an invalid surrogate_key: {reason}")]
     InvalidSurrogateKey { model: String, reason: String },
 
+    #[error(
+        "model '{model}' references unknown config group '{group}' (expected models/groups/{group}.toml)"
+    )]
+    UnknownGroup { model: String, group: String },
+
+    #[error("model '{model}' has an invalid config group: {reason}")]
+    InvalidGroup { model: String, reason: String },
+
     #[error("failed to substitute env vars in '{path}': {source}")]
     EnvSubstitution {
         path: String,
@@ -425,6 +433,20 @@ pub struct RawModelConfig {
     /// [`ModelConfig::skip`].
     #[serde(default)]
     pub skip: Option<SkipConfig>,
+
+    /// Name of a config group (`models/groups/<name>.toml`) this model opts
+    /// into. The group supplies shared routing (`schema_template`) and
+    /// `strategy` for a fan-out of models; per-model sidecar fields still win
+    /// over the group, which in turn wins over `_defaults.toml`. See
+    /// [`GroupConfig`] and [`load_groups_from_dir`].
+    #[serde(default)]
+    pub group: Option<String>,
+
+    /// Values that fill `{placeholder}`s in the group's `schema_template`
+    /// (e.g. `{ region = "emea" }` resolving `mart_{region}` → `mart_emea`).
+    /// Ignored when the model declares no `group`.
+    #[serde(default)]
+    pub args: std::collections::BTreeMap<String, String>,
 }
 
 /// `[skip]` — per-model overrides for the opt-in model-skip gate.
@@ -537,6 +559,113 @@ pub fn load_dir_defaults(path: &Path) -> Result<DirDefaults, ModelError> {
     Ok(defaults)
 }
 
+// ---------------------------------------------------------------------------
+// Config groups (models/groups/<name>.toml)
+// ---------------------------------------------------------------------------
+
+/// A reusable config group: one definition that a fan-out of models opts into
+/// by name (`group = "<name>"` in their sidecar). The group supplies shared
+/// **routing** (`schema_template`, filled per model from its `args`) and a
+/// shared `strategy`.
+///
+/// Precedence at resolution is **per-model sidecar > group > `_defaults.toml`**:
+/// a model can still override anything the group sets, the group overrides the
+/// directory defaults. Loaded from `models/groups/<name>.toml`, where the file
+/// stem is the group name (mirroring how a model's name defaults to its `.sql`
+/// stem). See [`load_groups_from_dir`].
+///
+/// ```toml
+/// # models/groups/daily_marts.toml
+/// schema_template = "mart_{region}"
+///
+/// [strategy]
+/// type = "merge"
+/// unique_key = ["id"]
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupConfig {
+    /// Target-schema template with `{placeholder}`s filled from each model's
+    /// `args` (e.g. `mart_{region}`). Uses the same `{name}` / `{name:SEP}`
+    /// grammar as schema-pattern templates.
+    #[serde(default)]
+    pub schema_template: Option<String>,
+    /// Shared materialization strategy for every model in the group.
+    #[serde(default)]
+    pub strategy: Option<StrategyConfig>,
+}
+
+/// Load config groups from `<models_dir>/groups/*.toml`. Each file defines one
+/// group whose name is the file stem; `${VAR}` placeholders resolve at load
+/// time (matching `rocky.toml` / sidecars). Returns an empty map when the
+/// `groups/` directory is absent.
+///
+/// The model loader does not recurse into subdirectories, so `models/groups/`
+/// is never walked as model sidecars — group files and model files cannot
+/// collide.
+pub fn load_groups_from_dir(
+    models_dir: &Path,
+) -> Result<std::collections::HashMap<String, GroupConfig>, ModelError> {
+    let groups_dir = models_dir.join("groups");
+    if !groups_dir.exists() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let mut out = std::collections::HashMap::new();
+    for entry in std::fs::read_dir(&groups_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let raw = std::fs::read_to_string(&path)?;
+        let content = substitute_env_vars(&raw).map_err(|source| ModelError::EnvSubstitution {
+            path: path.display().to_string(),
+            source: Box::new(source),
+        })?;
+        let group: GroupConfig =
+            toml::from_str(&content).map_err(|e| ModelError::ParseFrontmatter {
+                path: path.display().to_string(),
+                source: e,
+            })?;
+        out.insert(stem.to_string(), group);
+    }
+    Ok(out)
+}
+
+/// Resolve a group's `schema_template` against a model's `args`, returning the
+/// concrete target schema. Errors if the template references a placeholder the
+/// model did not supply (so a misconfigured fan-out fails loudly at load rather
+/// than routing a model to a literal `mart_{region}` schema).
+fn resolve_group_schema(
+    template: &str,
+    args: &std::collections::BTreeMap<String, String>,
+    model: &str,
+    group: &str,
+) -> Result<String, ModelError> {
+    use crate::schema::{ParsedSchema, SchemaValue};
+    let values = args
+        .iter()
+        .map(|(k, v)| (k.clone(), SchemaValue::Single(v.clone())))
+        .collect();
+    let parsed = ParsedSchema { values };
+    // `resolve_template` leaves unknown `{placeholder}`s untouched; a residual
+    // `{` therefore means the model omitted a value the template needs.
+    let resolved = parsed.resolve_template(template, "_");
+    if resolved.contains('{') {
+        return Err(ModelError::InvalidGroup {
+            model: model.to_string(),
+            reason: format!(
+                "group '{group}' schema_template '{template}' has unfilled placeholder(s); \
+                 supply them under the model's [args]"
+            ),
+        });
+    }
+    Ok(resolved)
+}
+
 /// Raw, pre-substitution view of the lint-relevant sidecar fields.
 ///
 /// Captured from the TOML *before* `${VAR}` / `${VAR:-default}` env
@@ -565,13 +694,30 @@ fn resolve_model_config(
     raw: RawModelConfig,
     file_stem: &str,
     defaults: Option<&DirDefaults>,
+    groups: Option<&std::collections::HashMap<String, GroupConfig>>,
     declared: DeclaredModelFields,
 ) -> Result<ModelConfig, ModelError> {
     let name = raw.name.unwrap_or_else(|| file_stem.to_string());
     let name_declared = declared.name.unwrap_or_else(|| file_stem.to_string());
 
+    // Resolve the opted-into config group (if any) once. An unknown group is a
+    // hard error so a typo doesn't silently skip the shared routing/strategy.
+    let group: Option<&GroupConfig> = match raw.group.as_deref() {
+        None => None,
+        Some(g) => Some(
+            groups
+                .and_then(|m| m.get(g))
+                .ok_or_else(|| ModelError::UnknownGroup {
+                    model: name.clone(),
+                    group: g.to_string(),
+                })?,
+        ),
+    };
+
+    // Precedence: per-model sidecar > group > directory defaults.
     let strategy = raw
         .strategy
+        .or_else(|| group.and_then(|g| g.strategy.clone()))
         .or_else(|| defaults.and_then(|d| d.strategy.clone()))
         .unwrap_or_default();
 
@@ -599,8 +745,21 @@ fn resolve_model_config(
             field: "catalog".into(),
         })?;
 
+    // Group routing: when the sidecar doesn't pin a schema, fall back to the
+    // group's `schema_template` (filled from the model's `args`) before the
+    // directory default — keeping the sidecar > group > defaults precedence.
+    let group_schema = match group.and_then(|g| g.schema_template.as_deref()) {
+        Some(template) => Some(resolve_group_schema(
+            template,
+            &raw.args,
+            &name,
+            raw.group.as_deref().unwrap_or_default(),
+        )?),
+        None => None,
+    };
     let schema = raw_target
         .schema
+        .or(group_schema)
         .or_else(|| dir_target.and_then(|t| t.schema.clone()))
         .ok_or_else(|| ModelError::MissingTarget {
             model: name.clone(),
@@ -863,6 +1022,19 @@ pub fn load_model_pair(
     toml_path: &Path,
     defaults: Option<&DirDefaults>,
 ) -> Result<Model, ModelError> {
+    load_model_pair_with_groups(sql_path, toml_path, defaults, None)
+}
+
+/// [`load_model_pair`] with config-group resolution. A model's `group = "<name>"`
+/// reference is resolved against `groups`; the group supplies shared routing and
+/// strategy at lower precedence than the per-model sidecar. Bare `load_model_pair`
+/// passes `None` (no groups), preserving its behavior for every existing caller.
+pub fn load_model_pair_with_groups(
+    sql_path: &Path,
+    toml_path: &Path,
+    defaults: Option<&DirDefaults>,
+    groups: Option<&std::collections::HashMap<String, GroupConfig>>,
+) -> Result<Model, ModelError> {
     let sql = {
         let s = std::fs::read_to_string(sql_path)?;
         let trimmed = s.trim();
@@ -890,7 +1062,7 @@ pub fn load_model_pair(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let config = resolve_model_config(raw, &file_stem, defaults, declared)?;
+    let config = resolve_model_config(raw, &file_stem, defaults, groups, declared)?;
 
     // Check for sibling contract file
     let contract_path = sql_path.with_extension("contract.toml");
@@ -917,6 +1089,17 @@ pub fn parse_model_inline(
     file_path: &str,
     defaults: Option<&DirDefaults>,
 ) -> Result<Model, ModelError> {
+    parse_model_inline_with_groups(content, file_path, defaults, None)
+}
+
+/// [`parse_model_inline`] with config-group resolution. See
+/// [`load_model_pair_with_groups`]. Bare `parse_model_inline` passes `None`.
+pub fn parse_model_inline_with_groups(
+    content: &str,
+    file_path: &str,
+    defaults: Option<&DirDefaults>,
+    groups: Option<&std::collections::HashMap<String, GroupConfig>>,
+) -> Result<Model, ModelError> {
     let (frontmatter, sql) =
         split_frontmatter(content).ok_or_else(|| ModelError::MissingFrontmatter {
             path: file_path.to_string(),
@@ -941,7 +1124,7 @@ pub fn parse_model_inline(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let config = resolve_model_config(raw, &file_stem, defaults, declared)?;
+    let config = resolve_model_config(raw, &file_stem, defaults, groups, declared)?;
 
     // Check for sibling contract file (inline models can have them too)
     let contract_file = Path::new(file_path).with_extension("contract.toml");
@@ -973,12 +1156,18 @@ pub fn load_models_from_dir(dir: &Path) -> Result<Vec<Model>, ModelError> {
         return Ok(Vec::new());
     }
 
-    // Load optional directory defaults (once, upfront)
+    // Load optional directory defaults and config groups (once, upfront)
     let defaults_path = dir.join("_defaults.toml");
     let defaults = if defaults_path.exists() {
         Some(load_dir_defaults(&defaults_path)?)
     } else {
         None
+    };
+    let groups = load_groups_from_dir(dir)?;
+    let groups = if groups.is_empty() {
+        None
+    } else {
+        Some(&groups)
     };
 
     // Collect all .sql file paths first (fs::read_dir is not Send)
@@ -1004,10 +1193,15 @@ pub fn load_models_from_dir(dir: &Path) -> Result<Vec<Model>, ModelError> {
         .map(|path| {
             let toml_path = path.with_extension("toml");
             if toml_path.exists() {
-                load_model_pair(path, &toml_path, defaults.as_ref())
+                load_model_pair_with_groups(path, &toml_path, defaults.as_ref(), groups)
             } else {
                 let content = std::fs::read_to_string(path)?;
-                parse_model_inline(&content, &path.display().to_string(), defaults.as_ref())
+                parse_model_inline_with_groups(
+                    &content,
+                    &path.display().to_string(),
+                    defaults.as_ref(),
+                    groups,
+                )
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2509,6 +2703,137 @@ columns = ["order_id"]
                 "expected InvalidSurrogateKey for name={name:?} {columns_line}, got {err:?}"
             );
         }
+    }
+
+    // ----- config groups (models/groups/<name>.toml) -----
+
+    /// Write a `groups/<name>.toml` group definition under `dir`.
+    fn write_group(dir: &Path, name: &str, body: &str) {
+        let groups = dir.join("groups");
+        std::fs::create_dir_all(&groups).unwrap();
+        std::fs::write(groups.join(format!("{name}.toml")), body).unwrap();
+    }
+
+    /// A model opting into a group inherits the group's strategy and a
+    /// `schema_template` filled from the model's `[args]`.
+    #[test]
+    fn group_supplies_strategy_and_routes_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        write_group(
+            dir.path(),
+            "daily_marts",
+            "schema_template = \"mart_{region}\"\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\nupdate_columns = [\"v\"]\n",
+        );
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "group = \"daily_marts\"\n\n[target]\ncatalog = \"wh\"\n\n[args]\nregion = \"emea\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
+
+        let models = load_models_from_dir(dir.path()).unwrap();
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(m.config.target.schema, "mart_emea");
+        assert!(matches!(m.config.strategy, StrategyConfig::Merge { .. }));
+    }
+
+    /// Per-model sidecar fields win over the group (sidecar > group).
+    #[test]
+    fn sidecar_overrides_group() {
+        let dir = tempfile::tempdir().unwrap();
+        write_group(
+            dir.path(),
+            "daily_marts",
+            "schema_template = \"mart_{region}\"\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\nupdate_columns = [\"v\"]\n",
+        );
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            // Sidecar pins both schema and strategy — the group must not override.
+            "group = \"daily_marts\"\n\n[target]\ncatalog = \"wh\"\nschema = \"custom\"\n\n[args]\nregion = \"emea\"\n\n[strategy]\ntype = \"full_refresh\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
+
+        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        assert_eq!(m.config.target.schema, "custom");
+        assert!(matches!(m.config.strategy, StrategyConfig::FullRefresh));
+    }
+
+    /// The group wins over `_defaults.toml` (group > directory defaults).
+    #[test]
+    fn group_overrides_dir_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        // Directory default sets full_refresh; the group sets merge.
+        std::fs::write(
+            dir.path().join("_defaults.toml"),
+            "[target]\ncatalog = \"wh\"\nschema = \"fallback\"\n\n[strategy]\ntype = \"full_refresh\"\n",
+        )
+        .unwrap();
+        write_group(
+            dir.path(),
+            "daily_marts",
+            "[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\nupdate_columns = [\"v\"]\n",
+        );
+        // Model sets neither strategy nor schema locally — the group's strategy
+        // must win over the directory default; schema falls through to defaults.
+        std::fs::write(dir.path().join("orders.toml"), "group = \"daily_marts\"\n").unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
+
+        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        assert!(
+            matches!(m.config.strategy, StrategyConfig::Merge { .. }),
+            "group strategy must override the directory default"
+        );
+        assert_eq!(m.config.target.schema, "fallback");
+    }
+
+    /// An unknown `group` reference is a hard error (typo protection).
+    #[test]
+    fn unknown_group_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        write_group(
+            dir.path(),
+            "daily_marts",
+            "schema_template = \"mart_{region}\"\n",
+        );
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "group = \"nope\"\n\n[target]\ncatalog = \"wh\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
+
+        let err = load_models_from_dir(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ModelError::UnknownGroup { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// A `schema_template` placeholder the model doesn't supply fails loudly,
+    /// rather than routing to a literal `mart_{region}` schema.
+    #[test]
+    fn missing_group_template_arg_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        write_group(
+            dir.path(),
+            "daily_marts",
+            "schema_template = \"mart_{region}\"\n",
+        );
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            // No [args] region → the template can't resolve.
+            "group = \"daily_marts\"\n\n[target]\ncatalog = \"wh\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
+
+        let err = load_models_from_dir(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ModelError::InvalidGroup { .. }),
+            "got {err:?}"
+        );
     }
 
     /// FR-001 Option A: `${VAR}` and `${VAR:-default}` placeholders in a

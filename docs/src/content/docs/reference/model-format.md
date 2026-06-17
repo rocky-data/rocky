@@ -138,6 +138,39 @@ table   = "${ROCKY_TABLE_OVERRIDE:-customer_facts}"
 
 See [Environment Variables](/reference/configuration/#environment-variables) for the canonical syntax reference and [`examples/playground/pocs/00-foundations/07-config-layering/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations/07-config-layering) for a runnable three-layer example.
 
+### Config groups
+
+When many models share the same routing and materialization, define a **config group** once and have each model opt in by name. A group lives in `models/groups/<name>.toml` (the file stem is the group name) and supplies a `schema_template` and a `strategy`:
+
+```toml
+# models/groups/daily_marts.toml
+schema_template = "mart_{region}"
+
+[strategy]
+type = "merge"
+unique_key = ["id"]
+update_columns = ["amount", "status"]
+```
+
+A model joins the group with `group = "<name>"` and fills the template's placeholders from its own `[args]`:
+
+```toml
+# models/fct_orders.toml
+group = "daily_marts"
+
+[target]
+catalog = "warehouse"   # schema comes from the group template
+
+[args]
+region = "emea"         # fills {region} -> schema "mart_emea"
+```
+
+Precedence is **per-model sidecar > group > `_defaults.toml`**: a model can still pin its own `schema` or `strategy` to override the group, and the group in turn overrides directory defaults. A `group` that names no definition, or a `schema_template` placeholder the model doesn't supply, fails the load with a clear error rather than routing a model to the wrong place.
+
+The model loader does not recurse into subdirectories, so `models/groups/` is never mistaken for model files.
+
+A group currently carries `schema_template` and `strategy`. Shared tags and per-model computed keys are planned additions; until then, an unrecognized key in a group file is rejected at load so typos surface immediately.
+
 ### `[classification]`
 
 Per-column classification tags. Keys are column names, values are free-form classification strings. Rocky resolves each value against `[mask]` / `[mask.<env>]` in `rocky.toml` to pick the masking strategy, then applies both the column tag and the mask via the governance adapter after a successful DAG.
