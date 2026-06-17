@@ -614,11 +614,10 @@ mod tests {
 
     #[test]
     fn test_resolve_template_explicit_separator_pins_variadic_join() {
-        // The motivating Gold-Engine case: a `permission_key`
-        // metadata_columns.value template hashes a string composed of
-        // `{client}_{hierarchies}_{connector}`. Without an explicit
-        // separator, `{hierarchies}` is joined with whatever the caller
-        // passes — which today differs across call sites
+        // The motivating case: a metadata_columns.value template hashes a
+        // string composed of `{client}_{hierarchies}_{connector}`. Without an
+        // explicit separator, `{hierarchies}` is joined with whatever the
+        // caller passes — which today differs across call sites
         // (target rendering vs metadata_columns rendering). Pinning the
         // separator at the use site removes that ambiguity.
         let pattern = SchemaPattern {
@@ -633,7 +632,7 @@ mod tests {
         };
 
         let parsed = pattern
-            .parse("q__raw__pfizer__namer__can__googleads")
+            .parse("q__raw__globex__namer__can__googleads")
             .unwrap();
 
         // Bare form joins with caller default — call-site dependent.
@@ -641,20 +640,20 @@ mod tests {
             parsed.resolve_template("md5('fivetran_{client}_{hierarchies}_{connector}')", "__");
         assert_eq!(
             bare_with_source_sep,
-            "md5('fivetran_pfizer_namer__can_googleads')"
+            "md5('fivetran_globex_namer__can_googleads')"
         );
 
         // Explicit form pins the separator regardless of caller default.
         let explicit =
             parsed.resolve_template("md5('fivetran_{client}_{hierarchies:_}_{connector}')", "__");
-        assert_eq!(explicit, "md5('fivetran_pfizer_namer_can_googleads')");
+        assert_eq!(explicit, "md5('fivetran_globex_namer_can_googleads')");
 
         // Same explicit form, caller passes target sep — same output.
         let explicit_target_default =
             parsed.resolve_template("md5('fivetran_{client}_{hierarchies:_}_{connector}')", "_");
         assert_eq!(
             explicit_target_default,
-            "md5('fivetran_pfizer_namer_can_googleads')"
+            "md5('fivetran_globex_namer_can_googleads')"
         );
     }
 

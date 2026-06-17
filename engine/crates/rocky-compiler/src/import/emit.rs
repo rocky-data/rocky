@@ -985,20 +985,16 @@ mod tests {
         let dbt_dir = tempfile::TempDir::new().unwrap();
         let out_dir = tempfile::TempDir::new().unwrap();
 
-        let mut model = make_model(
-            "brief__brief",
-            StrategyConfig::FullRefresh,
-            "SELECT 1 AS id",
-        );
+        let mut model = make_model("stg_orders", StrategyConfig::FullRefresh, "SELECT 1 AS id");
         model.unit_tests = vec![UnitTestDef {
-            name: "stamps_permission_key".into(),
-            description: Some("permission key stamped via md5".into()),
+            name: "stamps_order_key".into(),
+            description: Some("order key stamped via md5".into()),
             given: vec![TestFixture {
-                model_ref: "int_brief__brief".into(),
-                rows: vec![serde_json::json!({ "artifact_id": 1001, "brief_id": 50 })],
+                model_ref: "int_orders".into(),
+                rows: vec![serde_json::json!({ "order_id": 1001, "customer_id": 50 })],
             }],
             expect: TestExpectation {
-                rows: vec![serde_json::json!({ "permission_key": "abc", "artifact_id": 1001 })],
+                rows: vec![serde_json::json!({ "order_key": "abc", "order_id": 1001 })],
                 ordered: false,
             },
         }];
@@ -1019,13 +1015,13 @@ mod tests {
         })
         .unwrap();
 
-        let body = std::fs::read_to_string(out_dir.path().join("models/brief__brief.toml"))
+        let body = std::fs::read_to_string(out_dir.path().join("models/stg_orders.toml"))
             .expect("sidecar written");
         assert!(
             body.contains("[[test]]"),
             "sidecar must declare a [[test]] block:\n{body}"
         );
-        assert!(body.contains("stamps_permission_key"));
+        assert!(body.contains("stamps_order_key"));
 
         // Round-trip via the public UnitTestDef deserializer. The sidecar
         // contains other top-level keys (`name`, `[strategy]`, etc.) — we
@@ -1039,9 +1035,9 @@ mod tests {
         let parsed: UnitTestsOnly = toml::from_str(&body).expect("sidecar parses");
         assert_eq!(parsed.test.len(), 1);
         let ut = &parsed.test[0];
-        assert_eq!(ut.name, "stamps_permission_key");
+        assert_eq!(ut.name, "stamps_order_key");
         assert_eq!(ut.given.len(), 1);
-        assert_eq!(ut.given[0].model_ref, "int_brief__brief");
+        assert_eq!(ut.given[0].model_ref, "int_orders");
         assert_eq!(ut.expect.rows.len(), 1);
     }
 

@@ -1339,7 +1339,7 @@ def test_build_defs_survives_duplicate_table_records(tmp_path: Path, caplog):
             {
                 "id": "src_dup",
                 "components": {
-                    "tenant": "pfizer",
+                    "tenant": "globex",
                     "region": "namer",
                     "subregion": "usa",
                     "source": "dv360",

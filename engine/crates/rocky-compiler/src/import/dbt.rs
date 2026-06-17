@@ -2643,9 +2643,9 @@ FROM {{ ref('stg_events') }}
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
             "nodes": {
-                "model.p.brief__brief": {
-                    "unique_id": "model.p.brief__brief",
-                    "name": "brief__brief",
+                "model.p.stg_orders": {
+                    "unique_id": "model.p.stg_orders",
+                    "name": "stg_orders",
                     "resource_type": "model",
                     "compiled_code": "SELECT 1",
                     "raw_code": "SELECT 1",
@@ -2656,21 +2656,21 @@ FROM {{ ref('stg_events') }}
             },
             "sources": {},
             "unit_tests": {
-                "unit_test.p.brief__brief.stamps_permission_key": {
-                    "unique_id": "unit_test.p.brief__brief.stamps_permission_key",
-                    "name": "stamps_permission_key",
-                    "model": "brief__brief",
+                "unit_test.p.stg_orders.stamps_order_key": {
+                    "unique_id": "unit_test.p.stg_orders.stamps_order_key",
+                    "name": "stamps_order_key",
+                    "model": "stg_orders",
                     "given": [
                         {
-                            "input": "ref('int_brief__brief')",
-                            "rows": [{ "artifact_id": 1001, "brief_id": 50 }]
+                            "input": "ref('int_orders')",
+                            "rows": [{ "order_id": 1001, "customer_id": 50 }]
                         }
                     ],
                     "expect": {
-                        "rows": [{ "permission_key": "abc", "artifact_id": 1001 }],
+                        "rows": [{ "order_key": "abc", "order_id": 1001 }],
                         "format": "dict"
                     },
-                    "description": "permission key",
+                    "description": "order key",
                     "tags": []
                 }
             }
@@ -2683,14 +2683,14 @@ FROM {{ ref('stg_events') }}
         let imported = result
             .imported
             .iter()
-            .find(|m| m.name == "brief__brief")
+            .find(|m| m.name == "stg_orders")
             .expect("model imported");
         assert_eq!(imported.unit_tests.len(), 1);
         let ut = &imported.unit_tests[0];
-        assert_eq!(ut.name, "stamps_permission_key");
-        assert_eq!(ut.description.as_deref(), Some("permission key"));
+        assert_eq!(ut.name, "stamps_order_key");
+        assert_eq!(ut.description.as_deref(), Some("order key"));
         assert_eq!(ut.given.len(), 1);
-        assert_eq!(ut.given[0].model_ref, "int_brief__brief");
+        assert_eq!(ut.given[0].model_ref, "int_orders");
         assert_eq!(ut.given[0].rows.len(), 1);
         assert_eq!(ut.expect.rows.len(), 1);
         assert!(!ut.expect.ordered);
