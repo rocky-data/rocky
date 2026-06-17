@@ -212,6 +212,30 @@ impl SqlDialect for BigQueryDialect {
         "STRING"
     }
 
+    fn surrogate_key_expr(&self, columns: &[&str]) -> String {
+        // BigQuery's `MD5()` returns BYTES, so dbt-bigquery wraps it in
+        // `to_hex(...)`; it also concatenates with `concat(...)` rather than the
+        // `||` operator. Otherwise identical to the trait default.
+        let str_type = self.string_type_name();
+        let fields: Vec<String> = columns
+            .iter()
+            .map(|c| format!("coalesce(cast({c} as {str_type}), '_dbt_utils_surrogate_key_null_')"))
+            .collect();
+        let concatenated = if fields.is_empty() {
+            "''".to_string()
+        } else {
+            let mut args = Vec::with_capacity(fields.len() * 2 - 1);
+            for (i, f) in fields.into_iter().enumerate() {
+                if i > 0 {
+                    args.push("'-'".to_string());
+                }
+                args.push(f);
+            }
+            format!("concat({})", args.join(", "))
+        };
+        format!("to_hex(md5(cast({concatenated} as {str_type})))")
+    }
+
     fn ground_table_ref(&self, parts: &[&str]) -> AdapterResult<String> {
         // BigQuery refs are `project.dataset.table`. The project (catalog)
         // segment allows hyphens — every real GCP project ID has them — so it
@@ -491,6 +515,20 @@ mod tests {
         let d = BigQueryDialect;
         let sql = d.create_schema_sql("project", "dataset").unwrap().unwrap();
         assert_eq!(sql, "CREATE SCHEMA IF NOT EXISTS `project`.`dataset`");
+    }
+
+    #[test]
+    fn surrogate_key_uses_to_hex_md5_and_concat() {
+        let d = BigQueryDialect;
+        assert_eq!(
+            d.surrogate_key_expr(&["a", "b"]),
+            "to_hex(md5(cast(concat(coalesce(cast(a as STRING), '_dbt_utils_surrogate_key_null_'), '-', coalesce(cast(b as STRING), '_dbt_utils_surrogate_key_null_')) as STRING)))"
+        );
+        // Single column: still wrapped in concat(...).
+        assert_eq!(
+            d.surrogate_key_expr(&["id"]),
+            "to_hex(md5(cast(concat(coalesce(cast(id as STRING), '_dbt_utils_surrogate_key_null_')) as STRING)))"
+        );
     }
 
     #[test]

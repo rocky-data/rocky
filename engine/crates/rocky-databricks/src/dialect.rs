@@ -283,6 +283,20 @@ mod tests {
     }
 
     #[test]
+    fn surrogate_key_uses_dbt_form_with_string_cast() {
+        let d = dialect();
+        assert_eq!(
+            d.surrogate_key_expr(&["a", "b"]),
+            "md5(cast(coalesce(cast(a as STRING), '_dbt_utils_surrogate_key_null_') || '-' || coalesce(cast(b as STRING), '_dbt_utils_surrogate_key_null_') as STRING))"
+        );
+        // Single column: no separator.
+        assert_eq!(
+            d.surrogate_key_expr(&["id"]),
+            "md5(cast(coalesce(cast(id as STRING), '_dbt_utils_surrogate_key_null_') as STRING))"
+        );
+    }
+
+    #[test]
     fn test_create_table_as() {
         let d = dialect();
         let sql = d.create_table_as("cat.sch.tbl", "SELECT * FROM src");

@@ -1008,6 +1008,34 @@ pub trait SqlDialect: Send + Sync {
         "VARCHAR"
     }
 
+    /// Build a deterministic surrogate-key SQL expression over `columns`,
+    /// modeled on dbt-utils' `generate_surrogate_key`: each input is coerced to
+    /// text and NULL-coalesced to a fixed sentinel, the inputs are joined with a
+    /// `-` separator, and the concatenation is MD5-hashed.
+    ///
+    /// The default form — `md5(cast(coalesce(cast(c as <str>), '<sentinel>') ||
+    /// '-' || … as <str>))` — matches dbt's default adapter (Databricks,
+    /// Snowflake, DuckDB, Trino all concatenate with `||`). BigQuery overrides
+    /// this to wrap the hash in `to_hex(...)` and concatenate with `concat(...)`.
+    /// Byte-exact parity with a specific dbt project's output is validated by
+    /// the SQL parity harness, which is the source of truth for case/spacing.
+    ///
+    /// Column references are interpolated as given; the caller is responsible
+    /// for validating them.
+    fn surrogate_key_expr(&self, columns: &[&str]) -> String {
+        let str_type = self.string_type_name();
+        let fields: Vec<String> = columns
+            .iter()
+            .map(|c| format!("coalesce(cast({c} as {str_type}), '_dbt_utils_surrogate_key_null_')"))
+            .collect();
+        let concatenated = if fields.is_empty() {
+            "''".to_string()
+        } else {
+            fields.join(" || '-' || ")
+        };
+        format!("md5(cast({concatenated} as {str_type}))")
+    }
+
     /// Build a validated, dialect-correct table reference for the
     /// data-grounding tools from an already-split list of name segments.
     ///
