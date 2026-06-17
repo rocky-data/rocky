@@ -4406,8 +4406,10 @@ pub(crate) async fn execute_models(
     // results, contract diagnostics) ride on this struct without further
     // signature churn.
     // Per-model surrogate-key specs, loaded once and threaded via the context.
-    let surrogate_keys =
-        rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap_or_default();
+    // Surface a malformed key spec (bad output name, empty/invalid input
+    // columns) as a hard run failure rather than silently emitting broken SQL.
+    let surrogate_keys = rocky_core::models::load_surrogate_keys_from_dir(models_dir)
+        .context("invalid surrogate_key configuration")?;
     let exec_ctx = ExecutionContext {
         typed_models: &compile_result.type_check.typed_models,
         model_timings: &compile_result.model_timings,
@@ -4461,7 +4463,12 @@ pub(crate) async fn execute_models(
                 // mirroring `project_ir_from_compile`) so `skip_hash()` can
                 // canonicalise. An empty `typed_columns` ⇒ `skip_hash()` is
                 // `None` ⇒ the gate builds.
-                let typed_ir = typed_model_ir(model, exec_ctx.typed_models);
+                let typed_ir = typed_model_ir(
+                    model,
+                    exec_ctx.typed_models,
+                    exec_ctx.surrogate_keys,
+                    dialect,
+                );
                 match gate
                     .evaluate(model, &typed_ir, warehouse, state_store)
                     .await
@@ -5254,10 +5261,18 @@ pub(crate) fn is_plain_strategy(model: &rocky_core::models::Model) -> bool {
 fn typed_model_ir(
     model: &rocky_core::models::Model,
     typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    surrogate_keys: &HashMap<String, Vec<rocky_core::models::SurrogateKeySpec>>,
+    dialect: &dyn rocky_core::traits::SqlDialect,
 ) -> rocky_ir::ModelIr {
     let mut ir = model.to_model_ir();
     if let Some(cols) = typed_models.get(&model.config.name) {
         ir.typed_columns = cols.clone();
+    }
+    // Mirror the materialization-time SQL wrap so the skip-hash reflects a
+    // declared surrogate key: a model that *gains* a key changes its IR and
+    // re-materializes instead of being skipped as unchanged.
+    if let Some(specs) = surrogate_keys.get(&model.config.name) {
+        rocky_core::models::apply_surrogate_keys(&mut ir, specs, dialect);
     }
     ir
 }
@@ -5288,22 +5303,12 @@ async fn execute_one_plain_model(
     exec_ctx: ExecutionContext<'_>,
 ) -> Result<MaterializationOutput> {
     let mut model_ir = model.to_model_ir();
-    // Inject declared surrogate-key columns (config-driven, dialect-resolved) by
-    // wrapping the model's SELECT:
-    //   `SELECT *, CAST(<hash> AS <str>) AS <name> FROM (<sql>) __rocky_keyed`.
-    // Transformation models materialize their raw SQL directly (it never flows
-    // through the replication-only metadata-column path), so wrapping is what
-    // surfaces the computed column into the CTAS / merge-source schema.
-    if let Some(specs) = exec_ctx.surrogate_keys.get(model_name)
-        && !specs.is_empty()
-    {
-        let additions = rocky_core::models::surrogate_key_metadata_columns(specs, dialect)
-            .iter()
-            .map(|m| format!("CAST({} AS {}) AS {}", m.value, m.data_type, m.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let inner = model_ir.sql.trim().trim_end_matches(';');
-        model_ir.sql = format!("SELECT *, {additions}\nFROM (\n{inner}\n) AS __rocky_keyed");
+    // Inject declared surrogate-key columns by wrapping the model's SELECT.
+    // Transformation models materialize their raw SQL directly (never the
+    // replication-only metadata-column path), so the wrap is what surfaces the
+    // computed column into the CTAS / merge-source schema.
+    if let Some(specs) = exec_ctx.surrogate_keys.get(model_name) {
+        rocky_core::models::apply_surrogate_keys(&mut model_ir, specs, dialect);
     }
     let target_ref = dialect
         .format_table_ref(

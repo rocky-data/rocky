@@ -46,6 +46,9 @@ pub enum ModelError {
         reason: String,
     },
 
+    #[error("model '{model}' has an invalid surrogate_key: {reason}")]
+    InvalidSurrogateKey { model: String, reason: String },
+
     #[error("failed to substitute env vars in '{path}': {source}")]
     EnvSubstitution {
         path: String,
@@ -1223,7 +1226,11 @@ pub fn load_surrogate_keys_from_dir(
         if sidecar.surrogate_key.is_empty() {
             continue;
         }
-        out.insert(sidecar.name.unwrap_or(stem), sidecar.surrogate_key);
+        let model_name = sidecar.name.unwrap_or(stem);
+        for spec in &sidecar.surrogate_key {
+            validate_surrogate_key_spec(spec, &model_name)?;
+        }
+        out.insert(model_name, sidecar.surrogate_key);
     }
     Ok(out)
 }
@@ -1248,6 +1255,60 @@ pub fn surrogate_key_metadata_columns(
             }
         })
         .collect()
+}
+
+/// Validate a surrogate-key spec: a non-empty, valid-identifier output `name`
+/// and at least one valid-identifier input column. These are the compile-time
+/// invariants for the injected column, enforced at load so malformed config
+/// fails loudly rather than emitting broken SQL.
+fn validate_surrogate_key_spec(spec: &SurrogateKeySpec, model: &str) -> Result<(), ModelError> {
+    let invalid = |reason: String| ModelError::InvalidSurrogateKey {
+        model: model.to_string(),
+        reason,
+    };
+    if rocky_sql::validation::validate_identifier(&spec.name).is_err() {
+        return Err(invalid(format!(
+            "output column name '{}' is not a valid SQL identifier",
+            spec.name
+        )));
+    }
+    if spec.columns.is_empty() {
+        return Err(invalid(format!(
+            "key '{}' must list at least one input column",
+            spec.name
+        )));
+    }
+    for col in &spec.columns {
+        if rocky_sql::validation::validate_identifier(col).is_err() {
+            return Err(invalid(format!(
+                "key '{}' references invalid column identifier '{col}'",
+                spec.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Wrap a transformation model's SELECT to append the declared surrogate-key
+/// columns: `SELECT *, CAST(<hash> AS <str>) AS <name> FROM (<sql>) __rocky_keyed`.
+/// A no-op when `specs` is empty. Used by both the materialization path and the
+/// skip-gate IR, so a model that *gains* a key re-materializes rather than being
+/// skipped as unchanged.
+pub fn apply_surrogate_keys(
+    model_ir: &mut rocky_ir::ModelIr,
+    specs: &[SurrogateKeySpec],
+    dialect: &dyn crate::traits::SqlDialect,
+) {
+    if specs.is_empty() {
+        return;
+    }
+    let additions = surrogate_key_metadata_columns(specs, dialect)
+        .iter()
+        .map(|m| format!("CAST({} AS {}) AS {}", m.value, m.data_type, m.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let inner = model_ir.sql.trim().trim_end_matches(';');
+    model_ir.sql = format!("SELECT *, {additions}\nFROM (\n{inner}\n) AS __rocky_keyed");
 }
 
 fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
@@ -2388,14 +2449,14 @@ catalog = "wh"
 schema = "main"
 
 [[surrogate_key]]
-name = "permission_key"
-columns = ["advertiser_id"]
+name = "order_key"
+columns = ["order_id"]
 "#,
         )
         .unwrap();
         std::fs::write(
             dir.path().join("keyed.sql"),
-            "SELECT advertiser_id FROM upstream",
+            "SELECT order_id FROM upstream",
         )
         .unwrap();
         // A model with no `[[surrogate_key]]` block is omitted from the map.
@@ -2410,9 +2471,44 @@ columns = ["advertiser_id"]
         assert_eq!(specs.len(), 1);
         let keyed = specs.get("keyed").unwrap();
         assert_eq!(keyed.len(), 1);
-        assert_eq!(keyed[0].name, "permission_key");
-        assert_eq!(keyed[0].columns, vec!["advertiser_id".to_string()]);
+        assert_eq!(keyed[0].name, "order_key");
+        assert_eq!(keyed[0].columns, vec!["order_id".to_string()]);
         assert!(!specs.contains_key("plain"));
+    }
+
+    /// A malformed `[[surrogate_key]]` block fails the load with
+    /// [`ModelError::InvalidSurrogateKey`] rather than emitting broken SQL.
+    /// Covers all three guard arms: an empty column list, a non-identifier
+    /// output name, and a non-identifier input column.
+    #[test]
+    fn load_surrogate_keys_rejects_malformed_config() {
+        use tempfile::tempdir;
+        let cases = [
+            // empty input columns
+            ("order_key", "columns = []"),
+            // output name with a SQL-injecting character
+            ("bad name; DROP", "columns = [\"order_id\"]"),
+            // input column with an injecting character
+            ("order_key", "columns = [\"order_id); DROP\"]"),
+        ];
+        for (name, columns_line) in cases {
+            let dir = tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("m.toml"),
+                format!(
+                    "[target]\ncatalog = \"wh\"\nschema = \"main\"\n\n\
+                     [[surrogate_key]]\nname = \"{name}\"\n{columns_line}\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(dir.path().join("m.sql"), "SELECT order_id FROM upstream").unwrap();
+
+            let err = load_surrogate_keys_from_dir(dir.path()).unwrap_err();
+            assert!(
+                matches!(err, ModelError::InvalidSurrogateKey { .. }),
+                "expected InvalidSurrogateKey for name={name:?} {columns_line}, got {err:?}"
+            );
+        }
     }
 
     /// FR-001 Option A: `${VAR}` and `${VAR:-default}` placeholders in a
