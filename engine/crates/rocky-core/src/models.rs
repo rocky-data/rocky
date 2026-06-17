@@ -66,6 +66,11 @@ pub enum ModelError {
         field: String,
     },
 
+    #[error(
+        "model '{model}' references unknown named test '{name}' (expected a [{name}] entry in test_definitions.toml)"
+    )]
+    UnknownTest { model: String, name: String },
+
     #[error("failed to substitute env vars in '{path}': {source}")]
     EnvSubstitution {
         path: String,
@@ -456,6 +461,12 @@ pub struct RawModelConfig {
     /// Ignored when the model declares no `group`.
     #[serde(default)]
     pub args: std::collections::BTreeMap<String, String>,
+
+    /// `[[use_test]]` references that apply named test definitions (from
+    /// `test_definitions.toml`) to this model, resolved into concrete
+    /// [`TestDecl`]s and appended to `tests` at load.
+    #[serde(default)]
+    pub use_test: Vec<TestRef>,
 }
 
 /// `[skip]` — per-model overrides for the opt-in model-skip gate.
@@ -653,6 +664,113 @@ pub fn load_groups_from_dir(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Named test definitions (models/test_definitions.toml)
+// ---------------------------------------------------------------------------
+
+/// A reusable, named data-quality test: a [`crate::tests::TestType`] (the check
+/// logic + its parameters) defined once and applied by name to many models /
+/// columns via a `[[use_test]]` reference. Mirrors dbt's generic tests, but
+/// declarative — no macro expansion.
+///
+/// ```toml
+/// # models/test_definitions.toml
+/// [positive_amount]
+/// type = "expression"
+/// expression = "amount > 0"
+///
+/// [known_status]
+/// type = "accepted_values"
+/// values = ["pending", "shipped", "delivered"]
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct NamedTest {
+    /// The check logic and its type-specific parameters.
+    #[serde(flatten)]
+    pub test_type: crate::tests::TestType,
+    /// Default column the test binds to. A `[[use_test]]` reference may supply
+    /// or override the column at the use site.
+    #[serde(default)]
+    pub column: Option<String>,
+}
+
+/// A `[[use_test]]` reference in a model sidecar: apply the named test `name`
+/// (from `test_definitions.toml`) to this model, optionally binding/overriding
+/// the column, severity, and row filter at the use site.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TestRef {
+    /// Name of the definition in `test_definitions.toml`.
+    pub name: String,
+    /// Column to bind the test to; falls back to the definition's `column`.
+    #[serde(default)]
+    pub column: Option<String>,
+    /// Failure severity at this use site (defaults to `error`).
+    #[serde(default)]
+    pub severity: crate::tests::TestSeverity,
+    /// Optional row-scoping SQL filter (same contract as an inline test).
+    #[serde(default)]
+    pub filter: Option<String>,
+}
+
+/// Load named test definitions from `<models_dir>/test_definitions.toml`, a
+/// table of `name -> definition`. `${VAR}` placeholders resolve at load time.
+/// Returns an empty map when the file is absent.
+pub fn load_test_definitions_from_dir(
+    models_dir: &Path,
+) -> Result<std::collections::HashMap<String, NamedTest>, ModelError> {
+    let path = models_dir.join("test_definitions.toml");
+    if !path.exists() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let raw = std::fs::read_to_string(&path)?;
+    let content = substitute_env_vars(&raw).map_err(|source| ModelError::EnvSubstitution {
+        path: path.display().to_string(),
+        source: Box::new(source),
+    })?;
+    let defs: std::collections::HashMap<String, NamedTest> =
+        toml::from_str(&content).map_err(|e| ModelError::ParseFrontmatter {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+    Ok(defs)
+}
+
+/// Directory-level shared config threaded into per-model resolution: config
+/// groups and named test definitions. Cheap to pass by value (two borrows).
+#[derive(Default, Clone, Copy)]
+pub struct ModelLoadContext<'a> {
+    /// Config groups (`models/groups/*.toml`), keyed by group name.
+    pub groups: Option<&'a std::collections::HashMap<String, GroupConfig>>,
+    /// Named test definitions (`models/test_definitions.toml`), keyed by name.
+    pub test_defs: Option<&'a std::collections::HashMap<String, NamedTest>>,
+}
+
+/// Resolve a model's `[[use_test]]` references into concrete [`TestDecl`]s by
+/// looking each name up in `test_defs`. An unknown reference is a hard error.
+fn resolve_test_refs(
+    refs: &[TestRef],
+    test_defs: Option<&std::collections::HashMap<String, NamedTest>>,
+    model: &str,
+) -> Result<Vec<TestDecl>, ModelError> {
+    refs.iter()
+        .map(|r| {
+            let def =
+                test_defs
+                    .and_then(|m| m.get(&r.name))
+                    .ok_or_else(|| ModelError::UnknownTest {
+                        model: model.to_string(),
+                        name: r.name.clone(),
+                    })?;
+            Ok(TestDecl {
+                test_type: def.test_type.clone(),
+                column: r.column.clone().or_else(|| def.column.clone()),
+                severity: r.severity,
+                filter: r.filter.clone(),
+            })
+        })
+        .collect()
+}
+
 /// Resolve a group's `schema_template` against a model's `args`, returning the
 /// concrete target schema. Errors if the template references a placeholder the
 /// model did not supply (so a misconfigured fan-out fails loudly at load rather
@@ -712,7 +830,7 @@ fn resolve_model_config(
     raw: RawModelConfig,
     file_stem: &str,
     defaults: Option<&DirDefaults>,
-    groups: Option<&std::collections::HashMap<String, GroupConfig>>,
+    ctx: &ModelLoadContext,
     declared: DeclaredModelFields,
 ) -> Result<ModelConfig, ModelError> {
     let name = raw.name.unwrap_or_else(|| file_stem.to_string());
@@ -722,15 +840,22 @@ fn resolve_model_config(
     // hard error so a typo doesn't silently skip the shared routing/strategy.
     let group: Option<&GroupConfig> = match raw.group.as_deref() {
         None => None,
-        Some(g) => Some(
-            groups
-                .and_then(|m| m.get(g))
-                .ok_or_else(|| ModelError::UnknownGroup {
-                    model: name.clone(),
-                    group: g.to_string(),
-                })?,
-        ),
+        Some(g) => {
+            Some(
+                ctx.groups
+                    .and_then(|m| m.get(g))
+                    .ok_or_else(|| ModelError::UnknownGroup {
+                        model: name.clone(),
+                        group: g.to_string(),
+                    })?,
+            )
+        }
     };
+
+    // Resolve `[[use_test]]` references into concrete tests (appended to any
+    // inline `[[tests]]`), looking each name up in the test-definition registry.
+    let mut tests = raw.tests;
+    tests.extend(resolve_test_refs(&raw.use_test, ctx.test_defs, &name)?);
 
     // Enforcement: when the group sets `enforce = true`, a member model may not
     // locally override a field the group controls. Checked here, before the
@@ -849,7 +974,7 @@ fn resolve_model_config(
         adapter: raw.adapter,
         intent,
         freshness,
-        tests: raw.tests,
+        tests,
         format: raw.format,
         format_options: raw.format_options,
         classification: raw.classification,
@@ -1070,18 +1195,18 @@ pub fn load_model_pair(
     toml_path: &Path,
     defaults: Option<&DirDefaults>,
 ) -> Result<Model, ModelError> {
-    load_model_pair_with_groups(sql_path, toml_path, defaults, None)
+    load_model_pair_with_context(sql_path, toml_path, defaults, &ModelLoadContext::default())
 }
 
-/// [`load_model_pair`] with config-group resolution. A model's `group = "<name>"`
-/// reference is resolved against `groups`; the group supplies shared routing and
-/// strategy at lower precedence than the per-model sidecar. Bare `load_model_pair`
-/// passes `None` (no groups), preserving its behavior for every existing caller.
-pub fn load_model_pair_with_groups(
+/// [`load_model_pair`] with directory-level config resolution: config-group
+/// references (`group = "<name>"`) and named-test references (`[[use_test]]`)
+/// resolve against the [`ModelLoadContext`]. Bare `load_model_pair` passes an
+/// empty context, preserving its behavior for every existing caller.
+pub fn load_model_pair_with_context(
     sql_path: &Path,
     toml_path: &Path,
     defaults: Option<&DirDefaults>,
-    groups: Option<&std::collections::HashMap<String, GroupConfig>>,
+    ctx: &ModelLoadContext,
 ) -> Result<Model, ModelError> {
     let sql = {
         let s = std::fs::read_to_string(sql_path)?;
@@ -1110,7 +1235,7 @@ pub fn load_model_pair_with_groups(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let config = resolve_model_config(raw, &file_stem, defaults, groups, declared)?;
+    let config = resolve_model_config(raw, &file_stem, defaults, ctx, declared)?;
 
     // Check for sibling contract file
     let contract_path = sql_path.with_extension("contract.toml");
@@ -1137,16 +1262,17 @@ pub fn parse_model_inline(
     file_path: &str,
     defaults: Option<&DirDefaults>,
 ) -> Result<Model, ModelError> {
-    parse_model_inline_with_groups(content, file_path, defaults, None)
+    parse_model_inline_with_context(content, file_path, defaults, &ModelLoadContext::default())
 }
 
-/// [`parse_model_inline`] with config-group resolution. See
-/// [`load_model_pair_with_groups`]. Bare `parse_model_inline` passes `None`.
-pub fn parse_model_inline_with_groups(
+/// [`parse_model_inline`] with directory-level config resolution (groups +
+/// named tests). See [`load_model_pair_with_context`]. Bare `parse_model_inline`
+/// passes an empty context.
+pub fn parse_model_inline_with_context(
     content: &str,
     file_path: &str,
     defaults: Option<&DirDefaults>,
-    groups: Option<&std::collections::HashMap<String, GroupConfig>>,
+    ctx: &ModelLoadContext,
 ) -> Result<Model, ModelError> {
     let (frontmatter, sql) =
         split_frontmatter(content).ok_or_else(|| ModelError::MissingFrontmatter {
@@ -1172,7 +1298,7 @@ pub fn parse_model_inline_with_groups(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let config = resolve_model_config(raw, &file_stem, defaults, groups, declared)?;
+    let config = resolve_model_config(raw, &file_stem, defaults, ctx, declared)?;
 
     // Check for sibling contract file (inline models can have them too)
     let contract_file = Path::new(file_path).with_extension("contract.toml");
@@ -1212,10 +1338,10 @@ pub fn load_models_from_dir(dir: &Path) -> Result<Vec<Model>, ModelError> {
         None
     };
     let groups = load_groups_from_dir(dir)?;
-    let groups = if groups.is_empty() {
-        None
-    } else {
-        Some(&groups)
+    let test_defs = load_test_definitions_from_dir(dir)?;
+    let ctx = ModelLoadContext {
+        groups: (!groups.is_empty()).then_some(&groups),
+        test_defs: (!test_defs.is_empty()).then_some(&test_defs),
     };
 
     // Collect all .sql file paths first (fs::read_dir is not Send)
@@ -1241,14 +1367,14 @@ pub fn load_models_from_dir(dir: &Path) -> Result<Vec<Model>, ModelError> {
         .map(|path| {
             let toml_path = path.with_extension("toml");
             if toml_path.exists() {
-                load_model_pair_with_groups(path, &toml_path, defaults.as_ref(), groups)
+                load_model_pair_with_context(path, &toml_path, defaults.as_ref(), &ctx)
             } else {
                 let content = std::fs::read_to_string(path)?;
-                parse_model_inline_with_groups(
+                parse_model_inline_with_context(
                     &content,
                     &path.display().to_string(),
                     defaults.as_ref(),
-                    groups,
+                    &ctx,
                 )
             }
         })
@@ -2955,6 +3081,86 @@ columns = ["order_id"]
             m2.config.target.schema, "escape",
             "non-enforced group allows override"
         );
+    }
+
+    // ----- named test definitions (test_definitions.toml + [[use_test]]) -----
+
+    /// A `[[use_test]]` reference resolves a named definition onto a column,
+    /// the use-site column overriding the definition's default.
+    #[test]
+    fn named_test_applied_by_reference() {
+        use crate::tests::TestType;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("test_definitions.toml"),
+            // `known_status` binds to a default column; `positive` has none.
+            "[known_status]\ntype = \"accepted_values\"\ncolumn = \"status\"\nvalues = [\"ok\", \"bad\"]\n\n[positive]\ntype = \"expression\"\nexpression = \"amount > 0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "[target]\ncatalog = \"wh\"\nschema = \"main\"\n\n\
+             [[use_test]]\nname = \"known_status\"\n\n\
+             [[use_test]]\nname = \"positive\"\nseverity = \"warning\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
+
+        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        assert_eq!(m.config.tests.len(), 2);
+        // Definition default column is used when the reference omits one.
+        let status = &m.config.tests[0];
+        assert!(matches!(status.test_type, TestType::AcceptedValues { .. }));
+        assert_eq!(status.column.as_deref(), Some("status"));
+        // The reference's severity is applied.
+        let positive = &m.config.tests[1];
+        assert!(matches!(positive.test_type, TestType::Expression { .. }));
+        assert_eq!(positive.severity, crate::tests::TestSeverity::Warning);
+    }
+
+    /// A `[[use_test]]` column overrides the definition's default column, and
+    /// inline `[[tests]]` coexist with references.
+    #[test]
+    fn named_test_column_override_and_inline_coexist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("test_definitions.toml"),
+            "[not_empty]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "[target]\ncatalog = \"wh\"\nschema = \"main\"\n\n\
+             [[tests]]\ntype = \"unique\"\ncolumn = \"id\"\n\n\
+             [[use_test]]\nname = \"not_empty\"\ncolumn = \"email\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
+
+        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        assert_eq!(m.config.tests.len(), 2, "inline test + resolved reference");
+        // The reference's column overrides the definition default ("id").
+        assert_eq!(m.config.tests[1].column.as_deref(), Some("email"));
+    }
+
+    /// An unknown `[[use_test]]` name is a hard error (typo protection).
+    #[test]
+    fn unknown_named_test_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("test_definitions.toml"),
+            "[known]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "[target]\ncatalog = \"wh\"\nschema = \"main\"\n\n[[use_test]]\nname = \"nope\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
+
+        let err = load_models_from_dir(dir.path()).unwrap_err();
+        assert!(matches!(err, ModelError::UnknownTest { .. }), "got {err:?}");
     }
 
     /// FR-001 Option A: `${VAR}` and `${VAR:-default}` placeholders in a
