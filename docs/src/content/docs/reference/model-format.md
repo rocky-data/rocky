@@ -167,9 +167,25 @@ region = "emea"         # fills {region} -> schema "mart_emea"
 
 Precedence is **per-model sidecar > group > `_defaults.toml`**: a model can still pin its own `schema` or `strategy` to override the group, and the group in turn overrides directory defaults. A `group` that names no definition, or a `schema_template` placeholder the model doesn't supply, fails the load with a clear error rather than routing a model to the wrong place.
 
+#### Enforced groups
+
+Set `enforce = true` on a group to make its fields binding rather than defaults. A member model that locally pins a field the group controls — its target `schema` or its `strategy` — then fails the load instead of silently routing or materializing itself differently from the rest of the group:
+
+```toml
+# models/groups/regulated.toml
+enforce = true
+schema_template = "mart_{region}"
+
+[strategy]
+type = "merge"
+unique_key = ["id"]
+```
+
+Enforcement is strictly opt-in: without `enforce`, groups stay overridable defaults. A model under an enforced group still supplies its own `[args]` (and any field the group doesn't set, like `target.catalog`); it just can't override what the group owns. Use this when a set of models must share routing and materialization as a governance guarantee.
+
 The model loader does not recurse into subdirectories, so `models/groups/` is never mistaken for model files.
 
-A group currently carries `schema_template` and `strategy`. Shared tags and per-model computed keys are planned additions; until then, an unrecognized key in a group file is rejected at load so typos surface immediately.
+A group currently carries `schema_template`, `strategy`, and `enforce`. Shared tags and per-model computed keys are planned additions; until then, an unrecognized key in a group file is rejected at load so typos surface immediately.
 
 ### `[classification]`
 

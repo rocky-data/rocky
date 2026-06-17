@@ -57,6 +57,15 @@ pub enum ModelError {
     #[error("model '{model}' has an invalid config group: {reason}")]
     InvalidGroup { model: String, reason: String },
 
+    #[error(
+        "model '{model}' overrides '{field}', which its enforced group '{group}' controls; remove the local override or set the group's enforce = false"
+    )]
+    GroupOverride {
+        model: String,
+        group: String,
+        field: String,
+    },
+
     #[error("failed to substitute env vars in '{path}': {source}")]
     EnvSubstitution {
         path: String,
@@ -593,6 +602,15 @@ pub struct GroupConfig {
     /// Shared materialization strategy for every model in the group.
     #[serde(default)]
     pub strategy: Option<StrategyConfig>,
+    /// When `true`, the group's fields are **enforced**, not just defaulted: a
+    /// member model that locally pins a field the group also sets (its target
+    /// `schema`, or its `strategy`) fails the load with
+    /// [`ModelError::GroupOverride`]. This is the governance guarantee — a model
+    /// in an enforced group cannot quietly route or materialize itself
+    /// differently from the rest of the group. Defaults to `false` (groups are
+    /// overridable defaults unless the author opts in).
+    #[serde(default)]
+    pub enforce: bool,
 }
 
 /// Load config groups from `<models_dir>/groups/*.toml`. Each file defines one
@@ -713,6 +731,36 @@ fn resolve_model_config(
                 })?,
         ),
     };
+
+    // Enforcement: when the group sets `enforce = true`, a member model may not
+    // locally override a field the group controls. Checked here, before the
+    // fields are consumed by the resolution chain below, using sidecar
+    // provenance (`raw.<field>.is_some()` ⇒ the model set it locally).
+    if let Some(g) = group
+        && g.enforce
+    {
+        let group_name = raw.group.as_deref().unwrap_or_default();
+        if g.strategy.is_some() && raw.strategy.is_some() {
+            return Err(ModelError::GroupOverride {
+                model: name.clone(),
+                group: group_name.to_string(),
+                field: "strategy".into(),
+            });
+        }
+        if g.schema_template.is_some()
+            && raw
+                .target
+                .as_ref()
+                .and_then(|t| t.schema.as_ref())
+                .is_some()
+        {
+            return Err(ModelError::GroupOverride {
+                model: name.clone(),
+                group: group_name.to_string(),
+                field: "target.schema".into(),
+            });
+        }
+    }
 
     // Precedence: per-model sidecar > group > directory defaults.
     let strategy = raw
@@ -2833,6 +2881,79 @@ columns = ["order_id"]
         assert!(
             matches!(err, ModelError::InvalidGroup { .. }),
             "got {err:?}"
+        );
+    }
+
+    /// An `enforce = true` group rejects a member model that locally overrides
+    /// a field the group controls (its strategy, or its routing schema).
+    #[test]
+    fn enforced_group_rejects_local_override() {
+        for (override_block, field) in [
+            ("[strategy]\ntype = \"full_refresh\"\n", "strategy"),
+            (
+                "[target]\ncatalog = \"wh\"\nschema = \"escape\"\n",
+                "target.schema",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_group(
+                dir.path(),
+                "locked",
+                "enforce = true\nschema_template = \"mart_{region}\"\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\nupdate_columns = [\"v\"]\n",
+            );
+            std::fs::write(
+                dir.path().join("orders.toml"),
+                format!("group = \"locked\"\n\n[args]\nregion = \"emea\"\n\n{override_block}"),
+            )
+            .unwrap();
+            std::fs::write(dir.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
+
+            let err = load_models_from_dir(dir.path()).unwrap_err();
+            assert!(
+                matches!(&err, ModelError::GroupOverride { field: f, .. } if f == field),
+                "expected GroupOverride for {field}, got {err:?}"
+            );
+        }
+    }
+
+    /// An `enforce = true` group accepts a model that takes everything from the
+    /// group (only supplies its `[args]`), and a non-enforced group still allows
+    /// local overrides (enforcement is strictly opt-in).
+    #[test]
+    fn enforcement_is_opt_in_and_allows_conforming_models() {
+        // Conforming model under an enforced group: OK.
+        let dir = tempfile::tempdir().unwrap();
+        write_group(
+            dir.path(),
+            "locked",
+            "enforce = true\nschema_template = \"mart_{region}\"\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\nupdate_columns = [\"v\"]\n",
+        );
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "group = \"locked\"\n\n[target]\ncatalog = \"wh\"\n\n[args]\nregion = \"emea\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
+        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        assert_eq!(m.config.target.schema, "mart_emea");
+
+        // The same override under a NON-enforced group is allowed.
+        let dir2 = tempfile::tempdir().unwrap();
+        write_group(
+            dir2.path(),
+            "flexible",
+            "schema_template = \"mart_{region}\"\n\n[strategy]\ntype = \"merge\"\nunique_key = [\"id\"]\nupdate_columns = [\"v\"]\n",
+        );
+        std::fs::write(
+            dir2.path().join("orders.toml"),
+            "group = \"flexible\"\n\n[target]\ncatalog = \"wh\"\nschema = \"escape\"\n\n[args]\nregion = \"emea\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir2.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
+        let m2 = &load_models_from_dir(dir2.path()).unwrap()[0];
+        assert_eq!(
+            m2.config.target.schema, "escape",
+            "non-enforced group allows override"
         );
     }
 
