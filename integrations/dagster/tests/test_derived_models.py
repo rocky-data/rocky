@@ -251,6 +251,35 @@ def test_build_model_specs_gnarly_tag_keys_pass_dagster_validation():
     assert all(len(k) <= 63 for k in specs[0].tags)
 
 
+def test_build_model_specs_gnarly_tag_values_pass_dagster_validation():
+    # The value-side counterpart of the gnarly-keys test: Dagster validates tag
+    # *values* (charset [A-Za-z0-9_.-], ≤63 chars) at AssetSpec construction,
+    # not just keys. Governance values inherited from a config group can carry
+    # `@`, `/`, whitespace, or exceed 63 chars. Push such values — under *clean*
+    # keys, to isolate the value path — through build_model_specs and prove
+    # they're accepted, not rejected. Without value sanitization this raises
+    # DagsterInvalidDefinitionError at spec construction.
+    long_value = "x" * 80
+    result = _compile_result(
+        _model(
+            "orders",
+            tags={
+                "team": "data-eng@corp.com",
+                "domain": "growth marketing",
+                "region": "finance/emea",
+                "note": long_value,
+            },
+        ),
+    )
+    specs = build_model_specs(result, translator=RockyDagsterTranslator())
+
+    assert specs[0].tags["team"] == "data-eng_corp.com"
+    assert specs[0].tags["domain"] == "growth_marketing"
+    assert specs[0].tags["region"] == "finance_emea"
+    assert specs[0].tags["note"] == "x" * 63
+    assert all(len(v) <= 63 for v in specs[0].tags.values())
+
+
 # ---------------------------------------------------------------------------
 # split_model_specs_by_partition_shape
 # ---------------------------------------------------------------------------
