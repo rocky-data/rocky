@@ -295,32 +295,27 @@ For time-interval models, `@start_date` and `@end_date` placeholders in your SQL
 
 ## 9. The State Store
 
-Rocky keeps a small embedded database (redb, a key-value store built into the binary) alongside your project. No external database needed. It holds a number of named tables; the ones that matter most for a run:
+Rocky keeps a small embedded database (redb, a key-value store built into the binary) alongside your project. No external database needed.
 
 ```
-redb state file
-    ├── watermarks            key: "catalog.schema.orders_summary"
-    │                         val: "2024-01-15 12:34:56"
+.rocky-state/
+└── state.redb
+    ├── WATERMARKS        key: "catalog.schema.orders_summary"
+    │                     val: "2024-01-15 12:34:56"
     │
-    ├── run_progress          key: run_id
-    │                         val: run header (started_at, total_tables)
+    ├── RUN_PROGRESS      key: run_id + model_name
+    │                     val: "Completed" | "Failed" | "Skipped"
     │
-    ├── run_progress_entries  key: "run_id|table"
-    │                         val: per-table status (drives --resume)
+    ├── PARTITIONS        key: model + partition_key
+    │                     val: partition metadata (start, end, status)
     │
-    ├── partitions            key: model + partition_key
-    │                         val: partition metadata (start, end, status)
-    │
-    └── idempotency_keys      key: "run_id|model|file"
-                              val: statement-completion marker
-
-    (plus run_history, quality_history, schema_cache, branches,
-     check_history, dag_snapshots, … — same file, one table each)
+    └── IDEMPOTENCY       key: run_id
+                          val: list of statements already executed
 ```
 
 **Watermarks** answer "where did I leave off?" The watermark is read *from the target table* (not the source), using `SELECT MAX(updated_at) FROM target.orders_summary`. Reading from the target prevents a race condition: if the source gets new data while we're running, we don't accidentally move the watermark past data we haven't processed.
 
-**run_progress_entries + idempotency_keys** make runs resumable. If a run is interrupted, Rocky can skip the models that already completed. `rocky run --resume-latest` uses this.
+**IDEMPOTENCY** makes runs resumable. If a run is interrupted, Rocky can skip statements that already completed (the IDEMPOTENCY table records each statement's success). `rocky run --resume-latest` uses this.
 
 ---
 
@@ -330,7 +325,7 @@ When you type `rocky run`, here's what happens inside, step by step:
 
 ```
 Step 1: Mint a run_id
-  "run-20240115-123456-789"   (run-%Y%m%d-%H%M%S-%3f)
+  "run_20240115_1234"
   (stored in state — every action is tagged with it)
 
 Step 2: Validate config
@@ -377,7 +372,7 @@ Step 7: Commit watermarks (batch, after layer completes)
   (If any model failed, no watermarks are committed for that layer)
 
 Step 8: Fire post-run hooks
-  Shell commands or webhooks on "pipeline_complete" / "pipeline_error" events
+  Shell commands or webhooks on "run_complete" / "run_failed" events
 
 Step 9: Emit JSON output
   { tables_copied, materializations, check_results, drift, anomalies }
@@ -932,26 +927,27 @@ This is extracted from the SQL AST by `rocky-sql::lineage` — no runtime execut
 
 ## 25. Hooks and Webhooks
 
-Rocky can fire shell commands or HTTP calls on 18 different lifecycle events. The event names below are the exact strings you put in `event = "..."` (the `HookEvent` enum, serialized as snake_case).
+Rocky can fire shell commands or HTTP calls on 18 different lifecycle events.
 
-**The 18 lifecycle events:**
+**Lifecycle events:**
 
 ```
-Pipeline lifecycle:        Materialize / model:       Checks & signals:
-──────────────────         ────────────────────       ─────────────────
-pipeline_start             before_materialize         before_checks
-discover_complete          after_materialize          check_result
-compile_complete           materialize_error          after_checks
-pipeline_complete          before_model_run           drift_detected
-pipeline_error             after_model_run            anomaly_detected
-                           model_error                state_synced
-                                                      budget_breach
+Pipeline events:           Model events:              Quality events:
+──────────────────         ──────────────             ──────────────
+run_start                  model_start                check_passed
+run_complete               model_complete             check_failed
+run_failed                 model_skipped              drift_detected
+run_partial                model_failed               anomaly_detected
+plan_created               watermark_updated
+review_approved            schema_altered
+apply_start                catalog_created
+apply_complete
 ```
 
 **Command hook (shell):**
 ```toml
 [[hooks]]
-event = "pipeline_error"
+event = "run_failed"
 command = "python scripts/alert.py --model {{model}} --error {{error}}"
 on_failure = "warn"   # or "abort" or "ignore"
 ```
@@ -959,7 +955,7 @@ on_failure = "warn"   # or "abort" or "ignore"
 **Webhook hook (HTTP):**
 ```toml
 [[hooks]]
-event = "pipeline_complete"
+event = "run_complete"
 url   = "https://hooks.slack.com/services/..."
 preset = "slack"   # pre-built template for Slack's JSON format
 async = true       # don't wait for the response
@@ -976,7 +972,8 @@ Rocky run complete ✓
   Models skipped: 3 (unchanged)
 ```
 
-Hooks receive a context payload (rendered into command args and webhook templates via `{{var}}` placeholders) carrying the run and model details — `run_id`, the model/table, error info, timings, and the active environment.
+Hook context variables (available as `{{var}}` in templates and commands):
+`run_id`, `model`, `table`, `error`, `duration_ms`, `rows_written`, `watermark`, `environment`, `git_sha`, `trigger`, `plan_id`
 
 ---
 

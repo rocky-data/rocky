@@ -45,7 +45,7 @@ rocky run -c rocky.toml
 
 ## Step 1: Mint a run_id
 
-Every run gets a unique `run_id` — a timestamp-based string of the form `run-%Y%m%d-%H%M%S-%3f` (e.g. `run-20240115-123456-789`), so IDs sort lexicographically in chronological order. Every subsequent state-store write is tagged with this ID. This is what makes `--resume-latest` work: Rocky looks up the most recent `run_id` in the state store and finds which tables already completed.
+Every run gets a unique `run_id` (a ULIDv2 — sortable, monotonic, collision-free). Every subsequent state-store write is tagged with this ID. This is what makes `--resume-latest` work: Rocky looks up the most recent `run_id` in the state store and finds which tables already completed.
 
 ## Step 2: Validate config + ping adapters
 
@@ -99,7 +99,7 @@ Source column: region  (new, not in target yet)
 → ALTER TABLE target ADD COLUMN region STRING
 ```
 
-Safe widening allowlist (no recreate needed): integer widenings (`TINYINT`/`SMALLINT`/`INT`/`INTEGER → BIGINT`), `FLOAT → DOUBLE`, widening to `STRING` (`BIGINT → STRING`, `DOUBLE → STRING`), `DECIMAL` precision widening, and `VARCHAR` length widening. Everything else triggers a full recreate. (The default lives in `default_is_safe_type_widening`; a dialect can override `SqlDialect::is_safe_type_widening`.)
+Safe widening allowlist (no recreate needed): `INT → BIGINT`, `FLOAT → DOUBLE`, `DATE → TIMESTAMP`, and a few others. Everything else triggers a full recreate.
 
 If the target doesn't exist yet, it's created from scratch on first run.
 
@@ -138,10 +138,10 @@ Rocky calls `WarehouseAdapter::execute_statement(sql)`. The adapter handles conn
 
 For Databricks, this calls `POST /api/2.0/sql/statements` and polls for the result. Adaptive concurrency control (AIMD: additive increase on success, multiplicative decrease on 429/throttle) prevents overloading the warehouse.
 
-Failed execution produces a `failure_kind` (the `FailureKind` enum in `output.rs`: `AuthFailed`, `ConnectionFailed`, `QueryRejected`, `QuotaExceeded`, `NotFound`, `Transient`, `Unknown`). Rocky branches on this:
+Failed execution produces a `failure_kind` (one of: `Transient`, `AuthFailed`, `QueryRejected`, `QuotaExceeded`, `SchemaConflict`, etc.). Rocky branches on this:
 - `Transient` → retry with backoff
 - `AuthFailed` → stop immediately, surface the error
-- `QuotaExceeded` → surface the error and back off (a 429 or tripped circuit breaker maps here)
+- `QuotaExceeded` → surface the error with `cooldown_seconds` hint
 
 ### 6f. Quality checks
 
@@ -176,13 +176,16 @@ After a layer completes (all models succeeded, or the run is in partial mode), R
 
 ## Step 8: Fire post-run hooks
 
-Rocky fires the appropriate lifecycle hooks — `pipeline_complete` on success, `pipeline_error` on failure (the `HookEvent` enum is serialized as snake_case; the full set of 18 events runs from `pipeline_start` through `after_model_run`, `check_result`, `drift_detected`, and `budget_breach`).
+Rocky fires the appropriate lifecycle hooks:
+- `run_complete` if all models succeeded
+- `run_failed` if all models failed
+- `run_partial` if some succeeded and some failed (exit code 2)
 
 Command hooks are executed as shell subprocesses. Webhook hooks fire as HTTP POSTs (async if configured). Hook failures are handled per the `on_failure` setting (`abort`, `warn`, or `ignore`).
 
 ## Step 9: Emit JSON output
 
-Rocky serializes the `RunOutput` struct to JSON on stdout. Illustrative shape (top-level fields are stable; per-entry fields shown for orientation):
+Rocky serializes the `RunOutput` struct to JSON on stdout:
 
 ```json
 {
@@ -190,13 +193,12 @@ Rocky serializes the `RunOutput` struct to JSON on stdout. Illustrative shape (t
   "command": "run",
   "tables_copied": 3,
   "materializations": [
-    { "model": "orders_summary",  "status": "completed", "reason": "..." },
-    { "model": "product_stats",   "status": "skipped",   "reason": "unchanged" },
-    { "model": "customer_totals", "status": "failed",    "failure_kind": "QueryRejected" }
+    { "model": "orders_summary", "status": "completed", "rows_written": 14203, "duration_ms": 1840 },
+    { "model": "product_stats",  "status": "skipped",   "reason": "unchanged" },
+    { "model": "customer_totals","status": "failed",    "error": "...", "failure_kind": "QueryRejected" }
   ],
   "check_results": [...],
   "drift": [...],
-  "permissions": [...],
   "anomalies": [...]
 }
 ```
@@ -210,14 +212,14 @@ Exit code:
 
 If a run is interrupted mid-layer (process killed, network failure, etc.), Rocky can resume from the last successful checkpoint.
 
-The state store records which models completed via the `run_progress_entries` table (one entry per `run_id` + table) and the `idempotency_keys` table (keyed by `run_id` + model + file). `rocky run --resume-latest` looks up the most recent `run_id`, checks which models already completed, and skips them. Models whose watermarks were not committed (because the layer didn't finish) are re-run from their last committed watermark.
+The `IDEMPOTENCY` table in the state store records each statement that completed. `rocky run --resume-latest` looks up the most recent `run_id` in the state store, checks which models completed, and skips them. Models whose watermarks were not committed (because the layer didn't finish) are re-run from their last committed watermark.
 
 ```bash
 # Resume the most recent run:
 rocky run -c rocky.toml --resume-latest
 
 # Resume a specific run:
-rocky run -c rocky.toml --resume run-20240115-123456-789
+rocky run -c rocky.toml --resume run_20240115_1234
 ```
 
 ## AIMD adaptive concurrency
