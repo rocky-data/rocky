@@ -11,7 +11,8 @@
 //! ## Scope of the runnable guarantee
 //!
 //! Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that
-//! runs as-is against a fresh warehouse and is identical to what a run executes.
+//! runs as-is against a fresh warehouse and matches what a run executes in the
+//! resolved dialect (see the dialect note below).
 //! Incremental and merge models emit their **steady-state** statement (a bare
 //! `INSERT` / `MERGE` that operates on an existing target); `rocky run`
 //! bootstraps the target table on first build and threads the incremental
@@ -20,7 +21,10 @@
 //!
 //! The dialect is the project's configured target adapter type (resolved from
 //! `rocky.toml` without credentials); with no resolvable config it defaults to
-//! DuckDB. Output is one `<model>.sql` file per model when `--out-dir` is given,
+//! DuckDB. All models render in this one resolved dialect, so for a project
+//! whose models target more than one adapter, the emitted SQL matches
+//! `rocky run` only for the models whose target uses that dialect. Output is
+//! one `<model>.sql` file per model when `--out-dir` is given,
 //! otherwise the concatenated SQL is printed to stdout, both in dependency
 //! order. Models that produce no standalone SQL — ephemeral (inlined as CTEs)
 //! or strategies that cannot render offline (e.g. Snowflake `DynamicTable`,
@@ -217,6 +221,20 @@ fn emit_models(
     })
 }
 
+/// True when `name` is safe to use as a single `<name>.sql` filename component:
+/// non-empty, no path separators, no parent-/absolute-path escape. Model names
+/// are normally plain identifiers; a name that fails this is anomalous, so the
+/// `--out-dir` path skips it with a report rather than risking a `std::fs::write`
+/// outside `out_dir` via a traversing join.
+fn is_safe_file_stem(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !Path::new(name).is_absolute()
+        && Path::new(name).components().count() == 1
+        && Path::new(name).file_name().and_then(|n| n.to_str()) == Some(name)
+}
+
 /// `rocky emit-sql` entry point. Writes one `<model>.sql` per model into
 /// `out_dir` when given, otherwise prints the concatenated SQL to stdout.
 pub fn run_emit_sql(
@@ -225,7 +243,10 @@ pub fn run_emit_sql(
     model_filter: Option<&str>,
     out_dir: Option<&Path>,
 ) -> Result<()> {
-    let EmitResult { models, skipped } = emit_models(config_path, models_dir, model_filter)?;
+    let EmitResult {
+        models,
+        mut skipped,
+    } = emit_models(config_path, models_dir, model_filter)?;
 
     if models.is_empty() {
         println!("emit-sql: no transformation SQL to emit.");
@@ -237,14 +258,22 @@ pub fn run_emit_sql(
         Some(dir) => {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("failed to create out-dir {}", dir.display()))?;
+            let mut written = 0usize;
             for m in &models {
+                if !is_safe_file_stem(&m.name) {
+                    skipped.push(format!(
+                        "{} (unsafe model name for a file path; not written)",
+                        m.name
+                    ));
+                    continue;
+                }
                 let path = dir.join(format!("{}.sql", m.name));
                 std::fs::write(&path, format!("{}\n", file_body(m)))
                     .with_context(|| format!("failed to write {}", path.display()))?;
+                written += 1;
             }
             println!(
-                "emit-sql: wrote {} model(s) to {} in dependency order",
-                models.len(),
+                "emit-sql: wrote {written} model(s) to {} in dependency order",
                 dir.display()
             );
         }
@@ -420,5 +449,25 @@ mod tests {
             .expect("query materialized table");
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0][0].as_str(), Some("ok"));
+    }
+
+    #[test]
+    fn is_safe_file_stem_rejects_path_traversal() {
+        // Plain identifiers and dotted names are fine.
+        assert!(is_safe_file_stem("stg_orders"));
+        assert!(is_safe_file_stem("orders.v2"));
+        // Anything that could escape `out_dir` via the join is rejected.
+        for bad in [
+            "",
+            "..",
+            ".",
+            "../evil",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "/etc/passwd",
+        ] {
+            assert!(!is_safe_file_stem(bad), "expected {bad:?} to be rejected");
+        }
     }
 }

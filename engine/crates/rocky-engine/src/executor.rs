@@ -24,6 +24,18 @@ pub struct ExecutionResult {
 ///
 /// Models are executed in DAG layer order. Each model's compiled SQL
 /// is run against the DuckDB instance.
+///
+/// # Divergence: surrogate keys are not applied here
+///
+/// Unlike `rocky run` and `rocky emit-sql` — which call
+/// [`rocky_core::models::apply_surrogate_keys`] — this path materializes each
+/// model from its compiled SQL alone. A model that declares a `[[surrogate_key]]`
+/// block is built here *without* the surrogate column. This backs `rocky test`'s
+/// model-execution check ([`crate::test_runner::run_tests`]), so a test that
+/// depends on a surrogate column (e.g. a `unique` assertion on it) would behave
+/// differently from a real run. Aligning the two would change existing
+/// `rocky test` outcomes, so it is left as a known divergence pending a decision
+/// on whether `rocky test` should mirror run-time surrogate keys.
 pub fn execute_locally(compile_result: &CompileResult, db: &DuckDbConnector) -> ExecutionResult {
     let mut result = ExecutionResult {
         succeeded: Vec::new(),
