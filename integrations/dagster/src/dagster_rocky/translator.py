@@ -14,11 +14,27 @@ if TYPE_CHECKING:
     from .types import DagNodeOutput
 
 _INVALID_CHARS = re.compile(r"[^A-Za-z0-9_]")
+_INVALID_TAG_KEY_CHARS = re.compile(r"[^A-Za-z0-9_.\-]")
 
 
 def _sanitize_key_part(s: str) -> str:
     """Replace characters invalid in Dagster names with underscores."""
     return _INVALID_CHARS.sub("_", s)
+
+
+def _sanitize_tag_key(s: str) -> str:
+    """Coerce an arbitrary governance tag key into a Dagster-valid tag key.
+
+    Dagster tag keys allow ``[A-Za-z0-9_.-]`` plus one optional ``/``
+    namespace separator (which this never introduces). Disallowed characters
+    — including ``/`` and whitespace — collapse to ``_``, and the result is
+    truncated to Dagster's 63-character key limit. Two keys that differ only
+    in disallowed characters therefore collapse to the same sanitized key
+    (last write wins); governance keys are expected to be simple identifiers,
+    so this is rare. Returns ``""`` only for an empty input, in which case the
+    caller drops the tag.
+    """
+    return _INVALID_TAG_KEY_CHARS.sub("_", s)[:63]
 
 
 def strip_tenant_component(source: SourceInfo, tenant_component: str) -> SourceInfo:
@@ -199,15 +215,34 @@ class RockyDagsterTranslator:
     def get_model_tags(self, model: ModelDetail) -> dict[str, str]:
         """Returns Dagster tags for a derived model asset.
 
-        Default tags: ``rocky/strategy`` (the materialization type),
-        ``rocky/target_catalog``, ``rocky/target_schema``,
-        ``rocky/model_name``.
+        Two kinds of tag are emitted:
+
+        * **Governance tags** — the model's own ``[tags]`` block, inherited
+          from its config group, projected as *first-class* Dagster tags so
+          they're usable in asset selection (e.g. ``tag:domain=finance``).
+          Keys are sanitized to the Dagster-valid charset via
+          :func:`_sanitize_tag_key` and values stringified; a key that
+          sanitizes to empty is dropped.
+        * **Synthesized metadata tags** — ``rocky/model_name``,
+          ``rocky/target_catalog``, ``rocky/target_schema``, and
+          ``rocky/strategy`` (the materialization type).
+
+        The synthesized keys always contain a ``/``; sanitized governance
+        keys never do, so a governance tag can never clobber Rocky's own
+        metadata. Override this method to namespace governance tags
+        differently or drop the synthesized ones.
         """
-        tags: dict[str, str] = {
-            "rocky/model_name": model.name,
-            "rocky/target_catalog": str(model.target.get("catalog", "")),
-            "rocky/target_schema": str(model.target.get("schema", "")),
-        }
+        tags: dict[str, str] = {}
+        # `getattr` (not `model.tags`) so an older rocky-sdk without the field
+        # degrades to "no governance tags" instead of crashing — same defensive
+        # access the rest of this module uses for newer ModelDetail fields.
+        for key, value in (getattr(model, "tags", None) or {}).items():
+            sanitized = _sanitize_tag_key(str(key))
+            if sanitized:
+                tags[sanitized] = str(value)
+        tags["rocky/model_name"] = model.name
+        tags["rocky/target_catalog"] = str(model.target.get("catalog", ""))
+        tags["rocky/target_schema"] = str(model.target.get("schema", ""))
         strategy_type = model.strategy.get("type") if isinstance(model.strategy, dict) else None
         if strategy_type:
             tags["rocky/strategy"] = str(strategy_type)
