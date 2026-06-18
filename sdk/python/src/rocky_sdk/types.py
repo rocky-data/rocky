@@ -616,41 +616,13 @@ class ColumnLineageResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Test output (v0.1.0)
+# Test / CI output (v0.1.0)
 # ---------------------------------------------------------------------------
-
-
-class TestResult(BaseModel):
-    """Output of ``rocky test --json``."""
-
-    __test__ = False  # Prevent pytest collection
-
-    version: str
-    command: str
-    total: int
-    passed: int
-    failed: int
-    failures: list[list[str]]
-
-
-# ---------------------------------------------------------------------------
-# CI output (v0.1.0)
-# ---------------------------------------------------------------------------
-
-
-class CiResult(BaseModel):
-    """Output of ``rocky ci --json``."""
-
-    version: str
-    command: str
-    compile_ok: bool
-    tests_ok: bool
-    models_compiled: int
-    tests_passed: int
-    tests_failed: int
-    exit_code: int
-    diagnostics: list[Diagnostic]
-    failures: list[list[str]]
+# ``TestResult`` and ``CiResult`` were hand-written shadows that diverged from
+# the engine's real wire format (``failures`` is ``[{"name", "error"}]``, not
+# positional ``[[name, error]]``). They are now soft-swapped to the generated
+# ``TestOutput`` / ``CiOutput`` — see the alias block near the bottom of this
+# module, alongside the ``HistoryResult`` / ``ModelHistoryResult`` swap.
 
 
 # ---------------------------------------------------------------------------
@@ -1178,6 +1150,19 @@ DagEdge = DagEdgeOutput
 # exports so external consumers don't break.
 HistoryResult = HistoryOutput
 ModelHistoryResult = ModelHistoryOutput
+
+# ``TestResult`` / ``CiResult`` had the same drift: both declared
+# ``failures: list[list[str]]`` (positional tuples), but the engine serializes
+# ``failures`` as ``[{"name", "error"}]`` objects (``TestFailure``) — so the
+# hand-written shape only ever parsed the empty (all-pass) case and raised on
+# any real failure. They also lacked ``model_results`` / ``declarative`` /
+# ``unit_tests``. The generated outputs are the source of truth; keep the
+# Result names as aliases for import compatibility.
+TestResult = TestOutput
+CiResult = CiOutput
+# ``TestResult``/``TestOutput`` start with "Test"; without this guard pytest
+# tries to collect the alias as a test class wherever a test module imports it.
+TestOutput.__test__ = False
 
 # ``rocky ai-contract`` has no hand-written legacy class; the generated model
 # is the source of truth. Expose a Python-flavored alias for symmetry with the

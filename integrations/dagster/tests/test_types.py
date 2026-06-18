@@ -566,7 +566,17 @@ def test_parse_test_result(test_result_json: str):
     assert result.passed == 2
     assert result.failed == 1
     assert len(result.failures) == 1
-    assert result.failures[0][0] == "revenue_summary"
+    # `failures` entries are {name, error} objects, not positional [name, error]
+    # tuples — the old hand-written `list[list[str]]` shadow could not parse this
+    # wire shape and raised on any non-empty failure list.
+    assert result.failures[0].name == "revenue_summary"
+    assert "type mismatch" in result.failures[0].error
+    # Per-model outcomes (C-series) round-trip too, including passes.
+    assert {(m.model, m.status) for m in result.model_results} == {
+        ("revenue_summary", "fail"),
+        ("daily_active_users", "pass"),
+        ("customer_ltv", "pass"),
+    }
 
 
 def test_parse_ci_result(ci_json: str):

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from rocky_sdk import CompileResult, DiscoverResult, parse_rocky_output
+from rocky_sdk import CiResult, CompileResult, DiscoverResult, TestResult, parse_rocky_output
 from rocky_sdk.client import _parse_rocky_json, _parse_run_or_apply
 from rocky_sdk.exceptions import RockyOutputParseError
 
@@ -45,6 +45,45 @@ def test_parse_compile_model_without_tags_defaults_none():
     )
     result = parse_rocky_output(payload)
     assert result.models_detail[0].tags is None
+
+
+def test_parse_test_result_failures_are_objects():
+    # `rocky test --output json` serializes `failures` as [{name, error}]
+    # objects (the engine maps its (name, error) tuples to the `TestFailure`
+    # struct), and carries `model_results` (per-model outcomes, passes too).
+    # The old hand-written `TestResult` declared `failures: list[list[str]]`
+    # and lacked `model_results` — it could not parse this payload at all and
+    # raised on the first failing test. Captured shape from the live binary.
+    payload = (
+        '{"version": "1.0.0", "command": "test", "total": 2, "passed": 1, '
+        '"failed": 1, "failures": [{"name": "fct_orders", "error": '
+        '"DuckDB error: Binder Error"}], "model_results": ['
+        '{"model": "fct_orders", "status": "fail", "error": "DuckDB error: Binder Error"}, '
+        '{"model": "stg_orders", "status": "pass"}]}'
+    )
+    result = parse_rocky_output(payload)
+    assert isinstance(result, TestResult)
+    assert result.failures[0].name == "fct_orders"
+    assert "Binder Error" in result.failures[0].error
+    assert {(m.model, m.status) for m in result.model_results} == {
+        ("fct_orders", "fail"),
+        ("stg_orders", "pass"),
+    }
+
+
+def test_parse_ci_result_failures_are_objects():
+    # `rocky ci` shares the same `failures` shape: [{name, error}] objects, not
+    # positional tuples. Same drift as `TestResult`; same soft-swap fix.
+    payload = (
+        '{"version": "1.0.0", "command": "ci", "compile_ok": true, '
+        '"tests_ok": false, "models_compiled": 2, "tests_passed": 1, '
+        '"tests_failed": 1, "exit_code": 1, "diagnostics": [], '
+        '"failures": [{"name": "fct_orders", "error": "type mismatch"}]}'
+    )
+    result = parse_rocky_output(payload)
+    assert isinstance(result, CiResult)
+    assert result.failures[0].name == "fct_orders"
+    assert result.failures[0].error == "type mismatch"
 
 
 def test_parse_rocky_output_rejects_non_object():
