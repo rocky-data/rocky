@@ -266,6 +266,39 @@ pub async fn upload_state(config: &StateConfig, local_path: &Path) -> Result<(),
         .await
 }
 
+/// End-of-run state upload, suppressed when the local store was recreated after
+/// a forward-incompatible schema mismatch.
+///
+/// This is the **no-clobber** half of the mixed-version safety invariant. When
+/// `recreated_for_forward_incompat` is true, the local `state.redb` was
+/// bootstrapped fresh under `on_schema_mismatch = recreate` because the on-disk
+/// state was written by a *newer* binary — so the local state is a downgrade.
+/// Uploading it back would overwrite the newer shared state that
+/// already-upgraded pods depend on, so the upload is deliberately skipped.
+/// Otherwise the local state is uploaded via [`upload_state`].
+///
+/// The open-time half of the invariant (refusing to *run* against
+/// forward-incompatible on-disk state, or recreating under policy) lives in
+/// [`crate::state`]'s `open_with_policy`. The periodic mid-run uploader in the
+/// CLI is gated by the same flag at spawn time (it is simply not started when
+/// the store was recreated), so both upload paths honor the suppression.
+pub async fn upload_state_unless_recreated(
+    recreated_for_forward_incompat: bool,
+    config: &StateConfig,
+    local_path: &Path,
+) -> Result<(), StateSyncError> {
+    if recreated_for_forward_incompat {
+        info!(
+            outcome = "skipped_forward_incompat_recreate",
+            "skipping end-of-run state upload: local state was recreated after a \
+             forward-incompatible schema mismatch (on_schema_mismatch = recreate); \
+             leaving the newer shared state intact"
+        );
+        return Ok(());
+    }
+    upload_state(config, local_path).await
+}
+
 /// Variant of [`upload_state`] that lets the caller override the list of
 /// redb tables stripped from the remote copy.
 ///
@@ -1575,5 +1608,54 @@ mod tests {
 
         let config = StateConfig::default();
         assert!(upload_state(&config, &src).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn upload_state_unless_recreated_suppresses_upload_when_recreated() {
+        // The "no-clobber" half of the mixed-version safety invariant: when the
+        // local store was recreated after a forward-incompatible schema
+        // mismatch, the end-of-run upload must NOT run — otherwise a downgraded
+        // pod overwrites the newer shared state.
+        //
+        // We prove the upload is *not attempted* (not just that a bool flipped)
+        // by pointing the config at a real upload backend that hard-errors the
+        // moment dispatch is reached — S3 with no bucket, under the `Fail`
+        // policy so the error propagates instead of being warn-swallowed:
+        //   recreated = true  → Ok                       (upload skipped, broken backend never touched)
+        //   recreated = false → Err(MissingConfig "s3")  (upload attempted, hit the broken S3 dispatch)
+        // Deleting the suppression guard would make the `true` case also reach
+        // the broken backend and fail — i.e. this test goes red, which is the
+        // regression we want to catch.
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("state.redb");
+        // The local state file must exist, else `upload_state` early-returns Ok
+        // and the `false` case would look "skipped" too.
+        seed_watermark_and_cache(&src);
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: None, // deliberately misconfigured → dispatch yields MissingConfig
+            on_upload_failure: StateUploadFailureMode::Fail, // propagate, don't warn-swallow
+            ..StateConfig::default()
+        };
+
+        // Recreated store: the upload is skipped entirely, so the broken
+        // backend is never reached.
+        assert!(
+            upload_state_unless_recreated(true, &config, &src)
+                .await
+                .is_ok(),
+            "a store recreated for forward-incompat must skip the end-of-run upload"
+        );
+
+        // Normal store: the upload runs and hits the (deliberately broken) S3
+        // dispatch — proving the gate let a real upload attempt through.
+        let err = upload_state_unless_recreated(false, &config, &src)
+            .await
+            .expect_err("an un-suppressed upload must actually attempt the backend");
+        assert!(
+            matches!(&err, StateSyncError::MissingConfig(backend, _) if backend == "s3"),
+            "expected the S3 dispatch to be reached (MissingConfig for the bucket); got {err:?}"
+        );
     }
 }

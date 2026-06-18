@@ -3594,15 +3594,15 @@ pub async fn run(
     // Upload state to remote storage — unless this store was bootstrapped
     // fresh from a forward-incompatible on-disk schema. In that case the local
     // state is a downgrade; persisting it back would clobber the newer state
-    // that already-upgraded pods depend on, so we deliberately skip the upload.
-    if suppress_state_upload {
-        info!(
-            outcome = "skipped_forward_incompat_recreate",
-            "skipping end-of-run state upload: local state was recreated after a \
-             forward-incompatible schema mismatch (on_schema_mismatch = recreate); \
-             leaving the newer shared state intact"
-        );
-    } else if let Err(e) = rocky_core::state_sync::upload_state(&rocky_cfg.state, state_path).await {
+    // that already-upgraded pods depend on, so the upload is deliberately
+    // skipped (the periodic mid-run uploader above is gated by the same flag).
+    if let Err(e) = rocky_core::state_sync::upload_state_unless_recreated(
+        suppress_state_upload,
+        &rocky_cfg.state,
+        state_path,
+    )
+    .await
+    {
         warn!(error = %e, "state upload failed");
     }
 
