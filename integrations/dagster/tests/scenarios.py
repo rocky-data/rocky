@@ -497,8 +497,25 @@ TEST_RESULT: dict[str, Any] = {
     "total": 3,
     "passed": 2,
     "failed": 1,
+    # `failures` is an array of {name, error} objects on the wire — the engine
+    # maps its (name, error) tuples to the `TestFailure` struct. Captured from
+    # `rocky test --output json` against examples/test-declarative.
     "failures": [
-        ["revenue_summary", "type mismatch: expected INT64 but got STRING for column 'order_id'"],
+        {
+            "name": "revenue_summary",
+            "error": "type mismatch: expected INT64 but got STRING for column 'order_id'",
+        },
+    ],
+    # Per-model outcomes (passes too, not just failures) — the C-series field
+    # consumed by the VS Code Inspector Tests tab and dagster.
+    "model_results": [
+        {
+            "model": "revenue_summary",
+            "status": "fail",
+            "error": "type mismatch: expected INT64 but got STRING for column 'order_id'",
+        },
+        {"model": "daily_active_users", "status": "pass"},
+        {"model": "customer_ltv", "status": "pass"},
     ],
 }
 
@@ -526,7 +543,10 @@ CI: dict[str, Any] = {
         },
     ],
     "failures": [
-        ["revenue_summary", "DuckDB execution error: column 'order_id' type mismatch"],
+        {
+            "name": "revenue_summary",
+            "error": "DuckDB execution error: column 'order_id' type mismatch",
+        },
     ],
 }
 

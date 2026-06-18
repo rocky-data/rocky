@@ -736,7 +736,12 @@ pub struct NamedTest {
 /// A `[[use_test]]` reference in a model sidecar: apply the named test `name`
 /// (from `test_definitions.toml`) to this model, optionally binding/overriding
 /// the column, severity, and row filter at the use site.
+///
+/// `deny_unknown_fields` so a mistyped key in a `[[use_test]]` block (e.g.
+/// `colum =` or `filer =`) is rejected at load instead of being silently
+/// ignored, which would apply the test with the wrong binding.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestRef {
     /// Name of the definition in `test_definitions.toml`.
     pub name: String,
@@ -835,6 +840,20 @@ fn resolve_group_schema(
             reason: format!(
                 "group '{group}' schema_template '{template}' has unfilled placeholder(s); \
                  supply them under the model's [args]"
+            ),
+        });
+    }
+    // The resolved schema flows into `format_table_ref`, which validates every
+    // component with `validate_identifier`. Validate here too — with the same
+    // validator — so an `[args]` value carrying a bad character (e.g. a hyphen
+    // or quote) fails at load with a clear message instead of at SQL-gen, and
+    // load/run never disagree on what's acceptable.
+    if rocky_sql::validation::validate_identifier(&resolved).is_err() {
+        return Err(ModelError::InvalidGroup {
+            model: model.to_string(),
+            reason: format!(
+                "group '{group}' schema_template resolved to '{resolved}', which is not a valid \
+                 SQL identifier; check the model's [args] values"
             ),
         });
     }
@@ -1612,7 +1631,12 @@ pub fn load_column_docs_from_dir(
 /// A surrogate-key computed column declared in a model sidecar
 /// `[[surrogate_key]]` block: an output column `name` whose value is a
 /// deterministic hash of `columns`, injected into the materialized SELECT.
+///
+/// `deny_unknown_fields` so a typo in a `[[surrogate_key]]` block (e.g.
+/// `colums = [...]`) fails the load loudly rather than silently dropping the
+/// columns and computing the hash over nothing.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SurrogateKeySpec {
     pub name: String,
     pub columns: Vec<String>,
@@ -1745,6 +1769,15 @@ fn validate_surrogate_key_spec(spec: &SurrogateKeySpec, model: &str) -> Result<(
 /// A no-op when `specs` is empty. Used by both the materialization path and the
 /// skip-gate IR, so a model that *gains* a key re-materializes rather than being
 /// skipped as unchanged.
+///
+/// # Precondition
+///
+/// Every spec must already be validated by [`validate_surrogate_key_spec`] —
+/// [`load_surrogate_keys_from_dir`] does this at load. The spec's `name` and
+/// `columns` are interpolated into SQL without re-escaping (per the
+/// validate-before-interpolation rule), so passing an unvalidated spec is a
+/// SQL-injection vector. A `debug_assert!` re-checks the precondition in debug
+/// builds.
 pub fn apply_surrogate_keys(
     model_ir: &mut rocky_ir::ModelIr,
     specs: &[SurrogateKeySpec],
@@ -1753,6 +1786,14 @@ pub fn apply_surrogate_keys(
     if specs.is_empty() {
         return;
     }
+    debug_assert!(
+        specs
+            .iter()
+            .all(|s| validate_surrogate_key_spec(s, "").is_ok()),
+        "apply_surrogate_keys received an unvalidated SurrogateKeySpec — callers must validate \
+         via validate_surrogate_key_spec (load_surrogate_keys_from_dir does) before its fields \
+         are interpolated into SQL"
+    );
     let additions = surrogate_key_metadata_columns(specs, dialect)
         .iter()
         .map(|m| format!("CAST({} AS {}) AS {}", m.value, m.data_type, m.name))
@@ -2962,6 +3003,28 @@ columns = ["order_id"]
         }
     }
 
+    #[test]
+    fn load_surrogate_keys_rejects_unknown_field() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("m.toml"),
+            "[target]\ncatalog = \"wh\"\nschema = \"main\"\n\n\
+             [[surrogate_key]]\nname = \"order_key\"\ncolumns = [\"order_id\"]\n\
+             algoritm = \"sha256\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("m.sql"), "SELECT order_id FROM upstream").unwrap();
+
+        // A mistyped key in a [[surrogate_key]] block (deny_unknown_fields) fails
+        // the load loudly instead of silently dropping the misspelled setting.
+        let err = load_surrogate_keys_from_dir(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ModelError::ParseFrontmatter { .. }),
+            "expected ParseFrontmatter for unknown [[surrogate_key]] field, got {err:?}"
+        );
+    }
+
     // ----- config groups (models/groups/<name>.toml) -----
 
     /// Write a `groups/<name>.toml` group definition under `dir`.
@@ -3269,6 +3332,30 @@ columns = ["order_id"]
         );
     }
 
+    /// A group `schema_template` that resolves to a non-identifier (because an
+    /// `[args]` value carries an illegal character) is rejected at load with the
+    /// same `validate_identifier` `format_table_ref` applies at SQL-gen — so the
+    /// failure surfaces early with a clear message instead of as broken SQL.
+    #[test]
+    fn group_schema_resolving_to_invalid_identifier_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write_group(dir.path(), "marts", "schema_template = \"mart_{region}\"\n");
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            // `us-west` has a hyphen → resolved schema `mart_us-west` is not a
+            // valid SQL identifier (no pinned schema, so the template resolves).
+            "group = \"marts\"\n\n[target]\ncatalog = \"wh\"\n\n[args]\nregion = \"us-west\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
+
+        let err = load_models_from_dir(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ModelError::InvalidGroup { ref model, .. } if model == "orders"),
+            "got {err:?}"
+        );
+    }
+
     // ----- named test definitions (test_definitions.toml + [[use_test]]) -----
 
     /// A `[[use_test]]` reference resolves a named definition onto a column,
@@ -3327,6 +3414,31 @@ columns = ["order_id"]
         assert_eq!(m.config.tests.len(), 2, "inline test + resolved reference");
         // The reference's column overrides the definition default ("id").
         assert_eq!(m.config.tests[1].column.as_deref(), Some("email"));
+    }
+
+    /// A mistyped key in a `[[use_test]]` block (deny_unknown_fields) is a hard
+    /// error, so a typo like `colum =` can't silently drop the column binding.
+    #[test]
+    fn use_test_rejects_unknown_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("test_definitions.toml"),
+            "[not_empty]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "[target]\ncatalog = \"wh\"\nschema = \"main\"\n\n\
+             [[use_test]]\nname = \"not_empty\"\ncolum = \"email\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
+
+        let err = load_models_from_dir(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ModelError::ParseFrontmatter { .. }),
+            "expected ParseFrontmatter for unknown [[use_test]] field, got {err:?}"
+        );
     }
 
     /// An unknown `[[use_test]]` name is a hard error (typo protection).

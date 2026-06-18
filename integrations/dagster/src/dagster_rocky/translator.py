@@ -14,7 +14,12 @@ if TYPE_CHECKING:
     from .types import DagNodeOutput
 
 _INVALID_CHARS = re.compile(r"[^A-Za-z0-9_]")
-_INVALID_TAG_KEY_CHARS = re.compile(r"[^A-Za-z0-9_.\-]")
+# Dagster's strict tag charset is identical for key segments and strict values:
+# ``[A-Za-z0-9_.-]`` (dagster._utils.tags ``VALID_TAG_KEY_REGEX`` /
+# ``VALID_STRICT_TAG_VALUE_REGEX``). A single complement class drives both the
+# key and value sanitizers below; if Dagster ever diverges the two charsets,
+# split this into separate constants.
+_INVALID_TAG_CHARS = re.compile(r"[^A-Za-z0-9_.\-]")
 
 
 def _sanitize_key_part(s: str) -> str:
@@ -34,7 +39,22 @@ def _sanitize_tag_key(s: str) -> str:
     so this is rare. Returns ``""`` only for an empty input, in which case the
     caller drops the tag.
     """
-    return _INVALID_TAG_KEY_CHARS.sub("_", s)[:63]
+    return _INVALID_TAG_CHARS.sub("_", s)[:63]
+
+
+def _sanitize_tag_value(s: str) -> str:
+    """Coerce an arbitrary governance tag value into a Dagster-valid strict value.
+
+    Dagster validates tag *values* against ``^[A-Za-z0-9_.-]{0,63}$`` at
+    ``AssetSpec`` construction (``normalize_tags(strict=True)``). Disallowed
+    characters — ``@``, ``:``, ``/``, whitespace, etc. — collapse to ``_`` and
+    the result is truncated to 63 characters. Unlike keys, an empty value is
+    valid in Dagster and is preserved as-is. This is the value-side counterpart
+    of :func:`_sanitize_tag_key`; without it, a governance value like
+    ``data-eng@corp.com`` would raise at spec construction rather than degrade
+    gracefully.
+    """
+    return _INVALID_TAG_CHARS.sub("_", s)[:63]
 
 
 def strip_tenant_component(source: SourceInfo, tenant_component: str) -> SourceInfo:
@@ -221,8 +241,10 @@ class RockyDagsterTranslator:
           from its config group, projected as *first-class* Dagster tags so
           they're usable in asset selection (e.g. ``tag:domain=finance``).
           Keys are sanitized to the Dagster-valid charset via
-          :func:`_sanitize_tag_key` and values stringified; a key that
-          sanitizes to empty is dropped.
+          :func:`_sanitize_tag_key` and values via :func:`_sanitize_tag_value`
+          (both required — Dagster validates keys *and* values at ``AssetSpec``
+          construction); a key that sanitizes to empty is dropped, an empty
+          value is kept.
         * **Synthesized metadata tags** — ``rocky/model_name``,
           ``rocky/target_catalog``, ``rocky/target_schema``, and
           ``rocky/strategy`` (the materialization type).
@@ -239,13 +261,16 @@ class RockyDagsterTranslator:
         for key, value in (getattr(model, "tags", None) or {}).items():
             sanitized = _sanitize_tag_key(str(key))
             if sanitized:
-                tags[sanitized] = str(value)
-        tags["rocky/model_name"] = model.name
-        tags["rocky/target_catalog"] = str(model.target.get("catalog", ""))
-        tags["rocky/target_schema"] = str(model.target.get("schema", ""))
+                tags[sanitized] = _sanitize_tag_value(str(value))
+        # Synthesized values are warehouse identifiers / strategy enums and are
+        # virtually always already valid, but sanitize them too so an
+        # unexpected value can never raise at AssetSpec construction.
+        tags["rocky/model_name"] = _sanitize_tag_value(model.name)
+        tags["rocky/target_catalog"] = _sanitize_tag_value(str(model.target.get("catalog", "")))
+        tags["rocky/target_schema"] = _sanitize_tag_value(str(model.target.get("schema", "")))
         strategy_type = model.strategy.get("type") if isinstance(model.strategy, dict) else None
         if strategy_type:
-            tags["rocky/strategy"] = str(strategy_type)
+            tags["rocky/strategy"] = _sanitize_tag_value(str(strategy_type))
         return tags
 
     def get_model_metadata(self, model: ModelDetail) -> dict[str, str]:

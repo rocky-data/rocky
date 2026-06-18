@@ -568,6 +568,13 @@ impl StateStore {
                 }
             }
 
+            // Eagerly open every table so a freshly-created DB materializes the
+            // full set up front. This is what makes the on-disk format
+            // deterministic and lets the `on_disk_state_schema_format_is_pinned`
+            // golden enumerate it via `list_tables()`. When adding a table:
+            // register it HERE (eager creation) *and* in that golden's
+            // EXPECTED_TABLES. A table created lazily on first write would not
+            // appear in a fresh DB and would silently escape the golden.
             let _table = txn.open_table(WATERMARKS)?;
             let _table = txn.open_table(CHECK_HISTORY)?;
             let _table = txn.open_table(RUN_HISTORY)?;
