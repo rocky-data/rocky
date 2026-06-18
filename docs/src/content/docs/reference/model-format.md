@@ -185,7 +185,22 @@ Enforcement is strictly opt-in: without `enforce`, groups stay overridable defau
 
 The model loader does not recurse into subdirectories, so `models/groups/` is never mistaken for model files.
 
-A group currently carries `schema_template`, `strategy`, and `enforce`. Shared tags and per-model computed keys are planned additions; until then, an unrecognized key in a group file is rejected at load so typos surface immediately.
+#### Group tags
+
+A group can also declare a `[tags]` block. Every member model inherits the group's tags as a shared baseline, so a governance attribute applied once on the group lands on the whole fan-out:
+
+```toml
+# models/groups/finance.toml
+schema_template = "mart_{region}"
+
+[tags]
+domain = "finance"
+tier = "gold"
+```
+
+A member model's own `[tags]` override the group per key (sidecar > group) without dropping the rest of the group's tags — so one model can set `tier = "silver"` and still inherit `domain = "finance"`. The resolved tags appear on the `rocky compile` JSON output (`models_detail[].tags`), and `dagster-rocky` projects them onto each derived asset's Dagster tags — making the governed fan-out visible to the orchestrator end-to-end. See [`[tags]`](#tags) for the model-level block.
+
+A group carries `schema_template`, `strategy`, `tags`, and `enforce`. An unrecognized key in a group file is rejected at load so typos surface immediately.
 
 ### `[classification]`
 
@@ -210,6 +225,26 @@ Tags are free-form strings (no enum), so teams can coin new classifications with
 :::note[Adapter support]
 Classification tags + masking policies are applied today against **Databricks** Unity Catalog (column tags + `CREATE MASK` / `SET MASKING POLICY`, one statement per column). Snowflake, BigQuery, and DuckDB default-unsupported until demand. Best-effort: failures emit `warn!` and don't abort the run.
 :::
+
+### `[tags]`
+
+Model-level governance tags. Unlike `[classification]` (keyed by column, drives masking), these describe the model **as a whole** — `domain`, `tier`, `owner`, anything your governance model needs:
+
+```toml
+# models/fct_orders.toml
+name = "fct_orders"
+
+[tags]
+domain = "finance"
+tier = "gold"
+owner = "data-eng"
+```
+
+| Key pattern | Value type | Description |
+|---|---|---|
+| `<tag_name>` | string | Free-form governance attribute. Merged over any [config-group `[tags]`](#group-tags) baseline (sidecar > group). |
+
+Resolved tags are emitted on `rocky compile --output json` as `models_detail[].tags`. The `dagster-rocky` integration projects them onto the derived asset's Dagster tags, so the same attribute drives both Rocky's view of the model and the orchestrator's. Tags are inherited from a model's config group when it belongs to one — see [Group tags](#group-tags).
 
 ### Retention
 

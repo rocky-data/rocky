@@ -349,6 +349,7 @@ fn load_single_rocky_model_with_db(
             format: None,
             format_options: None,
             classification: Default::default(),
+            tags: Default::default(),
             retention: None,
             budget: None,
             skip: None,
@@ -396,6 +397,7 @@ mod tests {
                 format: None,
                 format_options: None,
                 classification: Default::default(),
+                tags: Default::default(),
                 retention: None,
                 budget: None,
                 skip: None,
@@ -626,6 +628,54 @@ mod tests {
             flow.config.tests.len(),
             1,
             "the named test must resolve onto the .rocky model"
+        );
+    }
+
+    /// Regression: a `.rocky` DSL model inherits its config group's `[tags]`
+    /// and merges its own `[tags]` over them (sidecar > group) through the
+    /// salsa loader — the same merge a `.sql` model gets via
+    /// `load_models_from_dir`. Guards the #917-class wiring gap where a
+    /// model-load feature reaches only the `.sql` path.
+    #[test]
+    fn rocky_model_resolves_governance_tags() {
+        let _guard = crate::salsa_compile::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("groups")).unwrap();
+        std::fs::write(
+            d.join("groups/finance.toml"),
+            "[tags]\ndomain = \"finance\"\ntier = \"gold\"\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("flow.rocky"), "from orders\nselect { id }\n").unwrap();
+        std::fs::write(
+            d.join("flow.toml"),
+            "group = \"finance\"\n\n[target]\ncatalog = \"wh\"\nschema = \"s\"\n\n\
+             [tags]\ntier = \"silver\"\nowner = \"data-eng\"\n",
+        )
+        .unwrap();
+
+        let models = load_dir_models(d).unwrap();
+        let flow = models
+            .iter()
+            .find(|m| m.config.name == "flow")
+            .expect("rocky model loaded");
+        // group baseline inherited
+        assert_eq!(
+            flow.config.tags.get("domain").map(String::as_str),
+            Some("finance")
+        );
+        // model overrides the group's value for a shared key
+        assert_eq!(
+            flow.config.tags.get("tier").map(String::as_str),
+            Some("silver")
+        );
+        // model-only key present alongside the group baseline
+        assert_eq!(
+            flow.config.tags.get("owner").map(String::as_str),
+            Some("data-eng")
         );
     }
 }

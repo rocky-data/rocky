@@ -189,6 +189,7 @@ mod tests {
                 format: None,
                 format_options: None,
                 classification: Default::default(),
+                tags: Default::default(),
                 retention: None,
                 budget,
                 skip: None,

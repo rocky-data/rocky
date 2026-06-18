@@ -153,6 +153,7 @@ mod save_intent_tests {
                 format: None,
                 format_options: None,
                 classification: Default::default(),
+                tags: Default::default(),
                 retention: None,
                 budget: None,
                 skip: None,

@@ -294,6 +294,7 @@ mod tests {
                 format: None,
                 format_options: None,
                 classification,
+                tags: Default::default(),
                 retention: None,
                 budget: None,
                 skip: None,
