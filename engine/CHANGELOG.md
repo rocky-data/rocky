@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Model-level `[tags]`, inheritable from config groups.** A model can declare a `[tags]` block of free-form governance attributes (`domain`, `tier`, `owner`, …), and a config group can declare `[tags]` that every member inherits as a shared baseline — a model's own tags override the group per key (sidecar > group). Resolved tags are surfaced on `rocky compile --output json` as `models_detail[].tags`, where orchestrators can read them. Merged at the shared `.sql` / `.rocky` resolution path so both model formats inherit. (#920)
 - **Config-group misplacement guard.** A group member that pins its own `target.schema` **and** supplies `[args]` now fails the load: the pin bypasses the group's `schema_template`, so the args could only fill a template that's never used — a contradiction that usually masks a routing mistake. Pinning a schema with no args (a legitimate override) and routing via args with no pin both stay valid. (#923)
 
+### Changed
+
+- **A config group's `schema_template` is validated as a SQL identifier once resolved against a model's `[args]`.** A bad `[args]` value (e.g. one carrying a hyphen) now fails at load with a clear message instead of surfacing later as broken SQL — the same `validate_identifier` the table-reference builder applies, so load and run agree. (#924)
+- **Typos in a `[[surrogate_key]]` or `[[use_test]]` sidecar block now fail the load** (`deny_unknown_fields`) instead of being silently ignored. (#924)
+
+### Fixed
+
+- **`emit-sql --out-dir` skips a model whose name is not a safe filename** (reporting it) rather than joining the name into the output path. (#924)
+
 ## [1.51.1] — 2026-06-14
 
 ### Security
