@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Model governance tags on derived asset specs.** `RockyDagsterTranslator.get_model_tags` now projects a model's resolved `[tags]` (its own, inherited from its config group) as first-class Dagster tags — usable in asset selection (`tag:domain=finance`) — alongside the synthesized `rocky/*` metadata. Keys are sanitized to Dagster's tag charset; the synthesized keys keep their `/` so a governance tag can't clobber Rocky's own metadata. Requires `rocky-sdk` with `ModelDetail.tags`; older SDKs degrade to no governance tags. (#921)
+
 ## [1.49.0] — 2026-06-14
 
 ### Changed
