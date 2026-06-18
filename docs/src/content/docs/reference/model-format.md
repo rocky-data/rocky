@@ -167,6 +167,8 @@ region = "emea"         # fills {region} -> schema "mart_emea"
 
 Precedence is **per-model sidecar > group > `_defaults.toml`**: a model can still pin its own `schema` or `strategy` to override the group, and the group in turn overrides directory defaults. A `group` that names no definition, or a `schema_template` placeholder the model doesn't supply, fails the load with a clear error rather than routing a model to the wrong place.
 
+A model that pins its own `schema` overrides the group's template entirely — so it must **not** also supply `[args]`, since the args could only fill a template that's now bypassed. That combination is a misplacement (the args silently do nothing, usually masking a routing mistake) and fails the load. Pin a schema *or* supply args, not both.
+
 #### Enforced groups
 
 Set `enforce = true` on a group to make its fields binding rather than defaults. A member model that locally pins a field the group controls — its target `schema` or its `strategy` — then fails the load instead of silently routing or materializing itself differently from the rest of the group:

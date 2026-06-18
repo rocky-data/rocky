@@ -678,4 +678,41 @@ mod tests {
             Some("data-eng")
         );
     }
+
+    /// Regression: the C5 misplacement guard (a group member that supplies
+    /// `[args]` AND pins its own `target.schema`) fires for a `.rocky` DSL model
+    /// too, since it rides the shared `resolve_model_config` chokepoint — not
+    /// only the `.sql` `load_models_from_dir` path.
+    #[test]
+    fn rocky_model_args_with_pinned_schema_is_rejected() {
+        let _guard = crate::salsa_compile::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("groups")).unwrap();
+        std::fs::write(
+            d.join("groups/marts.toml"),
+            "schema_template = \"mart_{region}\"\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("flow.rocky"), "from orders\nselect { id }\n").unwrap();
+        std::fs::write(
+            d.join("flow.toml"),
+            "group = \"marts\"\n\n[target]\ncatalog = \"wh\"\nschema = \"escape\"\n\n[args]\nregion = \"emea\"\n",
+        )
+        .unwrap();
+
+        let err = load_dir_models(d).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ProjectError::ModelLoad(rocky_core::models::ModelError::GroupArgsWithPinnedSchema {
+                    model,
+                    group,
+                }) if model == "flow" && group == "marts"
+            ),
+            "got {err:?}"
+        );
+    }
 }
