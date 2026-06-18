@@ -9,6 +9,47 @@ import pocCounts from "../../../data/poc-counts.json";
 
 Rocky is a Cargo workspace composed of several crates, each with a focused responsibility. This page describes what each crate does and how they connect.
 
+## How data flows
+
+A `rocky run` touches every layer of the stack. From config file to warehouse result:
+
+```
+rocky.toml
+    │  parse config + env-var substitution
+    ▼
+Config struct
+    │  call DiscoveryAdapter
+    ▼
+Source metadata  ◀── Fivetran REST API / DuckDB info_schema / manual config
+    │  compile .sql + .toml models
+    ▼
+rocky-compiler  →  diagnostics (E001–E033 / W001–W012)
+    │  produces typed ProjectIr on success
+    ▼
+ProjectIr  (one ModelIr per model, fully typed and validated)
+    │  topological sort → execution layers
+    ▼
+Layer 0: [raw_a, raw_b]   ← run in parallel
+Layer 1: [enriched]
+Layer 2: [summary]
+    │  per model: drift detect → skip gate → SQL gen → execute → checks
+    ▼
+WarehouseAdapter
+    ├── rocky-databricks  →  Databricks SQL Statement API
+    ├── rocky-snowflake   →  Snowflake REST API
+    ├── rocky-bigquery    →  BigQuery REST API
+    ├── rocky-trino       →  Trino /v1/statement
+    └── rocky-duckdb      →  DuckDB in-process
+    │  write results to warehouse; update state store
+    ▼
+State store (redb, embedded)
+    │  watermarks, run progress, partitions, idempotency
+    ▼
+Hooks + JSON output on stdout
+```
+
+For a detailed walkthrough of each step, see [Execution Flow](/concepts/execution-flow/).
+
 ## Adapter model
 
 Rocky separates concerns through two adapter types:

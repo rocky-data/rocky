@@ -5,6 +5,44 @@ sidebar:
   order: 1
 ---
 
+## Where to start
+
+The right entry point depends on what you want to change. Use this table to orient yourself before diving into the code.
+
+| You want to change | Start here |
+|---|---|
+| How a warehouse executes SQL | `engine/crates/rocky-<name>/` — the adapter crate. Implement `WarehouseAdapter` / `SqlDialect` from `rocky-adapter-sdk`. |
+| How SQL is generated from the IR | `engine/crates/rocky-core/src/sql_gen.rs` |
+| What the IR looks like (model shape) | `engine/crates/rocky-ir/src/ir.rs` |
+| The type checker or semantic graph | `engine/crates/rocky-compiler/src/` |
+| A diagnostic code (error/warning) | `engine/crates/rocky-compiler/src/diagnostic.rs` |
+| Incremental / watermark logic | `engine/crates/rocky-core/src/state.rs` + `sql_gen.rs` |
+| The `rocky run` execution loop | `engine/crates/rocky-cli/src/commands/run.rs` |
+| DAG / dependency resolution | `engine/crates/rocky-ir/src/dag.rs` |
+| Data contracts enforcement | `engine/crates/rocky-core/src/contracts.rs` |
+| Schema drift detection | `engine/crates/rocky-core/src/drift.rs` |
+| Masking strategies | `engine/crates/rocky-core/src/masking.rs` |
+| Permission / role graph | `engine/crates/rocky-core/src/role_graph.rs` |
+| SCD-2 snapshot logic | `engine/crates/rocky-core/src/snapshots.rs` |
+| Quality checks | `engine/crates/rocky-core/src/checks.rs` |
+| Hooks / webhooks | `engine/crates/rocky-core/src/hooks/` |
+| Column lineage extraction | `engine/crates/rocky-sql/src/lineage.rs` |
+| Skip-unchanged gate / hashing | `engine/crates/rocky-sql/src/determinism.rs` + `rocky-ir/src/ir.rs::skip_hash()` |
+| CLI JSON output shape | `engine/crates/rocky-cli/src/output.rs` — then run `just codegen` |
+| A new CLI subcommand | See the `rocky-new-cli-command` skill in `.claude/skills/` |
+| The Rocky DSL (`.rocky` files) | `engine/crates/rocky-lang/src/` — then update VS Code grammar too |
+| The LSP server | `engine/crates/rocky-server/src/lsp.rs` |
+| The Dagster integration | `integrations/dagster/src/dagster_rocky/` |
+| The Python SDK | `sdk/python/src/rocky_sdk/client.py` |
+| The VS Code extension | `editors/vscode/src/` |
+
+### Key invariants before you commit
+
+- **Never** commit a Rust `*Output` change without running `just codegen` — `codegen-drift.yml` CI will fail.
+- **Never** `format!()` untrusted input into SQL — use `rocky-sql/validation.rs` to validate identifiers first.
+- **Never** hand-edit files under `*/types_generated/` or `*/types/generated/` — those are codegen outputs.
+- **Never** skip hooks (`--no-verify`). Fix the underlying issue instead.
+
 ## Monorepo Structure
 
 Rocky is a monorepo with four subprojects:

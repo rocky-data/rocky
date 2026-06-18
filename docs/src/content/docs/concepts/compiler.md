@@ -12,7 +12,40 @@ Rocky includes a full compiler (`rocky-compiler` crate) that performs static ana
 The compiler runs five stages in sequence:
 
 ```
-Load models → Resolve dependencies → Build semantic graph → Type check → Validate contracts
+ ┌──────────────────────────────────────┐
+ │  .sql files   .toml sidecars         │
+ │  .rocky files  contracts/*.toml      │
+ └───────────────────┬──────────────────┘
+                     │
+          ┌──────────▼──────────┐
+          │   1. Load models    │   parse SQL + TOML from disk
+          └──────────┬──────────┘
+                     │
+          ┌──────────▼──────────┐
+          │ 2. Resolve deps     │   bare name → DAG edge
+          │    (build DAG)      │   schema.table → external ref
+          └──────────┬──────────┘
+                     │
+          ┌──────────▼──────────┐
+          │ 3. Semantic graph   │   track column lineage across DAG
+          │    (column lineage) │   a.id ──Direct──▶ b.id
+          └──────────┬──────────┘
+                     │
+          ┌──────────▼──────────┐
+          │  4. Type check      │   propagate types through graph
+          │                     │   INT + FLOAT → FLOAT
+          │                     │   String + INT → E001 error
+          └──────────┬──────────┘
+                     │
+          ┌──────────▼──────────┐
+          │ 5. Validate         │   required columns present?
+          │    contracts        │   types match declarations?
+          └──────────┬──────────┘
+                     │
+          ┌──────────▼──────────┐
+          │  CompileResult      │   models, diagnostics,
+          │                     │   semantic_graph, timings
+          └─────────────────────┘
 ```
 
 ### 1. Load models
@@ -62,6 +95,17 @@ Each model receives a typed schema: a list of `TypedColumn` entries with name, `
 
 If a contracts directory exists, `.contract.toml` files are loaded and validated against the inferred schemas. See the [Testing and Contracts](/concepts/testing) page for details on the contract format.
 
+## Diagnostic format
+
+Diagnostics render in a format inspired by `rustc`, with machine-readable codes and actionable suggestions:
+
+```
+error[E011]: column 'id' type mismatch: contract expects Int64, got String
+ --> models/orders.sql:3:8
+ in model: orders_summary
+ = help: add CAST(id AS BIGINT) to fix the type
+```
+
 ## The type system
 
 `RockyType` is Rocky's unified type representation. All warehouse-specific types map to and from `RockyType` via a `TypeMapper` trait, so the compiler works identically regardless of the target warehouse.
@@ -98,6 +142,19 @@ Incompatible types (e.g., `String` + `Int64`) produce an error diagnostic.
 The `is_assignable` function determines whether a value of one type can be written to a column of another type. It allows widening conversions (e.g., `Int32` into `Int64`) but rejects narrowing conversions (e.g., `Int64` into `Int32`).
 
 ## Semantic graph
+
+The semantic graph is a cross-model column lineage map. It tracks every column's origin and transformation kind through the entire DAG.
+
+```
+raw_orders                  orders_enriched              orders_summary
+──────────                  ───────────────              ──────────────
+order_id  ──[Direct]──────▶ order_id  ──[Direct]───────▶ order_id
+amount    ──[Cast:DECIMAL]─▶ amount   ──[Agg:SUM]────────▶ total
+customer_id──[Direct]──────▶ customer_id
+                            region    ◀──[Direct]── raw_customers.region
+```
+
+The graph is built in topological order, so downstream models always see the full column list of their upstreams (including `SELECT *` expansions).
 
 The semantic graph is the foundation for several compiler features:
 
