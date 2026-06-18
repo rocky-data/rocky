@@ -6148,6 +6148,74 @@ mod tests {
         );
     }
 
+    /// F1 golden: pin the **on-disk state-schema format** — the schema version
+    /// plus the exact set of redb tables a fresh store materializes.
+    ///
+    /// The `state.redb` file is persisted and shared across pods (see
+    /// `state_sync`), so its layout is a compatibility contract. `init_db`
+    /// eagerly creates every table, so a fresh store's `list_tables()` is the
+    /// authoritative on-disk table set. Adding, removing, or renaming a table
+    /// — or bumping `CURRENT_SCHEMA_VERSION` — must be a deliberate, reviewed
+    /// change paired with the version-mismatch migration story (the
+    /// `open_with_policy_*` tests above). This test fails on any such change
+    /// until the golden below is updated **in the same PR**, making "no silent
+    /// breaking change to the consumed state format" mechanically true.
+    #[test]
+    fn on_disk_state_schema_format_is_pinned() {
+        use redb::TableHandle;
+
+        // The pinned format contract. Update DELIBERATELY: a table-set change
+        // is an on-disk break that needs a `CURRENT_SCHEMA_VERSION` bump + a
+        // migration path, not just an edit here.
+        const EXPECTED_VERSION: u32 = 9;
+        const EXPECTED_TABLES: &[&str] = &[
+            "branches",
+            "check_history",
+            "dag_snapshots",
+            "discover_snapshots",
+            "grace_periods",
+            "idempotency_keys",
+            "input_index",
+            "input_provenance",
+            "loaded_files",
+            "metadata",
+            "output_artifacts",
+            "partitions",
+            "quality_history",
+            "run_history",
+            "run_progress",
+            "run_progress_entries",
+            "schema_cache",
+            "watermarks",
+        ];
+
+        assert_eq!(
+            CURRENT_SCHEMA_VERSION, EXPECTED_VERSION,
+            "the on-disk state schema version changed. Update EXPECTED_VERSION here, and \
+             confirm the version-mismatch migration path (open_with_policy_* tests) handles \
+             the bump, in the same PR."
+        );
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+        let txn = store.db.begin_read().unwrap();
+        let mut actual: Vec<String> = txn
+            .list_tables()
+            .unwrap()
+            .map(|t| t.name().to_string())
+            .collect();
+        actual.sort_unstable();
+
+        assert_eq!(
+            actual, EXPECTED_TABLES,
+            "the on-disk state table set changed: a fresh `StateStore` now materializes a \
+             different set of redb tables than the pinned format contract. If intentional, \
+             update EXPECTED_TABLES (and bump CURRENT_SCHEMA_VERSION + add the migration) in \
+             the same PR."
+        );
+    }
+
     // -----------------------------------------------------------------------
     // VACUUM refcount (Phase 6) — refcount_for_hash + partition_vacuum_candidates
     // -----------------------------------------------------------------------
