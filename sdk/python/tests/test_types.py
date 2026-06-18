@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from rocky_sdk import DiscoverResult, parse_rocky_output
+from rocky_sdk import CompileResult, DiscoverResult, parse_rocky_output
 from rocky_sdk.client import _parse_rocky_json, _parse_run_or_apply
 from rocky_sdk.exceptions import RockyOutputParseError
 
@@ -17,6 +17,34 @@ def test_parse_rocky_output_dispatches_discover():
     result = parse_rocky_output(DISCOVER_JSON)
     assert isinstance(result, DiscoverResult)
     assert result.sources == []
+
+
+def test_parse_compile_surfaces_model_governance_tags():
+    # A model's resolved [tags] (own + inherited from its config group) ride
+    # on `models_detail[].tags` — the seam dagster-rocky reads to project
+    # governance tags onto the derived asset.
+    payload = (
+        '{"version": "1.0.0", "command": "compile", "models": 1, '
+        '"execution_layers": 1, "diagnostics": [], "has_errors": false, '
+        '"models_detail": [{"name": "fct_orders", '
+        '"strategy": {"type": "full_refresh"}, '
+        '"target": {"catalog": "wh", "schema": "mart_emea", "table": "fct_orders"}, '
+        '"tags": {"domain": "finance", "tier": "silver"}}]}'
+    )
+    result = parse_rocky_output(payload)
+    assert isinstance(result, CompileResult)
+    assert result.models_detail[0].tags == {"domain": "finance", "tier": "silver"}
+
+
+def test_parse_compile_model_without_tags_defaults_none():
+    payload = (
+        '{"version": "1.0.0", "command": "compile", "models": 1, '
+        '"execution_layers": 1, "diagnostics": [], "has_errors": false, '
+        '"models_detail": [{"name": "stg", "strategy": {"type": "full_refresh"}, '
+        '"target": {"catalog": "wh", "schema": "s", "table": "stg"}}]}'
+    )
+    result = parse_rocky_output(payload)
+    assert result.models_detail[0].tags is None
 
 
 def test_parse_rocky_output_rejects_non_object():

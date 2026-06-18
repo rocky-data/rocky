@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Model-level `[tags]`, inheritable from config groups.** A model can declare a `[tags]` block of free-form governance attributes (`domain`, `tier`, `owner`, …), and a config group can declare `[tags]` that every member inherits as a shared baseline — a model's own tags override the group per key (sidecar > group). Resolved tags are surfaced on `rocky compile --output json` as `models_detail[].tags`, where orchestrators can read them. Merged at the shared `.sql` / `.rocky` resolution path so both model formats inherit. (#920)
+
 ## [1.51.1] — 2026-06-14
 
 ### Security

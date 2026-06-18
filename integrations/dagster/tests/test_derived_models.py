@@ -30,12 +30,14 @@ def _model(
     target: dict[str, str] | None = None,
     freshness: ModelFreshnessConfig | None = None,
     depends_on: list[str] | None = None,
+    tags: dict[str, str] | None = None,
 ) -> ModelDetail:
     detail = ModelDetail(
         name=name,
         strategy=strategy or {"type": "full_refresh"},
         target=target or {"catalog": "warehouse", "schema": "marts", "table": name},
         freshness=freshness,
+        tags=tags,
     )
     # depends_on isn't a field on ModelDetail; the helper reads it via
     # getattr so a custom attribute on the dict is fine for tests. We
@@ -185,6 +187,68 @@ def test_build_model_specs_kinds_includes_rocky_and_model():
 
     assert "rocky" in specs[0].kinds
     assert "model" in specs[0].kinds
+
+
+def test_build_model_specs_projects_governance_tags():
+    # Governance tags (from the model's [tags], inherited from its config
+    # group) land as first-class Dagster tags alongside the synthesized
+    # rocky/* metadata — the engine→orchestrator end of the C4 fan-out.
+    result = _compile_result(
+        _model("orders", tags={"domain": "finance", "tier": "gold"}),
+    )
+    specs = build_model_specs(result, translator=RockyDagsterTranslator())
+
+    assert specs[0].tags["domain"] == "finance"
+    assert specs[0].tags["tier"] == "gold"
+    # synthesized metadata still present and untouched
+    assert specs[0].tags["rocky/model_name"] == "orders"
+
+
+def test_build_model_specs_no_tags_when_model_has_none():
+    result = _compile_result(_model("orders"))
+    specs = build_model_specs(result, translator=RockyDagsterTranslator())
+
+    # only the synthesized rocky/* tags, no governance keys
+    assert all("/" in k for k in specs[0].tags)
+
+
+def test_get_model_tags_sanitizes_keys_and_cannot_clobber_metadata():
+    translator = RockyDagsterTranslator()
+    # A `/` in a governance key would be a second namespace separator (invalid
+    # for Dagster) and could otherwise impersonate a synthesized rocky/* tag;
+    # whitespace is also disallowed. Both collapse to `_`, so the resulting
+    # key can never equal a synthesized `rocky/...` key.
+    model = _model(
+        "orders",
+        tags={"rocky/model_name": "hijack", "cost center": "kpi", "": "dropped"},
+    )
+    tags = translator.get_model_tags(model)
+
+    assert tags["rocky/model_name"] == "orders"  # synthesized wins, not "hijack"
+    assert tags["rocky_model_name"] == "hijack"  # the sanitized governance key
+    assert tags["cost_center"] == "kpi"
+    assert "" not in tags  # empty key dropped
+
+
+def test_build_model_specs_gnarly_tag_keys_pass_dagster_validation():
+    # The real test of sanitization: Dagster validates tag keys at AssetSpec
+    # construction (charset [A-Za-z0-9_.-], ≤63 chars, no second `/`). Push
+    # keys that would be rejected raw — whitespace, an extra slash, an
+    # over-long key — through build_model_specs and prove they're accepted,
+    # not just that our regex produced what we expected.
+    long_key = "x" * 100
+    result = _compile_result(
+        _model(
+            "orders",
+            tags={"cost center": "kpi", "a/b/c": "v", long_key: "w"},
+        ),
+    )
+    # Would raise DagsterInvalidDefinitionError here if any key were invalid.
+    specs = build_model_specs(result, translator=RockyDagsterTranslator())
+
+    assert specs[0].tags["cost_center"] == "kpi"
+    assert specs[0].tags["a_b_c"] == "v"
+    assert all(len(k) <= 63 for k in specs[0].tags)
 
 
 # ---------------------------------------------------------------------------

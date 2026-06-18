@@ -527,6 +527,12 @@ class ModelDetail(BaseModel):
     strategy: dict[str, object]
     target: dict[str, str]
     freshness: ModelFreshnessConfig | None = None
+    #: Model-level governance tags — the model's own ``[tags]`` block merged
+    #: over any config-group ``[tags]`` baseline (sidecar > group). Free-form
+    #: ``{key: value}`` strings describing the model as a whole (``domain``,
+    #: ``tier``, ``owner``, …). ``None`` when none are declared. ``dagster-rocky``
+    #: projects these onto the derived asset's Dagster tags.
+    tags: dict[str, str] | None = None
 
 
 class CompileResult(BaseModel):
