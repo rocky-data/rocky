@@ -67,6 +67,11 @@ pub enum ModelError {
     },
 
     #[error(
+        "model '{model}' supplies [args] for config group '{group}'s schema_template but also pins its own target.schema; the pin overrides the template, so the [args] are dead. Remove the pinned schema to route via [args], or remove [args] if the pinned schema is intended."
+    )]
+    GroupArgsWithPinnedSchema { model: String, group: String },
+
+    #[error(
         "model '{model}' references unknown named test '{name}' (expected a [{name}] entry in test_definitions.toml)"
     )]
     UnknownTest { model: String, name: String },
@@ -928,6 +933,31 @@ fn resolve_model_config(
         }
     }
 
+    // Misplacement guard (C5): `[args]` exist solely to fill a group's
+    // `schema_template`. If a member also pins its own `target.schema`, the pin
+    // wins (sidecar > group) and the `[args]` become dead — an incoherent
+    // config that usually means the author believes `[args]` is routing the
+    // model when the pin actually sends it elsewhere. Hard-error regardless of
+    // `enforce` (this is a coherence check, not enforcement): an enforced group
+    // already rejects the pin above, so this only adds the non-enforced case. A
+    // legitimate non-enforced override pins a schema with NO `[args]`, which
+    // stays allowed. (`[args]` is template-only; if a future feature consumes
+    // args elsewhere, revisit this guard.)
+    if let Some(g) = group
+        && g.schema_template.is_some()
+        && !raw.args.is_empty()
+        && raw
+            .target
+            .as_ref()
+            .and_then(|t| t.schema.as_ref())
+            .is_some()
+    {
+        return Err(ModelError::GroupArgsWithPinnedSchema {
+            model: name.clone(),
+            group: raw.group.as_deref().unwrap_or_default().to_string(),
+        });
+    }
+
     // Precedence: per-model sidecar > group > directory defaults.
     let strategy = raw
         .strategy
@@ -962,14 +992,25 @@ fn resolve_model_config(
     // Group routing: when the sidecar doesn't pin a schema, fall back to the
     // group's `schema_template` (filled from the model's `args`) before the
     // directory default — keeping the sidecar > group > defaults precedence.
-    let group_schema = match group.and_then(|g| g.schema_template.as_deref()) {
-        Some(template) => Some(resolve_group_schema(
-            template,
-            &raw.args,
-            &name,
-            raw.group.as_deref().unwrap_or_default(),
-        )?),
-        None => None,
+    //
+    // Resolution is lazy: a model that pins its own `target.schema` overrides
+    // the group, so the template is skipped entirely. This keeps a legitimate
+    // pin-without-args override from erroring on an unfilled placeholder for a
+    // template it never uses. (Pin *with* `[args]` is rejected by the
+    // misplacement guard above; this branch handles the allowed pin-without-args
+    // case and the no-pin routing case.)
+    let group_schema = if raw_target.schema.is_some() {
+        None
+    } else {
+        match group.and_then(|g| g.schema_template.as_deref()) {
+            Some(template) => Some(resolve_group_schema(
+                template,
+                &raw.args,
+                &name,
+                raw.group.as_deref().unwrap_or_default(),
+            )?),
+            None => None,
+        }
     };
     let schema = raw_target
         .schema
@@ -2966,7 +3007,10 @@ columns = ["order_id"]
         std::fs::write(
             dir.path().join("orders.toml"),
             // Sidecar pins both schema and strategy — the group must not override.
-            "group = \"daily_marts\"\n\n[target]\ncatalog = \"wh\"\nschema = \"custom\"\n\n[args]\nregion = \"emea\"\n\n[strategy]\ntype = \"full_refresh\"\n",
+            // No `[args]`: pinning the schema is a legitimate override, but pairing
+            // it with `[args]` would trip the misplacement guard (the args could
+            // only fill the now-bypassed template).
+            "group = \"daily_marts\"\n\n[target]\ncatalog = \"wh\"\nschema = \"custom\"\n\n[strategy]\ntype = \"full_refresh\"\n",
         )
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
@@ -3158,7 +3202,8 @@ columns = ["order_id"]
         let m = &load_models_from_dir(dir.path()).unwrap()[0];
         assert_eq!(m.config.target.schema, "mart_emea");
 
-        // The same override under a NON-enforced group is allowed.
+        // The same override under a NON-enforced group is allowed (pin a schema
+        // with no `[args]` — the template is bypassed, not filled).
         let dir2 = tempfile::tempdir().unwrap();
         write_group(
             dir2.path(),
@@ -3167,7 +3212,7 @@ columns = ["order_id"]
         );
         std::fs::write(
             dir2.path().join("orders.toml"),
-            "group = \"flexible\"\n\n[target]\ncatalog = \"wh\"\nschema = \"escape\"\n\n[args]\nregion = \"emea\"\n",
+            "group = \"flexible\"\n\n[target]\ncatalog = \"wh\"\nschema = \"escape\"\n",
         )
         .unwrap();
         std::fs::write(dir2.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
@@ -3175,6 +3220,52 @@ columns = ["order_id"]
         assert_eq!(
             m2.config.target.schema, "escape",
             "non-enforced group allows override"
+        );
+    }
+
+    /// C5 misplacement guard: a group member that supplies `[args]` (which only
+    /// fill the group's `schema_template`) AND pins its own `target.schema` is
+    /// an incoherent config — the pin bypasses the template, leaving the args
+    /// dead. It is a hard error regardless of `enforce`.
+    #[test]
+    fn group_args_with_pinned_schema_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        // Non-enforced group with a placeholder template.
+        write_group(dir.path(), "marts", "schema_template = \"mart_{region}\"\n");
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            // Pins schema AND supplies args → the args can never route anything.
+            "group = \"marts\"\n\n[target]\ncatalog = \"wh\"\nschema = \"escape\"\n\n[args]\nregion = \"emea\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
+
+        let err = load_models_from_dir(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ModelError::GroupArgsWithPinnedSchema { ref model, ref group }
+                if model == "orders" && group == "marts"),
+            "got {err:?}"
+        );
+    }
+
+    /// The allowed companion to the guard: a group member may pin its own schema
+    /// as long as it supplies no `[args]` — the placeholder template is bypassed
+    /// (and never resolved), so an unfilled `{region}` is not an error.
+    #[test]
+    fn group_member_pins_schema_without_args_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_group(dir.path(), "marts", "schema_template = \"mart_{region}\"\n");
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "group = \"marts\"\n\n[target]\ncatalog = \"wh\"\nschema = \"escape\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
+
+        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        assert_eq!(
+            m.config.target.schema, "escape",
+            "a pin without args overrides the group, bypassing the template"
         );
     }
 
