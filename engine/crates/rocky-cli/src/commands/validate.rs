@@ -1533,6 +1533,7 @@ schema_template = "demo"
                 format: None,
                 format_options: None,
                 classification: Default::default(),
+                tags: Default::default(),
                 retention: None,
                 budget: None,
                 skip: None,
@@ -1592,6 +1593,7 @@ target.adapter = "default"
                 format: None,
                 format_options: None,
                 classification: Default::default(),
+                tags: Default::default(),
                 retention: None,
                 budget: None,
                 // Declared literally — same value as `name_declared`.

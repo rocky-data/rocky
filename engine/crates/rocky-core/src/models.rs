@@ -145,6 +145,27 @@ pub struct ModelConfig {
     /// [`GovernanceAdapter`]: crate::traits::GovernanceAdapter
     #[serde(default)]
     pub classification: std::collections::BTreeMap<String, String>,
+    /// Model-level governance tags. Keys and values are free-form strings
+    /// parsed from a `[tags]` sidecar block:
+    ///
+    /// ```toml
+    /// name = "fct_orders"
+    ///
+    /// [tags]
+    /// domain = "finance"
+    /// tier = "gold"
+    /// ```
+    ///
+    /// Unlike [`classification`](ModelConfig::classification) (which is keyed
+    /// by *column* and drives masking), these describe the model as a whole.
+    /// A model that opts into a config [`GroupConfig`] inherits the group's
+    /// `[tags]` as a shared baseline; the model's own `[tags]` override per
+    /// key (sidecar > group), mirroring the schema/strategy precedence.
+    /// Surfaced on the `rocky compile` JSON output (`ModelDetail.tags`) so
+    /// orchestrators (`dagster-rocky` projects them onto the asset's Dagster
+    /// tags) can see the governed fan-out end-to-end.
+    #[serde(default)]
+    pub tags: std::collections::BTreeMap<String, String>,
     /// Declarative data-retention policy for this model. Parsed from the
     /// `retention` sidecar key:
     ///
@@ -431,6 +452,11 @@ pub struct RawModelConfig {
     /// block. See [`ModelConfig::classification`].
     #[serde(default)]
     pub classification: std::collections::BTreeMap<String, String>,
+    /// Model-level governance tags from the `[tags]` sidecar block. Merged
+    /// over any group-declared tags in [`resolve_model_config`]. See
+    /// [`ModelConfig::tags`].
+    #[serde(default)]
+    pub tags: std::collections::BTreeMap<String, String>,
     /// Raw retention string from the `retention` sidecar key. Parsed into
     /// [`RetentionPolicy`] by [`resolve_model_config`]. Kept as
     /// `Option<String>` at the toml layer so parse errors surface as
@@ -613,6 +639,14 @@ pub struct GroupConfig {
     /// Shared materialization strategy for every model in the group.
     #[serde(default)]
     pub strategy: Option<StrategyConfig>,
+    /// Governance tags applied to every model in the group as a shared
+    /// baseline. A member model's own `[tags]` override per key
+    /// (sidecar > group). This is how a group makes its whole fan-out
+    /// uniformly attributable — `[tags] domain = "finance"` once on the group
+    /// tags every member model, and `dagster-rocky` projects them onto each
+    /// asset. See [`ModelConfig::tags`].
+    #[serde(default)]
+    pub tags: std::collections::BTreeMap<String, String>,
     /// When `true`, the group's fields are **enforced**, not just defaulted: a
     /// member model that locally pins a field the group also sets (its target
     /// `schema`, or its `strategy`) fails the load with
@@ -857,6 +891,13 @@ fn resolve_model_config(
     let mut tests = raw.tests;
     tests.extend(resolve_test_refs(&raw.use_test, ctx.test_defs, &name)?);
 
+    // Governance tags: the group's `[tags]` are the shared baseline; the
+    // model's own `[tags]` override per key (sidecar > group), mirroring the
+    // schema/strategy precedence. `extend` lets a member tag a sibling-shared
+    // key with its own value without dropping the rest of the group's tags.
+    let mut tags = group.map(|g| g.tags.clone()).unwrap_or_default();
+    tags.extend(raw.tags);
+
     // Enforcement: when the group sets `enforce = true`, a member model may not
     // locally override a field the group controls. Checked here, before the
     // fields are consumed by the resolution chain below, using sidecar
@@ -978,6 +1019,7 @@ fn resolve_model_config(
         format: raw.format,
         format_options: raw.format_options,
         classification: raw.classification,
+        tags,
         retention,
         budget: raw.budget,
         skip: raw.skip,
@@ -2960,6 +3002,59 @@ columns = ["order_id"]
             "group strategy must override the directory default"
         );
         assert_eq!(m.config.target.schema, "fallback");
+    }
+
+    /// A config group's `[tags]` are inherited by every member as a shared
+    /// baseline; the member's own `[tags]` override per key (sidecar > group)
+    /// without dropping the rest of the group's tags.
+    #[test]
+    fn group_tags_inherited_and_model_tags_override() {
+        let dir = tempfile::tempdir().unwrap();
+        write_group(
+            dir.path(),
+            "finance",
+            "[tags]\ndomain = \"finance\"\ntier = \"gold\"\n",
+        );
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            // Overrides `tier`, adds `owner`, leaves `domain` to the group.
+            "group = \"finance\"\n\n[target]\ncatalog = \"wh\"\nschema = \"s\"\n\n\
+             [tags]\ntier = \"silver\"\nowner = \"data-eng\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT id FROM upstream").unwrap();
+
+        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        assert_eq!(
+            m.config.tags.get("domain").map(String::as_str),
+            Some("finance")
+        );
+        assert_eq!(
+            m.config.tags.get("tier").map(String::as_str),
+            Some("silver")
+        );
+        assert_eq!(
+            m.config.tags.get("owner").map(String::as_str),
+            Some("data-eng")
+        );
+    }
+
+    /// A model with its own `[tags]` and no group resolves them verbatim.
+    #[test]
+    fn model_tags_without_group() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("orders.toml"),
+            "[target]\ncatalog = \"wh\"\nschema = \"s\"\n\n[tags]\nowner = \"data-eng\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("orders.sql"), "SELECT id FROM upstream").unwrap();
+
+        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        assert_eq!(
+            m.config.tags.get("owner").map(String::as_str),
+            Some("data-eng")
+        );
     }
 
     /// An unknown `group` reference is a hard error (typo protection).

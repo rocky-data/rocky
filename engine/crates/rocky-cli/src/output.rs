@@ -1400,6 +1400,14 @@ pub struct ModelDetail {
     /// references. Empty when the model has no upstream dependencies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// Model-level governance tags — the model's own `[tags]` block merged
+    /// over any config-group `[tags]` baseline (sidecar > group). Free-form
+    /// key/value strings describing the model as a whole (`domain`, `tier`,
+    /// `owner`, …). `dagster-rocky` projects these onto the derived asset's
+    /// Dagster tags, so a governed fan-out declared once on a config group is
+    /// visible to the orchestrator end-to-end. Empty when none are declared.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tags: std::collections::BTreeMap<String, String>,
 }
 
 /// Heuristic cost estimate derived from DAG-aware cardinality propagation.

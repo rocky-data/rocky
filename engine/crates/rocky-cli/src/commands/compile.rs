@@ -307,6 +307,7 @@ fn compile_inner(
                 incrementality_hint,
                 cost_hint,
                 depends_on: model.config.depends_on.clone(),
+                tags: model.config.tags.clone(),
             }
         })
         .collect();

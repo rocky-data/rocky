@@ -444,6 +444,10 @@ class ModelDetail(BaseModel):
     """
     Materialization strategy as the wire-shape `StrategyConfig` (`{"type": "...", ...}`).
     """
+    tags: dict[str, str] | None = None
+    """
+    Model-level governance tags — the model's own `[tags]` block merged over any config-group `[tags]` baseline (sidecar > group). Free-form key/value strings describing the model as a whole (`domain`, `tier`, `owner`, …). `dagster-rocky` projects these onto the derived asset's Dagster tags, so a governed fan-out declared once on a config group is visible to the orchestrator end-to-end. Empty when none are declared.
+    """
     target: TargetConfig
     """
     Target table coordinates.
