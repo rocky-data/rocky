@@ -9,7 +9,7 @@ Rocky includes a full compiler (`rocky-compiler` crate) that performs static ana
 
 ## Compile pipeline
 
-The compiler runs five stages in sequence:
+The compiler runs as a sequence of stages. The first five do the core work (load, resolve, build the graph, type-check, validate contracts); three more lint passes run afterward, before the diagnostics are merged into the result:
 
 ```
  ┌──────────────────────────────────────┐
@@ -43,6 +43,12 @@ The compiler runs five stages in sequence:
           └──────────┬──────────┘
                      │
           ┌──────────▼──────────┐
+          │ 6. Lint passes      │   blast-radius (P002),
+          │    + merge          │   classification (W004),
+          │                     │   freshness (W005)
+          └──────────┬──────────┘
+                     │
+          ┌──────────▼──────────┐
           │  CompileResult      │   models, diagnostics,
           │                     │   semantic_graph, timings
           └─────────────────────┘
@@ -64,16 +70,7 @@ Explicit `depends_on` entries in the model config are merged with auto-resolved 
 
 ### 3. Build semantic graph
 
-The semantic graph is a cross-DAG column lineage map. It tracks which source columns flow through which models to which final outputs.
-
-For each model (processed in topological order), the compiler:
-
-- Extracts column-level lineage from the SQL AST
-- Resolves table aliases to real model or source names
-- Records lineage edges with transform types (Direct, Cast, Expression, Aggregation)
-- Expands `SELECT *` by inheriting columns from upstream models or known source schemas
-
-The result is a `SemanticGraph` containing per-model schemas, upstream/downstream relationships, and all cross-model lineage edges.
+Walking each model in topological order, the compiler extracts column-level lineage from the SQL AST, resolves table aliases to real model or source names, and expands `SELECT *` against upstream schemas. The result is a `SemanticGraph` of per-model schemas, upstream/downstream relationships, and cross-model lineage edges. The [Semantic graph](#semantic-graph) section below covers it in detail.
 
 ### 4. Type check
 
@@ -95,16 +92,9 @@ Each model receives a typed schema: a list of `TypedColumn` entries with name, `
 
 If a contracts directory exists, `.contract.toml` files are loaded and validated against the inferred schemas. See the [Testing and Contracts](/concepts/testing) page for details on the contract format.
 
-## Diagnostic format
+### 6. Lint passes and merge
 
-Diagnostics render in a format inspired by `rustc`, with machine-readable codes and actionable suggestions:
-
-```
-error[E011]: column 'id' type mismatch: contract expects Int64, got String
- --> models/orders.sql:3:8
- in model: orders_summary
- = help: add CAST(id AS BIGINT) to fix the type
-```
+After contract validation, three always-on lint passes run against the typed models. The blast-radius lint (`P002`) flags a `SELECT *` model whose downstream consumers read specific columns. The classification-tag check (`W004`) flags a `[classification]` tag with no matching `[mask]` strategy. The freshness-coverage check (`W005`) flags a model with temporal columns but no `freshness` declaration in scope. Their diagnostics are merged with the type-checker and contract diagnostics into the final `CompileResult`.
 
 ## The type system
 
@@ -189,14 +179,27 @@ The compiler produces structured diagnostics with codes, severity levels, source
 
 | Code | Meaning |
 |------|---------|
-| `E001`--`E009` | Type checking errors (type mismatch, incompatible join keys) |
+| `E001` | Type-checking error (unresolved reference, type mismatch) |
 | `E010` | Required column missing from model output |
 | `E011` | Column type mismatch against contract |
 | `E012` | Nullability violation against contract |
 | `E013` | Protected column removed |
-| `W001`--`W009` | Type checking warnings |
-| `W010` | Contract column not found in model output |
-| `W011` | Contract exists for unknown model |
+| `E020`--`E026` | `time_interval` validation (`@start_date`/`@end_date` placeholders, `time_column` presence/type/nullability/granularity) |
+| `E027` | Budget exceeded -- projected spend over the model's `[budget]` ceiling |
+| `E030` | Imported producer dropped a column this project reads (cross-team contract) |
+| `E033` | Imported snapshot's recipe hash does not match the configured `pin` |
+| `W001` | Unused model (no downstream consumers) |
+| `W002` | Duplicate column in model output |
+| `W003` | `time_column` is TIMESTAMP where DATE is preferred for the granularity |
+| `W004` | Classification tag with no matching `[mask]` strategy |
+| `W005` | Temporal column present but no `freshness` declaration in scope |
+| `W010` | Contract defines a column not in model output (not required) |
+| `W011` | Contract exists for a model not found in the project |
+| `W012` | An `[imports.<name>]` snapshot could not be loaded; `E030`/`E033` checks skipped |
+| `I001` | Model dependency inferred from SQL |
+| `I002` | Model compiled with `SELECT *` |
+| `P001` | Construct not portable to the target dialect (opt-in via `--target-dialect`) |
+| `P002` | `SELECT *` model has downstream consumers that read specific columns |
 
 ### Format
 
