@@ -83,7 +83,7 @@ This avoids rebuilding a VSIX on every change. Run `npm run compile` after editi
 
 ## 2. Configure the Rocky Binary Path
 
-The extension launches the Rocky language server by running `rocky lsp`. By default, it looks for `rocky` on your `PATH`. If Rocky is installed elsewhere, configure the path:
+The extension runs the Rocky language server. It prefers a standalone `rocky-lsp` binary when one is available (the install scripts place `rocky-lsp` next to `rocky`), and otherwise falls back to running `rocky lsp`. By default it resolves both from your `PATH`. If Rocky is installed elsewhere, configure the path:
 
 1. Open VS Code Settings (**Cmd+,** / **Ctrl+,**)
 2. Search for `rocky.server.path`

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The installers now also install the standalone `rocky-lsp` binary** next to `rocky`, and the Windows installer replaces an in-use `rocky.exe` (rename-then-replace) instead of failing the overwrite. The VS Code extension prefers `rocky-lsp` for the language server, so updating `rocky` no longer fails because the editor is running it. (#931)
+
 ## [1.52.0] — 2026-06-19
 
 ### Added
