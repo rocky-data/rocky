@@ -1,0 +1,15 @@
+# Member 1 — OVERRIDES one tag, inherits the rest.
+#
+# Joins the `finance` group, so it inherits the group's [tags] baseline
+# (domain = "finance", tier = "silver") and its [strategy].
+#
+# Its own [tags] pins tier = "gold". The merge is PER KEY: tier is overridden,
+# but domain = "finance" is still inherited from the group — the override does
+# NOT replace the whole tag set.
+#
+# Resolved tags: domain = "finance", tier = "gold".
+
+group = "finance"
+
+[tags]
+tier = "gold"

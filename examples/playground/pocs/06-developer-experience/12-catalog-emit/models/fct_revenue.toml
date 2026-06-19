@@ -1,2 +1,13 @@
 [strategy]
 type = "full_refresh"
+
+# Per-column documentation. Each [columns.<name>] table attaches a description
+# to one *projected* output column. fct_revenue projects the aliases
+# customer_id, total, orders — NOT the raw inputs amount/order_id (those are
+# aggregated away), so the keys below are the SUM/COUNT result columns. A
+# description keyed to a column the SELECT does not produce is silently dropped.
+[columns.total]
+description = "Completed revenue per customer (SUM of order amount, cancelled orders excluded)."
+
+[columns.orders]
+description = "Count of completed orders per customer (COUNT of order_id)."

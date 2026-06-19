@@ -1,0 +1,8 @@
+# Directory-level target defaults.
+#
+# Both members share one catalog + schema and differ only by table name
+# (the filename stem). This POC is about tag inheritance, not routing — so the
+# target is kept deliberately uniform across the group.
+[target]
+catalog = "warehouse"
+schema = "marts"

@@ -1,0 +1,17 @@
+# ENFORCED config group.
+#
+# `enforce = true` makes the group's fields BINDING, not just defaults. A
+# member may still supply its own [args] and any field the group doesn't set
+# (like target.catalog) — it just cannot override what the group OWNS
+# (target.schema, strategy). Use this when a set of models must share routing
+# and materialization as a governance guarantee.
+
+enforce = true
+schema_template = "mart_{region}"
+
+[strategy]
+type = "full_refresh"
+
+[tags]
+domain = "finance"
+tier = "gold"

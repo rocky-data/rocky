@@ -1,0 +1,20 @@
+# Config group: daily_marts
+#
+# Defined ONCE; every member opts in with `group = "daily_marts"`.
+#   * schema_template — each member fills {region} from its own [args],
+#     so the fan-out lands in distinct schemas (mart_emea, mart_us_west, …).
+#   * [strategy]      — one shared materialization for the whole group.
+#   * [tags]          — a governance baseline inherited by every member.
+#
+# This group is an overridable DEFAULT (no `enforce`): a member may still
+# pin its own schema/strategy. The enforced sibling under broken/ shows the
+# governance-guarantee variant.
+
+schema_template = "mart_{region}"
+
+[strategy]
+type = "full_refresh"
+
+[tags]
+domain = "sales"
+tier = "gold"

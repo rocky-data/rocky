@@ -1,0 +1,16 @@
+# Config group: finance
+#
+# This group exists purely to carry a governance baseline — no schema_template,
+# no fan-out routing (see 00-foundations/14-config-groups for that). It supplies:
+#   * [tags]     — a governance baseline (domain + tier) inherited by every member.
+#   * [strategy] — one shared materialization for the whole group.
+#
+# Every member opts in with `group = "finance"`. A member's own [tags] override
+# the group PER KEY (sidecar > group) without dropping the rest of the baseline.
+
+[tags]
+domain = "finance"
+tier = "silver"
+
+[strategy]
+type = "full_refresh"

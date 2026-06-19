@@ -1,0 +1,20 @@
+# 09-named-tests — reusable named tests applied across models via [[use_test]]
+#
+# A transformation pipeline that materializes two marts into poc.demo on
+# DuckDB, so the declarative [[tests]] / [[use_test]] assertions have real
+# tables to run against — no warehouse credentials required.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+type = "transformation"
+models = "models/**"
+
+[pipeline.poc.target]
+
+# Lets `rocky run` auto-create poc.demo on first invocation so the POC needs
+# no manual `CREATE SCHEMA` step.
+[pipeline.poc.target.governance]
+auto_create_schemas = true

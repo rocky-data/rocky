@@ -5,7 +5,7 @@
 > **Category:** 06-developer-experience
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 5s
-> **Rocky features:** `rocky catalog`, `--format json|parquet|both`, `--out`, state-store enrichment
+> **Rocky features:** `rocky catalog`, `--format json|parquet|both`, `--out`, state-store enrichment, per-column docs (`[columns.<name>]` → `CatalogColumn.description`)
 
 ## What it shows
 
@@ -17,7 +17,8 @@ self-contained, machine-consumable lineage artefact under
   `last_run_id`, an `assets[]` array (one per model with its columns +
   upstream/downstream models), and an `edges[]` array of column-level
   lineage edges including transform kind (`direct`, `aggregation: sum`,
-  …) and confidence.
+  …) and confidence. Each asset column carries a `description` field when
+  the model's sidecar documents it via a `[columns.<name>]` table.
 - `edges.parquet` — flat table of column-lineage edges. Any Parquet
   reader (DuckDB, Polars, Spark, BigQuery external table, Athena…) can
   query it without going through the engine.
@@ -36,6 +37,11 @@ self-contained, machine-consumable lineage artefact under
   table-to-table edges only.
 - **No engine on the read path.** Once the catalog is written, lineage
   consumers (Looker, Superset, custom dashboards) read Parquet directly.
+- **Per-column docs ride along.** A `[columns.<name>]` table in a model's
+  sidecar attaches a description to one *projected* output column, and it
+  surfaces as `CatalogColumn.description` in `rocky catalog --output json`.
+  A description keyed to a column the SELECT doesn't produce is silently
+  dropped, so the keys stay honest about the real output schema.
 
 ## Layout
 
@@ -49,7 +55,8 @@ self-contained, machine-consumable lineage artefact under
     ├── _defaults.toml      catalog=poc, schema=demo
     ├── raw_orders.sql      SELECT … FROM raw__orders.orders
     ├── stg_orders.sql      filter cancelled
-    └── fct_revenue.sql     group by customer_id → SUM(amount), COUNT(order_id)
+    ├── fct_revenue.sql     group by customer_id → SUM(amount), COUNT(order_id)
+    └── fct_revenue.toml    [columns.total] / [columns.orders] docs the SUM/COUNT outputs
 ```
 
 ## Prerequisites
@@ -74,6 +81,11 @@ self-contained, machine-consumable lineage artefact under
    shows each asset's columns + upstream models, then queries
    `edges.parquet` directly via DuckDB to prove the artefact is
    tool-agnostic.
+4. **Per-column docs** — `fct_revenue.toml` carries `[columns.total]` and
+   `[columns.orders]` descriptions (keyed to the aggregated output columns,
+   not the raw inputs). The demo re-emits `catalog.json`, prints every
+   column with a description, then asserts `fct_revenue.total.description`
+   is populated in `rocky catalog --output json`.
 
 ## Related
 

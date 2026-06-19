@@ -38,11 +38,11 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**76 of 88 POCs run with no external credentials.** See each POC's README for prerequisites.
+**82 of 94 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
-### 00 — Foundations (14 POCs · DuckDB)
+### 00 — Foundations (16 POCs · DuckDB)
 
 DSL syntax, materialization basics, playground baseline, the trust-arc 1 storage primitives, file-format ingest and per-tenant routing, plus the plan/apply deployment workflow and project scaffolding.
 
@@ -62,8 +62,10 @@ DSL syntax, materialization basics, playground baseline, the trust-arc 1 storage
 | [10-route-by-tenant](pocs/00-foundations/10-route-by-tenant) | One Parquet file with mixed-account rows is loaded then fanned out to per-tenant schemas (`account_acme.events`, `account_beta.events`, …) via per-model `target.schema` overrides |
 | [11-plan-apply-workflow](pocs/00-foundations/11-plan-apply-workflow) | `rocky plan` persists a content-addressed plan to `.rocky/plans/<id>.json`; `rocky apply <id>` executes it. Re-planning the same intent yields the same `plan_id` |
 | [12-init-scaffolding](pocs/00-foundations/12-init-scaffolding) | `rocky init --template duckdb` scaffolds a project that validates + compiles out of the box; `--template snowflake` shows the layout changes per warehouse |
+| [13-surrogate-keys](pocs/00-foundations/13-surrogate-keys) | A model sidecar `[[surrogate_key]]` block injects a deterministic, dbt_utils-identical MD5 hash column into the materialized table at `rocky run` |
+| [14-config-groups](pocs/00-foundations/14-config-groups) | One `models/groups/*.toml` fans `schema_template` + strategy + tags to N members via per-model `[args]`; `broken/` siblings show the `enforce` and pinned-schema-plus-args load guards |
 
-### 01 — Quality (8 POCs · DuckDB)
+### 01 — Quality (10 POCs · DuckDB)
 
 Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, standalone quality pipeline, freshness SLAs, cross-source overlap.
 
@@ -77,6 +79,8 @@ Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, sta
 | [06-quality-pipeline-standalone](pocs/01-quality/06-quality-pipeline-standalone) | `type = "quality"` pipeline — standalone checks (row_count, freshness, null_rate) with `depends_on` chaining |
 | [07-freshness-sla](pocs/01-quality/07-freshness-sla) | Per-model + project `[freshness]` SLAs (`expected_lag_seconds` alias); the **W005** coverage diagnostic fires on a temporal-output model with no freshness declaration (`compile --with-seed`), suppressed by a per-model block or a project default; also surfaces in the editor with an AI fix |
 | [08-cross-source-overlap](pocs/01-quality/08-cross-source-overlap) | The same data arriving via two sibling sources — `cross_source_overlap` flags a business key shared across siblings (which per-table `unique` can't see) + `unique_expr` catches a derived-key duplicate, both at replication time |
+| [09-named-tests](pocs/01-quality/09-named-tests) | Define a check once in `test_definitions.toml`, apply it across models via `[[use_test]]` (column/severity overrides) alongside inline `[[tests]]` |
+| [10-unit-tests](pocs/01-quality/10-unit-tests) | Fixture-driven `[[test]]` blocks (`given` rows → `expect` rows) run by `rocky test` — multiset by default, positional with `ordered` |
 
 ### 02 — Performance (14 POCs · DuckDB)
 
@@ -112,7 +116,7 @@ AI-powered model generation, intent extraction, schema sync, test generation, sc
 | [05-schema-grounded-validation](pocs/03-ai/05-schema-grounded-validation) | **Trust arc 5** — `ValidationContext` schema grounding + compile-verify retry loop |
 | [06-mcp-grounding](pocs/03-ai/06-mcp-grounding) | `rocky mcp` server — a schema-only model compiles but reconciles wrong; sampling the data via the MCP tools fixes it (creds-free `run.sh`) |
 
-### 04 — Governance (8 POCs · Databricks / DuckDB)
+### 04 — Governance (9 POCs · Databricks / DuckDB)
 
 Unity Catalog grants, schema patterns, workspace isolation, tagging, classification + masking, retention, auto-create schemas.
 
@@ -126,6 +130,7 @@ Unity Catalog grants, schema patterns, workspace isolation, tagging, classificat
 | [06-retention-policies](pocs/04-governance/06-retention-policies) | Declarative `retention = "<N>[dy]"` sidecars + `rocky retention-status --drift` | none |
 | [07-auto-create-schemas](pocs/04-governance/07-auto-create-schemas) | `[…target.governance] auto_create_schemas = true` on a transformation pipeline targeting a fresh schema (v1.29.0 parity fix) | none |
 | [08-cross-team-contracts](pocs/04-governance/08-cross-team-contracts) | Consumer imports a producer's published IR snapshot via `[imports.<name>]`; `rocky compile` fails with E030 when the producer drops a column the consumer reads (E033 on pin mismatch) | none |
+| [09-model-tags-inheritance](pocs/04-governance/09-model-tags-inheritance) | A config-group `[tags]` baseline inherited by members and overridden per-key by a model's own `[tags]`, surfaced on `rocky compile --output json` as `models_detail[].tags` | none |
 
 ### 05 — Orchestration (11 POCs · DuckDB / docker)
 
@@ -145,7 +150,7 @@ Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode
 | [10-state-retention-sweep](pocs/05-orchestration/10-state-retention-sweep) | `[state.retention]` + `rocky state retention sweep` — manual + end-of-run auto-sweep of run history / lineage / audit domains |
 | [11-state-namespacing](pocs/05-orchestration/11-state-namespacing) | `rocky --state-namespace <key>` routes each pipeline/client to its own `<models>/.rocky-state/<key>.redb` (own single-writer lock) — opt-in, byte-identical when off |
 
-### 06 — Developer Experience (20 POCs · DuckDB)
+### 06 — Developer Experience (21 POCs · DuckDB)
 
 Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, portability lint, SQL types, PR-preview, lineage-diff, run-watch, dbt-import failure modes, view strategy, dbt unit-test import.
 
@@ -171,6 +176,7 @@ Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, p
 | [18-view-strategy](pocs/06-developer-experience/18-view-strategy) | `[strategy] type = "view"` — model compiles to `CREATE OR REPLACE VIEW <target>` on every warehouse |
 | [19-import-dbt-unit-tests](pocs/06-developer-experience/19-import-dbt-unit-tests) | `rocky import-dbt --manifest` walks `manifest.unit_tests` into Rocky `[[test]]` sidecars; `data_tests:` accepted as alias for `tests:` on column tests (dbt 1.7+) |
 | [20-defer-against-prod](pocs/06-developer-experience/20-defer-against-prod) | `rocky run --model <name> --defer --defer-to <schema>` — build only the changed model locally, resolve its unbuilt upstream `ref()`s against a production schema (default-off dev convenience) |
+| [21-emit-sql-exit-path](pocs/06-developer-experience/21-emit-sql-exit-path) | `rocky emit-sql --out-dir` renders the model DAG to plain `.sql`, then runs it through DuckDB with no Rocky — the tested no-lock-in exit path |
 
 ### 07 — Adapters (7 POCs · mixed)
 

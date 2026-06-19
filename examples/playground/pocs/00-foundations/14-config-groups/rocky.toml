@@ -1,0 +1,21 @@
+# 14-config-groups — governed materialization fan-out via a config group
+#
+# A config group (models/groups/<name>.toml) defines a schema_template,
+# a shared [strategy], and a [tags] baseline once. Each member model opts
+# in with `group = "<name>"` and fills the template's {placeholder}s from
+# its own [args] — so one definition fans out across many target schemas.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.marts]
+type = "transformation"
+
+# Transformation pipelines defer catalog/schema/table to per-model sidecars
+# and (here) to the config group's schema_template. The adapter reference is
+# all that's needed at the pipeline level.
+[pipeline.marts.target]
+
+[pipeline.marts.target.governance]
+auto_create_schemas = true

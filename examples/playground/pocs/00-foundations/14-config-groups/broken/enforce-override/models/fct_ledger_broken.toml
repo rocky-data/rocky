@@ -1,0 +1,19 @@
+# DELIBERATELY BROKEN — the enforced-group guard.
+#
+# This member belongs to the ENFORCED `regulated` group, which OWNS the
+# target schema (via schema_template). The member tries to pin its own
+# target.schema — routing itself away from the rest of the group. Under an
+# enforced group that is a governance violation, so Rocky FAILS the load
+# instead of letting one regulated model drift to a different schema.
+#
+# Fix: remove the pinned schema and route via [args] like every other
+# member, or (if the divergence is intended) set enforce = false on the group.
+
+group = "regulated"
+
+[target]
+catalog = "warehouse"
+schema  = "rogue_schema"   # the enforced group controls schema -> load error
+
+[args]
+region  = "emea"
