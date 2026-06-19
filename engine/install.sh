@@ -190,6 +190,32 @@ fi
 mv "${TMP}/rocky" "${INSTALL_DIR}/rocky"
 chmod +x "${INSTALL_DIR}/rocky"
 
+# Best-effort: also install the standalone rocky-lsp binary. The VS Code
+# extension prefers a sibling rocky-lsp for the language server (a startup
+# optimization), so install it alongside rocky when the release ships it.
+# Optional — skipped silently if the archive is missing (older release) or
+# fails verification; the extension then falls back to `rocky lsp`.
+LSP_ARCHIVE="rocky-lsp-${TARGET}.tar.gz"
+if download_file "https://github.com/${REPO}/releases/download/${ROCKY_VERSION}/${LSP_ARCHIVE}" "${TMP}/${LSP_ARCHIVE}" 2>/dev/null; then
+    LSP_OK=1
+    if [[ -n "${ACTUAL_HASH}" && -f "${TMP}/checksums.txt" ]]; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            LSP_ACTUAL="$(sha256sum "${TMP}/${LSP_ARCHIVE}" | cut -d' ' -f1)"
+        else
+            LSP_ACTUAL="$(shasum -a 256 "${TMP}/${LSP_ARCHIVE}" | cut -d' ' -f1)"
+        fi
+        LSP_EXPECTED="$(grep "${LSP_ARCHIVE}" "${TMP}/checksums.txt" | cut -d' ' -f1 || true)"
+        if [[ -z "${LSP_EXPECTED}" || "${LSP_ACTUAL}" != "${LSP_EXPECTED}" ]]; then
+            LSP_OK=0
+        fi
+    fi
+    if [[ "${LSP_OK}" == "1" ]] && tar xzf "${TMP}/${LSP_ARCHIVE}" -C "${TMP}" 2>/dev/null && [[ -f "${TMP}/rocky-lsp" ]]; then
+        mv "${TMP}/rocky-lsp" "${INSTALL_DIR}/rocky-lsp"
+        chmod +x "${INSTALL_DIR}/rocky-lsp"
+        echo "  Installed rocky-lsp (the VS Code extension prefers it for the language server)."
+    fi
+fi
+
 echo ""
 
 # Verify installation
