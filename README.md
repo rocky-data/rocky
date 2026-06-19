@@ -172,6 +172,8 @@ New to Rocky and want the whole thing explained in plain English? **[`ROCKY_EXPL
 
 New to Rocky and want the whole thing explained from first principles? **[`ROCKY_EXPLAINED.md`](ROCKY_EXPLAINED.md)** is a single-file, plain-English tour of every feature — the compiler, the IR, the DAG, adapters, incremental watermarks, contracts, masking, lineage, and more — with ASCII diagrams throughout.
 
+New to Rocky and want the whole thing explained from first principles? **[`ROCKY_EXPLAINED.md`](ROCKY_EXPLAINED.md)** is a single-file, plain-English tour of every feature — the compiler, the IR, the DAG, adapters, incremental watermarks, contracts, masking, lineage, and more — with ASCII diagrams throughout.
+
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md). Before you open a PR, read the cross-project change guidance: a change to the output format or the Rocky DSL needs to update all the dependent pieces at once.
