@@ -21,6 +21,11 @@ env:
   # Limit parallelism — DuckDB C++ compilation is extremely memory-intensive
   # and OOMs the GitHub Actions runner (~7GB RAM) at default parallelism
   CARGO_BUILD_JOBS: 4
+  # Survive transient crates.io download flakes on GitHub runners (seen as
+  # "[16] Error in the HTTP2 framing layer" mid-fetch): retry the download and
+  # force HTTP/1.1, which sidesteps the intermittent HTTP/2 framing bug.
+  CARGO_NET_RETRY: '10'
+  CARGO_HTTP_MULTIPLEXING: 'false'
 
 defaults:
   run:
