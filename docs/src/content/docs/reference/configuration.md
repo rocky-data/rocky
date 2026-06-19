@@ -382,6 +382,8 @@ Given `source=shopify`:
 
 For multi-tenant setups with per-tenant catalogs, use `{component}` placeholders in `catalog_template`. See [Schema Patterns](/concepts/schema-patterns/) for the full pattern reference (e.g. `catalog_template = "{tenant}_warehouse"` with `components = ["tenant", "regions...", "source"]`).
 
+This `schema_template` routes replication targets, and its `{component}` placeholders are filled from the parsed source-schema components defined in `[pipeline.NAME.source.schema_pattern]`. It is a different feature from the config-group `schema_template`, which fills its `{placeholder}` values from a model's `[args]` to route a fan-out of transformation models. See [Config groups](/reference/model-format/#config-groups) for that one.
+
 ### `[pipeline.NAME.target.governance]`
 
 Catalog/schema lifecycle, tagging, grants, and isolation. Tagging, grants, and workspace isolation are implemented against Databricks Unity Catalog APIs and apply only when the target adapter is Databricks. The two `auto_create_*` lifecycle flags work on every adapter that emits `CREATE SCHEMA` SQL.

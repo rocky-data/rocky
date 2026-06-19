@@ -198,6 +198,27 @@ catalog_template = "{environment}_analytics"
 schema_template = "{department}__{system}"
 ```
 
+## Config groups vs schema patterns
+
+Schema patterns route at the pipeline level: they parse a source schema *name* into components, then fill a target `catalog_template` / `schema_template` from those parsed values. The values come from the schema name itself, and a `...` component can be multi-valued.
+
+Rocky has a separate model-level routing feature that shares the same template grammar but takes its values from a different place. A **config group** lives in `models/groups/<name>.toml` and defines a `schema_template` once. Each model opts in with `group = "<name>"` and fills the template's placeholders from its own `[args]` block:
+
+```toml
+# models/groups/daily_marts.toml
+schema_template = "mart_{region}"
+
+# models/fct_orders.toml
+group = "daily_marts"
+
+[args]
+region = "emea"   # fills {region} -> schema "mart_emea"
+```
+
+A group's `schema_template` uses the same `{name}` / `{name:SEP}` placeholder grammar as the target templates on this page, and resolves through the same engine code. The difference is the input: a config group substitutes the explicit single-valued strings a model declares under `[args]`, not components parsed out of a source schema name. Use schema patterns when the routing information is encoded in source schema names; use config groups when a fan-out of models shares one routing and materialization that you set by hand.
+
+See [Config groups](/reference/model-format/#config-groups) in the model format reference for the full `[args]` rules, precedence, enforced groups, and shared tags.
+
 ## Filtering by parsed component
 
 Once your sources are parsed into components, you can scope `rocky plan` and `rocky compare` (and the `rocky run` alias) to a subset via the `--filter` flag. The filter key is one of the component names you declared above (or the reserved `id`), and the value is matched against the parsed value, with containment semantics for multi-valued (`...`) components:

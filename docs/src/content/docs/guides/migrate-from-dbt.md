@@ -430,6 +430,19 @@ For migrations that lean on `{{ var() }}` or `{{ target.* }}` to drive per-model
 
 For each failed model, check the error message and rewrite the SQL manually. Most Jinja macros exist to work around SQL limitations that Rocky handles differently (incremental logic, schema naming, environment branching).
 
+### `generate_surrogate_key`
+
+`{{ dbt_utils.generate_surrogate_key([...]) }}` is a common one. The importer does not auto-convert it: it surfaces as an `UnsupportedMacro` warning and the call is replaced with a `/* TODO: unsupported macro */` marker in the emitted SQL. Rewrite it by hand as a `[[surrogate_key]]` block in the model sidecar. The block names the output column and the input columns; `rocky run` injects the hash column at materialization time:
+
+```toml
+# models/fct_orders.toml
+[[surrogate_key]]
+name = "order_key"
+columns = ["order_id", "customer_id"]
+```
+
+Drop the `{{ ... }}` expression from the model SQL and let the sidecar add the column. Rocky's hash matches what dbt-utils produces on the same warehouse: each input is cast to text, NULL-coalesced to the same `_dbt_utils_surrogate_key_null_` sentinel, joined with a `-` separator, and MD5-hashed. The expression is dialect-correct on DuckDB, Databricks, Snowflake, and BigQuery, so the hash values are identical to the dbt output for the matching warehouse.
+
 ## 4. Configure rocky.toml
 
 Create a `rocky.toml` in your project root. Rocky uses **named adapters** plus **named pipelines**. Define one adapter for the source and one for the warehouse, then a pipeline that wires them together. If you were using dbt with Databricks, your settings map directly:
@@ -485,6 +498,39 @@ export DATABRICKS_TOKEN="dapi..."
 | `catalog` | `[pipeline.<name>.target] catalog_template` |
 | `schema` | `[pipeline.<name>.target] schema_template` |
 | `threads` | `[pipeline.<name>.execution] concurrency` |
+
+### Folder-level config (`+materialized`, `+schema`)
+
+dbt's `dbt_project.yml` sets per-directory defaults like `marts: +materialized: table` and `+schema: marts`. Rocky's equivalent is a **config group**: define the shared routing and strategy once in `models/groups/<name>.toml`, then have each member model opt in with `group = "<name>"` in its sidecar. The mapping is direct:
+
+| dbt folder-level | Rocky config group (`models/groups/<name>.toml`) |
+|---|---|
+| `+materialized: table` (or `incremental`, etc.) | `[strategy]` block |
+| `+schema: marts` | `schema_template = "marts"` (a literal is a template with no placeholders) |
+
+```toml
+# models/groups/daily_marts.toml
+schema_template = "mart_{region}"
+
+[strategy]
+type = "merge"
+unique_key = ["id"]
+
+[tags]
+domain = "finance"
+```
+
+```toml
+# models/fct_orders.toml
+group = "daily_marts"
+
+[args]
+region = "emea"
+```
+
+The groups differ from dbt's folder defaults in one way. dbt's folder defaults apply automatically to every model in the directory; a Rocky config group applies only to models that name it with `group = "<name>"`. Precedence is per-model sidecar over group over `models/_defaults.toml`, so a member can still override anything the group sets.
+
+Rocky adds a knob dbt has no equivalent for. Set `enforce = true` on a group and a member model that locally pins a field the group controls (its target schema or its strategy) fails to load instead of silently diverging. Enforced groups are Rocky-only: they turn the group from an overridable default into a governance guarantee that the whole fan-out routes and materializes the same way.
 
 ## 5. Compile the Imported Models
 
@@ -561,6 +607,8 @@ rocky plan --filter tenant=acme
 ```
 
 This shows the SQL Rocky will generate for each model. Compare it against `dbt compile` output for the same models.
+
+For a connection-free side-by-side, `rocky emit-sql --models ./rocky-models` renders the compiled SQL for every transformation model without a warehouse, the same shape `dbt compile` writes to `target/`. It also doubles as the exit door: the SQL it produces is plain runnable SQL you keep if you ever step away from the engine. See [No lock-in](/guides/no-lock-in/) for the full walkthrough.
 
 ### Run on a test catalog
 
@@ -660,6 +708,34 @@ column = "customer_id"
 
 Anything else (`dbt_utils.*`, `dbt_expectations.*`, project-defined generics, model-level tests) is surfaced as an `UnsupportedTest` warning with the model, column, and test name. Rewrite those as a Rocky `expression` test or a quality-pipeline check; the importer does not stub them in the emitted TOML.
 
+#### Consolidating repeated tests into named definitions
+
+The importer writes one inline `[[tests]]` block per column, so a `not_null` you apply across twelve models lands as twelve identical blocks. To get dbt's generic-test parity (define a test once, apply it by name), define each test once in `models/test_definitions.toml` and reference it from each sidecar with `[[use_test]]`. This is a post-import authoring step, not a conversion the importer performs.
+
+```toml
+# models/test_definitions.toml
+[positive_amount]
+type = "expression"
+expression = "amount > 0"
+
+[known_status]
+type = "accepted_values"
+values = ["pending", "shipped", "delivered"]
+```
+
+```toml
+# models/fct_orders.toml
+[[use_test]]
+name = "positive_amount"
+column = "total_amount"
+
+[[use_test]]
+name = "known_status"
+column = "status"
+```
+
+`test_definitions.toml` is a table of named entries (`[name]`, not an array of `[[...]]` blocks); each entry is the test type plus its parameters. A `[[use_test]]` reference binds the named test to a column at the use site and may override the column, `severity`, or row `filter`. An unknown name is a hard error at load. These resolve into the same `[[tests]]` the importer would emit inline, so they run under `rocky test --declarative` against the configured warehouse the same way.
+
 ### dbt unit tests (manifest path)
 
 If your dbt project has compiled to a `manifest.json` and declares `unit_tests:` blocks (dbt 1.8+), `rocky import-dbt --manifest target/manifest.json` walks `manifest.unit_tests` and emits each entry as a `[[test]]` block in the matching model's sidecar TOML. `ref('upstream_model')` / `source('s', 't')` wrappers on `given.input` are stripped to bare references.
@@ -704,7 +780,7 @@ The importer also surfaces three new counters on the `--output json` payload and
 - `OrphanUnitTest`: the unit test targets a model the importer didn't pick up. Skipped and counted as skipped.
 - `UnsupportedUnitTestFormat`: `expect.format = "csv"` or `"sql"`, fixture references, or any other shape Rocky's `UnitTestDef` doesn't yet model. Skipped.
 
-CSV / SQL fixtures and `overrides:` blocks are deferred until Rocky's runtime test runner grows the matching surface; emitted `[[test]]` blocks deserialize through Rocky today but aren't yet wired into `rocky test` execution.
+CSV / SQL fixtures and `overrides:` blocks are deferred until Rocky's runtime test runner grows the matching surface. Emitted given/expect `[[test]]` blocks now execute under `rocky test` as of engine-v1.52.0: the runner seeds a fresh in-memory DuckDB with each `given` fixture, materializes the model against it, and compares the output to `expect` (a multiset comparison by default, positional when `expect.ordered` is set).
 
 ### Column-level contracts (manual)
 

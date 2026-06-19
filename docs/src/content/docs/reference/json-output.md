@@ -311,3 +311,29 @@ Additional fields vary by check type:
 - **Machine-readable schemas:** [`schemas/*.schema.json`](https://github.com/rocky-data/rocky/tree/main/schemas), one per command, exported via `rocky export-schemas`. These generate the Dagster Pydantic models and the VS Code TypeScript types, so they are the contract to validate against.
 - **Per-command examples:** each command's entry in the [CLI Reference](/reference/cli/) and the category pages under [Reference → Commands](/reference/commands/core-pipeline/) shows a worked JSON example.
 
+The shapes below are the ones consumers tend to get wrong; the full, authoritative shape for each still lives in the generated schemas.
+
+### `test` unit-test results
+
+When a model declares a fixture-driven `[[test]]` block, `rocky test --output json` carries a `unit_tests` object alongside the top-level `total` / `passed` / `failed` counts. It's present only when at least one model declares such a block, and is distinct from `declarative` (the `[[tests]]` summary, present only under `--declarative`).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `unit_tests.total` | integer | Number of fixture-driven unit tests run. |
+| `unit_tests.passed` | integer | Number that passed. |
+| `unit_tests.failed` | integer | Number that failed. |
+| `unit_tests.results` | array | Per-test outcomes. |
+| `unit_tests.results[].model` | string | Model under test. |
+| `unit_tests.results[].test` | string | Test name. |
+| `unit_tests.results[].passed` | boolean | Whether the test passed. |
+| `unit_tests.results[].error` | string or null | Failure message. Null when the test passed. |
+| `unit_tests.results[].mismatches` | array | Row-level diffs between expected and actual output, for diagnosing a failure. Empty on pass. See the generated schema for the per-row shape. |
+
+### `test` and `ci` failures
+
+On both `rocky test` and `rocky ci`, the top-level `failures` field is an array of objects, each `{ "name": "...", "error": "..." }`, not positional `[name, error]` tuples. JSON Schema can't represent positional tuples cleanly, so the engine emits named fields. See [`test.schema.json`](https://github.com/rocky-data/rocky/blob/main/schemas/test.schema.json) and [`ci.schema.json`](https://github.com/rocky-data/rocky/blob/main/schemas/ci.schema.json) for the exact shape.
+
+### `compile` model tags
+
+`rocky compile --output json` includes a `models_detail[]` array, one entry per compiled model. Each entry's `tags` object carries the model's **resolved** governance tags: the model's own sidecar `[tags]` merged over its config-group `[tags]` baseline, with the sidecar winning per key. So a `domain` set once on a config group is visible on every member model's `models_detail[].tags` without being repeated. The authoritative `models_detail[]` shape lives in [`compile.schema.json`](https://github.com/rocky-data/rocky/blob/main/schemas/compile.schema.json), and the tag-resolution rules are documented under [Group tags](/reference/model-format/#group-tags).
+

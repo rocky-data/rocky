@@ -45,9 +45,34 @@ rocky compile
   "has_errors": false,
   "diagnostics": [],
   "compile_timings": { "load_ms": 8, "resolve_ms": 2, "typecheck_ms": 42 },
-  "models_detail": [ /* one entry per model */ ]
+  "models_detail": [
+    {
+      "name": "fct_revenue",
+      "strategy": { "type": "full_refresh" },
+      "target": { "catalog": "acme_warehouse", "schema": "gold", "table": "fct_revenue" },
+      "freshness": { "max_lag_seconds": 86400, "time_column": "order_date", "severity": "warning" },
+      "contract_source": "auto",
+      "incrementality_hint": {
+        "is_candidate": true,
+        "recommended_column": "order_date",
+        "confidence": "medium",
+        "signals": ["column name 'order_date' ends with '_date' (timestamp pattern)"]
+      },
+      "cost_hint": {
+        "estimated_rows": 10000,
+        "estimated_bytes": 2560000,
+        "estimated_cost_usd": 0.0000228,
+        "confidence": "high"
+      },
+      "depends_on": ["stg_orders", "stg_refunds"],
+      "tags": { "domain": "finance", "tier": "gold", "owner": "analytics", "region": "emea" }
+    }
+    /* one entry per model */
+  ]
 }
 ```
+
+`models_detail` carries the stable, declarative shape of each compiled model: its name, materialization `strategy` (the wire form `{"type": "..."}`), `target` coordinates, and direct `depends_on` list. Optional fields appear only when present: `freshness` when the model declares a freshness expectation, `contract_source` (`"auto"` for a sibling `.contract.toml`, `"explicit"` for one passed via `--contracts`) when a contract applies, `incrementality_hint` when a `full_refresh` model has a monotonic-looking column, and `cost_hint` when upstream statistics support a heuristic estimate. The `tags` object holds the model's `[tags]` block merged over any config-group baseline (sidecar wins), so a governed key like `domain` or `owner` declared once on a group is visible to consumers such as `dagster-rocky`. Empty `tags`, `depends_on`, and absent optional fields are omitted from the JSON.
 
 Compile a single model with contracts, showing a warning diagnostic:
 
@@ -284,7 +309,7 @@ rocky catalog [flags]
 
 The artifact contains:
 
-- `assets` — one entry per model or upstream source, with columns (name plus inferred type and nullability when known), upstream / downstream lists, and the model's intent description when supplied.
+- `assets` — one entry per model or upstream source, with columns (name plus inferred type and nullability when known, and a per-column `description` from the sidecar `[columns]` table when set), upstream / downstream lists, and the model's intent description when supplied.
 - `edges` — one entry per column-level lineage edge: source column, target column, transform kind (`direct`, `cast`, `expression`, `aggregation: <fn>`), and a confidence grade (`High` for explicit projections, `Medium` for star-expanded edges, `Low` reserved for future use).
 - `stats` — aggregate counts (`asset_count`, `edge_count`, `column_count`, `assets_with_star`, `orphan_columns`, `duration_ms`).
 - A `config_hash` fingerprint of `rocky.toml` so consumers can tell whether the catalog was built against the current configuration.
@@ -329,6 +354,87 @@ rocky catalog --out build/catalog
 
 - [`rocky lineage`](#rocky-lineage) -- per-model lineage exploration with `--column` traces
 - [`rocky compile`](#rocky-compile) -- build the semantic graph that the catalog reads
+
+---
+
+## `rocky emit-sql`
+
+Render the runnable SQL each transformation model would emit, without a warehouse connection and without running anything. This is Rocky's tested exit path: a project can always be reduced to plain, dialect-correct SQL files that feed a hand-SQL or dbt fallback, so adopting Rocky is never a one-way door. The SQL is generated through the same path `rocky run` uses, including declared surrogate-key columns wrapped exactly as they are at materialization.
+
+```bash
+rocky emit-sql [flags]
+```
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--models <PATH>` | `PathBuf` | `models` | Directory containing `.sql` and `.toml` model files. |
+| `--model <NAME>` | `string` | | Render a single model by name instead of the whole project. |
+| `--out-dir <PATH>` | `PathBuf` | | Write one `<model>.sql` file per model into this directory, in dependency order. When omitted, the concatenated SQL is printed to stdout (also in dependency order). |
+
+### Dialect and the runnable guarantee
+
+The dialect is the project's configured target adapter type, resolved from `rocky.toml` without credentials. With no resolvable config it defaults to DuckDB. All models render in this one resolved dialect, so for a project whose models target more than one adapter, the emitted SQL matches `rocky run` only for the models whose target uses that dialect.
+
+Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect. Incremental and merge models emit their steady-state statement instead: a bare `INSERT` or `MERGE` that operates on an existing target. `rocky run` bootstraps the target table on first build and threads the incremental watermark from state, neither of which a static emit can reproduce, so those files carry a leading note to that effect:
+
+```sql
+-- NOTE: incremental/merge statement — operates on an existing target.
+-- `rocky run` bootstraps the table on first build and threads the
+-- incremental watermark from state; this static SQL does neither.
+MERGE INTO ...
+```
+
+Models that produce no standalone SQL are reported on stderr rather than silently dropped, so you never mistake the emitted set for the complete project. Two cases are skipped this way: ephemeral models (inlined as CTEs upstream, so they have no statement of their own) and strategies that cannot render offline, such as a Snowflake dynamic table that needs a live compute-warehouse name.
+
+### Examples
+
+Print the whole project's SQL to stdout in dependency order:
+
+```bash
+rocky emit-sql
+```
+
+```sql
+-- model: stg_orders
+CREATE OR REPLACE TABLE main.stg_orders AS
+SELECT order_id, customer_id, total_amount FROM raw.orders;
+
+-- model: fct_revenue
+CREATE OR REPLACE TABLE main.fct_revenue AS
+SELECT customer_id, SUM(total_amount) AS revenue_amount FROM main.stg_orders GROUP BY customer_id;
+```
+
+Write one file per model, ready to commit or hand to another tool:
+
+```bash
+rocky emit-sql --out-dir build/sql/
+```
+
+```text
+emit-sql: wrote 2 model(s) to build/sql/ in dependency order
+```
+
+Render a single model, and capture the project-wide SQL into one file:
+
+```bash
+rocky emit-sql --model fct_revenue
+rocky emit-sql > build/all.sql
+```
+
+When some models cannot be emitted as standalone SQL, the skip report goes to stderr:
+
+```text
+emit-sql: 1 model(s) not emitted:
+  - dim_session (ephemeral — inlined as a CTE)
+```
+
+### Related Commands
+
+- `rocky dag` -- inspect the dependency order `emit-sql` renders in
+- [`rocky catalog`](#rocky-catalog) -- the same compiled graph, exported as a lineage snapshot rather than runnable SQL
+- [No lock-in](/guides/no-lock-in/) -- the full fallback recipe for stepping away from the engine
 
 ---
 
@@ -387,7 +493,39 @@ rocky test --model fct_revenue --contracts contracts/
 }
 ```
 
-`--declarative` adds a `declarative` block summarising `[[tests]]` declared in model sidecars; see [Testing and Contracts](/concepts/testing/) for that surface.
+The default `rocky test` path also runs fixture-driven `[[test]]` unit tests declared in model sidecars. Each `[[test]]` block mocks upstream inputs with inline rows (`given`) and asserts the model's output rows (`expect`), executed in-memory against DuckDB. When at least one model declares a `[[test]]` block, the JSON output gains a `unit_tests` summary; the key is omitted entirely when no model declares one. A failing unit test makes `rocky test` exit non-zero, the same as a failing model assertion.
+
+```json
+{
+  "version": "1.11.0",
+  "command": "test",
+  "total": 3,
+  "passed": 3,
+  "failed": 0,
+  "failures": [],
+  "unit_tests": {
+    "total": 2,
+    "passed": 1,
+    "failed": 1,
+    "results": [
+      { "model": "fct_revenue", "test": "discount_caps_at_total", "passed": true, "error": null, "mismatches": [] },
+      {
+        "model": "fct_revenue",
+        "test": "refunds_subtract",
+        "passed": false,
+        "error": "ordered output mismatch (1 expected vs 1 actual row(s))",
+        "mismatches": [
+          { "row_index": 0, "expected": "customer_id=7, revenue_amount=80", "actual": "customer_id=7, revenue_amount=100", "kind": "value_diff" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Each `results` entry carries the model name, the `[[test]]` block's `test` name, a `passed` flag, an `error` message (`null` when the test passed), and the `mismatches` array of row-level diffs. Each mismatch renders its row as `col=val, col=val`. A mismatch `kind` is `missing` (expected but not produced), `extra` (produced but not expected), or `value_diff` (same positional row, differing values, from an `ordered` expectation).
+
+`--declarative` is a separate surface: it adds a `declarative` block summarising `[[tests]]` (plural) declared in model sidecars, run against the configured warehouse adapter rather than DuckDB. See [Testing and Contracts](/concepts/testing/) for both surfaces.
 
 ### Related Commands
 

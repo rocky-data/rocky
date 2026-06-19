@@ -31,6 +31,10 @@ A data-quality assertion that runs inline during a run (row counts, column match
 
 A schema agreement Rocky enforces before any row is written. A missing required column or an unsafe type change becomes a compile error (`E010`, `E013`) that blocks the PR. See [Testing and contracts](/concepts/testing/).
 
+### Config group
+
+A `models/groups/<name>.toml` definition that a fan-out of models opts into by name (`group = "<name>"` in the sidecar). The group supplies shared routing (a `schema_template` filled per model from its `[args]`), a shared `strategy`, and shared `[tags]`. Precedence is per-model sidecar over group over `_defaults.toml`, so a model can still override what the group sets unless the group is enforced. See [Config groups](/reference/model-format/#config-groups) and [Enforced group](#enforced-group).
+
 ### Content-addressed
 
 Identified by the hash of its contents rather than a name or timestamp. Rocky records each run's inputs, code, and outputs this way, which is what lets [replay](#replay) verify a past run against its record. See [Content-addressed writes](/concepts/content-addressed/).
@@ -42,6 +46,10 @@ A stable identifier for a compiler finding: errors (`E###`), warnings (`W###`), 
 ### Drift
 
 A mismatch between what your code expects and what the warehouse actually has, usually because a source column changed type or was added or dropped. Rocky detects it on every run and either recreates the target or blocks the PR. See [Schema drift](/concepts/schema-drift/).
+
+### Enforced group
+
+A [config group](#config-group) with `enforce = true`. The group's fields become binding rather than defaults: a member model that locally pins a field the group controls (its target `schema` or its `strategy`) fails the load instead of quietly routing or materializing itself differently from the rest of the group. Enforcement is opt-in; without it, groups stay overridable defaults. See [Enforced groups](/reference/model-format/#enforced-groups).
 
 ### IR (intermediate representation)
 
@@ -82,6 +90,10 @@ The transformation layer: SQL (or `.rocky` DSL) models that build on the bronze 
 ### State store
 
 The embedded database (`redb`) where Rocky keeps run records, watermarks, and plans, with optional S3 or Valkey sync. There is no `manifest.json`. See [State management](/concepts/state-management/).
+
+### Surrogate key
+
+A computed column whose value is a deterministic MD5 hash over a set of input columns, declared in a `[[surrogate_key]]` sidecar block (`name` plus `columns`). Modeled on dbt-utils' `generate_surrogate_key`: each input is coerced to text and NULL-coalesced to a fixed sentinel before hashing, so on a given warehouse the output matches dbt-utils over the same columns. Rocky injects the hash into the model's SELECT at `rocky run` and on the emit-SQL path, so you don't hand-write it. See [`[[surrogate_key]]`](/reference/model-format/#surrogate_key).
 
 ### Trust plane
 
