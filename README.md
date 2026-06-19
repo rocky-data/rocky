@@ -170,6 +170,8 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md#releases) for the full release flow.
 
 Full documentation lives at **[rocky-data.dev](https://rocky-data.dev)**: concepts, guides, CLI reference, the Python SDK, Dagster integration, and the adapter SDK.
 
+New to Rocky and want the whole thing explained from first principles? **[`ROCKY_EXPLAINED.md`](ROCKY_EXPLAINED.md)** is a single-file, plain-English tour of every feature — the compiler, the IR, the DAG, adapters, incremental watermarks, contracts, masking, lineage, and more — with ASCII diagrams throughout.
+
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md). Before opening a PR, please read the cross-project change guidance: schema and DSL changes must update consumers atomically.
