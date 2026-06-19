@@ -37,6 +37,11 @@ Key idea: **Rocky is a program that compiles other programs** (your SQL models).
 | **Incremental loads** | Only processes new rows since the last run (watermark-based) |
 | **Schema drift detection** | Notices when a source column changed type and handles it automatically |
 | **Data contracts** | Declare what columns must exist and what types they must be; enforced at compile time |
+| **Deterministic surrogate keys** | Declare `[[surrogate_key]]` and Rocky injects a dialect-correct hash column into the SELECT; the value matches `dbt_utils.generate_surrogate_key` over the same columns, so keys stay stable when migrating a dbt Core project to Rocky |
+| **Declarative tests** | Not-null, unique, accepted-values, relationships, expression, row-count assertions as TOML, not SQL macros; define once in `models/test_definitions.toml`, apply by name with `[[use_test]]` |
+| **Fixture-driven unit tests** | `[[test]]` blocks feed a model mocked input rows and assert on its output, run locally on DuckDB with no warehouse |
+| **Config groups** | A `models/groups/<name>.toml` group routes and materializes a fan-out of models from one definition; `enforce = true` makes it a compile-time guardrail |
+| **Model tags** | Free-form `[tags]` describe a model as a whole (domain, tier, owner); inherited from a config group and projected onto Dagster assets |
 | **Data masking** | Hash, redact, or partially mask sensitive columns per environment |
 | **Role graph & permissions** | Declare who gets what; Rocky reconciles GRANT/REVOKE to match |
 | **Hooks & webhooks** | Fire shell commands or HTTP calls on 18 lifecycle events |
@@ -1043,6 +1048,13 @@ Everything Rocky does, in one ASCII map:
  Health checks  ──▶ rocky doctor
  Run history    ──▶ rocky history [--model <name>]
  Metrics        ──▶ rocky metrics <model>
+ Unit tests     ──▶ rocky test --models models/  (runs [[test]] fixtures on DuckDB)
+
+
+ EXIT PATH (never a one-way door):
+ ─────────────────────────────────
+ Render SQL     ──▶ rocky emit-sql --models models/ [--out-dir sql/]
+                    ↳ dialect-correct SQL you can run by hand or hand to a hand-SQL / dbt Core fallback
 
 
  INTEGRATIONS:
@@ -1068,6 +1080,108 @@ Everything Rocky does, in one ASCII map:
 
 ---
 
+## 27. Config Groups: Governed Fan-Out
+
+When many models share the same routing and materialization (a fleet of regional marts, say), you don't want to repeat that config in every sidecar. A **config group** declares it once. Each model opts in by name.
+
+```
+models/groups/daily_marts.toml          models/fct_orders_emea.toml
+─────────────────────────────────       ──────────────────────────────
+schema_template = "mart_{region}"        group = "daily_marts"
+
+[strategy]                                [target]
+type = "merge"                            catalog = "warehouse"
+unique_key = ["id"]                       # schema comes from the group
+
+[tags]                                    [args]
+domain = "finance"                        region = "emea"   → schema "mart_emea"
+```
+
+The group supplies a `schema_template`, a `strategy`, and `[tags]`. Each member fills the template's `{placeholder}`s from its own `[args]`. Resolution precedence is **per-model sidecar > group > `_defaults.toml`**: a model can pin its own schema or strategy to override the group, and the group in turn overrides directory defaults.
+
+**`enforce` turns a default into a guardrail.** By default a group is overridable. Set `enforce = true` and a member that locally pins a field the group controls (its target `schema` or its `strategy`) fails the load:
+
+```
+error: model 'fct_orders_emea' overrides 'target.schema', which its enforced
+       group 'daily_marts' controls; remove the local override or set the
+       group's enforce = false
+```
+
+This is a compile-time governance check, not a runtime convention. A model in an enforced group cannot quietly route or materialize itself differently from the rest of the fan-out. A misfilled template (a `{region}` no model supplied, or an `[args]` value that isn't a valid SQL identifier) also fails the load rather than routing a model to the wrong place.
+
+---
+
+## 28. Declarative Tests and Unit Tests
+
+Rocky has two test mechanisms, distinguished by a singular-vs-plural key. They do different jobs.
+
+```
+[[tests]]  (plural)  — assertions about data already in the warehouse
+[[test]]   (singular) — fixture-driven logic test, run locally on DuckDB
+```
+
+**Declarative tests (`[[tests]]`)** assert properties of a materialized table: not-null, unique, accepted-values, relationships, expression predicates, row-count ranges. They are declarative TOML, not SQL macros. Rocky generates the assertion SQL for the active dialect. To apply the same assertion across many models, define it once as a named test in `models/test_definitions.toml` and reference it by name:
+
+```
+models/test_definitions.toml             models/fct_orders.toml
+─────────────────────────────────        ──────────────────────────────
+[positive_amount]                         [[use_test]]
+type = "expression"                       name = "positive_amount"
+expression = "amount > 0"                 severity = "warning"
+
+[known_status]                            [[use_test]]
+type = "accepted_values"                  name = "known_status"
+values = ["pending", "shipped"]           column = "order_status"  # bind here
+column = "status"
+```
+
+A `[[use_test]]` reference resolves into an ordinary assertion at load and is appended to the model's inline `[[tests]]`. An unknown name fails the load; so does a mistyped key in the block, so a `colum =` typo never silently applies the test to the wrong column.
+
+**Unit tests (`[[test]]`)** check the model's SQL logic against inputs you write by hand. The block seeds mock upstream tables, runs the model SQL on an in-memory DuckDB, and compares the result to an expected row set. No warehouse needed.
+
+```toml
+[[test]]
+name = "flags_orders_over_100"
+
+[[test.given]]                 # mock the upstream
+ref = "orders"
+rows = [
+    { id = 1, amount = 150.0 },
+    { id = 2, amount = 50.0 },
+]
+
+[test.expect]                  # assert the output
+rows = [
+    { id = 1, amount = 150.0, is_high_value = true },
+]
+```
+
+Rows compare as a multiset by default (order doesn't matter, duplicate counts do); set `ordered = true` to compare positionally. Only the columns you list in `expect` are checked, so you assert on what you care about and ignore the rest. Unit tests run on the default `rocky test` path alongside the local model-execution check, and a failure fails the run with a non-zero exit code.
+
+---
+
+## 29. Model Tags and Per-Column Docs
+
+A model's `[tags]` block is free-form governance metadata about the model as a whole: `domain`, `tier`, `owner`, whatever your governance model needs. This is distinct from `[classification]`, which is keyed by *column* and drives masking.
+
+```toml
+# models/fct_orders.toml
+name = "fct_orders"
+
+[tags]
+domain = "finance"
+tier = "gold"
+owner = "data-eng"
+```
+
+Tags compose with config groups: a model inherits its group's `[tags]` as a shared baseline, and its own `[tags]` override per key (sidecar > group) without dropping the rest. One `domain = "finance"` on the group tags the whole fan-out.
+
+Resolved tags land on `rocky compile --output json` as `models_detail[].tags`, and the `dagster-rocky` integration projects them onto each derived asset's Dagster tags. The same attribute drives both Rocky's view of the model and the orchestrator's, so a governed fan-out is visible end-to-end.
+
+**Per-column docs.** A `[columns.<name>]` table attaches a one-line description to an output column. Those descriptions surface in `rocky catalog --output json` as each asset's `CatalogColumn.description`. They do **not** appear in the `rocky docs` HTML catalog, which has no warehouse connection to introspect the column list; column descriptions reach consumers through `rocky catalog`, not the generated HTML.
+
+---
+
 ## Quick Reference
 
 | You want to... | Command |
@@ -1087,3 +1201,5 @@ Everything Rocky does, in one ASCII map:
 | Health check everything | `rocky doctor -c rocky.toml` |
 | Generate a model with AI | `rocky ai "create a daily revenue summary by region"` |
 | Test models locally (no warehouse) | `rocky test --models models/` |
+| Run fixture-driven unit tests | `rocky test --models models/` (any `[[test]]` blocks run on the default path) |
+| Render runnable SQL offline (leave Rocky) | `rocky emit-sql --models models/ --out-dir sql/` |

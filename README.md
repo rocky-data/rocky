@@ -107,7 +107,9 @@ Core features are production-ready on Databricks: the checker, named branches, r
 | Auditor asks what changed `fct_revenue.amount` | Run history, no code record | `rocky replay <run_id>` |
 | Pipeline fails at 3 AM, half already ran | `dbt retry` from failed model | `rocky run --resume-latest`, skips succeeded models |
 
-`rocky import-dbt` converts a vanilla dbt project in one command.
+`rocky import-dbt` converts a vanilla dbt Core project in one command. Rocky also closes the dbt-Core feature gaps teams hit first: deterministic surrogate keys (`[[surrogate_key]]`, the same value `dbt_utils.generate_surrogate_key` produces on each warehouse), named data-quality tests defined once and reused by name (the analogue of dbt Core's generic tests), and fixture-driven unit tests that mock upstream inputs and assert the output. See the [model format reference](https://rocky-data.dev/reference/model-format/).
+
+- **No vendor lock-in.** `rocky emit-sql` renders every transformation model as plain, dependency-ordered SQL, offline with no warehouse connection. It's a one-command export, not a rewrite, so adopting Rocky is never a one-way door. See [No lock-in](https://rocky-data.dev/guides/no-lock-in/).
 
 In June 2026 dbt Labs released Fusion (dbt Core v2.0, Rust, Apache 2.0, alpha) with SQL type-checking and column lineage, though it still templates with Jinja and safety checks are opt-in. Neither dbt Core v2.0 nor Fusion includes named branches, a code-and-output record per run, per-model cost as a built-in, a cross-database portability check, or declarative masking. Those are in dbt's paid platform; Rocky's are Apache 2.0.
 

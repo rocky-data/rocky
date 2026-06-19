@@ -45,6 +45,8 @@ A typed compiler that drives your warehouse. Storage and compute stay where they
 | Quality | ✅ | Inline assertions during `rocky apply`; no separate test step |
 | Orchestration | Partial | First-class Dagster integration; `rocky serve` for small standalone teams |
 
+Quality is more than the inline runtime gate. Alongside the assertions that run during `rocky apply`, models can declare fixture-driven unit tests (`[[test]]` blocks that mock upstream rows and assert the expected output) and declarative data tests (`[[tests]]` blocks of not-null, uniqueness, accepted-values, and similar assertions, with reusable named definitions applied by name through `[[use_test]]`). Unit tests exercise a model's SQL against fixtures you control and run locally on DuckDB with `rocky test`; declarative tests check the rows already in your warehouse and run with `rocky test --declarative`. Both give you a pre-deployment and CI surface that complements the inline checks. See [Testing and Contracts](/concepts/testing/).
+
 ## The seven trust dimensions
 
 1. **SQL as a typed, compiled language.** Column-level type inference across the full DAG. 35+ diagnostic codes (`E###` errors, `W###` warnings, `P###` portability lints) with actionable suggestions. Not text macros, but a real compiler with a real LSP.
