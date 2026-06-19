@@ -22,7 +22,7 @@ rocky emit-sql --models models/ --out-dir build/sql/
 rocky emit-sql --models models/ --model fct_orders
 ```
 
-The output is generated through the same code path `rocky run` uses, including any declared surrogate-key columns. The dialect comes from your configured target adapter in `rocky.toml` (Databricks, Snowflake, BigQuery, Trino, or DuckDB); with no resolvable config it defaults to DuckDB.
+The output is generated through the same code path `rocky run` uses, including any declared [surrogate-key columns](/reference/model-format/#surrogate_key). The dialect comes from your configured target adapter in `rocky.toml` (Databricks, Snowflake, BigQuery, Trino, or DuckDB); with no resolvable config it defaults to DuckDB.
 
 Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is and matches what a run executes. Incremental and merge models emit their steady-state statement, a bare `INSERT` or `MERGE` against an existing target. `rocky run` creates that target on the first build and threads the incremental watermark from its state store, neither of which a static SQL file can carry, so those files include a short note. Treat them as the recurring operation, not a from-scratch build.
 
@@ -56,3 +56,9 @@ For full-refresh models this is exact: a CI test emits the SQL and executes it d
 `emit-sql` renders transformation models. Replication pipelines (incremental source-to-target copies) are driven by the engine's watermark state, so their SQL preview lives behind the live `rocky plan` path instead. Models that produce no standalone statement are reported on stderr rather than dropped silently: ephemeral models (inlined as CTEs) and strategies that need a live connection to render, such as Snowflake dynamic tables that resolve a compute-warehouse name at runtime.
 
 For incremental and merge models, remember the limits above: the emitted statement assumes the target already exists and carries no watermark, so reproducing a run from scratch means creating the target first (and, for incremental, deciding how to seed it).
+
+## Related
+
+- [SQL Generation](/concepts/sql-generation/) — how Rocky compiles each strategy to the SQL that `emit-sql` renders.
+- [Model Format](/reference/model-format/#surrogate_key) — the sidecar fields, including the `[[surrogate_key]]` block `emit-sql` carries through.
+- [Migrating from dbt](/guides/migrate-from-dbt/) — uses `emit-sql` for a connection-free side-by-side and as the exit door.

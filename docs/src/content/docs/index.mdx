@@ -45,6 +45,12 @@ Rocky exists because the most expensive failures in modern data platforms aren't
   <Card title="Dialect-divergence lint" icon="puzzle">
     `P001` catches Snowflake-only constructs in a Databricks project, and the reverse. Cross-warehouse teams stop discovering portability bugs in prod.
   </Card>
+  <Card title="Declarative tests and keys, not templated SQL" icon="list-format">
+    Tests are declarative TOML and Rocky generates the assertion SQL for your target dialect. Define an assertion once in `models/test_definitions.toml` and apply it by name with `[[use_test]]`. Fixture-driven `[[test]]` blocks seed mock inputs, run the model SQL, and compare the rows on `rocky test` via DuckDB, no warehouse required. A `[[surrogate_key]]` block injects a deterministic hash into your SELECT whose value matches `dbt_utils.generate_surrogate_key` on the same warehouse.
+  </Card>
+  <Card title="A tested exit door, not a one-way door" icon="cloud-download">
+    `rocky emit-sql` renders the compiled SQL for your transformation models with no warehouse connection. The output is plain runnable SQL with no Rocky-specific syntax, so adopting Rocky never locks you in. A CI test emits the full-refresh SQL and runs it directly against DuckDB, so the exit path stays runnable as the engine evolves.
+  </Card>
 </CardGrid>
 
 ## Get Started in 60 Seconds

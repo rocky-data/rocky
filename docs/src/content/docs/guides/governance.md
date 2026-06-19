@@ -589,7 +589,70 @@ This means you can deploy Rocky across multiple catalogs and discover all manage
 - Use `cost_center` for chargeback and FinOps
 - Add custom tags for compliance (e.g., `pii = "true"`, `data_classification = "internal"`)
 
-## 10. Quality Checks
+## 10. Config Groups and Enforcement
+
+A config group is one definition that a fan-out of models opts into by name (`group = "<name>"` in the sidecar). It supplies shared routing (`schema_template`) and a shared `strategy`, so a set of models route and materialize the same way without repeating the config. The full reference lives in [the model format guide](../reference/model-format.md#config-groups); this section covers the governance angle.
+
+### Enforced config groups
+
+By default a group is an overridable default: a member model can pin its own `target.schema` or `strategy` and the local value wins. Set `enforce = true` to make the group's fields binding instead. A member that locally pins a field the group controls then fails the load rather than quietly routing or materializing itself differently from the rest of the group:
+
+```toml
+# models/groups/regulated.toml
+enforce = true
+schema_template = "mart_{region}"
+
+[strategy]
+type = "merge"
+unique_key = ["id"]
+```
+
+Enforcement covers exactly the two fields the group owns: the target `schema` (when the group sets `schema_template`) and the `strategy`. A member that locally sets either one fails the load with a `GroupOverride` error. The model can still supply its own `[args]` to fill the template and set any field the group does not own (such as `target.catalog`); it just cannot override the schema routing or materialization that the group governs.
+
+This is a load-time guarantee in the same family as data contracts: the check runs when the model graph loads, so an off-policy override is rejected before any SQL reaches the warehouse rather than surfacing as drift later. Enforcement is strictly opt-in. Without `enforce`, groups stay overridable defaults.
+
+It applies to every model in the group regardless of whether the model is written in SQL or the `.rocky` DSL. The group governs routing and materialization, not the model body.
+
+## 11. Model Tags
+
+Model tags are free-form governance attributes that describe a model as a whole (`domain`, `tier`, `owner`, anything your governance model needs). They are distinct from the [tagging strategy](#9-tagging-strategy) in the previous section: those tags live under `[pipeline.*.target.governance.tags]` and land on Unity Catalog catalogs, schemas, and tables via `ALTER ... SET TAGS`, used for catalog discovery. Model tags live in the model sidecar (or its config group) and flow into Rocky's model graph, the orchestrator's asset tags, and the `rocky compile` JSON. They use a different config location and a different mechanism, and reach a different consumer.
+
+### Sidecar `[tags]`
+
+Declare model tags in a `[tags]` block in the model's `.toml` sidecar. Keys and values are free-form strings:
+
+```toml
+# models/fct_orders.toml
+name = "fct_orders"
+
+[tags]
+domain = "finance"
+tier = "gold"
+owner = "data-eng"
+```
+
+### Config-group `[tags]` baseline
+
+A config group can declare its own `[tags]` block. Every member model inherits the group's tags as a shared baseline, so a governance attribute applied once on the group lands on the whole fan-out:
+
+```toml
+# models/groups/finance.toml
+schema_template = "mart_{region}"
+
+[tags]
+domain = "finance"
+tier = "gold"
+```
+
+### Sidecar over group, per key
+
+When a model belongs to a group, its resolved tags are the group's `[tags]` with the model's own `[tags]` merged on top, per key. A member can override a single inherited key without dropping the rest of the group's tags: a model in the `finance` group above can set `tier = "silver"` in its sidecar and still inherit `domain = "finance"`. Precedence mirrors the rest of the group resolution, sidecar over group.
+
+### Projection to Dagster
+
+Resolved tags are emitted on `rocky compile --output json` as `models_detail[].tags`. The `dagster-rocky` integration projects them onto each derived asset's first-class Dagster tags, so the same attribute is usable in asset selection (for example `tag:domain=finance`). Alongside the governance tags, the translator synthesizes `rocky/`-namespaced tags for the model name, target catalog, target schema, and strategy. The `rocky/` prefix keeps those from ever colliding with a governance key. The result is that a tag applied once in a sidecar or group is visible end-to-end, from the typed model graph through `rocky compile` to the orchestrator.
+
+## 12. Quality Checks
 
 Rocky runs data quality checks inline during replication. Checks execute immediately after each table is copied, and results are included in the run output.
 
@@ -693,7 +756,7 @@ threshold = 0
 
 The check passes if the query result is less than or equal to the threshold.
 
-## 11. Audit Trail
+## 13. Audit Trail
 
 Rocky stores run history and quality metrics in the embedded state store (redb), providing a queryable audit trail. Every `rocky apply` now stamps eight extra governance fields on its `RunRecord` (shipped in engine-v1.16.0); the full trail is available via `rocky history --audit`.
 
@@ -831,7 +894,7 @@ rocky history -o json
 rocky metrics fct_daily_revenue --trend -o json
 ```
 
-## 12. Complete Governance Configuration
+## 14. Complete Governance Configuration
 
 Here is a full pipeline target with every governance feature enabled. Governance lives under each pipeline's target so different pipelines can have different policies:
 
@@ -949,7 +1012,7 @@ This configuration ensures:
 - Data quality is validated after every replication
 - History and metrics provide a complete audit trail, including 8 governance fields per run
 
-## 13. CI Gate Example
+## 15. CI Gate Example
 
 The CI gate pattern wires `rocky compliance --fail-on exception` into a pipeline step that blocks merges when classified columns are unmasked. For quieter local runs, drop `--fail-on` and add `--exceptions-only` so the output skips the per-column table when nothing is wrong.
 
