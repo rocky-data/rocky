@@ -1,0 +1,16 @@
+# Member of the daily_marts group, US-West region.
+#
+# Same group, different [args] -> a DISTINCT target schema (mart_us_west).
+# This member also overrides ONE tag (tier = "silver") to show per-key
+# merge: it keeps the group's `domain = "sales"` but pins its own tier.
+
+group = "daily_marts"
+
+[target]
+catalog = "warehouse"
+
+[args]
+region = "us_west"      # fills {region} -> schema "mart_us_west"
+
+[tags]
+tier = "silver"         # overrides the group's tier; domain stays inherited

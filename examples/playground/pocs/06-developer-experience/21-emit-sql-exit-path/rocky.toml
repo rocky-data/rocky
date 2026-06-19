@@ -1,0 +1,26 @@
+# 21-emit-sql-exit-path — prove the no-lock-in exit path.
+#
+# `rocky emit-sql --out-dir build/sql` compiles the model DAG offline and
+# writes one dialect-correct `<model>.sql` file per model — the exact SQL
+# `rocky run` would execute, surrogate keys included. This POC then PROVES
+# those files run Rocky-free: it seeds a fresh DuckDB and replays the emitted
+# SQL in dependency order through the plain `duckdb` CLI, with no `rocky run`.
+#
+# The catalog name (`poc`) matches the DuckDB file stem (`poc.duckdb`), so the
+# emitted `CREATE OR REPLACE TABLE poc.main.<model>` targets and the bare
+# `FROM <upstream>` references both resolve in vanilla DuckDB with no ATTACH
+# and no search_path fiddling.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.exit_path]
+type = "transformation"
+models = "models/**"
+
+[pipeline.exit_path.target.governance]
+auto_create_schemas = true
+
+[pipeline.exit_path.execution]
+concurrency = 4

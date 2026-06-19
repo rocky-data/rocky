@@ -1,0 +1,18 @@
+# DELIBERATELY BROKEN — the misplacement guard.
+#
+# This member pins its own target.schema AND supplies [args]. The pin wins
+# (sidecar > group), so the schema_template is bypassed and the [args] can
+# never fill anything — they are dead. That combination usually masks a
+# routing mistake, so Rocky FAILS the load rather than silently misrouting.
+#
+# Fix one way or the other: pin a schema (drop [args]), OR route via [args]
+# (drop the pinned schema). Not both.
+
+group = "daily_marts"
+
+[target]
+catalog = "warehouse"
+schema  = "manual_override"   # pin overrides the group template...
+
+[args]
+region  = "emea"              # ...so this is dead — load-time error.

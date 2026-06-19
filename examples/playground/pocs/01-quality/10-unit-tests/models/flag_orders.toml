@@ -1,0 +1,61 @@
+depends_on = ["raw_orders"]
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "poc"
+schema = "marts"
+
+# ---------------------------------------------------------------------------
+# Fixture-driven unit tests. Singular [[test]] (NOT plural [[tests]]).
+#
+# Each block seeds a mock upstream with hand-written rows ([[test.given]]),
+# runs flag_orders.sql against it, and compares the result to [test.expect].
+# Default comparison is a multiset (row order ignored). Set ordered = true to
+# pin the exact output order — useful here because the model sorts amount DESC.
+# ---------------------------------------------------------------------------
+
+# Case 1 — DEFAULT multiset comparison (order does not matter).
+# Only the columns named in expect.rows are compared; `region` is ignored.
+[[test]]
+name = "flags_orders_at_or_above_100"
+description = "amount >= 100 is flagged high-value; the < 100 row is not"
+
+[[test.given]]
+ref = "raw_orders"
+rows = [
+    { order_id = 1, region = "emea",    amount = 150.0 },
+    { order_id = 2, region = "us_west", amount = 50.0 },
+    { order_id = 3, region = "emea",    amount = 100.0 },
+]
+
+[test.expect]
+rows = [
+    { order_id = 1, is_high_value = true },
+    { order_id = 2, is_high_value = false },
+    { order_id = 3, is_high_value = true },
+]
+
+# Case 2 — ORDERED comparison (ordered = true). The model sorts amount DESC,
+# so the expected rows must appear in descending-amount order. Reorder them
+# and the test fails — exactly the regression a positional assertion guards.
+[[test]]
+name = "sorts_by_amount_descending"
+description = "output is ordered by amount DESC; ordered = true pins the order"
+
+[[test.given]]
+ref = "raw_orders"
+rows = [
+    { order_id = 10, region = "emea",    amount = 25.0 },
+    { order_id = 11, region = "us_west", amount = 300.0 },
+    { order_id = 12, region = "emea",    amount = 175.0 },
+]
+
+[test.expect]
+ordered = true
+rows = [
+    { order_id = 11, amount = 300.0 },
+    { order_id = 12, amount = 175.0 },
+    { order_id = 10, amount = 25.0 },
+]

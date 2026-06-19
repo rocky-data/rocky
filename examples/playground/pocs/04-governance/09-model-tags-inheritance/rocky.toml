@@ -1,0 +1,22 @@
+# 09-model-tags-inheritance — governance tags: group baseline + per-key override
+#
+# A config group declares a [tags] baseline once; every member model inherits
+# it, and a member can override a single key from its own [tags] without
+# dropping the rest (sidecar > group, merged per key). The resolved tags land
+# on `rocky compile --output json` as models_detail[].tags, which dagster-rocky
+# projects onto each derived asset's Dagster tags.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.marts]
+type = "transformation"
+
+# Transformation pipelines defer catalog/schema/table to per-model sidecars
+# (here, to models/_defaults.toml). The adapter reference is all that's needed
+# at the pipeline level.
+[pipeline.marts.target]
+
+[pipeline.marts.target.governance]
+auto_create_schemas = true

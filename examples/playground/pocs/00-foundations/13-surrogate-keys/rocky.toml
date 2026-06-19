@@ -1,0 +1,27 @@
+# 13-surrogate-keys — a transformation model that injects a deterministic
+# surrogate-key column via a [[surrogate_key]] sidecar block. No credentials.
+#
+# Seed the local DuckDB once, then materialize the model:
+#   duckdb poc.duckdb < data/seed.sql
+#   rocky run
+#
+# The materialized `poc.main.order_keys` table carries an `order_key` column
+# that holds a 32-char md5 hash, byte-identical to what
+# dbt_utils.generate_surrogate_key('order_id', 'customer_id') produces.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.surrogate_keys]
+type = "transformation"
+models = "models/**"
+
+# The model targets the database's default schema (`poc.main`), so the
+# materialized table resolves the same way under `rocky run` and the
+# in-memory `rocky test` run.
+[pipeline.surrogate_keys.target.governance]
+auto_create_schemas = true
+
+[pipeline.surrogate_keys.execution]
+concurrency = 4

@@ -1,0 +1,13 @@
+[strategy]
+type = "full_refresh"
+
+# Rocky injects CAST(md5(tenant || order_id) AS VARCHAR) AS order_key into the
+# emitted SELECT — so the surrogate key survives the exit path and is rebuilt
+# by plain DuckDB, not by rocky run.
+[[surrogate_key]]
+name = "order_key"
+columns = ["tenant", "order_id"]
+
+[target]
+catalog = "poc"
+schema = "main"

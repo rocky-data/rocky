@@ -1,0 +1,12 @@
+# Member of the daily_marts group, APAC region.
+#
+# A third [args] value -> a third DISTINCT schema (mart_apac). Inherits the
+# group's strategy and full [tags] baseline unchanged.
+
+group = "daily_marts"
+
+[target]
+catalog = "warehouse"
+
+[args]
+region = "apac"         # fills {region} -> schema "mart_apac"

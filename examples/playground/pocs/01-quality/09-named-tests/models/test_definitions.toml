@@ -1,0 +1,13 @@
+# Reusable named tests — defined once here, applied by name from any model
+# via [[use_test]]. This is Rocky's answer to a dbt generic test: one
+# definition, many call sites, each free to override the column, severity,
+# or filter at the point of use.
+
+[positive_amount]
+type = "expression"
+expression = "amount > 0"
+
+[known_status]
+type = "accepted_values"
+values = ["pending", "shipped", "delivered"]
+column = "status"

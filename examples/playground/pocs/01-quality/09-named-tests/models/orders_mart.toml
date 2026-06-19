@@ -1,0 +1,25 @@
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "poc"
+schema = "demo"
+
+# Inline assertion — coexists with the named tests below. Shows that
+# [[tests]] (one-off, declared in place) and [[use_test]] (shared, declared
+# once in test_definitions.toml) live side by side on the same model.
+[[tests]]
+type = "not_null"
+column = "order_id"
+
+# Named test with a severity override: the shared `positive_amount`
+# definition fails the run by default (error); here it's downgraded to a
+# warning at this call site only.
+[[use_test]]
+name = "positive_amount"
+severity = "warning"
+
+# Named test using its definition's default column. `known_status` binds to
+# `status` (declared in test_definitions.toml) without restating it here.
+[[use_test]]
+name = "known_status"

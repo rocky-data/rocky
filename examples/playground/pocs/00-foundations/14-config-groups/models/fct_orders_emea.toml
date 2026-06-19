@@ -1,0 +1,13 @@
+# Member of the daily_marts group, EMEA region.
+#
+# The sidecar pins only `target.catalog`. The schema comes from the group's
+# schema_template, filled by [args]: region = "emea" -> schema "mart_emea".
+# strategy + [tags] are inherited from the group.
+
+group = "daily_marts"
+
+[target]
+catalog = "warehouse"   # schema comes from the group's schema_template
+
+[args]
+region = "emea"         # fills {region} -> schema "mart_emea"

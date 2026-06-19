@@ -1,0 +1,8 @@
+# Member 2 — inherits the FULL group baseline, overrides nothing.
+#
+# Joins the `finance` group with no [tags] of its own, so it inherits the
+# group's baseline verbatim.
+#
+# Resolved tags: domain = "finance", tier = "silver".
+
+group = "finance"

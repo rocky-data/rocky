@@ -1,0 +1,10 @@
+-- Customer order rollup (Rocky DSL group-by) — proves the DSL also reduces to
+-- plain SQL on the emit-sql exit path, not just hand-written SQL models.
+from stg_orders
+where status != "cancelled"
+group customer_id {
+    total_revenue: sum(amount),
+    order_count: count(),
+    first_order: min(order_date)
+}
+where total_revenue > 0

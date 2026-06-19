@@ -1,0 +1,14 @@
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "poc"
+schema = "demo"
+
+# Named test with a column-bind override: the same `known_status`
+# definition (whose default column is `status`) is re-pointed at this
+# model's differently-named `fulfilment_state` column. One definition,
+# applied to a column it was never written for.
+[[use_test]]
+name = "known_status"
+column = "fulfilment_state"

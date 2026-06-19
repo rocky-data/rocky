@@ -1,0 +1,12 @@
+# Same NON-enforced group as the parent POC. Without `enforce`, a member may
+# legitimately pin its own schema to override the template — but it must NOT
+# also supply [args], since the pin bypasses the template the args would fill.
+
+schema_template = "mart_{region}"
+
+[strategy]
+type = "full_refresh"
+
+[tags]
+domain = "sales"
+tier = "gold"

@@ -1,0 +1,17 @@
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "poc"
+schema = "main"
+
+# Rocky appends `CAST(md5(...) AS VARCHAR) AS order_key` to the model's
+# projection, hashing the listed input columns. The columns must be produced
+# by the SELECT above. The hash is byte-identical to
+# dbt_utils.generate_surrogate_key('order_id', 'customer_id') on this dialect.
+[[surrogate_key]]
+name = "order_key"
+columns = ["order_id", "customer_id"]
+
+[columns.order_key]
+description = "Deterministic md5 surrogate key over (order_id, customer_id), dbt_utils-compatible."
