@@ -146,8 +146,31 @@ try {
         exit 1
     }
 
-    # Install
-    Copy-Item -Path $BinaryPath -Destination (Join-Path $InstallDir "rocky.exe") -Force
+    # Install. On Windows a running executable is locked, so overwriting rocky.exe
+    # in place fails when a process is running it — most often the VS Code Rocky
+    # extension, which spawns `rocky lsp`. Renaming an in-use binary IS allowed (the
+    # running process keeps its handle to the renamed file), so this mirrors what
+    # install.sh does with `mv`: try a normal copy first, and on a locked overwrite,
+    # move the old binary aside and drop the new one into its place. The running LSP
+    # keeps using the renamed copy until VS Code (or the extension) restarts.
+    $Dest = Join-Path $InstallDir "rocky.exe"
+
+    # Clear leftover .old binaries from previous in-use updates (now unlocked).
+    Get-ChildItem -Path $InstallDir -Filter "rocky.exe.old*" -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+
+    try {
+        Copy-Item -Path $BinaryPath -Destination $Dest -Force -ErrorAction Stop
+    }
+    catch {
+        if (-not (Test-Path $Dest)) { throw }
+        # A unique name avoids colliding with a still-locked .old from an earlier
+        # in-use update in the same session.
+        $Stale = "$Dest.old-$(Get-Random)"
+        Move-Item -Path $Dest -Destination $Stale -Force
+        Copy-Item -Path $BinaryPath -Destination $Dest -Force
+        Write-Host "  Replaced an in-use rocky.exe. Restart VS Code (or the Rocky extension) to use the new version." -ForegroundColor Yellow
+    }
 }
 finally {
     Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
