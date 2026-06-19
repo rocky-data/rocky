@@ -165,12 +165,11 @@ If there's a cycle (A depends on B depends on A), Rocky reports it clearly and s
 The compiler is a 9-stage pipeline. It reads your models and produces a typed project description plus any diagnostics (errors/warnings).
 
 ```
-Stage 1: Load project
-  .sql + .toml files from disk → parsed models
+Stage 1: Load + resolve project
+  .sql + .toml files from disk → parsed models, DAG edges resolved
          ↓
 Stage 2: Build semantic graph
-  Parse SQL → extract table references → build DAG edges
-  Track column lineage: which col flows where
+  Parse SQL → extract table references → column lineage map
          ↓
 Stage 3: Type check
   Propagate types through the DAG
@@ -182,14 +181,14 @@ Stage 4: Contract validation
   Check column types match declared types
   Check protected columns aren't removed
          ↓
-Stage 5: Blast-radius lint
-  "You're changing orders.id — 4 downstream models use it"
+Stage 5: Blast-radius lint (P002)
+  Warn when a SELECT * model feeds consumers that read specific columns
          ↓
-Stage 6: Breaking-change classification
-  16 kinds of breaking change (E011: type narrowed, E013: col removed, ...)
+Stage 6: Classification-tag completeness (W004)
+  Warn on a [classification] tag with no matching [mask] strategy
          ↓
-Stage 7: Freshness coverage
-  Check that incremental models have freshness SLAs defined
+Stage 7: Freshness coverage (W005)
+  Warn on a model with temporal columns but no freshness block in scope
          ↓
 Stage 8: Merge diagnostics
   Collect all errors + warnings into a single list
@@ -211,13 +210,13 @@ error[E011]: column 'id' type mismatch
 
 Every diagnostic has: `code`, `severity` (Error/Warning/Info), `message`, `span` (file + line + col), `model`, and `suggestion`.
 
-**Key codes:**
-- `E001–E009` — Type errors (mismatch, incompatible join keys)
-- `E010` — Required contract column missing
-- `E011` — Column type doesn't match contract
-- `E012` — Nullability violation
-- `E013` — Protected column removed
-- `W001–W012` — Warnings (type widening, loose checks, etc.)
+**Key codes** (the full set spans E001–E033, W001–W012, P001–P002):
+- `E001` — Type-checking error (unresolved reference, type mismatch)
+- `E010`–`E013` — Contract violations (missing / retyped / nullability / protected-column removed)
+- `E020`–`E027` — Time-interval placeholders and budget ceiling
+- `E030` / `E033` — Cross-team import-contract violations
+- `W001`–`W012` — Warnings (unused model, duplicate column, classification + freshness gaps, …)
+- `P001` / `P002` — Dialect-portability and blast-radius lints
 
 ---
 
@@ -542,10 +541,10 @@ Rocky has a safety gate for AI-generated changes. An AI can propose a plan, but 
 
 **Rocky refuses `rocky apply` on AI-authored plans without an approval marker.** This is enforced in the engine — not a convention.
 
-The breaking-change classifier knows 16 kinds of breaking change:
-- Column removed, column renamed, type narrowed, type changed incompatibly
-- Required contract column removed, protected column dropped
-- Upstream model deleted, join key type changed, etc.
+The breaking-change classifier lives in `rocky-core` (consumed by `rocky review` and `rocky plan`, not the compiler) and knows 16 kinds of change:
+- Model added or removed; column dropped, added, retyped (narrowing flagged), nullability flipped, or reordered
+- Materialization strategy or key changed, partition-by changed, replication columns changed
+- Target renamed, source rebound, column mask changed, lakehouse format changed, SQL body changed
 
 ---
 
@@ -1088,4 +1087,3 @@ Everything Rocky does, in one ASCII map:
 | Health check everything | `rocky doctor -c rocky.toml` |
 | Generate a model with AI | `rocky ai "create a daily revenue summary by region"` |
 | Test models locally (no warehouse) | `rocky test --models models/` |
-```
