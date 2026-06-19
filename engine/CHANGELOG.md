@@ -7,10 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.52.0] — 2026-06-19
+
 ### Added
 
+- **Fixture-driven unit tests in `rocky test`.** A model sidecar can declare `[[test]]` blocks with mocked upstream inputs (`given`) and an `expect` table; `rocky test` seeds a fresh in-memory DuckDB, materializes the model against the fixtures, and compares the output (multiset comparison plus a row count). (#899)
+- **Named test definitions.** Define a data-quality assertion once in `models/test_definitions.toml` and apply it across models by name via `[[use_test]]`, overriding the column, severity, or row filter at the use site — the declarative analogue of dbt's generic tests. Inline `[[tests]]` keep working alongside. (#919)
+- **Config groups.** A `models/groups/<name>.toml` definition fans shared routing (`schema_template`, filled per model from its `[args]`) and strategy out to every model that opts in with `group = "<name>"`, so a one-line change flows to the whole group. (#917)
+- **Enforced config groups.** `enforce = true` makes a group's fields binding rather than defaults: a member that locally pins the group-controlled target schema or strategy fails the load instead of silently diverging from the group. (#918)
 - **Model-level `[tags]`, inheritable from config groups.** A model can declare a `[tags]` block of free-form governance attributes (`domain`, `tier`, `owner`, …), and a config group can declare `[tags]` that every member inherits as a shared baseline — a model's own tags override the group per key (sidecar > group). Resolved tags are surfaced on `rocky compile --output json` as `models_detail[].tags`, where orchestrators can read them. Merged at the shared `.sql` / `.rocky` resolution path so both model formats inherit. (#920)
 - **Config-group misplacement guard.** A group member that pins its own `target.schema` **and** supplies `[args]` now fails the load: the pin bypasses the group's `schema_template`, so the args could only fill a template that's never used — a contradiction that usually masks a routing mistake. Pinning a schema with no args (a legitimate override) and routing via args with no pin both stay valid. (#923)
+- **Deterministic surrogate keys.** A model sidecar can declare `[[surrogate_key]]` blocks (an output column name plus its input columns); `rocky run` injects each as a dialect-correct, dbt-value-identical MD5 hash column at materialization (DuckDB, Databricks, Snowflake, BigQuery), validates the spec at load, and treats a newly added key as a change so the model re-materializes rather than being skipped as unchanged. (#911, #913, #914)
+- **Per-column documentation.** Column descriptions declared in a model sidecar `[columns.<name>]` table now surface in `rocky docs` (the HTML catalog) and `rocky catalog --output json`. (#900)
+- **`rocky emit-sql` — a tested, dependency-ordered exit path.** Renders the runnable SQL each transformation model would produce, offline with no warehouse connection, either to stdout or as one `<model>.sql` file per model under `--out-dir`. A project always reduces to plain SQL, so adopting Rocky is never a one-way door. (#916)
 
 ### Changed
 
