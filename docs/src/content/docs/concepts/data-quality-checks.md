@@ -101,6 +101,8 @@ Row count and freshness checks use batched `UNION ALL` queries in groups of 200 
 
 Declarative assertions are defined as repeated `[[assertions]]` (or `[[tests]]` in a model sidecar) blocks. Each one declares a `type`, optional `column`, optional `severity`, optional `filter`, and type-specific parameters.
 
+**Don't confuse `[[tests]]` with `[[test]]`.** They differ by one letter and run on different paths. The plural `[[tests]]` (and the equivalent `[[assertions]]`) are the declarative assertions on this page. Assertions written under `[pipeline.<name>.checks]` run inline against the warehouse during `rocky run`/`apply`; the model-sidecar `[[tests]]` form runs standalone with `rocky test --declarative`, which executes each assertion against the configured warehouse adapter. The singular `[[test]]` is a separate surface: fixture-driven unit tests that mock upstream inputs (`given`) and assert expected output rows (`expect`), run locally on DuckDB by plain `rocky test`. The assertions check rows already in the warehouse; the unit tests check the model's SQL against fixtures, with no warehouse connection.
+
 ```toml
 [[assertions]]
 type = "not_null"

@@ -54,7 +54,14 @@ The `.toml` file specifies the model name, dependencies, materialization strateg
 |-------|------|----------|-------------|
 | `name` | string | Yes | Model identifier. Must be unique across all models. |
 | `depends_on` | list of strings | No | Names of upstream models that must run before this one. Defaults to `[]`. |
+| `group` | string | No | Name of a [config group](#config-groups) (`models/groups/<name>.toml`) this model opts into for shared routing and materialization. |
 | `retention` | string | No | Data retention policy for this model. Grammar `^\d+[dy]$` — e.g. `"90d"` or `"1y"`. See [Retention](#retention). |
+
+**`[args]`** -- Placeholder values for a config group's `schema_template` (only meaningful when the model declares a `group`):
+
+| Key pattern | Value type | Description |
+|---|---|---|
+| `<placeholder>` | string | Fills a `{placeholder}` in the group's `schema_template` (e.g. `region = "emea"` resolves `mart_{region}` to `mart_emea`). Ignored when the model declares no `group`. See [Config groups](#config-groups). |
 
 **`[strategy]`** -- Materialization configuration:
 
@@ -247,6 +254,180 @@ owner = "data-eng"
 | `<tag_name>` | string | Free-form governance attribute. Merged over any [config-group `[tags]`](#group-tags) baseline (sidecar > group). |
 
 Resolved tags are emitted on `rocky compile --output json` as `models_detail[].tags`. The `dagster-rocky` integration projects them onto the derived asset's Dagster tags, so the same attribute drives both Rocky's view of the model and the orchestrator's. Tags are inherited from a model's config group when it belongs to one — see [Group tags](#group-tags).
+
+### `[[surrogate_key]]`
+
+Declares a computed surrogate-key column. Rocky injects a deterministic hash of the listed input columns into the materialized SELECT, so you don't hand-write the hash expression in your SQL.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Output column name for the injected key. Must be a valid SQL identifier (`^[a-zA-Z0-9_]+$`). |
+| `columns` | list of strings | Yes | Input columns to hash. At least one, each a valid SQL identifier. |
+
+```toml
+# models/dim_customers.toml
+name = "dim_customers"
+
+[[surrogate_key]]
+name = "customer_sk"
+columns = ["tenant_id", "customer_id"]
+
+[target]
+catalog = "warehouse"
+schema = "marts"
+table = "dim_customers"
+```
+
+At `rocky run` (and on the emit-SQL path), Rocky appends `CAST(md5(...) AS <string_type>) AS <name>` to the model's projection, computed over the input columns. The hash expression is dialect-correct: it uses the warehouse's variable-length string type (`STRING` on Databricks and BigQuery, `VARCHAR` on Snowflake, DuckDB, and Trino) and BigQuery's `to_hex(...)` / `concat(...)` form where the default `||` concatenation doesn't apply. On a given warehouse the hash value is the same one `dbt_utils.generate_surrogate_key` produces over the same columns, so a surrogate key keeps the same values whether it was built by Rocky or a prior dbt project and a key Rocky computes joins against the same key in an upstream dbt model. NULL inputs coalesce to a fixed sentinel before hashing, matching dbt-utils.
+
+A `[[surrogate_key]]` block uses `deny_unknown_fields`: a typo such as `colums = [...]` fails the load rather than silently hashing nothing. An empty `columns` list or a `name` / column that isn't a valid identifier is rejected at load with a clear diagnostic. Declare multiple blocks to inject more than one key column.
+
+### `[[tests]]`
+
+Inline declarative data-quality assertions. Each `[[tests]]` block is one assertion that runs against the model's target table. Tests are declarative TOML, not SQL macros. Rocky generates the assertion SQL for the active dialect.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | Yes | Assertion kind. Common types: `not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`. (More are available, including `in_range`, `regex_match`, `aggregate`, and composite-key uniqueness.) |
+| `column` | string | Sometimes | Column under test. Required for `not_null`, `unique`, `accepted_values`, `relationships`. Ignored for `expression` and `row_count_range`. |
+| `severity` | string | No | `"error"` (default) fails the run; `"warning"` records the failure and continues. |
+| `filter` | string | No | SQL boolean predicate that scopes the assertion to a subset of rows. Only rows where the filter is `TRUE` are checked; rows where it's `FALSE` or `NULL` pass unconditionally. |
+
+Type-specific fields: `accepted_values` takes `values` (a list of allowed string literals), `relationships` takes `to_table` and `to_column` (referential integrity against another table), `expression` takes an `expression` (a SQL boolean that must hold for every row), and `row_count_range` takes `min` and/or `max` (inclusive bounds on the total row count).
+
+```toml
+# models/fct_orders.toml
+name = "fct_orders"
+
+[[tests]]
+type = "not_null"
+column = "order_id"
+
+[[tests]]
+type = "unique"
+column = "order_id"
+
+[[tests]]
+type = "accepted_values"
+column = "status"
+values = ["pending", "shipped", "delivered"]
+severity = "warning"
+
+[[tests]]
+type = "expression"
+expression = "amount >= 0"
+filter = "status != 'cancelled'"
+
+[[tests]]
+type = "row_count_range"
+min = 1
+```
+
+`filter` and `expression` are user-supplied SQL passed through verbatim, so treat them with the same trust as any SQL you run against the warehouse.
+
+### `[[use_test]]`
+
+References a reusable test defined once in `models/test_definitions.toml` and applies it to this model by name. Use this when several models share the same assertion and you don't want to repeat it as inline `[[tests]]`.
+
+A named definition lives in `models/test_definitions.toml`, keyed by name, carrying the test `type` and its parameters plus an optional default `column`:
+
+```toml
+# models/test_definitions.toml
+[positive_amount]
+type = "expression"
+expression = "amount > 0"
+
+[known_status]
+type = "accepted_values"
+values = ["pending", "shipped", "delivered"]
+column = "status"
+```
+
+A model applies one with a `[[use_test]]` reference:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Name of the definition in `test_definitions.toml`. An unknown name fails the load. |
+| `column` | string | No | Column to bind the test to. Overrides the definition's own `column` at this use site. |
+| `severity` | string | No | Failure severity here. Defaults to `error`. |
+| `filter` | string | No | Row-scoping SQL predicate, same contract as an inline test's `filter`. |
+
+```toml
+# models/fct_orders.toml
+name = "fct_orders"
+
+[[use_test]]
+name = "positive_amount"
+severity = "warning"
+
+[[use_test]]
+name = "known_status"
+column = "order_status"   # override the definition's default column
+```
+
+Resolved references are appended to the model's `[[tests]]` at load. A `[[use_test]]` block uses `deny_unknown_fields`, so a mistyped key (`colum =`, `filer =`) is rejected at load rather than silently applying the test with the wrong binding.
+
+### `[[test]]`
+
+A fixture-driven unit test. Where `[[tests]]` asserts properties of materialized output, a `[[test]]` checks the model's SQL logic against hand-written inputs: it seeds mock upstream tables, runs the model SQL, and compares the result to an expected set of rows. The block name is singular (`[[test]]`), unlike the plural `[[tests]]` used for declarative assertions.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Test name. Unique within the model. |
+| `description` | string | No | Free-form note describing what the test covers. |
+
+Each test declares one or more input fixtures and one expected output:
+
+- **`[[test.given]]`** — a mocked upstream model or source. `ref` is the name to mock (matches a `depends_on` or `from` reference); `rows` is an inline list of TOML tables seeded as that table's contents.
+- **`[test.expect]`** — the expected output. `rows` is the list of expected output rows. Set `ordered = true` to require the output in exactly this order; the default is a multiset comparison where row order doesn't matter.
+
+```toml
+# models/high_value_orders.toml
+name = "high_value_orders"
+
+[[test]]
+name = "flags_orders_over_100"
+description = "Orders over $100 should be flagged as high value"
+
+[[test.given]]
+ref = "orders"
+rows = [
+    { id = 1, amount = 150.0, status = "completed" },
+    { id = 2, amount = 50.0, status = "completed" },
+    { id = 3, amount = 200.0, status = "cancelled" },
+]
+
+[test.expect]
+rows = [
+    { id = 1, amount = 150.0, is_high_value = true },
+    { id = 3, amount = 200.0, is_high_value = true },
+]
+```
+
+The runner seeds DuckDB with each `given` fixture, executes the model SQL, and asserts the result matches `expect`. A test may declare several `[[test.given]]` blocks to mock more than one upstream, and a model may declare several `[[test]]` blocks.
+
+### `[columns.<name>]`
+
+Per-column documentation. Each `[columns.<name>]` table attaches a description to one output column:
+
+| Field | Type | Description |
+|---|---|---|
+| `description` | string | Natural-language description of the column. |
+
+```toml
+# models/fct_orders.toml
+name = "fct_orders"
+
+[columns.order_id]
+description = "Unique order identifier"
+
+[columns.amount]
+description = "Order total in USD"
+```
+
+Descriptions surface in `rocky catalog --output json` as each asset's `CatalogColumn.description`. A description is attached only when its `<name>` matches a column the model actually projects; a description for a column the SELECT doesn't produce is silently dropped, so keep the key in sync with your output columns. The `rocky docs` HTML catalog does not emit per-column detail (it has no warehouse connection to introspect the column list), so column descriptions reach consumers through `rocky catalog`, not the generated HTML.
+
+The singular `[columns.<name>]` table documents columns, and is distinct from the plural `[[columns]]` array used to declare a contract's column schema. The two look similar but do different jobs.
 
 ### Retention
 

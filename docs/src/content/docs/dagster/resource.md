@@ -158,6 +158,8 @@ Runs `rocky lineage` and returns the dependency graph for a model or a single co
 
 Runs `rocky test` to execute models locally via DuckDB without warehouse credentials.
 
+`TestResult` is an import-compatible alias of the generated `TestOutput`. Its `.failures` field is a list of `TestFailure` objects, each with a `name` and an `error` field.
+
 **Wraps**: `rocky test --models <models_dir> --output json`
 
 | Parameter | Type | Default | Description |
@@ -167,6 +169,8 @@ Runs `rocky test` to execute models locally via DuckDB without warehouse credent
 ### `ci() -> CiResult`
 
 Runs `rocky ci` (compile + test) and returns the combined result.
+
+`CiResult` is an import-compatible alias of the generated `CiOutput`. Its `.failures` field is a list of `TestFailure` objects, each with a `name` and an `error` field.
 
 **Wraps**: `rocky ci --models <models_dir> --output json`
 

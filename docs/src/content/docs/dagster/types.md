@@ -8,7 +8,7 @@ sidebar:
 All data returned by `RockyResource` methods is parsed into Pydantic v2 models. These models provide type safety, validation, and IDE autocompletion.
 
 :::tip[Source of truth]
-These types are generated from the engine's JSON schemas via `just codegen`; the generated [`dagster_rocky.types_generated`](https://github.com/rocky-data/rocky/tree/main/integrations/dagster/src/dagster_rocky/types_generated) module is the canonical, complete definition, and `dagster_rocky.types` re-exports it with Python-flavored names. This page documents the types you consume most (discover, run, compile, doctor) plus `parse_rocky_output`. For any type not shown here, consult the generated module or the [JSON Output reference](/reference/json-output/).
+These types are generated from the engine's JSON schemas via `just codegen`; the generated [`dagster_rocky.types_generated`](https://github.com/rocky-data/rocky/tree/main/integrations/dagster/src/dagster_rocky/types_generated) module is the canonical, complete definition, and `dagster_rocky.types` re-exports it with Python-flavored names. This page documents the types you consume most (discover, run, compile, test, ci, doctor) plus `parse_rocky_output`. For any type not shown here, consult the generated module or the [JSON Output reference](/reference/json-output/).
 :::
 
 ## Discover types
@@ -279,7 +279,7 @@ Top-level result from `rocky compile`.
 | `execution_layers` | `int` | Number of execution layers in the DAG |
 | `diagnostics` | `list[Diagnostic]` | Compiler diagnostics (errors, warnings, info) |
 | `has_errors` | `bool` | Whether any diagnostics are errors |
-| `models_detail` | `list[ModelDetail]` | Per-model detail (strategy, target, freshness) |
+| `models_detail` | `list[ModelDetail]` | Per-model detail (strategy, target, freshness, tags) |
 
 ### `Diagnostic`
 
@@ -304,6 +304,89 @@ Per-model summary from compilation.
 | `strategy` | `dict` | Strategy configuration (tagged union) |
 | `target` | `dict[str, str]` | Target catalog/schema/table |
 | `freshness` | `ModelFreshnessConfig \| None` | Per-model freshness config |
+| `tags` | `dict[str, str] \| None` | Model governance tags (own + group-inherited), projected onto Dagster asset tags |
+
+---
+
+## Test and CI types
+
+`TestResult` and `CiResult` are import-compatible aliases for the generated `TestOutput` and `CiOutput`. `parse_rocky_output` dispatches the `"test"` command to `TestOutput` and the `"ci"` command to `CiOutput`. Both share the same `TestFailure` shape for the `failures` list. The nested sub-types (`ModelTestResult`, `DeclarativeTestSummary`, `UnitTestSummary`, and their per-item types) are not re-exported at the top level; import them from `rocky_sdk.types_generated.test_schema` when you need to type-annotate those fields.
+
+### `TestOutput`
+
+Top-level result from `rocky test`. Also exported as `TestResult`.
+
+| Field | Type | Description |
+|---|---|---|
+| `version` | `str` | Output schema version |
+| `command` | `str` | Command that produced this output |
+| `total` | `int` | Total tests run |
+| `passed` | `int` | Tests that passed |
+| `failed` | `int` | Tests that failed |
+| `failures` | `list[TestFailure]` | Failed tests, each a `{name, error}` object |
+| `model_results` | `list[ModelTestResult] \| None` | Per-model outcomes from the model-execution test, passes included. Empty when only declarative tests ran; filtered to `--model` when that flag is set |
+| `declarative` | `DeclarativeTestSummary \| None` | Results from declarative `[[tests]]` in model sidecars. Present only when `--declarative` is used |
+| `unit_tests` | `UnitTestSummary \| None` | Results from fixture-driven `[[test]]` unit tests. Present only when at least one model declares a `[[test]]` block |
+
+### `TestFailure`
+
+A single failed test. The `failures` field carries these as objects, not positional tuples.
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | `str` | Test name |
+| `error` | `str` | Failure message |
+
+### `ModelTestResult`
+
+One per-model outcome from the model-execution test.
+
+| Field | Type | Description |
+|---|---|---|
+| `model` | `str` | Model name |
+| `status` | `str` | `"pass"` or `"fail"` |
+| `error` | `str \| None` | Failure message, set only when `status` is `"fail"` |
+
+### `DeclarativeTestSummary`
+
+Summary of declarative test execution from `[[tests]]` in model sidecars.
+
+| Field | Type | Description |
+|---|---|---|
+| `total` | `int` | Total declarative assertions run |
+| `passed` | `int` | Assertions that passed |
+| `failed` | `int` | Assertions that failed |
+| `warned` | `int` | Assertions that failed at `warning` severity |
+| `errored` | `int` | Assertions that raised an execution error |
+| `results` | `list[DeclarativeTestResult]` | Per-assertion detail |
+
+### `UnitTestSummary`
+
+Summary of fixture-driven unit-test execution from `[[test]]` blocks in model sidecars.
+
+| Field | Type | Description |
+|---|---|---|
+| `total` | `int` | Total unit tests run |
+| `passed` | `int` | Unit tests that passed |
+| `failed` | `int` | Unit tests that failed |
+| `results` | `list[UnitTestResult]` | Per-test detail, including row-level mismatches |
+
+### `CiOutput`
+
+Top-level result from `rocky ci`. Also exported as `CiResult`.
+
+| Field | Type | Description |
+|---|---|---|
+| `version` | `str` | Output schema version |
+| `command` | `str` | Command that produced this output |
+| `compile_ok` | `bool` | Whether compilation succeeded |
+| `models_compiled` | `int` | Number of models compiled |
+| `diagnostics` | `list[Diagnostic]` | Compiler diagnostics (errors, warnings, info) |
+| `tests_ok` | `bool` | Whether all tests passed |
+| `tests_passed` | `int` | Tests that passed |
+| `tests_failed` | `int` | Tests that failed |
+| `failures` | `list[TestFailure]` | Failed tests, each a `{name, error}` object |
+| `exit_code` | `int` | Process exit code |
 
 ---
 

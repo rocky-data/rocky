@@ -47,7 +47,12 @@ Each derived-model asset gets:
   group, which usually corresponds to a logical layer (`raw` /
   `staging` / `marts`).
 - **Tags:** `rocky/strategy`, `rocky/target_catalog`,
-  `rocky/target_schema`, `rocky/model_name`.
+  `rocky/target_schema`, `rocky/model_name`, plus the model's resolved
+  `[tags]` (its own block merged over any config-group baseline)
+  projected as first-class Dagster tags via
+  `RockyDagsterTranslator.get_model_tags`, so a governance tag is usable
+  in asset selection (`dagster asset materialize --select
+  tag:domain=finance`).
 - **Kinds:** `{"rocky", "model"}` for UI badges.
 - **Freshness policy:** from `model.freshness` (`[freshness]
   max_lag_seconds` in the model's TOML frontmatter).

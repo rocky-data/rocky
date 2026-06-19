@@ -8,7 +8,7 @@ sidebar:
 Rocky provides a single binary with subcommands for the full pipeline lifecycle. Commands are organized into categories:
 
 - **Core Pipeline**: `init`, `validate`, `discover`, `plan`, `apply`, `state`, `branch` (single-step alias: `run`)
-- **Modeling**: `compile`, `lineage`, `lineage-diff`, `test`, `ci`, `ci-diff`, `preview`
+- **Modeling**: `compile`, `lineage`, `lineage-diff`, `test`, `ci`, `ci-diff`, `preview`, `emit-sql`, `catalog`
 - **Data**: `seed`, `snapshot`, `docs`
 - **AI**: `ai`, `ai-sync`, `ai-explain`, `ai-test`
 - **Development**: `playground`, `shell`, `watch`, `fmt`, `list`, `serve`, `lsp`, `import-dbt`, `init-adapter`, `adapter`, `hooks`, `validate-migration`, `test-adapter`
@@ -636,6 +636,68 @@ rocky docs --models models/ --output site/api.html  # Custom paths
   "duration_ms": 15
 }
 ```
+
+---
+
+### `rocky emit-sql`
+
+Render the runnable SQL each transformation model would produce, without a warehouse connection and without running anything. This is the tested exit path: a Rocky project always reduces to plain SQL files you can run directly or hand to a dbt / hand-SQL fallback, so adopting Rocky is never a one-way door. See [No lock-in](/guides/no-lock-in/) for the full workflow.
+
+```bash
+rocky emit-sql                                   # Print SQL for every model to stdout
+rocky emit-sql --out-dir build/sql/              # Write one <model>.sql file per model
+rocky emit-sql --model stg_orders --out-dir sql/ # Emit a single model
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--models <PATH>` | `models` | Models directory to compile. |
+| `--model <NAME>` | (all) | Restrict output to a single model by name. |
+| `--out-dir <PATH>` | (stdout) | Write one `<model>.sql` file per model into this directory, in dependency order. When omitted, the concatenated SQL is printed to stdout, also in dependency order. |
+
+**Behavior:**
+
+- Compiles the project offline and generates SQL through the same path `rocky run` uses, including declared surrogate-key columns, so the emitted statements match what a run executes.
+- The dialect is the project's configured target adapter type, resolved from `rocky.toml` without credentials. With no resolvable config it defaults to DuckDB. All models render in this one resolved dialect, so for a project whose models target more than one adapter, the emitted SQL matches `rocky run` only for the models whose target uses that dialect.
+- **Full-refresh models.** Emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect.
+- **Incremental and merge models.** Emit their steady-state statement (a bare `INSERT` / `MERGE` against an existing target). `rocky run` bootstraps the target table on first build and threads the incremental watermark from state, neither of which a static emit can reproduce, so each such file carries a leading `-- NOTE:` comment to that effect.
+- Models that produce no standalone SQL are reported on stderr rather than silently dropped. This covers ephemeral models (inlined as CTEs) and strategies that cannot render offline, such as Snowflake dynamic tables, which need a live compute-warehouse name.
+
+This command prints SQL or writes files; it has no JSON output mode.
+
+---
+
+### `rocky catalog`
+
+Emit a project-wide column-level lineage snapshot as a persisted catalog artifact, so any non-Rocky consumer can read column-level lineage without invoking the engine.
+
+```bash
+rocky catalog                              # Write all artifacts to ./.rocky/catalog/
+rocky catalog --out build/catalog/         # Custom output directory
+rocky catalog --format json               # Emit only catalog.json
+rocky catalog --catalog acme_warehouse     # Scope to a single warehouse catalog
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--models <PATH>` | `models` | Models directory to compile. |
+| `--out <PATH>` | `./.rocky/catalog/` | Output directory for the catalog artifacts. |
+| `--format <FORMAT>` | `both` | Which artefact family to emit. `json` writes only `catalog.json`; `parquet` writes only `edges.parquet` and `assets.parquet`; `both` writes all three. |
+| `--catalog <NAME>` | (all) | Scope the snapshot to a single warehouse catalog. Only assets whose fully-qualified name sits in the named catalog are emitted, and edges referencing dropped assets are pruned. Mirrors `compact --catalog` and `archive --catalog`. |
+
+**Artifacts:**
+
+- `catalog.json` is the single-file front door for the snapshot.
+- `edges.parquet` holds one row per column-lineage edge.
+- `assets.parquet` holds one row per asset column.
+
+**Behavior:**
+
+- JSON output is [`CatalogOutput`](/reference/json-output/). Under `--output json` the same `CatalogOutput` is mirrored to stdout, independent of `--format`, so a consumer can pipe it without re-reading the written files.
 
 ---
 

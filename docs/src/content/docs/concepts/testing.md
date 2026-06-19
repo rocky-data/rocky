@@ -129,11 +129,146 @@ Testing 12 models...
   "passed": 10,
   "failed": 2,
   "failures": [
-    ["orders_summary", "column 'revenue' type mismatch"],
-    ["customer_ltv", "required column 'customer_id' missing"]
+    { "name": "orders_summary", "error": "column 'revenue' type mismatch" },
+    { "name": "customer_ltv", "error": "required column 'customer_id' missing" }
   ]
 }
 ```
+
+## Unit tests (`[[test]]`)
+
+A unit test feeds a model mocked input rows and asserts on the rows it produces. This is the same approach dbt 1.8 ships as unit tests: you exercise the model's logic in isolation, against fixtures you control, without touching the warehouse. Rocky runs unit tests on the default `rocky test` path via DuckDB, alongside the local model-execution check above.
+
+Unit tests live in a model's `.toml` sidecar as singular `[[test]]` blocks. Each block names the test, declares one or more mocked inputs under `[[test.given]]`, and declares the expected output under `[test.expect]`:
+
+```toml
+# models/orders_summary.toml
+
+[[test]]
+name = "high_value_orders"
+description = "Orders over $100 should be flagged as high value"
+
+[[test.given]]
+ref = "orders"
+rows = [
+    { id = 1, amount = 150.0, status = "completed" },
+    { id = 2, amount = 50.0, status = "completed" },
+    { id = 3, amount = 200.0, status = "cancelled" },
+]
+
+[test.expect]
+rows = [
+    { id = 1, amount = 150.0, is_high_value = true },
+    { id = 3, amount = 200.0, is_high_value = true },
+]
+```
+
+The runner seeds DuckDB with each `[[test.given]]` fixture as a table named after its `ref`, executes the model's compiled SQL against those fixtures, and compares the result to `[test.expect]`.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Test name, unique within the model. |
+| `description` | No | Documentation for human readers. |
+| `[[test.given]]` | No | A mocked upstream input. `ref` is the model or source name to stand in for (matches the model's `from` / `depends_on` references); `rows` is an inline list of input rows. Repeat the block to mock more than one input. |
+| `[test.expect]` | Yes | The expected output. `rows` is an inline list of expected rows; `ordered` is an optional boolean. |
+
+Comparison rules:
+
+- **Multiset by default.** Rows are compared as a multiset (order does not matter, but duplicate counts do), implemented as `EXCEPT ALL` in both directions so a missing row and an unexpected row are both reported.
+- **Ordered comparison.** Set `ordered = true` under `[test.expect]` to compare rows positionally, in the model's output order against the declaration order of the expected rows.
+- **Only asserted columns are compared.** The comparison uses the columns present in the expected rows. Extra columns in the model's output are ignored, so you assert on the columns you care about.
+- **Empty `rows` asserts zero output.** An empty `[test.expect]` `rows` list asserts that the model produces no rows for the given inputs.
+
+```bash
+# Unit tests run automatically on the default test path
+rocky test --models models/
+
+# Scope to one model
+rocky test --models models/ --model orders_summary
+```
+
+When a project declares any `[[test]]` blocks, `rocky test` reports a unit-test summary after the model results, and the `--output json` payload gains a `unit_tests` object:
+
+```json
+{
+  "version": "1.6.0",
+  "command": "test",
+  "total": 12,
+  "passed": 12,
+  "failed": 0,
+  "failures": [],
+  "unit_tests": {
+    "total": 3,
+    "passed": 2,
+    "failed": 1,
+    "results": [
+      {
+        "model": "orders_summary",
+        "test": "high_value_orders",
+        "passed": false,
+        "error": "output mismatch: 1 expected row(s) missing, 0 unexpected row(s)"
+      }
+    ]
+  }
+}
+```
+
+A failed unit test also carries a `mismatches` array of row-level diagnostics (each entry naming a missing, extra, or value-differing row), omitted above for brevity. A unit-test failure fails the `rocky test` run with a non-zero exit code, the same as a model-execution failure.
+
+## Declarative tests (`[[tests]]`)
+
+Declarative tests are assertions about the data already in your warehouse: not-null columns, uniqueness, accepted values, referential integrity, row-count ranges, and more. They share the assertion vocabulary of pipeline-level data quality checks. See [Data quality checks](/concepts/data-quality-checks/) for the full catalog of assertion kinds, severity, and quarantine behavior.
+
+Declarative tests use the plural `[[tests]]` array in a model's `.toml` sidecar. Each entry declares a `type`, an optional `column`, an optional `severity`, an optional `filter`, and type-specific parameters:
+
+```toml
+# models/orders_summary.toml
+
+[[tests]]
+type = "not_null"
+column = "customer_id"
+
+[[tests]]
+type = "unique"
+column = "order_id"
+
+[[tests]]
+type = "accepted_values"
+column = "status"
+values = ["pending", "shipped", "delivered"]
+severity = "warning"
+```
+
+Run them with `--declarative`. Unlike unit tests, declarative tests execute against the configured warehouse adapter rather than DuckDB, so they need a `rocky.toml` and a reachable warehouse:
+
+```bash
+# Run declarative assertions against the warehouse
+rocky test --declarative
+
+# Pick a pipeline when the config defines more than one
+rocky test --declarative --pipeline silver
+
+# Scope to one model
+rocky test --declarative --model orders_summary
+```
+
+Each assertion compiles to a SQL query in the adapter's dialect, runs against the model's target table, and reports `pass`, `fail`, or `error`. An assertion with `severity = "error"` (the default) that fails causes a non-zero exit; `severity = "warning"` reports without failing the run. The `--output json` payload carries a `declarative` summary with per-assertion results and the SQL that ran.
+
+### Reusable named tests
+
+To apply the same assertion across many models, define it once in `models/test_definitions.toml` and reference it by name with a `[[use_test]]` block. Inline `[[tests]]` and `[[use_test]]` references coexist in a sidecar, and references resolve into ordinary assertions at load. See the [Reusable named tests](/concepts/data-quality-checks/#reusable-named-tests) section of the data quality checks page for the full syntax.
+
+### `[[test]]` vs `[[tests]]`
+
+The singular and plural keys are two different test mechanisms. The names are close, so keep the distinction in mind:
+
+| | `[[test]]` (singular) | `[[tests]]` (plural) |
+|---|---|---|
+| What it tests | Model logic against mocked inputs | Data already in the warehouse |
+| Inputs | `[[test.given]]` fixtures you supply | The model's real target table |
+| Executes against | DuckDB, locally | The configured warehouse adapter |
+| How to run | `rocky test` (default path) | `rocky test --declarative` |
+| Analogous to | dbt 1.8 unit tests | dbt / DQX data tests and assertions |
 
 ## rocky ci
 

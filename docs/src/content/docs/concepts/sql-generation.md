@@ -88,6 +88,47 @@ User-defined SQL is wrapped in the appropriate statement depending on the materi
 - **Dynamic Table**: `CREATE OR REPLACE DYNAMIC TABLE ... TARGET_LAG = '<lag>' AS <user_sql>` (Snowflake)
 - **Time Interval**: Per-partition `INSERT OVERWRITE` with `@start_date`/`@end_date` substitution
 
+## Surrogate Key Columns
+
+A model declares deterministic surrogate keys with `[[surrogate_key]]` blocks in its `.toml` sidecar:
+
+```toml
+[[surrogate_key]]
+name = "order_key"
+columns = ["order_id"]
+```
+
+At `rocky run` and `rocky emit-sql`, Rocky wraps the model's SELECT and appends each key as a top-level column (DuckDB shown):
+
+```sql
+SELECT *, CAST(md5(cast(coalesce(cast(order_id as VARCHAR), '_dbt_utils_surrogate_key_null_') as VARCHAR)) AS VARCHAR) AS order_key
+FROM (
+<user_sql>
+) AS __rocky_keyed
+```
+
+The hash expression follows dbt-utils' `generate_surrogate_key`: each input is cast to text, NULL-coalesced to the `_dbt_utils_surrogate_key_null_` sentinel, joined with a `-` separator, and MD5-hashed. Most warehouses concatenate with `||` and differ only in the text type they cast to:
+
+- **DuckDB / Snowflake** cast to `VARCHAR`:
+
+  ```sql
+  md5(cast(coalesce(cast(a as VARCHAR), '_dbt_utils_surrogate_key_null_') || '-' || coalesce(cast(b as VARCHAR), '_dbt_utils_surrogate_key_null_') as VARCHAR))
+  ```
+
+- **Databricks** casts to `STRING` (Spark SQL rejects an unsized `VARCHAR`):
+
+  ```sql
+  md5(cast(coalesce(cast(a as STRING), '_dbt_utils_surrogate_key_null_') || '-' || coalesce(cast(b as STRING), '_dbt_utils_surrogate_key_null_') as STRING))
+  ```
+
+- **BigQuery** wraps the hash in `to_hex(...)` (its `MD5()` returns `BYTES`) and concatenates with `concat(...)` instead of `||`, casting to `STRING`:
+
+  ```sql
+  to_hex(md5(cast(concat(coalesce(cast(a as STRING), '_dbt_utils_surrogate_key_null_'), '-', coalesce(cast(b as STRING), '_dbt_utils_surrogate_key_null_')) as STRING)))
+  ```
+
+The hash digest is the same one dbt-utils' `generate_surrogate_key` produces for the same columns, so a key Rocky computes joins against the same key in an upstream dbt model.
+
 ## Materialized View (Databricks)
 
 ```sql
