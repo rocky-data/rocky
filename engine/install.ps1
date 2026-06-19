@@ -18,6 +18,36 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = 'SilentlyContinue'
 
+# Install a binary with rename-then-replace. On Windows a running executable is
+# locked, so overwriting it in place fails when a process is running it (most
+# often the VS Code Rocky extension). Renaming an in-use binary IS allowed — the
+# running process keeps its handle to the renamed file until it restarts — so try
+# a normal copy first and, on a locked overwrite, move the old binary aside and
+# drop the new one into place. Mirrors what install.sh does with `mv`.
+function Install-RockyBinary {
+    param(
+        [Parameter(Mandatory)] [string]$Source,
+        [Parameter(Mandatory)] [string]$Dest
+    )
+    $Name = [System.IO.Path]::GetFileName($Dest)
+    $Dir = Split-Path -Path $Dest -Parent
+    # Sweep leftover .old binaries from previous in-use updates (now unlocked).
+    Get-ChildItem -Path $Dir -Filter "$Name.old*" -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    try {
+        Copy-Item -Path $Source -Destination $Dest -Force -ErrorAction Stop
+    }
+    catch {
+        if (-not (Test-Path $Dest)) { throw }
+        # A unique name avoids colliding with a still-locked .old from an earlier
+        # in-use update in the same session.
+        $Stale = "$Dest.old-$(Get-Random)"
+        Move-Item -Path $Dest -Destination $Stale -Force
+        Copy-Item -Path $Source -Destination $Dest -Force
+        Write-Host "  Replaced an in-use $Name. Restart VS Code (or the Rocky extension) to use the new version." -ForegroundColor Yellow
+    }
+}
+
 # Check for 32-bit Windows
 if (-not [Environment]::Is64BitProcess) {
     Write-Error "Rocky does not support 32-bit Windows."
@@ -146,8 +176,39 @@ try {
         exit 1
     }
 
-    # Install
-    Copy-Item -Path $BinaryPath -Destination (Join-Path $InstallDir "rocky.exe") -Force
+    # Install rocky.exe (rename-then-replace handles a locked, in-use binary).
+    Install-RockyBinary -Source $BinaryPath -Dest (Join-Path $InstallDir "rocky.exe")
+
+    # Best-effort: also install the standalone rocky-lsp binary. The VS Code
+    # extension prefers a sibling rocky-lsp for the language server; when it's
+    # present the extension never runs rocky.exe as the LSP, so rocky.exe is never
+    # locked in the first place. Optional — if the archive is missing (older
+    # release) or fails verification we skip it and the extension falls back to
+    # `rocky lsp`, which the rename-then-replace install above already handles.
+    $LspArchive = "rocky-lsp-x86_64-pc-windows-msvc.zip"
+    $LspZip = Join-Path $TmpDir $LspArchive
+    try {
+        Invoke-WebRequest -Uri "https://github.com/$Repo/releases/download/$ResolvedVersion/$LspArchive" -OutFile $LspZip -UseBasicParsing -ErrorAction Stop
+        if ($null -ne $ChecksumsResponse) {
+            $LspHash = (Get-FileHash -Path $LspZip -Algorithm SHA256).Hash.ToLower()
+            $LspLine = ($ChecksumsText -split "`n") |
+                Where-Object { $_ -match [regex]::Escape($LspArchive) } |
+                Select-Object -First 1
+            $LspExpected = if ($LspLine) { ($LspLine.Trim() -split '\s+')[0].ToLower() } else { "" }
+            if ($LspExpected -ne $LspHash) {
+                throw "rocky-lsp checksum missing or mismatched; skipping."
+            }
+        }
+        Expand-Archive -Path $LspZip -DestinationPath $TmpDir -Force
+        $LspBin = Join-Path $TmpDir "rocky-lsp.exe"
+        if (Test-Path $LspBin) {
+            Install-RockyBinary -Source $LspBin -Dest (Join-Path $InstallDir "rocky-lsp.exe")
+            Write-Host "  Installed rocky-lsp (the VS Code extension prefers it for the language server)."
+        }
+    }
+    catch {
+        Write-Host "  (Optional rocky-lsp not installed; the VS Code extension will use 'rocky lsp'.)"
+    }
 }
 finally {
     Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
