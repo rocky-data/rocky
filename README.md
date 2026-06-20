@@ -11,7 +11,7 @@
 [![VS Code CI](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**Rocky checks your SQL data pipelines and catches problems before they reach your warehouse.**
+**Rocky is a SQL transformation engine that type-checks your whole pipeline and catches breaking changes before they run.**
 
 Works with Databricks, Snowflake, BigQuery, and DuckDB. You keep your warehouse and your existing SQL. Apache 2.0.
 

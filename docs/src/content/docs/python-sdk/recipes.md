@@ -45,7 +45,7 @@ except RockyCommandError as exc:
 
 ### Partial success
 
-`run()` returns its `RunResult` even when some tables fail — it does not raise —
+`run()` returns its `RunResult` even when some tables fail (it does not raise),
 so you can act on what landed and report the rest:
 
 ```python

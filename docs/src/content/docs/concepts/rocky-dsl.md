@@ -5,7 +5,7 @@ sidebar:
   order: 8
 ---
 
-Rocky's DSL is a pipeline-oriented alternative to SQL for transformation models. `.rocky` files lower to standard SQL before execution; the warehouse only sees SQL.
+Rocky's DSL is a pipeline-oriented syntax for transformation models. `.rocky` files lower to standard SQL before execution; the warehouse only sees SQL.
 
 :::note[The DSL is optional]
 Rocky is **SQL-first**. Every feature works with plain `.sql` files. The DSL exists for teams that want a more readable shape for multi-step transformations. Mix and match freely: a DSL model can depend on a SQL model and vice versa.
