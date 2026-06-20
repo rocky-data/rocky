@@ -8,7 +8,7 @@ Everything Rocky does, from the outside in, with ASCII diagrams.
 
 Rocky is a **typed, compiled data platform**. You write SQL (or a SQL-like DSL). Rocky compiles it, checks it for mistakes, then runs it against your warehouse.
 
-The closest comparison is dbt — but Rocky has a real compiler. There's no Jinja templating, no string-substitution tricks. Rocky parses your SQL into a typed tree, checks types across the whole DAG at once, and only generates warehouse SQL after everything has been verified.
+The closest comparison is dbt Core — but Rocky has a real compiler. There's no Jinja templating, no string-substitution tricks. Rocky parses your SQL into a typed tree, checks types across the whole DAG at once, and only generates warehouse SQL after everything has been verified.
 
 ```
 You write this:            Rocky does this:              Warehouse gets this:
