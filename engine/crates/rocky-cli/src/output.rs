@@ -3411,6 +3411,18 @@ pub enum ImportDbtStructuredWarning {
     /// A microbatch model is missing the required `event_time` field —
     /// the importer fell back to `full_refresh`.
     MicrobatchMissingEventTime { model: String },
+    /// A dbt microbatch model was remapped: to an idempotent `merge`
+    /// (`mapped_to = "merge"`) when it has a `unique_key`, or kept append-only
+    /// (`mapped_to = "append"`) when it does not.
+    MicrobatchMapped { model: String, mapped_to: String },
+    /// A dbt construct the importer does not translate was detected and
+    /// skipped (snapshot, source freshness, grants, meta, metric, semantic
+    /// model, exposure), surfaced so a migration is never silently lossy.
+    DroppedConstruct {
+        construct: String,
+        name: String,
+        detail: String,
+    },
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

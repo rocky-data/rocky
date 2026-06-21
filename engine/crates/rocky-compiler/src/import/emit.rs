@@ -346,6 +346,22 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
     out.push_str(&format!("schema = \"{}\"\n", config.target.schema));
     out.push_str(&format!("table = \"{}\"\n", config.target.table));
 
+    if !config.tags.is_empty() {
+        out.push('\n');
+        out.push_str("[tags]\n");
+        for (k, v) in &config.tags {
+            let key = if !k.is_empty()
+                && k.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                k.clone()
+            } else {
+                format!("{k:?}")
+            };
+            out.push_str(&format!("{key} = \"{v}\"\n"));
+        }
+    }
+
     if !config.sources.is_empty() {
         out.push('\n');
         for src in &config.sources {
@@ -533,7 +549,10 @@ fn write_structured_warnings(
             | W::DroppedHook { model, .. }
             | W::DroppedOnSchemaChange { model, .. }
             | W::UnresolvableMacro { model, .. }
-            | W::MicrobatchMissingEventTime { model } => model.as_str(),
+            | W::MicrobatchMissingEventTime { model }
+            | W::MicrobatchMapped { model, .. } => model.as_str(),
+            // Project-level drops have no owning model — group by their name.
+            W::DroppedConstruct { name, .. } => name.as_str(),
         };
         by_model.entry(model).or_default().push(w);
     }
@@ -594,6 +613,24 @@ fn write_structured_warnings(
                     out.push_str(
                         "- **Microbatch missing `event_time`** — fell back to `full_refresh`. Add `event_time = '<timestamp_column>'` to the model's dbt config block\n",
                     );
+                }
+                W::MicrobatchMapped { mapped_to, .. } => {
+                    if mapped_to == "merge" {
+                        out.push_str(
+                            "- **dbt microbatch → idempotent `merge`** — partition-replace became key-upsert; rows removed from the source window are not deleted. Review the `[strategy]` block.\n",
+                        );
+                    } else {
+                        out.push_str(
+                            "- **dbt microbatch imported append-only** — re-inserts the lookback window every run. Add a `unique_key` (maps to an idempotent merge) or convert to a time-interval strategy.\n",
+                        );
+                    }
+                }
+                W::DroppedConstruct {
+                    construct,
+                    name,
+                    detail,
+                } => {
+                    out.push_str(&format!("- **Dropped {construct}** `{name}` — {detail}\n"));
                 }
             }
         }

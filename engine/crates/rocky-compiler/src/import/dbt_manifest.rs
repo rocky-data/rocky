@@ -85,6 +85,13 @@ pub struct DbtNodeConfig {
     /// `on_schema_change` — dbt-databricks drift policy. One of `ignore`,
     /// `fail`, `append_new_columns`, `sync_all_columns`.
     pub on_schema_change: Option<String>,
+    /// `alias` — overrides the output relation (table) name. When set, the
+    /// model materializes to this name instead of the node name.
+    pub alias: Option<String>,
+    /// `merge_update_columns` — explicit MERGE UPDATE column list (dbt).
+    pub merge_update_columns: Option<Vec<String>>,
+    /// `merge_exclude_columns` — columns excluded from the MERGE UPDATE (dbt).
+    pub merge_exclude_columns: Option<Vec<String>>,
 }
 
 /// unique_key can be a single string or a list.
@@ -278,6 +285,18 @@ struct RawNodeConfig {
     post_hook_dashed: Option<serde_json::Value>,
     #[serde(default)]
     on_schema_change: Option<String>,
+    /// `alias` — overrides the relation (table) name. dbt routes the model's
+    /// output to this name instead of the file/node name; dropping it silently
+    /// lands the data in the wrong table.
+    #[serde(default)]
+    alias: Option<String>,
+    /// `merge_update_columns` — the explicit columns to UPDATE on a MERGE
+    /// match. Dropping it silently turns a column-scoped merge into update-all.
+    #[serde(default)]
+    merge_update_columns: Option<Vec<String>>,
+    /// `merge_exclude_columns` — columns excluded from the MERGE UPDATE.
+    #[serde(default)]
+    merge_exclude_columns: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -478,6 +497,9 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
             pre_hook,
             post_hook,
             on_schema_change: config.on_schema_change,
+            alias: config.alias,
+            merge_update_columns: config.merge_update_columns,
+            merge_exclude_columns: config.merge_exclude_columns,
         },
         columns,
         description: raw.description.filter(|d| !d.is_empty()),

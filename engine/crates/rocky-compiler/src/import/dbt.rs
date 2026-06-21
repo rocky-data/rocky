@@ -140,6 +140,20 @@ pub enum ImportDbtStructuredWarning {
     /// surfaces the gap so the user can either add `event_time` to the
     /// dbt source or pick a non-microbatch strategy.
     MicrobatchMissingEventTime { model: String },
+    /// A dbt microbatch model was remapped. With a `unique_key` it becomes an
+    /// idempotent Rocky `merge` (`mapped_to = "merge"`); without one it stays
+    /// append-only (`mapped_to = "append"`) and will re-insert the lookback
+    /// window every run, so it must be converted manually.
+    MicrobatchMapped { model: String, mapped_to: String },
+    /// A dbt construct the importer does not translate was detected and
+    /// skipped (snapshot, source freshness, grants, meta, metric, semantic
+    /// model, exposure). Surfaced with a count so a migration is never
+    /// silently lossy.
+    DroppedConstruct {
+        construct: String,
+        name: String,
+        detail: String,
+    },
 }
 
 /// A model that failed to import.
@@ -512,7 +526,28 @@ fn import_manifest_node(
     default_target: &TargetConfig,
     result: &mut ImportResult,
 ) {
-    // Use compiled_code (Jinja resolved) if available, else raw_code
+    // Resolve the model's output coordinates up front so the raw-code fallback
+    // (for {{ this }}) and the emitted target use the same values. dbt `alias`
+    // overrides the relation name; dropping it silently lands the data in a
+    // table named after the node.
+    let schema = node
+        .config
+        .schema
+        .clone()
+        .unwrap_or_else(|| default_target.schema.clone());
+    let catalog = if node.database.is_empty() {
+        default_target.catalog.clone()
+    } else {
+        node.database.clone()
+    };
+    let table = node
+        .config
+        .alias
+        .clone()
+        .unwrap_or_else(|| node.name.clone());
+    let this_ref = format!("{catalog}.{schema}.{table}");
+
+    // Use compiled_code (Jinja resolved) if available, else raw_code.
     let sql = match &node.compiled_code {
         Some(code) => code.clone(),
         None => {
@@ -523,7 +558,7 @@ fn import_manifest_node(
                     .to_string(),
                 suggestion: Some("run `dbt compile` to generate compiled SQL".to_string()),
             });
-            convert_jinja_to_sql(&node.raw_code)
+            convert_jinja_to_sql(&node.raw_code, &this_ref)
         }
     };
 
@@ -554,26 +589,14 @@ fn import_manifest_node(
     // Use description as intent
     let intent = node.description.clone();
 
-    let schema = node
-        .config
-        .schema
-        .as_deref()
-        .unwrap_or(&default_target.schema);
-
-    let catalog = if node.database.is_empty() {
-        default_target.catalog.clone()
-    } else {
-        node.database.clone()
-    };
-
     let config = ModelConfig {
         name: node.name.clone(),
         depends_on,
         strategy,
         target: TargetConfig {
             catalog,
-            schema: schema.to_string(),
-            table: node.name.clone(),
+            schema,
+            table,
         },
         sources: vec![],
         adapter: None,
@@ -583,7 +606,7 @@ fn import_manifest_node(
         format: None,
         format_options: None,
         classification: Default::default(),
-        tags: Default::default(),
+        tags: dbt_tags_to_map(&node.tags),
         retention: None,
         budget: None,
         skip: None,
@@ -697,10 +720,25 @@ fn map_incremental_strategy(
 
     match strategy_kind.as_str() {
         "merge" => match unique_keys {
-            Some(keys) if !keys.is_empty() => StrategyConfig::Merge {
-                unique_key: keys,
-                update_columns: None,
-            },
+            Some(keys) if !keys.is_empty() => {
+                // dbt `merge_exclude_columns` (update all-but-these) has no
+                // direct Rocky equivalent — without the full column list we
+                // can't invert it, so warn rather than silently update-all.
+                if config.merge_update_columns.is_none() && config.merge_exclude_columns.is_some() {
+                    warnings.push(ImportWarning {
+                        model: model_name.to_string(),
+                        category: WarningCategory::UnsupportedMaterialization,
+                        message: "merge_exclude_columns has no direct Rocky equivalent — the emitted merge updates all columns".to_string(),
+                        suggestion: Some(
+                            "list the columns to update via the emitted [strategy] `update_columns` instead".to_string(),
+                        ),
+                    });
+                }
+                StrategyConfig::Merge {
+                    unique_key: keys,
+                    update_columns: config.merge_update_columns.clone(),
+                }
+            }
             _ => {
                 warnings.push(ImportWarning {
                     model: model_name.to_string(),
@@ -824,9 +862,53 @@ fn map_microbatch_strategy(
         .map(|s| batch_size_to_grain(s, model_name, warnings))
         .unwrap_or(TimeGrain::Day);
 
-    StrategyConfig::Microbatch {
-        timestamp_column: event_time,
-        granularity,
+    // dbt microbatch idempotently REPLACES each batch partition. Rocky's
+    // Microbatch strategy emits an append-only INSERT (sql_gen.rs), so importing
+    // it as-is silently re-inserts the lookback window every run. dbt microbatch
+    // requires a `unique_key`, so map it to an idempotent Rocky merge instead;
+    // only fall back to append-only (loudly) if a key is somehow absent.
+    let unique_keys: Option<Vec<String>> = config.unique_key.as_ref().map(|uk| match uk {
+        UniqueKeyValue::Single(s) => vec![s.clone()],
+        UniqueKeyValue::Multiple(v) => v.clone(),
+    });
+
+    match unique_keys {
+        Some(keys) if !keys.is_empty() => {
+            warnings.push(ImportWarning {
+                model: model_name.to_string(),
+                category: WarningCategory::UnsupportedMaterialization,
+                message: "dbt microbatch mapped to an idempotent Rocky merge(unique_key); partition-replace becomes key-upsert, so rows removed from the source window are not deleted".to_string(),
+                suggestion: Some(
+                    "review the emitted [strategy] block; for true partition-replace use a time-interval model with @start_date/@end_date".to_string(),
+                ),
+            });
+            structured.push(ImportDbtStructuredWarning::MicrobatchMapped {
+                model: model_name.to_string(),
+                mapped_to: "merge".to_string(),
+            });
+            StrategyConfig::Merge {
+                unique_key: keys,
+                update_columns: config.merge_update_columns.clone(),
+            }
+        }
+        _ => {
+            warnings.push(ImportWarning {
+                model: model_name.to_string(),
+                category: WarningCategory::UnsupportedMaterialization,
+                message: "dbt microbatch without a unique_key imports as append-only and re-inserts the lookback window every run".to_string(),
+                suggestion: Some(
+                    "add a unique_key (microbatch requires one) so it maps to an idempotent merge, or convert to a time-interval strategy".to_string(),
+                ),
+            });
+            structured.push(ImportDbtStructuredWarning::MicrobatchMapped {
+                model: model_name.to_string(),
+                mapped_to: "append".to_string(),
+            });
+            StrategyConfig::Microbatch {
+                timestamp_column: event_time,
+                granularity,
+            }
+        }
     }
 }
 
@@ -1266,12 +1348,18 @@ fn import_single_model(
             block_re.is_match(&content_processed)
         };
         if has_non_incr_blocks {
-            warnings.push(ImportWarning {
-                model: name.to_string(),
-                category: WarningCategory::JinjaControlFlow,
-                message: "contains Jinja control flow ({% if %}, {% for %}) — replaced with TODO comments".to_string(),
-                suggestion: Some("consider using manifest.json import path for full Jinja resolution".to_string()),
-            });
+            // Refuse rather than half-render: `block_re` strips only the
+            // `{% %}` delimiters, so a `{% for %}`/`{% set %}`/non-incremental
+            // `{% if %}` body survives exactly once, yielding SQL that loads
+            // but is semantically wrong (a loop meant to emit N columns emits
+            // one broken fragment). A loud failure beats a silent mis-render.
+            return Err(
+                "contains unsupported Jinja control flow ({% for %}, {% set %}, or a \
+                 non-incremental {% if %}) that the no-manifest importer cannot faithfully \
+                 render — re-run after `dbt compile` (the manifest path resolves Jinja) or \
+                 rewrite the model without control flow"
+                    .to_string(),
+            );
         }
     }
     if content_processed.contains("{{ var(") {
@@ -1307,7 +1395,7 @@ fn import_single_model(
     }
 
     // Apply project config inheritance
-    let resolved_schema = if let Some(proj) = project_config {
+    let (resolved_schema, resolved_tags) = if let Some(proj) = project_config {
         let resolved = dbt_project::resolve_model_config(proj, rel_path);
         // Project-level materialization: only override if no model-level config
         if !content_processed.contains("config(") && matches!(strategy, StrategyConfig::FullRefresh)
@@ -1337,13 +1425,22 @@ fn import_single_model(
                 _ => {}
             }
         }
-        resolved.schema
+        (resolved.schema, resolved.tags)
     } else {
-        None
+        (None, Vec::new())
     };
 
-    // Convert Jinja refs to plain SQL
-    let sql = convert_jinja_to_sql(&content_processed);
+    // Resolve the model's output coordinates so {{ this }} substitutes the real
+    // FQN and the emitted target uses the same alias-aware table name.
+    let resolved_schema_str = resolved_schema.as_deref().unwrap_or(&default_target.schema);
+    let resolved_table = extract_dbt_alias(&content_processed).unwrap_or_else(|| name.to_string());
+    let this_ref = format!(
+        "{}.{}.{}",
+        default_target.catalog, resolved_schema_str, resolved_table
+    );
+
+    // Convert Jinja refs to plain SQL.
+    let sql = convert_jinja_to_sql(&content_processed, &this_ref);
 
     // Resolve source references
     let mut model_sources = Vec::new();
@@ -1366,16 +1463,14 @@ fn import_single_model(
         }
     }
 
-    let schema = resolved_schema.as_deref().unwrap_or(&default_target.schema);
-
     let config = ModelConfig {
         name: name.to_string(),
         depends_on: vec![], // Auto-resolved by compiler
         strategy,
         target: TargetConfig {
             catalog: default_target.catalog.clone(),
-            schema: schema.to_string(),
-            table: name.to_string(),
+            schema: resolved_schema_str.to_string(),
+            table: resolved_table,
         },
         sources: model_sources,
         adapter: None,
@@ -1385,7 +1480,7 @@ fn import_single_model(
         format: None,
         format_options: None,
         classification: Default::default(),
-        tags: Default::default(),
+        tags: dbt_tags_to_map(&resolved_tags),
         retention: None,
         budget: None,
         skip: None,
@@ -1497,6 +1592,26 @@ fn extract_timestamp_from_where(block: &str) -> Option<String> {
 /// discarded here on purpose — the regex path emits string warnings
 /// only (the manifest path is the canonical surface for
 /// structured-warning consumers).
+/// Map a dbt tag list onto Rocky's key/value `[tags]` shape. dbt tags are bare
+/// labels; each becomes `<tag> = "true"` so it stays a queryable key in
+/// `ModelConfig.tags` (a `BTreeMap<String, String>`).
+fn dbt_tags_to_map(tags: &[String]) -> std::collections::BTreeMap<String, String> {
+    tags.iter()
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| (t.clone(), "true".to_string()))
+        .collect()
+}
+
+/// Best-effort parse of `alias='...'` from a model's `{{ config(...) }}` block
+/// on the regex (no-manifest) path. dbt `alias` overrides the output relation
+/// name; dropping it would silently route the model's data to a table named
+/// after the file.
+fn extract_dbt_alias(content: &str) -> Option<String> {
+    let config_re = Regex::new(r"\{\{\s*config\s*\(([^)]*)\)\s*\}\}").ok()?;
+    let caps = config_re.captures(content)?;
+    single_string_value(&caps[1], "alias")
+}
+
 fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
     let mut messages = Vec::new();
 
@@ -1545,6 +1660,11 @@ fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
         pre_hook: Vec::new(),
         post_hook: Vec::new(),
         on_schema_change: None,
+        // alias does not affect strategy selection; the regex path threads it
+        // to target.table separately via extract_dbt_alias.
+        alias: None,
+        merge_update_columns: None,
+        merge_exclude_columns: None,
     };
 
     let mapping = map_manifest_strategy(&synthetic, "<regex-path>");
@@ -1591,7 +1711,7 @@ fn single_string_value(config_str: &str, key: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Convert dbt Jinja expressions to plain SQL.
-fn convert_jinja_to_sql(content: &str) -> String {
+fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
     let mut sql = content.to_string();
 
     // Remove {{ config(...) }} blocks
@@ -1608,9 +1728,14 @@ fn convert_jinja_to_sql(content: &str) -> String {
             .unwrap();
     sql = source_re.replace_all(&sql, "$1.$2").to_string();
 
-    // {{ this }} -> __this__ (placeholder, resolved at execution)
+    // {{ this }} -> the model's own fully-qualified name. Substituting a real
+    // catalog.schema.table (NoExpand so dots/`$` are literal) avoids emitting a
+    // bogus `__this__` identifier that loads via the sidecar but fails at the
+    // warehouse.
     let this_re = Regex::new(r"\{\{\s*this\s*\}\}").unwrap();
-    sql = this_re.replace_all(&sql, "__this__").to_string();
+    sql = this_re
+        .replace_all(&sql, regex::NoExpand(this_ref))
+        .to_string();
 
     // Replace unsupported Jinja blocks with TODO comments
     let block_re = Regex::new(r"\{%[^%]*%\}").unwrap();
@@ -1661,31 +1786,41 @@ mod tests {
     #[test]
     fn test_convert_ref() {
         let input = "SELECT * FROM {{ ref('orders') }}";
-        assert_eq!(convert_jinja_to_sql(input), "SELECT * FROM orders");
+        assert_eq!(
+            convert_jinja_to_sql(input, "cat.sch.tbl"),
+            "SELECT * FROM orders"
+        );
     }
 
     #[test]
     fn test_convert_source() {
         let input = "SELECT * FROM {{ source('raw', 'customers') }}";
-        assert_eq!(convert_jinja_to_sql(input), "SELECT * FROM raw.customers");
+        assert_eq!(
+            convert_jinja_to_sql(input, "cat.sch.tbl"),
+            "SELECT * FROM raw.customers"
+        );
     }
 
     #[test]
     fn test_convert_config_removed() {
         let input = "{{ config(materialized='table') }}\nSELECT 1";
-        assert_eq!(convert_jinja_to_sql(input), "SELECT 1");
+        assert_eq!(convert_jinja_to_sql(input, "cat.sch.tbl"), "SELECT 1");
     }
 
     #[test]
     fn test_convert_this() {
         let input = "SELECT * FROM {{ this }}";
-        assert_eq!(convert_jinja_to_sql(input), "SELECT * FROM __this__");
+        // {{ this }} resolves to the model's own FQN, not a bogus __this__.
+        assert_eq!(
+            convert_jinja_to_sql(input, "cat.sch.tbl"),
+            "SELECT * FROM cat.sch.tbl"
+        );
     }
 
     #[test]
     fn test_convert_unsupported_jinja() {
         let input = "{% if some_condition %}WHERE id > 0{% endif %}";
-        let result = convert_jinja_to_sql(input);
+        let result = convert_jinja_to_sql(input, "cat.sch.tbl");
         assert!(result.contains("TODO: unsupported Jinja block"));
     }
 
@@ -1776,7 +1911,7 @@ mod tests {
     fn test_multiple_refs() {
         let input =
             "SELECT * FROM {{ ref('orders') }} o JOIN {{ ref('customers') }} c ON o.id = c.id";
-        let result = convert_jinja_to_sql(input);
+        let result = convert_jinja_to_sql(input, "cat.sch.tbl");
         assert_eq!(
             result,
             "SELECT * FROM orders o JOIN customers c ON o.id = c.id"

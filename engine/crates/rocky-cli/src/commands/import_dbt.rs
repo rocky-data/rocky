@@ -340,5 +340,20 @@ fn to_cli_structured_warning(w: &CompilerStructuredWarning) -> ImportDbtStructur
                 model: model.clone(),
             }
         }
+        CompilerStructuredWarning::MicrobatchMapped { model, mapped_to } => {
+            ImportDbtStructuredWarning::MicrobatchMapped {
+                model: model.clone(),
+                mapped_to: mapped_to.clone(),
+            }
+        }
+        CompilerStructuredWarning::DroppedConstruct {
+            construct,
+            name,
+            detail,
+        } => ImportDbtStructuredWarning::DroppedConstruct {
+            construct: construct.clone(),
+            name: name.clone(),
+            detail: detail.clone(),
+        },
     }
 }
