@@ -1,11 +1,12 @@
 //! Live BigQuery dialect-sweep regression probes.
 //!
 //! Live execute-coverage regression tests for the dialect adapter-gating
-//! fixes (D1/D3) plus two capability probes that the audit REFUTED
-//! (insert_overwrite_partition, ALTER SET DATA TYPE widening) and which
-//! remain valuable regression coverage. They run the SQL Rocky *actually
-//! emits* (via the real emitter functions) against the BigQuery sandbox.
-//! Trial credits — tiny tables only.
+//! fixes (D1/D3), two capability probes that the audit REFUTED
+//! (insert_overwrite_partition, ALTER SET DATA TYPE widening), and a
+//! positive MERGE probe (`merge_into` — `INSERT ROW` + per-column UPDATE
+//! SET, the BQ-reachable `rocky run` merge path). They run the SQL Rocky
+//! *actually emits* (via the real emitter functions) against the BigQuery
+//! sandbox. Trial credits — tiny tables only.
 //!
 //! POST-FIX behaviour pinned:
 //!   - D1 (lakehouse `USING <format>` DDL) and D3 (compact/archive
@@ -32,7 +33,7 @@ use rocky_bigquery::dialect::BigQueryDialect;
 use rocky_core::lakehouse::{self, LakehouseError, LakehouseFormat, LakehouseOptions};
 use rocky_core::sql_gen::{SqlGenError, archive_from_ir, compact_from_ir};
 use rocky_core::traits::{SqlDialect, WarehouseAdapter};
-use rocky_ir::{ArchivePlanIr, CompactPlanIr};
+use rocky_ir::{ArchivePlanIr, ColumnSelection, CompactPlanIr};
 
 fn adapter_from_env() -> Option<(BigQueryAdapter, String)> {
     let project = std::env::var("BIGQUERY_TEST_PROJECT").ok()?;
@@ -372,4 +373,137 @@ async fn gap5_alter_set_data_type_widening() {
         "column should be widened to NUMERIC"
     );
     println!("VERDICT: REFUTED — BigQuery accepts the emitted ALTER ... SET DATA TYPE widening");
+}
+
+/// MERGE — `BigQueryDialect::merge_into` execute-coverage against the live
+/// sandbox. The `Merge` strategy dispatches **unconditionally** to
+/// `merge_into` on every dialect (`rocky_core::sql_gen` — both the
+/// replication path at ~:221 and the transformation path at ~:331); there is
+/// no per-dialect maintenance gate like the one D3/D3a/D3b probes assert for
+/// `OPTIMIZE`/`VACUUM`. So merge is a BigQuery-reachable `rocky run` path,
+/// and the BQ-specific `WHEN NOT MATCHED THEN INSERT ROW` + per-column
+/// `target.<c> = source.<c>` UPDATE SET it emits are exactly the kind of
+/// non-standard syntax that string-content unit tests pass but a real
+/// warehouse can reject.
+///
+/// **Production-faithful column selection.** The replication runner resolves
+/// `ColumnSelection::All` into the explicit per-column form *before* SQL-gen
+/// (`commands/run.rs::resolve_merge_update_columns`, called at ~:6328 with the
+/// note "Snowflake's MERGE rejects `UPDATE SET *`"), so the SQL `rocky run`
+/// actually emits is per-column `target.<c> = source.<c>`, not the whole-row
+/// `target = source` form. This test passes `ColumnSelection::Explicit([id,
+/// val])` — the keys-included shape the resolver produces — so it exercises
+/// the same MERGE statement the production replication path generates, plus
+/// the always-on `INSERT ROW` clause.
+///
+/// Seeds a 2-row target, merges a 2-row source (1 matched key, 1 new key),
+/// then reads back and asserts:
+///   - matched key (id=1) UPDATED to the new value,
+///   - new key (id=3) INSERTED via `INSERT ROW`,
+///   - untouched key (id=2) left intact.
+/// Reads are captured BEFORE the CASCADE drop. Dataset uses the
+/// `hc_dialsweep_merge_` prefix and is dropped on exit.
+#[tokio::test]
+#[ignore]
+async fn merge_into_updates_matched_and_inserts_unmatched() {
+    let Some((adapter, project)) = adapter_from_env() else {
+        eprintln!("SKIP merge: BigQuery env not set");
+        return;
+    };
+    let dataset = format!("hc_dialsweep_merge_{}", suffix());
+    drop_dataset(&adapter, &project, &dataset).await;
+    adapter
+        .execute_statement(&format!("CREATE SCHEMA `{project}`.`{dataset}`"))
+        .await
+        .expect("create dataset");
+
+    let dialect = BigQueryDialect;
+    let target = dialect
+        .format_table_ref(&project, &dataset, "hc_merge")
+        .expect("format target");
+
+    // Seed the target: id=1 ('old'), id=2 ('old'). The column order
+    // (id, val) must match the source's STRUCT field order so BigQuery's
+    // `INSERT ROW` (positional, whole-row insert) lands the new row in the
+    // right columns.
+    adapter
+        .execute_statement(&format!(
+            "CREATE OR REPLACE TABLE {target} AS \
+             SELECT * FROM UNNEST([\
+               STRUCT(1 AS id, 'old' AS val), STRUCT(2, 'old')])"
+        ))
+        .await
+        .expect("seed target");
+
+    // Real emitter: the source is the same UNNEST shape, aliased so the
+    // merge's `ON target.id = source.id` and `target.val = source.val`
+    // resolve. id=1 matches (→ UPDATE), id=3 is new (→ INSERT ROW).
+    let source_sql = "SELECT id, val FROM UNNEST([\
+                      STRUCT(1 AS id, 'new' AS val), STRUCT(3, 'new')])";
+    let update_cols = ColumnSelection::Explicit(vec!["id".into(), "val".into()]);
+    let merge_sql = dialect
+        .merge_into(&target, source_sql, &["id".into()], &update_cols)
+        .expect("merge_into");
+
+    let exec = adapter.execute_statement(&merge_sql).await;
+
+    // Read back all three keys regardless of exec outcome (before cleanup).
+    let after = adapter
+        .execute_query(&format!("SELECT id, val FROM {target} ORDER BY id"))
+        .await
+        .ok();
+
+    drop_dataset(&adapter, &project, &dataset).await;
+
+    println!("\n=== MERGE BigQuery: merge_into (matched UPDATE + unmatched INSERT ROW) ===");
+    println!("SQL SENT:\n{merge_sql}");
+    match &exec {
+        Ok(()) => println!("RAW RESPONSE: MERGE SUCCEEDED"),
+        Err(e) => println!("RAW ERROR: {e}"),
+    }
+    exec.expect(
+        "MERGE must execute — else CONFIRMED bug in BigQueryDialect::merge_into \
+         (INSERT ROW / per-column UPDATE SET rejected); see raw error",
+    );
+
+    let rows = after.expect("target queryable after merge");
+    // (id, val) keyed by id. BigQuery returns INT64 as a JSON string, so
+    // parse defensively via `as_i64`.
+    let mut by_id: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
+    for r in &rows.rows {
+        let id = as_i64(&r[0]).expect("id parses");
+        let val = r[1].as_str().unwrap_or_default().to_string();
+        by_id.insert(id, val);
+    }
+    println!("AFTER: {by_id:?} (expected {{1: \"new\", 2: \"old\", 3: \"new\"}})");
+
+    assert_eq!(
+        by_id.get(&1).map(String::as_str),
+        Some("new"),
+        "matched key id=1 must be UPDATED to 'new'"
+    );
+    assert_eq!(
+        by_id.get(&2).map(String::as_str),
+        Some("old"),
+        "untouched key id=2 must stay 'old' (no spurious update)"
+    );
+    assert_eq!(
+        by_id.get(&3).map(String::as_str),
+        Some("new"),
+        "unmatched key id=3 must be INSERTED via INSERT ROW"
+    );
+    assert_eq!(
+        by_id.len(),
+        3,
+        "exactly 3 distinct ids after merge; got {by_id:?}"
+    );
+    // Physical-row guard: a fan-out / double-applied MERGE can emit two rows
+    // sharing an id, which `by_id` silently dedupes — so check the raw count too.
+    assert_eq!(
+        rows.rows.len(),
+        3,
+        "exactly 3 physical rows after merge; a duplicated id would slip the distinct-id check; got {} rows",
+        rows.rows.len()
+    );
+    println!("VERDICT: merge_into works — id=1 UPDATED, id=3 INSERTED (INSERT ROW), id=2 intact");
 }
