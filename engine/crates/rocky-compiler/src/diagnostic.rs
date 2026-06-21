@@ -67,6 +67,30 @@ pub const E027: &str = "E027";
 /// consumer ships SQL that reads a column that no longer exists.
 pub const E030: &str = "E030";
 
+/// Imported producer narrowed the type of a column the consumer reads.
+///
+/// Emitted by `rocky compile` when an `[imports.<name>]` baseline→snapshot
+/// diff reports a `ColumnTypeChanged { narrowing: true }` on a producer
+/// column that one of the consumer's models references (Int64 → Int32,
+/// Decimal precision shrink, Timestamp → Date, …). The producer's new type
+/// can no longer represent every value the consumer was reading, so the
+/// change can truncate or reject the consumer's data.
+pub const E031: &str = "E031";
+
+/// Imported producer tightened a column the consumer reads from nullable to
+/// NOT NULL.
+///
+/// Emitted by `rocky compile` when an `[imports.<name>]` baseline→snapshot
+/// diff reports a `ColumnNullabilityChanged { old_nullable: true,
+/// new_nullable: false }` on a producer column a consumer model references.
+/// Conservatively an error: the consumer may have logic (or downstream
+/// contracts) built around the column being nullable. The producer-side
+/// classifier rates this `Warning`; the consumer-read direction is stricter
+/// because the assumption being broken lives on the consumer side, and Rocky
+/// has no consumer-side nullability hint yet to distinguish "relies on NULL"
+/// from "doesn't care". When that hint lands, this can relax to a warning.
+pub const E032: &str = "E032";
+
 /// Imported snapshot's recipe hash does not match the configured `pin`.
 ///
 /// Emitted by `rocky compile` when an `[imports.<name>]` block sets a
@@ -101,6 +125,28 @@ pub const W011: &str = "W011";
 /// error — the consumer compiles, it just isn't verified against that
 /// producer this run.
 pub const W012: &str = "W012";
+
+/// Imported producer added a column. Surfaced (at info severity) only to
+/// consumers that read the producer via `SELECT *`, where an added column
+/// shifts positional projection.
+///
+/// Emitted by `rocky compile` when an `[imports.<name>]` baseline→snapshot
+/// diff reports a `ColumnAdded` on a producer target that a consumer model
+/// reads with `SELECT *` (or otherwise can't enumerate its columns). A
+/// consumer that selects explicit columns is unaffected, so this is gated on
+/// the `SELECT *` / unfiltered case rather than the column-reference filter
+/// the E03x codes use (no consumer references a brand-new column by name).
+pub const W030: &str = "W030";
+
+/// Imported producer widened the type of a column the consumer reads.
+///
+/// Emitted by `rocky compile` when an `[imports.<name>]` baseline→snapshot
+/// diff reports a `ColumnTypeChanged { narrowing: false }` on a producer
+/// column a consumer model references (Int32 → Int64, Decimal precision
+/// grow, …). The new type holds every value the old one did, so existing
+/// reads keep working — but the consumer's own declared output type may now
+/// be too small, hence a warning rather than silence.
+pub const W031: &str = "W031";
 
 // Info
 /// Model dependency inferred from SQL.
