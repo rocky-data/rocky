@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bumped `@types/node` to 26 and refreshed the lockfile to the latest in-range dependency versions (`@vscode/test-electron` 3.0.0, `vitest` 4.1.9, plus transitives). `@types/vscode` stays pinned at 1.120.0 to match the `engines.vscode` / test-electron triangle. 0 vulnerabilities; compile, lint, and unit tests green. (#PRNUM)
+
 ## [1.33.1] — 2026-06-14
 
 ### Security
