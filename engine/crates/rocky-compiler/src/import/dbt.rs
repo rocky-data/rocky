@@ -140,6 +140,20 @@ pub enum ImportDbtStructuredWarning {
     /// surfaces the gap so the user can either add `event_time` to the
     /// dbt source or pick a non-microbatch strategy.
     MicrobatchMissingEventTime { model: String },
+    /// A dbt microbatch model was remapped. With a `unique_key` it becomes an
+    /// idempotent Rocky `merge` (`mapped_to = "merge"`); without one it stays
+    /// append-only (`mapped_to = "append"`) and will re-insert the lookback
+    /// window every run, so it must be converted manually.
+    MicrobatchMapped { model: String, mapped_to: String },
+    /// A dbt construct the importer does not translate was detected and
+    /// skipped (snapshot, source freshness, grants, meta, metric, semantic
+    /// model, exposure). Surfaced with a count so a migration is never
+    /// silently lossy.
+    DroppedConstruct {
+        construct: String,
+        name: String,
+        detail: String,
+    },
 }
 
 /// A model that failed to import.
@@ -197,6 +211,10 @@ pub struct ImportResult {
     /// fixture format, or any other shape the importer can't faithfully
     /// translate.
     pub unit_tests_skipped: usize,
+    /// Number of dbt resources the importer does not translate that were
+    /// detected and skipped (snapshots, metrics, semantic models, exposures).
+    /// Surfaced so a migration is never silently lossy.
+    pub constructs_dropped: usize,
 }
 
 /// A successfully imported model.
@@ -244,15 +262,91 @@ pub fn import_from_manifest(manifest: &DbtManifest, default_target: &TargetConfi
         unit_tests_found: 0,
         unit_tests_converted: 0,
         unit_tests_skipped: 0,
+        constructs_dropped: 0,
     };
+
+    // A manifest with no compiled SQL means every model falls back to the
+    // reduced-fidelity raw-code path; detect it before importing so we can warn
+    // loudly rather than emit a plausible-but-wrong repo.
+    let model_count = manifest.nodes.len();
+    let with_compiled = manifest
+        .nodes
+        .values()
+        .filter(|n| n.compiled_code.is_some())
+        .count();
 
     for node in manifest.nodes.values() {
         import_manifest_node(node, default_target, &mut result);
     }
 
+    if model_count > 0 && with_compiled == 0 {
+        result.warnings.push(ImportWarning {
+            model: "<manifest>".to_string(),
+            category: WarningCategory::StaleManifest,
+            message: format!(
+                "none of the {model_count} manifest nodes carry compiled SQL — every model was \
+                 imported via the reduced-fidelity raw-code path, which can mis-render Jinja. The \
+                 import likely looks complete but is not faithful."
+            ),
+            suggestion: Some(
+                "regenerate the manifest with `dbt compile` (including any required --vars) and re-import".to_string(),
+            ),
+        });
+    }
+
+    // Surface the resource classes the importer does not translate so a
+    // migration is never silently lossy.
+    record_dropped_constructs(&manifest.dropped, &mut result);
+
     apply_dbt_unit_tests(manifest, &mut result);
 
     result
+}
+
+/// Emit a structured `DroppedConstruct` warning per non-zero dropped resource
+/// class (snapshots, metrics, semantic models, exposures) and bump
+/// `constructs_dropped`.
+fn record_dropped_constructs(dropped: &dbt_manifest::DbtDroppedCounts, result: &mut ImportResult) {
+    for (construct, count, detail) in [
+        (
+            "snapshot",
+            dropped.snapshots,
+            "Rocky has no snapshot pipeline yet — re-implement as a [snapshot] pipeline or keep it in dbt",
+        ),
+        (
+            "metric",
+            dropped.metrics,
+            "MetricFlow metrics are not imported — keep your semantic layer in dbt or a metrics tool",
+        ),
+        (
+            "semantic_model",
+            dropped.semantic_models,
+            "MetricFlow semantic models are not imported",
+        ),
+        (
+            "exposure",
+            dropped.exposures,
+            "dbt exposures (downstream-usage docs) are not imported",
+        ),
+    ] {
+        if count == 0 {
+            continue;
+        }
+        result.constructs_dropped += count;
+        result.warnings.push(ImportWarning {
+            model: "<project>".to_string(),
+            category: WarningCategory::UnsupportedMaterialization,
+            message: format!("{count} {construct}(s) skipped — {detail}"),
+            suggestion: None,
+        });
+        result
+            .structured_warnings
+            .push(ImportDbtStructuredWarning::DroppedConstruct {
+                construct: construct.to_string(),
+                name: format!("{count} total"),
+                detail: detail.to_string(),
+            });
+    }
 }
 
 /// Walk a dbt project's `models/` tree for `schema.yml` files, convert any
@@ -512,7 +606,28 @@ fn import_manifest_node(
     default_target: &TargetConfig,
     result: &mut ImportResult,
 ) {
-    // Use compiled_code (Jinja resolved) if available, else raw_code
+    // Resolve the model's output coordinates up front so the raw-code fallback
+    // (for {{ this }}) and the emitted target use the same values. dbt `alias`
+    // overrides the relation name; dropping it silently lands the data in a
+    // table named after the node.
+    let schema = node
+        .config
+        .schema
+        .clone()
+        .unwrap_or_else(|| default_target.schema.clone());
+    let catalog = if node.database.is_empty() {
+        default_target.catalog.clone()
+    } else {
+        node.database.clone()
+    };
+    let table = node
+        .config
+        .alias
+        .clone()
+        .unwrap_or_else(|| node.name.clone());
+    let this_ref = format!("{catalog}.{schema}.{table}");
+
+    // Use compiled_code (Jinja resolved) if available, else raw_code.
     let sql = match &node.compiled_code {
         Some(code) => code.clone(),
         None => {
@@ -523,7 +638,7 @@ fn import_manifest_node(
                     .to_string(),
                 suggestion: Some("run `dbt compile` to generate compiled SQL".to_string()),
             });
-            convert_jinja_to_sql(&node.raw_code)
+            convert_jinja_to_sql(&node.raw_code, &this_ref)
         }
     };
 
@@ -554,26 +669,14 @@ fn import_manifest_node(
     // Use description as intent
     let intent = node.description.clone();
 
-    let schema = node
-        .config
-        .schema
-        .as_deref()
-        .unwrap_or(&default_target.schema);
-
-    let catalog = if node.database.is_empty() {
-        default_target.catalog.clone()
-    } else {
-        node.database.clone()
-    };
-
     let config = ModelConfig {
         name: node.name.clone(),
         depends_on,
         strategy,
         target: TargetConfig {
             catalog,
-            schema: schema.to_string(),
-            table: node.name.clone(),
+            schema,
+            table,
         },
         sources: vec![],
         adapter: None,
@@ -583,7 +686,7 @@ fn import_manifest_node(
         format: None,
         format_options: None,
         classification: Default::default(),
-        tags: Default::default(),
+        tags: dbt_tags_to_map(&node.tags),
         retention: None,
         budget: None,
         skip: None,
@@ -639,7 +742,9 @@ fn map_manifest_strategy(config: &DbtNodeConfig, model_name: &str) -> StrategyMa
             });
             StrategyConfig::FullRefresh
         }
-        "incremental" => map_incremental_strategy(config, model_name, &mut warnings),
+        "incremental" => {
+            map_incremental_strategy(config, model_name, &mut warnings, &mut structured)
+        }
         "microbatch" => map_microbatch_strategy(config, model_name, &mut warnings, &mut structured),
         other => {
             warnings.push(ImportWarning {
@@ -674,6 +779,7 @@ fn map_incremental_strategy(
     config: &DbtNodeConfig,
     model_name: &str,
     warnings: &mut Vec<ImportWarning>,
+    structured: &mut Vec<ImportDbtStructuredWarning>,
 ) -> StrategyConfig {
     let unique_keys: Option<Vec<String>> = config.unique_key.as_ref().map(|uk| match uk {
         UniqueKeyValue::Single(s) => vec![s.clone()],
@@ -697,10 +803,25 @@ fn map_incremental_strategy(
 
     match strategy_kind.as_str() {
         "merge" => match unique_keys {
-            Some(keys) if !keys.is_empty() => StrategyConfig::Merge {
-                unique_key: keys,
-                update_columns: None,
-            },
+            Some(keys) if !keys.is_empty() => {
+                // dbt `merge_exclude_columns` (update all-but-these) has no
+                // direct Rocky equivalent — without the full column list we
+                // can't invert it, so warn rather than silently update-all.
+                if config.merge_update_columns.is_none() && config.merge_exclude_columns.is_some() {
+                    warnings.push(ImportWarning {
+                        model: model_name.to_string(),
+                        category: WarningCategory::UnsupportedMaterialization,
+                        message: "merge_exclude_columns has no direct Rocky equivalent — the emitted merge updates all columns".to_string(),
+                        suggestion: Some(
+                            "list the columns to update via the emitted [strategy] `update_columns` instead".to_string(),
+                        ),
+                    });
+                }
+                StrategyConfig::Merge {
+                    unique_key: keys,
+                    update_columns: config.merge_update_columns.clone(),
+                }
+            }
             _ => {
                 warnings.push(ImportWarning {
                     model: model_name.to_string(),
@@ -771,10 +892,12 @@ fn map_incremental_strategy(
             }
         }
         "microbatch" => {
-            // Re-dispatch through the microbatch path so we get the
-            // same event_time validation + granularity translation.
-            let mut structured = Vec::new();
-            map_microbatch_strategy(config, model_name, warnings, &mut structured)
+            // Re-dispatch through the microbatch path for the same event_time
+            // validation + granularity translation. This is the REAL dbt
+            // microbatch form (`incremental_strategy='microbatch'`), so the
+            // MicrobatchMapped structured warning must be threaded out to the
+            // caller, not dropped into a local vec.
+            map_microbatch_strategy(config, model_name, warnings, structured)
         }
         other => {
             warnings.push(ImportWarning {
@@ -824,9 +947,53 @@ fn map_microbatch_strategy(
         .map(|s| batch_size_to_grain(s, model_name, warnings))
         .unwrap_or(TimeGrain::Day);
 
-    StrategyConfig::Microbatch {
-        timestamp_column: event_time,
-        granularity,
+    // dbt microbatch idempotently REPLACES each batch partition. Rocky's
+    // Microbatch strategy emits an append-only INSERT (sql_gen.rs), so importing
+    // it as-is silently re-inserts the lookback window every run. dbt microbatch
+    // requires a `unique_key`, so map it to an idempotent Rocky merge instead;
+    // only fall back to append-only (loudly) if a key is somehow absent.
+    let unique_keys: Option<Vec<String>> = config.unique_key.as_ref().map(|uk| match uk {
+        UniqueKeyValue::Single(s) => vec![s.clone()],
+        UniqueKeyValue::Multiple(v) => v.clone(),
+    });
+
+    match unique_keys {
+        Some(keys) if !keys.is_empty() => {
+            warnings.push(ImportWarning {
+                model: model_name.to_string(),
+                category: WarningCategory::UnsupportedMaterialization,
+                message: "dbt microbatch mapped to an idempotent Rocky merge(unique_key); partition-replace becomes key-upsert, so rows removed from the source window are not deleted".to_string(),
+                suggestion: Some(
+                    "review the emitted [strategy] block; for true partition-replace use a time-interval model with @start_date/@end_date".to_string(),
+                ),
+            });
+            structured.push(ImportDbtStructuredWarning::MicrobatchMapped {
+                model: model_name.to_string(),
+                mapped_to: "merge".to_string(),
+            });
+            StrategyConfig::Merge {
+                unique_key: keys,
+                update_columns: config.merge_update_columns.clone(),
+            }
+        }
+        _ => {
+            warnings.push(ImportWarning {
+                model: model_name.to_string(),
+                category: WarningCategory::UnsupportedMaterialization,
+                message: "dbt microbatch without a unique_key imports as append-only and re-inserts the lookback window every run".to_string(),
+                suggestion: Some(
+                    "add a unique_key (microbatch requires one) so it maps to an idempotent merge, or convert to a time-interval strategy".to_string(),
+                ),
+            });
+            structured.push(ImportDbtStructuredWarning::MicrobatchMapped {
+                model: model_name.to_string(),
+                mapped_to: "append".to_string(),
+            });
+            StrategyConfig::Microbatch {
+                timestamp_column: event_time,
+                granularity,
+            }
+        }
     }
 }
 
@@ -1127,6 +1294,7 @@ pub fn import_dbt_project(
         unit_tests_found: 0,
         unit_tests_converted: 0,
         unit_tests_skipped: 0,
+        constructs_dropped: 0,
     };
 
     // Verify at least one model directory exists
@@ -1261,16 +1429,31 @@ fn import_single_model(
 
     // Check for remaining unsupported Jinja patterns
     if content_processed.contains("{%") {
-        let has_non_incr_blocks = {
-            let block_re = Regex::new(r"\{%[^%]*%\}").unwrap();
-            block_re.is_match(&content_processed)
-        };
-        if has_non_incr_blocks {
+        // `{% for %}` / `{% set %}` REFUSE: the regex conversion strips only
+        // the `{% %}` delimiters, so a loop/assignment body survives exactly
+        // once — a loop meant to emit N columns emits one broken fragment that
+        // loads but is wrong. A loud failure beats a silent mis-render.
+        let for_set_re = Regex::new(r"\{%-?\s*(for|set)\b").unwrap();
+        if for_set_re.is_match(&content_processed) {
+            return Err(
+                "contains unsupported Jinja control flow ({% for %} or {% set %}) that the \
+                 no-manifest importer cannot faithfully render — re-run after `dbt compile` (the \
+                 manifest path resolves Jinja) or rewrite the model without loops/assignments"
+                    .to_string(),
+            );
+        }
+        // Other control flow ({% if %}) is still emitted with TODO markers and
+        // a warning — it degrades (the body is applied unconditionally) but
+        // stays inspectable for review, matching the long-standing behaviour.
+        let block_re = Regex::new(r"\{%[^%]*%\}").unwrap();
+        if block_re.is_match(&content_processed) {
             warnings.push(ImportWarning {
                 model: name.to_string(),
                 category: WarningCategory::JinjaControlFlow,
-                message: "contains Jinja control flow ({% if %}, {% for %}) — replaced with TODO comments".to_string(),
-                suggestion: Some("consider using manifest.json import path for full Jinja resolution".to_string()),
+                message: "contains Jinja control flow ({% if %}) — emitted with TODO markers; the conditional body is applied unconditionally, so review the result".to_string(),
+                suggestion: Some(
+                    "use the manifest import path (`dbt compile`) for faithful Jinja resolution".to_string(),
+                ),
             });
         }
     }
@@ -1307,7 +1490,7 @@ fn import_single_model(
     }
 
     // Apply project config inheritance
-    let resolved_schema = if let Some(proj) = project_config {
+    let (resolved_schema, resolved_tags) = if let Some(proj) = project_config {
         let resolved = dbt_project::resolve_model_config(proj, rel_path);
         // Project-level materialization: only override if no model-level config
         if !content_processed.contains("config(") && matches!(strategy, StrategyConfig::FullRefresh)
@@ -1337,13 +1520,22 @@ fn import_single_model(
                 _ => {}
             }
         }
-        resolved.schema
+        (resolved.schema, resolved.tags)
     } else {
-        None
+        (None, Vec::new())
     };
 
-    // Convert Jinja refs to plain SQL
-    let sql = convert_jinja_to_sql(&content_processed);
+    // Resolve the model's output coordinates so {{ this }} substitutes the real
+    // FQN and the emitted target uses the same alias-aware table name.
+    let resolved_schema_str = resolved_schema.as_deref().unwrap_or(&default_target.schema);
+    let resolved_table = extract_dbt_alias(&content_processed).unwrap_or_else(|| name.to_string());
+    let this_ref = format!(
+        "{}.{}.{}",
+        default_target.catalog, resolved_schema_str, resolved_table
+    );
+
+    // Convert Jinja refs to plain SQL.
+    let sql = convert_jinja_to_sql(&content_processed, &this_ref);
 
     // Resolve source references
     let mut model_sources = Vec::new();
@@ -1366,16 +1558,14 @@ fn import_single_model(
         }
     }
 
-    let schema = resolved_schema.as_deref().unwrap_or(&default_target.schema);
-
     let config = ModelConfig {
         name: name.to_string(),
         depends_on: vec![], // Auto-resolved by compiler
         strategy,
         target: TargetConfig {
             catalog: default_target.catalog.clone(),
-            schema: schema.to_string(),
-            table: name.to_string(),
+            schema: resolved_schema_str.to_string(),
+            table: resolved_table,
         },
         sources: model_sources,
         adapter: None,
@@ -1385,7 +1575,7 @@ fn import_single_model(
         format: None,
         format_options: None,
         classification: Default::default(),
-        tags: Default::default(),
+        tags: dbt_tags_to_map(&resolved_tags),
         retention: None,
         budget: None,
         skip: None,
@@ -1497,6 +1687,26 @@ fn extract_timestamp_from_where(block: &str) -> Option<String> {
 /// discarded here on purpose — the regex path emits string warnings
 /// only (the manifest path is the canonical surface for
 /// structured-warning consumers).
+/// Map a dbt tag list onto Rocky's key/value `[tags]` shape. dbt tags are bare
+/// labels; each becomes `<tag> = "true"` so it stays a queryable key in
+/// `ModelConfig.tags` (a `BTreeMap<String, String>`).
+fn dbt_tags_to_map(tags: &[String]) -> std::collections::BTreeMap<String, String> {
+    tags.iter()
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| (t.clone(), "true".to_string()))
+        .collect()
+}
+
+/// Best-effort parse of `alias='...'` from a model's `{{ config(...) }}` block
+/// on the regex (no-manifest) path. dbt `alias` overrides the output relation
+/// name; dropping it would silently route the model's data to a table named
+/// after the file.
+fn extract_dbt_alias(content: &str) -> Option<String> {
+    let config_re = Regex::new(r"\{\{\s*config\s*\(([^)]*)\)\s*\}\}").ok()?;
+    let caps = config_re.captures(content)?;
+    single_string_value(&caps[1], "alias")
+}
+
 fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
     let mut messages = Vec::new();
 
@@ -1545,6 +1755,11 @@ fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
         pre_hook: Vec::new(),
         post_hook: Vec::new(),
         on_schema_change: None,
+        // alias does not affect strategy selection; the regex path threads it
+        // to target.table separately via extract_dbt_alias.
+        alias: None,
+        merge_update_columns: None,
+        merge_exclude_columns: None,
     };
 
     let mapping = map_manifest_strategy(&synthetic, "<regex-path>");
@@ -1591,7 +1806,7 @@ fn single_string_value(config_str: &str, key: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Convert dbt Jinja expressions to plain SQL.
-fn convert_jinja_to_sql(content: &str) -> String {
+fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
     let mut sql = content.to_string();
 
     // Remove {{ config(...) }} blocks
@@ -1608,9 +1823,14 @@ fn convert_jinja_to_sql(content: &str) -> String {
             .unwrap();
     sql = source_re.replace_all(&sql, "$1.$2").to_string();
 
-    // {{ this }} -> __this__ (placeholder, resolved at execution)
+    // {{ this }} -> the model's own fully-qualified name. Substituting a real
+    // catalog.schema.table (NoExpand so dots/`$` are literal) avoids emitting a
+    // bogus `__this__` identifier that loads via the sidecar but fails at the
+    // warehouse.
     let this_re = Regex::new(r"\{\{\s*this\s*\}\}").unwrap();
-    sql = this_re.replace_all(&sql, "__this__").to_string();
+    sql = this_re
+        .replace_all(&sql, regex::NoExpand(this_ref))
+        .to_string();
 
     // Replace unsupported Jinja blocks with TODO comments
     let block_re = Regex::new(r"\{%[^%]*%\}").unwrap();
@@ -1661,31 +1881,41 @@ mod tests {
     #[test]
     fn test_convert_ref() {
         let input = "SELECT * FROM {{ ref('orders') }}";
-        assert_eq!(convert_jinja_to_sql(input), "SELECT * FROM orders");
+        assert_eq!(
+            convert_jinja_to_sql(input, "cat.sch.tbl"),
+            "SELECT * FROM orders"
+        );
     }
 
     #[test]
     fn test_convert_source() {
         let input = "SELECT * FROM {{ source('raw', 'customers') }}";
-        assert_eq!(convert_jinja_to_sql(input), "SELECT * FROM raw.customers");
+        assert_eq!(
+            convert_jinja_to_sql(input, "cat.sch.tbl"),
+            "SELECT * FROM raw.customers"
+        );
     }
 
     #[test]
     fn test_convert_config_removed() {
         let input = "{{ config(materialized='table') }}\nSELECT 1";
-        assert_eq!(convert_jinja_to_sql(input), "SELECT 1");
+        assert_eq!(convert_jinja_to_sql(input, "cat.sch.tbl"), "SELECT 1");
     }
 
     #[test]
     fn test_convert_this() {
         let input = "SELECT * FROM {{ this }}";
-        assert_eq!(convert_jinja_to_sql(input), "SELECT * FROM __this__");
+        // {{ this }} resolves to the model's own FQN, not a bogus __this__.
+        assert_eq!(
+            convert_jinja_to_sql(input, "cat.sch.tbl"),
+            "SELECT * FROM cat.sch.tbl"
+        );
     }
 
     #[test]
     fn test_convert_unsupported_jinja() {
         let input = "{% if some_condition %}WHERE id > 0{% endif %}";
-        let result = convert_jinja_to_sql(input);
+        let result = convert_jinja_to_sql(input, "cat.sch.tbl");
         assert!(result.contains("TODO: unsupported Jinja block"));
     }
 
@@ -1776,7 +2006,7 @@ mod tests {
     fn test_multiple_refs() {
         let input =
             "SELECT * FROM {{ ref('orders') }} o JOIN {{ ref('customers') }} c ON o.id = c.id";
-        let result = convert_jinja_to_sql(input);
+        let result = convert_jinja_to_sql(input, "cat.sch.tbl");
         assert_eq!(
             result,
             "SELECT * FROM orders o JOIN customers c ON o.id = c.id"
@@ -2200,6 +2430,125 @@ FROM {{ ref('stg_events') }}
             result.imported[0].config.strategy,
             StrategyConfig::View
         ));
+    }
+
+    fn model_node(
+        name: &str,
+        config: serde_json::Value,
+        tags: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut node = serde_json::json!({
+            "unique_id": format!("model.p.{name}"),
+            "name": name,
+            "resource_type": "model",
+            "compiled_code": "SELECT 1",
+            "raw_code": "SELECT 1",
+            "depends_on": { "nodes": [], "macros": [] },
+            "columns": {}, "schema": "s", "database": "d"
+        });
+        node["config"] = config;
+        node["tags"] = tags;
+        node
+    }
+
+    #[test]
+    fn test_manifest_alias_overrides_target_table() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.m": model_node("m",
+                serde_json::json!({ "materialized": "table", "alias": "renamed" }),
+                serde_json::json!([])) },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        // alias drives the physical table; the logical name is unchanged.
+        assert_eq!(result.imported[0].config.target.table, "renamed");
+        assert_eq!(result.imported[0].config.name, "m");
+    }
+
+    #[test]
+    fn test_manifest_microbatch_with_unique_key_maps_to_merge() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            // The REAL dbt microbatch form: materialized='incremental' +
+            // incremental_strategy='microbatch' (there is no
+            // materialized='microbatch' in dbt). This routes through
+            // map_incremental_strategy, so it guards the structured-warning
+            // threading.
+            "nodes": { "model.p.f": model_node("f",
+                serde_json::json!({ "materialized": "incremental", "incremental_strategy": "microbatch", "event_time": "ts", "batch_size": "day", "unique_key": "id" }),
+                serde_json::json!([])) },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert!(
+            matches!(
+                result.imported[0].config.strategy,
+                StrategyConfig::Merge { .. }
+            ),
+            "microbatch with a unique_key maps to an idempotent merge"
+        );
+        assert!(result.structured_warnings.iter().any(|w| matches!(w,
+            ImportDbtStructuredWarning::MicrobatchMapped { mapped_to, .. } if mapped_to == "merge")));
+    }
+
+    #[test]
+    fn test_manifest_tags_carry_onto_model() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.m": model_node("m",
+                serde_json::json!({ "materialized": "table" }),
+                serde_json::json!(["finance", "daily"])) },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        let tags = &result.imported[0].config.tags;
+        assert_eq!(tags.get("finance").map(String::as_str), Some("true"));
+        assert_eq!(tags.get("daily").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn test_manifest_sweep_reports_dropped_constructs() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.m": model_node("m", serde_json::json!({ "materialized": "table" }), serde_json::json!([])),
+                "snapshot.p.snap": {
+                    "unique_id": "snapshot.p.snap", "name": "snap",
+                    "resource_type": "snapshot", "raw_code": ""
+                }
+            },
+            "sources": {},
+            "metrics": { "metric.p.rev": {} }
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(result.imported.len(), 1, "only the model imports");
+        assert_eq!(result.constructs_dropped, 2, "1 snapshot + 1 metric");
+        assert!(result.structured_warnings.iter().any(|w| matches!(w,
+            ImportDbtStructuredWarning::DroppedConstruct { construct, .. } if construct == "snapshot")));
+    }
+
+    #[test]
+    fn test_manifest_without_compiled_code_warns_stale() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.m": {
+                "unique_id": "model.p.m", "name": "m", "resource_type": "model",
+                "raw_code": "SELECT 1",
+                "depends_on": { "nodes": [], "macros": [] },
+                "config": { "materialized": "table" },
+                "columns": {}, "tags": [], "schema": "s", "database": "d"
+            }},
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| matches!(w.category, WarningCategory::StaleManifest)),
+            "a manifest with no compiled SQL must warn loudly"
+        );
     }
 
     #[test]

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # 14-import-dbt-failure-modes — exercise `rocky import-dbt`'s handling of the
 # deliberately out-of-scope dbt features:
-#   - models with `{% if target.name %}` branching (JinjaControlFlow warning)
+#   - models with `{% if target.name %}` branching (JinjaControlFlow warning,
+#     emitted with a TODO marker)
+#   - models with `{% for %}` loops (REFUSED — would half-render to broken SQL)
 #   - models with `{{ var() }}` references (UnsupportedMacro warning)
 #   - schema.yml tests outside the canonical four (UnsupportedTest warning)
 #   - `snapshots/`, `dbt_packages/`, and `tests/` trees (silently ignored)
@@ -83,6 +85,17 @@ for unwanted in orders_snapshot star assert_revenue_positive; do
         fail=1
     fi
 done
+
+# A {% for %} model is REFUSED (it would half-render into broken SQL) — it
+# must not be emitted, and the importer must report the refusal.
+if [ -f "imported/models/stg_loop.sql" ] || [ -f "imported/models/stg_loop.toml" ]; then
+    echo "FAIL: stg_loop ({% for %} model) should be refused, not emitted"
+    fail=1
+fi
+if ! grep -qi 'unsupported Jinja control flow' expected/import.log; then
+    echo "FAIL: import log should report the refused {% for %} model"
+    fail=1
+fi
 
 if [ "$fail" -eq 0 ]; then
     echo "ok  All assertions passed."

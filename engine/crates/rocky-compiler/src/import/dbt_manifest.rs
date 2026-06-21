@@ -21,6 +21,19 @@ pub struct DbtManifest {
     /// Unit-test definitions keyed by `unit_test.<project>.<model>.<name>`.
     /// Empty when the manifest predates dbt's unit-test feature.
     pub unit_tests: HashMap<String, DbtManifestUnitTest>,
+    /// Counts of resource classes the importer does not translate, captured at
+    /// parse time so the sweep can report them.
+    pub dropped: DbtDroppedCounts,
+}
+
+/// Counts of dbt resource classes the importer skips. Surfaced (not silently
+/// ignored) via the import warning sweep.
+#[derive(Debug, Clone, Default)]
+pub struct DbtDroppedCounts {
+    pub snapshots: usize,
+    pub metrics: usize,
+    pub semantic_models: usize,
+    pub exposures: usize,
 }
 
 /// Manifest-level metadata.
@@ -85,6 +98,13 @@ pub struct DbtNodeConfig {
     /// `on_schema_change` — dbt-databricks drift policy. One of `ignore`,
     /// `fail`, `append_new_columns`, `sync_all_columns`.
     pub on_schema_change: Option<String>,
+    /// `alias` — overrides the output relation (table) name. When set, the
+    /// model materializes to this name instead of the node name.
+    pub alias: Option<String>,
+    /// `merge_update_columns` — explicit MERGE UPDATE column list (dbt).
+    pub merge_update_columns: Option<Vec<String>>,
+    /// `merge_exclude_columns` — columns excluded from the MERGE UPDATE (dbt).
+    pub merge_exclude_columns: Option<Vec<String>>,
 }
 
 /// unique_key can be a single string or a list.
@@ -162,6 +182,14 @@ struct RawManifest {
     sources: HashMap<String, RawManifestSource>,
     #[serde(default)]
     unit_tests: HashMap<String, RawUnitTest>,
+    // Count-only: resource classes the importer does not translate. Captured
+    // so the sweep can report them rather than silently ignoring them.
+    #[serde(default)]
+    metrics: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    semantic_models: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    exposures: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -278,6 +306,18 @@ struct RawNodeConfig {
     post_hook_dashed: Option<serde_json::Value>,
     #[serde(default)]
     on_schema_change: Option<String>,
+    /// `alias` — overrides the relation (table) name. dbt routes the model's
+    /// output to this name instead of the file/node name; dropping it silently
+    /// lands the data in the wrong table.
+    #[serde(default)]
+    alias: Option<String>,
+    /// `merge_update_columns` — the explicit columns to UPDATE on a MERGE
+    /// match. Dropping it silently turns a column-scoped merge into update-all.
+    #[serde(default)]
+    merge_update_columns: Option<Vec<String>>,
+    /// `merge_exclude_columns` — columns excluded from the MERGE UPDATE.
+    #[serde(default)]
+    merge_exclude_columns: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -321,6 +361,17 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
         project_name: raw.metadata.project_name.unwrap_or_default(),
     };
 
+    let dropped = DbtDroppedCounts {
+        snapshots: raw
+            .nodes
+            .values()
+            .filter(|n| n.resource_type == "snapshot")
+            .count(),
+        metrics: raw.metrics.len(),
+        semantic_models: raw.semantic_models.len(),
+        exposures: raw.exposures.len(),
+    };
+
     let nodes = raw
         .nodes
         .into_iter()
@@ -357,6 +408,7 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
         nodes,
         sources,
         unit_tests,
+        dropped,
     })
 }
 
@@ -478,6 +530,9 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
             pre_hook,
             post_hook,
             on_schema_change: config.on_schema_change,
+            alias: config.alias,
+            merge_update_columns: config.merge_update_columns,
+            merge_exclude_columns: config.merge_exclude_columns,
         },
         columns,
         description: raw.description.filter(|d| !d.is_empty()),

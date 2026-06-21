@@ -438,6 +438,23 @@ pub fn tests_to_test_decls(
                     }
                 },
                 DbtTestDef::Configured { name, config } => match name.as_str() {
+                    // Configured not_null/unique (e.g. `{not_null: {where: …,
+                    // severity: warn}}`) previously fell to the catch-all and
+                    // were dropped — silently turning a scoped or warn-level
+                    // test into nothing, or a `severity: warn` into a hard
+                    // error. Convert them, carrying the row filter and severity.
+                    "not_null" => decls.push(TestDecl {
+                        test_type: TestType::NotNull,
+                        column: Some(col.name.clone()),
+                        severity: config_severity(config),
+                        filter: config_filter(config),
+                    }),
+                    "unique" => decls.push(TestDecl {
+                        test_type: TestType::Unique,
+                        column: Some(col.name.clone()),
+                        severity: config_severity(config),
+                        filter: config_filter(config),
+                    }),
                     "accepted_values" => match accepted_values_decl(&col.name, config) {
                         Some(decl) => decls.push(decl),
                         None => unsupported.push(UnsupportedTest {
@@ -494,8 +511,8 @@ fn accepted_values_decl(
     Some(TestDecl {
         test_type: TestType::AcceptedValues { values },
         column: Some(col_name.to_string()),
-        severity: TestSeverity::Error,
-        filter: None,
+        severity: config_severity(config),
+        filter: config_filter(config),
     })
 }
 
@@ -514,9 +531,27 @@ fn relationships_decl(
             to_column: field.to_string(),
         },
         column: Some(col_name.to_string()),
-        severity: TestSeverity::Error,
-        filter: None,
+        severity: config_severity(config),
+        filter: config_filter(config),
     })
+}
+
+/// dbt test `severity: warn` maps to a Rocky warning; anything else (incl.
+/// the default and `error`) is a hard error.
+fn config_severity(config: &HashMap<String, serde_yaml::Value>) -> TestSeverity {
+    match config.get("severity").and_then(serde_yaml::Value::as_str) {
+        Some(s) if s.eq_ignore_ascii_case("warn") => TestSeverity::Warning,
+        _ => TestSeverity::Error,
+    }
+}
+
+/// dbt test `where: <expr>` scopes the test to a row subset; map it to the
+/// Rocky test decl's row filter.
+fn config_filter(config: &HashMap<String, serde_yaml::Value>) -> Option<String> {
+    config
+        .get("where")
+        .and_then(serde_yaml::Value::as_str)
+        .map(str::to_string)
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +848,35 @@ models:
             }
             _ => panic!("expected Configured test"),
         }
+    }
+
+    #[test]
+    fn test_configured_not_null_carries_severity_and_where() {
+        let yaml = r#"
+models:
+  - name: orders
+    columns:
+      - name: status
+        tests:
+          - not_null:
+              where: "created_at > '2026-01-01'"
+              severity: warn
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&models[0], &resolver);
+        assert_eq!(
+            unsupported.len(),
+            0,
+            "configured not_null must convert, not drop"
+        );
+        assert_eq!(decls.len(), 1);
+        assert!(matches!(decls[0].test_type, TestType::NotNull));
+        assert_eq!(decls[0].severity, TestSeverity::Warning);
+        assert_eq!(
+            decls[0].filter.as_deref(),
+            Some("created_at > '2026-01-01'")
+        );
     }
 
     #[test]

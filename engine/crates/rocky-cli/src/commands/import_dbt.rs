@@ -148,6 +148,7 @@ pub fn run_import_dbt(
             unit_tests_found: import_result.unit_tests_found,
             unit_tests_converted: import_result.unit_tests_converted,
             unit_tests_skipped: import_result.unit_tests_skipped,
+            constructs_dropped: import_result.constructs_dropped,
             macros_detected: import_result.macros_detected,
             imported_models: import_result
                 .imported
@@ -340,5 +341,20 @@ fn to_cli_structured_warning(w: &CompilerStructuredWarning) -> ImportDbtStructur
                 model: model.clone(),
             }
         }
+        CompilerStructuredWarning::MicrobatchMapped { model, mapped_to } => {
+            ImportDbtStructuredWarning::MicrobatchMapped {
+                model: model.clone(),
+                mapped_to: mapped_to.clone(),
+            }
+        }
+        CompilerStructuredWarning::DroppedConstruct {
+            construct,
+            name,
+            detail,
+        } => ImportDbtStructuredWarning::DroppedConstruct {
+            construct: construct.clone(),
+            name: name.clone(),
+            detail: detail.clone(),
+        },
     }
 }

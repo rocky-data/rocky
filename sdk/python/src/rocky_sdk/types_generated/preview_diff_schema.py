@@ -73,7 +73,7 @@ class Kind(StrEnum):
     sampled = "sampled"
 
 
-class Kind71(StrEnum):
+class Kind73(StrEnum):
     bisection = "bisection"
 
 
@@ -173,7 +173,7 @@ class PreviewModelDiffAlgorithm2(BaseModel):
 
     bisection_stats: BisectionStatsOutput
     diff: PreviewBisectionRowDiff
-    kind: Kind71
+    kind: Kind73
 
 
 class PreviewModelDiff(BaseModel):

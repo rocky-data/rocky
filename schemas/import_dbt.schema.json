@@ -243,6 +243,56 @@
             "model"
           ],
           "type": "object"
+        },
+        {
+          "description": "A dbt microbatch model was remapped: to an idempotent `merge` (`mapped_to = \"merge\"`) when it has a `unique_key`, or kept append-only (`mapped_to = \"append\"`) when it does not.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "microbatch_mapped"
+              ],
+              "type": "string"
+            },
+            "mapped_to": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "mapped_to",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A dbt construct the importer does not translate was detected and skipped (snapshot, source freshness, grants, meta, metric, semantic model, exposure), surfaced so a migration is never silently lossy.",
+          "properties": {
+            "construct": {
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "dropped_construct"
+              ],
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "construct",
+            "detail",
+            "kind",
+            "name"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -276,6 +326,13 @@
   "properties": {
     "command": {
       "type": "string"
+    },
+    "constructs_dropped": {
+      "default": 0,
+      "description": "Number of dbt resources the importer does not translate that were detected and skipped (snapshots, metrics, semantic models, exposures).",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
     },
     "dbt_version": {
       "type": [

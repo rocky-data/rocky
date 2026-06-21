@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rocky import-dbt` no longer silently mis-converts — it fixes or loudly flags each gap.** A migration tool that quietly emits wrong SQL is worse than one that errors, so this closes the silent failures: dbt **`alias`** now drives the sidecar `[target].table` (it was hardcoded to the node name, silently routing data to the wrong table); **`{{ this }}`** resolves to the model's real FQN (was a bogus `__this__`); **`{% for %}`/`{% set %}`** on the no-manifest path are **refused** rather than half-rendered into broken SQL (a `{% if %}` still emits with a TODO marker); dbt **`merge_update_columns`** carries into the `merge` strategy (was update-all); dbt **microbatch** maps to an idempotent `merge(unique_key)` instead of an append-only insert that re-inserts the lookback window every run; configured **`not_null`/`unique`** tests convert and carry `severity:`/`where:` (were dropped); dbt **tags** carry onto the model `[tags]` block; and the resources the importer skips (**snapshots, metrics, semantic models, exposures**) are now detected and counted (`constructs_dropped` + per-resource warnings) instead of vanishing. When a manifest carries no compiled SQL, the importer warns loudly to run `dbt compile` first rather than regex-rendering every model. (#944)
+
 ### Added
 
 - **`rocky cost --by tenant` (and `--by model`) — grouped cost rollups.** `rocky cost <run|latest>` can now roll its per-model cost attribution up by a dimension: `--by tenant` groups executions by the discover-time schema-pattern `{tenant}` component (replication models with no recorded tenant collect in an `<unattributed>` bucket), `--by model` groups by model name. The grouped rollup is emitted as an additive `groups` array on the JSON output; `per_model` is always present, so a plain `rocky cost` is byte-for-byte unchanged. The tenant dimension is persisted on each `ModelExecution` as an additive, serde-defaulted field — no state-schema version bump, and pre-existing run records read back as unattributed.
