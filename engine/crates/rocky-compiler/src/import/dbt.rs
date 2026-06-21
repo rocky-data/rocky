@@ -742,7 +742,9 @@ fn map_manifest_strategy(config: &DbtNodeConfig, model_name: &str) -> StrategyMa
             });
             StrategyConfig::FullRefresh
         }
-        "incremental" => map_incremental_strategy(config, model_name, &mut warnings),
+        "incremental" => {
+            map_incremental_strategy(config, model_name, &mut warnings, &mut structured)
+        }
         "microbatch" => map_microbatch_strategy(config, model_name, &mut warnings, &mut structured),
         other => {
             warnings.push(ImportWarning {
@@ -777,6 +779,7 @@ fn map_incremental_strategy(
     config: &DbtNodeConfig,
     model_name: &str,
     warnings: &mut Vec<ImportWarning>,
+    structured: &mut Vec<ImportDbtStructuredWarning>,
 ) -> StrategyConfig {
     let unique_keys: Option<Vec<String>> = config.unique_key.as_ref().map(|uk| match uk {
         UniqueKeyValue::Single(s) => vec![s.clone()],
@@ -889,10 +892,12 @@ fn map_incremental_strategy(
             }
         }
         "microbatch" => {
-            // Re-dispatch through the microbatch path so we get the
-            // same event_time validation + granularity translation.
-            let mut structured = Vec::new();
-            map_microbatch_strategy(config, model_name, warnings, &mut structured)
+            // Re-dispatch through the microbatch path for the same event_time
+            // validation + granularity translation. This is the REAL dbt
+            // microbatch form (`incremental_strategy='microbatch'`), so the
+            // MicrobatchMapped structured warning must be threaded out to the
+            // caller, not dropped into a local vec.
+            map_microbatch_strategy(config, model_name, warnings, structured)
         }
         other => {
             warnings.push(ImportWarning {
@@ -2465,8 +2470,13 @@ FROM {{ ref('stg_events') }}
     fn test_manifest_microbatch_with_unique_key_maps_to_merge() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
+            // The REAL dbt microbatch form: materialized='incremental' +
+            // incremental_strategy='microbatch' (there is no
+            // materialized='microbatch' in dbt). This routes through
+            // map_incremental_strategy, so it guards the structured-warning
+            // threading.
             "nodes": { "model.p.f": model_node("f",
-                serde_json::json!({ "materialized": "microbatch", "event_time": "ts", "batch_size": "day", "unique_key": "id" }),
+                serde_json::json!({ "materialized": "incremental", "incremental_strategy": "microbatch", "event_time": "ts", "batch_size": "day", "unique_key": "id" }),
                 serde_json::json!([])) },
             "sources": {}
         });
