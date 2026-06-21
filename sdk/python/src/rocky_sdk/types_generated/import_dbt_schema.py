@@ -155,6 +155,35 @@ class ImportDbtStructuredWarning6(BaseModel):
     model: str
 
 
+class Kind38(StrEnum):
+    microbatch_mapped = "microbatch_mapped"
+
+
+class ImportDbtStructuredWarning7(BaseModel):
+    """
+    A dbt microbatch model was remapped: to an idempotent `merge` (`mapped_to = "merge"`) when it has a `unique_key`, or kept append-only (`mapped_to = "append"`) when it does not.
+    """
+
+    kind: Kind38
+    mapped_to: str
+    model: str
+
+
+class Kind39(StrEnum):
+    dropped_construct = "dropped_construct"
+
+
+class ImportDbtStructuredWarning8(BaseModel):
+    """
+    A dbt construct the importer does not translate was detected and skipped (snapshot, source freshness, grants, meta, metric, semantic model, exposure), surfaced so a migration is never silently lossy.
+    """
+
+    construct_: str = Field(..., alias="construct")
+    detail: str
+    kind: Kind39
+    name: str
+
+
 class ImportDbtWarning(BaseModel):
     category: str
     message: str
@@ -170,6 +199,10 @@ class ImportDbtOutput(BaseModel):
     """
 
     command: str
+    constructs_dropped: conint(ge=0) | None = 0
+    """
+    Number of dbt resources the importer does not translate that were detected and skipped (snapshots, metrics, semantic models, exposures).
+    """
     dbt_version: str | None = None
     emission: ImportDbtEmission | None = None
     """
@@ -196,6 +229,8 @@ class ImportDbtOutput(BaseModel):
             | ImportDbtStructuredWarning4
             | ImportDbtStructuredWarning5
             | ImportDbtStructuredWarning6
+            | ImportDbtStructuredWarning7
+            | ImportDbtStructuredWarning8
         ]
         | None
     ) = Field([], validate_default=True)

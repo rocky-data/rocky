@@ -211,6 +211,10 @@ pub struct ImportResult {
     /// fixture format, or any other shape the importer can't faithfully
     /// translate.
     pub unit_tests_skipped: usize,
+    /// Number of dbt resources the importer does not translate that were
+    /// detected and skipped (snapshots, metrics, semantic models, exposures).
+    /// Surfaced so a migration is never silently lossy.
+    pub constructs_dropped: usize,
 }
 
 /// A successfully imported model.
@@ -258,15 +262,91 @@ pub fn import_from_manifest(manifest: &DbtManifest, default_target: &TargetConfi
         unit_tests_found: 0,
         unit_tests_converted: 0,
         unit_tests_skipped: 0,
+        constructs_dropped: 0,
     };
+
+    // A manifest with no compiled SQL means every model falls back to the
+    // reduced-fidelity raw-code path; detect it before importing so we can warn
+    // loudly rather than emit a plausible-but-wrong repo.
+    let model_count = manifest.nodes.len();
+    let with_compiled = manifest
+        .nodes
+        .values()
+        .filter(|n| n.compiled_code.is_some())
+        .count();
 
     for node in manifest.nodes.values() {
         import_manifest_node(node, default_target, &mut result);
     }
 
+    if model_count > 0 && with_compiled == 0 {
+        result.warnings.push(ImportWarning {
+            model: "<manifest>".to_string(),
+            category: WarningCategory::StaleManifest,
+            message: format!(
+                "none of the {model_count} manifest nodes carry compiled SQL — every model was \
+                 imported via the reduced-fidelity raw-code path, which can mis-render Jinja. The \
+                 import likely looks complete but is not faithful."
+            ),
+            suggestion: Some(
+                "regenerate the manifest with `dbt compile` (including any required --vars) and re-import".to_string(),
+            ),
+        });
+    }
+
+    // Surface the resource classes the importer does not translate so a
+    // migration is never silently lossy.
+    record_dropped_constructs(&manifest.dropped, &mut result);
+
     apply_dbt_unit_tests(manifest, &mut result);
 
     result
+}
+
+/// Emit a structured `DroppedConstruct` warning per non-zero dropped resource
+/// class (snapshots, metrics, semantic models, exposures) and bump
+/// `constructs_dropped`.
+fn record_dropped_constructs(dropped: &dbt_manifest::DbtDroppedCounts, result: &mut ImportResult) {
+    for (construct, count, detail) in [
+        (
+            "snapshot",
+            dropped.snapshots,
+            "Rocky has no snapshot pipeline yet — re-implement as a [snapshot] pipeline or keep it in dbt",
+        ),
+        (
+            "metric",
+            dropped.metrics,
+            "MetricFlow metrics are not imported — keep your semantic layer in dbt or a metrics tool",
+        ),
+        (
+            "semantic_model",
+            dropped.semantic_models,
+            "MetricFlow semantic models are not imported",
+        ),
+        (
+            "exposure",
+            dropped.exposures,
+            "dbt exposures (downstream-usage docs) are not imported",
+        ),
+    ] {
+        if count == 0 {
+            continue;
+        }
+        result.constructs_dropped += count;
+        result.warnings.push(ImportWarning {
+            model: "<project>".to_string(),
+            category: WarningCategory::UnsupportedMaterialization,
+            message: format!("{count} {construct}(s) skipped — {detail}"),
+            suggestion: None,
+        });
+        result
+            .structured_warnings
+            .push(ImportDbtStructuredWarning::DroppedConstruct {
+                construct: construct.to_string(),
+                name: format!("{count} total"),
+                detail: detail.to_string(),
+            });
+    }
 }
 
 /// Walk a dbt project's `models/` tree for `schema.yml` files, convert any
@@ -1209,6 +1289,7 @@ pub fn import_dbt_project(
         unit_tests_found: 0,
         unit_tests_converted: 0,
         unit_tests_skipped: 0,
+        constructs_dropped: 0,
     };
 
     // Verify at least one model directory exists
@@ -1343,23 +1424,32 @@ fn import_single_model(
 
     // Check for remaining unsupported Jinja patterns
     if content_processed.contains("{%") {
-        let has_non_incr_blocks = {
-            let block_re = Regex::new(r"\{%[^%]*%\}").unwrap();
-            block_re.is_match(&content_processed)
-        };
-        if has_non_incr_blocks {
-            // Refuse rather than half-render: `block_re` strips only the
-            // `{% %}` delimiters, so a `{% for %}`/`{% set %}`/non-incremental
-            // `{% if %}` body survives exactly once, yielding SQL that loads
-            // but is semantically wrong (a loop meant to emit N columns emits
-            // one broken fragment). A loud failure beats a silent mis-render.
+        // `{% for %}` / `{% set %}` REFUSE: the regex conversion strips only
+        // the `{% %}` delimiters, so a loop/assignment body survives exactly
+        // once — a loop meant to emit N columns emits one broken fragment that
+        // loads but is wrong. A loud failure beats a silent mis-render.
+        let for_set_re = Regex::new(r"\{%-?\s*(for|set)\b").unwrap();
+        if for_set_re.is_match(&content_processed) {
             return Err(
-                "contains unsupported Jinja control flow ({% for %}, {% set %}, or a \
-                 non-incremental {% if %}) that the no-manifest importer cannot faithfully \
-                 render — re-run after `dbt compile` (the manifest path resolves Jinja) or \
-                 rewrite the model without control flow"
+                "contains unsupported Jinja control flow ({% for %} or {% set %}) that the \
+                 no-manifest importer cannot faithfully render — re-run after `dbt compile` (the \
+                 manifest path resolves Jinja) or rewrite the model without loops/assignments"
                     .to_string(),
             );
+        }
+        // Other control flow ({% if %}) is still emitted with TODO markers and
+        // a warning — it degrades (the body is applied unconditionally) but
+        // stays inspectable for review, matching the long-standing behaviour.
+        let block_re = Regex::new(r"\{%[^%]*%\}").unwrap();
+        if block_re.is_match(&content_processed) {
+            warnings.push(ImportWarning {
+                model: name.to_string(),
+                category: WarningCategory::JinjaControlFlow,
+                message: "contains Jinja control flow ({% if %}) — emitted with TODO markers; the conditional body is applied unconditionally, so review the result".to_string(),
+                suggestion: Some(
+                    "use the manifest import path (`dbt compile`) for faithful Jinja resolution".to_string(),
+                ),
+            });
         }
     }
     if content_processed.contains("{{ var(") {
@@ -2335,6 +2425,120 @@ FROM {{ ref('stg_events') }}
             result.imported[0].config.strategy,
             StrategyConfig::View
         ));
+    }
+
+    fn model_node(
+        name: &str,
+        config: serde_json::Value,
+        tags: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut node = serde_json::json!({
+            "unique_id": format!("model.p.{name}"),
+            "name": name,
+            "resource_type": "model",
+            "compiled_code": "SELECT 1",
+            "raw_code": "SELECT 1",
+            "depends_on": { "nodes": [], "macros": [] },
+            "columns": {}, "schema": "s", "database": "d"
+        });
+        node["config"] = config;
+        node["tags"] = tags;
+        node
+    }
+
+    #[test]
+    fn test_manifest_alias_overrides_target_table() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.m": model_node("m",
+                serde_json::json!({ "materialized": "table", "alias": "renamed" }),
+                serde_json::json!([])) },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        // alias drives the physical table; the logical name is unchanged.
+        assert_eq!(result.imported[0].config.target.table, "renamed");
+        assert_eq!(result.imported[0].config.name, "m");
+    }
+
+    #[test]
+    fn test_manifest_microbatch_with_unique_key_maps_to_merge() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.f": model_node("f",
+                serde_json::json!({ "materialized": "microbatch", "event_time": "ts", "batch_size": "day", "unique_key": "id" }),
+                serde_json::json!([])) },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert!(
+            matches!(
+                result.imported[0].config.strategy,
+                StrategyConfig::Merge { .. }
+            ),
+            "microbatch with a unique_key maps to an idempotent merge"
+        );
+        assert!(result.structured_warnings.iter().any(|w| matches!(w,
+            ImportDbtStructuredWarning::MicrobatchMapped { mapped_to, .. } if mapped_to == "merge")));
+    }
+
+    #[test]
+    fn test_manifest_tags_carry_onto_model() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.m": model_node("m",
+                serde_json::json!({ "materialized": "table" }),
+                serde_json::json!(["finance", "daily"])) },
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        let tags = &result.imported[0].config.tags;
+        assert_eq!(tags.get("finance").map(String::as_str), Some("true"));
+        assert_eq!(tags.get("daily").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn test_manifest_sweep_reports_dropped_constructs() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.m": model_node("m", serde_json::json!({ "materialized": "table" }), serde_json::json!([])),
+                "snapshot.p.snap": {
+                    "unique_id": "snapshot.p.snap", "name": "snap",
+                    "resource_type": "snapshot", "raw_code": ""
+                }
+            },
+            "sources": {},
+            "metrics": { "metric.p.rev": {} }
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(result.imported.len(), 1, "only the model imports");
+        assert_eq!(result.constructs_dropped, 2, "1 snapshot + 1 metric");
+        assert!(result.structured_warnings.iter().any(|w| matches!(w,
+            ImportDbtStructuredWarning::DroppedConstruct { construct, .. } if construct == "snapshot")));
+    }
+
+    #[test]
+    fn test_manifest_without_compiled_code_warns_stale() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.m": {
+                "unique_id": "model.p.m", "name": "m", "resource_type": "model",
+                "raw_code": "SELECT 1",
+                "depends_on": { "nodes": [], "macros": [] },
+                "config": { "materialized": "table" },
+                "columns": {}, "tags": [], "schema": "s", "database": "d"
+            }},
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| matches!(w.category, WarningCategory::StaleManifest)),
+            "a manifest with no compiled SQL must warn loudly"
+        );
     }
 
     #[test]

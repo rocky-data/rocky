@@ -3298,6 +3298,10 @@ pub struct ImportDbtOutput {
     /// fixture format, or otherwise unsupported shape.
     #[serde(default)]
     pub unit_tests_skipped: usize,
+    /// Number of dbt resources the importer does not translate that were
+    /// detected and skipped (snapshots, metrics, semantic models, exposures).
+    #[serde(default)]
+    pub constructs_dropped: usize,
     pub macros_detected: usize,
     pub imported_models: Vec<String>,
     pub warning_details: Vec<ImportDbtWarning>,

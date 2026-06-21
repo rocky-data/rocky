@@ -21,6 +21,19 @@ pub struct DbtManifest {
     /// Unit-test definitions keyed by `unit_test.<project>.<model>.<name>`.
     /// Empty when the manifest predates dbt's unit-test feature.
     pub unit_tests: HashMap<String, DbtManifestUnitTest>,
+    /// Counts of resource classes the importer does not translate, captured at
+    /// parse time so the sweep can report them.
+    pub dropped: DbtDroppedCounts,
+}
+
+/// Counts of dbt resource classes the importer skips. Surfaced (not silently
+/// ignored) via the import warning sweep.
+#[derive(Debug, Clone, Default)]
+pub struct DbtDroppedCounts {
+    pub snapshots: usize,
+    pub metrics: usize,
+    pub semantic_models: usize,
+    pub exposures: usize,
 }
 
 /// Manifest-level metadata.
@@ -169,6 +182,14 @@ struct RawManifest {
     sources: HashMap<String, RawManifestSource>,
     #[serde(default)]
     unit_tests: HashMap<String, RawUnitTest>,
+    // Count-only: resource classes the importer does not translate. Captured
+    // so the sweep can report them rather than silently ignoring them.
+    #[serde(default)]
+    metrics: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    semantic_models: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    exposures: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -340,6 +361,17 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
         project_name: raw.metadata.project_name.unwrap_or_default(),
     };
 
+    let dropped = DbtDroppedCounts {
+        snapshots: raw
+            .nodes
+            .values()
+            .filter(|n| n.resource_type == "snapshot")
+            .count(),
+        metrics: raw.metrics.len(),
+        semantic_models: raw.semantic_models.len(),
+        exposures: raw.exposures.len(),
+    };
+
     let nodes = raw
         .nodes
         .into_iter()
@@ -376,6 +408,7 @@ pub fn parse_manifest(path: &Path) -> Result<DbtManifest, String> {
         nodes,
         sources,
         unit_tests,
+        dropped,
     })
 }
 

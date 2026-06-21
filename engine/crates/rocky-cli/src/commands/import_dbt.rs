@@ -148,6 +148,7 @@ pub fn run_import_dbt(
             unit_tests_found: import_result.unit_tests_found,
             unit_tests_converted: import_result.unit_tests_converted,
             unit_tests_skipped: import_result.unit_tests_skipped,
+            constructs_dropped: import_result.constructs_dropped,
             macros_detected: import_result.macros_detected,
             imported_models: import_result
                 .imported

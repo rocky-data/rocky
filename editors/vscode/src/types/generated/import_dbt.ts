@@ -49,6 +49,19 @@ export type ImportDbtStructuredWarning =
       kind: "microbatch_missing_event_time";
       model: string;
       [k: string]: unknown;
+    }
+  | {
+      kind: "microbatch_mapped";
+      mapped_to: string;
+      model: string;
+      [k: string]: unknown;
+    }
+  | {
+      construct: string;
+      detail: string;
+      kind: "dropped_construct";
+      name: string;
+      [k: string]: unknown;
     };
 /**
  * Lifecycle hook kind for [`ImportDbtStructuredWarning::DroppedHook`].
@@ -62,6 +75,10 @@ export type ImportDbtHookKind = "pre" | "post";
  */
 export interface ImportDbtOutput {
   command: string;
+  /**
+   * Number of dbt resources the importer does not translate that were detected and skipped (snapshots, metrics, semantic models, exposures).
+   */
+  constructs_dropped?: number;
   dbt_version?: string | null;
   /**
    * Metadata about the emitted Rocky repo. Present when `--output-dir` triggered repo emission (the default for `rocky import-dbt`). Absent when emission was skipped or failed before disk writes.

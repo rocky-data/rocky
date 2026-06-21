@@ -851,6 +851,35 @@ models:
     }
 
     #[test]
+    fn test_configured_not_null_carries_severity_and_where() {
+        let yaml = r#"
+models:
+  - name: orders
+    columns:
+      - name: status
+        tests:
+          - not_null:
+              where: "created_at > '2026-01-01'"
+              severity: warn
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&models[0], &resolver);
+        assert_eq!(
+            unsupported.len(),
+            0,
+            "configured not_null must convert, not drop"
+        );
+        assert_eq!(decls.len(), 1);
+        assert!(matches!(decls[0].test_type, TestType::NotNull));
+        assert_eq!(decls[0].severity, TestSeverity::Warning);
+        assert_eq!(
+            decls[0].filter.as_deref(),
+            Some("created_at > '2026-01-01'")
+        );
+    }
+
+    #[test]
     fn test_parse_model_without_tests() {
         let yaml = r#"
 models:
