@@ -250,9 +250,13 @@ What the importer translates cleanly:
 - `{{ source('s', 't') }}` → fully qualified reference + sidecar `[[sources]]`
 - `{{ config(materialized='table' \| 'incremental' \| 'view') }}` → sidecar `[strategy]` block (`view` flattens to `ephemeral` after import; see caveat above)
 - `{{ config(unique_key=...) }}` → `merge` strategy with `unique_key` array
-- `{{ this }}` → resolved against the sidecar `[target]`
+- `{{ config(alias='name') }}` → the sidecar `[target].table` — the output relation — so the data lands in the aliased table rather than one named after the node (dropping this silently mis-routes data)
+- `{{ config(materialized='microbatch') }}` with a `unique_key` → an idempotent `merge` (dbt microbatch's partition-replace becomes key-upsert; flagged so you can review). Without a `unique_key` it stays append-only and is flagged as such.
+- `{{ config(merge_update_columns=[...]) }}` → the `merge` strategy's `update_columns`
+- dbt **tags** (node- and folder-level) → the sidecar `[tags]` block (`<tag> = "true"`)
+- `{{ this }}` → the model's own fully-qualified `catalog.schema.table`
 - `is_incremental()` branches → stripped (Rocky derives the watermark filter from `[strategy]`)
-- **dbt generic tests** (`unique`, `not_null`, `accepted_values`, `relationships`) are translated column-by-column to `[[tests]]` blocks in the model sidecar (see [Generic test mapping](#generic-test-mapping) below)
+- **dbt generic tests** (`unique`, `not_null`, `accepted_values`, `relationships`) are translated column-by-column to `[[tests]]` blocks — including the *configured* forms that carry `severity:` (a `warn` becomes a Rocky warning, not a hard error) and `where:` (a row filter) (see [Generic test mapping](#generic-test-mapping) below)
 - Top-level `dbt_project.yml`, used to detect project name and seeds path
 - `<dbt_project>/seeds/` → copied verbatim into `<out>/seeds/`
 - `profiles.yml` adapter type → mapped to a Rocky `[adapter]` block (DuckDB / Databricks / Snowflake / BigQuery), or a DuckDB stub when absent or unrecognised
@@ -262,12 +266,17 @@ By design, the importer does not translate the following. Rocky has no Jinja run
 - **dbt tests outside the canonical four.** `dbt_utils.*`, `dbt_expectations.*`, project-defined generic tests, and model-level (non-column) tests are surfaced as structured warnings (`UnsupportedTest`) per occurrence and not stubbed in the emitted TOML. Rewrite as a Rocky `expression` test or a quality-pipeline check.
 - **Singular tests** in `tests/` (custom SQL): copy and rewrite manually.
 - **dbt macros and `dbt_packages/`.** Rocky has no Jinja runtime, so macro bodies do not expand.
-- **`{% if %}`, `{% for %}`, `{{ var() }}`** outside of `is_incremental()`: emitted verbatim with a TODO marker.
+- **`{% for %}` / `{% set %}`** outside `is_incremental()` on the no-manifest path: **refused** — the model is listed as a failure rather than half-rendered into broken SQL (the loop/assignment body would survive exactly once). Re-run after `dbt compile` (the manifest path resolves them) or rewrite the model. A `{% if %}` is still emitted verbatim with a TODO marker — its body applies *unconditionally*, so review it. `{{ var() }}` is emitted with a TODO marker.
 - **Unmapped `materialized` values** (`materialized_view`, `dynamic_table`, `seed`): flattened to `full_refresh` and listed in `MIGRATION-NOTES.md`.
 - **Ephemeral CTE inlining into downstream model bodies**: see the run-prerequisite note above.
 - **Adapters Rocky does not natively support** (e.g. Postgres, Redshift): the generated repo stubs DuckDB so the project still loads. Replace the `[adapter]` block once a Rocky adapter for the warehouse exists, or pass `--target-adapter <kind>` to skip detection.
 - **Custom Jinja macros emitting SQL** (e.g. `{{ generate_schema_name() }}`, dynamic `UNION ALL` macros): surfaced as failed models with the macro name in the reason.
 - **Python dbt models** (`.py` files): not SQL; rewrite manually.
+- **Snapshots, MetricFlow metrics + semantic models, and exposures** are not translated, but are now **detected and counted** — `constructs_dropped` in the JSON output plus a `DroppedConstruct` warning each — so a migration is never silently lossy.
+
+:::caution[Run `dbt compile` first]
+The importer prefers `manifest.json` (Jinja already resolved). A manifest that was only *parsed*, not *compiled*, carries no compiled SQL — every model then falls back to the lower-fidelity regex render, which can mis-render Jinja. The importer now warns loudly when it detects a manifest with no compiled SQL, but regenerate it with `dbt compile` (including any required `--vars`) before importing.
+:::
 
 The remainder of this guide walks each phase in detail (mapping `profiles.yml` to `rocky.toml`, handling unsupported Jinja, converting tests to contracts, cutover strategy), reading top-to-bottom as a migration playbook.
 
