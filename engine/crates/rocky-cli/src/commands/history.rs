@@ -462,6 +462,7 @@ mod tests {
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                tenant: None,
             }],
             trigger: RunTrigger::Manual,
             config_hash: "cfg-hash".to_string(),
@@ -529,6 +530,7 @@ mod tests {
             upstream_freshness: None,
             bytes_scanned: None,
             bytes_written: None,
+            tenant: None,
         }
     }
 

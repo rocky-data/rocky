@@ -469,6 +469,7 @@ fn test_run_history_flow() {
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                tenant: None,
             },
             ModelExecution {
                 model_name: "customers".to_string(),
@@ -482,6 +483,7 @@ fn test_run_history_flow() {
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                tenant: None,
             },
         ],
         trigger: RunTrigger::Manual,

@@ -2265,6 +2265,7 @@ mod tests {
             upstream_freshness: None,
             bytes_scanned: bytes,
             bytes_written: None,
+            tenant: None,
         }
     }
 

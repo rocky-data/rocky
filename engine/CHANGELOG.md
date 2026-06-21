@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rocky cost --by tenant` (and `--by model`) — grouped cost rollups.** `rocky cost <run|latest>` can now roll its per-model cost attribution up by a dimension: `--by tenant` groups executions by the discover-time schema-pattern `{tenant}` component (replication models with no recorded tenant collect in an `<unattributed>` bucket), `--by model` groups by model name. The grouped rollup is emitted as an additive `groups` array on the JSON output; `per_model` is always present, so a plain `rocky cost` is byte-for-byte unchanged. The tenant dimension is persisted on each `ModelExecution` as an additive, serde-defaulted field — no state-schema version bump, and pre-existing run records read back as unattributed.
+
 ### Changed
 
 - Added a live BigQuery MERGE-materialization regression test. The `Merge` strategy dispatches unconditionally to `BigQueryDialect::merge_into` (no per-dialect maintenance gate), so it is a BigQuery-reachable `rocky run` path; the new `#[ignore]`-gated test seeds a target, runs the emitted `MERGE … WHEN MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT ROW` against the sandbox, and asserts matched rows are updated and unmatched rows inserted. Mirrors the runner's `ColumnSelection::All` → explicit per-column resolution so it exercises the SQL replication actually emits.

@@ -1472,6 +1472,13 @@ enum Command {
         /// Filter to a single model within the run
         #[arg(long)]
         model: Option<String>,
+        /// Roll the per-model cost up by a dimension: `tenant` (the
+        /// discover-time schema-pattern `{tenant}` component) or
+        /// `model`. Adds a `groups` array to the output; `per_model`
+        /// is always present regardless. Omit for the flat per-model
+        /// view.
+        #[arg(long, value_name = "DIMENSION")]
+        by: Option<String>,
     },
 
     /// PR preview workflow — pruned re-run on a per-PR branch with
@@ -3184,9 +3191,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Trace { target, model } => {
             rocky_cli::commands::run_trace(&state_path, &target, model.as_deref(), json)
         }
-        Command::Cost { target, model } => {
-            rocky_cli::commands::run_cost(&state_path, &cli.config, &target, model.as_deref(), json)
-        }
+        Command::Cost { target, model, by } => rocky_cli::commands::run_cost(
+            &state_path,
+            &cli.config,
+            &target,
+            model.as_deref(),
+            by.as_deref(),
+            json,
+        ),
         Command::Preview { action } => match action {
             PreviewAction::Create { base, name, models } => {
                 rocky_cli::commands::run_preview_create(

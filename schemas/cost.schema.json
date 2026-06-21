@@ -1,6 +1,64 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "CostGroup": {
+      "description": "One grouped row in [`CostOutput::groups`], emitted when `rocky cost` is run with `--by <dimension>`.\n\nEach group sums the per-model figures of the executions that share the grouping key (a tenant, or a model name). The cost roll-up uses the same `compute_observed_cost_usd` figures as [`PerModelCostHistorical`], so a `--by tenant` total equals the sum of its members' `cost_usd`.",
+      "properties": {
+        "dimension": {
+          "description": "Dimension the grouping was performed on: `\"tenant\"` or `\"model\"`.",
+          "type": "string"
+        },
+        "key": {
+          "description": "The grouping key's value — the tenant name, the model name, or the literal `\"<unattributed>\"` for the `--by tenant` bucket that collects executions with no recorded tenant.",
+          "type": "string"
+        },
+        "model_count": {
+          "description": "Number of model executions rolled into this group.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_bytes_scanned": {
+          "description": "Sum of the group's member `bytes_scanned`. `None` when no member reported bytes scanned.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_bytes_written": {
+          "description": "Sum of the group's member `bytes_written`. `None` when no member reported bytes written.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_cost_usd": {
+          "description": "Sum of every member's `cost_usd` that produced a number. `None` when no member produced a cost.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "total_duration_ms": {
+          "description": "Wall-clock time summed across the group's member executions.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dimension",
+        "key",
+        "model_count",
+        "total_duration_ms"
+      ],
+      "type": "object"
+    },
     "PerModelCostHistorical": {
       "description": "A single model's cost attribution inside [`CostOutput`].\n\nDistinct from [`ModelCostEntry`] (which lives on [`RunCostSummary`]) because the historical surface carries the richer fields the state store actually persists: model name (not asset-key vector), row/byte counts, and the recorded per-model status.",
       "properties": {
@@ -48,6 +106,13 @@
         },
         "status": {
           "type": "string"
+        },
+        "tenant": {
+          "description": "Tenant this execution was attributed to, read back from the persisted `rocky_core::state::ModelExecution::tenant`. Present only for replication executions whose source schema declared a `{tenant}` component; `None` (and omitted from JSON) otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -77,6 +142,16 @@
     },
     "finished_at": {
       "type": "string"
+    },
+    "groups": {
+      "description": "Grouped cost rollup, present only when `--by <dimension>` is passed. `--by model` produces one group per model; `--by tenant` produces one group per tenant (models with no recorded tenant land in an `\"<unattributed>\"` bucket). `None` (and omitted from JSON) for a plain `rocky cost` invocation, so the default output shape is unchanged. `per_model` is always present regardless of grouping.",
+      "items": {
+        "$ref": "#/definitions/CostGroup"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
     },
     "per_model": {
       "items": {
