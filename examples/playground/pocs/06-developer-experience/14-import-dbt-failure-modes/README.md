@@ -82,8 +82,8 @@ before pointing it at a real codebase.
     {
       "model": "stg_orders",
       "category": "JinjaControlFlow",
-      "message": "contains Jinja control flow ({% if %}, {% for %}) — replaced with TODO comments",
-      "suggestion": "consider using manifest.json import path for full Jinja resolution"
+      "message": "contains Jinja control flow ({% if %}) — emitted with TODO markers; the conditional body is applied unconditionally, so review the result",
+      "suggestion": "use the manifest import path (`dbt compile`) for faithful Jinja resolution"
     },
     {
       "model": "stg_variables",
@@ -106,7 +106,8 @@ before pointing it at a real codebase.
 - **dbt generic tests outside the canonical four** ...
 - **Singular tests** in `tests/` (custom SQL) — copy and rewrite manually.
 - **dbt macros / `dbt_packages/`** — Rocky has no Jinja runtime. ...
-- **`{% if %}` / `{% for %}` / `{{ var() }}`** ...
+- **`{% if %}` / `{{ var() }}`** — emitted with a TODO marker (the `{% if %}` body applies unconditionally — review it).
+- **`{% for %}` / `{% set %}`** — **refused** (listed under "Failed models") rather than half-rendered into broken SQL; `stg_loop` here demonstrates the refusal. Re-run after `dbt compile`.
 ## Warnings
 - `stg_orders` — JinjaControlFlow: ...
 - `stg_variables` — UnsupportedMacro: ...
