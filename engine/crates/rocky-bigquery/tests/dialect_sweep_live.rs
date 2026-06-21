@@ -492,6 +492,18 @@ async fn merge_into_updates_matched_and_inserts_unmatched() {
         Some("new"),
         "unmatched key id=3 must be INSERTED via INSERT ROW"
     );
-    assert_eq!(by_id.len(), 3, "exactly 3 rows after merge; got {by_id:?}");
+    assert_eq!(
+        by_id.len(),
+        3,
+        "exactly 3 distinct ids after merge; got {by_id:?}"
+    );
+    // Physical-row guard: a fan-out / double-applied MERGE can emit two rows
+    // sharing an id, which `by_id` silently dedupes — so check the raw count too.
+    assert_eq!(
+        rows.rows.len(),
+        3,
+        "exactly 3 physical rows after merge; a duplicated id would slip the distinct-id check; got {} rows",
+        rows.rows.len()
+    );
     println!("VERDICT: merge_into works — id=1 UPDATED, id=3 INSERTED (INSERT ROW), id=2 intact");
 }
