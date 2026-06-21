@@ -866,6 +866,12 @@ enum Command {
         with_seed: bool,
     },
 
+    /// Maintain `[imports.<name>]` producer-contract baselines/pins.
+    Imports {
+        #[command(subcommand)]
+        action: ImportsAction,
+    },
+
     /// Show the full unified DAG (all pipeline stages and dependencies)
     Dag {
         /// Models directory
@@ -1941,6 +1947,20 @@ enum BranchAction {
     },
 }
 
+/// Subcommands under `rocky imports`.
+#[derive(Subcommand)]
+enum ImportsAction {
+    /// Advance vendored import baselines to the current snapshot (the explicit
+    /// "I reviewed and accept the producer's current state" gesture). Reports
+    /// any stale pin without rewriting `rocky.toml`.
+    Update {
+        /// Read-only CI guard: report what is out of date and exit non-zero
+        /// without writing anything.
+        #[arg(long)]
+        check: bool,
+    },
+}
+
 /// Subcommands under `rocky state`.
 #[derive(Subcommand)]
 enum StateAction {
@@ -2667,6 +2687,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             out,
             with_seed,
         } => rocky_cli::commands::run_publish_ir(&models, contracts.as_deref(), &out, with_seed),
+        Command::Imports { action } => match action {
+            ImportsAction::Update { check } => {
+                rocky_cli::commands::run_imports_update(&cli.config, check)
+            }
+        },
         Command::Dag {
             models,
             seeds,

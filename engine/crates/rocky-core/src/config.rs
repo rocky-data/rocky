@@ -2083,6 +2083,17 @@ fn format_env_var_hint(substitutions: &[EnvVarSubstitution]) -> String {
 /// baseline = "baseline.json"    # optional prior snapshot used for diffing
 /// pin = "*"                     # optional recipe-hash pin ("*" = trust any)
 /// ```
+///
+/// `pin` and `baseline` answer different questions and are complementary, not
+/// redundant. `pin` is a whole-project drift tripwire: a concrete recipe hash
+/// that, when set, makes `rocky compile` fail (E033) if the vendored snapshot
+/// differs at all. `baseline` is the column-level "before" image: the only
+/// input that lets the breaking-change diff emit the column codes
+/// (E030/E031/E032/W030/W031) for changes the consumer actually reads. Leave
+/// `pin` at `"*"` (or unset) to fail only on changes that touch your reads;
+/// set a concrete pin to fail on any drift. Run `rocky imports update` after
+/// reviewing a producer change to advance `baseline` to the current snapshot
+/// (the explicit accept) — nothing advances it automatically.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImportEntry {
