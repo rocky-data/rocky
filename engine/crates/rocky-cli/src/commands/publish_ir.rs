@@ -135,9 +135,9 @@ pub fn run_publish_ir(
             .with_context(|| format!("failed to create output directory {}", parent.display()))?;
     }
 
-    let json = serde_json::to_string_pretty(&project_ir)
-        .context("failed to serialize ProjectIr snapshot")?;
-    std::fs::write(out_path, json)
+    // Write through the versioned envelope ({snapshot_version, ir}) so a
+    // future format bump is detectable by older consumers (which fail closed).
+    rocky_core::imports::write_snapshot(&project_ir, out_path)
         .with_context(|| format!("failed to write snapshot to {}", out_path.display()))?;
 
     println!(

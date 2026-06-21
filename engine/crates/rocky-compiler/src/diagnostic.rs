@@ -99,6 +99,16 @@ pub const E032: &str = "E032";
 /// has not pinned to — the vendored file drifted from the agreed contract.
 pub const E033: &str = "E033";
 
+/// Imported snapshot declares a format version newer than this build of rocky
+/// can read.
+///
+/// Emitted by `rocky compile` when an `[imports.<name>]` snapshot's
+/// `snapshot_version` exceeds the version this binary understands. The
+/// snapshot is readable-but-unhonorable, so the contract is failed closed
+/// (rather than silently skipped, which would look enforced but check nothing)
+/// — upgrade rocky to read the producer's newer snapshot format.
+pub const E034: &str = "E034";
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";

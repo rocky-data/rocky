@@ -27,12 +27,80 @@ pub enum ImportsError {
         source: std::io::Error,
     },
 
+    /// The snapshot file could not be written.
+    #[error("failed to write import snapshot '{path}': {source}")]
+    WriteFile {
+        path: String,
+        source: std::io::Error,
+    },
+
     /// The snapshot file was not valid serialized [`ProjectIr`] JSON.
     #[error("failed to parse import snapshot '{path}': {source}")]
     Parse {
         path: String,
         source: serde_json::Error,
     },
+
+    /// The snapshot declares a `snapshot_version` newer than this build
+    /// understands. Fail closed rather than silently mis-read a future format
+    /// (which would recreate the "looks enforced, checks nothing" footgun).
+    #[error(
+        "import snapshot '{path}' is format version {found}, but this build of rocky \
+         understands at most version {max_supported}; upgrade rocky to read it"
+    )]
+    UnsupportedVersion {
+        path: String,
+        found: u64,
+        max_supported: u32,
+    },
+}
+
+/// Current on-disk format version for published snapshots. A snapshot with no
+/// `snapshot_version` key is a pre-versioning (`#774`-era) snapshot and is
+/// read as version 1; bump this whenever the envelope or IR wire shape changes
+/// in a way an older consumer cannot read.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+/// Owned envelope used when reading a versioned snapshot.
+#[derive(serde::Deserialize)]
+struct SnapshotEnvelope {
+    /// Honoured by [`load_snapshot`] before the `ir` is deserialized.
+    #[allow(dead_code)]
+    snapshot_version: u32,
+    ir: ProjectIr,
+}
+
+/// Borrowing envelope used when writing a snapshot (avoids cloning the IR).
+#[derive(serde::Serialize)]
+struct SnapshotEnvelopeRef<'a> {
+    snapshot_version: u32,
+    ir: &'a ProjectIr,
+}
+
+/// Serialize `ir` into a versioned snapshot envelope at `path`.
+///
+/// The envelope is `{"snapshot_version": N, "ir": <ProjectIr>}`. This is the
+/// single place the on-disk format is written, so a future v2 only needs to
+/// change here and in [`load_snapshot`].
+///
+/// # Errors
+///
+/// Returns [`ImportsError::WriteFile`] if the file cannot be written, or
+/// [`ImportsError::Parse`] if serialization fails (should not happen for a
+/// well-formed `ProjectIr`).
+pub fn write_snapshot(ir: &ProjectIr, path: &Path) -> Result<(), ImportsError> {
+    let envelope = SnapshotEnvelopeRef {
+        snapshot_version: SNAPSHOT_FORMAT_VERSION,
+        ir,
+    };
+    let json = serde_json::to_string_pretty(&envelope).map_err(|source| ImportsError::Parse {
+        path: path.display().to_string(),
+        source,
+    })?;
+    std::fs::write(path, json).map_err(|source| ImportsError::WriteFile {
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 /// Outcome of comparing a snapshot's recipe hash against a configured pin.
@@ -51,10 +119,16 @@ pub enum PinStatus {
 /// `dir` is the import's `path` (resolved relative to `rocky.toml` by the
 /// caller); `file` is the snapshot filename within it.
 ///
+/// Handles both the versioned envelope written by [`write_snapshot`]
+/// (`{"snapshot_version": N, "ir": …}`) and a pre-versioning bare `ProjectIr`
+/// (read as version 1). A snapshot declaring a version newer than this build
+/// understands fails closed.
+///
 /// # Errors
 ///
-/// Returns [`ImportsError::ReadFile`] if the file cannot be read and
-/// [`ImportsError::Parse`] if it is not valid serialized `ProjectIr` JSON.
+/// Returns [`ImportsError::ReadFile`] if the file cannot be read,
+/// [`ImportsError::Parse`] if it is not valid snapshot JSON, and
+/// [`ImportsError::UnsupportedVersion`] if it declares a future format version.
 pub fn load_snapshot(dir: &Path, file: &str) -> Result<ProjectIr, ImportsError> {
     let path = dir.join(file);
     let display = path.display().to_string();
@@ -62,10 +136,39 @@ pub fn load_snapshot(dir: &Path, file: &str) -> Result<ProjectIr, ImportsError> 
         path: display.clone(),
         source,
     })?;
-    serde_json::from_str(&contents).map_err(|source| ImportsError::Parse {
-        path: display,
-        source,
-    })
+
+    // A `snapshot_version` key marks a versioned envelope; its absence marks a
+    // pre-versioning (#774-era) bare `ProjectIr`, read as version 1. Detection
+    // is unambiguous because `ProjectIr` has no `snapshot_version` field.
+    let value: serde_json::Value =
+        serde_json::from_str(&contents).map_err(|source| ImportsError::Parse {
+            path: display.clone(),
+            source,
+        })?;
+    match value
+        .get("snapshot_version")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(version) if version > u64::from(SNAPSHOT_FORMAT_VERSION) => {
+            Err(ImportsError::UnsupportedVersion {
+                path: display,
+                found: version,
+                max_supported: SNAPSHOT_FORMAT_VERSION,
+            })
+        }
+        Some(_) => {
+            let envelope: SnapshotEnvelope =
+                serde_json::from_value(value).map_err(|source| ImportsError::Parse {
+                    path: display,
+                    source,
+                })?;
+            Ok(envelope.ir)
+        }
+        None => serde_json::from_value(value).map_err(|source| ImportsError::Parse {
+            path: display,
+            source,
+        }),
+    }
 }
 
 /// Compare a snapshot's recipe hash against an optional configured pin.
@@ -181,6 +284,75 @@ mod tests {
                 assert_eq!(actual, ir.recipe_hash().to_hex().to_string());
             }
             other => panic!("expected mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_snapshot_round_trips_with_envelope() {
+        let ir = sample_ir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap.json");
+        write_snapshot(&ir, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("\"snapshot_version\""),
+            "envelope carries the version header"
+        );
+
+        let loaded = load_snapshot(dir.path(), "snap.json").unwrap();
+        assert_eq!(loaded.models.len(), 1);
+        assert_eq!(
+            loaded.recipe_hash().to_hex().to_string(),
+            ir.recipe_hash().to_hex().to_string()
+        );
+    }
+
+    #[test]
+    fn headerless_snapshot_loads_as_v1_with_identical_recipe_hash() {
+        // A pre-versioning (#774-era) snapshot is a bare ProjectIr with no
+        // envelope. It must still load, and its recipe hash must equal the
+        // enveloped form's — proving wrapping never breaks an existing pin.
+        let ir = sample_ir();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("headerless.json"),
+            serde_json::to_string_pretty(&ir).unwrap(),
+        )
+        .unwrap();
+        write_snapshot(&ir, &dir.path().join("enveloped.json")).unwrap();
+
+        let from_headerless = load_snapshot(dir.path(), "headerless.json").unwrap();
+        let from_enveloped = load_snapshot(dir.path(), "enveloped.json").unwrap();
+        assert_eq!(
+            from_headerless.recipe_hash().to_hex().to_string(),
+            from_enveloped.recipe_hash().to_hex().to_string(),
+            "wrapping in an envelope must not change recipe_hash — #774 pins must still match"
+        );
+    }
+
+    #[test]
+    fn too_new_snapshot_version_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let future = u64::from(SNAPSHOT_FORMAT_VERSION) + 1;
+        std::fs::write(
+            dir.path().join("future.json"),
+            format!(
+                "{{\"snapshot_version\": {future}, \"ir\": {}}}",
+                serde_json::to_string(&sample_ir()).unwrap()
+            ),
+        )
+        .unwrap();
+        let err = load_snapshot(dir.path(), "future.json").unwrap_err();
+        match err {
+            ImportsError::UnsupportedVersion {
+                found,
+                max_supported,
+                ..
+            } => {
+                assert_eq!(found, future);
+                assert_eq!(max_supported, SNAPSHOT_FORMAT_VERSION);
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
     }
 }

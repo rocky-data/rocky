@@ -49,7 +49,7 @@ use std::path::Path;
 use rocky_compiler::diagnostic::{self, Diagnostic};
 use rocky_core::breaking_change::{BreakingChange, diff_project_ir};
 use rocky_core::config::RockyConfig;
-use rocky_core::imports::{PinStatus, load_snapshot, verify_pin};
+use rocky_core::imports::{ImportsError, PinStatus, load_snapshot, verify_pin};
 use rocky_core::models::Model;
 
 /// How a consumer model references a producer target.
@@ -166,11 +166,7 @@ pub fn imports_diagnostics(
         let current = match load_snapshot(&dir, &entry.snapshot) {
             Ok(ir) => ir,
             Err(e) => {
-                diagnostics.push(Diagnostic::warning(
-                    diagnostic::W012,
-                    import_name,
-                    format!("import '{import_name}': could not load snapshot: {e}"),
-                ));
+                diagnostics.push(load_failure_diagnostic(import_name, "snapshot", &e));
                 continue;
             }
         };
@@ -196,10 +192,10 @@ pub fn imports_diagnostics(
         let baseline = match load_snapshot(&dir, baseline_file) {
             Ok(ir) => ir,
             Err(e) => {
-                diagnostics.push(Diagnostic::warning(
-                    diagnostic::W012,
+                diagnostics.push(load_failure_diagnostic(
                     import_name,
-                    format!("import '{import_name}': could not load baseline snapshot: {e}"),
+                    "baseline snapshot",
+                    &e,
                 ));
                 continue;
             }
@@ -300,6 +296,26 @@ pub fn imports_diagnostics(
     }
 
     diagnostics
+}
+
+/// Classify a snapshot load failure. A snapshot declaring a too-new format
+/// version is a hard error (E034, fail closed) — silently skipping it would
+/// recreate the "looks enforced, checks nothing" footgun. Every other load
+/// failure (missing/unreadable/corrupt file) is a transient W012 warning that
+/// skips the import without failing the compile.
+fn load_failure_diagnostic(import_name: &str, what: &str, err: &ImportsError) -> Diagnostic {
+    match err {
+        ImportsError::UnsupportedVersion { .. } => Diagnostic::error(
+            diagnostic::E034,
+            import_name,
+            format!("import '{import_name}': {err}"),
+        ),
+        _ => Diagnostic::warning(
+            diagnostic::W012,
+            import_name,
+            format!("import '{import_name}': could not load {what}: {err}"),
+        ),
+    }
 }
 
 /// Returns the model's sole `[[sources]]` full name when it declares exactly
@@ -723,5 +739,41 @@ mod tests {
                 .iter()
                 .all(|d| d.severity != diagnostic::Severity::Error)
         );
+    }
+
+    #[test]
+    fn e034_fires_and_fails_closed_on_too_new_snapshot_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = producer_snapshot(&["id"]);
+        // A snapshot declaring a format version this build can't read must be
+        // an ERROR (fail closed), not a silently-skipped W012 warning.
+        std::fs::write(
+            dir.path().join("current.json"),
+            format!(
+                "{{\"snapshot_version\": 9999, \"ir\": {}}}",
+                serde_json::to_string(&snapshot).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("baseline.json"),
+            serde_json::to_string(&snapshot).unwrap(),
+        )
+        .unwrap();
+        let mut config: RockyConfig = toml::from_str("").unwrap();
+        config.imports.insert(
+            "orders".to_string(),
+            ImportEntry {
+                path: ".".to_string(),
+                snapshot: "current.json".to_string(),
+                baseline: Some("baseline.json".to_string()),
+                pin: None,
+            },
+        );
+        let model = consumer_model("SELECT id FROM shop.core.orders");
+        let diags = imports_diagnostics(&config, dir.path(), &[model]);
+        let e034: Vec<_> = diags.iter().filter(|d| &*d.code == "E034").collect();
+        assert_eq!(e034.len(), 1, "expected one E034, got: {diags:?}");
+        assert_eq!(e034[0].severity, diagnostic::Severity::Error);
     }
 }
