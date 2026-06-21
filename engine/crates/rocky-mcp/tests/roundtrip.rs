@@ -564,6 +564,7 @@ fn seed_run_history(models_dir: &Path) {
             upstream_freshness: None,
             bytes_scanned: None,
             bytes_written: Some(1024),
+            tenant: None,
         }],
         trigger: RunTrigger::Manual,
         config_hash: "cfg".to_string(),

@@ -26,6 +26,10 @@ export interface CostOutput {
   command: string;
   duration_ms: number;
   finished_at: string;
+  /**
+   * Grouped cost rollup, present only when `--by <dimension>` is passed. `--by model` produces one group per model; `--by tenant` produces one group per tenant (models with no recorded tenant land in an `"<unattributed>"` bucket). `None` (and omitted from JSON) for a plain `rocky cost` invocation, so the default output shape is unchanged. `per_model` is always present regardless of grouping.
+   */
+  groups?: CostGroup[] | null;
   per_model: PerModelCostHistorical[];
   run_id: string;
   started_at: string;
@@ -48,6 +52,42 @@ export interface CostOutput {
   total_duration_ms: number;
   trigger: string;
   version: string;
+  [k: string]: unknown;
+}
+/**
+ * One grouped row in [`CostOutput::groups`], emitted when `rocky cost` is run with `--by <dimension>`.
+ *
+ * Each group sums the per-model figures of the executions that share the grouping key (a tenant, or a model name). The cost roll-up uses the same `compute_observed_cost_usd` figures as [`PerModelCostHistorical`], so a `--by tenant` total equals the sum of its members' `cost_usd`.
+ */
+export interface CostGroup {
+  /**
+   * Dimension the grouping was performed on: `"tenant"` or `"model"`.
+   */
+  dimension: string;
+  /**
+   * The grouping key's value — the tenant name, the model name, or the literal `"<unattributed>"` for the `--by tenant` bucket that collects executions with no recorded tenant.
+   */
+  key: string;
+  /**
+   * Number of model executions rolled into this group.
+   */
+  model_count: number;
+  /**
+   * Sum of the group's member `bytes_scanned`. `None` when no member reported bytes scanned.
+   */
+  total_bytes_scanned?: number | null;
+  /**
+   * Sum of the group's member `bytes_written`. `None` when no member reported bytes written.
+   */
+  total_bytes_written?: number | null;
+  /**
+   * Sum of every member's `cost_usd` that produced a number. `None` when no member produced a cost.
+   */
+  total_cost_usd?: number | null;
+  /**
+   * Wall-clock time summed across the group's member executions.
+   */
+  total_duration_ms: number;
   [k: string]: unknown;
 }
 /**
@@ -74,5 +114,9 @@ export interface PerModelCostHistorical {
   model_name: string;
   rows_affected?: number | null;
   status: string;
+  /**
+   * Tenant this execution was attributed to, read back from the persisted `rocky_core::state::ModelExecution::tenant`. Present only for replication executions whose source schema declared a `{tenant}` component; `None` (and omitted from JSON) otherwise.
+   */
+  tenant?: string | null;
   [k: string]: unknown;
 }

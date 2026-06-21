@@ -618,6 +618,10 @@ class MaterializationOutput(BaseModel):
     """
     Wall-clock timestamp captured at the moment the engine began executing this model. Used by `RunOutput::to_run_record` to build accurate per-model windows on the persisted `ModelExecution` — replaces the prior lossy reconstruction (`finished_at - duration`) that mis-ordered parallel runs. `finished_at` is derived as `started_at + duration_ms`; keeping one source of truth avoids drift between the two.
     """
+    tenant: str | None = None
+    """
+    Tenant this materialization is attributed to, taken from the discover-time schema-pattern `{tenant}` component. Present only for replication pipelines whose schema pattern declares a `{tenant}` placeholder; transformation / `time_interval` models and non-tenant patterns leave it `None`. Carried onto the persisted `rocky_core::state::ModelExecution` by [`RunOutput::to_run_record`] so `rocky cost --by tenant` can roll per-model cost up to a tenant dimension. Omitted from JSON when `None` so non-tenant outputs stay byte-identical.
+    """
 
 
 class TableCheckOutput(BaseModel):

@@ -6,6 +6,43 @@ from __future__ import annotations
 from pydantic import BaseModel, conint
 
 
+class CostGroup(BaseModel):
+    """
+    One grouped row in [`CostOutput::groups`], emitted when `rocky cost` is run with `--by <dimension>`.
+
+    Each group sums the per-model figures of the executions that share the grouping key (a tenant, or a model name). The cost roll-up uses the same `compute_observed_cost_usd` figures as [`PerModelCostHistorical`], so a `--by tenant` total equals the sum of its members' `cost_usd`.
+    """
+
+    dimension: str
+    """
+    Dimension the grouping was performed on: `"tenant"` or `"model"`.
+    """
+    key: str
+    """
+    The grouping key's value — the tenant name, the model name, or the literal `"<unattributed>"` for the `--by tenant` bucket that collects executions with no recorded tenant.
+    """
+    model_count: conint(ge=0)
+    """
+    Number of model executions rolled into this group.
+    """
+    total_bytes_scanned: conint(ge=0) | None = None
+    """
+    Sum of the group's member `bytes_scanned`. `None` when no member reported bytes scanned.
+    """
+    total_bytes_written: conint(ge=0) | None = None
+    """
+    Sum of the group's member `bytes_written`. `None` when no member reported bytes written.
+    """
+    total_cost_usd: float | None = None
+    """
+    Sum of every member's `cost_usd` that produced a number. `None` when no member produced a cost.
+    """
+    total_duration_ms: conint(ge=0)
+    """
+    Wall-clock time summed across the group's member executions.
+    """
+
+
 class PerModelCostHistorical(BaseModel):
     """
     A single model's cost attribution inside [`CostOutput`].
@@ -31,6 +68,10 @@ class PerModelCostHistorical(BaseModel):
     model_name: str
     rows_affected: conint(ge=0) | None = None
     status: str
+    tenant: str | None = None
+    """
+    Tenant this execution was attributed to, read back from the persisted `rocky_core::state::ModelExecution::tenant`. Present only for replication executions whose source schema declared a `{tenant}` component; `None` (and omitted from JSON) otherwise.
+    """
 
 
 class CostOutput(BaseModel):
@@ -55,6 +96,10 @@ class CostOutput(BaseModel):
     command: str
     duration_ms: conint(ge=0)
     finished_at: str
+    groups: list[CostGroup] | None = None
+    """
+    Grouped cost rollup, present only when `--by <dimension>` is passed. `--by model` produces one group per model; `--by tenant` produces one group per tenant (models with no recorded tenant land in an `"<unattributed>"` bucket). `None` (and omitted from JSON) for a plain `rocky cost` invocation, so the default output shape is unchanged. `per_model` is always present regardless of grouping.
+    """
     per_model: list[PerModelCostHistorical]
     run_id: str
     started_at: str

@@ -1045,6 +1045,19 @@ pub struct ModelExecution {
     /// wired it yet. Reserved for adapters that produce a natural
     /// bytes-written figure via their statistics surface.
     pub bytes_written: Option<u64>,
+    /// Tenant this execution is attributed to, sourced from the
+    /// discover-time schema-pattern `{tenant}` component (see
+    /// [`crate::schema`]). Populated only for replication pipelines
+    /// whose schema pattern declares a `{tenant}` placeholder;
+    /// transformation / `time_interval` models and non-tenant patterns
+    /// record `None`. Read back by `rocky cost --by tenant` to roll
+    /// per-model cost up to a tenant dimension.
+    ///
+    /// Serde-defaulted so records written before this field existed
+    /// forward-deserialize to `None` — no `CURRENT_SCHEMA_VERSION` bump.
+    /// Guarded by `test_pre_tenant_model_execution_forward_deserializes_to_none`.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 /// A complete pipeline run record.
@@ -3796,6 +3809,7 @@ mod tests {
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                tenant: None,
             }],
         );
         store.record_run(&run).unwrap();
@@ -3836,6 +3850,7 @@ mod tests {
                     upstream_freshness: None,
                     bytes_scanned: None,
                     bytes_written: None,
+                    tenant: None,
                 },
                 ModelExecution {
                     model_name: "customers".to_string(),
@@ -3849,6 +3864,7 @@ mod tests {
                     upstream_freshness: None,
                     bytes_scanned: None,
                     bytes_written: None,
+                    tenant: None,
                 },
             ],
         );
@@ -3877,6 +3893,7 @@ mod tests {
                     upstream_freshness: None,
                     bytes_scanned: None,
                     bytes_written: None,
+                    tenant: None,
                 }],
             );
             store.record_run(&run).unwrap();
@@ -3955,6 +3972,48 @@ mod tests {
         // bytes fields also default (these predate the skip fields too).
         assert_eq!(exec.bytes_scanned, None);
         assert_eq!(exec.bytes_written, None);
+        // The tenant attribution field also defaults to None on a blob
+        // that predates it.
+        assert_eq!(exec.tenant, None);
+    }
+
+    /// A `ModelExecution` blob written before the `tenant` attribution
+    /// field existed must forward-deserialize with `tenant = None`. This
+    /// is the load-bearing state-schema guard for `rocky cost --by
+    /// tenant`: the field is additive and serde-defaulted, so the redb
+    /// blob format is unchanged and `CURRENT_SCHEMA_VERSION` does not move.
+    /// A record lacking the field simply reports as unattributed.
+    #[test]
+    fn test_pre_tenant_model_execution_forward_deserializes_to_none() {
+        // Note: this blob carries the skip/bytes fields (a record from a
+        // binary after those landed) but omits `tenant` — the exact shape
+        // a pre-tenant binary would have persisted.
+        let pre_tenant_blob = br#"{
+            "model_name": "orders",
+            "started_at": "2024-01-01T12:00:00Z",
+            "finished_at": "2024-01-01T12:00:02Z",
+            "duration_ms": 2000,
+            "rows_affected": 5000,
+            "status": "success",
+            "sql_hash": "legacy-sql-hash",
+            "skip_hash": "logic-key",
+            "upstream_freshness": null,
+            "bytes_scanned": 4096,
+            "bytes_written": 2048
+        }"#;
+
+        let exec: ModelExecution = serde_json::from_slice(pre_tenant_blob)
+            .expect("pre-tenant ModelExecution must forward-deserialize");
+
+        // Original fields preserved.
+        assert_eq!(exec.model_name, "orders");
+        assert_eq!(exec.sql_hash, "legacy-sql-hash");
+        assert_eq!(exec.skip_hash.as_deref(), Some("logic-key"));
+        assert_eq!(exec.bytes_scanned, Some(4096));
+        assert_eq!(exec.bytes_written, Some(2048));
+        // The new attribution dimension defaults to None — a pre-tenant
+        // record is treated as unattributed, never crashes the read.
+        assert_eq!(exec.tenant, None);
     }
 
     /// End-to-end variant of the forward-compat guard: write a v5 blob

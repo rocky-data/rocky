@@ -155,6 +155,12 @@ struct TableTask {
     target_schema: String,
     table_name: String,
     asset_key_prefix: Vec<String>,
+    /// Tenant this table belongs to, lifted from the discover-time
+    /// schema-pattern `{tenant}` component. `None` when the pipeline's
+    /// schema pattern declares no `{tenant}` placeholder. Carried onto
+    /// the resulting `MaterializationOutput` so the persisted
+    /// `ModelExecution` records a tenant for `rocky cost --by tenant`.
+    tenant: Option<String>,
     check_column_match: bool,
     check_row_count: bool,
     check_freshness: bool,
@@ -1901,6 +1907,15 @@ pub async fn run(
                         }
                         prefix
                     },
+                    // Lift the tenant dimension off the discover-time
+                    // schema-pattern components. The map stores it as a
+                    // `Value::String`; `None` when the pattern has no
+                    // `{tenant}` placeholder. Flows to the materialization
+                    // and on to the persisted `ModelExecution`.
+                    tenant: components
+                        .get("tenant")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
                     check_column_match: pipeline.checks.column_match.enabled(),
                     check_row_count: pipeline.checks.row_count.enabled(),
                     check_freshness: pipeline.checks.freshness.is_some(),
@@ -4758,6 +4773,9 @@ pub(crate) async fn execute_models(
                             cost_usd: None,
                             bytes_scanned: None,
                             bytes_written: Some(summary.size_bytes),
+                            // Transformation models carry no tenant
+                            // dimension (no source-schema `{tenant}`).
+                            tenant: None,
                             job_ids: vec![],
                             // content_addressed is never skip-eligible.
                             skip_internal: None,
@@ -5420,6 +5438,9 @@ async fn execute_one_plain_model(
         cost_usd: None,
         bytes_scanned: bytes_scanned_acc,
         bytes_written: bytes_written_acc,
+        // Transformation models carry no tenant dimension (their asset
+        // key is `[catalog, schema, table]`, not a source-schema parse).
+        tenant: None,
         job_ids: job_ids_acc,
         // Stamped by the gate in `execute_models` after a successful build
         // when `--skip-unchanged` is enabled; `None` keeps default-off
@@ -5832,6 +5853,8 @@ async fn run_one_partition(
             cost_usd: None,
             bytes_scanned: bytes_scanned_acc,
             bytes_written: bytes_written_acc,
+            // time_interval models carry no tenant dimension.
+            tenant: None,
             job_ids: job_ids_acc,
             // time_interval is excluded from the v1 skip gate.
             skip_internal: None,
@@ -6661,6 +6684,10 @@ async fn process_table(
             cost_usd: None,
             bytes_scanned: exec_stats.bytes_scanned,
             bytes_written: exec_stats.bytes_written,
+            // Tenant lifted from the discover-time schema-pattern
+            // `{tenant}` component on the task. `None` for non-tenant
+            // patterns; carried onto the persisted ModelExecution.
+            tenant: task.tenant.clone(),
             job_ids: exec_stats.job_id.clone().into_iter().collect(),
             // Replication materializations are not gated by --skip-unchanged
             // in v1 (the gate covers transformation models).
@@ -9710,6 +9737,7 @@ merge_keys = ["id"]
                 upstream_freshness: None,
                 bytes_scanned: None,
                 bytes_written: None,
+                tenant: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),

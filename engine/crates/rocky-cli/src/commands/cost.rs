@@ -38,9 +38,47 @@ use rocky_core::config::load_rocky_config;
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
 use rocky_core::state::{ModelExecution, RunRecord, RunStatus, RunTrigger, StateStore};
 
-use crate::output::{CostOutput, PerModelCostHistorical};
+use crate::output::{CostGroup, CostOutput, PerModelCostHistorical};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Sentinel bucket key for executions with no recorded tenant under
+/// `--by tenant`. A literal angle-bracketed string so it can never
+/// collide with a real tenant name (schema-pattern components are
+/// validated identifiers).
+const UNATTRIBUTED: &str = "<unattributed>";
+
+/// Dimension to roll per-model cost up by, selected via `--by`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostGroupBy {
+    /// One group per tenant (the discover-time `{tenant}` component);
+    /// models with no recorded tenant collect in an `"<unattributed>"`
+    /// bucket.
+    Tenant,
+    /// One group per model name.
+    Model,
+}
+
+impl CostGroupBy {
+    /// Parse the `--by` flag value. Accepts `tenant` / `model`
+    /// case-insensitively.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "tenant" => Ok(Self::Tenant),
+            "model" => Ok(Self::Model),
+            other => {
+                anyhow::bail!("unknown --by dimension '{other}' — expected 'tenant' or 'model'")
+            }
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tenant => "tenant",
+            Self::Model => "model",
+        }
+    }
+}
 
 fn status_str(status: &RunStatus) -> &'static str {
     match status {
@@ -120,6 +158,7 @@ fn build_output(
     record: &RunRecord,
     adapter_info: Option<&(String, WarehouseType, f64, f64)>,
     model_filter: Option<&str>,
+    group_by: Option<CostGroupBy>,
 ) -> CostOutput {
     let executions: Vec<&ModelExecution> = record
         .models_executed
@@ -164,6 +203,7 @@ fn build_output(
         }
         per_model.push(PerModelCostHistorical {
             model_name: exec.model_name.clone(),
+            tenant: exec.tenant.clone(),
             status: exec.status.clone(),
             duration_ms: exec.duration_ms,
             rows_affected: exec.rows_affected,
@@ -172,6 +212,8 @@ fn build_output(
             cost_usd: cost,
         });
     }
+
+    let groups = group_by.map(|by| build_groups(&per_model, by));
 
     let adapter_type = adapter_info.map(|(name, _, _, _)| name.clone());
     let total_cost_usd = if any_cost { Some(total_cost) } else { None };
@@ -205,7 +247,75 @@ fn build_output(
         total_bytes_scanned: total_bytes_scanned_out,
         total_bytes_written: total_bytes_written_out,
         per_model,
+        groups,
     }
+}
+
+/// Roll the per-model rows up by the requested dimension into a stable,
+/// deterministically-ordered list of [`CostGroup`]s.
+///
+/// Determinism: groups are sorted by `key`, with the `"<unattributed>"`
+/// tenant bucket sorting naturally (its angle brackets sort before
+/// alphanumerics). This keeps `--by` output diff-stable across runs and
+/// across the (arbitrary) execution order in the stored record.
+fn build_groups(per_model: &[PerModelCostHistorical], by: CostGroupBy) -> Vec<CostGroup> {
+    use std::collections::BTreeMap;
+
+    // Accumulator per key. BTreeMap gives sorted, deterministic output.
+    struct Acc {
+        model_count: u64,
+        total_cost: f64,
+        any_cost: bool,
+        total_duration_ms: u64,
+        total_bytes_scanned: u64,
+        any_bytes_scanned: bool,
+        total_bytes_written: u64,
+        any_bytes_written: bool,
+    }
+
+    let mut acc: BTreeMap<String, Acc> = BTreeMap::new();
+    for m in per_model {
+        let key = match by {
+            CostGroupBy::Tenant => m.tenant.clone().unwrap_or_else(|| UNATTRIBUTED.to_string()),
+            CostGroupBy::Model => m.model_name.clone(),
+        };
+        let entry = acc.entry(key).or_insert(Acc {
+            model_count: 0,
+            total_cost: 0.0,
+            any_cost: false,
+            total_duration_ms: 0,
+            total_bytes_scanned: 0,
+            any_bytes_scanned: false,
+            total_bytes_written: 0,
+            any_bytes_written: false,
+        });
+        entry.model_count += 1;
+        if let Some(c) = m.cost_usd {
+            entry.total_cost += c;
+            entry.any_cost = true;
+        }
+        entry.total_duration_ms = entry.total_duration_ms.saturating_add(m.duration_ms);
+        if let Some(b) = m.bytes_scanned {
+            entry.total_bytes_scanned = entry.total_bytes_scanned.saturating_add(b);
+            entry.any_bytes_scanned = true;
+        }
+        if let Some(b) = m.bytes_written {
+            entry.total_bytes_written = entry.total_bytes_written.saturating_add(b);
+            entry.any_bytes_written = true;
+        }
+    }
+
+    acc.into_iter()
+        .map(|(key, a)| CostGroup {
+            dimension: by.as_str().to_string(),
+            key,
+            model_count: a.model_count,
+            total_cost_usd: a.any_cost.then_some(a.total_cost),
+            total_duration_ms: a.total_duration_ms,
+            total_bytes_scanned: a.any_bytes_scanned.then_some(a.total_bytes_scanned),
+            total_bytes_written: a.any_bytes_written.then_some(a.total_bytes_written),
+        })
+        .collect()
 }
 
 fn print_table(output: &CostOutput) {
@@ -262,6 +372,37 @@ fn print_table(output: &CostOutput) {
         Some(c) => println!("total_cost_usd: ${c:.6}"),
         None => println!("total_cost_usd: -"),
     }
+
+    if let Some(groups) = &output.groups {
+        println!();
+        let dimension = groups
+            .first()
+            .map(|g| g.dimension.as_str())
+            .unwrap_or("group");
+        println!("by {dimension} ({}):", groups.len());
+        println!(
+            "  {:<24}  {:>8}  {:>12}  {:>14}  {:>14}  {:>12}",
+            dimension, "models", "duration", "bytes_scan", "bytes_write", "cost_usd"
+        );
+        for g in groups {
+            let bs = g
+                .total_bytes_scanned
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let bw = g
+                .total_bytes_written
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let cost = g
+                .total_cost_usd
+                .map(|v| format!("${v:.6}"))
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {:<24}  {:>8}  {:>12}  {:>14}  {:>14}  {:>12}",
+                g.key, g.model_count, g.total_duration_ms, bs, bw, cost
+            );
+        }
+    }
 }
 
 /// Execute `rocky cost <run_id|latest>`.
@@ -274,8 +415,10 @@ pub fn run_cost(
     config_path: &Path,
     target: &str,
     model_filter: Option<&str>,
+    by: Option<&str>,
     json: bool,
 ) -> Result<()> {
+    let group_by = by.map(CostGroupBy::parse).transpose()?;
     let store = StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
@@ -301,7 +444,7 @@ pub fn run_cost(
             }
         };
 
-    let output = build_output(&record, adapter_info.as_ref(), model_filter);
+    let output = build_output(&record, adapter_info.as_ref(), model_filter, group_by);
 
     if model_filter.is_some() && output.per_model.is_empty() {
         anyhow::bail!(
@@ -333,6 +476,24 @@ mod tests {
         bytes_scanned: Option<u64>,
         bytes_written: Option<u64>,
     ) -> ModelExecution {
+        sample_exec_tenant(
+            name,
+            status,
+            duration_ms,
+            bytes_scanned,
+            bytes_written,
+            None,
+        )
+    }
+
+    fn sample_exec_tenant(
+        name: &str,
+        status: &str,
+        duration_ms: u64,
+        bytes_scanned: Option<u64>,
+        bytes_written: Option<u64>,
+        tenant: Option<&str>,
+    ) -> ModelExecution {
         let now = Utc.with_ymd_and_hms(2026, 4, 21, 12, 0, 0).unwrap();
         ModelExecution {
             model_name: name.to_string(),
@@ -346,6 +507,7 @@ mod tests {
             upstream_freshness: None,
             bytes_scanned,
             bytes_written,
+            tenant: tenant.map(str::to_string),
         }
     }
 
@@ -391,7 +553,7 @@ mod tests {
             cost_per_dbu,
         );
 
-        let out = build_output(&record, Some(&adapter), None);
+        let out = build_output(&record, Some(&adapter), None, None);
 
         assert_eq!(out.command, "cost");
         assert_eq!(out.run_id, "run-1");
@@ -428,7 +590,7 @@ mod tests {
             )],
         );
 
-        let out = build_output(&record, None, None);
+        let out = build_output(&record, None, None, None);
 
         assert_eq!(out.adapter_type, None);
         assert_eq!(out.total_duration_ms, 5_000);
@@ -459,7 +621,7 @@ mod tests {
         );
 
         let adapter = ("bigquery".to_string(), WarehouseType::BigQuery, 0.0, 0.0);
-        let out = build_output(&record, Some(&adapter), None);
+        let out = build_output(&record, Some(&adapter), None, None);
 
         let cost = out.per_model[0].cost_usd.expect("BQ cost should be Some");
         assert!((cost - 6.25).abs() < 1e-9);
@@ -475,10 +637,104 @@ mod tests {
             ],
         );
 
-        let out = build_output(&record, None, Some("orders"));
+        let out = build_output(&record, None, Some("orders"), None);
         assert_eq!(out.per_model.len(), 1);
         assert_eq!(out.per_model[0].model_name, "orders");
         assert_eq!(out.total_duration_ms, 1_000);
+    }
+
+    #[test]
+    fn no_grouping_leaves_groups_none() {
+        let record = sample_run(
+            "run-flat",
+            vec![sample_exec("orders", "success", 1_000, None, None)],
+        );
+        let out = build_output(&record, None, None, None);
+        assert!(out.groups.is_none(), "default cost output has no groups");
+        // per_model is always present regardless of grouping.
+        assert_eq!(out.per_model.len(), 1);
+    }
+
+    #[test]
+    fn group_by_tenant_buckets_and_sums() {
+        // Two tenants + one unattributed model. 60s on Medium @ $0.40/DBU.
+        let record = sample_run(
+            "run-tenant",
+            vec![
+                sample_exec_tenant("orders", "success", 30_000, Some(10), None, Some("acme")),
+                sample_exec_tenant("returns", "success", 10_000, Some(5), None, Some("acme")),
+                sample_exec_tenant("orders", "success", 20_000, Some(7), None, Some("globex")),
+                // No tenant → lands in the "<unattributed>" bucket.
+                sample_exec("internal_metrics", "success", 5_000, Some(3), None),
+            ],
+        );
+
+        let dbu_per_hour = warehouse_size_to_dbu_per_hour("Medium");
+        let adapter = (
+            "databricks".to_string(),
+            WarehouseType::Databricks,
+            dbu_per_hour,
+            0.40,
+        );
+
+        let out = build_output(&record, Some(&adapter), None, Some(CostGroupBy::Tenant));
+        let groups = out.groups.expect("groups present under --by tenant");
+
+        // Deterministic ordering: "<unattributed>" (angle bracket sorts
+        // first), then "acme", then "globex".
+        assert_eq!(
+            groups.iter().map(|g| g.key.as_str()).collect::<Vec<_>>(),
+            vec![UNATTRIBUTED, "acme", "globex"]
+        );
+
+        let acme = groups.iter().find(|g| g.key == "acme").unwrap();
+        assert_eq!(acme.dimension, "tenant");
+        assert_eq!(acme.model_count, 2);
+        assert_eq!(acme.total_duration_ms, 40_000);
+        assert_eq!(acme.total_bytes_scanned, Some(15));
+
+        // Group cost equals the sum of its members' per-model costs.
+        let acme_members_cost: f64 = out
+            .per_model
+            .iter()
+            .filter(|m| m.tenant.as_deref() == Some("acme"))
+            .map(|m| m.cost_usd.unwrap_or(0.0))
+            .sum();
+        assert!((acme.total_cost_usd.unwrap() - acme_members_cost).abs() < 1e-12);
+
+        let unattr = groups.iter().find(|g| g.key == UNATTRIBUTED).unwrap();
+        assert_eq!(unattr.model_count, 1);
+        assert_eq!(unattr.total_duration_ms, 5_000);
+    }
+
+    #[test]
+    fn group_by_model_collapses_repeated_model_names() {
+        // Same model name across two executions collapses into one group.
+        let record = sample_run(
+            "run-model",
+            vec![
+                sample_exec("orders", "success", 1_000, Some(10), None),
+                sample_exec("orders", "success", 2_000, Some(20), None),
+                sample_exec("customers", "success", 500, None, None),
+            ],
+        );
+
+        let out = build_output(&record, None, None, Some(CostGroupBy::Model));
+        let groups = out.groups.expect("groups present under --by model");
+
+        assert_eq!(groups.len(), 2);
+        let orders = groups.iter().find(|g| g.key == "orders").unwrap();
+        assert_eq!(orders.dimension, "model");
+        assert_eq!(orders.model_count, 2);
+        assert_eq!(orders.total_duration_ms, 3_000);
+        assert_eq!(orders.total_bytes_scanned, Some(30));
+    }
+
+    #[test]
+    fn group_by_parse_rejects_unknown_dimension() {
+        assert!(CostGroupBy::parse("tenant").is_ok());
+        assert!(CostGroupBy::parse("MODEL").is_ok());
+        assert!(CostGroupBy::parse("region").is_err());
     }
 
     #[test]

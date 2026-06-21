@@ -432,4 +432,54 @@ mod tests {
         assert_eq!(regions[0], "us_west");
         assert_eq!(regions[1], "eu");
     }
+
+    /// End-to-end key agreement for the `rocky cost --by tenant` plumbing:
+    /// parse a real `src__{tenant}__{regions...}__{source}` schema with the
+    /// canonical pattern, run it through `parsed_to_json_map`, and apply the
+    /// *exact* extraction `run.rs` uses to populate `TableTask::tenant`.
+    /// This pins the contract that the run-side component map keys the tenant
+    /// under the literal `"tenant"` as a `Value::String` — if the schema
+    /// parser ever renamed that component, this fails instead of the feature
+    /// silently producing an all-`<unattributed>` cost rollup.
+    #[test]
+    fn parsed_to_json_map_keys_tenant_as_string_for_cost_attribution() {
+        use rocky_core::schema::SchemaPattern;
+
+        let pattern = SchemaPattern {
+            prefix: "src__".to_string(),
+            separator: "__".to_string(),
+            components: SchemaPattern::parse_components(&[
+                "tenant".to_string(),
+                "regions...".to_string(),
+                "source".to_string(),
+            ])
+            .unwrap(),
+        };
+        let parsed = pattern.parse("src__acme__us_west__shopify").unwrap();
+        let components = parsed_to_json_map(&parsed);
+
+        // The exact expression in run.rs's TableTask builder.
+        let tenant = components
+            .get("tenant")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        assert_eq!(tenant.as_deref(), Some("acme"));
+
+        // A pattern without a `{tenant}` component yields no tenant — the
+        // extraction returns None and the cost rollup buckets the model as
+        // unattributed.
+        let no_tenant_pattern = SchemaPattern {
+            prefix: "src__".to_string(),
+            separator: "__".to_string(),
+            components: SchemaPattern::parse_components(&["source".to_string()]).unwrap(),
+        };
+        let parsed_no_tenant = no_tenant_pattern.parse("src__shopify").unwrap();
+        let components_no_tenant = parsed_to_json_map(&parsed_no_tenant);
+        assert!(
+            components_no_tenant
+                .get("tenant")
+                .and_then(|v| v.as_str())
+                .is_none()
+        );
+    }
 }
