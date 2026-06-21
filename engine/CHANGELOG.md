@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **The installers now also install the standalone `rocky-lsp` binary** next to `rocky`, and the Windows installer replaces an in-use `rocky.exe` (rename-then-replace) instead of failing the overwrite. The VS Code extension prefers `rocky-lsp` for the language server, so updating `rocky` no longer fails because the editor is running it. (#931)
-- Refreshed locked workspace dependencies to their latest semver-compatible versions (`duckdb` 1.10504, plus transitive bumps). No `Cargo.toml` major bumps — the deliberate compat pins (duckdb↔arrow, the rustls dual-provider balance, the jsonwebtoken/tonic provider) are unchanged. Full suite green. (#PRNUM)
+- Refreshed locked workspace dependencies to their latest semver-compatible versions (`duckdb` 1.10504, plus transitive bumps). No `Cargo.toml` major bumps — the deliberate compat pins (duckdb↔arrow, the rustls dual-provider balance, the jsonwebtoken/tonic provider) are unchanged. Full suite green. (#939)
 
 ## [1.52.0] — 2026-06-19
 
