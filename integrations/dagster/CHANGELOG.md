@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Refreshed locked dependencies (`dagster` 1.13.10, `sqlalchemy` 2.0.51, `pytest` 9.1.1, `ruff` 0.15.18, plus transitives). The `dagster>=1.13.8` floor is unchanged — 1.13.10 is a bug-fix release with nothing on the integration's surface. Full suite (646 tests) green. (#939)
+
 ## [1.50.0] — 2026-06-19
 
 ### Added
