@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.33.2] — 2026-06-22
+
 ### Changed
 
+- Regenerated `src/types/generated/` for the engine 1.53.0 output schemas: `cost` gains the grouped-rollup `groups` array, `import-dbt` the new structured-warning variants + `constructs_dropped`, plus refreshed `test` / `compile` / `catalog` / `run` interfaces. Additive, type-only changes.
 - Bumped `@types/node` to 26 and refreshed the lockfile to the latest in-range dependency versions (`@vscode/test-electron` 3.0.0, `vitest` 4.1.9, plus transitives). `@types/vscode` stays pinned at 1.120.0 to match the `engines.vscode` / test-electron triangle. 0 vulnerabilities; compile, lint, and unit tests green. (#939)
 
 ## [1.33.1] — 2026-06-14
