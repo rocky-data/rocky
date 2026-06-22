@@ -251,19 +251,20 @@ What the importer translates cleanly:
 - `{{ config(materialized='table' \| 'incremental' \| 'view') }}` → sidecar `[strategy]` block (`view` flattens to `ephemeral` after import; see caveat above)
 - `{{ config(unique_key=...) }}` → `merge` strategy with `unique_key` array
 - `{{ config(alias='name') }}` → the sidecar `[target].table` — the output relation — so the data lands in the aliased table rather than one named after the node (dropping this silently mis-routes data)
-- `{{ config(materialized='microbatch') }}` with a `unique_key` → an idempotent `merge` (dbt microbatch's partition-replace becomes key-upsert; flagged so you can review). Without a `unique_key` it stays append-only and is flagged as such.
+- `{{ config(materialized='microbatch') }}` with a `unique_key` → an idempotent `merge` (dbt microbatch's partition-replace becomes key-upsert; flagged so you can review). Without a `unique_key` it maps to an append-only `incremental` strategy — not `microbatch`, which would falsely imply Rocky enforces the batch idempotency — and is flagged.
 - `{{ config(merge_update_columns=[...]) }}` → the `merge` strategy's `update_columns`
 - dbt **tags** (node- and folder-level) → the sidecar `[tags]` block (`<tag> = "true"`)
 - `{{ this }}` → the model's own fully-qualified `catalog.schema.table`
 - `is_incremental()` branches → stripped (Rocky derives the watermark filter from `[strategy]`)
 - **dbt generic tests** (`unique`, `not_null`, `accepted_values`, `relationships`) are translated column-by-column to `[[tests]]` blocks — including the *configured* forms that carry `severity:` (a `warn` becomes a Rocky warning, not a hard error) and `where:` (a row filter) (see [Generic test mapping](#generic-test-mapping) below)
+- model-level **`dbt_utils.unique_combination_of_columns`** → a Rocky `composite` uniqueness `[[tests]]` block over the same column tuple (the columns come from the test config, so no model schema is needed)
 - Top-level `dbt_project.yml`, used to detect project name and seeds path
 - `<dbt_project>/seeds/` → copied verbatim into `<out>/seeds/`
 - `profiles.yml` adapter type → mapped to a Rocky `[adapter]` block (DuckDB / Databricks / Snowflake / BigQuery), or a DuckDB stub when absent or unrecognised
 
 By design, the importer does not translate the following. Rocky has no Jinja runtime, so these need a manual pass. Each item is detected and listed under "Known limitations" in `MIGRATION-NOTES.md`, with `# TODO: dbt-jinja-not-translated` comments above any leftover Jinja in emitted SQL:
 
-- **dbt tests outside the canonical four.** `dbt_utils.*`, `dbt_expectations.*`, project-defined generic tests, and model-level (non-column) tests are surfaced as structured warnings (`UnsupportedTest`) per occurrence and not stubbed in the emitted TOML. Rewrite as a Rocky `expression` test or a quality-pipeline check.
+- **dbt tests outside the canonical four** (other than `unique_combination_of_columns`, which converts — see above). `dbt_utils.*`, `dbt_expectations.*`, project-defined generic tests, and other model-level tests are surfaced as structured warnings (`UnsupportedTest`) per occurrence and not stubbed in the emitted TOML. Rewrite as a Rocky `expression` test or a quality-pipeline check.
 - **Singular tests** in `tests/` (custom SQL): copy and rewrite manually.
 - **dbt macros and `dbt_packages/`.** Rocky has no Jinja runtime, so macro bodies do not expand.
 - **`{% for %}` / `{% set %}`** outside `is_incremental()` on the no-manifest path: **refused** — the model is listed as a failure rather than half-rendered into broken SQL (the loop/assignment body would survive exactly once). Re-run after `dbt compile` (the manifest path resolves them) or rewrite the model. A `{% if %}` is still emitted verbatim with a TODO marker — its body applies *unconditionally*, so review it. `{{ var() }}` is emitted with a TODO marker.
@@ -714,8 +715,9 @@ column = "customer_id"
 | `unique` | `type = "unique"` + `column` |
 | `accepted_values` | `type = "accepted_values"` + `values = [...]` + `column` |
 | `relationships` | `type = "relationships"` + `to_table` + `to_column` + `column` |
+| `dbt_utils.unique_combination_of_columns` (model-level) | `type = "composite"` + `kind = "unique"` + `columns = [...]` |
 
-Anything else (`dbt_utils.*`, `dbt_expectations.*`, project-defined generics, model-level tests) is surfaced as an `UnsupportedTest` warning with the model, column, and test name. Rewrite those as a Rocky `expression` test or a quality-pipeline check; the importer does not stub them in the emitted TOML.
+Anything else (`dbt_utils.*`, `dbt_expectations.*`, project-defined generics, other model-level tests) is surfaced as an `UnsupportedTest` warning with the model, column, and test name. Rewrite those as a Rocky `expression` test or a quality-pipeline check; the importer does not stub them in the emitted TOML.
 
 #### Consolidating repeated tests into named definitions
 
