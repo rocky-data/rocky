@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use rocky_core::tests::{TestDecl, TestSeverity, TestType};
+use rocky_core::tests::{CompositeKind, TestDecl, TestSeverity, TestType};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -20,6 +20,8 @@ pub struct DbtModelYaml {
     pub name: String,
     pub description: Option<String>,
     pub columns: Vec<DbtColumnYaml>,
+    /// Model-level (non-column) tests, e.g. `dbt_utils.unique_combination_of_columns`.
+    pub tests: Vec<DbtTestDef>,
 }
 
 /// A column definition within a dbt model YAML.
@@ -69,6 +71,11 @@ struct RawModel {
     description: Option<String>,
     #[serde(default)]
     columns: Vec<RawColumn>,
+    /// Model-level tests (dbt puts composite tests like
+    /// `unique_combination_of_columns` here, not under a column). dbt 1.7+
+    /// renamed `tests:` → `data_tests:`; accept both, mirroring `RawColumn`.
+    #[serde(default, alias = "data_tests")]
+    tests: Option<Vec<serde_yaml::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +178,7 @@ pub fn parse_model_yaml_content(content: &str) -> Result<Vec<DbtModelYaml>, Stri
 
     let mut models = Vec::new();
     for raw_model in raw_models {
+        let model_tests = parse_column_tests(&raw_model.tests);
         let columns = raw_model
             .columns
             .into_iter()
@@ -188,6 +196,7 @@ pub fn parse_model_yaml_content(content: &str) -> Result<Vec<DbtModelYaml>, Stri
             name: raw_model.name,
             description: raw_model.description,
             columns,
+            tests: model_tests,
         });
     }
 
@@ -483,7 +492,63 @@ pub fn tests_to_test_decls(
         }
     }
 
+    // Model-level (non-column) tests. dbt puts composite tests like
+    // `unique_combination_of_columns` here; convert it to a Rocky composite
+    // uniqueness test (column-less), everything else to an UnsupportedTest.
+    for test in &model.tests {
+        match test {
+            DbtTestDef::Configured { name, config }
+                if name == "unique_combination_of_columns"
+                    || name == "dbt_utils.unique_combination_of_columns" =>
+            {
+                match composite_unique_decl(config) {
+                    Some(decl) => decls.push(decl),
+                    None => unsupported.push(UnsupportedTest {
+                        model: model.name.clone(),
+                        column: None,
+                        test_name: name.clone(),
+                    }),
+                }
+            }
+            DbtTestDef::Configured { name, .. } | DbtTestDef::Simple(name) => {
+                unsupported.push(UnsupportedTest {
+                    model: model.name.clone(),
+                    column: None,
+                    test_name: name.clone(),
+                });
+            }
+        }
+    }
+
     (decls, unsupported)
+}
+
+/// Convert a dbt model-level `unique_combination_of_columns` into a Rocky
+/// composite-uniqueness `TestDecl`. Requires >= 2 columns (single-column
+/// uniqueness is a plain `unique`); the columns come from the test's own
+/// `combination_of_columns` config, so this needs no model schema. Carries
+/// the configured severity + row filter.
+fn composite_unique_decl(config: &HashMap<String, serde_yaml::Value>) -> Option<TestDecl> {
+    let combination = config.get("combination_of_columns")?;
+    let columns: Vec<String> = match combination {
+        serde_yaml::Value::Sequence(seq) => seq
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => return None,
+    };
+    if columns.len() < 2 {
+        return None;
+    }
+    Some(TestDecl {
+        test_type: TestType::Composite {
+            kind: CompositeKind::Unique,
+            columns,
+        },
+        column: None,
+        severity: config_severity(config),
+        filter: config_filter(config),
+    })
 }
 
 fn accepted_values_decl(
@@ -880,6 +945,66 @@ models:
     }
 
     #[test]
+    fn test_model_level_composite_unique_converts() {
+        // dbt puts `unique_combination_of_columns` at the MODEL level, not
+        // under a column. It must convert to a Rocky composite test — the
+        // columns come from the test's own config, not the model schema.
+        let yaml = r#"
+models:
+  - name: fct_orders
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - order_id
+            - line_number
+    columns:
+      - name: order_id
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&models[0], &resolver);
+        assert_eq!(
+            unsupported.len(),
+            0,
+            "composite test must convert, not drop"
+        );
+        assert_eq!(decls.len(), 1);
+        match &decls[0].test_type {
+            TestType::Composite { kind, columns } => {
+                assert!(matches!(kind, CompositeKind::Unique));
+                assert_eq!(
+                    columns,
+                    &vec!["order_id".to_string(), "line_number".to_string()]
+                );
+            }
+            other => panic!("expected Composite, got {other:?}"),
+        }
+        assert!(
+            decls[0].column.is_none(),
+            "composite uniqueness is model-level — no single column"
+        );
+    }
+
+    #[test]
+    fn test_single_column_combination_is_not_composite() {
+        // A 1-column "combination" is degenerate (that's plain `unique`) —
+        // don't emit a composite; surface it as unsupported instead.
+        let yaml = r#"
+models:
+  - name: m
+    tests:
+      - unique_combination_of_columns:
+          combination_of_columns:
+            - only_one
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&models[0], &resolver);
+        assert_eq!(decls.len(), 0);
+        assert_eq!(unsupported.len(), 1);
+    }
+
+    #[test]
     fn test_parse_model_without_tests() {
         let yaml = r#"
 models:
@@ -1037,6 +1162,7 @@ models:
                     tests: vec![DbtTestDef::Simple("not_null".to_string())],
                 },
             ],
+            tests: Vec::new(),
         };
 
         let (checks, skipped) = tests_to_contracts(&model);
@@ -1056,6 +1182,7 @@ models:
                 description: None,
                 tests: vec![DbtTestDef::Simple("unique".to_string())],
             }],
+            tests: Vec::new(),
         };
 
         let (checks, skipped) = tests_to_contracts(&model);
@@ -1086,6 +1213,7 @@ models:
                     config,
                 }],
             }],
+            tests: Vec::new(),
         };
 
         let (checks, _) = tests_to_contracts(&model);
@@ -1126,6 +1254,7 @@ models:
                     config,
                 }],
             }],
+            tests: Vec::new(),
         };
 
         let (checks, _) = tests_to_contracts(&model);
@@ -1160,6 +1289,7 @@ models:
                     config,
                 }],
             }],
+            tests: Vec::new(),
         };
 
         let (checks, _) = tests_to_contracts(&model);
@@ -1182,6 +1312,7 @@ models:
                 description: None,
                 tests: vec![DbtTestDef::Simple("some_custom_test".to_string())],
             }],
+            tests: Vec::new(),
         };
 
         let (checks, skipped) = tests_to_contracts(&model);
@@ -1223,6 +1354,7 @@ models:
                     }],
                 },
             ],
+            tests: Vec::new(),
         };
 
         let (checks, _) = tests_to_contracts(&model);
@@ -1347,6 +1479,7 @@ models:
                     DbtTestDef::Simple("not_null".to_string()),
                 ],
             }],
+            tests: Vec::new(),
         };
         let resolver = default_resolver();
         let (decls, unsupported) = tests_to_test_decls(&model, &resolver);
@@ -1386,6 +1519,7 @@ models:
                     config,
                 }],
             }],
+            tests: Vec::new(),
         };
         let resolver = default_resolver();
         let (decls, unsupported) = tests_to_test_decls(&model, &resolver);
@@ -1421,6 +1555,7 @@ models:
                     config,
                 }],
             }],
+            tests: Vec::new(),
         };
 
         // Build a resolver that knows where dim_customers lives.
@@ -1472,6 +1607,7 @@ models:
                     config,
                 }],
             }],
+            tests: Vec::new(),
         };
         let resolver = default_resolver();
         let (decls, _) = tests_to_test_decls(&model, &resolver);
@@ -1504,6 +1640,7 @@ models:
                     },
                 ],
             }],
+            tests: Vec::new(),
         };
         let resolver = default_resolver();
         let (decls, unsupported) = tests_to_test_decls(&model, &resolver);
@@ -1541,6 +1678,7 @@ models:
                     config,
                 }],
             }],
+            tests: Vec::new(),
         };
         let resolver = default_resolver();
         let (decls, unsupported) = tests_to_test_decls(&model, &resolver);
@@ -1580,6 +1718,7 @@ models:
                     ],
                 },
             ],
+            tests: Vec::new(),
         };
         let resolver = default_resolver();
         let (decls, unsupported) = tests_to_test_decls(&model, &resolver);

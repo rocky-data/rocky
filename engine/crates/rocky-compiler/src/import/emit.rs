@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use rocky_core::models::{ModelConfig, StrategyConfig};
-use rocky_core::tests::{TestDecl, TestSeverity, TestType};
+use rocky_core::tests::{CompositeKind, TestDecl, TestSeverity, TestType};
 use rocky_core::unit_test::UnitTestDef;
 use serde::Serialize;
 
@@ -412,9 +412,18 @@ fn render_test_decl(test: &TestDecl) -> String {
             out.push_str(&format!("to_table = \"{to_table}\"\n"));
             out.push_str(&format!("to_column = \"{to_column}\"\n"));
         }
-        // The dbt importer maps only the four canonical built-ins to
-        // `TestDecl`. Anything else here would be programmer error — emit
-        // toml that won't load is worse than a panic, so refuse to render.
+        TestType::Composite { kind, columns } => {
+            out.push_str("type = \"composite\"\n");
+            let kind_str = match kind {
+                CompositeKind::Unique => "unique",
+            };
+            out.push_str(&format!("kind = \"{kind_str}\"\n"));
+            let cols: Vec<String> = columns.iter().map(|c| format!("\"{c}\"")).collect();
+            out.push_str(&format!("columns = [{}]\n", cols.join(", ")));
+        }
+        // The dbt importer maps only the canonical built-ins + composite
+        // uniqueness to `TestDecl`. Anything else here would be programmer
+        // error — emit toml that won't load is worse than a panic, so refuse.
         other => {
             unreachable!(
                 "rocky import-dbt only produces NotNull/Unique/AcceptedValues/Relationships TestDecls; got {:?}",
@@ -1078,6 +1087,28 @@ mod tests {
         assert_eq!(ut.given.len(), 1);
         assert_eq!(ut.given[0].model_ref, "int_orders");
         assert_eq!(ut.expect.rows.len(), 1);
+    }
+
+    #[test]
+    fn renders_composite_uniqueness_test() {
+        let decl = TestDecl {
+            test_type: TestType::Composite {
+                kind: CompositeKind::Unique,
+                columns: vec!["order_id".to_string(), "line_number".to_string()],
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let toml = render_test_decl(&decl);
+        assert!(toml.contains("type = \"composite\""), "{toml}");
+        assert!(toml.contains("kind = \"unique\""), "{toml}");
+        assert!(
+            toml.contains("columns = [\"order_id\", \"line_number\"]"),
+            "{toml}"
+        );
+        // Model-level: no `column =` line.
+        assert!(!toml.contains("column ="), "{toml}");
     }
 
     #[test]
