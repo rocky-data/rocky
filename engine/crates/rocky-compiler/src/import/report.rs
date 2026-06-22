@@ -380,12 +380,15 @@ pub fn format_report(report: &MigrationReport) -> String {
                 "  {} converted to contracts\n",
                 report.tests.converted
             ));
-        }
-        if report.tests.converted_custom > 0 {
-            out.push_str(&format!(
-                "  {} converted as custom SQL\n",
-                report.tests.converted_custom
-            ));
+            // converted_custom is a SUBSET of converted (composite /
+            // multi-column tests), not an additional bucket — nest it so the
+            // numbers don't read as additive.
+            if report.tests.converted_custom > 0 {
+                out.push_str(&format!(
+                    "    ({} of them composite / multi-column)\n",
+                    report.tests.converted_custom
+                ));
+            }
         }
         if report.tests.skipped > 0 {
             out.push_str(&format!("  {} skipped\n", report.tests.skipped));

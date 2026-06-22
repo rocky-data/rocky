@@ -417,8 +417,8 @@ pub fn apply_dbt_tests(yaml_root: &Path, default_target: &TargetConfig, result: 
             imported.config.tests.extend(decls);
         }
 
-        // Surface every unsupported test as a structured warning. Skip
-        // model-level tests (column == None) — same rule today.
+        // Surface every unsupported test as a warning — including model-level
+        // ones (column == None), which render as "model-level".
         for u in unsupported {
             let where_ = match &u.column {
                 Some(c) => format!("column '{c}'"),
@@ -2127,6 +2127,67 @@ FROM raw.orders
         );
         assert_eq!(result.project_name.as_deref(), Some("test_proj"));
         assert_eq!(result.dbt_version.as_deref(), Some("1.7.4"));
+    }
+
+    #[test]
+    fn test_apply_dbt_tests_converts_model_level_only_composite() {
+        // Regression guard for the early-`continue` bug: a model whose ONLY
+        // tests are model-level (no column tests) must still be converted.
+        // apply_dbt_tests once summed only column tests when deciding whether
+        // a model had any, so this model would have been skipped entirely.
+        // Exercises the real YAML path (not tests_to_test_decls directly).
+        let dir = tempfile::TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(
+            models_dir.join("schema.yml"),
+            r#"
+models:
+  - name: fct_orders
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [order_id, line_number]
+"#,
+        )
+        .unwrap();
+
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        let mut result = ImportResult {
+            imported: Vec::new(),
+            warnings: Vec::new(),
+            structured_warnings: Vec::new(),
+            failed: Vec::new(),
+            sources_found: 0,
+            sources_mapped: 0,
+            import_method: ImportMethod::Regex,
+            project_name: None,
+            dbt_version: None,
+            tests_found: 0,
+            tests_converted: 0,
+            tests_converted_custom: 0,
+            tests_skipped: 0,
+            macros_detected: 0,
+            macros_expanded: 0,
+            macros_manifest_resolved: 0,
+            macros_unsupported: 0,
+            unit_tests_found: 0,
+            unit_tests_converted: 0,
+            unit_tests_skipped: 0,
+            constructs_dropped: 0,
+        };
+        apply_dbt_tests(dir.path(), &target, &mut result);
+
+        assert_eq!(result.tests_found, 1, "model-level test must be found");
+        assert_eq!(result.tests_converted, 1);
+        assert_eq!(
+            result.tests_converted_custom, 1,
+            "the composite must count as a custom conversion"
+        );
+        assert_eq!(result.tests_skipped, 0);
     }
 
     #[test]
