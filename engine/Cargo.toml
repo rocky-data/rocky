@@ -236,7 +236,7 @@ prost = "0.14"
 # Auto-generated tonic client for the BigQuery Storage Read API
 # (`google.cloud.bigquery.storage.v1`). Tracks the workspace tonic +
 # prost majors exactly.
-googleapis-tonic-google-cloud-bigquery-storage-v1 = "0.33"
+googleapis-tonic-google-cloud-bigquery-storage-v1 = "0.34"
 
 [profile.release]
 opt-level = 3

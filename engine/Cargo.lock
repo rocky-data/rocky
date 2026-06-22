@@ -1728,9 +1728,9 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "googleapis-tonic-google-api"
-version = "0.29.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4411485f14b532ed4a23fa143a355e9ff148def1727c18d262eceb0ceccea90"
+checksum = "fca39f3577e656ca9ad97737fc1a397f45c46f54d047a43af1fb680287b5ace8"
 dependencies = [
  "prost",
  "prost-types",
@@ -1740,9 +1740,9 @@ dependencies = [
 
 [[package]]
 name = "googleapis-tonic-google-cloud-bigquery-storage-v1"
-version = "0.33.0"
+version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee577ff55e3d3ca1bbb4720ea0036ca2b4d1cc9b3d0cf76264d6979305743b48"
+checksum = "be907032fcc9cb6a5de69de34ef41bdb4304d63b1c2818bd33def10a386d4dcf"
 dependencies = [
  "googleapis-tonic-google-api",
  "googleapis-tonic-google-rpc",
@@ -1754,9 +1754,9 @@ dependencies = [
 
 [[package]]
 name = "googleapis-tonic-google-rpc"
-version = "0.24.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f48f43a381f9a1b6dab85d87635a255602a516a2d691fa372c5bb340a3659d6"
+checksum = "8f8922a81782e57325a059334bcec9730f7865eea2a1a1453896efe53a65b6af"
 dependencies = [
  "prost",
  "prost-types",
