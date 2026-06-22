@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-06-22
+
 ### Changed
 
+- Regenerated `types_generated/` for the engine 1.53.0 output schemas: `import-dbt` gains the `microbatch_mapped` / `dropped_construct` structured-warning variants and a `constructs_dropped` count, `cost` gains the grouped-rollup `groups` array, and the cross-team-contract path exposes the new E031/E032/E034 diagnostics. Additive — existing parses are unaffected.
 - Refreshed locked dev-dependencies (`datamodel-code-generator` 0.64.1, `pytest` 9.1.1, `ruff` 0.15.18). Regenerated `types_generated/` with the new generator — byte-identical output, no drift. (#939)
 
 ## [0.1.2] — 2026-06-19
