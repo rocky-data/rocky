@@ -21,7 +21,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use regex::Regex;
-use rocky_ir::TimeGrain;
 
 use rocky_core::models::{ModelConfig, StrategyConfig, TargetConfig};
 use rocky_core::unit_test::{TestExpectation, TestFixture, UnitTestDef};
@@ -388,7 +387,12 @@ pub fn apply_dbt_tests(yaml_root: &Path, default_target: &TargetConfig, result: 
     };
 
     for (model_name, model_yaml) in &model_yamls {
-        let total_tests: usize = model_yaml.columns.iter().map(|c| c.tests.len()).sum();
+        let total_tests: usize = model_yaml
+            .columns
+            .iter()
+            .map(|c| c.tests.len())
+            .sum::<usize>()
+            + model_yaml.tests.len();
         if total_tests == 0 {
             // Still let YAML descriptions seed `intent` for matching imported models.
             attach_intent(result, model_name, model_yaml.description.as_deref());
@@ -399,6 +403,13 @@ pub fn apply_dbt_tests(yaml_root: &Path, default_target: &TargetConfig, result: 
         let (decls, unsupported) = super::dbt_tests::tests_to_test_decls(model_yaml, &resolver);
 
         result.tests_converted += decls.len();
+        // "custom" = converted tests that aren't the canonical column-level
+        // built-ins — today the composite (`unique_combination_of_columns`)
+        // conversions. Previously always 0 because nothing custom converted.
+        result.tests_converted_custom += decls
+            .iter()
+            .filter(|d| matches!(d.test_type, rocky_core::tests::TestType::Composite { .. }))
+            .count();
         result.tests_skipped += unsupported.len();
 
         // Attach the decls to the matching imported model (if present).
@@ -804,16 +815,18 @@ fn map_incremental_strategy(
     match strategy_kind.as_str() {
         "merge" => match unique_keys {
             Some(keys) if !keys.is_empty() => {
-                // dbt `merge_exclude_columns` (update all-but-these) has no
-                // direct Rocky equivalent — without the full column list we
-                // can't invert it, so warn rather than silently update-all.
+                // dbt `merge_exclude_columns` (update all-but-these) inverts
+                // to an explicit `update_columns` — but that needs the full
+                // physical column list, which the manifest does not carry
+                // (it lives in catalog.json from `dbt docs generate`). Without
+                // it we can't invert, so warn rather than silently update-all.
                 if config.merge_update_columns.is_none() && config.merge_exclude_columns.is_some() {
                     warnings.push(ImportWarning {
                         model: model_name.to_string(),
                         category: WarningCategory::UnsupportedMaterialization,
-                        message: "merge_exclude_columns has no direct Rocky equivalent — the emitted merge updates all columns".to_string(),
+                        message: "merge_exclude_columns can't be inverted from the manifest alone (it has no physical column list) — the emitted merge updates all columns".to_string(),
                         suggestion: Some(
-                            "list the columns to update via the emitted [strategy] `update_columns` instead".to_string(),
+                            "set the columns to update explicitly via the emitted [strategy] `update_columns`".to_string(),
                         ),
                     });
                 }
@@ -941,12 +954,6 @@ fn map_microbatch_strategy(
         });
         return StrategyConfig::FullRefresh;
     };
-    let granularity = config
-        .batch_size
-        .as_deref()
-        .map(|s| batch_size_to_grain(s, model_name, warnings))
-        .unwrap_or(TimeGrain::Day);
-
     // dbt microbatch idempotently REPLACES each batch partition. Rocky's
     // Microbatch strategy emits an append-only INSERT (sql_gen.rs), so importing
     // it as-is silently re-inserts the lookback window every run. dbt microbatch
@@ -980,45 +987,22 @@ fn map_microbatch_strategy(
             warnings.push(ImportWarning {
                 model: model_name.to_string(),
                 category: WarningCategory::UnsupportedMaterialization,
-                message: "dbt microbatch without a unique_key imports as append-only and re-inserts the lookback window every run".to_string(),
+                message: "dbt microbatch without a unique_key maps to an append-only incremental strategy — it re-inserts the lookback window on every run".to_string(),
                 suggestion: Some(
-                    "add a unique_key (microbatch requires one) so it maps to an idempotent merge, or convert to a time-interval strategy".to_string(),
+                    "add a unique_key (dbt microbatch normally has one) so it maps to an idempotent merge, or convert to a time-interval strategy with @start_date/@end_date".to_string(),
                 ),
             });
             structured.push(ImportDbtStructuredWarning::MicrobatchMapped {
                 model: model_name.to_string(),
-                mapped_to: "append".to_string(),
+                mapped_to: "incremental_append".to_string(),
             });
-            StrategyConfig::Microbatch {
+            // Emit `incremental`, not `microbatch`: both lower to an
+            // append-only INSERT (sql_gen), but `microbatch` misleadingly
+            // implies dbt's idempotent partition-replace. `incremental` is
+            // honest about the append semantics.
+            StrategyConfig::Incremental {
                 timestamp_column: event_time,
-                granularity,
             }
-        }
-    }
-}
-
-/// Translate a dbt `batch_size` string to a Rocky [`TimeGrain`]. Falls
-/// back to `Day` on unrecognized values with a warning.
-fn batch_size_to_grain(
-    raw: &str,
-    model_name: &str,
-    warnings: &mut Vec<ImportWarning>,
-) -> TimeGrain {
-    match raw.to_ascii_lowercase().as_str() {
-        "hour" => TimeGrain::Hour,
-        "day" => TimeGrain::Day,
-        "month" => TimeGrain::Month,
-        "year" => TimeGrain::Year,
-        other => {
-            warnings.push(ImportWarning {
-                model: model_name.to_string(),
-                category: WarningCategory::UnsupportedMaterialization,
-                message: format!(
-                    "batch_size='{other}' not recognized — defaulting to `day` granularity"
-                ),
-                suggestion: Some("set batch_size to one of: hour, day, month, year".to_string()),
-            });
-            TimeGrain::Day
         }
     }
 }
@@ -2578,7 +2562,7 @@ FROM {{ ref('stg_events') }}
     }
 
     #[test]
-    fn test_manifest_microbatch_maps_to_microbatch() {
+    fn test_manifest_microbatch_without_key_maps_to_incremental() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
             "nodes": {
@@ -2601,15 +2585,14 @@ FROM {{ ref('stg_events') }}
         });
         let result = import_from_manifest_json(&manifest);
         assert_eq!(result.imported.len(), 1);
+        // A microbatch without a unique_key maps to an append-only
+        // `incremental` (not `microbatch`) — both lower to a bare INSERT, but
+        // `incremental` doesn't misleadingly imply dbt's idempotent semantics.
         match &result.imported[0].config.strategy {
-            StrategyConfig::Microbatch {
-                timestamp_column,
-                granularity,
-            } => {
+            StrategyConfig::Incremental { timestamp_column } => {
                 assert_eq!(timestamp_column, "event_ts");
-                assert_eq!(*granularity, TimeGrain::Day);
             }
-            other => panic!("expected Microbatch, got {other:?}"),
+            other => panic!("expected Incremental, got {other:?}"),
         }
     }
 
@@ -2932,36 +2915,6 @@ FROM {{ ref('stg_events') }}
         let (macro_name, line) = found.expect("expected UnresolvableMacro warning");
         assert_eq!(macro_name, "custom_helper");
         assert_eq!(line, 2, "macro is on line 2 of the compiled SQL");
-    }
-
-    #[test]
-    fn test_batch_size_to_grain_unknown_warns_default_day() {
-        let mut warnings = Vec::new();
-        let g = batch_size_to_grain("week", "m", &mut warnings);
-        assert_eq!(g, TimeGrain::Day);
-        assert!(!warnings.is_empty());
-    }
-
-    #[test]
-    fn test_batch_size_to_grain_each_supported() {
-        let mut warnings = Vec::new();
-        assert_eq!(
-            batch_size_to_grain("hour", "m", &mut warnings),
-            TimeGrain::Hour
-        );
-        assert_eq!(
-            batch_size_to_grain("day", "m", &mut warnings),
-            TimeGrain::Day
-        );
-        assert_eq!(
-            batch_size_to_grain("month", "m", &mut warnings),
-            TimeGrain::Month
-        );
-        assert_eq!(
-            batch_size_to_grain("year", "m", &mut warnings),
-            TimeGrain::Year
-        );
-        assert!(warnings.is_empty());
     }
 
     // ---------------------------------------------------------------------
