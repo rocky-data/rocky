@@ -187,7 +187,7 @@ salsa = "0.27"
 # Web server
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 
 # LSP
 tower-lsp = "0.20"
