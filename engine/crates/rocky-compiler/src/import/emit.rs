@@ -1090,6 +1090,28 @@ mod tests {
     }
 
     #[test]
+    fn renders_composite_uniqueness_test() {
+        let decl = TestDecl {
+            test_type: TestType::Composite {
+                kind: CompositeKind::Unique,
+                columns: vec!["order_id".to_string(), "line_number".to_string()],
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let toml = render_test_decl(&decl);
+        assert!(toml.contains("type = \"composite\""), "{toml}");
+        assert!(toml.contains("kind = \"unique\""), "{toml}");
+        assert!(
+            toml.contains("columns = [\"order_id\", \"line_number\"]"),
+            "{toml}"
+        );
+        // Model-level: no `column =` line.
+        assert!(!toml.contains("column ="), "{toml}");
+    }
+
+    #[test]
     fn migration_notes_counts_unit_tests() {
         let dbt_dir = tempfile::TempDir::new().unwrap();
         let out_dir = tempfile::TempDir::new().unwrap();
