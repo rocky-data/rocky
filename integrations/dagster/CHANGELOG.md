@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Engine check severity now maps to the Dagster asset-check severity.** A check the engine reports with `severity = "warning"` (configured in `rocky.toml`) is emitted as `AssetCheckSeverity.WARN`; `"error"` (the default) stays `ERROR`. Applies to every surfaced check on both the `RockyComponent` path and the `emit_check_results` / `load_rocky_assets` functional path. The advisory level is also surfaced in the check metadata so it's visible on a *passing* check, where Dagster doesn't render the severity. (Dagster Pipes mode is unaffected for now — the engine's Pipes path reports checks with a fixed `ERROR` severity; mapping the configured severity there is a separate engine follow-up.)
+- **Engine check severity now maps to the Dagster asset-check severity.** A check the engine reports with `severity = "warning"` (configured in `rocky.toml`) is emitted as `AssetCheckSeverity.WARN`; `"error"` (the default) stays `ERROR`. Applies to every surfaced check on both the `RockyComponent` path and the `emit_check_results` / `load_rocky_assets` functional path. The advisory level is also surfaced in the check metadata so it's visible on a *passing* check, where Dagster doesn't render the severity. (Dagster Pipes mode is unaffected for now — the engine's Pipes path reports checks with a fixed `ERROR` severity; mapping the configured severity there is a separate engine follow-up.) (#959)
 
 ### Changed
 
