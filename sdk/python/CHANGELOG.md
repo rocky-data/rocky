@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`CheckResult.severity`** — the per-check failure severity (`"error"` | `"warning"`) the engine already emits on `rocky run` check results. The hand-written wide model omitted the field, so Pydantic's default `extra="ignore"` silently dropped the wire value and any consumer mapping it (e.g. `dagster-rocky`'s asset-check severity) only ever saw the default. Additive; defaults to `"error"` for older binaries that don't emit it, so existing parses are unaffected. (#959)
+
 ## [0.1.4] — 2026-06-23
 
 ### Added

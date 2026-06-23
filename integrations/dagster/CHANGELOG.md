@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Engine check severity now maps to the Dagster asset-check severity.** A check the engine reports with `severity = "warning"` (configured in `rocky.toml`) is emitted as `AssetCheckSeverity.WARN`; `"error"` (the default) stays `ERROR`. Applies to every surfaced check on both the `RockyComponent` path and the `emit_check_results` / `load_rocky_assets` functional path. The advisory level is also surfaced in the check metadata so it's visible on a *passing* check, where Dagster doesn't render the severity. (Dagster Pipes mode is unaffected for now — the engine's Pipes path reports checks with a fixed `ERROR` severity; mapping the configured severity there is a separate engine follow-up.) (#959)
+
+### Changed
+
+- **Will require `rocky-sdk>=0.1.5`** at release: the mapping reads `CheckResult.severity`, added to the SDK's wide model in 0.1.5. **Publish `rocky-sdk` 0.1.5 to PyPI and raise this floor before releasing `dagster-rocky`** — the published wheel resolves the floor from PyPI, not the monorepo path, so a stale `>=0.1.4` floor would silently map every check back to `ERROR`.
+- **Behavior change on upgrade:** a *failing* check configured `severity = "warning"` now emits `WARN` instead of `ERROR`, so it no longer degrades asset health. Alert policies keyed to `ASSET_HEALTH_DEGRADED` (and automation conditions gated on check health) will stop firing for advisory-severity check failures. This is the intended advisory semantics, but review any policy that relied on the prior always-`ERROR` behavior before upgrading.
+
 ## [1.51.0] — 2026-06-23
 
 ### Added

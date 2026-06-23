@@ -12,6 +12,7 @@ from .branch_deploy import (
 from .checks import (
     check_metadata,
     cost_metadata_from_optimize,
+    dagster_check_severity,
     emit_check_results,
     emit_materializations,
 )
@@ -176,6 +177,7 @@ __all__ = [
     "emit_check_results",
     "emit_materializations",
     "check_metadata",
+    "dagster_check_severity",
     "cost_metadata_from_optimize",
     "parse_rocky_output",
     # Freshness + automation (T1.1, T1.2, T5.2)

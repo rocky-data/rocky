@@ -15,6 +15,26 @@ from .contracts import sanitize_check_name
 from .types import CheckResult, MaterializationInfo, OptimizeResult, RunResult
 
 
+def dagster_check_severity(check: CheckResult) -> dg.AssetCheckSeverity:
+    """Map a Rocky check's configured severity to a Dagster ``AssetCheckSeverity``.
+
+    Rocky's :attr:`CheckResult.severity` carries the operator's configured
+    intent: ``"warning"`` is advisory, ``"error"`` (the default) is a hard
+    failure. A *failing* check surfaces at this severity — ``WARN`` does not
+    degrade asset health, ``ERROR`` does — so an advisory check can fail without
+    paging an ``ASSET_HEALTH_DEGRADED`` alert.
+
+    ``getattr`` (not ``check.severity``) is deliberate: a new ``dagster-rocky``
+    run against an older ``rocky-sdk`` whose wide ``CheckResult`` predates the
+    field degrades to ``ERROR`` rather than raising ``AttributeError``. Omitted
+    severity (older engine binaries) likewise preserves the prior fail-hard
+    behaviour.
+    """
+    if getattr(check, "severity", None) == "warning":
+        return dg.AssetCheckSeverity.WARN
+    return dg.AssetCheckSeverity.ERROR
+
+
 def emit_materializations(result: RunResult) -> list[dg.AssetMaterialization]:
     """Convert Rocky materializations into Dagster ``AssetMaterialization`` events."""
     return [
@@ -44,6 +64,7 @@ def emit_check_results(result: RunResult) -> list[dg.AssetCheckResult]:
                     asset_key=key,
                     check_name=sanitize_check_name(check.name),
                     passed=check.passed,
+                    severity=dagster_check_severity(check),
                     metadata=check_metadata(check),
                 )
             )
@@ -126,5 +147,13 @@ def check_metadata(check: CheckResult) -> dict[str, dg.MetadataValue]:
         metadata["query"] = dg.MetadataValue.text(check.query)
     if check.result_value is not None:
         metadata["result_value"] = dg.MetadataValue.int(check.result_value)
+
+    # Severity — surfaced only when advisory (WARN). ``"error"`` is the implicit
+    # default, so showing it on every check would clutter the panel. Deriving
+    # from :func:`dagster_check_severity` keeps one source of truth for "is this
+    # advisory?" and makes the level visible even on a *passing* check, where
+    # Dagster's ``AssetCheckSeverity`` is not rendered.
+    if dagster_check_severity(check) is dg.AssetCheckSeverity.WARN:
+        metadata["severity"] = dg.MetadataValue.text("warning")
 
     return metadata
