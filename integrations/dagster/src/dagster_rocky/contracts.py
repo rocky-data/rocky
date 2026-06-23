@@ -35,6 +35,7 @@ auto-wires them when ``contracts_dir`` is configured.
 from __future__ import annotations
 
 import logging
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -221,6 +222,75 @@ def contract_check_specs_for_model(
             description=(
                 "Column types and nullability constraints from .contract.toml are satisfied"
             ),
+            partitions_def=partitions_def,
+        )
+
+
+_INVALID_CHECK_NAME_CHARS = re.compile(r"[^A-Za-z0-9_]")
+
+
+def sanitize_check_name(name: str) -> str:
+    """Map an engine ``CheckResult.name`` to a Dagster-valid check name.
+
+    Dagster check (op output) names must match ``^[A-Za-z0-9_]+$``, but the
+    engine emits structured names with ``:`` / ``.`` separators
+    (``null_rate:amount``, ``cross_source_overlap:src.table``, synthesized
+    ``{kind}:{column}`` assertions). Each invalid character is replaced with
+    ``_`` so the name can be declared as a spec.
+
+    The function is applied identically when **declaring** a configured-check
+    spec and when **matching/emitting** the run-time result (in
+    ``_emit_results``), so the sanitized spec name and the sanitized run-time
+    name still agree — the engine's discover/run byte-match is preserved
+    through one extra deterministic transform on both sides. For the default,
+    contract, and compliance check names (already valid) it is the identity.
+
+    The mapping is not injective: two *distinct* engine check names that differ
+    only in their separators (e.g. ``a:b`` and ``a.b``, or a custom check named
+    literally ``null_rate_amount`` alongside a ``null_rate`` on column
+    ``amount``) collapse to the same Dagster name and are surfaced as a single
+    check. Configured check names that sanitize-collide on one asset are not
+    supported — give them distinct ``[A-Za-z0-9_]`` names to surface both.
+    """
+    return _INVALID_CHECK_NAME_CHARS.sub("_", name)
+
+
+def configured_check_specs_for_model(
+    asset_key: dg.AssetKey,
+    check_names: list[str],
+    *,
+    partitions_def: dg.PartitionsDefinition | None = None,
+) -> Iterator[dg.AssetCheckSpec]:
+    """Yield one ``AssetCheckSpec`` per engine-resolved configured check name.
+
+    ``check_names`` come VERBATIM from ``rocky discover``'s check-name
+    projection (``discover.checks.configured_checks``) — they are **never**
+    re-derived in Python — then passed through :func:`sanitize_check_name` so
+    they satisfy Dagster's name constraints. This matters for the dynamic
+    ``cross_source_overlap`` name (``cross_source_overlap:{source_type}.{table}``):
+    only the engine knows the exact string it will emit, so the spec name is
+    derived from discover (not re-built in Python) and the same sanitizer runs
+    in ``_emit_results`` so the run-time ``AssetCheckResult`` lands against the
+    spec rather than being silently dropped.
+
+    Args:
+        asset_key: The Dagster asset key the checks belong to.
+        check_names: Resolved check names from the engine, used verbatim.
+        partitions_def: Optional ``PartitionsDefinition`` to attach to each
+            spec. Must equal the target asset's ``partitions_def`` (Dagster
+            enforces this). Note (Dagster 1.13.x): a **preview** API whose UI
+            summary/badge status is last-writer-wins across partitions — only
+            the raw history is per-partition. ``None`` (unpartitioned) is
+            byte-identical to prior behaviour. Mirrors
+            :func:`contract_check_specs_for_model`.
+
+    Yields:
+        ``dg.AssetCheckSpec`` instances — one per name, in order.
+    """
+    for name in check_names:
+        yield dg.AssetCheckSpec(
+            name=sanitize_check_name(name),
+            asset=asset_key,
             partitions_def=partitions_def,
         )
 

@@ -288,7 +288,14 @@ pub async fn discover(
         emit_fivetran_state(&rocky_cfg, emit_path, no_cache).await?;
     }
 
-    let checks_output = ChecksConfigOutput::from_engine(&pipeline.checks);
+    // `rocky discover` is replication-only, so the projection gates on the
+    // replication runner's executed-check-kinds and reads the discovered
+    // (source_type, table) pairs from `output_sources` (borrowed before move).
+    let checks_output = ChecksConfigOutput::from_engine(
+        &pipeline.checks,
+        rocky_core::config::ReplicationPipelineConfig::EXECUTED_CHECK_KINDS,
+        &output_sources,
+    );
     let output = DiscoverOutput::new(output_sources)
         .with_checks(checks_output)
         .with_excluded_tables(excluded_tables)

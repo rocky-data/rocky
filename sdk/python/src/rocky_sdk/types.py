@@ -54,6 +54,24 @@ class FreshnessConfig(BaseModel):
     threshold_seconds: int
 
 
+class ResolvedCheckName(BaseModel):
+    """A resolved check name ``rocky discover`` projects so a consumer can
+    pre-declare a matching check spec.
+
+    ``name`` byte-matches the ``CheckResult.name`` the engine emits at run
+    time, so a consumer can declare a spec with this exact name and have the
+    run-time result land against it. ``candidate`` is ``True`` for names whose
+    existence depends on runtime-discovered siblings (``cross_source_overlap``)
+    and so may not be emitted on every run.
+    """
+
+    name: str
+    #: Check-kind tag: ``custom`` | ``assertion`` | ``null_rate`` |
+    #: ``cross_source_overlap``.
+    kind: str
+    candidate: bool = False
+
+
 class ChecksConfig(BaseModel):
     """Pipeline-level checks configuration projected into the discover output.
 
@@ -62,6 +80,13 @@ class ChecksConfig(BaseModel):
     """
 
     freshness: FreshnessConfig | None = None
+    #: Resolved per-model check names the pipeline emits as ``CheckResult.name``
+    #: at run time, keyed by unqualified table/model name. Only the non-default
+    #: checks (custom / assertion / null_rate / cross_source_overlap) are
+    #: listed. Consumed by ``dagster-rocky``'s ``surface_configured_checks`` to
+    #: pre-declare matching asset-check specs. Empty when no non-default checks
+    #: are configured.
+    configured_checks: dict[str, list[ResolvedCheckName]] = Field(default_factory=dict)
 
 
 class DiscoverResult(BaseModel):

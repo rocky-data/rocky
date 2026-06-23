@@ -352,6 +352,28 @@ pub struct TestDecl {
     pub filter: Option<String>,
 }
 
+/// Short snake_case tag for each [`TestType`] variant — embedded in assertion
+/// `CheckResult` details and used to synthesize an assertion's name when none
+/// is set. Shared by the runners (`rocky-cli`) and the `rocky discover`
+/// check-name projection so a synthesized name resolves identically on both.
+pub fn test_type_kind(t: &TestType) -> &'static str {
+    match t {
+        TestType::NotNull => "not_null",
+        TestType::Unique => "unique",
+        TestType::UniqueExpr { .. } => "unique_expr",
+        TestType::AcceptedValues { .. } => "accepted_values",
+        TestType::Relationships { .. } => "relationships",
+        TestType::Expression { .. } => "expression",
+        TestType::RowCountRange { .. } => "row_count_range",
+        TestType::InRange { .. } => "in_range",
+        TestType::RegexMatch { .. } => "regex_match",
+        TestType::Aggregate { .. } => "aggregate",
+        TestType::Composite { .. } => "composite",
+        TestType::NotInFuture => "not_in_future",
+        TestType::OlderThanNDays { .. } => "older_than_n_days",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SQL generation
 // ---------------------------------------------------------------------------

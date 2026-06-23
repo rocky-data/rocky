@@ -494,11 +494,8 @@ pub(crate) async fn run_table_assertions(
                 continue;
             }
         };
-        let kind = test_type_kind(&test.test_type);
-        let name = assertion
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("{kind}:{}", test.column.as_deref().unwrap_or("-")));
+        let kind = rocky_core::tests::test_type_kind(&test.test_type);
+        let name = assertion.resolved_name();
 
         match warehouse.execute_query(&sql).await {
             Ok(result) => {
@@ -530,27 +527,6 @@ pub(crate) async fn run_table_assertions(
         }
     }
     results
-}
-
-/// Short snake_case tag for each `TestType` variant — embedded in check
-/// result details so downstream consumers can distinguish assertion kinds.
-fn test_type_kind(t: &rocky_core::tests::TestType) -> &'static str {
-    use rocky_core::tests::TestType;
-    match t {
-        TestType::NotNull => "not_null",
-        TestType::Unique => "unique",
-        TestType::UniqueExpr { .. } => "unique_expr",
-        TestType::AcceptedValues { .. } => "accepted_values",
-        TestType::Relationships { .. } => "relationships",
-        TestType::Expression { .. } => "expression",
-        TestType::RowCountRange { .. } => "row_count_range",
-        TestType::InRange { .. } => "in_range",
-        TestType::RegexMatch { .. } => "regex_match",
-        TestType::Aggregate { .. } => "aggregate",
-        TestType::Composite { .. } => "composite",
-        TestType::NotInFuture => "not_in_future",
-        TestType::OlderThanNDays { .. } => "older_than_n_days",
-    }
 }
 
 /// Classify an assertion query's result into `(passed, failing_rows)`.

@@ -141,6 +141,13 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
             for msg in msgs {
                 out.push(msg);
             }
+
+            // Warn on check/strategy config a pipeline type won't act on, so
+            // silently-dead config is caught at validate time rather than after
+            // a clean run that never executed the guard.
+            for msg in inert_config_messages(name, pc) {
+                out.push(msg);
+            }
         }
 
         // Validate pipeline dependency graph (depends_on)
@@ -461,6 +468,70 @@ fn validate_adapter(
     }
 
     (ok, msgs)
+}
+
+/// Warnings for check/strategy config a pipeline's runner will not act on.
+/// Driven by [`PipelineConfig::executed_check_kinds`] (the shared source of
+/// truth) so the lint can never claim a check runs that the runner skips.
+fn inert_config_messages(
+    name: &str,
+    pc: &rocky_core::config::PipelineConfig,
+) -> Vec<ValidateMessage> {
+    let mut msgs = Vec::new();
+
+    // Configured checks the runner for this pipeline type never executes.
+    let executed = pc.executed_check_kinds();
+    for kind in pc.checks().configured_explicit_kinds() {
+        if !executed.contains(&kind) {
+            let field = check_kind_field(kind);
+            msgs.push(ValidateMessage {
+                severity: "warn".into(),
+                code: "V034".into(),
+                message: format!(
+                    "pipeline.{name}: checks.{field} is configured but a {} pipeline does not execute it — the check never runs (no-op). Move it to a pipeline type that runs it, or remove it.",
+                    pc.pipeline_type_str()
+                ),
+                file: None,
+                field: Some(format!("pipeline.{name}.checks.{field}")),
+            });
+        }
+    }
+
+    // A replication strategy typo parses cleanly and silently falls back to
+    // full_refresh at run time — surface it instead of letting it ship.
+    if let Some(repl) = pc.as_replication()
+        && !rocky_core::config::RECOGNIZED_REPLICATION_STRATEGIES.contains(&repl.strategy.as_str())
+    {
+        msgs.push(ValidateMessage {
+            severity: "warn".into(),
+            code: "V035".into(),
+            message: format!(
+                "pipeline.{name}: strategy \"{}\" is not a recognized replication strategy and will silently fall back to full_refresh at run time. Recognized: {}.",
+                repl.strategy,
+                rocky_core::config::RECOGNIZED_REPLICATION_STRATEGIES.join(", ")
+            ),
+            file: None,
+            field: Some(format!("pipeline.{name}.strategy")),
+        });
+    }
+
+    msgs
+}
+
+/// The `[checks]` sub-field name for a [`CheckKind`], used to point the
+/// inert-config warning at the offending key.
+fn check_kind_field(kind: rocky_core::checks::CheckKind) -> &'static str {
+    use rocky_core::checks::CheckKind;
+    match kind {
+        CheckKind::RowCount => "row_count",
+        CheckKind::ColumnMatch => "column_match",
+        CheckKind::Freshness => "freshness",
+        CheckKind::NullRate => "null_rate",
+        CheckKind::Custom => "custom",
+        CheckKind::CrossSourceOverlap => "cross_source_overlap",
+        CheckKind::Assertions => "assertions",
+        CheckKind::Anomaly => "anomaly_threshold_pct",
+    }
 }
 
 fn validate_replication_pipeline(
@@ -1202,6 +1273,127 @@ backend = "local"
         assert!(out.adapters[0].ok);
         assert_eq!(out.pipelines.len(), 1);
         assert!(out.pipelines[0].ok);
+    }
+
+    #[test]
+    fn inert_check_on_quality_pipeline_emits_v034() {
+        // A quality pipeline runs only row_count / custom / assertions, so a
+        // configured `freshness` check never executes — V034 must surface it.
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+
+[pipeline.q]
+type = "quality"
+
+[pipeline.q.target]
+adapter = "local"
+
+[[pipeline.q.tables]]
+catalog = "poc"
+schema  = "s"
+table   = "t"
+
+[pipeline.q.checks]
+enabled = true
+freshness = { threshold_seconds = 3600 }
+"#,
+        );
+        assert!(out.valid, "inert config is a warning, not an error");
+        let v034: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V034" && m.severity == "warn")
+            .collect();
+        assert_eq!(v034.len(), 1, "expected one V034: {:?}", out.messages);
+        assert_eq!(
+            v034[0].field.as_deref(),
+            Some("pipeline.q.checks.freshness")
+        );
+    }
+
+    #[test]
+    fn configured_checks_on_replication_do_not_warn() {
+        // Replication executes custom + null_rate (and the rest), so none of
+        // these is inert — guards the runner/lint coupling: if a future change
+        // stops the replication runner executing one of these, this test and
+        // `executed_check_kinds` must move together.
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+
+[pipeline.poc]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "poc"
+schema_template = "demo"
+
+[pipeline.poc.checks]
+enabled = true
+null_rate = { columns = ["a"], threshold = 0.1 }
+
+[[pipeline.poc.checks.custom]]
+name = "has_rows"
+sql = "SELECT COUNT(*) FROM {table}"
+threshold = 1
+"#,
+        );
+        let inert: Vec<_> = out.messages.iter().filter(|m| m.code == "V034").collect();
+        assert!(
+            inert.is_empty(),
+            "replication runs custom + null_rate — expected no V034: {inert:?}"
+        );
+    }
+
+    #[test]
+    fn unrecognized_replication_strategy_emits_v035() {
+        // `time_interval` is not a replication strategy — it parses clean and
+        // silently becomes full_refresh at run time. The lint must catch it.
+        let out = validate_toml(
+            r#"
+[adapter.local]
+type = "duckdb"
+
+[pipeline.poc]
+type = "replication"
+strategy = "time_interval"
+
+[pipeline.poc.source]
+adapter = "local"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+adapter = "local"
+catalog_template = "poc"
+schema_template = "demo"
+"#,
+        );
+        assert!(out.valid, "a strategy typo is a warning, not an error");
+        let v035: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V035" && m.severity == "warn")
+            .collect();
+        assert_eq!(v035.len(), 1, "expected one V035: {:?}", out.messages);
+        assert_eq!(v035[0].field.as_deref(), Some("pipeline.poc.strategy"));
+        assert!(v035[0].message.contains("full_refresh"));
     }
 
     #[test]

@@ -86,6 +86,60 @@ pub enum CheckDetails {
     },
 }
 
+/// The kinds of data-quality check Rocky can emit a [`CheckResult`] for.
+///
+/// Used to reason about which checks a given pipeline type actually executes —
+/// see [`crate::config::PipelineConfig::executed_check_kinds`], the single
+/// source of truth shared by the `rocky validate` inert-config lint and the
+/// `rocky discover` check-name projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckKind {
+    RowCount,
+    ColumnMatch,
+    Freshness,
+    NullRate,
+    Custom,
+    CrossSourceOverlap,
+    Assertions,
+    Anomaly,
+}
+
+/// The `CheckResult.name` for a cross-source-overlap check on a
+/// `(source_type, table)` sibling group. Shared by the replication runner
+/// (emit time, `run.rs`) and `rocky discover` (declare time) so the declared
+/// name byte-matches the emitted name.
+pub fn cross_source_overlap_name(source_type: &str, table: &str) -> String {
+    format!("cross_source_overlap:{source_type}.{table}")
+}
+
+/// The `(source_type, table)` keys with ≥2 sibling targets — the groups a
+/// cross-source-overlap check actually runs against, sorted for determinism
+/// (a single target cannot overlap with itself). Shared by the runner and
+/// discover so the declared overlap-name SET is computed by one rule.
+pub fn cross_source_overlap_groups<I>(pairs: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut counts: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+    for pair in pairs {
+        *counts.entry(pair).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .filter(|(_, n)| *n >= 2)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// The `CheckResult.name` for a null-rate check on `column` — per-column so
+/// multiple configured columns produce distinct, individually-addressable
+/// results (a single static name would collide across columns). Shared by the
+/// replication runner and `rocky discover`.
+pub fn null_rate_check_name(column: &str) -> String {
+    format!("null_rate:{column}")
+}
+
 /// Generates a batched null rate query using the given dialect's TABLESAMPLE syntax.
 /// Falls back to a full table scan if the dialect does not support TABLESAMPLE.
 pub fn generate_null_rate_sql(
@@ -337,6 +391,34 @@ mod tests {
     use crate::traits::{AdapterError, AdapterResult, SqlDialect};
     use rocky_ir::ColumnSelection;
     use rocky_ir::MetadataColumn;
+
+    #[test]
+    fn cross_source_overlap_groups_keeps_only_siblings_sorted() {
+        let pairs = vec![
+            ("duckdb".to_string(), "orders".to_string()),
+            ("duckdb".to_string(), "orders".to_string()),
+            ("duckdb".to_string(), "lonely".to_string()),
+            ("shopify".to_string(), "orders".to_string()),
+            ("shopify".to_string(), "orders".to_string()),
+        ];
+        // Only (source_type, table) with ≥2 members survive, sorted.
+        assert_eq!(
+            cross_source_overlap_groups(pairs),
+            vec![
+                ("duckdb".to_string(), "orders".to_string()),
+                ("shopify".to_string(), "orders".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_check_name_formats() {
+        assert_eq!(
+            cross_source_overlap_name("duckdb", "orders"),
+            "cross_source_overlap:duckdb.orders"
+        );
+        assert_eq!(null_rate_check_name("amount"), "null_rate:amount");
+    }
 
     /// Test dialect that mirrors Databricks behavior for rocky-core tests.
     struct TestDialect;

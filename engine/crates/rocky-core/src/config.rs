@@ -944,6 +944,48 @@ fn default_fail_on_error() -> bool {
     true
 }
 
+/// Replication `strategy` values the runner recognizes. Anything else parses
+/// cleanly but silently falls back to `full_refresh` at run time, so the
+/// `rocky validate` lint warns on unrecognized values (V035).
+///
+/// Keep this in lockstep with `build_replication_strategy_with_override` in
+/// `rocky-cli` (`commands/run.rs`) — a drift test there pins the relationship.
+pub const RECOGNIZED_REPLICATION_STRATEGIES: &[&str] = &[
+    "incremental",
+    "merge",
+    "view",
+    "materialized_view",
+    "dynamic_table",
+    "full_refresh",
+];
+
+impl ChecksConfig {
+    /// The check kinds a user has *explicitly opted into* — an `Option` is
+    /// `Some` or a `Vec` is non-empty. Toggle-style checks (`row_count`,
+    /// `column_match`) and the always-defaulted `anomaly_threshold_pct` are
+    /// deliberately excluded so the inert-config lint never fires on a default.
+    pub fn configured_explicit_kinds(&self) -> Vec<crate::checks::CheckKind> {
+        use crate::checks::CheckKind;
+        let mut kinds = Vec::new();
+        if self.freshness.is_some() {
+            kinds.push(CheckKind::Freshness);
+        }
+        if self.null_rate.is_some() {
+            kinds.push(CheckKind::NullRate);
+        }
+        if !self.custom.is_empty() {
+            kinds.push(CheckKind::Custom);
+        }
+        if self.cross_source_overlap.is_some() {
+            kinds.push(CheckKind::CrossSourceOverlap);
+        }
+        if !self.assertions.is_empty() {
+            kinds.push(CheckKind::Assertions);
+        }
+        kinds
+    }
+}
+
 /// Per-check-kind toggle that accepts either a plain boolean (legacy form)
 /// or a struct with `enabled` + `severity`.
 ///
@@ -1024,6 +1066,22 @@ pub struct QualityAssertion {
     /// type-specific fields like `values` / `to_table`).
     #[serde(flatten)]
     pub test: crate::tests::TestDecl,
+}
+
+impl QualityAssertion {
+    /// The `CheckResult.name` this assertion emits — the explicit `name` if
+    /// set, else a synthesized `"{kind}:{column}"`. Shared by the runners (via
+    /// `run_table_assertions`) and the `rocky discover` check-name projection
+    /// so the declared name byte-matches the emitted one.
+    pub fn resolved_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                crate::tests::test_type_kind(&self.test.test_type),
+                self.test.column.as_deref().unwrap_or("-")
+            )
+        })
+    }
 }
 
 /// How to handle rows that fail error-severity row-level assertions.
@@ -3431,6 +3489,23 @@ impl PipelineConfig {
         }
     }
 
+    /// The check kinds the `rocky run` runner for this pipeline type actually
+    /// executes — the single source of truth shared by the `rocky validate`
+    /// inert-config lint and the `rocky discover` check-name projection.
+    ///
+    /// Keep this in lockstep with the runners in `rocky-cli`: `commands/run.rs`
+    /// (replication) and `commands/run_local.rs` (`run_quality`).
+    /// Transformation, snapshot, and load pipelines run no pipeline-level
+    /// checks today, so they report an empty set.
+    pub fn executed_check_kinds(&self) -> &'static [crate::checks::CheckKind] {
+        use crate::checks::CheckKind::{Assertions, Custom, RowCount};
+        match self {
+            Self::Replication(_) => ReplicationPipelineConfig::EXECUTED_CHECK_KINDS,
+            Self::Quality(_) => &[RowCount, Custom, Assertions],
+            Self::Transformation(_) | Self::Snapshot(_) | Self::Load(_) => &[],
+        }
+    }
+
     /// Returns the target adapter name regardless of variant.
     pub fn target_adapter(&self) -> &str {
         match self {
@@ -4938,6 +5013,22 @@ fn is_bare_pipeline(val: &toml::Value) -> bool {
 }
 
 impl ReplicationPipelineConfig {
+    /// Check kinds the replication runner (`rocky-cli` `run.rs`) executes — the
+    /// single source of truth shared by [`PipelineConfig::executed_check_kinds`],
+    /// the `rocky validate` inert-config lint, and the `rocky discover`
+    /// check-name projection (`rocky discover` is replication-only). Keep in
+    /// lockstep with the check-execution blocks in `run.rs`.
+    pub const EXECUTED_CHECK_KINDS: &'static [crate::checks::CheckKind] = &[
+        crate::checks::CheckKind::RowCount,
+        crate::checks::CheckKind::ColumnMatch,
+        crate::checks::CheckKind::Freshness,
+        crate::checks::CheckKind::NullRate,
+        crate::checks::CheckKind::Custom,
+        crate::checks::CheckKind::CrossSourceOverlap,
+        crate::checks::CheckKind::Assertions,
+        crate::checks::CheckKind::Anomaly,
+    ];
+
     /// Builds a SchemaPattern from the source configuration.
     pub fn schema_pattern(&self) -> Result<SchemaPattern, crate::schema::SchemaError> {
         self.source.schema_pattern.to_schema_pattern()
@@ -7829,6 +7920,39 @@ concurrency = "turbo"
         let fixed = ConcurrencyMode::Fixed(16);
         let json = serde_json::to_string(&fixed).unwrap();
         assert_eq!(json, "16");
+    }
+
+    #[test]
+    fn configured_explicit_kinds_reports_only_opt_in_checks() {
+        use crate::checks::CheckKind;
+
+        // An empty/default checks block opts into nothing — row_count and
+        // column_match toggles and the always-defaulted anomaly threshold are
+        // not "explicitly configured", so the inert lint never fires on them.
+        assert!(
+            ChecksConfig::default()
+                .configured_explicit_kinds()
+                .is_empty()
+        );
+
+        let cfg: ChecksConfig = toml::from_str(
+            r#"
+null_rate = { columns = ["a"], threshold = 0.1 }
+freshness = { threshold_seconds = 3600 }
+
+[[custom]]
+name = "c"
+sql = "SELECT 1"
+threshold = 1
+"#,
+        )
+        .unwrap();
+        let kinds = cfg.configured_explicit_kinds();
+        assert!(kinds.contains(&CheckKind::NullRate));
+        assert!(kinds.contains(&CheckKind::Freshness));
+        assert!(kinds.contains(&CheckKind::Custom));
+        assert!(!kinds.contains(&CheckKind::RowCount));
+        assert!(!kinds.contains(&CheckKind::Anomaly));
     }
 
     // -- Budget ------------------------------------------------------------
