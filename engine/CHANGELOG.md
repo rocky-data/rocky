@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.54.0] - 2026-06-23
+
+### Added
+
+- **Replication pipelines now execute `[[checks.custom]]` and `null_rate` checks.** Custom checks previously ran only on quality pipelines and `null_rate` ran nowhere, so a replication pipeline can now enforce inline custom-SQL and per-column null-rate guards without standing up a separate quality pipeline. Null-rate results are named per column (`null_rate:<column>`). (#955)
+- **`rocky discover` projects the resolved check names a run will emit** under `checks.configured_checks`, so an orchestrator can pre-declare matching checks without re-reading `rocky.toml`. The projected names byte-match what the runner emits. (#955)
+
+### Changed
+
+- **`rocky validate` warns on data-quality config that won't run.** `V034` flags a configured check a pipeline type does not execute (for example `null_rate` on a quality pipeline); `V035` flags a replication `strategy` — at the pipeline level or in a `[[table_overrides]]` entry — that isn't recognized and would silently fall back to `full_refresh`. (#955, #956)
+
+### Fixed
+
+- **Null-rate checks no longer report a false pass on an unparseable count.** A sampled/null count that can't be parsed is skipped with a warning rather than treated as zero; the count parser also accepts integer aggregates returned as JSON floats. (#956)
+
 ## [1.53.0] - 2026-06-22
 
 ### Fixed

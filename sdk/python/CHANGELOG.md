@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-06-23
+
+### Added
+
+- `ChecksConfig.configured_checks` — the resolved per-model check names `rocky discover` now projects, typed as `ResolvedCheckName` (`name`, `kind`, `candidate`). Regenerated `types_generated/` for the engine 1.54.0 discover schema. Consumed by `dagster-rocky`'s `surface_configured_checks`. Additive — existing parses are unaffected. (#955)
+
 ## [0.1.3] — 2026-06-22
 
 ### Changed
