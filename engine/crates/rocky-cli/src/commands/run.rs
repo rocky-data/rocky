@@ -3241,6 +3241,148 @@ pub async fn run(
         }
     }
 
+    // Custom SQL checks on each replication target. Ported from the quality
+    // runner so `[[checks.custom]]` fires at replication time too. Driven by
+    // `assertion_targets` (every materialized table); surfaced advisorily like
+    // the other replication checks — the run reports pass/fail in the JSON
+    // CheckResult + severity rather than bailing (the data has already landed).
+    if !pipeline.checks.custom.is_empty() {
+        let dialect = shared_warehouse.dialect();
+        for (tref, asset_key) in &assertion_targets {
+            let full = match dialect.format_table_ref(&tref.catalog, &tref.schema, &tref.table) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        table = %tref.full_name(),
+                        error = %e,
+                        "custom check table ref formatting failed — skipping"
+                    );
+                    continue;
+                }
+            };
+            for custom in &pipeline.checks.custom {
+                let sql = custom.sql.replace("{table}", &full);
+                let severity = custom.severity;
+                let check = match shared_warehouse.execute_query(&sql).await {
+                    Ok(result) => {
+                        let result_value: u64 = result
+                            .rows
+                            .first()
+                            .and_then(|r| r.first())
+                            .and_then(|v| {
+                                v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                            })
+                            .unwrap_or(0);
+                        checks::CheckResult {
+                            name: custom.name.clone(),
+                            passed: result_value >= custom.threshold,
+                            severity,
+                            details: checks::CheckDetails::Custom {
+                                query: sql,
+                                result_value,
+                                threshold: custom.threshold,
+                            },
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, check = custom.name.as_str(), "custom check query failed");
+                        checks::CheckResult {
+                            name: custom.name.clone(),
+                            passed: false,
+                            severity,
+                            details: checks::CheckDetails::Custom {
+                                query: sql,
+                                result_value: 0,
+                                threshold: custom.threshold,
+                            },
+                        }
+                    }
+                };
+                pending_checks
+                    .entry(tref.full_name())
+                    .or_insert_with(|| PendingCheck {
+                        asset_key: asset_key.clone(),
+                        checks: Vec::new(),
+                    })
+                    .checks
+                    .push(check);
+            }
+        }
+    }
+
+    // Null-rate checks: sample each configured column and flag when the null
+    // fraction exceeds the threshold. `generate_null_rate_sql` returns one row
+    // per column `(col, nulls, sampled)`; the rate is computed per row. Like the
+    // other replication checks this is advisory — the configured severity rides
+    // into the JSON CheckResult and the orchestrator decides.
+    if let Some(ref null_rate_cfg) = pipeline.checks.null_rate {
+        let dialect = shared_warehouse.dialect();
+        for (tref, asset_key) in &assertion_targets {
+            let sql = match checks::generate_null_rate_sql(
+                tref,
+                &null_rate_cfg.columns,
+                null_rate_cfg.sample_percent,
+                dialect,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        table = %tref.full_name(),
+                        error = %e,
+                        "null_rate SQL generation failed — skipping"
+                    );
+                    continue;
+                }
+            };
+            match shared_warehouse.execute_query(&sql).await {
+                Ok(result) => {
+                    for row in &result.rows {
+                        let col = row
+                            .first()
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let nulls = row
+                            .get(1)
+                            .and_then(|v| {
+                                v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                            })
+                            .unwrap_or(0);
+                        let sampled = row
+                            .get(2)
+                            .and_then(|v| {
+                                v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                            })
+                            .unwrap_or(0);
+                        let rate = if sampled == 0 {
+                            0.0
+                        } else {
+                            nulls as f64 / sampled as f64
+                        };
+                        let mut check =
+                            checks::check_null_rate(&col, rate, null_rate_cfg.threshold);
+                        check.severity = null_rate_cfg.severity;
+                        // Per-column name so multiple columns don't collide as
+                        // identically-named "null_rate" results — shared with
+                        // discover's projection so the names byte-match.
+                        check.name = checks::null_rate_check_name(&col);
+                        pending_checks
+                            .entry(tref.full_name())
+                            .or_insert_with(|| PendingCheck {
+                                asset_key: asset_key.clone(),
+                                checks: Vec::new(),
+                            })
+                            .checks
+                            .push(check);
+                    }
+                }
+                Err(e) => {
+                    warn!(table = %tref.full_name(), error = %e, "null_rate query failed — skipping");
+                }
+            }
+        }
+    }
+
     // Cross-source overlap — flag a business key shared across SIBLING targets:
     // tables with the same source type + table name that landed in more than
     // one target schema (the hierarchy/tenant fan-out that gets unioned
@@ -3254,25 +3396,27 @@ pub async fn run(
         match overlap_cfg.resolved_key_exprs() {
             Ok(key_exprs) => {
                 // (source_type, table) -> sibling members (target ref, asset key).
+                // The ≥2 grouping and the result name come from shared helpers
+                // in rocky-core so `rocky discover` can declare the exact same
+                // overlap names this runner emits (byte-match guarantee).
                 type SiblingGroups = HashMap<(String, String), Vec<(TableRef, Vec<String>)>>;
                 let mut groups: SiblingGroups = HashMap::new();
+                let mut pairs: Vec<(String, String)> = Vec::new();
                 for (tref, asset_key) in &assertion_targets {
                     let source_type = asset_key.first().cloned().unwrap_or_default();
+                    let key = (source_type, tref.table.clone());
+                    pairs.push(key.clone());
                     groups
-                        .entry((source_type, tref.table.clone()))
+                        .entry(key)
                         .or_default()
                         .push((tref.clone(), asset_key.clone()));
                 }
-                // Deterministic order for stable output.
-                let mut group_keys: Vec<&(String, String)> = groups.keys().collect();
-                group_keys.sort();
+                // Qualifying (source_type, table) keys (≥2 siblings), sorted.
+                let qualifying = checks::cross_source_overlap_groups(pairs);
 
                 let dialect = shared_warehouse.dialect();
-                for gk in group_keys {
+                for gk in &qualifying {
                     let members = &groups[gk];
-                    if members.len() < 2 {
-                        continue; // a single target cannot overlap with itself
-                    }
                     let (source_type, table) = gk;
                     let siblings: Vec<TableRef> =
                         members.iter().map(|(t, _)| t.clone()).collect();
@@ -3285,7 +3429,7 @@ pub async fn run(
                             continue;
                         }
                     };
-                    let name = format!("cross_source_overlap:{source_type}.{table}");
+                    let name = checks::cross_source_overlap_name(source_type, table);
                     match shared_warehouse.execute_query(&sql).await {
                         Ok(result) => {
                             let overlap_count = result.rows.len() as u64;
@@ -5940,6 +6084,11 @@ fn build_replication_strategy_with_override(
         .as_deref()
         .unwrap_or(pipeline.timestamp_column.as_str());
 
+    // The recognized arms below must stay in lockstep with
+    // `rocky_core::config::RECOGNIZED_REPLICATION_STRATEGIES`, which the
+    // `rocky validate` V035 lint uses to flag a strategy that silently falls
+    // through the `_` arm to full_refresh. The
+    // `recognized_replication_strategies_match_builder` test pins the relationship.
     match effective_strategy {
         "incremental" => Ok(MaterializationStrategy::Incremental {
             timestamp_column: effective_timestamp.to_string(),
@@ -8211,6 +8360,54 @@ merge_keys_fallback = ["fallback_only"]
         let pipeline = parse_pipeline(r#"strategy = "totally_made_up""#);
         let strategy = build_replication_strategy(&pipeline).expect("strategy build");
         assert!(matches!(strategy, MaterializationStrategy::FullRefresh));
+    }
+
+    #[test]
+    fn recognized_replication_strategies_match_builder() {
+        use rocky_core::config::RECOGNIZED_REPLICATION_STRATEGIES as RECOGNIZED;
+
+        // The validate lint (V035) trusts this const to decide whether a
+        // strategy string silently falls back to full_refresh. Pin it to the
+        // builder so the two can never drift.
+        assert_eq!(
+            RECOGNIZED,
+            &[
+                "incremental",
+                "merge",
+                "view",
+                "materialized_view",
+                "dynamic_table",
+                "full_refresh"
+            ],
+            "RECOGNIZED_REPLICATION_STRATEGIES changed — update \
+             build_replication_strategy_with_override and this guard together"
+        );
+
+        for s in RECOGNIZED {
+            let toml = if *s == "merge" {
+                format!("strategy = \"{s}\"\nmerge_keys = [\"id\"]\n")
+            } else {
+                format!("strategy = \"{s}\"\n")
+            };
+            let pipeline = parse_pipeline(&toml);
+            match (*s, build_replication_strategy(&pipeline)) {
+                ("full_refresh", Ok(MaterializationStrategy::FullRefresh)) => {}
+                ("dynamic_table", Err(_)) => {}
+                (_, Ok(MaterializationStrategy::FullRefresh)) => {
+                    panic!("recognized strategy {s} silently fell back to full_refresh")
+                }
+                (_, Ok(_)) => {}
+                (other, res) => panic!("unexpected result for {other}: {res:?}"),
+            }
+        }
+
+        // A value the lint must flag: not recognized, silently full_refresh.
+        let bogus = parse_pipeline(r#"strategy = "time_interval""#);
+        assert!(matches!(
+            build_replication_strategy(&bogus),
+            Ok(MaterializationStrategy::FullRefresh)
+        ));
+        assert!(!RECOGNIZED.contains(&"time_interval"));
     }
 
     // ----- PR-B3: per-table override application -----

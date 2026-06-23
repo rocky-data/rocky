@@ -46,7 +46,25 @@ export interface DiscoverOutput {
  * This is intentionally a thin projection of `rocky_core::config::ChecksConfig` — only the fields downstream orchestrators currently consume are exposed. Add fields as new integrations need them.
  */
 export interface ChecksConfigOutput {
+  /**
+   * Resolved per-model check names the pipeline will emit as `CheckResult.name` at run time, keyed by unqualified table/model name. Only the NON-default checks are listed — the four defaults (row_count/column_match/freshness/anomaly) are well-known and pre-declared by consumers. A consumer (e.g. Dagster) declares an asset-check spec per name so the spec name byte-matches the emitted result. Empty (and omitted) when no non-default checks are configured.
+   */
+  configured_checks?: {
+    [k: string]: ResolvedCheckNameOutput[];
+  };
   freshness?: FreshnessConfigOutput | null;
+  [k: string]: unknown;
+}
+/**
+ * A resolved check name `rocky discover` projects so a consumer can pre-declare a matching check spec. `name` byte-matches the `CheckResult.name` the runner emits at run time. `candidate` is `true` for names whose existence depends on runtime-discovered siblings (`cross_source_overlap`) and so may not be emitted on every run.
+ */
+export interface ResolvedCheckNameOutput {
+  candidate?: boolean;
+  /**
+   * The check-kind tag: `custom` | `assertion` | `null_rate` | `cross_source_overlap`.
+   */
+  kind: string;
+  name: string;
   [k: string]: unknown;
 }
 /**

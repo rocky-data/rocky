@@ -339,6 +339,7 @@ def _build_defs_with_flags(
     *,
     surface_compliance: bool = False,
     surface_retention_status: bool = False,
+    surface_configured_checks: bool = False,
 ) -> dg.Definitions:
     """Same as ``_build_defs`` but with governance opt-ins on the component."""
     state_file = tmp_path / "state.json"
@@ -347,6 +348,7 @@ def _build_defs_with_flags(
         config_path="rocky.toml",
         surface_compliance=surface_compliance,
         surface_retention_status=surface_retention_status,
+        surface_configured_checks=surface_configured_checks,
     )
     return component.build_defs_from_state(context=None, state_path=state_file)
 
@@ -416,6 +418,98 @@ def test_compliance_check_spec_absent_by_default(discover_json: str, tmp_path: P
         if isinstance(asset_def, dg.AssetsDefinition):
             names = {cs.name for cs in asset_def.check_specs}
             assert "compliance_exception" not in names
+
+
+def _check_specs_for_table(defs: dg.Definitions, table: str) -> set[str]:
+    return {
+        cs.name
+        for asset_def in defs.assets or []
+        if isinstance(asset_def, dg.AssetsDefinition)
+        for cs in asset_def.check_specs
+        if cs.asset_key.path[-1] == table
+    }
+
+
+def test_configured_checks_predeclared_when_opt_in(discover_json: str, tmp_path: Path):
+    """``surface_configured_checks=True`` pre-declares one ``AssetCheckSpec``
+    per engine-resolved non-default check name from
+    ``discover.checks.configured_checks``, using the names VERBATIM (so they
+    byte-match the ``CheckResult.name`` the engine emits) on the matching
+    asset only."""
+    d = json.loads(discover_json)
+    d.setdefault("checks", {})["configured_checks"] = {
+        "orders": [
+            {"name": "orders_have_rows", "kind": "custom"},
+            {"name": "null_rate:amount", "kind": "null_rate"},
+            {
+                "name": "cross_source_overlap:fivetran.orders",
+                "kind": "cross_source_overlap",
+                "candidate": True,
+            },
+        ]
+    }
+    defs = _build_defs_with_flags(json.dumps(d), tmp_path, surface_configured_checks=True)
+
+    # Names are sanitized to Dagster-valid form (``:`` / ``.`` -> ``_``); the
+    # same sanitizer runs in _emit_results so the run-time result still lands.
+    orders_specs = _check_specs_for_table(defs, "orders")
+    assert {
+        "orders_have_rows",
+        "null_rate_amount",
+        "cross_source_overlap_fivetran_orders",
+    } <= orders_specs
+    # The names attach to the matching asset only, not to other tables.
+    assert "orders_have_rows" not in _check_specs_for_table(defs, "payments")
+
+
+def test_configured_checks_absent_by_default(discover_json: str, tmp_path: Path):
+    """Default ``surface_configured_checks=False`` declares no configured-check
+    specs even when discover carries them — zero behaviour change."""
+    d = json.loads(discover_json)
+    d.setdefault("checks", {})["configured_checks"] = {
+        "orders": [{"name": "orders_have_rows", "kind": "custom"}]
+    }
+    defs = _build_defs_with_flags(json.dumps(d), tmp_path)  # flag off
+    assert "orders_have_rows" not in _check_specs_for_table(defs, "orders")
+
+
+def test_configured_check_result_surfaces_after_sanitize(
+    discover_json: str, run_json: str, tmp_path: Path
+):
+    """End-to-end: a configured check whose engine name contains ``:``
+    (``null_rate:amount``) is pre-declared (sanitized to ``null_rate_amount``)
+    AND its run-time result lands as an ``AssetCheckResult`` — the same
+    sanitizer on both sides keeps spec and result matched instead of dropped by
+    ``_emit_results``."""
+    d = json.loads(discover_json)
+    d.setdefault("checks", {})["configured_checks"] = {
+        "orders": [{"name": "null_rate:amount", "kind": "null_rate"}]
+    }
+    defs = _build_defs_with_flags(json.dumps(d), tmp_path, surface_configured_checks=True)
+
+    orders_key = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"])
+    run = json.loads(run_json)
+    for table_check in run.get("check_results", []):
+        if table_check["asset_key"] == list(orders_key.path):
+            table_check["checks"].append(
+                {
+                    "name": "null_rate:amount",
+                    "passed": True,
+                    "column": "amount",
+                    "null_rate": 0.0,
+                    "threshold": 0.1,
+                }
+            )
+    run_result = RunResult.model_validate(run)
+
+    exec_result = _materialize_with_governance(defs, run_result, [orders_key])
+    assert exec_result.success
+    check_names = {
+        e.event_specific_data.check_name
+        for e in exec_result.all_events
+        if e.event_type_value == "ASSET_CHECK_EVALUATION"
+    }
+    assert "null_rate_amount" in check_names, check_names
 
 
 def test_governance_events_emitted_when_both_flags_true(

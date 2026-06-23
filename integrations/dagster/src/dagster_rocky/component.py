@@ -51,9 +51,11 @@ from .checks import check_metadata
 from .column_lineage import build_column_lineage
 from .contracts import (
     ContractRules,
+    configured_check_specs_for_model,
     contract_check_results_from_diagnostics,
     contract_check_specs_for_model,
     discover_contract_rules,
+    sanitize_check_name,
 )
 from .derived_models import (
     ModelGroup,
@@ -513,6 +515,19 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     #: :func:`_emit_placeholder_checks`. Default ``False`` preserves zero
     #: behaviour change.
     surface_compliance: bool = False
+    #: When ``True``, pre-declares one :class:`dg.AssetCheckSpec` per
+    #: engine-resolved *configured* (non-default) check name, per model, so the
+    #: Dagster UI surfaces assertions / cross_source_overlap / custom /
+    #: null_rate checks before any run — not just the four defaults. Names come
+    #: VERBATIM from ``discover.checks.configured_checks`` (the engine's
+    #: resolved-name projection); they are never re-derived in Python, so each
+    #: spec name byte-matches the ``CheckResult.name`` the engine emits and the
+    #: result lands against the spec instead of being dropped by
+    #: :func:`_emit_results`. Results flow through the existing emit path
+    #: unchanged; a configured check not produced by a given run gets a passing
+    #: placeholder via :func:`_emit_placeholder_checks`. Default ``False``
+    #: preserves zero behaviour change.
+    surface_configured_checks: bool = False
     #: When ``True``, the multi-asset invokes
     #: :meth:`RockyResource.retention_status` once per materialization batch
     #: and emits one :class:`dg.AssetObservation` per
@@ -1268,10 +1283,22 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             else {}
         )
 
+        # Configured non-default check names per model, sourced from the
+        # engine's discover projection. Names are used VERBATIM (never
+        # re-derived in Python) so the pre-declared spec name byte-matches the
+        # CheckResult.name the engine emits — see surface_configured_checks.
+        configured_checks_by_model: dict[str, list[str]] = {}
+        if self.surface_configured_checks and discover.checks is not None:
+            configured_checks_by_model = {
+                table: [c.name for c in names]
+                for table, names in discover.checks.configured_checks.items()
+            }
+
         check_specs = _build_check_specs(
             groups,
             contract_rules_by_model,
             surface_compliance=self.surface_compliance,
+            configured_checks_by_model=configured_checks_by_model,
             partitions_def=tenant_partitions_def,
         )
 
@@ -1991,6 +2018,7 @@ def _build_check_specs(
     contract_rules_by_model: dict[str, ContractRules] | None = None,
     *,
     surface_compliance: bool = False,
+    configured_checks_by_model: dict[str, list[str]] | None = None,
     partitions_def: dg.PartitionsDefinition | None = None,
 ) -> list[dg.AssetCheckSpec]:
     """Pre-declare check specs for every asset in every group.
@@ -2081,6 +2109,16 @@ def _build_check_specs(
                     spec.key, rules, partitions_def=partitions_def
                 ):
                     _add(contract_spec)
+
+            # Configured non-default checks (opt-in via surface_configured_checks).
+            # Names come VERBATIM from the engine's discover projection so the
+            # spec name byte-matches the CheckResult.name the engine emits.
+            configured_names = (configured_checks_by_model or {}).get(table_name)
+            if configured_names:
+                for configured_spec in configured_check_specs_for_model(
+                    spec.key, configured_names, partitions_def=partitions_def
+                ):
+                    _add(configured_spec)
 
     return specs
 
@@ -2898,21 +2936,26 @@ def _emit_results(
         if asset_key not in selected_keys:
             continue
         for check in table_check.checks:
-            spec_key = (asset_key, check.name)
+            # Sanitize the engine name (it may carry ``:`` / ``.`` separators,
+            # e.g. ``null_rate:amount``) to the Dagster-valid form used when the
+            # spec was declared, so configured checks match instead of being
+            # dropped. Identity for the default/contract/compliance names.
+            check_name = sanitize_check_name(check.name)
+            spec_key = (asset_key, check_name)
             if spec_key not in declared_checks:
                 continue
             if spec_key in yielded_checks:
                 _log.debug(
                     "Skipping duplicate AssetCheckResult emission: %s for %s "
                     "(already yielded earlier in this op)",
-                    check.name,
+                    check_name,
                     asset_key,
                 )
                 continue
             yielded_checks.add(spec_key)
             yield dg.AssetCheckResult(
                 asset_key=asset_key,
-                check_name=check.name,
+                check_name=check_name,
                 passed=check.passed,
                 metadata=check_metadata(check),
             )

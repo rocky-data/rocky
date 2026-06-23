@@ -138,6 +138,30 @@ pub struct CollisionCandidateOutput {
 pub struct ChecksConfigOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<FreshnessConfigOutput>,
+    /// Resolved per-model check names the pipeline will emit as
+    /// `CheckResult.name` at run time, keyed by unqualified table/model name.
+    /// Only the NON-default checks are listed — the four defaults
+    /// (row_count/column_match/freshness/anomaly) are well-known and
+    /// pre-declared by consumers. A consumer (e.g. Dagster) declares an
+    /// asset-check spec per name so the spec name byte-matches the emitted
+    /// result. Empty (and omitted) when no non-default checks are configured.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub configured_checks: BTreeMap<String, Vec<ResolvedCheckNameOutput>>,
+}
+
+/// A resolved check name `rocky discover` projects so a consumer can
+/// pre-declare a matching check spec. `name` byte-matches the
+/// `CheckResult.name` the runner emits at run time. `candidate` is `true` for
+/// names whose existence depends on runtime-discovered siblings
+/// (`cross_source_overlap`) and so may not be emitted on every run.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ResolvedCheckNameOutput {
+    pub name: String,
+    /// The check-kind tag: `custom` | `assertion` | `null_rate` |
+    /// `cross_source_overlap`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub candidate: bool,
 }
 
 /// Freshness check configuration projected into the discover output.
@@ -3784,14 +3808,214 @@ impl DiscoverOutput {
 
 impl ChecksConfigOutput {
     /// Project the engine `ChecksConfig` into its CLI output shape.
-    /// Returns `None` when nothing freshness-related is configured (the only
-    /// field currently surfaced); add more conditions here as fields are added.
-    pub fn from_engine(cfg: &rocky_core::config::ChecksConfig) -> Option<Self> {
+    ///
+    /// `executed_kinds` is the set of check kinds the pipeline type actually
+    /// runs (see `PipelineConfig::executed_check_kinds`) — names are projected
+    /// only for kinds the runner will execute, so discover never advertises a
+    /// check that won't produce a result. `sources` supplies the
+    /// `(source_type, table)` pairs the projection (and the cross-source
+    /// overlap grouping) needs. Returns `None` when nothing is surfaced.
+    pub fn from_engine(
+        cfg: &rocky_core::config::ChecksConfig,
+        executed_kinds: &[rocky_core::checks::CheckKind],
+        sources: &[SourceOutput],
+    ) -> Option<Self> {
+        use rocky_core::checks::CheckKind;
+
         let freshness = cfg.freshness.as_ref().map(|f| FreshnessConfigOutput {
             threshold_seconds: f.threshold_seconds,
         });
-        freshness.as_ref()?;
-        Some(ChecksConfigOutput { freshness })
+
+        let runs = |k: CheckKind| executed_kinds.contains(&k);
+        let mut configured_checks: BTreeMap<String, Vec<ResolvedCheckNameOutput>> = BTreeMap::new();
+
+        // (source_type, table) pairs across discovered sources.
+        let pairs: Vec<(String, String)> = sources
+            .iter()
+            .flat_map(|s| {
+                s.tables
+                    .iter()
+                    .map(move |t| (s.source_type.clone(), t.name.clone()))
+            })
+            .collect();
+        let unique_tables: std::collections::BTreeSet<&str> =
+            pairs.iter().map(|(_, t)| t.as_str()).collect();
+
+        // Custom checks run against every materialized table.
+        if runs(CheckKind::Custom) {
+            for &table in &unique_tables {
+                for custom in &cfg.custom {
+                    configured_checks
+                        .entry(table.to_string())
+                        .or_default()
+                        .push(ResolvedCheckNameOutput {
+                            name: custom.name.clone(),
+                            kind: "custom".into(),
+                            candidate: false,
+                        });
+                }
+            }
+        }
+
+        // Null-rate: one result per configured column, per table.
+        if runs(CheckKind::NullRate)
+            && let Some(nr) = cfg.null_rate.as_ref()
+        {
+            for &table in &unique_tables {
+                for col in &nr.columns {
+                    configured_checks
+                        .entry(table.to_string())
+                        .or_default()
+                        .push(ResolvedCheckNameOutput {
+                            name: rocky_core::checks::null_rate_check_name(col),
+                            kind: "null_rate".into(),
+                            candidate: false,
+                        });
+                }
+            }
+        }
+
+        // Assertions attach to their specific target table.
+        if runs(CheckKind::Assertions) {
+            for assertion in &cfg.assertions {
+                configured_checks
+                    .entry(assertion.table.clone())
+                    .or_default()
+                    .push(ResolvedCheckNameOutput {
+                        name: assertion.resolved_name(),
+                        kind: "assertion".into(),
+                        candidate: false,
+                    });
+            }
+        }
+
+        // Cross-source overlap: candidate names for ≥2 (source_type, table)
+        // groups — marked `candidate` because the actual set depends on
+        // runtime-discovered siblings, which may differ from what discover sees.
+        if runs(CheckKind::CrossSourceOverlap) && cfg.cross_source_overlap.is_some() {
+            for (source_type, table) in
+                rocky_core::checks::cross_source_overlap_groups(pairs.iter().cloned())
+            {
+                configured_checks
+                    .entry(table.clone())
+                    .or_default()
+                    .push(ResolvedCheckNameOutput {
+                        name: rocky_core::checks::cross_source_overlap_name(&source_type, &table),
+                        kind: "cross_source_overlap".into(),
+                        candidate: true,
+                    });
+            }
+        }
+
+        // Dedup identical names per table (e.g. a custom check on a table name
+        // that appears under multiple sources), preserving declaration order.
+        for names in configured_checks.values_mut() {
+            let mut seen = std::collections::HashSet::new();
+            names.retain(|n| seen.insert(n.name.clone()));
+        }
+
+        if freshness.is_none() && configured_checks.is_empty() {
+            return None;
+        }
+        Some(ChecksConfigOutput {
+            freshness,
+            configured_checks,
+        })
+    }
+}
+
+#[cfg(test)]
+mod checks_config_projection_tests {
+    use super::*;
+    use rocky_core::checks::CheckKind;
+
+    fn source(source_type: &str, table: &str) -> SourceOutput {
+        SourceOutput {
+            id: format!("{source_type}.{table}"),
+            components: IndexMap::new(),
+            source_type: source_type.to_string(),
+            last_sync_at: None,
+            tables: vec![TableOutput {
+                name: table.to_string(),
+                row_count: None,
+            }],
+            metadata: IndexMap::new(),
+        }
+    }
+
+    fn checks_cfg() -> rocky_core::config::ChecksConfig {
+        toml::from_str(
+            r#"
+null_rate = { columns = ["amount"], threshold = 0.1 }
+cross_source_overlap = { keys = ["id"] }
+
+[[custom]]
+name = "has_rows"
+sql = "SELECT COUNT(*) FROM {table}"
+threshold = 1
+
+[[assertions]]
+name = "id_not_null"
+table = "orders"
+type = "not_null"
+column = "id"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn replication_projects_all_kinds_with_overlap_marked_candidate() {
+        // Two sources sharing (source_type, table) form an overlap sibling group.
+        let sources = vec![source("duckdb", "orders"), source("duckdb", "orders")];
+        let out = ChecksConfigOutput::from_engine(
+            &checks_cfg(),
+            rocky_core::config::ReplicationPipelineConfig::EXECUTED_CHECK_KINDS,
+            &sources,
+        )
+        .expect("projection present");
+
+        let names = &out.configured_checks["orders"];
+        let by_name: std::collections::HashMap<&str, &ResolvedCheckNameOutput> =
+            names.iter().map(|n| (n.name.as_str(), n)).collect();
+        assert!(by_name.contains_key("has_rows"));
+        assert!(by_name.contains_key("null_rate:amount"));
+        assert!(by_name.contains_key("id_not_null"));
+        let overlap = by_name
+            .get("cross_source_overlap:duckdb.orders")
+            .expect("overlap name projected");
+        assert!(overlap.candidate, "overlap names must be marked candidate");
+        // The exact-name checks are not candidates.
+        assert!(!by_name["has_rows"].candidate);
+    }
+
+    #[test]
+    fn gates_out_kinds_the_pipeline_type_does_not_run() {
+        // A quality-style executed set runs custom + assertions but NOT
+        // null_rate / cross_source_overlap — those must not be projected.
+        let sources = vec![source("duckdb", "orders")];
+        let executed = &[
+            CheckKind::RowCount,
+            CheckKind::Custom,
+            CheckKind::Assertions,
+        ];
+        let out = ChecksConfigOutput::from_engine(&checks_cfg(), executed, &sources)
+            .expect("custom + assertion still project");
+
+        let names: Vec<&str> = out.configured_checks["orders"]
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(names.contains(&"has_rows"));
+        assert!(names.contains(&"id_not_null"));
+        assert!(
+            !names.iter().any(|n| n.starts_with("null_rate")),
+            "null_rate must be gated out: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("cross_source_overlap")),
+            "cross_source_overlap must be gated out: {names:?}"
+        );
     }
 }
 

@@ -89,6 +89,19 @@ class FreshnessConfigOutput(BaseModel):
     threshold_seconds: conint(ge=0)
 
 
+class ResolvedCheckNameOutput(BaseModel):
+    """
+    A resolved check name `rocky discover` projects so a consumer can pre-declare a matching check spec. `name` byte-matches the `CheckResult.name` the runner emits at run time. `candidate` is `true` for names whose existence depends on runtime-discovered siblings (`cross_source_overlap`) and so may not be emitted on every run.
+    """
+
+    candidate: bool | None = None
+    kind: str
+    """
+    The check-kind tag: `custom` | `assertion` | `null_rate` | `cross_source_overlap`.
+    """
+    name: str
+
+
 class TableOutput(BaseModel):
     name: str
     row_count: conint(ge=0) | None = None
@@ -101,6 +114,10 @@ class ChecksConfigOutput(BaseModel):
     This is intentionally a thin projection of `rocky_core::config::ChecksConfig` — only the fields downstream orchestrators currently consume are exposed. Add fields as new integrations need them.
     """
 
+    configured_checks: dict[str, list[ResolvedCheckNameOutput]] | None = None
+    """
+    Resolved per-model check names the pipeline will emit as `CheckResult.name` at run time, keyed by unqualified table/model name. Only the NON-default checks are listed — the four defaults (row_count/column_match/freshness/anomaly) are well-known and pre-declared by consumers. A consumer (e.g. Dagster) declares an asset-check spec per name so the spec name byte-matches the emitted result. Empty (and omitted) when no non-default checks are configured.
+    """
     freshness: FreshnessConfigOutput | None = None
 
 
