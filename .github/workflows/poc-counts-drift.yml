@@ -27,6 +27,10 @@ on:
       - 'scripts/update-poc-counts.sh'
       - '.github/workflows/poc-counts-drift.yml'
 
+# CI only reads the repo; restrict the token to the minimum (CodeQL ql-for-actions).
+permissions:
+  contents: read
+
 jobs:
   drift:
     name: Check POC counts are up to date

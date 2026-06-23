@@ -1,29 +1,72 @@
 version: 2
+
+# Each ecosystem groups patch + minor bumps into a SINGLE weekly PR so the
+# expensive engine-ci / codegen-drift runs fire once per ecosystem instead of
+# once per dependency. Major bumps are deliberately left ungrouped — they get
+# their own PR so a breaking change stays isolated and reviewable.
 updates:
-  # --- Engine (Rust + Astro docs) ---
+  # --- Engine (Rust) ---
   - package-ecosystem: cargo
     directory: /engine
     schedule:
       interval: weekly
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # --- Docs site (Astro / npm) ---
   - package-ecosystem: npm
     directory: /docs
     schedule:
       interval: weekly
+    groups:
+      docs-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # --- Python SDK (rocky-sdk) ---
+  - package-ecosystem: pip
+    directory: /sdk/python
+    schedule:
+      interval: weekly
+    groups:
+      sdk-minor-patch:
+        update-types:
+          - minor
+          - patch
 
   # --- Dagster integration (Python) ---
   - package-ecosystem: pip
     directory: /integrations/dagster
     schedule:
       interval: weekly
+    groups:
+      dagster-minor-patch:
+        update-types:
+          - minor
+          - patch
 
   # --- VS Code extension (npm) ---
   - package-ecosystem: npm
     directory: /editors/vscode
     schedule:
       interval: weekly
+    groups:
+      vscode-minor-patch:
+        update-types:
+          - minor
+          - patch
 
   # --- GitHub Actions (root workflows) ---
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions-minor-patch:
+        update-types:
+          - minor
+          - patch

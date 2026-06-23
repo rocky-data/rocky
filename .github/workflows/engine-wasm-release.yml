@@ -37,6 +37,7 @@ jobs:
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --generate-notes \
+              --latest=false \
               --title "$TAG"
           fi
 
