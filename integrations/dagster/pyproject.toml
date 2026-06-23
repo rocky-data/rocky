@@ -1,6 +1,6 @@
 [project]
 name = "dagster-rocky"
-version = "1.51.0"
+version = "1.52.0"
 description = "Dagster integration for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"
@@ -23,7 +23,7 @@ dependencies = [
     # package; RockyResource is a thin Dagster adapter over RockyClient. In-repo
     # dev/CI resolves this from the local path (see [tool.uv.sources]); the
     # published wheel floors on the released SDK.
-    "rocky-sdk>=0.1.4",
+    "rocky-sdk>=0.1.5",
     # Floor matches the version CI actually resolves and tests (uv.lock). The
     # RockyComponent path uses dagster.components.* APIs from preview namespaces,
     # so we advertise a tested floor rather than an older, never-exercised one.
