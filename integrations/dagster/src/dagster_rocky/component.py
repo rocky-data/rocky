@@ -517,13 +517,16 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
     surface_compliance: bool = False
     #: When ``True``, pre-declares one :class:`dg.AssetCheckSpec` per
     #: engine-resolved *configured* (non-default) check name, per model, so the
-    #: Dagster UI surfaces assertions / cross_source_overlap / custom /
-    #: null_rate checks before any run — not just the four defaults. Names come
-    #: VERBATIM from ``discover.checks.configured_checks`` (the engine's
-    #: resolved-name projection); they are never re-derived in Python, so each
-    #: spec name byte-matches the ``CheckResult.name`` the engine emits and the
-    #: result lands against the spec instead of being dropped by
-    #: :func:`_emit_results`. Results flow through the existing emit path
+    #: Dagster UI surfaces per-asset assertions / custom / null_rate checks
+    #: before any run — not just the four defaults. Names come VERBATIM from
+    #: ``discover.checks.configured_checks`` (the engine's resolved-name
+    #: projection); they are never re-derived in Python, so each spec name
+    #: byte-matches the ``CheckResult.name`` the engine emits and the result
+    #: lands against the spec instead of being dropped by
+    #: :func:`_emit_results`. ``candidate`` (cross_source_overlap) names are
+    #: excluded — that group check is emitted once for the whole sibling set, so
+    #: per-asset specs would leave non-emitting siblings with a misleading
+    #: passing placeholder. Results flow through the existing emit path
     #: unchanged; a configured check not produced by a given run gets a passing
     #: placeholder via :func:`_emit_placeholder_checks`. Default ``False``
     #: preserves zero behaviour change.
@@ -1287,10 +1290,16 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         # engine's discover projection. Names are used VERBATIM (never
         # re-derived in Python) so the pre-declared spec name byte-matches the
         # CheckResult.name the engine emits — see surface_configured_checks.
+        #
+        # `candidate` names (cross_source_overlap) are excluded: that is a GROUP
+        # check the engine emits once (on one sibling asset), so pre-declaring
+        # it on every same-named sibling would leave the others with a passing
+        # placeholder that doesn't reflect a real evaluation. Only exact,
+        # per-asset names (custom / null_rate / assertions) are surfaced.
         configured_checks_by_model: dict[str, list[str]] = {}
         if self.surface_configured_checks and discover.checks is not None:
             configured_checks_by_model = {
-                table: [c.name for c in names]
+                table: [c.name for c in names if not c.candidate]
                 for table, names in discover.checks.configured_checks.items()
             }
 

@@ -450,14 +450,13 @@ def test_configured_checks_predeclared_when_opt_in(discover_json: str, tmp_path:
     }
     defs = _build_defs_with_flags(json.dumps(d), tmp_path, surface_configured_checks=True)
 
-    # Names are sanitized to Dagster-valid form (``:`` / ``.`` -> ``_``); the
-    # same sanitizer runs in _emit_results so the run-time result still lands.
+    # Exact per-asset names are sanitized to Dagster-valid form (``:`` -> ``_``);
+    # the same sanitizer runs in _emit_results so the run-time result lands.
     orders_specs = _check_specs_for_table(defs, "orders")
-    assert {
-        "orders_have_rows",
-        "null_rate_amount",
-        "cross_source_overlap_fivetran_orders",
-    } <= orders_specs
+    assert {"orders_have_rows", "null_rate_amount"} <= orders_specs
+    # The ``candidate`` cross_source_overlap name is a GROUP check — excluded so
+    # non-emitting siblings don't get a misleading passing placeholder.
+    assert "cross_source_overlap_fivetran_orders" not in orders_specs
     # The names attach to the matching asset only, not to other tables.
     assert "orders_have_rows" not in _check_specs_for_table(defs, "payments")
 

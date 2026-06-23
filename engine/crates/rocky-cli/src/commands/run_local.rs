@@ -317,47 +317,16 @@ pub async fn run_quality(
                     }
                 }
 
-                // Custom checks
-                for custom in &pipeline.checks.custom {
-                    let sql = custom.sql.replace("{table}", &full_table);
-                    let severity = custom.severity;
-                    match warehouse_adapter.execute_query(&sql).await {
-                        Ok(result) => {
-                            let result_value: u64 = result
-                                .rows
-                                .first()
-                                .and_then(|r| r.first())
-                                .and_then(|v| {
-                                    v.as_u64()
-                                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                                })
-                                .unwrap_or(0);
-                            checks.push(CheckResult {
-                                name: custom.name.clone(),
-                                passed: result_value >= custom.threshold,
-                                severity,
-                                details: CheckDetails::Custom {
-                                    query: sql,
-                                    result_value,
-                                    threshold: custom.threshold,
-                                },
-                            });
-                        }
-                        Err(e) => {
-                            checks.push(CheckResult {
-                                name: custom.name.clone(),
-                                passed: false,
-                                severity,
-                                details: CheckDetails::Custom {
-                                    query: sql,
-                                    result_value: 0,
-                                    threshold: custom.threshold,
-                                },
-                            });
-                            warn!(error = %e, check = custom.name.as_str(), "custom check query failed");
-                        }
-                    }
-                }
+                // Custom checks — shared with the replication runner (run.rs)
+                // via `run_custom_checks`.
+                checks.extend(
+                    run_custom_checks(
+                        warehouse_adapter.as_ref(),
+                        &full_table,
+                        &pipeline.checks.custom,
+                    )
+                    .await,
+                );
 
                 // Row-level assertions — match by unqualified table name.
                 // Shared with the replication runner (run.rs) via
@@ -467,6 +436,56 @@ pub async fn run_quality(
 /// be dialect-formatted (quoted/qualified). Degradation is graceful: an
 /// SQL-generation error skips that assertion; a query error records a failed
 /// `CheckResult` — neither aborts the caller.
+/// Execute every custom check against `full_table`, returning one
+/// [`CheckResult`] per check. Shared by the quality runner (this module) and
+/// the replication runner (`run.rs`) so `[[checks.custom]]` fires identically
+/// on both surfaces. `full_table` must already be dialect-formatted
+/// (quoted/qualified). A query error records a failed `CheckResult` rather than
+/// aborting the caller.
+pub(crate) async fn run_custom_checks(
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    full_table: &str,
+    customs: &[rocky_core::config::CustomCheckConfig],
+) -> Vec<rocky_core::checks::CheckResult> {
+    use rocky_core::checks::{CheckDetails, CheckResult, cell_as_u64};
+
+    let mut results = Vec::new();
+    for custom in customs {
+        let sql = custom.sql.replace("{table}", full_table);
+        let severity = custom.severity;
+        match warehouse.execute_query(&sql).await {
+            Ok(result) => {
+                let result_value =
+                    cell_as_u64(result.rows.first().and_then(|r| r.first())).unwrap_or(0);
+                results.push(CheckResult {
+                    name: custom.name.clone(),
+                    passed: result_value >= custom.threshold,
+                    severity,
+                    details: CheckDetails::Custom {
+                        query: sql,
+                        result_value,
+                        threshold: custom.threshold,
+                    },
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, check = custom.name.as_str(), "custom check query failed");
+                results.push(CheckResult {
+                    name: custom.name.clone(),
+                    passed: false,
+                    severity,
+                    details: CheckDetails::Custom {
+                        query: sql,
+                        result_value: 0,
+                        threshold: custom.threshold,
+                    },
+                });
+            }
+        }
+    }
+    results
+}
+
 pub(crate) async fn run_table_assertions(
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
     dialect: &dyn rocky_core::traits::SqlDialect,

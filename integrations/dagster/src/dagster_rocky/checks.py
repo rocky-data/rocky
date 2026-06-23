@@ -11,6 +11,7 @@ from typing import Any
 
 import dagster as dg
 
+from .contracts import sanitize_check_name
 from .types import CheckResult, MaterializationInfo, OptimizeResult, RunResult
 
 
@@ -26,7 +27,14 @@ def emit_materializations(result: RunResult) -> list[dg.AssetMaterialization]:
 
 
 def emit_check_results(result: RunResult) -> list[dg.AssetCheckResult]:
-    """Convert Rocky check results into Dagster ``AssetCheckResult`` events."""
+    """Convert Rocky check results into Dagster ``AssetCheckResult`` events.
+
+    Check names are passed through :func:`sanitize_check_name`: engine results
+    carry structured names (``null_rate:<col>``, ``cross_source_overlap:…``)
+    whose ``:``/``.`` separators are invalid Dagster check names and would raise
+    at event construction. The matching spec must be declared with the sanitized
+    name too (mirroring ``RockyComponent``'s emit path).
+    """
     events: list[dg.AssetCheckResult] = []
     for table_check in result.check_results:
         key = dg.AssetKey(table_check.asset_key)
@@ -34,7 +42,7 @@ def emit_check_results(result: RunResult) -> list[dg.AssetCheckResult]:
             events.append(
                 dg.AssetCheckResult(
                     asset_key=key,
-                    check_name=check.name,
+                    check_name=sanitize_check_name(check.name),
                     passed=check.passed,
                     metadata=check_metadata(check),
                 )

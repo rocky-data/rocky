@@ -3260,44 +3260,13 @@ pub async fn run(
                     continue;
                 }
             };
-            for custom in &pipeline.checks.custom {
-                let sql = custom.sql.replace("{table}", &full);
-                let severity = custom.severity;
-                let check = match shared_warehouse.execute_query(&sql).await {
-                    Ok(result) => {
-                        let result_value: u64 = result
-                            .rows
-                            .first()
-                            .and_then(|r| r.first())
-                            .and_then(|v| {
-                                v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                            })
-                            .unwrap_or(0);
-                        checks::CheckResult {
-                            name: custom.name.clone(),
-                            passed: result_value >= custom.threshold,
-                            severity,
-                            details: checks::CheckDetails::Custom {
-                                query: sql,
-                                result_value,
-                                threshold: custom.threshold,
-                            },
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, check = custom.name.as_str(), "custom check query failed");
-                        checks::CheckResult {
-                            name: custom.name.clone(),
-                            passed: false,
-                            severity,
-                            details: checks::CheckDetails::Custom {
-                                query: sql,
-                                result_value: 0,
-                                threshold: custom.threshold,
-                            },
-                        }
-                    }
-                };
+            let results = super::run_local::run_custom_checks(
+                shared_warehouse.as_ref(),
+                &full,
+                &pipeline.checks.custom,
+            )
+            .await;
+            if !results.is_empty() {
                 pending_checks
                     .entry(tref.full_name())
                     .or_insert_with(|| PendingCheck {
@@ -3305,7 +3274,7 @@ pub async fn run(
                         checks: Vec::new(),
                     })
                     .checks
-                    .push(check);
+                    .extend(results);
             }
         }
     }
@@ -3337,35 +3306,30 @@ pub async fn run(
             match shared_warehouse.execute_query(&sql).await {
                 Ok(result) => {
                     for row in &result.rows {
-                        let col = row
-                            .first()
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        let nulls = row
-                            .get(1)
-                            .and_then(|v| {
-                                v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                            })
-                            .unwrap_or(0);
-                        let sampled = row
-                            .get(2)
-                            .and_then(|v| {
-                                v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                            })
-                            .unwrap_or(0);
+                        let col = row.first().and_then(|v| v.as_str()).unwrap_or_default();
+                        // A parse failure on the counts is a malformed result,
+                        // not a real zero — skip the column rather than emit a
+                        // false PASS (rate 0.0). An empty (0-row) sample still
+                        // parses to a real 0 and correctly passes below.
+                        let (Some(nulls), Some(sampled)) =
+                            (checks::cell_as_u64(row.get(1)), checks::cell_as_u64(row.get(2)))
+                        else {
+                            warn!(table = %tref.full_name(), column = col, "null_rate counts unparseable — skipping column");
+                            continue;
+                        };
+                        if col.is_empty() {
+                            warn!(table = %tref.full_name(), "null_rate result missing column name — skipping");
+                            continue;
+                        }
                         let rate = if sampled == 0 {
                             0.0
                         } else {
                             nulls as f64 / sampled as f64
                         };
-                        let mut check =
-                            checks::check_null_rate(&col, rate, null_rate_cfg.threshold);
+                        // `check_null_rate` names the result `null_rate:{col}`,
+                        // byte-matching discover's projection.
+                        let mut check = checks::check_null_rate(col, rate, null_rate_cfg.threshold);
                         check.severity = null_rate_cfg.severity;
-                        // Per-column name so multiple columns don't collide as
-                        // identically-named "null_rate" results — shared with
-                        // discover's projection so the names byte-match.
-                        check.name = checks::null_rate_check_name(&col);
                         pending_checks
                             .entry(tref.full_name())
                             .or_insert_with(|| PendingCheck {

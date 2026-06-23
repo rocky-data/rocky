@@ -140,6 +140,24 @@ pub fn null_rate_check_name(column: &str) -> String {
     format!("null_rate:{column}")
 }
 
+/// Parse a query-result cell as a `u64`. Tolerates the three shapes adapters
+/// return integer aggregates in: a JSON integer, an integer encoded as a JSON
+/// string (Databricks/Snowflake REST), and an integral JSON float (e.g. `5.0`).
+/// Returns `None` when the cell is absent or not a non-negative integer — the
+/// caller decides whether that is a skip, an error, or a default, rather than a
+/// silent `0` masking a parse failure as a real count.
+pub fn cell_as_u64(cell: Option<&serde_json::Value>) -> Option<u64> {
+    cell.and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .or_else(|| {
+                v.as_f64()
+                    .filter(|f| f.is_finite() && *f >= 0.0)
+                    .map(|f| f as u64)
+            })
+    })
+}
+
 /// Generates a batched null rate query using the given dialect's TABLESAMPLE syntax.
 /// Falls back to a full table scan if the dialect does not support TABLESAMPLE.
 pub fn generate_null_rate_sql(
@@ -320,7 +338,7 @@ pub fn check_column_match(
 /// Checks null rate for a column.
 pub fn check_null_rate(column: &str, null_rate: f64, threshold: f64) -> CheckResult {
     CheckResult {
-        name: "null_rate".to_string(),
+        name: null_rate_check_name(column),
         passed: null_rate <= threshold,
         severity: TestSeverity::Error,
         details: CheckDetails::NullRate {
@@ -418,6 +436,21 @@ mod tests {
             "cross_source_overlap:duckdb.orders"
         );
         assert_eq!(null_rate_check_name("amount"), "null_rate:amount");
+    }
+
+    #[test]
+    fn cell_as_u64_parses_int_string_and_float_but_not_garbage() {
+        use serde_json::json;
+        // The three shapes adapters return integer aggregates in.
+        assert_eq!(cell_as_u64(Some(&json!(5))), Some(5)); // JSON int
+        assert_eq!(cell_as_u64(Some(&json!("5"))), Some(5)); // int-as-string
+        assert_eq!(cell_as_u64(Some(&json!(5.0))), Some(5)); // integral float
+        assert_eq!(cell_as_u64(Some(&json!(0))), Some(0)); // a real zero is Some(0), not None
+        // A parse failure is None (so callers don't mistake it for a real 0).
+        assert_eq!(cell_as_u64(None), None);
+        assert_eq!(cell_as_u64(Some(&json!("abc"))), None);
+        assert_eq!(cell_as_u64(Some(&json!(-1.0))), None);
+        assert_eq!(cell_as_u64(Some(&serde_json::Value::Null)), None);
     }
 
     /// Test dialect that mirrors Databricks behavior for rocky-core tests.
@@ -631,7 +664,7 @@ mod tests {
     fn test_null_rate_pass() {
         let r = check_null_rate("email", 0.02, 0.05);
         assert!(r.passed);
-        assert_eq!(r.name, "null_rate");
+        assert_eq!(r.name, "null_rate:email");
     }
 
     #[test]
