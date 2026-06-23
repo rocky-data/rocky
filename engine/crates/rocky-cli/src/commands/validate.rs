@@ -498,21 +498,37 @@ fn inert_config_messages(
     }
 
     // A replication strategy typo parses cleanly and silently falls back to
-    // full_refresh at run time — surface it instead of letting it ship.
-    if let Some(repl) = pc.as_replication()
-        && !rocky_core::config::RECOGNIZED_REPLICATION_STRATEGIES.contains(&repl.strategy.as_str())
-    {
-        msgs.push(ValidateMessage {
+    // full_refresh at run time — surface it at both the pipeline level and in
+    // each `[[table_overrides]]` (the override flows through the same fallback).
+    if let Some(repl) = pc.as_replication() {
+        let recognized =
+            |s: &str| rocky_core::config::RECOGNIZED_REPLICATION_STRATEGIES.contains(&s);
+        let unrecognized = |strategy: &str, field: String| ValidateMessage {
             severity: "warn".into(),
             code: "V035".into(),
             message: format!(
-                "pipeline.{name}: strategy \"{}\" is not a recognized replication strategy and will silently fall back to full_refresh at run time. Recognized: {}.",
-                repl.strategy,
+                "pipeline.{name}: strategy \"{strategy}\" is not a recognized replication strategy and will silently fall back to full_refresh at run time. Recognized: {}.",
                 rocky_core::config::RECOGNIZED_REPLICATION_STRATEGIES.join(", ")
             ),
             file: None,
-            field: Some(format!("pipeline.{name}.strategy")),
-        });
+            field: Some(field),
+        };
+        if !recognized(&repl.strategy) {
+            msgs.push(unrecognized(
+                &repl.strategy,
+                format!("pipeline.{name}.strategy"),
+            ));
+        }
+        for (i, ov) in repl.table_overrides.iter().enumerate() {
+            if let Some(s) = ov.strategy.as_deref()
+                && !recognized(s)
+            {
+                msgs.push(unrecognized(
+                    s,
+                    format!("pipeline.{name}.table_overrides[{i}].strategy"),
+                ));
+            }
+        }
     }
 
     msgs

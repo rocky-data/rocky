@@ -212,6 +212,22 @@ impl PipesEmitter {
         severity: PipesCheckSeverity,
         metadata: &Value,
     ) {
+        // Dagster check names must match `^[A-Za-z0-9_]+$`, but engine check
+        // results carry structured names (`null_rate:<col>`,
+        // `cross_source_overlap:<src>.<table>`, `<kind>:<col>` assertions).
+        // Pipes IS the Dagster protocol, so map the invalid characters here so
+        // the emitted name matches the spec the dagster-rocky component
+        // pre-declares (which applies the same mapping, `sanitize_check_name`).
+        let check_name: String = check_name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
         self.write_message(
             "report_asset_check",
             &json!({
