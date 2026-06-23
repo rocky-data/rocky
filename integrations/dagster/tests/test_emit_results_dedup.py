@@ -348,3 +348,117 @@ def test_emit_results_materialization_yields_when_unique():
 
     mat_keys = {e.asset_key for e in events if isinstance(e, dg.MaterializeResult)}
     assert mat_keys == {orders, leads}
+
+
+# ---------------------------------------------------------------------------
+# Part D — _emit_results maps engine check severity → Dagster severity
+# ---------------------------------------------------------------------------
+
+
+def test_emit_results_maps_check_severity():
+    """A failing configured-``warning`` check surfaces as a Dagster WARN, not ERROR.
+
+    Without this, a failing advisory check degrades asset health and pages,
+    regardless of the operator's advisory intent — so consumers couldn't run a
+    "WARN-first, promote-to-error-later" rollout.
+    """
+    orders = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"])
+    mapping = {("fivetran", "acme", "us_west", "shopify", "orders"): orders}
+    check_specs = [
+        dg.AssetCheckSpec(name="null_rate", asset=orders),
+        dg.AssetCheckSpec(name="row_count", asset=orders),
+    ]
+    table_check = TableCheckResult(
+        asset_key=["fivetran", "acme", "us_west", "shopify", "orders"],
+        checks=[
+            CheckResult(
+                name="null_rate",
+                passed=False,
+                column="email",
+                null_rate=0.9,
+                threshold=0.05,
+                severity="warning",
+            ),
+            CheckResult(
+                name="row_count", passed=False, source_count=10, target_count=9, severity="error"
+            ),
+        ],
+    )
+
+    events = list(
+        _emit_results(
+            results=[_run_result(check_results=[table_check])],
+            check_specs=check_specs,
+            selected_keys={orders},
+            rocky_key_to_dagster_key=mapping,
+        )
+    )
+
+    by_name = {e.check_name: e for e in events if isinstance(e, dg.AssetCheckResult)}
+    assert by_name["null_rate"].severity == dg.AssetCheckSeverity.WARN
+    assert by_name["row_count"].severity == dg.AssetCheckSeverity.ERROR
+
+
+def test_emit_results_defaults_omitted_severity_to_error():
+    """Back-compat: a check that OMITS severity on the wire stays ERROR, while a
+    sibling ``warning`` check in the same stream maps to WARN.
+
+    Parsing through ``RunResult.model_validate`` (not a positional constructor)
+    exercises the SDK's ``severity: str | None = "error"`` default for the
+    omitted field — the genuine older-binary path. Co-locating a WARN assertion
+    makes the ERROR provably a product of the mapping rather than Dagster's own
+    ``AssetCheckResult`` default: drop the ``severity=`` argument from the emit
+    path and the ``null_rate`` assertion below flips to ERROR and fails.
+    """
+    orders = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"])
+    mapping = {("fivetran", "acme", "us_west", "shopify", "orders"): orders}
+    check_specs = [
+        dg.AssetCheckSpec(name="row_count", asset=orders),
+        dg.AssetCheckSpec(name="null_rate", asset=orders),
+    ]
+    run_result = RunResult.model_validate(
+        {
+            "version": "0.3.0",
+            "command": "run",
+            "filter": "tenant=acme",
+            "duration_ms": 1,
+            "tables_copied": 0,
+            "materializations": [],
+            "check_results": [
+                {
+                    "asset_key": ["fivetran", "acme", "us_west", "shopify", "orders"],
+                    "checks": [
+                        # severity OMITTED → SDK default "error" → ERROR
+                        {
+                            "name": "row_count",
+                            "passed": True,
+                            "source_count": 10,
+                            "target_count": 10,
+                        },
+                        # advisory failing check in the same stream → WARN
+                        {"name": "null_rate", "passed": False, "severity": "warning"},
+                    ],
+                }
+            ],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+
+    by_name = {
+        e.check_name: e
+        for e in _emit_results(
+            results=[run_result],
+            check_specs=check_specs,
+            selected_keys={orders},
+            rocky_key_to_dagster_key=mapping,
+        )
+        if isinstance(e, dg.AssetCheckResult)
+    }
+    assert by_name["row_count"].severity == dg.AssetCheckSeverity.ERROR
+    assert by_name["null_rate"].severity == dg.AssetCheckSeverity.WARN

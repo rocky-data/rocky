@@ -44,6 +44,7 @@ def emit_check_results(result: RunResult) -> list[dg.AssetCheckResult]:
                     asset_key=key,
                     check_name=sanitize_check_name(check.name),
                     passed=check.passed,
+                    severity=dagster_check_severity(check),
                     metadata=check_metadata(check),
                 )
             )
@@ -127,4 +128,27 @@ def check_metadata(check: CheckResult) -> dict[str, dg.MetadataValue]:
     if check.result_value is not None:
         metadata["result_value"] = dg.MetadataValue.int(check.result_value)
 
+    # Severity — surfaced only when advisory (``"warning"``). ``"error"`` is the
+    # implicit default, so showing it on every check would clutter the panel.
+    # This keeps the advisory level visible even on a *passing* check, where
+    # Dagster's ``AssetCheckSeverity`` is not rendered.
+    if getattr(check, "severity", None) == "warning":
+        metadata["severity"] = dg.MetadataValue.text("warning")
+
     return metadata
+
+
+def dagster_check_severity(check: CheckResult) -> dg.AssetCheckSeverity:
+    """Map a Rocky check's configured severity to a Dagster ``AssetCheckSeverity``.
+
+    Rocky's :attr:`CheckResult.severity` carries the operator's configured
+    intent: ``"warning"`` is advisory, ``"error"`` (the default) is a hard
+    failure. A *failing* check surfaces at this severity — ``WARN`` does not
+    degrade asset health, ``ERROR`` does — so an advisory check can fail without
+    paging an ``ASSET_HEALTH_DEGRADED`` alert. Defaults to ``ERROR`` when the
+    engine omits severity (older binaries), preserving the prior fail-hard
+    behaviour.
+    """
+    if getattr(check, "severity", None) == "warning":
+        return dg.AssetCheckSeverity.WARN
+    return dg.AssetCheckSeverity.ERROR

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import dagster as dg
+
 from dagster_rocky.checks import (
     check_metadata,
     cost_metadata_from_optimize,
+    dagster_check_severity,
     emit_check_results,
     emit_materializations,
 )
@@ -43,6 +46,40 @@ def test_emit_check_results(run_json: str):
     assert events[4].check_name == "no_future_dates"
 
 
+def test_emit_check_results_maps_severity():
+    """The functional helper maps engine severity onto the emitted event, just
+    like ``RockyComponent``'s path — a failing advisory check is a Dagster WARN."""
+    result = RunResult.model_validate(
+        {
+            "version": "1.0.0",
+            "command": "run",
+            "filter": "tenant=acme",
+            "duration_ms": 1,
+            "tables_copied": 0,
+            "materializations": [],
+            "check_results": [
+                {
+                    "asset_key": ["fivetran", "acme", "shopify", "orders"],
+                    "checks": [
+                        {"name": "null_rate", "passed": False, "severity": "warning"},
+                        {"name": "row_count", "passed": False, "severity": "error"},
+                    ],
+                }
+            ],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+    by_name = {e.check_name: e for e in emit_check_results(result)}
+    assert by_name["null_rate"].severity == dg.AssetCheckSeverity.WARN
+    assert by_name["row_count"].severity == dg.AssetCheckSeverity.ERROR
+
+
 def test_check_metadata_only_includes_populated_fields():
     """``check_metadata`` should never emit ``None`` values."""
     minimal = CheckResult(name="row_count", passed=True, source_count=10, target_count=10)
@@ -58,6 +95,54 @@ def test_check_metadata_handles_empty_lists_as_none_text():
     metadata = check_metadata(check)
     assert metadata["missing_columns"].value == "(none)"
     assert metadata["extra_columns"].value == "(none)"
+
+
+def test_check_metadata_surfaces_advisory_severity():
+    """An advisory (``warning``) check surfaces its severity so it's visible in
+    the UI regardless of pass/fail — on a *passing* check Dagster doesn't render
+    the ``AssetCheckSeverity`` at all, and on a failing one the row corroborates
+    the WARN level."""
+    passing = CheckResult(
+        name="null_rate",
+        passed=True,
+        column="email",
+        null_rate=0.0,
+        threshold=0.05,
+        severity="warning",
+    )
+    failing = CheckResult(
+        name="null_rate",
+        passed=False,
+        column="email",
+        null_rate=0.9,
+        threshold=0.05,
+        severity="warning",
+    )
+    assert check_metadata(passing)["severity"].value == "warning"
+    assert check_metadata(failing)["severity"].value == "warning"
+
+
+def test_check_metadata_omits_default_error_severity():
+    """The implicit ``error`` default is not surfaced — it would clutter every
+    check's panel with no added signal."""
+    check = CheckResult(name="row_count", passed=True, source_count=10, target_count=10)
+    assert "severity" not in check_metadata(check)
+
+
+def test_dagster_check_severity_maps_engine_severity():
+    """``warning`` → WARN, ``error`` → ERROR, and an absent/defaulted severity
+    falls back to ERROR (back-compat with older binaries). The mapping reads the
+    configured *intent*, not the outcome, so it ignores ``passed`` — a passing
+    advisory check is still WARN."""
+    warn = CheckResult(name="null_rate", passed=False, severity="warning")
+    warn_passing = CheckResult(name="null_rate", passed=True, severity="warning")
+    err = CheckResult(name="row_count", passed=False, severity="error")
+    defaulted = CheckResult(name="row_count", passed=False)  # severity defaults to "error"
+
+    assert dagster_check_severity(warn) == dg.AssetCheckSeverity.WARN
+    assert dagster_check_severity(warn_passing) == dg.AssetCheckSeverity.WARN
+    assert dagster_check_severity(err) == dg.AssetCheckSeverity.ERROR
+    assert dagster_check_severity(defaulted) == dg.AssetCheckSeverity.ERROR
 
 
 def test_cost_metadata_from_optimize(optimize_json: str):

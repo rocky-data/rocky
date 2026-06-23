@@ -210,6 +210,13 @@ class MaterializationInfo(BaseModel):
 class CheckResult(BaseModel):
     name: str
     passed: bool
+    #: Configured failure severity emitted by the engine: ``"error"`` (a hard
+    #: failure) or ``"warning"`` (advisory — does not fail the run). Defaults to
+    #: ``"error"`` for older binaries that don't emit the field. Without this
+    #: field declared, Pydantic's default ``extra="ignore"`` would silently drop
+    #: the wire value, so any consumer mapping it (e.g. dagster-rocky's
+    #: ``AssetCheckSeverity``) would never see anything but the default.
+    severity: str | None = "error"
     # Row count fields
     source_count: int | None = None
     target_count: int | None = None

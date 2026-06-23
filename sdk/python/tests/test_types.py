@@ -9,6 +9,7 @@ import pytest
 from rocky_sdk import CiResult, CompileResult, DiscoverResult, TestResult, parse_rocky_output
 from rocky_sdk.client import _parse_rocky_json, _parse_run_or_apply
 from rocky_sdk.exceptions import RockyOutputParseError
+from rocky_sdk.types import CheckResult, RunResult
 
 DISCOVER_JSON = '{"version": "1.0.0", "command": "discover", "sources": []}'
 
@@ -84,6 +85,51 @@ def test_parse_ci_result_failures_are_objects():
     assert isinstance(result, CiResult)
     assert result.failures[0].name == "fct_orders"
     assert result.failures[0].error == "type mismatch"
+
+
+def test_check_result_preserves_severity():
+    # Shadow-drift regression: the runtime ``RunResult`` routes check results
+    # through this hand-written wide ``CheckResult`` (not the generated
+    # per-variant models). Without ``severity`` declared here, Pydantic's
+    # default ``extra="ignore"`` would silently drop the wire value, and any
+    # consumer mapping it (dagster-rocky's ``AssetCheckSeverity``) would only
+    # ever see the default. Captured shape from the live binary.
+    advisory = CheckResult.model_validate(
+        {"name": "null_rate", "passed": False, "severity": "warning"}
+    )
+    assert advisory.severity == "warning"
+
+    # Omitted severity (older binary) defaults to "error".
+    assert CheckResult.model_validate({"name": "row_count", "passed": True}).severity == "error"
+
+
+def test_run_result_threads_check_severity_through_table_checks():
+    # The whole path the orchestrator reads: run output → check_results →
+    # checks[].severity must survive into the wide model.
+    result = RunResult.model_validate(
+        {
+            "version": "1.0.0",
+            "command": "run",
+            "filter": "tenant=acme",
+            "duration_ms": 1,
+            "tables_copied": 0,
+            "materializations": [],
+            "check_results": [
+                {
+                    "asset_key": ["fivetran", "acme", "shopify", "orders"],
+                    "checks": [{"name": "null_rate", "passed": False, "severity": "warning"}],
+                }
+            ],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+    assert result.check_results[0].checks[0].severity == "warning"
 
 
 def test_parse_rocky_output_rejects_non_object():

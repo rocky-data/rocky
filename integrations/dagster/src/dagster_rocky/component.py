@@ -47,7 +47,7 @@ from dagster.components.utils.translation import TranslationFn, TranslationFnRes
 from dagster_shared.serdes.objects.models.defs_state_info import DefsStateManagementType
 from pydantic import ValidationError
 
-from .checks import check_metadata
+from .checks import check_metadata, dagster_check_severity
 from .column_lineage import build_column_lineage
 from .contracts import (
     ContractRules,
@@ -2966,6 +2966,7 @@ def _emit_results(
                 asset_key=asset_key,
                 check_name=check_name,
                 passed=check.passed,
+                severity=dagster_check_severity(check),
                 metadata=check_metadata(check),
             )
 
