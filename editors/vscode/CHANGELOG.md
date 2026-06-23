@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.33.3] — 2026-06-23
+
+### Changed
+
+- Regenerated the `discover` output type binding to include `configured_checks` (the engine's resolved check-name projection). No user-facing behavior change. (#955)
+
 ## [1.33.2] — 2026-06-22
 
 ### Changed

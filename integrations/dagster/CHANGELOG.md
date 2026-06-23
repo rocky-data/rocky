@@ -7,8 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.51.0] — 2026-06-23
+
+### Added
+
+- **`RockyComponent.surface_configured_checks`** (opt-in, default off) pre-declares one Dagster asset-check spec per engine-resolved configured check — per-asset `assertions`, `custom`, and `null_rate` — so they surface in the UI before any run, not just the four defaults. Names come verbatim from `rocky discover` and are sanitized to Dagster-valid form on both the declare and emit sides. (#955, #956)
+
 ### Changed
 
+- Raised the `rocky-sdk` floor to `>=0.1.4` — the component now reads the `configured_checks` projection.
 - Refreshed locked dependencies (`dagster` 1.13.10, `sqlalchemy` 2.0.51, `pytest` 9.1.1, `ruff` 0.15.18, plus transitives). The `dagster>=1.13.8` floor is unchanged — 1.13.10 is a bug-fix release with nothing on the integration's surface. Full suite (646 tests) green. (#939)
 
 ## [1.50.0] — 2026-06-19
