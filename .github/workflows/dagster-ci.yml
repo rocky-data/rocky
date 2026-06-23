@@ -16,6 +16,13 @@ on:
       - 'schemas/**'
       - '.github/workflows/dagster-ci.yml'
 
+# Cancel superseded in-progress runs on the same PR — a new push supersedes the
+# previous run instead of letting both finish. Scoped to pull_request so a
+# fast-follow merge to main never cancels a main-branch validation run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 defaults:
   run:
     working-directory: integrations/dagster
