@@ -12,6 +12,10 @@ on:
       - 'engine/Cargo.lock'
       - '.github/workflows/engine-bench.yml'
 
+# CI only reads the repo; restrict the token to the minimum (CodeQL ql-for-actions).
+permissions:
+  contents: read
+
 defaults:
   run:
     working-directory: engine

@@ -9,6 +9,10 @@ on:
     - cron: '0 8 * * 1'   # Monday 08:00 UTC
   workflow_dispatch:
 
+# Advisory jobs only read the repo; restrict the token to the minimum (CodeQL ql-for-actions).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 4
@@ -86,7 +90,7 @@ jobs:
         working-directory: engine
         run: cargo build --release
       - name: Add rocky binary to PATH
-        run: echo "$GITHUB_WORKSPACE/engine/target/release" >> $GITHUB_PATH
+        run: echo "$GITHUB_WORKSPACE/engine/target/release" >> "$GITHUB_PATH"
       # The playground POC run.sh scripts shell out to the standalone `duckdb`
       # CLI to seed data and inspect Parquet companions. The runner doesn't
       # ship it, so without this step every DuckDB-seeding POC fails with

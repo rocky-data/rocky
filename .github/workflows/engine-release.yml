@@ -103,7 +103,11 @@ jobs:
 
       - name: Install cargo-zigbuild
         if: matrix.zigbuild
-        run: cargo install cargo-zigbuild --locked
+        # Prebuilt binary — avoids ~35s of `cargo install cargo-zigbuild
+        # --locked` (compiles from source) per Linux target.
+        uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: cargo-zigbuild
 
       # Linux cross-compile: install the cross-compilation toolchain
       - name: Install cross-compilation toolchain
@@ -220,5 +224,6 @@ jobs:
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --generate-notes \
+              --latest \
               --title "$TAG"
           fi

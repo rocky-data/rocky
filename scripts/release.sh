@@ -106,7 +106,11 @@ release_engine() {
     # 4. Create GitHub Release with macOS + Linux
     # The tag push also triggers engine-release.yml which builds all 5 targets.
     # CI will overwrite these two and add macOS Intel, Linux ARM64, and Windows.
+    # --latest: the engine binary is the artifact users install, so it owns
+    # the repo's "Latest" GitHub Release badge regardless of which tag (engine
+    # vs sdk/dagster/vscode) is pushed last in a coupled release.
     create_release "$tag" \
+        --latest \
         "$macos_archive" \
         "$linux_archive"
 
@@ -153,7 +157,10 @@ release_dagster() {
         || die "git push origin $tag failed"
 
     # 4. Create GitHub Release
+    # --latest=false: never let a wheel grab the "Latest" badge — the engine
+    # release owns it (see release_engine).
     create_release "$tag" \
+        --latest=false \
         "$WORKSPACE_ROOT/integrations/dagster/dist/"*
 
     echo
@@ -198,7 +205,9 @@ release_sdk() {
         || die "git push origin $tag failed"
 
     # 4. Create GitHub Release
+    # --latest=false: the engine release owns the "Latest" badge.
     create_release "$tag" \
+        --latest=false \
         "$WORKSPACE_ROOT/sdk/python/dist/"*
 
     echo
@@ -249,7 +258,9 @@ release_vscode() {
         || die "git push origin $tag failed"
 
     # 4. Create GitHub Release
+    # --latest=false: the engine release owns the "Latest" badge.
     create_release "$tag" \
+        --latest=false \
         "$WORKSPACE_ROOT/editors/vscode/"*.vsix
 
     echo
