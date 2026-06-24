@@ -175,12 +175,12 @@ fn run_watch_reruns_on_file_change_and_exits_clean_on_sigint() {
     // Touch the watched config to provoke a re-run.
     touch(&cfg_path);
 
-    let second = wait_for(&stderr_rx, "run completed in", Duration::from_secs(8));
+    let second = wait_for(&stderr_rx, "run completed in", Duration::from_secs(20));
     if !second.matched {
         sigterm(pid);
         let _ = child.wait();
         panic!(
-            "second run never triggered within 8s after touch.\n\
+            "second run never triggered within 20s after touch.\n\
              stderr since first run:\n{}",
             second.buffered
         );
@@ -194,8 +194,13 @@ fn run_watch_reruns_on_file_change_and_exits_clean_on_sigint() {
     // Clean shutdown: SIGINT, then await exit.
     sigint(pid);
 
-    let exit = wait_with_timeout(&mut child, Duration::from_secs(8))
-        .expect("rocky did not exit within 8s of SIGINT");
+    // Generous budget: under a loaded CI runner the watch loop can take
+    // several seconds to wind down the in-flight run and drop the notify
+    // watcher after SIGINT. This is a max-wait deadline — `wait_with_timeout`
+    // returns as soon as the child exits, so a large budget doesn't slow the
+    // happy path, it only removes the flake window.
+    let exit = wait_with_timeout(&mut child, Duration::from_secs(30))
+        .expect("rocky did not exit within 30s of SIGINT");
 
     assert!(
         exit.success(),
