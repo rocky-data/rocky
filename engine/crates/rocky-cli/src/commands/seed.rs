@@ -204,6 +204,18 @@ async fn load_single_seed(
     catalog: &str,
     target_schema: &str,
 ) -> Result<(usize, Vec<ColumnDef>)> {
+    // 0. Run pre-hooks BEFORE any warehouse write (including the destructive
+    //    DROP TABLE). A failing pre-hook aborts the seed with nothing written —
+    //    the canonical guard is "abort if the target already holds rows".
+    for (i, stmt) in seed.config.pre_hook.iter().enumerate() {
+        adapter.execute_statement(stmt).await.map_err(|e| {
+            anyhow::anyhow!(
+                "pre_hook[{i}] failed for {} (no data written): {e}",
+                seed.name
+            )
+        })?;
+    }
+
     // 1. Infer schema (with sidecar overrides).
     let schema = infer_schema_from_csv_with_overrides(&seed.file_path, &seed.config.column_types)
         .context(format!("schema inference failed for {}", seed.name))?;
@@ -244,5 +256,172 @@ async fn load_single_seed(
         total_rows += batch_rows;
     }
 
+    // 5. Run post-hooks after a successful load, in order.
+    for (i, stmt) in seed.config.post_hook.iter().enumerate() {
+        adapter
+            .execute_statement(stmt)
+            .await
+            .map_err(|e| anyhow::anyhow!("post_hook[{i}] failed for {}: {e}", seed.name))?;
+    }
+
     Ok((total_rows, schema))
+}
+
+#[cfg(all(test, feature = "duckdb"))]
+mod tests {
+    use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    use rocky_core::seeds::{SeedConfig, SeedFormat, SeedTarget};
+    use rocky_core::traits::WarehouseAdapter;
+    use rocky_duckdb::DuckDbConnector;
+    use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+    /// Build a `SeedFile` backed by a temp CSV with the given hooks.
+    fn seed_with_hooks(
+        dir: &Path,
+        csv: &str,
+        pre_hook: Vec<String>,
+        post_hook: Vec<String>,
+    ) -> SeedFile {
+        let path = dir.join("widgets.csv");
+        std::fs::write(&path, csv).unwrap();
+        SeedFile {
+            name: "widgets".into(),
+            file_path: path,
+            format: SeedFormat::Csv,
+            config: SeedConfig {
+                target: Some(SeedTarget {
+                    catalog: None,
+                    schema: "seeds".into(),
+                    table: Some("widgets".into()),
+                }),
+                pre_hook,
+                post_hook,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Coerce a DuckDB scalar cell to i64 — the driver may serialize counts as
+    /// either a JSON number or a string.
+    fn cell_as_i64(value: &serde_json::Value) -> i64 {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or_else(|| panic!("expected integer cell, got {value:?}"))
+    }
+
+    fn row_count(conn: &Arc<Mutex<DuckDbConnector>>, table: &str) -> i64 {
+        let guard = conn.lock().unwrap();
+        let result = guard
+            .execute_sql(&format!("SELECT COUNT(*) FROM {table}"))
+            .unwrap();
+        cell_as_i64(&result.rows[0][0])
+    }
+
+    /// (a) A pre_hook that errors aborts the load before any write — the
+    /// pre-existing target row survives because the DROP never fired.
+    #[tokio::test]
+    async fn pre_hook_error_aborts_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        let conn = adapter.shared_connector();
+
+        // Pre-populate the destructive target with a sentinel row.
+        adapter
+            .execute_statement("CREATE SCHEMA IF NOT EXISTS seeds")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement("CREATE TABLE seeds.widgets (id BIGINT, name VARCHAR)")
+            .await
+            .unwrap();
+        adapter
+            .execute_statement("INSERT INTO seeds.widgets VALUES (99, 'sentinel')")
+            .await
+            .unwrap();
+
+        // A guard that fails: abort when the target already holds rows.
+        let seed = seed_with_hooks(
+            dir.path(),
+            "id,name\n1,Alice\n2,Bob\n",
+            vec![
+                "SELECT CASE WHEN (SELECT COUNT(*) FROM seeds.widgets) > 0 \
+                 THEN error('target not empty') END"
+                    .into(),
+            ],
+            vec![],
+        );
+
+        let dialect = adapter.dialect();
+        let result = load_single_seed(&seed, dialect, &adapter, "", "seeds").await;
+
+        assert!(result.is_err(), "pre_hook failure must abort the seed");
+        // The original sentinel row is intact — the DROP never ran.
+        assert_eq!(row_count(&conn, "seeds.widgets"), 1);
+        let guard = conn.lock().unwrap();
+        let names = guard.execute_sql("SELECT name FROM seeds.widgets").unwrap();
+        assert_eq!(names.rows[0][0].as_str(), Some("sentinel"));
+    }
+
+    /// (b) A clean pre_hook proceeds and the seed loads its rows.
+    #[tokio::test]
+    async fn clean_pre_hook_proceeds_and_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        let conn = adapter.shared_connector();
+
+        let seed = seed_with_hooks(
+            dir.path(),
+            "id,name\n1,Alice\n2,Bob\n3,Carol\n",
+            // Trivially-true guard: target is empty, so no error.
+            vec!["SELECT 1".into()],
+            vec![],
+        );
+
+        let dialect = adapter.dialect();
+        load_single_seed(&seed, dialect, &adapter, "", "seeds")
+            .await
+            .expect("clean pre_hook should allow the load");
+
+        // The DB is the source of truth: all 3 CSV rows landed.
+        assert_eq!(row_count(&conn, "seeds.widgets"), 3);
+    }
+
+    /// (c) A post_hook runs after a successful load.
+    #[tokio::test]
+    async fn post_hook_runs_after_successful_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        let conn = adapter.shared_connector();
+
+        let seed = seed_with_hooks(
+            dir.path(),
+            "id,name\n1,Alice\n2,Bob\n",
+            vec![],
+            // Side-effecting post_hook: materialize a marker table that can
+            // only exist if the post_hook fired after the load.
+            vec![
+                "CREATE TABLE seeds.post_marker AS \
+                 SELECT COUNT(*) AS loaded FROM seeds.widgets"
+                    .into(),
+            ],
+        );
+
+        let dialect = adapter.dialect();
+        load_single_seed(&seed, dialect, &adapter, "", "seeds")
+            .await
+            .expect("seed with post_hook should succeed");
+
+        assert_eq!(row_count(&conn, "seeds.widgets"), 2);
+        // The marker exists and recorded the loaded row count — proving the
+        // post_hook fired after the load completed.
+        let guard = conn.lock().unwrap();
+        let marker = guard
+            .execute_sql("SELECT loaded FROM seeds.post_marker")
+            .unwrap();
+        assert_eq!(cell_as_i64(&marker.rows[0][0]), 2);
+    }
 }
