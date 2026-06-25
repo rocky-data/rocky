@@ -36,6 +36,39 @@ use super::dbt_sources;
 // Public types
 // ---------------------------------------------------------------------------
 
+/// How a dbt microbatch model is translated on import.
+///
+/// dbt microbatch idempotently replaces each event-time partition. Rocky
+/// can express that faithfully as a [`StrategyConfig::TimeInterval`] model
+/// (bounded `@start_date`/`@end_date` window + lookback), but doing so
+/// requires rewriting the model body to reference those placeholders — not
+/// always safe. The default keeps the historical `merge` mapping for
+/// back-compat; `--microbatch-as=time_interval` opts into the
+/// bounded-window translation, falling back to `merge` (loudly) whenever the
+/// body can't be rewritten safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MicrobatchMode {
+    /// Map to an idempotent `merge` (or append-only when no `unique_key`).
+    /// The historical default — preserves existing import behavior.
+    #[default]
+    Merge,
+    /// Map to a `time_interval` model with a bounded per-partition window,
+    /// deriving granularity/lookback from the dbt config. Falls back to
+    /// `Merge` with a warning when the body can't be rewritten safely.
+    TimeInterval,
+}
+
+impl MicrobatchMode {
+    /// Parse the `--microbatch-as` CLI value. Unknown values map to the
+    /// default ([`MicrobatchMode::Merge`]); the caller validates the flag.
+    pub fn from_flag(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "time_interval" => Self::TimeInterval,
+            _ => Self::Merge,
+        }
+    }
+}
+
 /// How the import was performed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportMethod {
@@ -248,6 +281,7 @@ pub fn import_from_manifest(
     manifest: &DbtManifest,
     default_target: &TargetConfig,
     skip_unit_tests: bool,
+    microbatch_mode: MicrobatchMode,
 ) -> ImportResult {
     let mut result = ImportResult {
         imported: Vec::new(),
@@ -288,7 +322,7 @@ pub fn import_from_manifest(
         .count();
 
     for node in manifest.nodes.values() {
-        import_manifest_node(node, default_target, &mut result);
+        import_manifest_node(node, default_target, microbatch_mode, &mut result);
     }
 
     if model_count > 0 && with_compiled == 0 {
@@ -687,6 +721,7 @@ fn attach_intent(result: &mut ImportResult, model_name: &str, description: Optio
 fn import_manifest_node(
     node: &DbtManifestNode,
     default_target: &TargetConfig,
+    microbatch_mode: MicrobatchMode,
     result: &mut ImportResult,
 ) {
     // Resolve the model's output coordinates up front so the raw-code fallback
@@ -711,7 +746,7 @@ fn import_manifest_node(
     let this_ref = format!("{catalog}.{schema}.{table}");
 
     // Use compiled_code (Jinja resolved) if available, else raw_code.
-    let sql = match &node.compiled_code {
+    let mut sql = match &node.compiled_code {
         Some(code) => code.clone(),
         None => {
             result.warnings.push(ImportWarning {
@@ -732,9 +767,17 @@ fn import_manifest_node(
         strategy,
         warnings: strategy_warnings,
         structured,
-    } = map_manifest_strategy(&node.config, &node.name);
+    } = map_manifest_strategy(&node.config, &node.name, microbatch_mode);
     result.warnings.extend(strategy_warnings);
     result.structured_warnings.extend(structured);
+
+    // A `time_interval` strategy can only originate from microbatch translation
+    // (`--microbatch-as=time_interval`). The model body must reference
+    // `@start_date`/`@end_date` so the runtime can bound each partition; wrap
+    // the original SELECT in a bounded subquery on the event-time column.
+    if let StrategyConfig::TimeInterval { time_column, .. } = &strategy {
+        sql = rewrite_body_for_time_interval(&sql, time_column);
+    }
 
     // Surface dbt-databricks specifics that Rocky doesn't auto-translate
     // (databricks_tags, pre/post hooks, on_schema_change). Emitted as
@@ -800,7 +843,11 @@ struct StrategyMappingOutput {
 /// (across all `incremental_strategy` values) / `ephemeral` /
 /// `microbatch`. Unknown materializations fall back to `FullRefresh` with
 /// a warning.
-fn map_manifest_strategy(config: &DbtNodeConfig, model_name: &str) -> StrategyMappingOutput {
+fn map_manifest_strategy(
+    config: &DbtNodeConfig,
+    model_name: &str,
+    microbatch_mode: MicrobatchMode,
+) -> StrategyMappingOutput {
     let mut warnings = Vec::new();
     let mut structured = Vec::new();
 
@@ -825,10 +872,20 @@ fn map_manifest_strategy(config: &DbtNodeConfig, model_name: &str) -> StrategyMa
             });
             StrategyConfig::FullRefresh
         }
-        "incremental" => {
-            map_incremental_strategy(config, model_name, &mut warnings, &mut structured)
-        }
-        "microbatch" => map_microbatch_strategy(config, model_name, &mut warnings, &mut structured),
+        "incremental" => map_incremental_strategy(
+            config,
+            model_name,
+            microbatch_mode,
+            &mut warnings,
+            &mut structured,
+        ),
+        "microbatch" => map_microbatch_strategy(
+            config,
+            model_name,
+            microbatch_mode,
+            &mut warnings,
+            &mut structured,
+        ),
         other => {
             warnings.push(ImportWarning {
                 model: model_name.to_string(),
@@ -861,6 +918,7 @@ fn map_manifest_strategy(config: &DbtNodeConfig, model_name: &str) -> StrategyMa
 fn map_incremental_strategy(
     config: &DbtNodeConfig,
     model_name: &str,
+    microbatch_mode: MicrobatchMode,
     warnings: &mut Vec<ImportWarning>,
     structured: &mut Vec<ImportDbtStructuredWarning>,
 ) -> StrategyConfig {
@@ -982,7 +1040,7 @@ fn map_incremental_strategy(
             // microbatch form (`incremental_strategy='microbatch'`), so the
             // MicrobatchMapped structured warning must be threaded out to the
             // caller, not dropped into a local vec.
-            map_microbatch_strategy(config, model_name, warnings, structured)
+            map_microbatch_strategy(config, model_name, microbatch_mode, warnings, structured)
         }
         other => {
             warnings.push(ImportWarning {
@@ -1003,12 +1061,27 @@ fn map_incremental_strategy(
 }
 
 /// Map `materialized='microbatch'` (or `incremental_strategy='microbatch'`)
-/// to [`StrategyConfig::Microbatch`]. Emits a
+/// to a Rocky strategy. Emits a
 /// [`ImportDbtStructuredWarning::MicrobatchMissingEventTime`] + falls back
 /// to `FullRefresh` if `event_time` is absent.
+///
+/// When `microbatch_mode` is [`MicrobatchMode::TimeInterval`] and the
+/// `event_time` field is a valid SQL identifier, this produces a
+/// [`StrategyConfig::TimeInterval`] with bounded per-partition windows
+/// (granularity + lookback derived from the dbt `batch_size`/`lookback`
+/// config). The caller is responsible for rewriting the model body to
+/// reference `@start_date`/`@end_date` (see [`rewrite_body_for_time_interval`]).
+/// When the `event_time` field can't be rewritten safely, it falls back to
+/// the `merge` mapping and warns that bounded-window semantics were not
+/// preserved.
+///
+/// The default [`MicrobatchMode::Merge`] keeps the historical behavior: dbt
+/// microbatch idempotently replaces each batch partition, so it maps to an
+/// idempotent Rocky merge (key-upsert) — or append-only when no `unique_key`.
 fn map_microbatch_strategy(
     config: &DbtNodeConfig,
     model_name: &str,
+    microbatch_mode: MicrobatchMode,
     warnings: &mut Vec<ImportWarning>,
     structured: &mut Vec<ImportDbtStructuredWarning>,
 ) -> StrategyConfig {
@@ -1026,6 +1099,44 @@ fn map_microbatch_strategy(
         });
         return StrategyConfig::FullRefresh;
     };
+
+    // `--microbatch-as=time_interval`: try the faithful bounded-window
+    // mapping. The body rewrite injects `@start_date`/`@end_date` bounds on
+    // `event_time`, so the column must be a safe SQL identifier; if it isn't,
+    // fall through to the merge mapping and warn that the bounded-window
+    // semantics were not preserved.
+    if microbatch_mode == MicrobatchMode::TimeInterval {
+        if rocky_sql::validation::validate_identifier(&event_time).is_ok() {
+            let granularity = microbatch_granularity(config.batch_size.as_deref());
+            structured.push(ImportDbtStructuredWarning::MicrobatchMapped {
+                model: model_name.to_string(),
+                mapped_to: "time_interval".to_string(),
+            });
+            return StrategyConfig::TimeInterval {
+                time_column: event_time,
+                granularity,
+                lookback: config.lookback.unwrap_or(0),
+                // dbt has no equivalent of Rocky's batch_size (partition
+                // count per SQL statement); default to atomic per-partition.
+                batch_size: std::num::NonZeroU32::new(1).expect("1 is non-zero"),
+                first_partition: None,
+            };
+        }
+        warnings.push(ImportWarning {
+            model: model_name.to_string(),
+            category: WarningCategory::UnsupportedMaterialization,
+            message: format!(
+                "microbatch event_time '{event_time}' is not a safe SQL identifier — \
+                 could not rewrite the body to a bounded time_interval window; mapped to merge instead, \
+                 so dbt's bounded-window semantics were not preserved"
+            ),
+            suggestion: Some(
+                "set `event_time` to a plain column name in the dbt config, or hand-author a Rocky time_interval model with @start_date/@end_date".to_string(),
+            ),
+        });
+        // Fall through to the merge mapping below.
+    }
+
     // dbt microbatch idempotently REPLACES each batch partition. Rocky's
     // Microbatch strategy emits an append-only INSERT (sql_gen.rs), so importing
     // it as-is silently re-inserts the lookback window every run. dbt microbatch
@@ -1077,6 +1188,47 @@ fn map_microbatch_strategy(
             }
         }
     }
+}
+
+/// Map dbt's microbatch `batch_size` (`hour` / `day` / `month` / `year`) to a
+/// Rocky [`TimeGrain`]. dbt's `batch_size` is a *granularity*, not a count —
+/// it names the size of each partition window. Unrecognized or absent values
+/// default to `Day`, matching dbt's most common configuration.
+fn microbatch_granularity(batch_size: Option<&str>) -> rocky_ir::TimeGrain {
+    match batch_size.map(str::to_ascii_lowercase).as_deref() {
+        Some("hour") => rocky_ir::TimeGrain::Hour,
+        Some("month") => rocky_ir::TimeGrain::Month,
+        Some("year") => rocky_ir::TimeGrain::Year,
+        // "day" and anything unrecognized.
+        _ => rocky_ir::TimeGrain::Day,
+    }
+}
+
+/// Rewrite a model body so a `time_interval` strategy can bound each
+/// partition. dbt's `compiled_code` for a microbatch model carries no
+/// event-time filter (dbt injects the window at run time), so we wrap the
+/// original SELECT in a bounded subquery keyed on `event_time`:
+///
+/// ```sql
+/// SELECT * FROM (
+///   <original body>
+/// ) AS _rocky_microbatch
+/// WHERE event_time >= @start_date AND event_time < @end_date
+/// ```
+///
+/// Wrapping the whole query is safe against CTEs, `GROUP BY`, and set
+/// operations, and keeps `event_time` in the output so the compiler's
+/// `time_column` validation passes. The half-open `>= @start_date AND
+/// < @end_date` bound matches the runtime's partition filter in
+/// `sql_gen::generate_transformation_sql` (insert_overwrite_partition).
+///
+/// The caller has already validated `event_time` as a SQL identifier before
+/// choosing the `time_interval` strategy.
+fn rewrite_body_for_time_interval(sql: &str, event_time: &str) -> String {
+    let body = sql.trim().trim_end_matches(';');
+    format!(
+        "SELECT * FROM (\n{body}\n) AS _rocky_microbatch\nWHERE {event_time} >= @start_date AND {event_time} < @end_date"
+    )
 }
 
 /// Collect structured warnings for dbt config Rocky can't auto-translate
@@ -1818,7 +1970,12 @@ fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
         merge_exclude_columns: None,
     };
 
-    let mapping = map_manifest_strategy(&synthetic, "<regex-path>");
+    // The regex (`--no-manifest`) path always uses the default microbatch
+    // mapping. The `--microbatch-as=time_interval` translation needs the
+    // model's compiled body to rewrite (it injects `@start_date`/`@end_date`),
+    // which only the manifest path reliably provides; opting it in on the
+    // reduced-fidelity regex path would risk corrupting un-compiled Jinja.
+    let mapping = map_manifest_strategy(&synthetic, "<regex-path>", MicrobatchMode::Merge);
     for w in mapping.warnings {
         messages.push(w.message);
     }
@@ -2184,7 +2341,7 @@ FROM raw.orders
             schema: "staging".to_string(),
             table: String::new(),
         };
-        let result = import_from_manifest(&manifest, &target, false);
+        let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
 
         assert_eq!(result.import_method, ImportMethod::Manifest);
         assert_eq!(result.imported.len(), 1);
@@ -2297,7 +2454,7 @@ models:
             schema: "s".to_string(),
             table: String::new(),
         };
-        let result = import_from_manifest(&manifest, &target, false);
+        let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
 
         assert_eq!(result.imported.len(), 1);
         assert!(matches!(
@@ -2341,7 +2498,7 @@ models:
             schema: "s".to_string(),
             table: String::new(),
         };
-        let result = import_from_manifest(&manifest, &target, false);
+        let result = import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge);
 
         assert_eq!(result.imported.len(), 1);
         assert!(matches!(
@@ -2520,7 +2677,152 @@ FROM {{ ref('stg_events') }}
             schema: "s".to_string(),
             table: String::new(),
         };
-        import_from_manifest(&manifest, &target, false)
+        import_from_manifest(&manifest, &target, false, MicrobatchMode::Merge)
+    }
+
+    fn import_from_manifest_json_with_mode(
+        manifest_json: &serde_json::Value,
+        mode: MicrobatchMode,
+    ) -> ImportResult {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, manifest_json.to_string()).unwrap();
+        let manifest = dbt_manifest::parse_manifest(&path).unwrap();
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+        import_from_manifest(&manifest, &target, false, mode)
+    }
+
+    #[test]
+    fn test_microbatch_as_time_interval_emits_time_interval_strategy() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.events_daily": {
+                "unique_id": "model.p.events_daily", "name": "events_daily",
+                "resource_type": "model",
+                "compiled_code": "SELECT event_ts, amount FROM raw.events",
+                "raw_code": "SELECT event_ts, amount FROM raw.events",
+                "depends_on": { "nodes": [], "macros": [] },
+                "config": {
+                    "materialized": "incremental",
+                    "incremental_strategy": "microbatch",
+                    "event_time": "event_ts",
+                    "batch_size": "day",
+                    "lookback": 3,
+                    "unique_key": "id"
+                },
+                "columns": {}, "tags": [], "schema": "s", "database": "d"
+            }},
+            "sources": {}
+        });
+        let result = import_from_manifest_json_with_mode(&manifest, MicrobatchMode::TimeInterval);
+        let model = &result.imported[0];
+        match &model.config.strategy {
+            StrategyConfig::TimeInterval {
+                time_column,
+                granularity,
+                lookback,
+                batch_size,
+                ..
+            } => {
+                assert_eq!(time_column, "event_ts");
+                assert_eq!(*granularity, rocky_ir::TimeGrain::Day);
+                assert_eq!(*lookback, 3);
+                assert_eq!(batch_size.get(), 1);
+            }
+            other => panic!("expected TimeInterval, got {other:?}"),
+        }
+        // Body must reference @start_date/@end_date so the runtime can bound it.
+        assert!(
+            model.sql.contains("@start_date") && model.sql.contains("@end_date"),
+            "rewritten body must inject the partition placeholders: {}",
+            model.sql
+        );
+        assert!(
+            model
+                .sql
+                .contains("event_ts >= @start_date AND event_ts < @end_date"),
+            "half-open bound must match the runtime partition filter: {}",
+            model.sql
+        );
+        assert!(
+            result.structured_warnings.iter().any(|w| matches!(w,
+                ImportDbtStructuredWarning::MicrobatchMapped { mapped_to, .. }
+                    if mapped_to == "time_interval")),
+            "must record the time_interval mapping"
+        );
+    }
+
+    #[test]
+    fn test_microbatch_default_mode_still_maps_to_merge() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.f": model_node("f",
+                serde_json::json!({ "materialized": "microbatch", "event_time": "ts", "batch_size": "day", "unique_key": "id" }),
+                serde_json::json!([])) },
+            "sources": {}
+        });
+        // Default mode is Merge — back-compat: no time_interval emitted.
+        let result = import_from_manifest_json(&manifest);
+        assert!(matches!(
+            result.imported[0].config.strategy,
+            StrategyConfig::Merge { .. }
+        ));
+        assert!(!result.imported[0].sql.contains("@start_date"));
+    }
+
+    #[test]
+    fn test_microbatch_as_time_interval_unsafe_event_time_falls_back_to_merge() {
+        // An event_time that isn't a plain identifier can't be safely
+        // interpolated; the importer must fall back to merge and warn that
+        // bounded-window semantics were not preserved.
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.f": model_node("f",
+                serde_json::json!({ "materialized": "microbatch", "event_time": "ts; DROP TABLE x", "batch_size": "day", "unique_key": "id" }),
+                serde_json::json!([])) },
+            "sources": {}
+        });
+        let result = import_from_manifest_json_with_mode(&manifest, MicrobatchMode::TimeInterval);
+        assert!(
+            matches!(
+                result.imported[0].config.strategy,
+                StrategyConfig::Merge { .. }
+            ),
+            "unsafe event_time must fall back to merge"
+        );
+        assert!(
+            result.warnings.iter().any(|w| w
+                .message
+                .contains("bounded-window semantics were not preserved")),
+            "must warn that the bounded-window mapping was skipped"
+        );
+    }
+
+    #[test]
+    fn test_microbatch_granularity_maps_batch_size() {
+        assert_eq!(
+            microbatch_granularity(Some("hour")),
+            rocky_ir::TimeGrain::Hour
+        );
+        assert_eq!(microbatch_granularity(Some("day")), rocky_ir::TimeGrain::Day);
+        assert_eq!(
+            microbatch_granularity(Some("month")),
+            rocky_ir::TimeGrain::Month
+        );
+        assert_eq!(
+            microbatch_granularity(Some("year")),
+            rocky_ir::TimeGrain::Year
+        );
+        // Absent / unknown defaults to Day.
+        assert_eq!(microbatch_granularity(None), rocky_ir::TimeGrain::Day);
+        assert_eq!(
+            microbatch_granularity(Some("weird")),
+            rocky_ir::TimeGrain::Day
+        );
     }
 
     #[test]
@@ -3400,7 +3702,7 @@ FROM {{ ref('stg_events') }}
             table: String::new(),
         };
 
-        let result = import_from_manifest(&manifest, &target, /* skip_unit_tests */ true);
+        let result = import_from_manifest(&manifest, &target, /* skip_unit_tests */ true, MicrobatchMode::Merge);
 
         assert_eq!(result.unit_tests_found, 1);
         assert_eq!(result.unit_tests_converted, 0);
