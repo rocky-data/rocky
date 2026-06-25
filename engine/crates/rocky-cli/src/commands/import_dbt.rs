@@ -30,7 +30,10 @@ use anyhow::Result;
 
 use rocky_compiler::import::{
     dbt,
-    dbt::{HookKind, ImportDbtStructuredWarning as CompilerStructuredWarning, ImportResult},
+    dbt::{
+        HookKind, ImportDbtStructuredWarning as CompilerStructuredWarning, ImportResult,
+        ImportWarning, WarningCategory,
+    },
     dbt_manifest, dbt_profiles,
     dbt_profiles::{AdapterKind, ProfileResolution, StubReason},
     emit,
@@ -65,13 +68,28 @@ pub fn run_import_dbt(
     let default_target = default_target_from_profile(&profile);
 
     // Run the existing importer to produce the per-model translation result.
-    let import_result = run_importer(
+    let mut import_result = run_importer(
         dbt_project,
         &default_target,
         manifest_path,
         no_manifest,
         skip_unit_tests,
     )?;
+
+    // A `profiles.yml` that was present but couldn't be resolved fell back to
+    // a stub DuckDB adapter. Surface it loudly (a warning + in `--output json`)
+    // so the migration never silently defaults to duckdb.
+    if let Some(reason) = &profile.fallback_reason {
+        tracing::warn!(reason = %reason, "dbt profiles.yml fell back to a stub DuckDB adapter");
+        import_result.warnings.push(ImportWarning {
+            model: "<profiles.yml>".to_string(),
+            category: WarningCategory::ProfileFallback,
+            message: reason.clone(),
+            suggestion: Some(
+                "edit the [adapter] block in the emitted rocky.toml to point at your real warehouse".to_string(),
+            ),
+        });
+    }
 
     // Capture which models had their `view` materialization flattened to
     // FullRefresh by the importer — we re-rewrite those to Ephemeral at
@@ -157,6 +175,7 @@ pub fn run_import_dbt(
             unit_tests_converted: import_result.unit_tests_converted,
             unit_tests_skipped: import_result.unit_tests_skipped,
             constructs_dropped: import_result.constructs_dropped,
+            contracts_dropped: import_result.contracts_dropped,
             macros_detected: import_result.macros_detected,
             imported_models: import_result
                 .imported
@@ -364,6 +383,17 @@ fn to_cli_structured_warning(w: &CompilerStructuredWarning) -> ImportDbtStructur
             construct: construct.clone(),
             name: name.clone(),
             detail: detail.clone(),
+        },
+        CompilerStructuredWarning::DroppedContract {
+            model,
+            typed_columns,
+            constraints,
+            contract_path,
+        } => ImportDbtStructuredWarning::DroppedContract {
+            model: model.clone(),
+            typed_columns: *typed_columns,
+            constraints: *constraints,
+            contract_path: contract_path.clone(),
         },
     }
 }

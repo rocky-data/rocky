@@ -21,7 +21,7 @@ class BreakingChange(BaseModel):
     model: str
 
 
-class Kind75(StrEnum):
+class Kind76(StrEnum):
     model_added = "model_added"
 
 
@@ -30,11 +30,11 @@ class BreakingChange70(BaseModel):
     A model present on the head side is absent on the base side.
     """
 
-    kind: Kind75
+    kind: Kind76
     model: str
 
 
-class Kind76(StrEnum):
+class Kind77(StrEnum):
     column_dropped = "column_dropped"
 
 
@@ -45,11 +45,11 @@ class BreakingChange71(BaseModel):
 
     column: str
     data_type: str
-    kind: Kind76
+    kind: Kind77
     model: str
 
 
-class Kind77(StrEnum):
+class Kind78(StrEnum):
     column_added = "column_added"
 
 
@@ -60,12 +60,12 @@ class BreakingChange72(BaseModel):
 
     column: str
     data_type: str
-    kind: Kind77
+    kind: Kind78
     model: str
     nullable: bool
 
 
-class Kind78(StrEnum):
+class Kind79(StrEnum):
     column_type_changed = "column_type_changed"
 
 
@@ -75,7 +75,7 @@ class BreakingChange73(BaseModel):
     """
 
     column: str
-    kind: Kind78
+    kind: Kind79
     model: str
     narrowing: bool
     """
@@ -85,7 +85,7 @@ class BreakingChange73(BaseModel):
     old_type: str
 
 
-class Kind79(StrEnum):
+class Kind80(StrEnum):
     column_nullability_changed = "column_nullability_changed"
 
 
@@ -95,13 +95,13 @@ class BreakingChange74(BaseModel):
     """
 
     column: str
-    kind: Kind79
+    kind: Kind80
     model: str
     new_nullable: bool
     old_nullable: bool
 
 
-class Kind80(StrEnum):
+class Kind81(StrEnum):
     column_reordered = "column_reordered"
 
 
@@ -111,13 +111,13 @@ class BreakingChange75(BaseModel):
     """
 
     column: str
-    kind: Kind80
+    kind: Kind81
     model: str
     new_index: conint(ge=0)
     old_index: conint(ge=0)
 
 
-class Kind81(StrEnum):
+class Kind82(StrEnum):
     materialization_strategy_changed = "materialization_strategy_changed"
 
 
@@ -126,13 +126,13 @@ class BreakingChange76(BaseModel):
     The materialization strategy switched between top-level variants (e.g. `FullRefresh` → `Incremental`).
     """
 
-    kind: Kind81
+    kind: Kind82
     model: str
     new_strategy: str
     old_strategy: str
 
 
-class Kind82(StrEnum):
+class Kind83(StrEnum):
     materialization_key_changed = "materialization_key_changed"
 
 
@@ -145,21 +145,6 @@ class BreakingChange77(BaseModel):
     """
     Which key changed: `unique_key`, `timestamp_column`, `partition_by`, `time_column`, `granularity`, `target_lag`, `update_columns`, `storage_prefix`, or `partition_columns`.
     """
-    kind: Kind82
-    model: str
-    new: list[str]
-    old: list[str]
-
-
-class Kind83(StrEnum):
-    replication_columns_changed = "replication_columns_changed"
-
-
-class BreakingChange78(BaseModel):
-    """
-    Replication column-selection mode flipped between `All` and `Explicit(...)` or the explicit list changed.
-    """
-
     kind: Kind83
     model: str
     new: list[str]
@@ -167,12 +152,12 @@ class BreakingChange78(BaseModel):
 
 
 class Kind84(StrEnum):
-    partition_by_changed = "partition_by_changed"
+    replication_columns_changed = "replication_columns_changed"
 
 
-class BreakingChange79(BaseModel):
+class BreakingChange78(BaseModel):
     """
-    `LakehouseOptions::partition_by` changed without the strategy changing. Distinct from `MaterializationKeyChanged` since this lives on `format_options` rather than the strategy enum.
+    Replication column-selection mode flipped between `All` and `Explicit(...)` or the explicit list changed.
     """
 
     kind: Kind84
@@ -182,6 +167,21 @@ class BreakingChange79(BaseModel):
 
 
 class Kind85(StrEnum):
+    partition_by_changed = "partition_by_changed"
+
+
+class BreakingChange79(BaseModel):
+    """
+    `LakehouseOptions::partition_by` changed without the strategy changing. Distinct from `MaterializationKeyChanged` since this lives on `format_options` rather than the strategy enum.
+    """
+
+    kind: Kind85
+    model: str
+    new: list[str]
+    old: list[str]
+
+
+class Kind86(StrEnum):
     target_renamed = "target_renamed"
 
 
@@ -190,13 +190,13 @@ class BreakingChange80(BaseModel):
     Target table reference renamed (catalog, schema, or table component).
     """
 
-    kind: Kind85
+    kind: Kind86
     model: str
     new: str
     old: str
 
 
-class Kind86(StrEnum):
+class Kind87(StrEnum):
     source_changed = "source_changed"
 
 
@@ -205,13 +205,13 @@ class BreakingChange81(BaseModel):
     Source reference rebound to a different table.
     """
 
-    kind: Kind86
+    kind: Kind87
     model: str
     new: list[str]
     old: list[str]
 
 
-class Kind87(StrEnum):
+class Kind88(StrEnum):
     column_mask_changed = "column_mask_changed"
 
 
@@ -221,13 +221,13 @@ class BreakingChange82(BaseModel):
     """
 
     column: str
-    kind: Kind87
+    kind: Kind88
     model: str
     new_strategy: str | None = None
     old_strategy: str | None = None
 
 
-class Kind88(StrEnum):
+class Kind89(StrEnum):
     lakehouse_format_changed = "lakehouse_format_changed"
 
 
@@ -236,13 +236,13 @@ class BreakingChange83(BaseModel):
     Lakehouse format switched (e.g. `DeltaTable` → `IcebergTable`).
     """
 
-    kind: Kind88
+    kind: Kind89
     model: str
     new: str
     old: str
 
 
-class Kind89(StrEnum):
+class Kind90(StrEnum):
     sql_body_changed = "sql_body_changed"
 
 
@@ -251,7 +251,7 @@ class BreakingChange84(BaseModel):
     SQL body changed without any other detectable structural change. Surfaced as `Info` because the typed-output shape is unchanged, but runtime row contents may differ.
     """
 
-    kind: Kind89
+    kind: Kind90
     model: str
 
 

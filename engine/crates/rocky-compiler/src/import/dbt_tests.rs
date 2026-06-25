@@ -480,6 +480,51 @@ pub fn tests_to_test_decls(
                             test_name: "relationships".to_string(),
                         }),
                     },
+                    // dbt_expectations / dbt_utils long-tail tests with a
+                    // clear native Rocky equivalent. Anything whose payload
+                    // can't be translated (e.g. a regex the strict allowlist
+                    // rejects) keeps the UnsupportedTest warning.
+                    "dbt_expectations.expect_column_values_to_be_between"
+                    | "dbt_utils.accepted_range" => {
+                        push_or_unsupported(
+                            in_range_decl(&col.name, config),
+                            &mut decls,
+                            &mut unsupported,
+                            &model.name,
+                            &col.name,
+                            name,
+                        );
+                    }
+                    "dbt_expectations.expect_column_values_to_match_regex" => {
+                        push_or_unsupported(
+                            regex_match_decl(&col.name, config),
+                            &mut decls,
+                            &mut unsupported,
+                            &model.name,
+                            &col.name,
+                            name,
+                        );
+                    }
+                    "dbt_expectations.expect_column_values_to_be_in_set" => {
+                        push_or_unsupported(
+                            accepted_values_from_set_decl(&col.name, config),
+                            &mut decls,
+                            &mut unsupported,
+                            &model.name,
+                            &col.name,
+                            name,
+                        );
+                    }
+                    "dbt_utils.expression_is_true" | "dbt_expectations.expression_is_true" => {
+                        push_or_unsupported(
+                            expression_decl(Some(&col.name), config),
+                            &mut decls,
+                            &mut unsupported,
+                            &model.name,
+                            &col.name,
+                            name,
+                        );
+                    }
                     other => {
                         unsupported.push(UnsupportedTest {
                             model: model.name.clone(),
@@ -502,6 +547,22 @@ pub fn tests_to_test_decls(
                     || name == "dbt_utils.unique_combination_of_columns" =>
             {
                 match composite_unique_decl(config) {
+                    Some(decl) => decls.push(decl),
+                    None => unsupported.push(UnsupportedTest {
+                        model: model.name.clone(),
+                        column: None,
+                        test_name: name.clone(),
+                    }),
+                }
+            }
+            // `dbt_utils.expression_is_true` is most often declared at model
+            // level (it asserts a row-level SQL predicate, no column anchor).
+            // Map it to a Rocky `expression` test.
+            DbtTestDef::Configured { name, config }
+                if name == "dbt_utils.expression_is_true"
+                    || name == "dbt_expectations.expression_is_true" =>
+            {
+                match expression_decl(None, config) {
                     Some(decl) => decls.push(decl),
                     None => unsupported.push(UnsupportedTest {
                         model: model.name.clone(),
@@ -599,6 +660,126 @@ fn relationships_decl(
         severity: config_severity(config),
         filter: config_filter(config),
     })
+}
+
+/// Push a converted `[`TestDecl`]` or record an `[`UnsupportedTest`]` when
+/// the long-tail conversion couldn't produce a native equivalent (e.g. a
+/// regex the strict allowlist rejects, or a missing config key).
+fn push_or_unsupported(
+    decl: Option<TestDecl>,
+    decls: &mut Vec<TestDecl>,
+    unsupported: &mut Vec<UnsupportedTest>,
+    model: &str,
+    column: &str,
+    test_name: &str,
+) {
+    match decl {
+        Some(d) => decls.push(d),
+        None => unsupported.push(UnsupportedTest {
+            model: model.to_string(),
+            column: Some(column.to_string()),
+            test_name: test_name.to_string(),
+        }),
+    }
+}
+
+/// Convert a `min_value` / `max_value` range test
+/// (`dbt_expectations.expect_column_values_to_be_between`,
+/// `dbt_utils.accepted_range`) to a Rocky [`TestType::InRange`]. At least one
+/// bound must be present.
+fn in_range_decl(col_name: &str, config: &HashMap<String, serde_yaml::Value>) -> Option<TestDecl> {
+    let min = config.get("min_value").map(yaml_scalar_to_string);
+    let max = config.get("max_value").map(yaml_scalar_to_string);
+    if min.is_none() && max.is_none() {
+        return None;
+    }
+    Some(TestDecl {
+        test_type: TestType::InRange { min, max },
+        column: Some(col_name.to_string()),
+        severity: config_severity(config),
+        filter: config_filter(config),
+    })
+}
+
+/// Convert `dbt_expectations.expect_column_values_to_match_regex` to a Rocky
+/// [`TestType::RegexMatch`]. The pattern is validated by the compiler's
+/// strict allowlist later; here we only require it to be present and a
+/// string.
+fn regex_match_decl(
+    col_name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+) -> Option<TestDecl> {
+    let pattern = config.get("regex")?.as_str()?.to_string();
+    if pattern.is_empty() {
+        return None;
+    }
+    Some(TestDecl {
+        test_type: TestType::RegexMatch { pattern },
+        column: Some(col_name.to_string()),
+        severity: config_severity(config),
+        filter: config_filter(config),
+    })
+}
+
+/// Convert `dbt_expectations.expect_column_values_to_be_in_set` (config key
+/// `value_set`) to a Rocky [`TestType::AcceptedValues`].
+fn accepted_values_from_set_decl(
+    col_name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+) -> Option<TestDecl> {
+    let raw = config.get("value_set")?;
+    let values: Vec<String> = match raw {
+        serde_yaml::Value::Sequence(seq) => seq
+            .iter()
+            .filter_map(|v| match v {
+                serde_yaml::Value::String(s) => Some(s.clone()),
+                serde_yaml::Value::Number(n) => Some(n.to_string()),
+                serde_yaml::Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => return None,
+    };
+    if values.is_empty() {
+        return None;
+    }
+    Some(TestDecl {
+        test_type: TestType::AcceptedValues { values },
+        column: Some(col_name.to_string()),
+        severity: config_severity(config),
+        filter: config_filter(config),
+    })
+}
+
+/// Convert `dbt_utils.expression_is_true` (config key `expression`) to a
+/// Rocky [`TestType::Expression`]. `column` is the optional anchor — `None`
+/// for model-level tests.
+fn expression_decl(
+    column: Option<&str>,
+    config: &HashMap<String, serde_yaml::Value>,
+) -> Option<TestDecl> {
+    let expression = config.get("expression")?.as_str()?.to_string();
+    if expression.trim().is_empty() {
+        return None;
+    }
+    Some(TestDecl {
+        test_type: TestType::Expression { expression },
+        column: column.map(str::to_string),
+        severity: config_severity(config),
+        filter: config_filter(config),
+    })
+}
+
+/// Render a YAML scalar (string / number / bool) as the string form Rocky's
+/// `in_range` bounds expect. Non-scalars render via the loose
+/// [`yaml_value_to_string`] fallback.
+fn yaml_scalar_to_string(v: &serde_yaml::Value) -> String {
+    match v {
+        serde_yaml::Value::String(s) => s.clone(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        other => yaml_value_to_string(other),
+    }
 }
 
 /// dbt test `severity: warn` maps to a Rocky warning; anything else (incl.
@@ -983,6 +1164,202 @@ models:
             decls[0].column.is_none(),
             "composite uniqueness is model-level — no single column"
         );
+    }
+
+    #[test]
+    fn test_dbt_expectations_between_maps_to_in_range() {
+        let yaml = r#"
+models:
+  - name: orders
+    columns:
+      - name: amount
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 1000
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&models[0], &resolver);
+        assert!(unsupported.is_empty(), "must convert, not skip");
+        assert_eq!(decls.len(), 1);
+        match &decls[0].test_type {
+            TestType::InRange { min, max } => {
+                assert_eq!(min.as_deref(), Some("0"));
+                assert_eq!(max.as_deref(), Some("1000"));
+            }
+            other => panic!("expected InRange, got {other:?}"),
+        }
+        assert_eq!(decls[0].column.as_deref(), Some("amount"));
+    }
+
+    #[test]
+    fn test_dbt_utils_accepted_range_maps_to_in_range() {
+        let yaml = r#"
+models:
+  - name: orders
+    columns:
+      - name: qty
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 1
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&models[0], &resolver);
+        assert!(unsupported.is_empty());
+        assert_eq!(decls.len(), 1);
+        match &decls[0].test_type {
+            TestType::InRange { min, max } => {
+                assert_eq!(min.as_deref(), Some("1"));
+                assert!(max.is_none());
+            }
+            other => panic!("expected InRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dbt_expectations_match_regex_maps_to_regex_match() {
+        let yaml = r#"
+models:
+  - name: users
+    columns:
+      - name: email
+        tests:
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: "[a-z]+@[a-z]+"
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&models[0], &resolver);
+        assert!(unsupported.is_empty());
+        assert_eq!(decls.len(), 1);
+        match &decls[0].test_type {
+            TestType::RegexMatch { pattern } => assert_eq!(pattern, "[a-z]+@[a-z]+"),
+            other => panic!("expected RegexMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dbt_expectations_be_in_set_maps_to_accepted_values() {
+        let yaml = r#"
+models:
+  - name: orders
+    columns:
+      - name: status
+        tests:
+          - dbt_expectations.expect_column_values_to_be_in_set:
+              value_set: ['pending', 'shipped', 'delivered']
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&models[0], &resolver);
+        assert!(unsupported.is_empty());
+        assert_eq!(decls.len(), 1);
+        match &decls[0].test_type {
+            TestType::AcceptedValues { values } => {
+                assert_eq!(
+                    values,
+                    &vec![
+                        "pending".to_string(),
+                        "shipped".to_string(),
+                        "delivered".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected AcceptedValues, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dbt_utils_expression_is_true_model_level_maps_to_expression() {
+        let yaml = r#"
+models:
+  - name: orders
+    tests:
+      - dbt_utils.expression_is_true:
+          expression: "total = subtotal + tax"
+    columns:
+      - name: total
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&models[0], &resolver);
+        assert!(
+            unsupported.is_empty(),
+            "model-level expression must convert"
+        );
+        assert_eq!(decls.len(), 1);
+        match &decls[0].test_type {
+            TestType::Expression { expression } => {
+                assert_eq!(expression, "total = subtotal + tax")
+            }
+            other => panic!("expected Expression, got {other:?}"),
+        }
+        assert!(decls[0].column.is_none());
+    }
+
+    #[test]
+    fn test_dbt_utils_expression_is_true_column_level_maps_to_expression() {
+        let yaml = r#"
+models:
+  - name: orders
+    columns:
+      - name: amount
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "amount >= 0"
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&models[0], &resolver);
+        assert!(unsupported.is_empty());
+        assert_eq!(decls.len(), 1);
+        match &decls[0].test_type {
+            TestType::Expression { expression } => assert_eq!(expression, "amount >= 0"),
+            other => panic!("expected Expression, got {other:?}"),
+        }
+        assert_eq!(decls[0].column.as_deref(), Some("amount"));
+    }
+
+    #[test]
+    fn test_long_tail_test_without_native_equivalent_still_unsupported() {
+        let yaml = r#"
+models:
+  - name: orders
+    columns:
+      - name: amount
+        tests:
+          - dbt_expectations.expect_column_mean_to_be_between:
+              min_value: 1
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&models[0], &resolver);
+        assert!(decls.is_empty(), "aggregate-mean has no native equivalent");
+        assert_eq!(unsupported.len(), 1);
+        assert_eq!(
+            unsupported[0].test_name,
+            "dbt_expectations.expect_column_mean_to_be_between"
+        );
+    }
+
+    #[test]
+    fn test_in_range_missing_both_bounds_is_unsupported() {
+        let yaml = r#"
+models:
+  - name: orders
+    columns:
+      - name: amount
+        tests:
+          - dbt_utils.accepted_range:
+              inclusive: true
+"#;
+        let models = parse_model_yaml_content(yaml).unwrap();
+        let resolver = default_resolver();
+        let (decls, unsupported) = tests_to_test_decls(&models[0], &resolver);
+        assert!(decls.is_empty());
+        assert_eq!(unsupported.len(), 1, "no bounds → cannot build in_range");
     }
 
     #[test]
@@ -1621,11 +1998,9 @@ models:
 
     #[test]
     fn test_decl_unsupported_simple_and_configured() {
-        let mut config = HashMap::new();
-        config.insert(
-            "min_value".to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(0)),
-        );
+        // Two tests with no native Rocky equivalent: a project-defined
+        // generic test (simple) and a dbt_utils test outside the long-tail
+        // mapping (configured). Both must surface as UnsupportedTest.
         let model = DbtModelYaml {
             name: "model".to_string(),
             description: None,
@@ -1635,8 +2010,8 @@ models:
                 tests: vec![
                     DbtTestDef::Simple("project_macro_test".to_string()),
                     DbtTestDef::Configured {
-                        name: "dbt_utils.accepted_range".to_string(),
-                        config,
+                        name: "dbt_utils.cardinality_equality".to_string(),
+                        config: HashMap::new(),
                     },
                 ],
             }],
@@ -1654,7 +2029,7 @@ models:
         assert!(
             unsupported
                 .iter()
-                .any(|u| u.test_name == "dbt_utils.accepted_range")
+                .any(|u| u.test_name == "dbt_utils.cardinality_equality")
         );
         for u in &unsupported {
             assert_eq!(u.model, "model");

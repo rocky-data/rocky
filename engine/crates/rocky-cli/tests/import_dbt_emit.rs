@@ -215,10 +215,10 @@ fn emit_runnable_repo_from_rich_fixture() {
     assert!(notes.contains("Required env vars"));
     assert!(notes.contains("dbt generic tests"));
 
-    // Generic-test mapping: the four canonical built-ins land as
-    // `[[tests]]` blocks on each model sidecar. Non-canonical tests
-    // (e.g. `dbt_utils.accepted_range`) must NOT appear in the toml —
-    // they are surfaced as structured import warnings instead.
+    // Generic-test mapping: the canonical built-ins land as `[[tests]]`
+    // blocks on each model sidecar, and the dbt_utils/dbt_expectations
+    // long-tail tests with a native equivalent map too (here
+    // `dbt_utils.accepted_range` → `in_range`).
     let stg_orders_toml = std::fs::read_to_string(models_dir.join("stg_orders.toml")).unwrap();
     assert!(
         stg_orders_toml.contains("[[tests]]"),
@@ -234,14 +234,22 @@ fn emit_runnable_repo_from_rich_fixture() {
         stg_orders_toml.contains("to_table = \""),
         "relationships test must include a fully-qualified to_table"
     );
-    // Non-canonical test must NOT be stubbed in the emitted toml.
+    // dbt_utils.accepted_range now maps to a native `in_range` test, carrying
+    // the min/max bounds — it is NOT dropped. The dbt-side name must not leak
+    // into the emitted toml (the Rocky type is `in_range`).
+    assert!(
+        stg_orders_toml.contains("type = \"in_range\""),
+        "dbt_utils.accepted_range should map to an in_range test: {stg_orders_toml}"
+    );
+    assert!(stg_orders_toml.contains("min = \"0\""));
+    assert!(stg_orders_toml.contains("max = \"1000000\""));
     assert!(
         !stg_orders_toml.contains("dbt_utils"),
-        "non-canonical tests must not be stubbed as TODO entries; emitted toml should be clean"
+        "the dbt-side test name must not leak into the emitted toml"
     );
     assert!(
         !stg_orders_toml.to_lowercase().contains("accepted_range"),
-        "non-canonical tests must not be stubbed as TODO entries"
+        "the dbt-side test name must not leak into the emitted toml"
     );
 
     let stg_customers_toml_again =
@@ -261,24 +269,27 @@ fn emit_runnable_repo_from_rich_fixture() {
         "stg_orders should carry at least one TestDecl after loading"
     );
 
-    // The non-canonical test must surface as a structured warning whose
-    // category is `UnsupportedTest` (not silently dropped).
+    // dbt_utils.accepted_range now has a native equivalent, so it must NOT
+    // surface as an UnsupportedTest warning.
     assert!(
-        result.warnings.iter().any(
-            |w| matches!(w.category, dbt::WarningCategory::UnsupportedTest)
-                && w.message.contains("dbt_utils.accepted_range")
-        ),
-        "expected an UnsupportedTest warning for dbt_utils.accepted_range"
+        !result.warnings.iter().any(|w| matches!(
+            w.category,
+            dbt::WarningCategory::UnsupportedTest
+        ) && w.message.contains("dbt_utils.accepted_range")),
+        "dbt_utils.accepted_range now maps to in_range — it must not warn as unsupported"
     );
 
-    // Counter check: the four canonical mappings flow through `tests_converted`.
-    // Total tests in the fixture: order_id × {unique, not_null}, customer_id ×
-    // {not_null, relationships}, customer_id × {unique, not_null}, status ×
-    // accepted_values, amount × dbt_utils.accepted_range.
+    // Counter check. Total tests in the fixture: order_id × {unique, not_null},
+    // customer_id × {not_null, relationships}, customer_id × {unique, not_null},
+    // status × accepted_values, amount × dbt_utils.accepted_range. All eight
+    // now convert (accepted_range → in_range), so none are skipped.
     assert_eq!(result.tests_found, 8, "all schema.yml tests are counted");
-    assert_eq!(result.tests_skipped, 1, "one non-canonical test skipped");
     assert_eq!(
-        result.tests_converted, 7,
-        "seven canonical tests converted to TestDecls"
+        result.tests_skipped, 0,
+        "all tests now have a native mapping"
+    );
+    assert_eq!(
+        result.tests_converted, 8,
+        "all eight tests convert to TestDecls (accepted_range → in_range)"
     );
 }

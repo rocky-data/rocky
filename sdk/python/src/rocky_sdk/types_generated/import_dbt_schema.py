@@ -184,6 +184,22 @@ class ImportDbtStructuredWarning8(BaseModel):
     name: str
 
 
+class Kind40(StrEnum):
+    dropped_contract = "dropped_contract"
+
+
+class ImportDbtStructuredWarning9(BaseModel):
+    """
+    A dbt model `contract` (`enforced: true`), column `data_type`s, and/or `constraints` were dropped on import. Rocky enforces contracts via a `{model}.contract.toml` sidecar the importer does not auto-generate; the user must hand-author it. Visibility only — no stub generated.
+    """
+
+    constraints: conint(ge=0)
+    contract_path: str
+    kind: Kind40
+    model: str
+    typed_columns: conint(ge=0)
+
+
 class ImportDbtWarning(BaseModel):
     category: str
     message: str
@@ -202,6 +218,10 @@ class ImportDbtOutput(BaseModel):
     constructs_dropped: conint(ge=0) | None = 0
     """
     Number of dbt resources the importer does not translate that were detected and skipped (snapshots, metrics, semantic models, exposures).
+    """
+    contracts_dropped: conint(ge=0) | None = 0
+    """
+    Number of dbt models whose enforced `contract` (column `data_type`s / `constraints`) was dropped on import. Rocky enforces contracts via a `{model}.contract.toml` sidecar the importer does not auto-generate.
     """
     dbt_version: str | None = None
     emission: ImportDbtEmission | None = None
@@ -231,6 +251,7 @@ class ImportDbtOutput(BaseModel):
             | ImportDbtStructuredWarning6
             | ImportDbtStructuredWarning7
             | ImportDbtStructuredWarning8
+            | ImportDbtStructuredWarning9
         ]
         | None
     ) = Field([], validate_default=True)
