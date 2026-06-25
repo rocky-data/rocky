@@ -5362,6 +5362,35 @@ fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static 
     }
 }
 
+/// Build the [`TagTarget`] for a model's `[governance.tags]`, dispatching on
+/// its materialization strategy.
+///
+/// View-materialized models (`strategy = "view"`) have no physical table, so
+/// their tags must be applied with `ALTER VIEW ... SET TAGS` —
+/// [`TagTarget::View`]. Every other strategy (full-refresh, incremental,
+/// merge, materialized-view, dynamic-table, …) produces a table securable and
+/// maps to [`TagTarget::Table`]. Pure so the dispatch is unit-testable without
+/// a warehouse.
+pub(crate) fn governance_tag_target(
+    strategy: &rocky_core::models::StrategyConfig,
+    catalog: &str,
+    schema: &str,
+    name: &str,
+) -> TagTarget {
+    match strategy {
+        rocky_core::models::StrategyConfig::View => TagTarget::View {
+            catalog: catalog.to_string(),
+            schema: schema.to_string(),
+            view: name.to_string(),
+        },
+        _ => TagTarget::Table {
+            catalog: catalog.to_string(),
+            schema: schema.to_string(),
+            table: name.to_string(),
+        },
+    }
+}
+
 /// True when `model` uses a "plain" single-statement transformation
 /// strategy — i.e. anything except the two special paths
 /// (`content_addressed`, `time_interval`) that the serial loop handles
@@ -7079,6 +7108,45 @@ fn is_rate_limit_error(error_msg: &str) -> bool {
 mod tests {
     use super::*;
     use rocky_core::plan_partition::PartitionSelection;
+
+    #[test]
+    fn governance_tag_target_dispatches_view_strategy_to_view() {
+        use rocky_core::models::StrategyConfig;
+        let target =
+            governance_tag_target(&StrategyConfig::View, "warehouse", "marts", "fct_orders");
+        match target {
+            TagTarget::View {
+                catalog,
+                schema,
+                view,
+            } => {
+                assert_eq!(catalog, "warehouse");
+                assert_eq!(schema, "marts");
+                assert_eq!(view, "fct_orders");
+            }
+            other => panic!("view strategy must map to TagTarget::View, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn governance_tag_target_dispatches_non_view_strategies_to_table() {
+        use rocky_core::models::StrategyConfig;
+        // Every non-view strategy — including materialized_view — produces a
+        // table securable and must dispatch to `ALTER TABLE ... SET TAGS`.
+        for strategy in [
+            StrategyConfig::FullRefresh,
+            StrategyConfig::MaterializedView,
+            StrategyConfig::Incremental {
+                timestamp_column: "ts".into(),
+            },
+        ] {
+            let target = governance_tag_target(&strategy, "warehouse", "marts", "fct_orders");
+            assert!(
+                matches!(target, TagTarget::Table { .. }),
+                "non-view strategy {strategy:?} must map to TagTarget::Table"
+            );
+        }
+    }
 
     #[test]
     fn ir_grants_to_securable_batch_renders_rest_privilege_form() {

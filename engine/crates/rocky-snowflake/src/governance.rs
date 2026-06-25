@@ -280,6 +280,9 @@ fn format_set_tags_sql(
                 "ALTER TABLE {catalog}.{schema}.{table} SET TAG {tag_clause}"
             ))
         }
+        TagTarget::View { .. } => Err(AdapterError::msg(
+            "ALTER VIEW SET TAG is not supported by the Snowflake adapter",
+        )),
     }
 }
 

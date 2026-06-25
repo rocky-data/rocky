@@ -75,6 +75,20 @@ impl<'a> CatalogManager<'a> {
         Ok(())
     }
 
+    /// Sets tags on a view.
+    pub async fn set_view_tags(
+        &self,
+        catalog: &str,
+        schema: &str,
+        view: &str,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<(), CatalogManagerError> {
+        let sql = catalog_sql::generate_set_view_tags_sql(catalog, schema, view, tags)?;
+        debug!(catalog, schema, view, "setting view tags");
+        self.connector.execute_statement(&sql).await?;
+        Ok(())
+    }
+
     /// Sets tags on a single column of a table. Empty tag maps are skipped
     /// (Unity Catalog rejects `SET TAGS ()`). One statement per column —
     /// Databricks does not support multi-column tag application in a

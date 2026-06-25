@@ -74,6 +74,28 @@ pub fn generate_set_table_tags_sql(
     ))
 }
 
+/// Generates `ALTER VIEW <catalog>.<schema>.<view> SET TAGS (...)` with key-value pairs.
+///
+/// Mirrors [`generate_set_table_tags_sql`] but targets a view securable. Unity
+/// Catalog applies view tags through the same idempotent upsert semantics as
+/// table tags — re-running with the same keys overwrites their values rather
+/// than erroring. Emitted for view-format transformation models so their
+/// `[governance.tags]` land on the view rather than a non-existent table.
+pub fn generate_set_view_tags_sql(
+    catalog: &str,
+    schema: &str,
+    view: &str,
+    tags: &BTreeMap<String, String>,
+) -> Result<String, CatalogError> {
+    validation::validate_identifier(catalog)?;
+    validation::validate_identifier(schema)?;
+    validation::validate_identifier(view)?;
+    let tags_clause = format_tags(tags)?;
+    Ok(format!(
+        "ALTER VIEW {catalog}.{schema}.{view} SET TAGS ({tags_clause})"
+    ))
+}
+
 /// Generates `ALTER TABLE <catalog>.<schema>.<table> ALTER COLUMN <column> SET TAGS (...)`
 /// for a single column. Returns `Ok(None)` when `tags` is empty so callers
 /// can skip the statement rather than emit a syntactically-empty `SET TAGS ()`.
@@ -291,6 +313,34 @@ mod tests {
         assert!(sql.contains("'source' = 'shopify'"));
         assert!(sql.contains("'region-1' = 'us_west'"));
         assert!(sql.contains("'layer' = 'raw'"));
+    }
+
+    #[test]
+    fn test_set_view_tags() {
+        let mut tags = BTreeMap::new();
+        tags.insert("domain".to_string(), "finance".to_string());
+        tags.insert("tier".to_string(), "gold".to_string());
+        let sql = generate_set_view_tags_sql("warehouse", "marts", "fct_orders", &tags).unwrap();
+        assert_eq!(
+            sql,
+            "ALTER VIEW warehouse.marts.fct_orders SET TAGS ('domain' = 'finance', 'tier' = 'gold')"
+        );
+    }
+
+    #[test]
+    fn test_set_view_tags_rejects_bad_identifiers() {
+        let mut tags = BTreeMap::new();
+        tags.insert("domain".to_string(), "finance".to_string());
+        assert!(generate_set_view_tags_sql("warehouse", "marts", "bad view", &tags).is_err());
+        assert!(generate_set_view_tags_sql("warehouse", "bad;DROP", "v", &tags).is_err());
+        assert!(generate_set_view_tags_sql("bad-cat", "marts", "v", &tags).is_err());
+    }
+
+    #[test]
+    fn test_set_view_tags_rejects_unsafe_tag_value() {
+        let mut tags = BTreeMap::new();
+        tags.insert("domain".to_string(), "fin'ance".to_string());
+        assert!(generate_set_view_tags_sql("warehouse", "marts", "v", &tags).is_err());
     }
 
     #[test]

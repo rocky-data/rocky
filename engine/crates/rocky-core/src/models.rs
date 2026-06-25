@@ -84,6 +84,35 @@ pub enum ModelError {
     },
 }
 
+/// Per-model `[governance]` sidecar block.
+///
+/// Distinct from the model's `[tags]` block: `[tags]` is Dagster-only asset
+/// metadata (projected onto the asset's Dagster tags, never written to the
+/// warehouse), whereas `[governance.tags]` are **applied to the warehouse
+/// securable** after the model materializes — `ALTER VIEW ... SET TAGS` for
+/// view-format models, `ALTER TABLE ... SET TAGS` otherwise. This mirrors the
+/// replication path's target-governance tags, scoped to a single model.
+///
+/// ```toml
+/// name = "fct_orders"
+///
+/// [governance.tags]
+/// domain = "finance"
+/// tier = "gold"
+/// ```
+///
+/// Best-effort at apply time: a failure warns but never aborts the run, the
+/// same posture as classification/retention governance. Empty maps are
+/// skipped (Unity Catalog rejects `SET TAGS ()`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ModelGovernanceConfig {
+    /// Unity Catalog tags applied to the model's target securable
+    /// (table or view) after materialization. Keys and values are free-form
+    /// strings, used verbatim — no prefix is applied.
+    #[serde(default)]
+    pub tags: std::collections::BTreeMap<String, String>,
+}
+
 /// TOML frontmatter in a model SQL file.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModelConfig {
@@ -171,6 +200,17 @@ pub struct ModelConfig {
     /// tags) can see the governed fan-out end-to-end.
     #[serde(default)]
     pub tags: std::collections::BTreeMap<String, String>,
+    /// Per-model governance applied to the warehouse securable. Today this
+    /// carries `[governance.tags]` — Unity Catalog tags written to the
+    /// model's target table/view after it materializes. Parsed from a
+    /// `[governance]` sidecar block; merged over any group-declared
+    /// `[governance.tags]` in [`resolve_model_config`] (sidecar > group).
+    ///
+    /// Unlike [`tags`](ModelConfig::tags) (Dagster-only asset metadata), these
+    /// are emitted as `ALTER TABLE/VIEW ... SET TAGS` during `rocky run`. See
+    /// [`ModelGovernanceConfig`].
+    #[serde(default)]
+    pub governance: ModelGovernanceConfig,
     /// Declarative data-retention policy for this model. Parsed from the
     /// `retention` sidecar key:
     ///
@@ -462,6 +502,11 @@ pub struct RawModelConfig {
     /// [`ModelConfig::tags`].
     #[serde(default)]
     pub tags: std::collections::BTreeMap<String, String>,
+    /// Per-model `[governance]` block — warehouse-applied tags. Merged over
+    /// any group-declared `[governance.tags]` in [`resolve_model_config`].
+    /// See [`ModelConfig::governance`].
+    #[serde(default)]
+    pub governance: ModelGovernanceConfig,
     /// Raw retention string from the `retention` sidecar key. Parsed into
     /// [`RetentionPolicy`] by [`resolve_model_config`]. Kept as
     /// `Option<String>` at the toml layer so parse errors surface as
@@ -652,6 +697,12 @@ pub struct GroupConfig {
     /// asset. See [`ModelConfig::tags`].
     #[serde(default)]
     pub tags: std::collections::BTreeMap<String, String>,
+    /// Group-level `[governance]` baseline. Its `[governance.tags]` apply to
+    /// every member model's warehouse securable; a member's own
+    /// `[governance.tags]` override per key (sidecar > group). Mirrors the
+    /// `[tags]` precedence. See [`ModelConfig::governance`].
+    #[serde(default)]
+    pub governance: ModelGovernanceConfig,
     /// When `true`, the group's fields are **enforced**, not just defaulted: a
     /// member model that locally pins a field the group also sets (its target
     /// `schema`, or its `strategy`) fails the load with
@@ -922,6 +973,17 @@ fn resolve_model_config(
     let mut tags = group.map(|g| g.tags.clone()).unwrap_or_default();
     tags.extend(raw.tags);
 
+    // Warehouse-applied governance tags follow the same precedence: the
+    // group's `[governance.tags]` are the shared baseline; the model's own
+    // `[governance.tags]` override per key (sidecar > group). These are
+    // emitted as `ALTER TABLE/VIEW ... SET TAGS` at run time, distinct from
+    // the Dagster-only `[tags]` above.
+    let mut governance_tags = group.map(|g| g.governance.tags.clone()).unwrap_or_default();
+    governance_tags.extend(raw.governance.tags);
+    let governance = ModelGovernanceConfig {
+        tags: governance_tags,
+    };
+
     // Enforcement: when the group sets `enforce = true`, a member model may not
     // locally override a field the group controls. Checked here, before the
     // fields are consumed by the resolution chain below, using sidecar
@@ -1080,6 +1142,7 @@ fn resolve_model_config(
         format_options: raw.format_options,
         classification: raw.classification,
         tags,
+        governance,
         retention,
         budget: raw.budget,
         skip: raw.skip,
@@ -2757,6 +2820,61 @@ SELECT * FROM raw.events
             model.config.classification.get("ip_address"),
             Some(&"location_adjacent".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_governance_tags_block() {
+        // `[governance.tags]` lands in `config.governance.tags` (warehouse-
+        // applied), and the Dagster-only `[tags]` stays separate and untouched.
+        let content = r#"---toml
+name = "fct_orders"
+target = { catalog = "warehouse", schema = "marts", table = "fct_orders" }
+
+[tags]
+owner = "analytics"
+
+[governance.tags]
+domain = "finance"
+tier = "gold"
+---
+
+SELECT 1
+"#;
+        let model = parse_model_inline(content, "fct_orders.sql", None).unwrap();
+        assert_eq!(
+            model.config.governance.tags.get("domain"),
+            Some(&"finance".to_string())
+        );
+        assert_eq!(
+            model.config.governance.tags.get("tier"),
+            Some(&"gold".to_string())
+        );
+        // `[tags]` (Dagster-only) is NOT promoted into governance.tags.
+        assert!(
+            !model.config.governance.tags.contains_key("owner"),
+            "[tags] must not leak into [governance.tags]"
+        );
+        assert_eq!(
+            model.config.tags.get("owner"),
+            Some(&"analytics".to_string())
+        );
+        assert!(
+            !model.config.tags.contains_key("domain"),
+            "[governance.tags] must not leak into [tags]"
+        );
+    }
+
+    #[test]
+    fn test_parse_no_governance_block_defaults_empty() {
+        let content = r#"---toml
+name = "no_gov"
+target = { catalog = "c", schema = "s", table = "t" }
+---
+
+SELECT 1
+"#;
+        let model = parse_model_inline(content, "no_gov.sql", None).unwrap();
+        assert!(model.config.governance.tags.is_empty());
     }
 
     #[test]
