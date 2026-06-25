@@ -5473,16 +5473,51 @@ async fn execute_one_plain_model(
         )
         .map_err(anyhow::Error::from)?;
 
-    // MERGE requires the target to exist before the statement runs.
-    // sql_gen exposes `generate_transformation_initial_ddl` for
-    // exactly this purpose but no call site has been wiring it up,
-    // so MERGE on a fresh target failed with "table not found".
-    // Mirror the time_interval bootstrap pattern: probe via
-    // describe_table().is_ok() and run the initial DDL if missing.
-    if matches!(
+    let model_started_at = Utc::now();
+    let mut bytes_scanned_acc: Option<u64> = None;
+    let mut bytes_written_acc: Option<u64> = None;
+    let mut job_ids_acc: Vec<String> = Vec::new();
+
+    // First-run bootstrap. Strategies that mutate an existing target
+    // (Merge, Incremental, DeleteInsert, Microbatch) all assume the target
+    // table already exists — a MERGE/INSERT/DELETE against a missing table
+    // fails with "table not found". On first run we probe via
+    // `describe_table().is_ok()` and, if absent, create the target through
+    // `generate_transformation_initial_ddl`, which honors the model's
+    // lakehouse `format` + `format_options` (e.g. `USING ICEBERG`,
+    // `PARTITIONED BY`, `TBLPROPERTIES`). Without this the first-run create
+    // fell back to the warehouse default and an incremental Iceberg mart
+    // silently lost its declared format.
+    //
+    // The initial DDL is a populated CTAS (`CREATE TABLE ... AS <model SQL>`),
+    // so it already loads the full result set. We therefore split the
+    // strategies into two groups:
+    //
+    //   * Merge — populate the target, then run the MERGE. The MERGE upserts
+    //     on the unique key, so re-applying it over the just-loaded rows is
+    //     idempotent. Behavior is unchanged from before this wiring.
+    //   * Incremental / DeleteInsert / Microbatch — the CTAS *is* the first
+    //     load. Running the subsequent append (`INSERT INTO`) or
+    //     delete+insert over the same source would double-load (Incremental /
+    //     Microbatch) or redundantly rewrite (DeleteInsert) the just-created
+    //     rows. We capture the CTAS stats and skip the strategy statements on
+    //     this first run; subsequent runs find the target present and take the
+    //     normal incremental path.
+    let strategy_mutates_existing_target = matches!(
         model_ir.materialization,
         rocky_ir::MaterializationStrategy::Merge { .. }
-    ) {
+            | rocky_ir::MaterializationStrategy::Incremental { .. }
+            | rocky_ir::MaterializationStrategy::DeleteInsert { .. }
+            | rocky_ir::MaterializationStrategy::Microbatch { .. }
+    );
+    // Merge keeps its populate-then-MERGE flow; the other three populate and
+    // skip the strategy exec to avoid a double load.
+    let bootstrap_is_the_load = !matches!(
+        model_ir.materialization,
+        rocky_ir::MaterializationStrategy::Merge { .. }
+    );
+    let mut skip_strategy_exec = false;
+    if strategy_mutates_existing_target {
         let target_table_struct = rocky_ir::TableRef {
             catalog: model_ir.target.catalog.clone(),
             schema: model_ir.target.schema.clone(),
@@ -5499,15 +5534,41 @@ async fn execute_one_plain_model(
                 model = model_name,
                 target = target_ref.as_str(),
                 statements = initial_ddls.len(),
-                "merge target does not exist — bootstrapping empty table from model schema"
+                bootstrap_is_the_load,
+                "transformation target does not exist — bootstrapping from model schema"
             );
             for ddl in &initial_ddls {
-                warehouse.execute_statement(ddl).await.map_err(|e| {
-                    anyhow::Error::from(e).context(format!(
-                        "bootstrap of '{target_ref}' for model '{model_name}' failed"
-                    ))
-                })?;
+                if bootstrap_is_the_load {
+                    // The CTAS loads the data, so capture its stats into the
+                    // model's `bytes_scanned` / `bytes_written` output.
+                    match warehouse.execute_statement_with_stats(ddl).await {
+                        Ok(stats) => {
+                            bytes_scanned_acc =
+                                accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
+                            bytes_written_acc =
+                                accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                            if let Some(jid) = stats.job_id {
+                                job_ids_acc.push(jid);
+                            }
+                        }
+                        Err(e) => {
+                            return Err(anyhow::Error::from(e).context(format!(
+                                "bootstrap of '{target_ref}' for model '{model_name}' failed"
+                            )));
+                        }
+                    }
+                } else {
+                    // Merge: the bootstrap only needs to materialize the
+                    // table; the MERGE that follows does the load and reports
+                    // its own stats.
+                    warehouse.execute_statement(ddl).await.map_err(|e| {
+                        anyhow::Error::from(e).context(format!(
+                            "bootstrap of '{target_ref}' for model '{model_name}' failed"
+                        ))
+                    })?;
+                }
             }
+            skip_strategy_exec = bootstrap_is_the_load;
         }
     }
 
@@ -5524,26 +5585,28 @@ async fn execute_one_plain_model(
         model = model_name,
         target = target_ref.as_str(),
         statements = exec_stmts.len(),
+        skip_strategy_exec,
         "executing model"
     );
     // Capture per-statement stats so derived models report the
     // same `bytes_scanned` / `bytes_written` shape that replication
-    // tables already have.
-    let model_started_at = Utc::now();
-    let mut bytes_scanned_acc: Option<u64> = None;
-    let mut bytes_written_acc: Option<u64> = None;
-    let mut job_ids_acc: Vec<String> = Vec::new();
-    for exec_sql in &exec_stmts {
-        match warehouse.execute_statement_with_stats(exec_sql).await {
-            Ok(stats) => {
-                bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
-                bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
-                if let Some(jid) = stats.job_id {
-                    job_ids_acc.push(jid);
+    // tables already have. Skipped on a first-run bootstrap that already
+    // loaded the data via CTAS (Incremental / DeleteInsert / Microbatch).
+    if !skip_strategy_exec {
+        for exec_sql in &exec_stmts {
+            match warehouse.execute_statement_with_stats(exec_sql).await {
+                Ok(stats) => {
+                    bytes_scanned_acc = accumulate_bytes(bytes_scanned_acc, stats.bytes_scanned);
+                    bytes_written_acc = accumulate_bytes(bytes_written_acc, stats.bytes_written);
+                    if let Some(jid) = stats.job_id {
+                        job_ids_acc.push(jid);
+                    }
                 }
-            }
-            Err(e) => {
-                return Err(anyhow::Error::from(e).context(format!("model '{model_name}' failed")));
+                Err(e) => {
+                    return Err(
+                        anyhow::Error::from(e).context(format!("model '{model_name}' failed"))
+                    );
+                }
             }
         }
     }
@@ -10925,5 +10988,128 @@ merge_keys = ["id"]
             }
             other => panic!("expected a Content identity, got {other:?}"),
         }
+    }
+
+    /// Runtime regression: a first run of an incremental transformation
+    /// model against a missing target must bootstrap the table (via
+    /// `generate_transformation_initial_ddl`) and load the source **exactly
+    /// once** — the populated CTAS is the load, so the subsequent `INSERT INTO`
+    /// is skipped. Before this wiring the first run hit `INSERT INTO` against a
+    /// nonexistent table and errored; a naive fix that ran the INSERT after the
+    /// CTAS would double-load. This drives the real `execute_one_plain_model`
+    /// runtime path on in-memory DuckDB (format = None, so dialect-independent
+    /// of the lakehouse DDL — what's proven here is the skip, not the format).
+    ///
+    /// The model SQL carries no watermark filter (transformation incrementals
+    /// own their own filtering), so a second run re-selects the full source and
+    /// appends it — proving the table is reused, not recreated, and that the
+    /// skip only fires on the bootstrap run.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn incremental_transformation_first_run_loads_source_once_then_appends() {
+        use std::time::Instant;
+
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, region VARCHAR)",
+            "INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        ] {
+            adapter.execute_statement(ddl).await.unwrap();
+        }
+        let source_rows: i64 = 3;
+
+        // Build a real `Model` from a sidecar + SQL pair so the runtime path
+        // (`Model::to_model_ir` → `execute_one_plain_model`) is exercised
+        // end-to-end rather than hand-assembling the IR.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("fct_events.toml"),
+            r#"
+name = "fct_events"
+
+[strategy]
+type = "incremental"
+timestamp_column = "id"
+
+[target]
+catalog = ""
+schema = "tgt"
+table = "fct_events"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct_events.sql"),
+            "SELECT id, region FROM src.events",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("fct_events.sql"),
+            &dir.path().join("fct_events.toml"),
+            None,
+        )
+        .expect("load incremental model");
+
+        let dialect = DuckDbSqlDialect;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+
+        async fn count_target(adapter: &DuckDbWarehouseAdapter) -> i64 {
+            let r = adapter
+                .execute_query("SELECT COUNT(*) FROM tgt.fct_events")
+                .await
+                .expect("count query");
+            let cell = &r.rows[0][0];
+            cell.as_i64()
+                .or_else(|| cell.as_str().and_then(|s| s.parse::<i64>().ok()))
+                .expect("count parses as i64")
+        }
+
+        // --- First run: target missing → bootstrap CTAS, INSERT skipped. ---
+        super::execute_one_plain_model(
+            &model,
+            &adapter as &dyn WarehouseAdapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "fct_events",
+            Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect("first run bootstraps without error");
+        assert_eq!(
+            count_target(&adapter).await,
+            source_rows,
+            "first run must load the source exactly once (no double-load)"
+        );
+
+        // --- Second run: target exists → normal incremental append. ---
+        super::execute_one_plain_model(
+            &model,
+            &adapter as &dyn WarehouseAdapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "fct_events",
+            Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect("second run appends without error");
+        assert_eq!(
+            count_target(&adapter).await,
+            source_rows * 2,
+            "second run reuses the existing table and appends through the INSERT path"
+        );
     }
 }
