@@ -350,10 +350,34 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
             let keys: Vec<String> = partition_by.iter().map(|k| format!("\"{k}\"")).collect();
             out.push_str(&format!("partition_by = [{}]\n", keys.join(", ")));
         }
-        // TimeInterval + ContentAddressed don't arise from the dbt
-        // importer today; if we ever hit one, fall back to full_refresh
-        // (the user can hand-edit the sidecar).
-        _ => {
+        StrategyConfig::TimeInterval {
+            time_column,
+            granularity,
+            lookback,
+            batch_size,
+            first_partition,
+        } => {
+            out.push_str("type = \"time_interval\"\n");
+            out.push_str(&format!("time_column = \"{time_column}\"\n"));
+            let g = match granularity {
+                rocky_ir::TimeGrain::Hour => "hour",
+                rocky_ir::TimeGrain::Day => "day",
+                rocky_ir::TimeGrain::Month => "month",
+                rocky_ir::TimeGrain::Year => "year",
+            };
+            out.push_str(&format!("granularity = \"{g}\"\n"));
+            out.push_str(&format!("lookback = {lookback}\n"));
+            out.push_str(&format!("batch_size = {}\n", batch_size.get()));
+            if let Some(first) = first_partition {
+                out.push_str(&format!("first_partition = \"{first}\"\n"));
+            }
+        }
+        // ContentAddressed doesn't arise from the dbt importer today; if we
+        // ever hit one, fall back to full_refresh (the user can hand-edit the
+        // sidecar). Matched explicitly (not via `_`) so a newly added strategy
+        // forces a compile error here rather than silently degrading — the
+        // exact failure mode FR-036 fixed.
+        StrategyConfig::ContentAddressed { .. } => {
             out.push_str("type = \"full_refresh\"\n");
         }
     }
@@ -934,6 +958,73 @@ mod tests {
         assert!(toml_body.contains("[strategy]"));
         assert!(toml_body.contains("type = \"full_refresh\""));
         assert!(toml_body.contains("[target]"));
+    }
+
+    #[test]
+    fn time_interval_strategy_serializes_and_round_trips() {
+        use std::num::NonZeroU32;
+
+        let config = ModelConfig {
+            name: "fct_daily_orders".to_string(),
+            depends_on: vec![],
+            strategy: StrategyConfig::TimeInterval {
+                time_column: "order_date".to_string(),
+                granularity: rocky_ir::TimeGrain::Day,
+                lookback: 2,
+                batch_size: NonZeroU32::new(7).unwrap(),
+                first_partition: Some("2024-01-01".to_string()),
+            },
+            target: TargetConfig {
+                catalog: "warehouse".to_string(),
+                schema: "main".to_string(),
+                table: "fct_daily_orders".to_string(),
+            },
+            sources: vec![],
+            adapter: None,
+            intent: None,
+            freshness: None,
+            tests: vec![],
+            format: None,
+            format_options: None,
+            classification: Default::default(),
+            tags: Default::default(),
+            retention: None,
+            budget: None,
+            skip: None,
+            name_declared: String::new(),
+            target_table_declared: String::new(),
+        };
+
+        let sidecar = render_model_sidecar(&config);
+        // Emits the partition fields, not the stale `full_refresh` fallback.
+        assert!(sidecar.contains("type = \"time_interval\""));
+        assert!(sidecar.contains("time_column = \"order_date\""));
+        assert!(sidecar.contains("granularity = \"day\""));
+        assert!(sidecar.contains("lookback = 2"));
+        assert!(sidecar.contains("batch_size = 7"));
+        assert!(sidecar.contains("first_partition = \"2024-01-01\""));
+        assert!(!sidecar.contains("full_refresh"));
+
+        // Round-trips: the emitted sidecar parses back as a TimeInterval with
+        // the same fields, so `rocky run --partition <date>` substitutes
+        // @start_date / @end_date instead of failing on the dropped placeholders.
+        let parsed: ModelConfig = toml::from_str(&sidecar).unwrap();
+        match parsed.strategy {
+            StrategyConfig::TimeInterval {
+                ref time_column,
+                granularity,
+                lookback,
+                batch_size,
+                ref first_partition,
+            } => {
+                assert_eq!(time_column, "order_date");
+                assert_eq!(granularity, rocky_ir::TimeGrain::Day);
+                assert_eq!(lookback, 2);
+                assert_eq!(batch_size.get(), 7);
+                assert_eq!(first_partition.as_deref(), Some("2024-01-01"));
+            }
+            other => panic!("expected TimeInterval, got {other:?}"),
+        }
     }
 
     #[test]
