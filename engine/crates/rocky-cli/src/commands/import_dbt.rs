@@ -47,6 +47,7 @@ use crate::output::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Execute `rocky import-dbt`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_import_dbt(
     dbt_project: &Path,
     output_dir: &Path,
@@ -54,6 +55,7 @@ pub fn run_import_dbt(
     no_manifest: bool,
     target_adapter: Option<&str>,
     overwrite: bool,
+    skip_unit_tests: bool,
     output_json: bool,
 ) -> Result<()> {
     // Resolve adapter shape — profile detection unless --target-adapter overrides.
@@ -63,7 +65,13 @@ pub fn run_import_dbt(
     let default_target = default_target_from_profile(&profile);
 
     // Run the existing importer to produce the per-model translation result.
-    let import_result = run_importer(dbt_project, &default_target, manifest_path, no_manifest)?;
+    let import_result = run_importer(
+        dbt_project,
+        &default_target,
+        manifest_path,
+        no_manifest,
+        skip_unit_tests,
+    )?;
 
     // Capture which models had their `view` materialization flattened to
     // FullRefresh by the importer — we re-rewrite those to Ephemeral at
@@ -241,6 +249,7 @@ fn run_importer(
     default_target: &TargetConfig,
     manifest_path: Option<&Path>,
     no_manifest: bool,
+    skip_unit_tests: bool,
 ) -> Result<ImportResult> {
     if no_manifest {
         return dbt::import_dbt_project(dbt_project, default_target)
@@ -267,7 +276,7 @@ fn run_importer(
 
     if let Some(ref mf) = manifest_file {
         let manifest = dbt_manifest::parse_manifest(mf).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut result = dbt::import_from_manifest(&manifest, default_target);
+        let mut result = dbt::import_from_manifest(&manifest, default_target, skip_unit_tests);
         // The manifest path doesn't itself walk schema.yml files for tests.
         // Apply the dbt-tests pass against the project root so manifest
         // imports also pick up the four canonical generic tests.
