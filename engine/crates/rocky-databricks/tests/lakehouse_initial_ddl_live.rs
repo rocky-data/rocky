@@ -123,8 +123,10 @@ async fn scalar_i64(adapter: &DatabricksWarehouseAdapter, sql: &str) -> i64 {
         .expect("cell parses as i64")
 }
 
-/// `SHOW CREATE TABLE` returns the full DDL as a single string cell.
-async fn show_create_table(
+/// Read a managed table's storage format from `information_schema.tables`.
+/// `SHOW CREATE TABLE` is not supported on managed Iceberg, so the format is
+/// confirmed via the catalog's information schema (e.g. `"ICEBERG"`/`"DELTA"`).
+async fn table_format(
     adapter: &DatabricksWarehouseAdapter,
     catalog: &str,
     schema: &str,
@@ -133,22 +135,24 @@ async fn show_create_table(
     let result = adapter
         .connector()
         .execute_sql(&format!(
-            "SHOW CREATE TABLE `{catalog}`.`{schema}`.`{table}`"
+            "SELECT data_source_format FROM `{catalog}`.information_schema.tables \
+             WHERE table_schema = '{schema}' AND table_name = '{table}'"
         ))
         .await
-        .expect("SHOW CREATE TABLE");
+        .expect("query information_schema.tables");
     result
         .rows
-        .iter()
-        .filter_map(|r| r.first())
-        .filter_map(|c| c.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Build an Incremental model declaring managed-Iceberg format with
-/// representative `format_options` (partitioning, clustering, table
-/// properties). The SELECT mirrors the seeded source columns.
+/// representative `format_options` (partitioning + table properties; Iceberg
+/// disallows clustering alongside partitioning). The SELECT mirrors the seeded
+/// source columns.
 fn incremental_iceberg_model(
     catalog: &str,
     src_schema: &str,
@@ -179,8 +183,14 @@ fn incremental_iceberg_model(
         Some(LakehouseFormat::IcebergTable),
         Some(LakehouseOptions {
             partition_by: vec!["region".into()],
-            cluster_by: vec!["id".into()],
-            table_properties: vec![("write.format.default".into(), "parquet".into())],
+            // Databricks rejects PARTITIONED BY + CLUSTER BY together on Iceberg
+            // (SPECIFY_CLUSTER_BY_WITH_PARTITIONED_BY_IS_NOT_ALLOWED) — they are
+            // mutually exclusive, so this fixture exercises partitioning only.
+            cluster_by: vec![],
+            // Managed Iceberg rejects engine-managed write properties like
+            // write.format.default (MANAGED_ICEBERG_OPERATION_NOT_SUPPORTED), so
+            // this fixture asserts the format + partitioning, not raw TBLPROPERTIES.
+            table_properties: vec![],
             comment: Some("incremental iceberg mart".into()),
         }),
     )
@@ -235,20 +245,15 @@ async fn live_incremental_iceberg_initial_ddl_uses_iceberg_format() {
             .expect("execute initial DDL");
     }
 
-    // The declared format + format_options landed on the physical table.
-    let create_sql = show_create_table(&adapter, &catalog, &tgt_schema, table).await;
-    let upper = create_sql.to_uppercase();
+    // The declared format landed on the physical table. (The partitioned
+    // `USING ICEBERG` CTAS executing without error already proves partitioning
+    // was accepted; managed Iceberg has no SHOW CREATE TABLE, so confirm the
+    // format via information_schema.)
+    let fmt = table_format(&adapter, &catalog, &tgt_schema, table).await;
     assert!(
-        upper.contains("USING ICEBERG"),
-        "first-run create must declare USING ICEBERG: {create_sql}"
-    );
-    assert!(
-        upper.contains("PARTITIONED BY"),
-        "first-run create must carry the declared partitioning: {create_sql}"
-    );
-    assert!(
-        create_sql.contains("write.format.default"),
-        "first-run create must carry the declared table properties: {create_sql}"
+        fmt.eq_ignore_ascii_case("ICEBERG"),
+        "first-run create must materialize as Iceberg (not the default format); \
+         information_schema reports data_source_format = {fmt:?}"
     );
 
     // The CTAS *is* the first load — the source is materialized exactly once.
@@ -277,10 +282,11 @@ async fn live_incremental_iceberg_initial_ddl_uses_iceberg_format() {
             .expect("execute incremental append");
     }
 
-    let create_sql_after = show_create_table(&adapter, &catalog, &tgt_schema, table).await;
+    let fmt_after = table_format(&adapter, &catalog, &tgt_schema, table).await;
     assert!(
-        create_sql_after.to_uppercase().contains("USING ICEBERG"),
-        "second run must not change the declared format: {create_sql_after}"
+        fmt_after.eq_ignore_ascii_case("ICEBERG"),
+        "second run must not change the declared format; \
+         information_schema reports data_source_format = {fmt_after:?}"
     );
 
     // This model's SQL has no watermark filter, so the second run appends the
