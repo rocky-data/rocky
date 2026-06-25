@@ -280,13 +280,17 @@ pub fn generate_transformation_sql_with_warehouse(
         dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?;
     }
 
-    // If a lakehouse format is specified, use format-specific DDL generation
-    // for strategies that create tables (FullRefresh, Incremental first-run,
-    // Merge first-run). For non-FullRefresh strategies, the runtime probes
-    // target existence via `describe_table` and calls
-    // `generate_transformation_initial_ddl` when missing (Merge today;
-    // Incremental / DeleteInsert / Microbatch wired in as their live smoke
-    // tests land). Here we handle FullRefresh which always does CTAS.
+    // `FullRefresh` rebuilds the whole table every run, so it always emits a
+    // format-aware CTAS here when a lakehouse `format` is set. The other
+    // strategies that create a table on first run (Merge, Incremental,
+    // DeleteInsert, Microbatch) instead create it through
+    // `generate_transformation_initial_ddl`: the runtime probes target
+    // existence via `describe_table` and calls that helper when the target is
+    // missing, so the declared `format` + `format_options` are honored from
+    // the very first create (see `execute_one_plain_model` in
+    // `rocky-cli/src/commands/run.rs`). `time_interval` first-run creates go
+    // through `generate_time_interval_bootstrap_sql`, which is likewise
+    // format-aware. This branch only handles FullRefresh's always-CTAS path.
     if let Some(ref format) = model_ir.format
         && matches!(
             model_ir.materialization,
@@ -2253,6 +2257,106 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         assert!(
             sql.contains("PARTITIONED BY (date_key)"),
             "should include partitioning: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_initial_ddl_with_microbatch_strategy() {
+        // Microbatch strategy should also get format-aware DDL on initial
+        // creation: an incremental/microbatch Iceberg mart must get
+        // USING ICEBERG + format_options on its first run, not the warehouse
+        // default.
+        let plan = lakehouse_ir(
+            LakehouseFormat::IcebergTable,
+            LakehouseOptions {
+                partition_by: vec!["event_date".into()],
+                table_properties: vec![("write.format.default".into(), "parquet".into())],
+                ..LakehouseOptions::default()
+            },
+            MaterializationStrategy::Microbatch {
+                timestamp_column: "event_ts".into(),
+                granularity: rocky_ir::TimeGrain::Day,
+            },
+        );
+        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        let sql = &stmts[0];
+        assert!(
+            sql.contains("USING ICEBERG"),
+            "initial DDL should use ICEBERG: {sql}"
+        );
+        assert!(
+            sql.contains("PARTITIONED BY (event_date)"),
+            "should include partitioning: {sql}"
+        );
+        assert!(
+            sql.contains("TBLPROPERTIES"),
+            "should include tblproperties: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_lakehouse_initial_ddl_incremental_iceberg_with_format_options() {
+        // Core guarantee: an Incremental model declaring iceberg_table
+        // format yields USING ICEBERG plus its format_options on first-run
+        // initial DDL — the same code path the runtime invokes when the
+        // target is missing.
+        let plan = lakehouse_ir(
+            LakehouseFormat::IcebergTable,
+            LakehouseOptions {
+                partition_by: vec!["region".into()],
+                cluster_by: vec!["id".into()],
+                table_properties: vec![("write.format.default".into(), "parquet".into())],
+                comment: Some("Incremental orders mart".into()),
+            },
+            MaterializationStrategy::Incremental {
+                timestamp_column: "updated_at".into(),
+            },
+        );
+        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        let sql = &stmts[0];
+        assert!(
+            sql.contains("USING ICEBERG"),
+            "initial DDL should use ICEBERG: {sql}"
+        );
+        assert!(
+            sql.contains("PARTITIONED BY (region)"),
+            "should include partitioning: {sql}"
+        );
+        assert!(
+            sql.contains("CLUSTER BY (id)"),
+            "should include clustering: {sql}"
+        );
+        assert!(
+            sql.contains("write.format.default"),
+            "should include format_options table properties: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_full_refresh_initial_ddl_format_unchanged() {
+        // Regression guard: FullRefresh initial DDL must keep emitting a
+        // single format-aware CTAS — the incremental-strategy wiring only adds
+        // the append/upsert bootstrap and must not alter FullRefresh.
+        let plan = lakehouse_ir(
+            LakehouseFormat::IcebergTable,
+            LakehouseOptions {
+                partition_by: vec!["region".into()],
+                ..LakehouseOptions::default()
+            },
+            MaterializationStrategy::FullRefresh,
+        );
+        let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 1);
+        let sql = &stmts[0];
+        assert!(
+            sql.contains("USING ICEBERG"),
+            "FullRefresh initial DDL should use ICEBERG: {sql}"
+        );
+        assert!(
+            sql.contains("PARTITIONED BY (region)"),
+            "FullRefresh initial DDL should include partitioning: {sql}"
         );
     }
 
