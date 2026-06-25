@@ -399,6 +399,11 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
     out
 }
 
+/// Escape a string for a double-quoted TOML basic string (backslash + quote).
+fn toml_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Serialise a [`TestDecl`] as a `[[tests]]` block matching the canonical
 /// Rocky model sidecar shape (`type = "..."`, `column = "..."`, plus
 /// type-specific fields). Mirrors the derived serde untagged shape used
@@ -439,12 +444,32 @@ fn render_test_decl(test: &TestDecl) -> String {
             let cols: Vec<String> = columns.iter().map(|c| format!("\"{c}\"")).collect();
             out.push_str(&format!("columns = [{}]\n", cols.join(", ")));
         }
-        // The dbt importer maps only the canonical built-ins + composite
-        // uniqueness to `TestDecl`. Anything else here would be programmer
-        // error — emit toml that won't load is worse than a panic, so refuse.
+        // dbt_expectations / dbt_utils long-tail mappings.
+        TestType::InRange { min, max } => {
+            out.push_str("type = \"in_range\"\n");
+            if let Some(min) = min {
+                out.push_str(&format!("min = \"{}\"\n", toml_escape(min)));
+            }
+            if let Some(max) = max {
+                out.push_str(&format!("max = \"{}\"\n", toml_escape(max)));
+            }
+        }
+        TestType::RegexMatch { pattern } => {
+            out.push_str("type = \"regex_match\"\n");
+            out.push_str(&format!("pattern = \"{}\"\n", toml_escape(pattern)));
+        }
+        TestType::Expression { expression } => {
+            out.push_str("type = \"expression\"\n");
+            out.push_str(&format!("expression = \"{}\"\n", toml_escape(expression)));
+        }
+        // The dbt importer maps only the canonical built-ins, composite
+        // uniqueness, and the dbt_expectations/dbt_utils long-tail
+        // (in_range / regex_match / expression) to `TestDecl`. Anything else
+        // here would be programmer error — emit toml that won't load is worse
+        // than a panic, so refuse.
         other => {
             unreachable!(
-                "rocky import-dbt only produces NotNull/Unique/AcceptedValues/Relationships TestDecls; got {:?}",
+                "rocky import-dbt does not produce this TestDecl variant; got {:?}",
                 std::mem::discriminant(other)
             );
         }
