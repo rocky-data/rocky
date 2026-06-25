@@ -91,6 +91,7 @@ export type FailureKind =
   | "transient"
   | "quota-exceeded"
   | "not-found"
+  | "compile-error"
   | "unknown";
 /**
  * The per-model build decision the engine made this run — what the skip-gate and content-addressed reuse machinery actually decided.

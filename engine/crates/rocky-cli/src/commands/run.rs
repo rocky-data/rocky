@@ -128,6 +128,35 @@ pub struct PartialFailure {
     pub run_id: String,
 }
 
+/// Map a finalized [`RunOutput`]'s derived status onto the CLI exit-code
+/// contract for the transformation / model-only execution paths.
+///
+/// - `Success` → `Ok(())` (exit 0).
+/// - `PartialFailure` (some models built, some failed) → the
+///   [`PartialFailure`] sentinel `main.rs` maps to exit 2.
+/// - `Failure` (nothing built) → an `anyhow` error (exit 1).
+///
+/// Callers MUST have already emitted the JSON `RunOutput` on stdout before
+/// invoking this — the returned error short-circuits the rest of the path,
+/// so the structured payload (status, `tables_failed`, `errors`) is what a
+/// JSON consumer reads regardless of exit code. This is what makes a
+/// compile-failed model a first-class run failure instead of a silently
+/// skipped no-op that still reported `status: "Success"`, exit 0.
+pub(crate) fn run_status_exit_result(output: &RunOutput, run_id: &str) -> Result<()> {
+    match output.derive_run_status() {
+        rocky_core::state::RunStatus::PartialFailure => Err(PartialFailure {
+            count: output.tables_failed,
+            run_id: run_id.to_string(),
+        }
+        .into()),
+        rocky_core::state::RunStatus::Failure => anyhow::bail!(
+            "{} model(s) failed (run_id: {run_id}, see the `errors` array in the JSON output)",
+            output.tables_failed
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Arm a background watcher that hard-exits with code 130 on a *second*
 /// SIGINT. The first signal (SIGINT or SIGTERM) is handled by the outer
 /// `tokio::select!` branch — this watcher gives the user an out when
@@ -1192,11 +1221,19 @@ pub async fn run(
         )
         .await;
 
+        // Stamp the terminal status so the JSON payload reports the run
+        // outcome directly (a compile-failed target makes this `Failure`).
+        output.status = output.derive_run_status();
         if output_json {
             print_json(&output)?;
         }
         budget_result?;
-        return Ok(());
+        // Same run-status exit contract as the transformation path: a
+        // model-only run (`rocky run --model <X>`) whose target failed to
+        // compile is recorded in `output.errors` / `tables_failed` by
+        // `execute_models`; propagate the non-zero exit so it doesn't
+        // report exit 0 with a JSON payload that says the model failed.
+        return run_status_exit_result(&output, &run_id);
     }
 
     let (pipeline_name, pipeline_config) =
@@ -4409,11 +4446,40 @@ pub(crate) async fn execute_models(
     let mut compile_result = match rocky_compiler::compile::compile(&compile_config) {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, "model compilation failed — skipping model execution");
+            // A whole-project compile failure (couldn't even produce a
+            // result — bad models dir, unparseable project) means nothing
+            // can execute. Surface it as a first-class run failure instead
+            // of returning `Ok(())`: record an error entry + bump
+            // `tables_failed` so `derive_run_status()` yields `Failure`,
+            // the caller emits the JSON, and the process exits non-zero.
+            // Without this a broken project reported `status: "Success"`,
+            // exit 0, with zero data materialized.
+            warn!(error = %e, "model compilation failed — no models can execute");
+            output.tables_failed += 1;
+            output.errors.push(crate::output::TableErrorOutput {
+                asset_key: vec!["<compile>".to_string()],
+                error: format!("model compilation failed: {e:#}"),
+                failure_kind: crate::output::FailureKind::CompileError,
+                cooldown_seconds: None,
+            });
             return Ok(());
         }
     };
 
+    // Per-model compile errors are first-class run failures, not silent
+    // skips. Each model that fails to type-check (e.g. E020 — a
+    // `time_interval` model whose `time_column` is absent from its SELECT
+    // output) is recorded in `output.errors` with the diagnostic, counted
+    // in `tables_failed`, and excluded from execution. Models that compiled
+    // cleanly still build, so a mixed project is a `PartialFailure` (good
+    // models materialize) rather than a green run that dropped data.
+    //
+    // Before this, `execute_models` warned and `return`ed `Ok(())`, so the
+    // run reported `status: "Success"`, exit 0, `materializations: []` —
+    // an orchestrator consuming `--output json` saw fully green while zero
+    // data materialized.
+    let mut compile_failed_models: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     if compile_result.has_errors {
         for d in &compile_result.diagnostics {
             if d.is_error() {
@@ -4423,10 +4489,24 @@ pub(crate) async fn execute_models(
                     message = &*d.message,
                     "compile error"
                 );
+                // Surface every error diagnostic as a run error so JSON
+                // consumers see the code + message; count each distinct
+                // model once toward `tables_failed`.
+                if compile_failed_models.insert(d.model.clone()) {
+                    output.tables_failed += 1;
+                }
+                output.errors.push(crate::output::TableErrorOutput {
+                    asset_key: vec![d.model.clone()],
+                    error: format!("[{}] {}", &*d.code, &*d.message),
+                    failure_kind: crate::output::FailureKind::CompileError,
+                    cooldown_seconds: None,
+                });
             }
         }
-        warn!("model compilation had errors — skipping model execution");
-        return Ok(());
+        warn!(
+            failed_models = compile_failed_models.len(),
+            "model(s) failed to compile — excluded from execution; run will report failure"
+        );
     }
 
     // `--defer`: rewrite the selected models' bare upstream `ref()`s to point
@@ -4561,6 +4641,11 @@ pub(crate) async fn execute_models(
         let matched: Vec<(usize, &String, &rocky_core::models::Model)> = layer
             .iter()
             .filter(|name| model_name_filter.is_none_or(|target| target == name.as_str()))
+            // Exclude models that failed to compile — they're already
+            // recorded as failures in `output.errors` above. A downstream
+            // model that `ref()`s an excluded one will fail at execution
+            // (missing table) and surface through the normal error path.
+            .filter(|name| !compile_failed_models.contains(name.as_str()))
             .filter_map(|name| compile_result.project.model(name).map(|m| (name, m)))
             .enumerate()
             .map(|(idx, (name, model))| (idx, name, model))
@@ -9018,6 +9103,33 @@ merge_keys = ["id"]
         .expect("write model toml");
     }
 
+    /// `run_status_exit_result` maps the derived run status onto the CLI
+    /// exit-code contract: Success → Ok, PartialFailure → the
+    /// `PartialFailure` sentinel (exit 2), Failure → an error (exit 1).
+    #[test]
+    fn run_status_exit_result_maps_status_to_exit_contract() {
+        // Clean run → Ok.
+        let mut ok = RunOutput::new(String::new(), 0, 1);
+        ok.tables_copied = 1;
+        assert!(super::run_status_exit_result(&ok, "r").is_ok());
+
+        // Some progress + a failure → PartialFailure sentinel (exit 2).
+        let mut partial = RunOutput::new(String::new(), 0, 1);
+        partial.tables_copied = 1;
+        partial.tables_failed = 1;
+        let err = super::run_status_exit_result(&partial, "r").unwrap_err();
+        assert!(
+            err.downcast_ref::<PartialFailure>().is_some(),
+            "PartialFailure must map to the exit-2 sentinel, got: {err:#}"
+        );
+
+        // No progress + a failure → a plain error (exit 1).
+        let mut total = RunOutput::new(String::new(), 0, 1);
+        total.tables_failed = 1;
+        let err = super::run_status_exit_result(&total, "r").unwrap_err();
+        assert!(err.downcast_ref::<PartialFailure>().is_none());
+    }
+
     /// End-to-end: a model declaring a `[[surrogate_key]]` block materializes a
     /// table that carries the injected, dialect-resolved hash column.
     #[cfg(feature = "duckdb")]
@@ -9044,6 +9156,114 @@ merge_keys = ["id"]
         assert_eq!(r.rows.len(), 1);
         let sk = r.rows[0][0].as_str().unwrap_or_default();
         assert_eq!(sk.len(), 32, "md5 hex should be 32 chars, got {sk:?}");
+    }
+
+    /// Write a `[strategy] time_interval` model whose `time_column` is
+    /// absent from its SELECT output — guaranteed E020 at type-check.
+    #[cfg(feature = "duckdb")]
+    fn write_e020_model(dir: &std::path::Path, name: &str) {
+        // Output schema is `{id}`; `time_column = "ts"` is not present → E020.
+        std::fs::write(dir.join(format!("{name}.sql")), "SELECT 1 AS id\n")
+            .expect("write model sql");
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            "[strategy]\ntype = \"time_interval\"\ntime_column = \"ts\"\ngranularity = \"day\"\nfirst_partition = \"2026-01-01\"\nlookback = 0\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .expect("write model toml");
+    }
+
+    /// A model that fails to compile (E020) is a first-class run failure,
+    /// not a silent skip: it is counted in `tables_failed`, surfaced in
+    /// `errors` with `FailureKind::CompileError` + the diagnostic, and the
+    /// clean sibling model still materializes — so the run is a
+    /// `PartialFailure`, not a green run that dropped data.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn compile_error_model_is_a_partial_failure_not_a_silent_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        // One clean model + one E020 model, independent of each other.
+        write_plain_model(&models, "good", "SELECT 7 AS id");
+        write_e020_model(&models, "broken");
+
+        let db_path = dir.path().join("t.duckdb");
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        // execute_models itself returns Ok — the failure is carried in the
+        // populated `output`, so the caller can still emit the JSON payload
+        // before mapping status to a non-zero exit code.
+        result.expect("execute_models should return Ok (failure carried in output)");
+
+        // The broken model counts once toward `tables_failed` even if it
+        // raised several diagnostics.
+        assert_eq!(output.tables_failed, 1, "the broken model counts as failed");
+        assert!(!output.errors.is_empty(), "diagnostics surfaced in errors");
+        // Every surfaced error belongs to the broken model and is tagged as
+        // a compile failure; at least one carries the E020 code.
+        assert!(output.errors.iter().all(|e| {
+            e.asset_key == vec!["broken".to_string()]
+                && e.failure_kind == crate::output::FailureKind::CompileError
+        }));
+        assert!(
+            output.errors.iter().any(|e| e.error.contains("E020")),
+            "an E020 diagnostic is present: {:?}",
+            output.errors
+        );
+
+        // The clean model still materialized.
+        let mat_names: Vec<String> = output
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(mat_names, vec!["good".to_string()]);
+
+        // Status is PartialFailure (some progress + a failure).
+        assert!(matches!(
+            output.derive_run_status(),
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+
+        // The good table exists; the broken one was never created.
+        let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("open db");
+        assert_eq!(
+            conn.execute_sql("SELECT id FROM main.good")
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        assert!(
+            conn.execute_sql("SELECT id FROM main.broken").is_err(),
+            "the compile-failed model must not have been materialized"
+        );
+    }
+
+    /// When every model fails to compile, the run is a total `Failure`:
+    /// nothing materializes, `tables_failed` is bumped, and the diagnostic
+    /// is surfaced in `errors`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn all_models_compile_error_is_a_total_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        write_e020_model(&models, "broken");
+
+        let db_path = dir.path().join("t.duckdb");
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("execute_models returns Ok with the failure in output");
+
+        assert_eq!(output.tables_failed, 1);
+        assert!(output.materializations.is_empty());
+        assert_eq!(
+            output.errors[0].failure_kind,
+            crate::output::FailureKind::CompileError
+        );
+        assert!(matches!(
+            output.derive_run_status(),
+            rocky_core::state::RunStatus::Failure
+        ));
     }
 
     /// Materialize all models in `models_dir` against a fresh DuckDB file,

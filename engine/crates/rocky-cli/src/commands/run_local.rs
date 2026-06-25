@@ -218,6 +218,12 @@ pub async fn run_transformation(
         &audit,
     );
 
+    // Stamp the terminal status onto the emitted payload so a JSON
+    // consumer reads it directly instead of re-deriving from counts. A
+    // model that failed to compile makes this `Failure` / `PartialFailure`
+    // rather than the `Success` default.
+    output.status = output.derive_run_status();
+
     if let Some(p) = &pipes {
         super::run::emit_pipes_events(p, &output);
         p.log(
@@ -243,7 +249,13 @@ pub async fn run_transformation(
         }
     }
 
-    Ok(())
+    // Honour the run-status exit-code contract. A model that failed to
+    // compile (recorded in `output.errors` / `tables_failed` by
+    // `execute_models`) makes the run a `Failure` (nothing built) or
+    // `PartialFailure` (some models built). The JSON `RunOutput` was
+    // already emitted above, so a consumer keying on `status` / `errors`
+    // sees the failure; this just propagates the non-zero exit code.
+    super::run::run_status_exit_result(&output, run_id)
 }
 
 /// Execute `rocky run` for a quality pipeline.

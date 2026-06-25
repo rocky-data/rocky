@@ -142,6 +142,14 @@ class FailureKind6(StrEnum):
 
 class FailureKind7(StrEnum):
     """
+    A model failed to compile (parse / type-check / contract diagnostic) before any SQL was issued — e.g. a `time_interval` model whose `time_column` is absent from its SELECT output (E020). The model never reached the warehouse; the run surfaces it as a failure instead of silently skipping it.
+    """
+
+    compile_error = "compile-error"
+
+
+class FailureKind8(StrEnum):
+    """
     Fallback when the failure could not be classified — e.g. errors raised outside the connector layer that reach this struct type-erased through `anyhow::Error`.
     """
 
@@ -433,6 +441,7 @@ class TableErrorOutput(BaseModel):
         | FailureKind5
         | FailureKind6
         | FailureKind7
+        | FailureKind8
         | None
     ) = "unknown"
     """
