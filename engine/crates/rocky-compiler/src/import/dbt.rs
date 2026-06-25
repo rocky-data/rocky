@@ -69,6 +69,11 @@ pub enum WarningCategory {
     /// `given.rows` or `expect.rows` (typically `csv` or `sql`). Inline
     /// `format = "dict"` is the only shape supported today.
     UnsupportedUnitTestFormat,
+    /// A `manifest.unit_tests` entry has fixture/expectation rows that
+    /// can't be represented in the Rocky sidecar TOML — typically a `null`
+    /// field value or a non-object row element (TOML has no null type).
+    /// The test is dropped so it never aborts the rest of the import.
+    UnserializableUnitTest,
 }
 
 /// A warning produced during import.
@@ -235,7 +240,15 @@ pub struct ImportedModel {
 ///
 /// Uses `compiled_code` (all Jinja resolved) for each model node, falling
 /// back to `raw_code` if compiled_code is absent.
-pub fn import_from_manifest(manifest: &DbtManifest, default_target: &TargetConfig) -> ImportResult {
+///
+/// When `skip_unit_tests` is set, `manifest.unit_tests` entries are counted
+/// but not converted (see [`apply_dbt_unit_tests`]) — backing the
+/// `rocky import-dbt --skip-unit-tests` flag.
+pub fn import_from_manifest(
+    manifest: &DbtManifest,
+    default_target: &TargetConfig,
+    skip_unit_tests: bool,
+) -> ImportResult {
     let mut result = ImportResult {
         imported: Vec::new(),
         warnings: Vec::new(),
@@ -297,7 +310,7 @@ pub fn import_from_manifest(manifest: &DbtManifest, default_target: &TargetConfi
     // migration is never silently lossy.
     record_dropped_constructs(&manifest.dropped, &mut result);
 
-    apply_dbt_unit_tests(manifest, &mut result);
+    apply_dbt_unit_tests(manifest, &mut result, skip_unit_tests);
 
     result
 }
@@ -453,9 +466,23 @@ pub fn apply_dbt_tests(yaml_root: &Path, default_target: &TargetConfig, result: 
 /// The `unit_tests_found`, `unit_tests_converted`, and
 /// `unit_tests_skipped` counters on [`ImportResult`] are updated in
 /// place.
-pub fn apply_dbt_unit_tests(manifest: &DbtManifest, result: &mut ImportResult) {
+///
+/// When `skip_unit_tests` is set, every entry is still counted in
+/// `unit_tests_found` but none are converted — each bumps
+/// `unit_tests_skipped` so the report stays honest. This backs the
+/// `rocky import-dbt --skip-unit-tests` escape hatch.
+pub fn apply_dbt_unit_tests(
+    manifest: &DbtManifest,
+    result: &mut ImportResult,
+    skip_unit_tests: bool,
+) {
     for ut in manifest.unit_tests.values() {
         result.unit_tests_found += 1;
+
+        if skip_unit_tests {
+            result.unit_tests_skipped += 1;
+            continue;
+        }
 
         if let Some(format) = ut.expect.format.as_deref()
             && !is_dict_format(format)
@@ -523,9 +550,54 @@ pub fn apply_dbt_unit_tests(manifest: &DbtManifest, result: &mut ImportResult) {
             given: ut.given.iter().map(convert_unit_test_given).collect(),
             expect: convert_unit_test_expect(&ut.expect),
         };
+
+        // Guard: the Rocky sidecar serializes `[[test]]` blocks to TOML,
+        // which has no `null` type. A fixture/expectation row carrying a
+        // `null` field value — or a non-object row element — can't be
+        // represented, and the `toml` crate fails the whole serialize with
+        // "unsupported unit type". Catch it here, per test, so one bad
+        // fixture never aborts the import of every other model/seed/test.
+        if let Err(reason) = check_unit_test_serializable(&test_def) {
+            tracing::warn!(
+                model = %ut.model,
+                unit_test = %ut.name,
+                reason = %reason,
+                "dropping dbt unit_test that can't be represented in Rocky sidecar TOML",
+            );
+            result.warnings.push(ImportWarning {
+                model: ut.model.clone(),
+                category: WarningCategory::UnserializableUnitTest,
+                message: format!(
+                    "dbt unit_test '{}' can't be represented in the Rocky sidecar TOML ({reason}) — skipped",
+                    ut.name
+                ),
+                suggestion: Some(
+                    "TOML has no null type; replace `null` fixture values with a sentinel \
+                     (or omit the column) in the dbt unit_test, then re-import".to_string(),
+                ),
+            });
+            result.unit_tests_skipped += 1;
+            continue;
+        }
+
         imported.unit_tests.push(test_def);
         result.unit_tests_converted += 1;
     }
+}
+
+/// Check that a converted unit test round-trips to the sidecar TOML the
+/// emitter writes. Returns `Err(reason)` when the `toml` crate rejects the
+/// shape — most commonly a `null` value inside a fixture/expectation row,
+/// which TOML cannot express. Mirrors the emitter's `[[test]]` wrapper so a
+/// pass here guarantees the emit-time serialize won't fail.
+fn check_unit_test_serializable(test: &UnitTestDef) -> Result<(), String> {
+    #[derive(serde::Serialize)]
+    struct Wrapper<'a> {
+        test: [&'a UnitTestDef; 1],
+    }
+    toml::to_string(&Wrapper { test: [test] })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// `format` is treated as `dict` when absent or explicitly set to
@@ -2112,7 +2184,7 @@ FROM raw.orders
             schema: "staging".to_string(),
             table: String::new(),
         };
-        let result = import_from_manifest(&manifest, &target);
+        let result = import_from_manifest(&manifest, &target, false);
 
         assert_eq!(result.import_method, ImportMethod::Manifest);
         assert_eq!(result.imported.len(), 1);
@@ -2225,7 +2297,7 @@ models:
             schema: "s".to_string(),
             table: String::new(),
         };
-        let result = import_from_manifest(&manifest, &target);
+        let result = import_from_manifest(&manifest, &target, false);
 
         assert_eq!(result.imported.len(), 1);
         assert!(matches!(
@@ -2269,7 +2341,7 @@ models:
             schema: "s".to_string(),
             table: String::new(),
         };
-        let result = import_from_manifest(&manifest, &target);
+        let result = import_from_manifest(&manifest, &target, false);
 
         assert_eq!(result.imported.len(), 1);
         assert!(matches!(
@@ -2448,7 +2520,7 @@ FROM {{ ref('stg_events') }}
             schema: "s".to_string(),
             table: String::new(),
         };
-        import_from_manifest(&manifest, &target)
+        import_from_manifest(&manifest, &target, false)
     }
 
     #[test]
@@ -3206,6 +3278,135 @@ FROM {{ ref('stg_events') }}
         assert_eq!(result.unit_tests_skipped, 0);
         let imported = result.imported.iter().find(|m| m.name == "m").unwrap();
         assert_eq!(imported.unit_tests.len(), 1);
+    }
+
+    /// A `null` fixture value (TOML has no null type) must NOT abort the
+    /// import. The offending unit test is skipped + counted; every other
+    /// model/seed/test still imports — and a sibling null-free unit test in
+    /// the same manifest round-trips cleanly. Regression for the
+    /// `toml::to_string … unsupported unit type` import-abort bug.
+    #[test]
+    fn test_apply_dbt_unit_tests_null_fixture_value_skips_not_aborts() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.m": {
+                    "unique_id": "model.p.m",
+                    "name": "m",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "table" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {},
+            "unit_tests": {
+                // Offending: a `null` field value inside an expectation row.
+                "unit_test.p.m.has_null": {
+                    "unique_id": "unit_test.p.m.has_null",
+                    "name": "has_null",
+                    "model": "m",
+                    "given": [{ "input": "ref('u')", "rows": [{ "id": 1, "note": "x" }] }],
+                    "expect": { "rows": [{ "id": 1, "note": null }], "format": "dict" },
+                    "tags": []
+                },
+                // Valid sibling: null-free, no description — must round-trip.
+                "unit_test.p.m.clean": {
+                    "unique_id": "unit_test.p.m.clean",
+                    "name": "clean",
+                    "model": "m",
+                    "given": [{ "input": "ref('u')", "rows": [{ "id": 2 }] }],
+                    "expect": { "rows": [{ "id": 2 }], "format": "dict" },
+                    "tags": []
+                }
+            }
+        });
+
+        let result = import_from_manifest_json(&manifest);
+
+        // Exit-0 behavior: the import completed, the model is present.
+        let imported = result
+            .imported
+            .iter()
+            .find(|m| m.name == "m")
+            .expect("model still imported despite the unserializable unit test");
+
+        // Counters: both seen, one converted, one skipped.
+        assert_eq!(result.unit_tests_found, 2);
+        assert_eq!(result.unit_tests_converted, 1);
+        assert_eq!(result.unit_tests_skipped, 1);
+
+        // Only the clean test is attached.
+        assert_eq!(imported.unit_tests.len(), 1);
+        assert_eq!(imported.unit_tests[0].name, "clean");
+
+        // A structured warning explains the skip.
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.category == WarningCategory::UnserializableUnitTest
+                    && w.message.contains("has_null")),
+            "expected an UnserializableUnitTest warning naming the dropped test"
+        );
+
+        // The retained test round-trips to the sidecar TOML the emitter writes.
+        let emitted = crate::import::emit::render_unit_tests("m", &imported.unit_tests);
+        assert!(
+            emitted.contains("[[test]]") && emitted.contains("clean"),
+            "clean test must serialize to a [[test]] block:\n{emitted}"
+        );
+    }
+
+    /// `--skip-unit-tests` counts every unit test as skipped, converts none,
+    /// and never aborts — even when a null-bearing fixture is present.
+    #[test]
+    fn test_skip_unit_tests_flag_skips_everything() {
+        let manifest_json = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.m": {
+                    "unique_id": "model.p.m",
+                    "name": "m",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "table" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {},
+            "unit_tests": {
+                "unit_test.p.m.clean": {
+                    "unique_id": "unit_test.p.m.clean",
+                    "name": "clean",
+                    "model": "m",
+                    "given": [{ "input": "ref('u')", "rows": [{ "id": 2 }] }],
+                    "expect": { "rows": [{ "id": 2 }], "format": "dict" },
+                    "tags": []
+                }
+            }
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, manifest_json.to_string()).unwrap();
+        let manifest = dbt_manifest::parse_manifest(&path).unwrap();
+        let target = TargetConfig {
+            catalog: "w".to_string(),
+            schema: "s".to_string(),
+            table: String::new(),
+        };
+
+        let result = import_from_manifest(&manifest, &target, /* skip_unit_tests */ true);
+
+        assert_eq!(result.unit_tests_found, 1);
+        assert_eq!(result.unit_tests_converted, 0);
+        assert_eq!(result.unit_tests_skipped, 1);
+        let imported = result.imported.iter().find(|m| m.name == "m").unwrap();
+        assert!(imported.unit_tests.is_empty());
     }
 
     // --- L1: model-path traversal rejection ---

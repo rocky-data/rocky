@@ -222,7 +222,7 @@ fn write_model_files(model: &ImportedModel, models_dir: &Path) -> Result<(), Str
 
     let mut toml_body = render_model_sidecar(&model.config);
     if !model.unit_tests.is_empty() {
-        toml_body.push_str(&render_unit_tests(&model.unit_tests)?);
+        toml_body.push_str(&render_unit_tests(&model.name, &model.unit_tests));
     }
     std::fs::write(&toml_path, toml_body)
         .map_err(|e| format!("failed to write {}: {e}", toml_path.display()))?;
@@ -232,17 +232,35 @@ fn write_model_files(model: &ImportedModel, models_dir: &Path) -> Result<(), Str
 /// Serialize a model's unit tests as `[[test]]` blocks. Uses the `toml`
 /// crate so the array-of-tables nesting (`[[test]]`, `[[test.given]]`,
 /// `[test.expect]`) matches what the [`UnitTestDef`] deserializer expects.
-fn render_unit_tests(tests: &[UnitTestDef]) -> Result<String, String> {
+///
+/// Each test is serialized individually so a single unrepresentable test
+/// (e.g. a `null` fixture value, which TOML can't express) is skipped with
+/// a warning rather than aborting the whole import. The upstream importer
+/// already drops such tests in `apply_dbt_unit_tests`; this is the
+/// defense-in-depth backstop so emission can never fail on a stray shape.
+pub(crate) fn render_unit_tests(model: &str, tests: &[UnitTestDef]) -> String {
     #[derive(Serialize)]
     struct Wrapper<'a> {
-        test: &'a [UnitTestDef],
+        test: [&'a UnitTestDef; 1],
     }
-    let body = toml::to_string(&Wrapper { test: tests })
-        .map_err(|e| format!("failed to serialize unit tests: {e}"))?;
-    let mut out = String::with_capacity(body.len() + 1);
-    out.push('\n');
-    out.push_str(&body);
-    Ok(out)
+    let mut out = String::new();
+    for test in tests {
+        match toml::to_string(&Wrapper { test: [test] }) {
+            Ok(body) => {
+                out.push('\n');
+                out.push_str(&body);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = %model,
+                    unit_test = %test.name,
+                    reason = %e,
+                    "skipping unit_test that can't be serialized to sidecar TOML",
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Inject a comment line above any TODO/Jinja-leftover marker so reviewers

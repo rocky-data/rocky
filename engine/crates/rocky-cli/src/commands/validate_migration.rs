@@ -54,7 +54,7 @@ pub fn run_validate_migration(
     let import_result = if manifest_path.exists() {
         let manifest =
             dbt_manifest::parse_manifest(&manifest_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        dbt::import_from_manifest(&manifest, &default_target)
+        dbt::import_from_manifest(&manifest, &default_target, false)
     } else {
         dbt::import_dbt_project(dbt_project, &default_target).map_err(|e| anyhow::anyhow!("{e}"))?
     };

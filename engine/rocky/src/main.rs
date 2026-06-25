@@ -1147,6 +1147,12 @@ enum Command {
         /// Without this flag, the importer refuses to write into a non-empty directory.
         #[arg(long)]
         overwrite: bool,
+        /// Skip dbt unit-test (`manifest.unit_tests`) translation entirely.
+        /// Models, seeds, and generic tests still import; every unit test is
+        /// reported under `unit_tests_skipped`. Use when a manifest carries
+        /// unit-test fixtures the Rocky sidecar can't represent.
+        #[arg(long = "skip-unit-tests")]
+        skip_unit_tests: bool,
     },
 
     /// Interactive SQL shell against the configured warehouse
@@ -2897,6 +2903,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             no_manifest,
             target_adapter,
             overwrite,
+            skip_unit_tests,
         } => rocky_cli::commands::run_import_dbt(
             &dbt_project,
             &output_dir,
@@ -2904,6 +2911,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             no_manifest,
             target_adapter.as_deref(),
             overwrite,
+            skip_unit_tests,
             json,
         ),
         Command::Shell { pipeline } => {
