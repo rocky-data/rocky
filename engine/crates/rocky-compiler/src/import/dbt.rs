@@ -107,6 +107,11 @@ pub enum WarningCategory {
     /// field value or a non-object row element (TOML has no null type).
     /// The test is dropped so it never aborts the rest of the import.
     UnserializableUnitTest,
+    /// A `profiles.yml` was present but could not be parsed/resolved (bad
+    /// YAML, unresolvable merge keys, or an `env_var()` `type` with no
+    /// default), so the importer emitted a stub DuckDB adapter. Surfaced
+    /// loudly so the migration never silently defaults to duckdb.
+    ProfileFallback,
 }
 
 /// A warning produced during import.
