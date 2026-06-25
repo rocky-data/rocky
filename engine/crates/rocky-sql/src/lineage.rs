@@ -61,6 +61,16 @@ pub struct TableReference {
     pub name: String,
     /// Alias if any.
     pub alias: Option<String>,
+    /// Output column names of a derived table (subquery in the `FROM` clause),
+    /// when they can be determined statically — i.e. the subquery does not
+    /// itself project a `SELECT *`. `None` for plain table references and for
+    /// subqueries whose column set can't be enumerated (e.g. the inner query
+    /// is itself a `SELECT *`, or a nested derived table that doesn't expand).
+    ///
+    /// This lets `SELECT * FROM (<subquery>) AS alias` resolve to the inner
+    /// query's projected columns instead of an empty schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_columns: Option<Vec<String>>,
 }
 
 /// Extracts the names of tables referenced in FROM/JOIN clauses.
@@ -139,12 +149,31 @@ fn extract_table_factor(factor: &TableFactor, tables: &mut Vec<TableReference>) 
             tables.push(TableReference {
                 name: name.to_string(),
                 alias: alias.as_ref().map(|a| a.name.value.clone()),
+                derived_columns: None,
             });
         }
-        TableFactor::Derived { alias: Some(a), .. } => {
+        TableFactor::Derived {
+            subquery,
+            alias: Some(a),
+            ..
+        } => {
+            // Resolve the subquery's output columns so that an outer
+            // `SELECT *` over this derived table can expand to them. We can
+            // only do this when the inner query enumerates its columns — an
+            // inner `SELECT *` (or a nested derived table that doesn't expand)
+            // leaves `has_star = true` with no individual columns, in which
+            // case we fall back to `None`.
+            let derived_columns = extract_query_lineage(subquery).ok().and_then(|inner| {
+                if inner.has_star || inner.columns.is_empty() {
+                    None
+                } else {
+                    Some(inner.columns.into_iter().map(|c| c.target_column).collect())
+                }
+            });
             tables.push(TableReference {
                 name: "(subquery)".to_string(),
                 alias: Some(a.name.value.clone()),
+                derived_columns,
             });
         }
         _ => {}
@@ -327,6 +356,77 @@ mod tests {
         let result = extract_lineage("SELECT * FROM catalog.schema.users").unwrap();
         assert!(result.has_star);
         assert!(result.columns.is_empty()); // star doesn't produce individual lineage
+    }
+
+    #[test]
+    fn test_derived_table_columns_resolved() {
+        // `SELECT * FROM (<subquery>) AS alias` records the inner query's
+        // output columns on the derived TableReference so the outer star can
+        // expand to them.
+        let result =
+            extract_lineage("SELECT * FROM (SELECT ts, id FROM raw.base) AS x WHERE ts >= '2026'")
+                .unwrap();
+        assert!(result.has_star);
+        assert_eq!(result.source_tables.len(), 1);
+        assert_eq!(result.source_tables[0].name, "(subquery)");
+        assert_eq!(result.source_tables[0].alias, Some("x".to_string()));
+        assert_eq!(
+            result.source_tables[0].derived_columns,
+            Some(vec!["ts".to_string(), "id".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_derived_table_columns_with_time_interval_placeholders() {
+        // The exact shape the import-dbt microbatch→time_interval rewrite emits.
+        let result = extract_lineage(
+            "SELECT * FROM (SELECT ts, id FROM raw.base) AS _rocky_microbatch \
+             WHERE ts >= @start_date AND ts < @end_date",
+        )
+        .unwrap();
+        assert!(result.has_star);
+        assert_eq!(
+            result.source_tables[0].derived_columns,
+            Some(vec!["ts".to_string(), "id".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_derived_table_uses_inner_output_names() {
+        // Inner aliases become the derived table's output column names.
+        let result =
+            extract_lineage("SELECT * FROM (SELECT ts AS event_time, id FROM raw.base) AS x")
+                .unwrap();
+        assert_eq!(
+            result.source_tables[0].derived_columns,
+            Some(vec!["event_time".to_string(), "id".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_qualified_wildcard_over_derived_table() {
+        // `SELECT x.*` (QualifiedWildcard) over a derived table still resolves.
+        let result = extract_lineage("SELECT x.* FROM (SELECT ts, id FROM raw.base) AS x").unwrap();
+        assert!(result.has_star);
+        assert_eq!(
+            result.source_tables[0].derived_columns,
+            Some(vec!["ts".to_string(), "id".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_derived_table_inner_star_not_resolved() {
+        // An inner `SELECT *` can't be enumerated statically — no derived
+        // columns, falling back to the pre-existing (empty) behavior.
+        let result = extract_lineage("SELECT * FROM (SELECT * FROM raw.base) AS x").unwrap();
+        assert!(result.has_star);
+        assert_eq!(result.source_tables[0].derived_columns, None);
+    }
+
+    #[test]
+    fn test_plain_table_has_no_derived_columns() {
+        let result = extract_lineage("SELECT * FROM catalog.schema.users").unwrap();
+        assert_eq!(result.source_tables[0].derived_columns, None);
     }
 
     #[test]
