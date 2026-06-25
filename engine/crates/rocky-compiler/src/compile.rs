@@ -85,6 +85,14 @@ pub struct CompilerConfig {
     /// keep the default (`false`) and continue to see W005 per
     /// uncovered model.
     pub project_freshness_default: bool,
+    /// Per-run variables (`rocky run --var name=value`) substituted into each
+    /// model's SQL **before** the semantic graph and typecheck run, so the
+    /// resolved SQL flows uniformly into `rocky run`, `rocky compile`, and
+    /// `rocky emit-sql`. Empty by default; a model that references
+    /// `@var(name)` with no supplied value and no inline default yields an
+    /// E028 error diagnostic naming the variable. Distinct from `${ENV}`
+    /// config-time interpolation, which resolves while parsing `rocky.toml`.
+    pub run_vars: rocky_core::run_vars::RunVars,
 }
 
 /// Result of compilation.
@@ -186,10 +194,39 @@ pub fn compile_with_db(
 
 /// Compile a pre-loaded project (useful when models come from other sources).
 pub fn compile_project(
-    project: Project,
+    mut project: Project,
     config: &CompilerConfig,
 ) -> Result<CompileResult, CompileError> {
     let mut timings = PhaseTimings::default();
+
+    // 1b. Substitute per-run variables (`@var(name)` / `@var(name, default)`)
+    //     into each model's SQL before any SQL parsing happens, so the
+    //     resolved text flows uniformly through the semantic graph, typecheck,
+    //     and downstream SQL generation. A reference with no supplied value and
+    //     no inline default is recorded and turned into an E028 error
+    //     diagnostic naming the variable. This pass is a no-op (and allocates
+    //     nothing extra beyond the per-model scan) when no model uses `@var()`.
+    let mut run_var_diagnostics: Vec<Diagnostic> = Vec::new();
+    for model in &mut project.models {
+        let substitution = rocky_core::run_vars::substitute_run_vars(&model.sql, &config.run_vars);
+        for missing in substitution.missing {
+            run_var_diagnostics.push(
+                Diagnostic::error(
+                    super::diagnostic::E028,
+                    &model.config.name,
+                    format!(
+                        "model references run variable `@var({missing})` but no value was \
+                         supplied and it has no inline default"
+                    ),
+                )
+                .with_suggestion(format!(
+                    "pass `--var {missing}=<value>` or give the reference an inline default \
+                     `@var({missing}, <default>)`"
+                )),
+            );
+        }
+        model.sql = substitution.sql;
+    }
 
     // 2. Build semantic graph
     let sg_start = Instant::now();
@@ -284,6 +321,7 @@ pub fn compile_project(
     diagnostics.extend(blast_radius_diagnostics);
     diagnostics.extend(classification_diagnostics);
     diagnostics.extend(freshness_diagnostics);
+    diagnostics.extend(run_var_diagnostics);
 
     let has_errors = diagnostics
         .iter()

@@ -130,6 +130,7 @@ pub async fn run_preview_rows(
         mask: rocky_cfg.mask.clone(),
         allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
         project_freshness_default: rocky_cfg.freshness.has_default(),
+        run_vars: rocky_core::run_vars::RunVars::new(),
     };
     let result = compile::compile(&compiler_cfg).map_err(|e| {
         err(

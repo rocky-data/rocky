@@ -36,6 +36,7 @@ pub fn run_compile(
     target_dialect: Option<Dialect>,
     with_seed: bool,
     cache_ttl_override: Option<u64>,
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
     let (output, text_data) = compile_inner(
         config_path,
@@ -47,6 +48,7 @@ pub fn run_compile(
         target_dialect,
         with_seed,
         cache_ttl_override,
+        run_vars,
     )?;
 
     if output_json {
@@ -81,6 +83,7 @@ fn compile_inner(
     target_dialect: Option<Dialect>,
     with_seed: bool,
     cache_ttl_override: Option<u64>,
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<(CompileOutput, CompileTextData)> {
     // `source_schemas` precedence:
     //   1. `--with-seed` wins -> seed loader (explicit user intent,
@@ -137,6 +140,7 @@ fn compile_inner(
         mask,
         allow_unmasked,
         project_freshness_default,
+        run_vars: run_vars.clone(),
     };
 
     let mut result = compile::compile(&config)?;
@@ -394,6 +398,9 @@ pub fn compile_output(
         target_dialect,
         with_seed,
         cache_ttl_override,
+        // `compile_output` backs commands that don't expose `--var`
+        // (ci / dag); an `@var()` model would surface an E028 diagnostic.
+        &rocky_core::run_vars::RunVars::new(),
     )?;
     Ok(output)
 }
@@ -667,6 +674,7 @@ schema_template = "s"
             Some(Dialect::BigQuery),
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .unwrap_err();
         assert!(
@@ -694,6 +702,7 @@ schema_template = "s"
             None,
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .expect("compile should succeed without lint");
     }
@@ -717,6 +726,7 @@ schema_template = "s"
             Some(Dialect::Snowflake),
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .expect("snowflake target should accept NVL");
     }
@@ -742,6 +752,7 @@ schema_template = "s"
             None,
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .unwrap_err();
         assert!(
@@ -774,6 +785,7 @@ schema_template = "s"
             Some(Dialect::BigQuery),
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("compilation failed"));
@@ -802,6 +814,7 @@ schema_template = "s"
             None,
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .expect("allow-listed NVL should not trip the lint");
     }
@@ -830,6 +843,7 @@ schema_template = "s"
             None,
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .expect("pragma-exempted model should not trip the lint");
     }
@@ -859,6 +873,7 @@ schema_template = "s"
             None,
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .unwrap_err();
         assert!(
@@ -888,6 +903,7 @@ schema_template = "s"
             None,
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .expect("missing config should fall through, not error");
     }
@@ -937,6 +953,7 @@ schema_template = "s"
             None,
             true,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .expect("with-seed compile should succeed");
     }
@@ -961,6 +978,7 @@ schema_template = "s"
             None,
             true,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -988,6 +1006,7 @@ schema_template = "s"
             None,
             true,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .unwrap_err();
         assert!(
@@ -1093,6 +1112,7 @@ schema_template = "s"
             None,
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .expect("compile with cache-backed source_schemas should succeed");
     }
@@ -1203,6 +1223,7 @@ schema_template = "s"
             None,
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .unwrap_err();
         assert!(
@@ -1231,6 +1252,7 @@ schema_template = "s"
             None,
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .expect("model without budget should compile cleanly");
     }
@@ -1262,6 +1284,7 @@ schema_template = "s"
             None,
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .unwrap_err();
         assert!(
@@ -1290,6 +1313,7 @@ schema_template = "s"
             None,
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .expect("generous budget should not trigger E027");
     }
@@ -1318,6 +1342,7 @@ schema_template = "s"
             None,
             false,
             None,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .expect("compile without state file should succeed");
         assert!(

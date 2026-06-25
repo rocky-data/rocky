@@ -64,6 +64,10 @@ pub async fn run_transformation(
     // idempotency entry under `K`, so `rocky history --audit` shows
     // `idempotency_key=-` instead of `K`.
     idempotency_key: Option<&str>,
+    // `--var` per-run variables threaded from `run()`. Substituted into
+    // `@var()` markers in this pipeline's model SQL at compile time (both the
+    // execution compile and the governance reconcile compile below).
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -115,6 +119,7 @@ pub async fn run_transformation(
             &super::run::DeferOptions::default(),
             skip_gate,
             rocky_cfg.reuse.enabled,
+            run_vars,
         )
         .await?;
 
@@ -145,6 +150,10 @@ pub async fn run_transformation(
                 mask: rocky_cfg.mask.clone(),
                 allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
                 project_freshness_default: rocky_cfg.freshness.has_default(),
+                // Resolve `@var()` on the governance reconcile compile too,
+                // so it doesn't re-read raw markers and spuriously report
+                // every variable as missing.
+                run_vars: run_vars.clone(),
             });
         match governance_compile {
             Ok(gov_compile) => {
@@ -998,6 +1007,7 @@ mod tests {
             None, // env
             &DeferOptions::default(),
             &skip_opts,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .await
         .expect("full-DAG transformation run should succeed");
@@ -1182,6 +1192,7 @@ auto_create_schemas = true
             None,      // env
             &DeferOptions::default(),
             &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
         )
         .await
         .expect("full-DAG transformation run with idempotency key should succeed");

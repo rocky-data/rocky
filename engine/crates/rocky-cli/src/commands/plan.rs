@@ -599,6 +599,7 @@ pub fn plan_preview_output(
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
         project_freshness_default: false,
+        run_vars: rocky_core::run_vars::RunVars::new(),
     };
     let result = match compile::compile(&config) {
         Ok(r) => r,
@@ -712,6 +713,7 @@ fn build_and_persist_run_plan(
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
         project_freshness_default: false,
+        run_vars: rocky_core::run_vars::RunVars::new(),
     };
 
     let result = compile::compile(&config).context("failed to compile models for run plan")?;
@@ -885,6 +887,7 @@ pub fn populate_governance_actions(
         mask: cfg.mask.clone(),
         allow_unmasked: cfg.classifications.allow_unmasked.clone(),
         project_freshness_default: cfg.freshness.has_default(),
+        run_vars: rocky_core::run_vars::RunVars::new(),
     })
     .context("failed to compile project for governance preview")?;
 
@@ -986,6 +989,7 @@ async fn check_plan_budget(
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
         project_freshness_default: false,
+        run_vars: rocky_core::run_vars::RunVars::new(),
     };
     let result = match rocky_compiler::compile::compile(&compile_cfg) {
         Ok(r) => r,

@@ -447,6 +447,7 @@ impl RockyLsp {
             mask,
             allow_unmasked,
             project_freshness_default,
+            run_vars: rocky_core::run_vars::RunVars::new(),
         };
 
         match rocky_compiler::compile::compile(&config) {
@@ -5684,6 +5685,7 @@ mod tests {
             mask: cfg.mask,
             allow_unmasked: cfg.classifications.allow_unmasked,
             project_freshness_default,
+            run_vars: rocky_core::run_vars::RunVars::new(),
         };
         let result = rocky_compiler::compile::compile(&compile_config).unwrap();
 

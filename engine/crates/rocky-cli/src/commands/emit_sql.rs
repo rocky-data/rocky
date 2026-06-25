@@ -98,6 +98,7 @@ fn emit_models(
     config_path: Option<&Path>,
     models_dir: &Path,
     model_filter: Option<&str>,
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<EmitResult> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
@@ -111,6 +112,7 @@ fn emit_models(
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
         project_freshness_default: false,
+        run_vars: run_vars.clone(),
     };
     let result = match compile::compile(&config) {
         Ok(r) => r,
@@ -242,11 +244,12 @@ pub fn run_emit_sql(
     models_dir: &Path,
     model_filter: Option<&str>,
     out_dir: Option<&Path>,
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
     let EmitResult {
         models,
         mut skipped,
-    } = emit_models(config_path, models_dir, model_filter)?;
+    } = emit_models(config_path, models_dir, model_filter, run_vars)?;
 
     if models.is_empty() {
         println!("emit-sql: no transformation SQL to emit.");
@@ -343,7 +346,14 @@ mod tests {
         write_model(dir.path(), "m", "SELECT 1 AS id", "");
 
         // No config → DuckDB dialect.
-        let emitted = emit_models(None, dir.path(), None).unwrap().models;
+        let emitted = emit_models(
+            None,
+            dir.path(),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap()
+        .models;
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].name, "m");
         assert!(!emitted[0].assumes_existing_target);
@@ -363,7 +373,14 @@ mod tests {
             "\n[[surrogate_key]]\nname = \"order_key\"\ncolumns = [\"order_id\"]\n",
         );
 
-        let emitted = emit_models(None, dir.path(), None).unwrap().models;
+        let emitted = emit_models(
+            None,
+            dir.path(),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap()
+        .models;
         assert_eq!(emitted.len(), 1);
         // The emitted SQL wraps the SELECT with the dbt-form hash column, exactly
         // as the materialization path does.
@@ -383,7 +400,14 @@ mod tests {
         write_model(dir.path(), "downstream", "SELECT id FROM upstream", "");
         write_model(dir.path(), "upstream", "SELECT 1 AS id", "");
 
-        let emitted = emit_models(None, dir.path(), None).unwrap().models;
+        let emitted = emit_models(
+            None,
+            dir.path(),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap()
+        .models;
         let names: Vec<&str> = emitted.iter().map(|m| m.name.as_str()).collect();
         let up = names.iter().position(|n| *n == "upstream").unwrap();
         let down = names.iter().position(|n| *n == "downstream").unwrap();
@@ -396,7 +420,14 @@ mod tests {
         write_model(dir.path(), "a", "SELECT 1 AS id", "");
         write_model(dir.path(), "b", "SELECT 2 AS id", "");
 
-        let emitted = emit_models(None, dir.path(), Some("b")).unwrap().models;
+        let emitted = emit_models(
+            None,
+            dir.path(),
+            Some("b"),
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap()
+        .models;
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].name, "b");
     }
@@ -411,7 +442,14 @@ mod tests {
         )
         .unwrap();
 
-        let emitted = emit_models(None, dir.path(), None).unwrap().models;
+        let emitted = emit_models(
+            None,
+            dir.path(),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap()
+        .models;
         assert_eq!(emitted.len(), 1);
         // A merge emits a statement operating on an existing target, so it is
         // flagged and the written file carries the bootstrap/watermark caveat.
@@ -435,7 +473,14 @@ mod tests {
         write_model(&models, "m", "SELECT 'ok' AS status", "");
 
         let out = dir.path().join("sql");
-        run_emit_sql(None, &models, None, Some(&out)).unwrap();
+        run_emit_sql(
+            None,
+            &models,
+            None,
+            Some(&out),
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
         let emitted = std::fs::read_to_string(out.join("m.sql")).unwrap();
 
         // Execute the emitted SQL against a fresh DuckDB — no `rocky run`.

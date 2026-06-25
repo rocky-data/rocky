@@ -141,6 +141,8 @@ fn print_compile_result(
         // freshness in a watch session should set `[cache.schemas]
         // ttl_seconds` in `rocky.toml` instead.
         None,
+        // `rocky compile --watch` does not expose `--var`.
+        &rocky_core::run_vars::RunVars::new(),
     ) {
         Ok(()) => {
             if !output_json {

@@ -116,6 +116,10 @@ pub enum WarningCategory {
     /// column `constraints` were dropped on import. Rocky enforces contracts
     /// via a `{model}.contract.toml` sidecar the importer doesn't generate.
     DroppedContract,
+    /// A dbt construct was mapped to a native Rocky equivalent rather than
+    /// dropped — informational, not a degradation. Today this covers
+    /// `{{ var('x') }}` → `@var(x)` (Rocky's per-run variable marker).
+    MappedConstruct,
 }
 
 /// A warning produced during import.
@@ -1761,13 +1765,21 @@ fn import_single_model(
             });
         }
     }
+    // `{{ var('x') }}` is now mapped to Rocky's native per-run variable marker
+    // `@var(x)` (with `{{ var('x', 'd') }}` -> `@var(x, d)`) during
+    // `convert_jinja_to_sql`, so it is no longer an unsupported macro. Emit an
+    // informational note so the operator knows to supply the value at run time
+    // via `rocky run --var x=value` (or rely on the inline default).
     if content_processed.contains("{{ var(") {
         warnings.push(ImportWarning {
             model: name.to_string(),
-            category: WarningCategory::UnsupportedMacro,
-            message: "contains {{ var() }} — not supported, replaced with TODO".to_string(),
+            category: WarningCategory::MappedConstruct,
+            message: "contains {{ var() }} — mapped to Rocky's `@var()` per-run variable marker"
+                .to_string(),
             suggestion: Some(
-                "replace with a literal value or use manifest.json import path".to_string(),
+                "supply values at run time with `rocky run --var name=value`, or rely on an \
+                 inline default `@var(name, default)`"
+                    .to_string(),
             ),
         });
     }
@@ -2120,6 +2132,21 @@ fn single_string_value(config_str: &str, key: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Convert dbt Jinja expressions to plain SQL.
+/// Strip a single pair of matching surrounding quotes (`'...'` or `"..."`)
+/// from `s`. Used to normalize a dbt `var('x', 'default')` literal default
+/// into the bare text Rocky's `@var(x, default)` expects.
+fn strip_surrounding_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'\'' || bytes[0] == b'"')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
 fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
     let mut sql = content.to_string();
 
@@ -2136,6 +2163,27 @@ fn convert_jinja_to_sql(content: &str, this_ref: &str) -> String {
         Regex::new(r#"\{\{\s*source\s*\(\s*['"](\w+)['"]\s*,\s*['"](\w+)['"]\s*\)\s*\}\}"#)
             .unwrap();
     sql = source_re.replace_all(&sql, "$1.$2").to_string();
+
+    // {{ var('x') }} -> @var(x) and {{ var('x', 'd') }} -> @var(x, d).
+    // Rocky's per-run variables (`rocky run --var x=value`) are the native
+    // home for dbt vars: the marker stays parse-visible and is resolved at
+    // compile/render time. The default is emitted verbatim minus any
+    // surrounding quotes so a string default `'d'` and a bare default `42`
+    // both round-trip to `@var(x, d)` / `@var(x, 42)`.
+    let var_re =
+        Regex::new(r#"\{\{\s*var\s*\(\s*['"](\w+)['"]\s*(?:,\s*([^)]*?))?\s*\)\s*\}\}"#).unwrap();
+    sql = var_re
+        .replace_all(&sql, |caps: &regex::Captures<'_>| {
+            let name = &caps[1];
+            match caps.get(2) {
+                Some(default) => {
+                    let default = strip_surrounding_quotes(default.as_str().trim());
+                    format!("@var({name}, {default})")
+                }
+                None => format!("@var({name})"),
+            }
+        })
+        .to_string();
 
     // {{ this }} -> the model's own fully-qualified name. Substituting a real
     // catalog.schema.table (NoExpand so dots/`$` are literal) avoids emitting a
@@ -2198,6 +2246,37 @@ mod tests {
         assert_eq!(
             convert_jinja_to_sql(input, "cat.sch.tbl"),
             "SELECT * FROM orders"
+        );
+    }
+
+    #[test]
+    fn test_convert_var_no_default() {
+        // `{{ var('drop_date') }}` maps to Rocky's `@var(drop_date)` marker —
+        // NOT a TODO / unsupported-macro placeholder.
+        let input = "SELECT * FROM t WHERE d = '{{ var('drop_date') }}'";
+        let out = convert_jinja_to_sql(input, "cat.sch.tbl");
+        assert_eq!(out, "SELECT * FROM t WHERE d = '@var(drop_date)'");
+        assert!(!out.contains("TODO"));
+    }
+
+    #[test]
+    fn test_convert_var_with_string_default() {
+        // `{{ var('x', 'd') }}` maps to `@var(x, d)` — surrounding quotes on
+        // the literal default are stripped.
+        let input = "SELECT {{ var('region', 'us') }} AS r";
+        assert_eq!(
+            convert_jinja_to_sql(input, "cat.sch.tbl"),
+            "SELECT @var(region, us) AS r"
+        );
+    }
+
+    #[test]
+    fn test_convert_var_with_bare_default() {
+        // A non-string default (e.g. a number) round-trips verbatim.
+        let input = "SELECT {{ var('threshold', 100) }} AS t";
+        assert_eq!(
+            convert_jinja_to_sql(input, "cat.sch.tbl"),
+            "SELECT @var(threshold, 100) AS t"
         );
     }
 

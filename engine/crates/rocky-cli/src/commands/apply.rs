@@ -250,6 +250,9 @@ async fn execute_run_plan(
         // The skip gate is a runtime-only `rocky run` overlay, not persisted
         // on the plan; the two-step path builds every planned model.
         &crate::commands::run::SkipRunOptions::default(),
+        // Per-run `--var` values are not persisted on the plan; an
+        // `@var()` model would compile-error on a two-step apply.
+        &rocky_core::run_vars::RunVars::new(),
     )
     .await
     .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))?;
@@ -465,6 +468,8 @@ async fn run_apply_replication_plan(
         &crate::commands::run::DeferOptions::default(),
         // The skip gate only applies to transformation models; inert here.
         &crate::commands::run::SkipRunOptions::default(),
+        // Replication apply runs no transformation models; vars are inert.
+        &rocky_core::run_vars::RunVars::new(),
     )
     .await
     .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
@@ -834,6 +839,7 @@ pub async fn run_apply_inline_for_run(
     env: Option<&str>,
     defer_opts: &crate::commands::run::DeferOptions,
     skip_opts: &crate::commands::run::SkipRunOptions,
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
     // Thin passthrough — routes to the existing run implementation.
     crate::commands::run::run(
@@ -855,6 +861,7 @@ pub async fn run_apply_inline_for_run(
         env,
         defer_opts,
         skip_opts,
+        run_vars,
     )
     .await
 }
