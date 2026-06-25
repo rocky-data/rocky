@@ -2073,6 +2073,68 @@ mod tests {
             .collect()
     }
 
+    fn make_time_interval_select_star_model(name: &str, time_column: &str, sql: &str) -> Model {
+        let mut model = make_model(name, sql);
+        model.config.strategy = StrategyConfig::TimeInterval {
+            time_column: time_column.to_string(),
+            granularity: rocky_ir::TimeGrain::Day,
+            lookback: 0,
+            batch_size: std::num::NonZeroU32::new(1).unwrap(),
+            first_partition: None,
+        };
+        model
+    }
+
+    #[test]
+    fn test_e020_not_fired_for_select_star_over_derived_table() {
+        // Regression: `SELECT * FROM (<subquery>) AS alias` used to compute an
+        // empty output schema, so E020 wrongly fired for a time_column the
+        // inner query clearly projects. The derived table now expands.
+        let models = vec![make_time_interval_select_star_model(
+            "ti",
+            "ts",
+            "SELECT * FROM (SELECT ts, id FROM raw.base) AS x \
+             WHERE ts >= @start_date AND ts < @end_date",
+        )];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        let ti_cols = result.typed_models.get("ti").unwrap();
+        assert!(
+            ti_cols.iter().any(|c| c.name == "ts"),
+            "expected ts in output schema, got: {ti_cols:?}"
+        );
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "E020"),
+            "E020 must not fire when the inner query projects ts: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_e020_still_fires_when_inner_query_omits_time_column() {
+        // The fix must not weaken E020: a genuinely-absent time_column still
+        // errors even with a SELECT * over a derived table.
+        let models = vec![make_time_interval_select_star_model(
+            "ti",
+            "ts",
+            "SELECT * FROM (SELECT id FROM raw.base) AS x \
+             WHERE id >= @start_date AND id < @end_date",
+        )];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        assert!(
+            result.diagnostics.iter().any(|d| &*d.code == "E020"),
+            "E020 must still fire for a missing time_column: {:?}",
+            result.diagnostics
+        );
+    }
+
     #[test]
     fn test_basic_type_propagation() {
         let models = vec![

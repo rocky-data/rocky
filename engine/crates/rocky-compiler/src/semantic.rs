@@ -340,6 +340,20 @@ pub fn build_semantic_graph(
                             });
                         }
                     }
+                } else if let Some(derived_cols) = &table_ref.derived_columns {
+                    // Derived table (subquery in FROM): expand to the inner
+                    // query's statically-resolved output columns. These carry
+                    // no cross-model edge (the subquery isn't a named model or
+                    // source), so their types stay Unknown — that's enough for
+                    // the column to exist in the output schema (e.g. the E020
+                    // time_column check) without weakening any type-shape check.
+                    for col_name in derived_cols {
+                        if output_names.insert(col_name.clone()) {
+                            output_columns.push(ColumnDef {
+                                name: col_name.clone(),
+                            });
+                        }
+                    }
                 } else if let Some(source_cols) = source_schemas.get(table_name.as_str()) {
                     // External source with known schema
                     for col in source_cols {
@@ -446,6 +460,44 @@ mod tests {
         assert!(!c_edges.is_empty());
         assert_eq!(&*c_edges[0].source.model, "b");
         assert_eq!(&*c_edges[0].source.column, "id");
+    }
+
+    #[test]
+    fn test_select_star_over_derived_table_expands_inner_columns() {
+        // `SELECT * FROM (<subquery>) AS alias` must expose the inner query's
+        // output columns in the model's schema, not an empty column set.
+        let models = vec![make_model(
+            "ti",
+            "SELECT * FROM (SELECT ts, id FROM raw.base) AS x \
+             WHERE ts >= @start_date AND ts < @end_date",
+        )];
+
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+
+        let schema = graph.models.get("ti").expect("model present");
+        assert!(schema.has_star);
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"ts"), "expected ts in {names:?}");
+        assert!(names.contains(&"id"), "expected id in {names:?}");
+    }
+
+    #[test]
+    fn test_select_star_over_derived_table_missing_column() {
+        // The negative case: a column the inner query does NOT project must
+        // stay absent from the schema (so E020 still fires for it).
+        let models = vec![make_model(
+            "ti",
+            "SELECT * FROM (SELECT id FROM raw.base) AS x",
+        )];
+
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+
+        let schema = graph.models.get("ti").expect("model present");
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"id"), "expected id in {names:?}");
+        assert!(!names.contains(&"ts"), "ts must be absent in {names:?}");
     }
 
     #[test]
