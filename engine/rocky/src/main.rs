@@ -1153,6 +1153,14 @@ enum Command {
         /// unit-test fixtures the Rocky sidecar can't represent.
         #[arg(long = "skip-unit-tests")]
         skip_unit_tests: bool,
+        /// How to translate dbt microbatch models. `merge` (default) keeps the
+        /// historical idempotent-merge mapping for back-compat. `time_interval`
+        /// emits a bounded per-partition `time_interval` model
+        /// (`@start_date`/`@end_date` window + lookback), falling back to merge
+        /// with a warning when the body can't be rewritten safely. Manifest
+        /// import only.
+        #[arg(long = "microbatch-as", default_value = "merge", value_parser = ["merge", "time_interval"])]
+        microbatch_as: String,
     },
 
     /// Interactive SQL shell against the configured warehouse
@@ -2904,6 +2912,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             target_adapter,
             overwrite,
             skip_unit_tests,
+            microbatch_as,
         } => rocky_cli::commands::run_import_dbt(
             &dbt_project,
             &output_dir,
@@ -2912,6 +2921,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             target_adapter.as_deref(),
             overwrite,
             skip_unit_tests,
+            &microbatch_as,
             json,
         ),
         Command::Shell { pipeline } => {

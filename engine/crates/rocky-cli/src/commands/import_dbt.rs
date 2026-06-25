@@ -32,7 +32,7 @@ use rocky_compiler::import::{
     dbt,
     dbt::{
         HookKind, ImportDbtStructuredWarning as CompilerStructuredWarning, ImportResult,
-        ImportWarning, WarningCategory,
+        ImportWarning, MicrobatchMode, WarningCategory,
     },
     dbt_manifest, dbt_profiles,
     dbt_profiles::{AdapterKind, ProfileResolution, StubReason},
@@ -59,8 +59,11 @@ pub fn run_import_dbt(
     target_adapter: Option<&str>,
     overwrite: bool,
     skip_unit_tests: bool,
+    microbatch_as: &str,
     output_json: bool,
 ) -> Result<()> {
+    let microbatch_mode = MicrobatchMode::from_flag(microbatch_as);
+
     // Resolve adapter shape — profile detection unless --target-adapter overrides.
     let profile = resolve_profile(dbt_project, target_adapter);
     let adapter_override_label = target_adapter.map(std::string::ToString::to_string);
@@ -74,6 +77,7 @@ pub fn run_import_dbt(
         manifest_path,
         no_manifest,
         skip_unit_tests,
+        microbatch_mode,
     )?;
 
     // A `profiles.yml` that was present but couldn't be resolved fell back to
@@ -269,8 +273,12 @@ fn run_importer(
     manifest_path: Option<&Path>,
     no_manifest: bool,
     skip_unit_tests: bool,
+    microbatch_mode: MicrobatchMode,
 ) -> Result<ImportResult> {
     if no_manifest {
+        // The regex (`--no-manifest`) path keeps the default microbatch
+        // mapping; `--microbatch-as=time_interval` needs the compiled body
+        // only the manifest path carries.
         return dbt::import_dbt_project(dbt_project, default_target)
             .map_err(|e| anyhow::anyhow!("{e}"));
     }
@@ -295,7 +303,8 @@ fn run_importer(
 
     if let Some(ref mf) = manifest_file {
         let manifest = dbt_manifest::parse_manifest(mf).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut result = dbt::import_from_manifest(&manifest, default_target, skip_unit_tests);
+        let mut result =
+            dbt::import_from_manifest(&manifest, default_target, skip_unit_tests, microbatch_mode);
         // The manifest path doesn't itself walk schema.yml files for tests.
         // Apply the dbt-tests pass against the project root so manifest
         // imports also pick up the four canonical generic tests.
