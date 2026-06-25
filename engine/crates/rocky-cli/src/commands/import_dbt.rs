@@ -179,6 +179,7 @@ pub fn run_import_dbt(
             unit_tests_converted: import_result.unit_tests_converted,
             unit_tests_skipped: import_result.unit_tests_skipped,
             constructs_dropped: import_result.constructs_dropped,
+            contracts_dropped: import_result.contracts_dropped,
             macros_detected: import_result.macros_detected,
             imported_models: import_result
                 .imported
@@ -391,6 +392,17 @@ fn to_cli_structured_warning(w: &CompilerStructuredWarning) -> ImportDbtStructur
             construct: construct.clone(),
             name: name.clone(),
             detail: detail.clone(),
+        },
+        CompilerStructuredWarning::DroppedContract {
+            model,
+            typed_columns,
+            constraints,
+            contract_path,
+        } => ImportDbtStructuredWarning::DroppedContract {
+            model: model.clone(),
+            typed_columns: *typed_columns,
+            constraints: *constraints,
+            contract_path: contract_path.clone(),
         },
     }
 }

@@ -105,6 +105,19 @@ pub struct DbtNodeConfig {
     pub merge_update_columns: Option<Vec<String>>,
     /// `merge_exclude_columns` — columns excluded from the MERGE UPDATE (dbt).
     pub merge_exclude_columns: Option<Vec<String>>,
+    /// `contract` — dbt model contract enforcement (`{ enforced: true }`).
+    /// Rocky does not auto-generate `{model}.contract.toml` on import; the
+    /// importer surfaces this so the migration is never silently lossy.
+    pub contract: Option<DbtContractConfig>,
+}
+
+/// dbt model `contract` config — whether the model enforces a declared
+/// column-level contract (`config: { contract: { enforced: true } }`).
+#[derive(Debug, Clone, Default)]
+pub struct DbtContractConfig {
+    /// `enforced` — when true, dbt validates the model output against the
+    /// declared column types/constraints at build time.
+    pub enforced: bool,
 }
 
 /// unique_key can be a single string or a list.
@@ -119,6 +132,14 @@ pub enum UniqueKeyValue {
 pub struct DbtManifestColumn {
     pub name: String,
     pub description: Option<String>,
+    /// `data_type` — declared physical type (part of a dbt model contract).
+    /// Dropped on import (Rocky infers types from the model SQL); surfaced
+    /// alongside the contract warning so the loss is visible.
+    pub data_type: Option<String>,
+    /// `constraints` — declared column constraints (`not_null`, `primary_key`,
+    /// `check`, …) from a dbt model contract. Dropped on import; the count is
+    /// surfaced in the contract warning.
+    pub constraints: Vec<String>,
 }
 
 /// A unit-test definition extracted from `manifest.unit_tests`.
@@ -318,6 +339,15 @@ struct RawNodeConfig {
     /// `merge_exclude_columns` — columns excluded from the MERGE UPDATE.
     #[serde(default)]
     merge_exclude_columns: Option<Vec<String>>,
+    /// `contract` — dbt model contract enforcement block.
+    #[serde(default)]
+    contract: Option<RawContract>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawContract {
+    #[serde(default)]
+    enforced: bool,
 }
 
 #[derive(Deserialize)]
@@ -326,6 +356,20 @@ struct RawColumn {
     name: String,
     #[serde(default)]
     description: Option<String>,
+    /// `data_type` — declared physical type (model contract).
+    #[serde(default)]
+    data_type: Option<String>,
+    /// `constraints` — declared column constraints (model contract). dbt emits
+    /// these as objects (`{ type: "not_null", ... }`); we keep just the
+    /// constraint `type` for the dropped-contract warning.
+    #[serde(default)]
+    constraints: Vec<RawConstraint>,
+}
+
+#[derive(Deserialize)]
+struct RawConstraint {
+    #[serde(default, rename = "type")]
+    constraint_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -497,11 +541,18 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
         .columns
         .into_iter()
         .map(|(k, c)| {
+            let constraints = c
+                .constraints
+                .into_iter()
+                .filter_map(|x| x.constraint_type)
+                .collect();
             (
                 k,
                 DbtManifestColumn {
                     name: c.name,
                     description: c.description,
+                    data_type: c.data_type,
+                    constraints,
                 },
             )
         })
@@ -533,6 +584,9 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
             alias: config.alias,
             merge_update_columns: config.merge_update_columns,
             merge_exclude_columns: config.merge_exclude_columns,
+            contract: config.contract.map(|c| DbtContractConfig {
+                enforced: c.enforced,
+            }),
         },
         columns,
         description: raw.description.filter(|d| !d.is_empty()),

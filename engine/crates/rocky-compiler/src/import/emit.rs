@@ -602,7 +602,8 @@ fn write_structured_warnings(
             | W::DroppedOnSchemaChange { model, .. }
             | W::UnresolvableMacro { model, .. }
             | W::MicrobatchMissingEventTime { model }
-            | W::MicrobatchMapped { model, .. } => model.as_str(),
+            | W::MicrobatchMapped { model, .. }
+            | W::DroppedContract { model, .. } => model.as_str(),
             // Project-level drops have no owning model — group by their name.
             W::DroppedConstruct { name, .. } => name.as_str(),
         };
@@ -683,6 +684,16 @@ fn write_structured_warnings(
                     detail,
                 } => {
                     out.push_str(&format!("- **Dropped {construct}** `{name}` — {detail}\n"));
+                }
+                W::DroppedContract {
+                    typed_columns,
+                    constraints,
+                    contract_path,
+                    ..
+                } => {
+                    out.push_str(&format!(
+                        "- **Dropped enforced contract** ({typed_columns} typed column(s), {constraints} constraint(s)) — Rocky enforces contracts via `{contract_path}`, which the importer does not auto-generate. Author it to re-establish the contract.\n"
+                    ));
                 }
             }
         }
@@ -881,6 +892,7 @@ mod tests {
             unit_tests_converted: 0,
             unit_tests_skipped: 0,
             constructs_dropped: 0,
+            contracts_dropped: 0,
         }
     }
 
