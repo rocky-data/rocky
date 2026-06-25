@@ -88,20 +88,45 @@ pub struct ProfileResolution {
     /// Schema / dataset name as declared in profiles.yml, when present —
     /// used as a default for `[target] schema`.
     pub schema: Option<String>,
+    /// A loud diagnostic when a `profiles.yml` was present but could not be
+    /// parsed/resolved, so the importer fell back to a stub DuckDB adapter.
+    /// `None` on a clean resolve. The CLI surfaces this as an import warning
+    /// (and in `--output json`) rather than silently defaulting to duckdb.
+    pub fallback_reason: Option<String>,
 }
 
 /// Resolve the adapter shape from a dbt project directory.
 ///
-/// Tries `<dbt_project>/profiles.yml`. If absent or unparseable, returns
-/// `None` and the caller stubs a DuckDB adapter with a TODO note. We
-/// deliberately do **not** read `~/.dbt/profiles.yml` — the importer
-/// is meant to operate on a self-contained project tree.
+/// Tries `<dbt_project>/profiles.yml`. Returns `None` only when no
+/// `profiles.yml` exists (the caller then stubs a DuckDB adapter for an
+/// absent profile). When a `profiles.yml` is present but can't be
+/// parsed/resolved, this returns a `Some(stub)` whose
+/// [`ProfileResolution::fallback_reason`] names the problem — so the caller
+/// warns loudly instead of silently defaulting to duckdb.
+///
+/// We deliberately do **not** read `~/.dbt/profiles.yml` — the importer is
+/// meant to operate on a self-contained project tree.
 pub fn resolve_from_project(dbt_project: &Path) -> Option<ProfileResolution> {
     let profiles_path = dbt_project.join("profiles.yml");
     if !profiles_path.exists() {
         return None;
     }
-    parse_profiles_file(&profiles_path).ok()
+    match parse_profiles_file(&profiles_path) {
+        Ok(resolved) => Some(resolved),
+        Err(reason) => {
+            tracing::warn!(
+                profiles = %profiles_path.display(),
+                reason = %reason,
+                "could not resolve dbt profiles.yml — falling back to a stub DuckDB adapter",
+            );
+            let mut stub = stub_resolution(StubReason::ProfilesUnparseable);
+            stub.fallback_reason = Some(format!(
+                "{}: {reason} — emitted a stub DuckDB adapter; edit the [adapter] block in rocky.toml manually",
+                profiles_path.display()
+            ));
+            Some(stub)
+        }
+    }
 }
 
 /// Stub adapter used when profiles.yml is missing or unparseable, or when
@@ -121,6 +146,7 @@ pub fn stub_resolution(reason: StubReason) -> ProfileResolution {
         env_vars: ProfileEnvVars::default(),
         database: None,
         schema: None,
+        fallback_reason: None,
     }
 }
 
@@ -145,6 +171,7 @@ pub fn resolution_for_kind(kind: AdapterKind, original_label: &str) -> ProfileRe
         env_vars,
         database: None,
         schema: None,
+        fallback_reason: None,
     }
 }
 
@@ -173,8 +200,27 @@ struct RawOutput {
 fn parse_profiles_file(path: &Path) -> Result<ProfileResolution, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let parsed: ProfilesFile = serde_yaml::from_str(&content)
+
+    // Parse to an untyped `Value` first so we can resolve YAML merge keys
+    // (`<<: *anchor`). `serde_yaml` expands plain anchors/aliases on its own,
+    // but does NOT apply merge keys unless asked — without this a profile that
+    // factors common output config into a `&base` anchor loses its `type`
+    // field and silently falls back to duckdb.
+    let mut value: serde_yaml::Value = serde_yaml::from_str(&content)
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    value.apply_merge().map_err(|e| {
+        format!(
+            "failed to resolve YAML merge keys in {}: {e}",
+            path.display()
+        )
+    })?;
+
+    let parsed: ProfilesFile = serde_yaml::from_value(value).map_err(|e| {
+        format!(
+            "failed to read {} after merge-key resolution: {e}",
+            path.display()
+        )
+    })?;
 
     // Pick the first profile (dbt projects typically have exactly one).
     let (_profile_name, profile) = parsed
@@ -194,10 +240,26 @@ fn parse_profiles_file(path: &Path) -> Result<ProfileResolution, String> {
         .or_else(|| outputs.values().next())
         .ok_or_else(|| format!("{}: target '{target_name}' not found", path.display()))?;
 
-    let profile_type = output
+    let raw_type = output
         .profile_type
         .clone()
         .ok_or_else(|| format!("{}: missing 'type' on output", path.display()))?;
+
+    // The `type` field may be a `{{ env_var('ADAPTER','duckdb') }}` template
+    // rather than a literal. We never read the live secret — only the adapter
+    // discriminator matters, so use the env_var default when present. A
+    // template with no default is a genuine failure (we can't know the type).
+    let profile_type = match resolve_env_var_template(&raw_type) {
+        EnvVarType::Literal(s) => s,
+        EnvVarType::WithDefault(default) => default,
+        EnvVarType::NoDefault(var) => {
+            return Err(format!(
+                "{}: output 'type' is `{{{{ env_var('{var}') }}}}` with no default — \
+                 cannot determine the adapter type without resolving the env var",
+                path.display()
+            ));
+        }
+    };
 
     let kind = AdapterKind::from_dbt_type(&profile_type);
     let (adapter_toml, env_vars) = render_adapter_skeleton(&kind);
@@ -212,7 +274,68 @@ fn parse_profiles_file(path: &Path) -> Result<ProfileResolution, String> {
         env_vars,
         database,
         schema,
+        fallback_reason: None,
     })
+}
+
+/// Outcome of interpreting a profile `type` field that may be a dbt
+/// `{{ env_var(...) }}` template.
+#[derive(Debug, PartialEq, Eq)]
+enum EnvVarType {
+    /// A plain literal type (e.g. `duckdb`).
+    Literal(String),
+    /// `env_var('X', 'default')` — use the default as the discriminator.
+    WithDefault(String),
+    /// `env_var('X')` with no default — can't resolve without the secret.
+    NoDefault(String),
+}
+
+/// Interpret a profile `type` value that may be a dbt `{{ env_var('X','d') }}`
+/// template. Only the adapter discriminator matters, so the env-var **default**
+/// is used when present — the live value (a secret) is never read here.
+/// A non-template value is returned verbatim as a literal.
+fn resolve_env_var_template(raw: &str) -> EnvVarType {
+    let trimmed = raw.trim();
+    // Match `{{ env_var('NAME') }}` or `{{ env_var('NAME', 'default') }}`
+    // with single or double quotes. Anything that doesn't look like an
+    // env_var template is a literal.
+    let Some(inner) = trimmed
+        .strip_prefix("{{")
+        .and_then(|s| s.strip_suffix("}}"))
+        .map(str::trim)
+    else {
+        return EnvVarType::Literal(trimmed.to_string());
+    };
+    let Some(args) = inner
+        .strip_prefix("env_var(")
+        .and_then(|s| s.strip_suffix(')'))
+    else {
+        return EnvVarType::Literal(trimmed.to_string());
+    };
+
+    let parts: Vec<String> = split_quoted_args(args);
+    match parts.as_slice() {
+        [_name, default] => EnvVarType::WithDefault(default.clone()),
+        [name] => EnvVarType::NoDefault(name.clone()),
+        // Malformed env_var(...) — treat as a literal so the caller's
+        // adapter mapping flags it as Unmapped rather than crashing.
+        _ => EnvVarType::Literal(trimmed.to_string()),
+    }
+}
+
+/// Split a comma-separated list of single/double-quoted string args, trimming
+/// surrounding whitespace and the quote characters. Unquoted tokens are kept
+/// as-is (trimmed). Good enough for the `env_var('X','d')` shape; not a full
+/// expression parser.
+fn split_quoted_args(args: &str) -> Vec<String> {
+    args.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.trim_matches(|c| c == '\'' || c == '"' || c == ' ')
+                .to_string()
+        })
+        .collect()
 }
 
 fn render_adapter_skeleton(kind: &AdapterKind) -> (String, ProfileEnvVars) {
@@ -371,6 +494,90 @@ mod tests {
     fn missing_profiles_file_returns_none() {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(resolve_from_project(dir.path()).is_none());
+    }
+
+    #[test]
+    fn resolves_yaml_merge_keys_anchor() {
+        // The output factors common config into a `&base` anchor and pulls it
+        // in with `<<: *base`. Without merge-key resolution the `type` field is
+        // missing and we'd silently fall back to duckdb.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("profiles.yml"),
+            "shop:\n  target: prod\n  outputs:\n    base: &base\n      type: databricks\n      host: dbc-x.cloud.databricks.com\n      http_path: /sql/1.0/warehouses/abc\n    prod:\n      <<: *base\n      catalog: analytics\n      schema: marts\n",
+        )
+        .unwrap();
+        let resolved = resolve_from_project(dir.path()).unwrap();
+        assert_eq!(resolved.kind, AdapterKind::Databricks);
+        assert!(resolved.fallback_reason.is_none());
+        assert_eq!(resolved.database.as_deref(), Some("analytics"));
+        assert_eq!(resolved.schema.as_deref(), Some("marts"));
+    }
+
+    #[test]
+    fn resolves_env_var_type_with_default() {
+        // `type: "{{ env_var('ROCKY_ADAPTER', 'snowflake') }}"` — only the
+        // discriminator matters, so use the default. The live env var (a
+        // secret) is never read.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("profiles.yml"),
+            "p:\n  target: dev\n  outputs:\n    dev:\n      type: \"{{ env_var('ROCKY_ADAPTER', 'snowflake') }}\"\n      schema: marts\n",
+        )
+        .unwrap();
+        let resolved = resolve_from_project(dir.path()).unwrap();
+        assert_eq!(resolved.kind, AdapterKind::Snowflake);
+        assert!(resolved.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn env_var_type_without_default_falls_back_loudly() {
+        // `type: "{{ env_var('ROCKY_ADAPTER') }}"` with no default can't be
+        // resolved — must surface a loud fallback reason, not silently duckdb.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("profiles.yml"),
+            "p:\n  target: dev\n  outputs:\n    dev:\n      type: \"{{ env_var('ROCKY_ADAPTER') }}\"\n      schema: marts\n",
+        )
+        .unwrap();
+        let resolved = resolve_from_project(dir.path()).unwrap();
+        assert_eq!(resolved.kind, AdapterKind::DuckDb);
+        let reason = resolved
+            .fallback_reason
+            .expect("must carry a loud fallback reason");
+        assert!(reason.contains("env_var"), "reason names env_var: {reason}");
+    }
+
+    #[test]
+    fn unparseable_profiles_surfaces_loud_fallback_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("profiles.yml"), "this: : : not yaml\n").unwrap();
+        let resolved = resolve_from_project(dir.path()).unwrap();
+        assert_eq!(resolved.kind, AdapterKind::DuckDb);
+        assert!(
+            resolved.fallback_reason.is_some(),
+            "a present-but-unparseable profiles.yml must warn loudly, not silently default"
+        );
+    }
+
+    #[test]
+    fn resolve_env_var_template_variants() {
+        assert_eq!(
+            resolve_env_var_template("duckdb"),
+            EnvVarType::Literal("duckdb".to_string())
+        );
+        assert_eq!(
+            resolve_env_var_template("{{ env_var('X', 'snowflake') }}"),
+            EnvVarType::WithDefault("snowflake".to_string())
+        );
+        assert_eq!(
+            resolve_env_var_template("{{ env_var(\"X\", \"bigquery\") }}"),
+            EnvVarType::WithDefault("bigquery".to_string())
+        );
+        assert_eq!(
+            resolve_env_var_template("{{ env_var('X') }}"),
+            EnvVarType::NoDefault("X".to_string())
+        );
     }
 
     #[test]
