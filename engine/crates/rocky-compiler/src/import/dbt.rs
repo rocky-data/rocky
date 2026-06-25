@@ -79,6 +79,10 @@ pub enum WarningCategory {
     /// default), so the importer emitted a stub DuckDB adapter. Surfaced
     /// loudly so the migration never silently defaults to duckdb.
     ProfileFallback,
+    /// A dbt model `contract` (`enforced: true`), column `data_type`s, or
+    /// column `constraints` were dropped on import. Rocky enforces contracts
+    /// via a `{model}.contract.toml` sidecar the importer doesn't generate.
+    DroppedContract,
 }
 
 /// A warning produced during import.
@@ -163,6 +167,20 @@ pub enum ImportDbtStructuredWarning {
         name: String,
         detail: String,
     },
+    /// A dbt model `contract` (`contract: { enforced: true }`), column
+    /// `data_type`s, and/or column `constraints` were dropped on import.
+    /// Rocky enforces contracts via a `{model}.contract.toml` sidecar, but
+    /// the importer doesn't auto-generate one — the user must hand-author it.
+    /// Stub generation is out of scope; this is visibility only.
+    DroppedContract {
+        model: String,
+        /// Number of columns that declared a `data_type`.
+        typed_columns: usize,
+        /// Number of declared column constraints across all columns.
+        constraints: usize,
+        /// Path (relative to the emitted repo) the user should author.
+        contract_path: String,
+    },
 }
 
 /// A model that failed to import.
@@ -224,6 +242,10 @@ pub struct ImportResult {
     /// detected and skipped (snapshots, metrics, semantic models, exposures).
     /// Surfaced so a migration is never silently lossy.
     pub constructs_dropped: usize,
+    /// Number of dbt models whose enforced `contract` (column `data_type`s /
+    /// `constraints`) was dropped on import. Rocky enforces contracts via a
+    /// `{model}.contract.toml` sidecar the importer doesn't auto-generate.
+    pub contracts_dropped: usize,
 }
 
 /// A successfully imported model.
@@ -280,6 +302,7 @@ pub fn import_from_manifest(
         unit_tests_converted: 0,
         unit_tests_skipped: 0,
         constructs_dropped: 0,
+        contracts_dropped: 0,
     };
 
     // A manifest with no compiled SQL means every model falls back to the
@@ -757,6 +780,11 @@ fn import_manifest_node(
     // structured warnings so the downstream UI can route them.
     collect_dropped_config_warnings(&node.config, &node.name, result);
 
+    // Surface a dropped model contract (`contract: { enforced: true }` +
+    // column data_type/constraints). Rocky enforces contracts via a sidecar
+    // the importer doesn't generate — point the user at where to author it.
+    collect_dropped_contract_warnings(node, &table, result);
+
     // Detect unresolvable Jinja macros that survived `dbt compile`. dbt's
     // compile step inlines in-tree macros, so anything still present
     // points at an out-of-tree macro the user needs to hand-port.
@@ -1182,6 +1210,56 @@ fn collect_dropped_config_warnings(
     }
 }
 
+/// Detect a dropped dbt model contract and surface it. dbt's
+/// `contract: { enforced: true }` (plus per-column `data_type` / `constraints`)
+/// has no auto-translation in Rocky — contracts are enforced via a
+/// `{model}.contract.toml` sidecar the importer does not generate. We emit a
+/// structured + string warning naming the file the user should author, and
+/// bump `contracts_dropped`, so the loss is never silent. Stub generation is
+/// out of scope (visibility only).
+///
+/// Only fires when the contract is `enforced`; an un-enforced `contract` block
+/// (dbt's default) carries no semantics to lose.
+fn collect_dropped_contract_warnings(
+    node: &DbtManifestNode,
+    table: &str,
+    result: &mut ImportResult,
+) {
+    let enforced = node.config.contract.as_ref().is_some_and(|c| c.enforced);
+    if !enforced {
+        return;
+    }
+
+    let typed_columns = node
+        .columns
+        .values()
+        .filter(|c| c.data_type.is_some())
+        .count();
+    let constraints: usize = node.columns.values().map(|c| c.constraints.len()).sum();
+    let contract_path = format!("models/{table}.contract.toml");
+
+    result.contracts_dropped += 1;
+    result
+        .structured_warnings
+        .push(ImportDbtStructuredWarning::DroppedContract {
+            model: node.name.clone(),
+            typed_columns,
+            constraints,
+            contract_path: contract_path.clone(),
+        });
+    result.warnings.push(ImportWarning {
+        model: node.name.clone(),
+        category: WarningCategory::DroppedContract,
+        message: format!(
+            "enforced dbt contract dropped ({typed_columns} typed column(s), {constraints} constraint(s)) — \
+             Rocky enforces contracts via {contract_path}, which the importer does not auto-generate"
+        ),
+        suggestion: Some(format!(
+            "author {contract_path} declaring the required/protected columns to re-establish the contract"
+        )),
+    });
+}
+
 /// Translate dbt's `on_schema_change` values to a human-readable Rocky
 /// drift-policy hint. Used for the structured warning's
 /// `rocky_equivalent` field.
@@ -1368,6 +1446,7 @@ pub fn import_dbt_project(
         unit_tests_converted: 0,
         unit_tests_skipped: 0,
         constructs_dropped: 0,
+        contracts_dropped: 0,
     };
 
     // Verify at least one model directory exists
@@ -1834,6 +1913,10 @@ fn extract_dbt_config(content: &str) -> (StrategyConfig, Vec<String>) {
         alias: None,
         merge_update_columns: None,
         merge_exclude_columns: None,
+        // The regex path doesn't recover the contract block (it's nested config
+        // not present in the inline `config()` call); contract detection is
+        // manifest-only.
+        contract: None,
     };
 
     let mapping = map_manifest_strategy(&synthetic, "<regex-path>");
@@ -2268,6 +2351,7 @@ models:
             unit_tests_converted: 0,
             unit_tests_skipped: 0,
             constructs_dropped: 0,
+            contracts_dropped: 0,
         };
         apply_dbt_tests(dir.path(), &target, &mut result);
 
@@ -2625,6 +2709,84 @@ FROM {{ ref('stg_events') }}
         );
         assert!(result.structured_warnings.iter().any(|w| matches!(w,
             ImportDbtStructuredWarning::MicrobatchMapped { mapped_to, .. } if mapped_to == "merge")));
+    }
+
+    #[test]
+    fn test_manifest_enforced_contract_warns_and_counts() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.dim_customer": {
+                "unique_id": "model.p.dim_customer", "name": "dim_customer",
+                "resource_type": "model",
+                "compiled_code": "SELECT 1", "raw_code": "SELECT 1",
+                "depends_on": { "nodes": [], "macros": [] },
+                "config": { "materialized": "table", "contract": { "enforced": true } },
+                "columns": {
+                    "id": { "name": "id", "data_type": "bigint", "constraints": [{ "type": "not_null" }, { "type": "primary_key" }] },
+                    "email": { "name": "email", "data_type": "varchar" }
+                },
+                "tags": [], "schema": "s", "database": "d"
+            }},
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(
+            result.contracts_dropped, 1,
+            "enforced contract must be counted"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.category == WarningCategory::DroppedContract),
+            "must emit a DroppedContract string warning"
+        );
+        let structured = result
+            .structured_warnings
+            .iter()
+            .find_map(|w| match w {
+                ImportDbtStructuredWarning::DroppedContract {
+                    typed_columns,
+                    constraints,
+                    contract_path,
+                    ..
+                } => Some((*typed_columns, *constraints, contract_path.clone())),
+                _ => None,
+            })
+            .expect("must emit a DroppedContract structured warning");
+        assert_eq!(structured.0, 2, "two columns declared a data_type");
+        assert_eq!(structured.1, 2, "two constraints declared");
+        assert!(
+            structured.2.contains("dim_customer.contract.toml"),
+            "warning must point at the contract sidecar path: {}",
+            structured.2
+        );
+    }
+
+    #[test]
+    fn test_manifest_unenforced_contract_is_not_dropped() {
+        // dbt's default `contract: { enforced: false }` carries no semantics
+        // to lose; it must not trip the dropped-contract warning.
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.m": {
+                "unique_id": "model.p.m", "name": "m", "resource_type": "model",
+                "compiled_code": "SELECT 1", "raw_code": "SELECT 1",
+                "depends_on": { "nodes": [], "macros": [] },
+                "config": { "materialized": "table", "contract": { "enforced": false } },
+                "columns": { "id": { "name": "id", "data_type": "bigint" } },
+                "tags": [], "schema": "s", "database": "d"
+            }},
+            "sources": {}
+        });
+        let result = import_from_manifest_json(&manifest);
+        assert_eq!(result.contracts_dropped, 0);
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.category == WarningCategory::DroppedContract)
+        );
     }
 
     #[test]

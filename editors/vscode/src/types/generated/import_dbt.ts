@@ -62,6 +62,14 @@ export type ImportDbtStructuredWarning =
       kind: "dropped_construct";
       name: string;
       [k: string]: unknown;
+    }
+  | {
+      constraints: number;
+      contract_path: string;
+      kind: "dropped_contract";
+      model: string;
+      typed_columns: number;
+      [k: string]: unknown;
     };
 /**
  * Lifecycle hook kind for [`ImportDbtStructuredWarning::DroppedHook`].
@@ -79,6 +87,10 @@ export interface ImportDbtOutput {
    * Number of dbt resources the importer does not translate that were detected and skipped (snapshots, metrics, semantic models, exposures).
    */
   constructs_dropped?: number;
+  /**
+   * Number of dbt models whose enforced `contract` (column `data_type`s / `constraints`) was dropped on import. Rocky enforces contracts via a `{model}.contract.toml` sidecar the importer does not auto-generate.
+   */
+  contracts_dropped?: number;
   dbt_version?: string | null;
   /**
    * Metadata about the emitted Rocky repo. Present when `--output-dir` triggered repo emission (the default for `rocky import-dbt`). Absent when emission was skipped or failed before disk writes.

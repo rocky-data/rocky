@@ -3326,6 +3326,11 @@ pub struct ImportDbtOutput {
     /// detected and skipped (snapshots, metrics, semantic models, exposures).
     #[serde(default)]
     pub constructs_dropped: usize,
+    /// Number of dbt models whose enforced `contract` (column `data_type`s /
+    /// `constraints`) was dropped on import. Rocky enforces contracts via a
+    /// `{model}.contract.toml` sidecar the importer does not auto-generate.
+    #[serde(default)]
+    pub contracts_dropped: usize,
     pub macros_detected: usize,
     pub imported_models: Vec<String>,
     pub warning_details: Vec<ImportDbtWarning>,
@@ -3450,6 +3455,16 @@ pub enum ImportDbtStructuredWarning {
         construct: String,
         name: String,
         detail: String,
+    },
+    /// A dbt model `contract` (`enforced: true`), column `data_type`s, and/or
+    /// `constraints` were dropped on import. Rocky enforces contracts via a
+    /// `{model}.contract.toml` sidecar the importer does not auto-generate;
+    /// the user must hand-author it. Visibility only — no stub generated.
+    DroppedContract {
+        model: String,
+        typed_columns: usize,
+        constraints: usize,
+        contract_path: String,
     },
 }
 

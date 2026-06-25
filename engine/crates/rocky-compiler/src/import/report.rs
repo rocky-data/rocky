@@ -506,6 +506,7 @@ mod tests {
             unit_tests_converted: 0,
             unit_tests_skipped: 0,
             constructs_dropped: 0,
+            contracts_dropped: 0,
         }
     }
 
