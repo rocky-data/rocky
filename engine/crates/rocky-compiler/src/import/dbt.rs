@@ -451,11 +451,22 @@ pub fn apply_dbt_tests(yaml_root: &Path, default_target: &TargetConfig, result: 
 
         result.tests_converted += decls.len();
         // "custom" = converted tests that aren't the canonical column-level
-        // built-ins — today the composite (`unique_combination_of_columns`)
-        // conversions. Previously always 0 because nothing custom converted.
+        // built-ins (not_null / unique / accepted_values / relationships):
+        // the composite (`unique_combination_of_columns`) conversion plus the
+        // dbt_expectations / dbt_utils long-tail mappings (in_range,
+        // regex_match, expression).
         result.tests_converted_custom += decls
             .iter()
-            .filter(|d| matches!(d.test_type, rocky_core::tests::TestType::Composite { .. }))
+            .filter(|d| {
+                use rocky_core::tests::TestType;
+                matches!(
+                    d.test_type,
+                    TestType::Composite { .. }
+                        | TestType::InRange { .. }
+                        | TestType::RegexMatch { .. }
+                        | TestType::Expression { .. }
+                )
+            })
             .count();
         result.tests_skipped += unsupported.len();
 
@@ -475,7 +486,7 @@ pub fn apply_dbt_tests(yaml_root: &Path, default_target: &TargetConfig, result: 
                 model: u.model.clone(),
                 category: WarningCategory::UnsupportedTest,
                 message: format!(
-                    "dbt test '{name}' on {where_} is outside the supported set (unique, not_null, accepted_values, relationships) — not translated",
+                    "dbt test '{name}' on {where_} has no native Rocky equivalent (supported: unique, not_null, accepted_values, relationships, unique_combination_of_columns, and the dbt_expectations/dbt_utils range/regex/in-set/expression tests) — not translated",
                     name = u.test_name,
                 ),
                 suggestion: Some(
