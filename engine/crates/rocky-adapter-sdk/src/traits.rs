@@ -289,6 +289,13 @@ pub enum TagTarget {
         schema: String,
         table: String,
     },
+    /// A SQL view (no physical storage). Tagged via `ALTER VIEW ... SET TAGS`
+    /// rather than `ALTER TABLE`.
+    View {
+        catalog: String,
+        schema: String,
+        view: String,
+    },
 }
 
 /// A permission grant on a catalog or schema.

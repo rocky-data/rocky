@@ -118,6 +118,61 @@ pub async fn run_transformation(
         )
         .await?;
 
+        // --- Governance: per-model `[governance.tags]` ---
+        //
+        // After every model materializes, apply each model's
+        // `[governance.tags]` to its target securable through the
+        // `GovernanceAdapter`. Dispatch is strategy-aware: view-format models
+        // (`strategy = "view"`) tag via `ALTER VIEW ... SET TAGS`, everything
+        // else via `ALTER TABLE ... SET TAGS` (see [`super::run::governance_tag_target`]).
+        //
+        // Best-effort: a tag failure warns but never aborts the run, mirroring
+        // the classification/retention governance posture on the replication
+        // path. Models with no `[governance.tags]` are skipped — Unity Catalog
+        // rejects an empty `SET TAGS ()`. NoopGovernanceAdapter (DuckDB and
+        // other non-governed targets) silently succeeds.
+        //
+        // The model set is re-compiled here (mirroring `run.rs`'s governance
+        // reconcile idiom) rather than threading resolved configs out of
+        // `execute_models`, keeping that hot path's signature unchanged.
+        let governance_adapter = adapter_registry.governance_adapter(&pipeline.target.adapter);
+        let governance_compile =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir: models_dir.clone(),
+                contracts_dir: None,
+                source_schemas: std::collections::HashMap::new(),
+                source_column_info: std::collections::HashMap::new(),
+                mask: rocky_cfg.mask.clone(),
+                allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
+                project_freshness_default: rocky_cfg.freshness.has_default(),
+            });
+        match governance_compile {
+            Ok(gov_compile) => {
+                for model in &gov_compile.project.models {
+                    let tags = &model.config.governance.tags;
+                    if tags.is_empty() {
+                        continue;
+                    }
+                    let target = super::run::governance_tag_target(
+                        &model.config.strategy,
+                        &model.config.target.catalog,
+                        &model.config.target.schema,
+                        &model.config.target.table,
+                    );
+                    if let Err(e) = governance_adapter.set_tags(&target, tags).await {
+                        warn!(
+                            model = %model.config.name,
+                            error = %e,
+                            "apply model governance tags failed"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "governance compile failed; skipping model tag application");
+            }
+        }
+
         state_store = Some(store);
     } else {
         warn!(
@@ -1170,5 +1225,54 @@ auto_create_schemas = true
             3,
             "default-off must rebuild every run — sentinel dropped"
         );
+    }
+
+    /// Reached-ness guard for per-model `[governance.tags]` application.
+    ///
+    /// Drives `run() → run_transformation` over a transformation pipeline whose
+    /// model is a **view** carrying a `[governance.tags]` block. The post-
+    /// materialize governance step must execute without panicking and the run
+    /// must succeed end-to-end. DuckDB's `GovernanceAdapter` is a no-op, so
+    /// this proves only that the apply block is *reached* on the real run path
+    /// (the recurring trap is a generator wired nowhere) — the actual
+    /// `ALTER VIEW ... SET TAGS` DDL is proven by the live Databricks test.
+    #[tokio::test]
+    async fn full_dag_view_governance_tags_run_reaches_apply_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = dir.join("t.duckdb");
+        let state_path = dir.join(".rocky-state.redb");
+
+        seed_src(&db, 3).await;
+        // A view-strategy model with a `[governance.tags]` block — the exact
+        // shape that routes to `TagTarget::View` in the apply step.
+        std::fs::write(models_dir.join("v_orders.sql"), "SELECT id FROM main.src\n").unwrap();
+        std::fs::write(
+            models_dir.join("v_orders.toml"),
+            "[strategy]\ntype = \"view\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"v_orders\"\n\n\
+             [governance.tags]\ndomain = \"finance\"\ntier = \"gold\"\n",
+        )
+        .unwrap();
+        write_config(dir, &db, "");
+        let config_path = dir.join("rocky.toml");
+
+        // The run must succeed: the governance.tags apply block runs (no-op on
+        // DuckDB) without aborting the transformation.
+        run_full_dag(&config_path, &state_path, false).await;
+
+        // The view materialized and is queryable.
+        let a = DuckDbWarehouseAdapter::open(&db).expect("open db");
+        let r = a
+            .execute_query("SELECT COUNT(*) FROM main.v_orders")
+            .await
+            .expect("view must be queryable after run");
+        let n = r.rows[0][0]
+            .as_i64()
+            .or_else(|| r.rows[0][0].as_str().and_then(|s| s.parse().ok()))
+            .unwrap();
+        assert_eq!(n, 3, "view over the 3-row source must return 3 rows");
     }
 }

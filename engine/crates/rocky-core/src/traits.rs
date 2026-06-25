@@ -1191,6 +1191,14 @@ pub enum TagTarget {
         schema: String,
         table: String,
     },
+    /// A SQL view (no physical storage). Tagged via `ALTER VIEW ... SET TAGS`
+    /// rather than `ALTER TABLE`. Emitted for view-format transformation
+    /// models so their `[governance.tags]` land on the right securable.
+    View {
+        catalog: String,
+        schema: String,
+        view: String,
+    },
 }
 
 /// A concrete masking policy resolved for a specific environment.

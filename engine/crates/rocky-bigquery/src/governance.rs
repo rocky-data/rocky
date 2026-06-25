@@ -170,6 +170,9 @@ impl GovernanceAdapter for BigQueryGovernanceAdapter {
                 let sql = generate_table_labels_sql(catalog, schema, table, tags)?;
                 self.adapter.execute_statement(&sql).await
             }
+            TagTarget::View { .. } => Err(AdapterError::msg(
+                "view labels are not supported by the BigQuery adapter",
+            )),
         }
     }
 

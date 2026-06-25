@@ -411,6 +411,7 @@ mod tests {
                 format_options: None,
                 classification: Default::default(),
                 tags: Default::default(),
+                governance: Default::default(),
                 retention: None,
                 budget: None,
                 skip: None,

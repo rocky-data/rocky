@@ -101,6 +101,14 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter {
                 .set_table_tags(catalog, schema, table, tags)
                 .await
                 .map_err(AdapterError::new),
+            TagTarget::View {
+                catalog,
+                schema,
+                view,
+            } => mgr
+                .set_view_tags(catalog, schema, view, tags)
+                .await
+                .map_err(AdapterError::new),
         }
     }
 
