@@ -1042,9 +1042,7 @@ mod tests {
             format: crate::seeds::SeedFormat::Csv,
             config: SeedConfig {
                 name: Some(name.into()),
-                target: None,
-                strategy: Default::default(),
-                column_types: Default::default(),
+                ..Default::default()
             },
         }
     }

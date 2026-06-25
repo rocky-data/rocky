@@ -90,7 +90,7 @@ pub struct SeedTarget {
 }
 
 /// Configuration for a single seed, loaded from an optional `.toml` sidecar.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SeedConfig {
     /// Logical name (defaults to file stem).
     #[serde(default)]
@@ -105,6 +105,18 @@ pub struct SeedConfig {
     /// SQL type strings (e.g., `"INTEGER"`, `"TIMESTAMP"`).
     #[serde(default)]
     pub column_types: std::collections::HashMap<String, String>,
+    /// Operator-authored SQL statements executed before the load, in order.
+    ///
+    /// Runs before any warehouse write (including the destructive
+    /// `DROP TABLE`). If any statement errors, the seed aborts before
+    /// writing anything — the canonical use is a guard such as
+    /// "abort if the target already holds rows".
+    #[serde(default)]
+    pub pre_hook: Vec<String>,
+    /// Operator-authored SQL statements executed after a successful load,
+    /// in order.
+    #[serde(default)]
+    pub post_hook: Vec<String>,
 }
 
 /// A discovered seed file with its configuration.
@@ -372,12 +384,7 @@ pub fn discover_seeds(dir: &Path) -> Result<Vec<SeedFile>, SeedError> {
                 source: e,
             })?
         } else {
-            SeedConfig {
-                name: None,
-                target: None,
-                strategy: SeedStrategy::default(),
-                column_types: std::collections::HashMap::new(),
-            }
+            SeedConfig::default()
         };
 
         let name = config.name.clone().unwrap_or_else(|| stem.clone());
@@ -821,6 +828,41 @@ id = "INTEGER"
         assert!(result.is_err());
     }
 
+    // -- Hook config parsing --------------------------------------------------
+
+    #[test]
+    fn sidecar_without_hooks_parses_to_empty_vecs() {
+        // Existing configs (pre-hook feature) must keep parsing unchanged.
+        let config: SeedConfig = toml::from_str(
+            r#"
+name = "dim_date"
+strategy = "drop_and_recreate"
+"#,
+        )
+        .unwrap();
+        assert!(config.pre_hook.is_empty());
+        assert!(config.post_hook.is_empty());
+    }
+
+    #[test]
+    fn sidecar_with_hooks_parses() {
+        let config: SeedConfig = toml::from_str(
+            r#"
+pre_hook = ["SELECT 1 / COUNT(*) FROM main.seeds.dim_date"]
+post_hook = ["ANALYZE main.seeds.dim_date"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.pre_hook,
+            vec!["SELECT 1 / COUNT(*) FROM main.seeds.dim_date".to_string()]
+        );
+        assert_eq!(
+            config.post_hook,
+            vec!["ANALYZE main.seeds.dim_date".to_string()]
+        );
+    }
+
     // -- SQL generation -------------------------------------------------------
 
     /// Minimal dialect for testing SQL generation.
@@ -911,10 +953,8 @@ id = "INTEGER"
             file_path: PathBuf::from("seeds/dim_date.csv"),
             format: SeedFormat::Csv,
             config: SeedConfig {
-                name: None,
-                target: None,
                 strategy: SeedStrategy::DropAndRecreate,
-                column_types: std::collections::HashMap::new(),
+                ..Default::default()
             },
         };
         let schema = vec![
@@ -950,10 +990,8 @@ id = "INTEGER"
             file_path: csv_path,
             format: SeedFormat::Csv,
             config: SeedConfig {
-                name: None,
-                target: None,
                 strategy: SeedStrategy::DropAndRecreate,
-                column_types: std::collections::HashMap::new(),
+                ..Default::default()
             },
         };
         let schema = vec![
@@ -989,10 +1027,8 @@ id = "INTEGER"
             file_path: csv_path,
             format: SeedFormat::Csv,
             config: SeedConfig {
-                name: None,
-                target: None,
                 strategy: SeedStrategy::DropAndRecreate,
-                column_types: std::collections::HashMap::new(),
+                ..Default::default()
             },
         };
         let schema = vec![
