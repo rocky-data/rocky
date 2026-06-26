@@ -171,17 +171,27 @@ pub(crate) fn run_status_exit_result(output: &RunOutput, run_id: &str) -> Result
 /// to `status = Success` / exit 0.
 ///
 /// This merges instead: it keeps the already-recorded compile-error entries,
-/// folds their count (held in `output.tables_failed` at call time, since
-/// nothing but the compile section mutates it before the merge) into the total
-/// alongside the copy failures, appends the parallel-copy errors, and
-/// re-derives `output.status` so a `--output json` consumer reads the right
-/// terminal status (not the `RunOutput::new` default of `success`). A clean
-/// run still derives `Success`; a copy-only failure behaves exactly as before.
+/// folds their count (the number of distinct compile-failed models, counted
+/// directly from the retained entries rather than inferred from
+/// `output.tables_failed`) into the total alongside the copy failures, appends
+/// the parallel-copy errors, and re-derives `output.status` so a
+/// `--output json` consumer reads the right terminal status (not the
+/// `RunOutput::new` default of `success`). A clean run still derives
+/// `Success`; a copy-only failure behaves exactly as before.
 fn merge_replication_compile_and_copy_errors(output: &mut RunOutput, table_errors: &[TableError]) {
-    let compile_failed_count = output.tables_failed;
     output
         .errors
         .retain(|e| e.failure_kind == crate::output::FailureKind::CompileError);
+    // Count distinct compile-failed models from the retained entries rather
+    // than inferring from `tables_failed`: the compile path records one
+    // `errors` entry per diagnostic but bumps `tables_failed` once per model,
+    // so count distinct asset_keys, not raw entries.
+    let compile_failed_count = output
+        .errors
+        .iter()
+        .map(|e| e.asset_key.as_slice())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
     output.tables_failed = compile_failed_count + table_errors.len();
     output
         .errors
@@ -9306,6 +9316,40 @@ merge_keys = ["id"]
             crate::output::FailureKind::CompileError
         );
         // No progress + a failure → total Failure, never Success.
+        assert!(matches!(out.status, rocky_core::state::RunStatus::Failure));
+    }
+
+    /// A single model that emits **two** compile-error diagnostics produces two
+    /// `errors` entries sharing one asset_key but only one `tables_failed`
+    /// bump (the per-model compile path dedups the count via a model set). The
+    /// merge counts distinct models, not raw entries, so `tables_failed` stays
+    /// `1`. Guards against re-inflating the count to `errors.len()` — the
+    /// single-entry tests above pass either way.
+    #[test]
+    fn merge_counts_distinct_models_not_diagnostics() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        // One model ("broken") with two distinct error diagnostics → two
+        // entries, one model. Mirrors `execute_models`' per-diagnostic push
+        // against its per-model `tables_failed` bump.
+        out.tables_failed = 1;
+        for code in ["E020", "E021"] {
+            out.errors.push(crate::output::TableErrorOutput {
+                asset_key: vec!["broken".to_string()],
+                error: format!("[{code}] compile error on broken"),
+                failure_kind: crate::output::FailureKind::CompileError,
+                cooldown_seconds: None,
+            });
+        }
+        let no_copy_errors: Vec<TableError> = Vec::new();
+
+        super::merge_replication_compile_and_copy_errors(&mut out, &no_copy_errors);
+
+        // Distinct failing models == 1, even though two diagnostics survive.
+        assert_eq!(
+            out.tables_failed, 1,
+            "one model with two diagnostics counts once, not twice"
+        );
+        assert_eq!(out.errors.len(), 2, "both diagnostics are preserved");
         assert!(matches!(out.status, rocky_core::state::RunStatus::Failure));
     }
 
