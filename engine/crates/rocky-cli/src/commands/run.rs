@@ -5962,17 +5962,30 @@ async fn execute_time_interval_model(
 
     // --parallel N drives concurrency. The flag is parsed in main.rs and
     // arrives here in `partition_opts.parallel`. The bootstrap above is
-    // already complete (sequential), so it's safe to fan out per-partition
-    // execution: each partition is independent SQL, the state-store writes
-    // serialize through redb's single writer lock, and warehouse-query
-    // parallelism is what the user asked for.
+    // already complete (sequential), so on an adapter that supports
+    // concurrent execution it's safe to fan out per-partition execution:
+    // each partition is independent SQL, the state-store writes serialize
+    // through redb's single writer lock, and warehouse-query parallelism is
+    // what the user asked for.
+    //
+    // But every partition writes to the *same* target table, so an adapter
+    // without concurrent execution (DuckDB, or any serial-only adapter)
+    // cannot run concurrent partition writes — its single connection would
+    // either serialize them anyway or fail. We therefore force the limit to
+    // 1 when `supports_concurrent_execution()` is false, mirroring the
+    // model-path gate in `execute_models`. DuckDB backfill stays serial
+    // regardless of `--parallel`.
     //
     // We use `futures::stream::buffer_unordered` rather than
     // tokio::task::JoinSet because the per-partition futures don't need
     // to be Send / 'static — they're polled in the same task as
     // `execute_time_interval_model`, just up to N at a time. This avoids
     // having to wrap warehouse and state_ref in Arc.
-    let parallel_limit = (partition_opts.parallel as usize).max(1);
+    let parallel_limit = if warehouse.supports_concurrent_execution() {
+        (partition_opts.parallel as usize).max(1)
+    } else {
+        1
+    };
     info!(
         model = model_name,
         partitions = plans.len(),
@@ -9969,6 +9982,166 @@ merge_keys = ["id"]
             out.materializations.len(),
             3,
             "all three models must materialize on the forced-serial DuckDB path"
+        );
+    }
+
+    /// (d) Partition-backfill regression: a `time_interval` model backfilled
+    /// over a multi-partition range with `--parallel 4` must stay serial on a
+    /// DuckDB adapter (concurrency unsupported) and still materialize every
+    /// partition correctly. This guards the backfill-path concurrency gate in
+    /// `execute_time_interval_model`: without it, the default `--parallel 4`
+    /// would fan out concurrent writes to the *same* target table, which a
+    /// serial-only adapter cannot do. The forced-serial backfill must produce
+    /// the identical result to `--parallel 1`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn duckdb_partition_backfill_stays_serial_with_parallel_flag() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+
+        // A `time_interval` model materializing into `main` (always present),
+        // partitioned by day on the derived `order_date`. Mirrors the
+        // partition-checksum POC that backs the dagster `partition/run_backfill`
+        // fixture.
+        std::fs::write(
+            models_dir.join("fct_daily_orders.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date, customer_id, \
+             COUNT(*) AS order_count, SUM(amount) AS revenue \
+             FROM raw__orders.orders \
+             WHERE order_at >= @start_date AND order_at < @end_date \
+             GROUP BY 1, 2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("fct_daily_orders.toml"),
+            "depends_on = []\n\n\
+             [[sources]]\ncatalog = \"\"\nschema = \"raw__orders\"\ntable = \"orders\"\n\n\
+             [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+             granularity = \"day\"\nfirst_partition = \"2026-04-04\"\nlookback = 0\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+
+        // Seed a raw source spanning five daily partitions (2026-04-04 ..
+        // 2026-04-08) into a fresh DB at `db`.
+        async fn seed_source(db: &std::path::Path) {
+            let seed = DuckDbWarehouseAdapter::open(db).expect("open duckdb for seeding");
+            seed.execute_statement("CREATE SCHEMA IF NOT EXISTS raw__orders")
+                .await
+                .unwrap();
+            seed.execute_statement(
+                "CREATE TABLE raw__orders.orders AS SELECT * FROM (VALUES \
+                 (1, 1, TIMESTAMP '2026-04-04 09:00:00', 100.0), \
+                 (2, 2, TIMESTAMP '2026-04-04 14:00:00',  50.0), \
+                 (3, 1, TIMESTAMP '2026-04-05 10:00:00', 200.0), \
+                 (4, 2, TIMESTAMP '2026-04-06 11:00:00',  75.0), \
+                 (5, 2, TIMESTAMP '2026-04-06 16:00:00',  25.0), \
+                 (6, 1, TIMESTAMP '2026-04-07 08:00:00', 300.0), \
+                 (7, 1, TIMESTAMP '2026-04-07 13:00:00', 150.0), \
+                 (8, 2, TIMESTAMP '2026-04-07 18:00:00',  80.0), \
+                 (9, 1, TIMESTAMP '2026-04-08 12:00:00', 500.0)) \
+                 AS t(order_id, customer_id, order_at, amount)",
+            )
+            .await
+            .unwrap();
+        }
+
+        // Run the inclusive backfill range against a freshly-seeded DB. The
+        // serial-only DuckDB adapter (concurrency unsupported, the production
+        // default) must force the run serial regardless of `--parallel`.
+        async fn run_backfill(
+            models_dir: &std::path::Path,
+            db: &std::path::Path,
+            parallel: u32,
+        ) -> RunOutput {
+            seed_source(db).await;
+            let adapter = DuckDbWarehouseAdapter::open(db)
+                .expect("open duckdb")
+                .with_concurrent_for_test(false);
+            let opts = PartitionRunOptions {
+                from: Some("2026-04-04".into()),
+                to: Some("2026-04-08".into()),
+                parallel,
+                ..Default::default()
+            };
+            let mut output = RunOutput::new(String::new(), 0, parallel.max(1) as usize);
+            super::execute_models(
+                models_dir,
+                &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+                None,
+                &opts,
+                "test-run",
+                None,
+                &mut output,
+                None,
+                None,
+                &rocky_core::config::SchemaCacheConfig::default(),
+                false,
+                &DeferOptions::default(),
+                super::SkipGateConfig::off(),
+                false,
+                &rocky_core::run_vars::RunVars::new(),
+            )
+            .await
+            .expect("backfill run must succeed on serial DuckDB under --parallel");
+            output
+        }
+
+        // Read the total revenue the backfill materialized into `main`.
+        async fn total_revenue(db: &std::path::Path) -> f64 {
+            let v = DuckDbWarehouseAdapter::open(db).expect("reopen for verify");
+            let r = v
+                .execute_query("SELECT CAST(SUM(revenue) AS DOUBLE) FROM main.fct_daily_orders")
+                .await
+                .expect("query materialized fact");
+            r.rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|c| c.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .expect("a numeric total revenue")
+        }
+
+        let parallel_db = tmp.path().join("backfill_parallel.duckdb");
+        let serial_db = tmp.path().join("backfill_serial.duckdb");
+        let parallel_out = run_backfill(&models_dir, &parallel_db, 4).await;
+        let serial_out = run_backfill(&models_dir, &serial_db, 1).await;
+
+        let parallel_summary = parallel_out
+            .partition_summaries
+            .iter()
+            .find(|s| s.model == "fct_daily_orders")
+            .expect("partition summary for the --parallel 4 run");
+        let serial_summary = serial_out
+            .partition_summaries
+            .iter()
+            .find(|s| s.model == "fct_daily_orders")
+            .expect("partition summary for the --parallel 1 run");
+
+        // All five partitions (2026-04-04 .. 2026-04-08, inclusive) must
+        // succeed with none failed — the forced-serial path materialized the
+        // whole range despite `--parallel 4`.
+        assert_eq!(
+            parallel_summary.partitions_succeeded, 5,
+            "all five partitions must materialize on the forced-serial backfill path"
+        );
+        assert_eq!(
+            parallel_summary.partitions_failed, 0,
+            "no partition may fail when --parallel is forced serial on DuckDB"
+        );
+        // `--parallel 4` must be byte-for-byte equivalent to `--parallel 1`.
+        assert_eq!(
+            parallel_summary.partitions_succeeded, serial_summary.partitions_succeeded,
+            "--parallel 4 must materialize the same partitions as --parallel 1 on DuckDB"
+        );
+        assert_eq!(
+            total_revenue(&parallel_db).await,
+            total_revenue(&serial_db).await,
+            "parallel and serial backfills must materialize identical data"
         );
     }
 
