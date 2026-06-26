@@ -175,6 +175,9 @@ export interface RunOutput {
    */
   status: RunStatus;
   tables_copied: number;
+  /**
+   * Total number of failed tables/models for the run, **including** pre-execution compile failures: a model that fails to type-check is counted here even though it never reached the execution phase. This is the authoritative failure count — consumers should key overall pass/fail on the top-level `tables_failed` / `status` / `errors`, not on `execution.tables_failed`, which counts only execution-phase (copy / runtime) failures and excludes models excluded before execution.
+   */
   tables_failed: number;
   tables_skipped: number;
   version: string;
@@ -320,6 +323,9 @@ export interface ExecutionSummary {
    * Number of rate-limit signals (HTTP 429 / UC_REQUEST_LIMIT_EXCEEDED) that triggered concurrency reduction. Only present when adaptive concurrency is enabled.
    */
   rate_limits_detected?: number | null;
+  /**
+   * Tables that failed during the **execution phase** — copy or runtime failures while materializing. This does **not** include models excluded before execution started (for example, a model that failed to compile); those are counted only in the top-level `RunOutput.tables_failed`. For overall run pass/fail, read the top-level `tables_failed` / `status`, not this `execution.tables_failed`.
+   */
   tables_failed: number;
   tables_processed: number;
   [k: string]: unknown;

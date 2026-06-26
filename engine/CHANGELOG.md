@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rocky run --var name=value` — per-run variables in model SQL.** A model can reference an explicit `@var(name)` (or `@var(name, default)`) placeholder that the compiler resolves to a caller-supplied string at compile time, parallel to dbt's `{{ var() }}`. The substitution is textual — the operator owns SQL quoting — and a referenced variable with no value and no inline default fails the run with a diagnostic naming it. (#976)
+- **`[governance.tags]` propagation on transformation runs, with view-aware Unity Catalog tag DDL.** Model and pipeline governance tags are applied to transformation targets, emitting the correct tag DDL for a view versus a table. (#971)
+- **Lakehouse-format initial DDL for incremental strategies.** The first materialization of an incremental model emits the configured lakehouse-format table DDL instead of an untyped create. (#970)
+- **Seed pre/post-hooks.** `rocky seed` fires the same `pre_hook` / `post_hook` lifecycle as model materialization. (#969)
+- **`rocky import-dbt` fidelity: `dbt_expectations` / `dbt_utils` test mapping, `profiles.yml` anchors + `env_var(...)`, and dropped-contract warnings.** Common `dbt_expectations` / `dbt_utils` generic tests map to native Rocky tests where there is a clear equivalent (carrying severity and row filter); `profiles.yml` YAML anchors / merge keys and `{{ env_var(...) }}` adapter types resolve instead of silently falling back to DuckDB; and a dbt model `contract: { enforced: true }` (with its column `data_type`s and `constraints`) no longer drops silently on import — the importer emits a per-model warning and a `contracts_dropped` count flagging the lost enforcement. (#972)
+- **`rocky import-dbt --microbatch-as=time_interval`** translates a dbt microbatch model to a Rocky `time_interval` strategy (granularity and lookback derived from the dbt config); the default `merge` keeps the idempotent-merge mapping. (#974)
+- **`rocky import-dbt --skip-unit-tests`** skips translating dbt `unit_tests`, counting them as dropped constructs. (#968)
+
+### Changed
+
+- **`rocky run` now fails when a model does not compile.** A model that fails to type-check was previously logged as a WARN, skipped, and the run still reported `status: "success"` / exit 0 with the model un-materialized. A compile error is now a first-class run failure: the run reports `status` `failure` or `partial_failure`, exits non-zero (1 or 2), counts the model in `tables_failed`, and surfaces the diagnostic in `--output json` `errors` with `failure_kind: "compile-error"`. This also reclassifies a transformation run where some models materialized and one failed at runtime from `failure` / exit 1 to `partial_failure` / exit 2. (#975)
+- **`rocky run --parallel` now defaults to 4** (was serial / `1`). It stays overridable: `--parallel 1` forces serial, and adapters that do not support concurrent execution (e.g. DuckDB) stay serial regardless. Concurrent-capable warehouses (Databricks, Snowflake) now run up to 4 models or partitions per layer concurrently by default, relying on the adapters' adaptive throttling. (#977)
+
+### Fixed
+
+- **`rocky import-dbt` no longer aborts on an unserializable dbt unit test.** A unit test whose payload can't be serialized is counted as a dropped construct and reported, rather than failing the whole import. (#968)
+- **`rocky compile` expands `SELECT *` over a derived table** during output-schema inference, so a model selecting `*` from a subquery or CTE infers the correct columns. (#973)
+
 ## [1.54.0] - 2026-06-23
 
 ### Added
