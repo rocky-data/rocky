@@ -121,7 +121,7 @@ enforces it):
 | `--latest` | Run the partition containing `now()` (UTC). Default for `time_interval` models when no other selection flag is given. |
 | `--missing` | Compute the diff between expected partitions (`first_partition` → `now()`) and what's recorded as `Computed` in the `PARTITIONS` state-store table; run only the gaps. Errors if `first_partition` is unset. |
 | `--lookback N` | Recompute the previous N partitions in addition to the selected ones. CLI override beats the model's TOML `lookback`. |
-| `--parallel N` | Run N partitions concurrently (default 1). Driven by `futures::stream::buffer_unordered` so the per-partition futures are polled in the same task — no spawn, no `Send` constraint. Warehouse-query parallelism only: state writes serialize through redb's single-writer lock. **Caveat:** DuckDB's adapter holds a connection mutex and runs `execute_statement` synchronously, so `--parallel N > 1` has no effect against DuckDB. Snowflake and Databricks (REST-based async I/O) parallelize as expected. |
+| `--parallel N` | Run N partitions concurrently (default 4; pass `--parallel 1` for serial). Driven by `futures::stream::buffer_unordered` so the per-partition futures are polled in the same task — no spawn, no `Send` constraint. Warehouse-query parallelism only: state writes serialize through redb's single-writer lock. **Caveat:** DuckDB's adapter holds a connection mutex and runs `execute_statement` synchronously, so partitions always run serially against DuckDB regardless of `--parallel`. Snowflake and Databricks (REST-based async I/O) parallelize up to N as expected. |
 
 ```bash
 # Run today's partition

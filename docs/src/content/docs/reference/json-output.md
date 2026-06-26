@@ -225,13 +225,15 @@ Returns a complete summary of the pipeline execution.
 | `tables_skipped` | integer | Number of tables skipped (omitted when 0). |
 | `resumed_from` | string or absent | Run ID this run resumed from, if `--resume` was used. |
 | `shadow` | boolean | True when running in shadow mode (omitted when false). |
-| `errors` | array | Error details for tables that failed. Each entry has `asset_key` and `error`. |
+| `errors` | array | Error details for tables that failed. Each entry has `asset_key`, `error`, and a typed `failure_kind` discriminator (kebab-case, e.g. `query-rejected`, `transient`, `compile-error`) so consumers can branch without parsing the free-form string. See [Per-table error containment](/advanced/per-table-error-containment/#failure_kind-taxonomy). |
 | `execution` | object | Concurrency and throughput summary. |
 | `metrics` | object or null | Counters and percentile histograms for the run. |
 | `anomalies` | array | Row count anomalies detected by historical baseline comparison. |
 | `partition_summaries` | array | Per-model partition execution summaries (present for `time_interval` models). |
 | `cost_summary` | object or absent | Per-run cost rollup: `total_usd` (float or null), `by_adapter` (map of adapter → USD). Present when at least one adapter reports cost data. See [`[budget]`](/reference/configuration/#budget) for how cost limits are enforced. |
 | `budget_breaches` | array | Populated when `[budget]` limits tripped. Each entry has `limit_type` (`"max_usd"` / `"max_duration_ms"` / `"max_bytes_scanned"`), `limit`, and `actual` (both floats). Empty array when within budget or no limits configured. |
+
+A transformation model that fails to compile during a run is now a counted failure rather than a silent skip: the model lands on `tables_failed`, gets an `errors[]` entry with `failure_kind: "compile-error"` carrying the diagnostic, and the run reports overall status `Failure` (or `PartialFailure` when other models succeeded) with a non-zero exit code (`1` or `2`). Earlier engine versions skipped the model and still reported success.
 
 **`materializations[]`:**
 

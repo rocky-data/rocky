@@ -7,6 +7,10 @@ sidebar:
 
 Rocky fires lifecycle events at key points during pipeline execution. You can attach shell scripts or HTTP webhooks to any event for notifications, gating, auditing, or custom integrations.
 
+:::note[Not the same as seed hooks]
+The lifecycle hooks on this page fire **shell commands and webhooks** on pipeline events. They are separate from the `pre_hook` / `post_hook` fields on a seed sidecar, which run **SQL statements** on the warehouse around a single [`rocky seed`](/reference/cli/#rocky-seed) load.
+:::
+
 ## Lifecycle events
 
 Events are organized into five phases:

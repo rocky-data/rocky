@@ -31,7 +31,7 @@ The default incremental strategy for replication. It relies on a monotonically i
 
 1. **Read watermark.** Rocky reads the last stored watermark for the table from the state store. The watermark is keyed by the fully qualified table name (`catalog.schema.table`).
 
-2. **No watermark (first run).** If no watermark exists, Rocky performs a full refresh and copies all rows from the source. This establishes the baseline.
+2. **No watermark (first run).** If no watermark exists, Rocky performs a full refresh and copies all rows from the source. This establishes the baseline. When the model declares a lakehouse `format` (`delta_table` / `iceberg_table`) with `[format_options]`, that format is now applied on this first materialization — so the baseline table is created in the requested Delta or Iceberg shape rather than as a plain table. The same holds for the `delete_insert`, `microbatch`, and `time_interval` strategies. See [Lakehouse formats](/reference/model-format/) in the model format reference.
 
 3. **Watermark exists.** Rocky generates an incremental query that filters to rows newer than the watermark:
 
