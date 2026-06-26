@@ -212,6 +212,10 @@ impl NodeDispatcher for CliDispatcher {
                     // (full-pipeline sub-runs); default OFF keeps sub-run
                     // behavior unchanged.
                     &super::run::SkipRunOptions::default(),
+                    // The unified-DAG driver does not surface `--var`; pass an
+                    // empty set so `@var()` models would compile-error rather
+                    // than silently resolve under a DAG run.
+                    &rocky_core::run_vars::RunVars::new(),
                 )
                 .await
                 .map_err(|e| e.to_string())

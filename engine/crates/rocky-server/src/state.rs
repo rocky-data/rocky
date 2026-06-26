@@ -117,6 +117,7 @@ impl ServerState {
             mask,
             allow_unmasked,
             project_freshness_default,
+            run_vars: rocky_core::run_vars::RunVars::new(),
         };
 
         // The compile pass walks the model directory, parses every

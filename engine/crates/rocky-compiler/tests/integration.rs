@@ -602,3 +602,89 @@ fn salsa_compile_with_db_invalidates_only_changed_file() {
          unrelated file is edited (per-file invalidation receipt)",
     );
 }
+
+// ---- Per-run variables (`@var()` substitution at compile time) ----
+
+/// Write a single `.sql` model (plus a minimal `.toml` sidecar) into a fresh
+/// temp models dir and return the dir handle so it stays alive for the test.
+fn temp_model_project(sql: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let models = dir.path().join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    std::fs::write(models.join("m.sql"), sql).unwrap();
+    std::fs::write(
+        models.join("m.toml"),
+        "name = \"m\"\n\n[target]\ncatalog = \"cat\"\nschema = \"sch\"\ntable = \"m\"\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn run_var_substituted_into_model_sql_at_compile_time() {
+    let dir = temp_model_project("SELECT * FROM raw.base WHERE region = '@var(region)'");
+    let config = CompilerConfig {
+        models_dir: dir.path().join("models"),
+        run_vars: rocky_core::run_vars::RunVars::parse_pairs(["region=us"]).unwrap(),
+        ..Default::default()
+    };
+
+    let result = compile(&config).unwrap();
+
+    let model = result.project.model("m").unwrap();
+    assert_eq!(
+        model.sql, "SELECT * FROM raw.base WHERE region = 'us'",
+        "the @var(region) marker must resolve to the supplied value"
+    );
+    assert!(
+        !result.diagnostics.iter().any(|d| &*d.code == "E028"),
+        "no missing-var diagnostic when the value is supplied"
+    );
+}
+
+#[test]
+fn missing_required_run_var_is_a_named_compile_error() {
+    let dir = temp_model_project("SELECT * FROM raw.base WHERE region = '@var(region)'");
+    let config = CompilerConfig {
+        models_dir: dir.path().join("models"),
+        // No `region` supplied and no inline default.
+        ..Default::default()
+    };
+
+    let result = compile(&config).unwrap();
+
+    assert!(
+        result.has_errors,
+        "a missing required var must fail compile"
+    );
+    let e028: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "E028")
+        .collect();
+    assert_eq!(e028.len(), 1, "exactly one E028 for the one missing var");
+    assert!(
+        e028[0].message.contains("region"),
+        "the error must name the missing variable: {}",
+        e028[0].message
+    );
+}
+
+#[test]
+fn run_var_inline_default_used_when_unset() {
+    let dir = temp_model_project("SELECT * FROM raw.base WHERE d = '@var(drop_date, 2024-01-01)'");
+    let config = CompilerConfig {
+        models_dir: dir.path().join("models"),
+        // `drop_date` not supplied → falls back to the inline default.
+        ..Default::default()
+    };
+
+    let result = compile(&config).unwrap();
+
+    let model = result.project.model("m").unwrap();
+    assert_eq!(model.sql, "SELECT * FROM raw.base WHERE d = '2024-01-01'");
+    assert!(
+        !result.has_errors,
+        "an inline default satisfies the reference; no E028"
+    );
+}

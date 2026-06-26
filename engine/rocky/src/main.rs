@@ -732,6 +732,21 @@ enum Command {
         /// parallel to `--force-rebuild` for `--skip-unchanged`. Default OFF.
         #[arg(long)]
         no_reuse: bool,
+
+        /// Per-run variable substituted into model SQL. Repeatable:
+        /// `--var region=us --var since=2024-01-01`.
+        ///
+        /// Each occurrence of the marker `@var(name)` in a model's SQL is
+        /// replaced with the supplied value at compile time (the operator owns
+        /// any quoting, e.g. `where region = '@var(region)'`). A reference may
+        /// carry an inline default — `@var(name, default)` — used when the var
+        /// is not passed. A `@var(name)` with no value and no default is a
+        /// compile error naming the variable.
+        ///
+        /// The value may contain `=` (split is on the first `=` only). This is
+        /// distinct from `${ENV}` config-time interpolation in `rocky.toml`.
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        var: Vec<String>,
     },
 
     /// Compare shadow tables against production tables
@@ -839,6 +854,13 @@ enum Command {
         /// columns into concrete types.
         #[arg(long)]
         with_seed: bool,
+
+        /// Per-run variable substituted into model SQL (repeatable). Resolves
+        /// `@var(name)` markers to the supplied value so `rocky compile` type-
+        /// checks the same SQL `rocky run --var …` would execute. A required
+        /// `@var(name)` with no value and no inline default is a compile error.
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        var: Vec<String>,
     },
 
     /// Publish a snapshot of this project's compiled IR for consumers to
@@ -908,6 +930,12 @@ enum Command {
         /// When omitted, the concatenated SQL is printed to stdout.
         #[arg(long)]
         out_dir: Option<PathBuf>,
+
+        /// Per-run variable substituted into model SQL (repeatable). Resolves
+        /// `@var(name)` markers to the supplied value (or inline default) so
+        /// the emitted SQL shows the resolved text.
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        var: Vec<String>,
     },
 
     /// Emit a project-wide column-level lineage snapshot.
@@ -2467,7 +2495,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             skip_unchanged,
             force_rebuild,
             no_reuse,
+            var,
         } => {
+            // Parse `--var name=value` pairs into the run-variable map. A
+            // malformed pair (no `=`, empty/invalid name) is a clear CLI error.
+            let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             // --idempotency-key is mutually exclusive with --resume / --resume-latest:
             // a resume is an explicit override and should never be short-circuited.
             if idempotency_key.is_some() && (resume.is_some() || resume_latest) {
@@ -2594,6 +2627,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     env.as_deref(),
                     &defer_opts,
                     &skip_opts,
+                    &run_vars,
                 )
                 .await
             }
@@ -2683,18 +2717,24 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             expand_macros,
             target_dialect,
             with_seed,
-        } => rocky_cli::commands::run_compile(
-            Some(cli.config.as_path()),
-            &state_path,
-            &models,
-            contracts.as_deref(),
-            model.as_deref(),
-            json,
-            expand_macros,
-            target_dialect.map(Into::into),
-            with_seed,
-            cli.cache_ttl,
-        ),
+            var,
+        } => {
+            let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            rocky_cli::commands::run_compile(
+                Some(cli.config.as_path()),
+                &state_path,
+                &models,
+                contracts.as_deref(),
+                model.as_deref(),
+                json,
+                expand_macros,
+                target_dialect.map(Into::into),
+                with_seed,
+                cli.cache_ttl,
+                &run_vars,
+            )
+        }
         Command::PublishIr {
             models,
             contracts,
@@ -2725,12 +2765,18 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             models,
             model,
             out_dir,
-        } => rocky_cli::commands::run_emit_sql(
-            Some(cli.config.as_path()),
-            &models,
-            model.as_deref(),
-            out_dir.as_deref(),
-        ),
+            var,
+        } => {
+            let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            rocky_cli::commands::run_emit_sql(
+                Some(cli.config.as_path()),
+                &models,
+                model.as_deref(),
+                out_dir.as_deref(),
+                &run_vars,
+            )
+        }
         Command::Catalog {
             models,
             out,

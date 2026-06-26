@@ -286,6 +286,8 @@ async fn iter_once(
         // selection to defer against.
         &super::run::DeferOptions::default(),
         skip_opts,
+        // `--watch` does not expose `--var` today; pass an empty set.
+        &rocky_core::run_vars::RunVars::new(),
     )
     .await;
     let elapsed_ms = started.elapsed().as_millis();

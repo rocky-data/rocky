@@ -55,6 +55,14 @@ pub const E026: &str = "E026";
 /// [`rocky_core::cost::propagate_costs`] using catalog-sourced table stats
 /// when available, falling back to conservative stub statistics.
 pub const E027: &str = "E027";
+/// Required run variable (`@var(name)`) referenced but not supplied.
+///
+/// Emitted by `rocky compile` / `rocky run` / `rocky emit-sql` when a model's
+/// SQL references `@var(name)` with no `--var name=value` supplied and no
+/// inline `@var(name, default)`. The fix is to pass `--var name=value` or to
+/// give the reference an inline default. Distinct from the config-time
+/// `${ENV}` interpolation, which resolves while parsing `rocky.toml`.
+pub const E028: &str = "E028";
 
 // Errors — imported producer contracts
 /// Consumer references a column that an imported producer snapshot dropped.

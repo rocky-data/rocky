@@ -85,6 +85,7 @@ pub fn run_publish_ir(
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: Vec::new(),
         project_freshness_default: false,
+        run_vars: rocky_core::run_vars::RunVars::new(),
     };
 
     let result = compile::compile(&config)?;

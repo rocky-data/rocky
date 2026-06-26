@@ -1034,6 +1034,10 @@ pub async fn run(
     // `--skip-unchanged` / `--force-rebuild` CLI overlay for the opt-in
     // model-skip gate. Default OFF (both `false`) ⇒ byte-identical behavior.
     skip_opts: &SkipRunOptions,
+    // `--var name=value` per-run variables. Substituted into `@var(name)`
+    // placeholders in model SQL at compile time. Empty ⇒ no `@var()` model
+    // resolves and behavior is byte-identical.
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
     let start = Instant::now();
     let started_at = Utc::now();
@@ -1216,6 +1220,7 @@ pub async fn run(
             // suppresses the whole reuse path for this invocation — both the
             // point-to decision and the spine population it would feed.
             rocky_cfg.reuse.enabled && !skip_opts.no_reuse,
+            run_vars,
         )
         .await?;
 
@@ -1341,6 +1346,10 @@ pub async fn run(
                 // claimed key, matching the model-only / replication paths.
                 // The claim is finalized under this same value just below.
                 idempotency_key,
+                // `--var` per-run variables, so `@var()` markers in the
+                // transformation pipeline's models resolve to the supplied
+                // values (or inline defaults) at compile time.
+                run_vars,
             )
             .await?;
             finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
@@ -3611,6 +3620,7 @@ pub async fn run(
                     // Reuse is active iff `[reuse]` is enabled AND `--no-reuse`
                     // was not passed (clause 1 of the fail-closed decision).
                     rocky_cfg.reuse.enabled && !skip_opts.no_reuse,
+                    run_vars,
                 )
                 .await?;
                 Ok(())
@@ -3652,6 +3662,12 @@ pub async fn run(
                     mask: rocky_cfg.mask.clone(),
                     allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
                     project_freshness_default: rocky_cfg.freshness.has_default(),
+                    // Resolve `@var()` on the governance compile too, so this
+                    // second compile of the same models doesn't re-read raw
+                    // `@var()` tokens from disk and spuriously report every
+                    // variable as missing (or leave placeholders in the SQL
+                    // the masking/tag reconcile inspects).
+                    run_vars: run_vars.clone(),
                 },
             );
             if let Ok(gov_compile) = governance_compile {
@@ -4464,6 +4480,12 @@ pub(crate) async fn execute_models(
     // populated AND an eligible model whose inputs match a prior strong run
     // points-to that run's parquet instead of executing its SQL.
     reuse_enabled: bool,
+    // Per-run variables (`rocky run --var name=value`). Threaded into the
+    // compile config so `@var(name)` placeholders in model SQL resolve to the
+    // supplied value (or inline default) before typecheck and SQL generation.
+    // Empty for the call sites that don't expose `--var` (watch / dag / local
+    // / tests).
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -4495,6 +4517,7 @@ pub(crate) async fn execute_models(
         // this function (it already holds the loaded `RockyConfig`).
         // This pre-execution compile stays scoped to typecheck +
         // contract diagnostics to avoid broadening its signature.
+        run_vars: run_vars.clone(),
         ..Default::default()
     };
 
@@ -8065,6 +8088,7 @@ adapter = "default"
             None,
             &DeferOptions::default(),
             &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
         )
         .await
         .expect("transformation run should succeed");
@@ -8171,6 +8195,7 @@ schema = "mart"
             None,
             &DeferOptions::default(),
             &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
         )
         .await
         .expect(
@@ -9484,9 +9509,94 @@ merge_keys = ["id"]
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .await;
         (output, result)
+    }
+
+    /// End-to-end run-path coverage for `--var`: a model whose SQL references
+    /// `@var(region)` materializes only the rows matching the supplied value
+    /// when a non-empty `RunVars` is threaded through `execute_models`.
+    ///
+    /// This guards the run-path threading specifically — the compiler-level
+    /// substitution is covered separately in `rocky-compiler`, but only an
+    /// execution test catches a regression where `execute_models` is handed an
+    /// empty `RunVars` (which would turn `@var()` into an E028 compile error
+    /// and silently skip the model).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn run_var_substituted_and_materialized() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db_path = tmp.path().join("var.duckdb");
+
+        // Seed a source table with mixed regions.
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db_path).expect("open duckdb for seeding");
+            seed.execute_statement(
+                "CREATE TABLE main.base AS SELECT * FROM (VALUES \
+                 (1, 'us'), (2, 'eu'), (3, 'us'), (4, 'apac')) AS t(id, region)",
+            )
+            .await
+            .unwrap();
+        }
+
+        // Model filters on `@var(region)`.
+        std::fs::write(
+            models_dir.join("filtered.sql"),
+            "SELECT id, region FROM main.base WHERE region = '@var(region)'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("filtered.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .unwrap();
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).expect("open duckdb");
+        let opts = PartitionRunOptions::default();
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let run_vars = rocky_core::run_vars::RunVars::parse_pairs(["region=us"]).unwrap();
+        super::execute_models(
+            &models_dir,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &opts,
+            "test-run",
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            &run_vars,
+        )
+        .await
+        .expect("run with --var should succeed");
+
+        // The target table holds only the `us` rows (ids 1 and 3).
+        let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("open db");
+        let r = conn
+            .execute_sql("SELECT id FROM main.filtered ORDER BY id")
+            .expect("query filtered");
+        let ids: Vec<&str> = r
+            .rows
+            .iter()
+            .map(|row| row[0].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["1", "3"],
+            "only region='us' rows survive the @var filter"
+        );
     }
 
     /// `rocky run --model down --defer`: the selected model `down` reads its
@@ -9568,6 +9678,7 @@ merge_keys = ["id"]
             &defer_opts,
             super::SkipGateConfig::off(),
             false,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .await
         .expect("deferred run must succeed");
@@ -9683,6 +9794,7 @@ merge_keys = ["id"]
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .await;
 
@@ -9919,6 +10031,7 @@ merge_keys = ["id"]
             &DeferOptions::default(),
             gate,
             false,
+            &rocky_core::run_vars::RunVars::new(),
         )
         .await
         .expect("gate run must succeed");
@@ -10878,6 +10991,7 @@ merge_keys = ["id"]
                 &DeferOptions::default(),
                 active_gate(true, 0),
                 false,
+                &rocky_core::run_vars::RunVars::new(),
             )
             .await
             .unwrap();
