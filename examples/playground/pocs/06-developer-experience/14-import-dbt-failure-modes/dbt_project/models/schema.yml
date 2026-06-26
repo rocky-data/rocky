@@ -1,8 +1,9 @@
 version: 2
 
-# Exercises the importer's failure-mode handling for non-canonical tests.
-# `unique` and `not_null` translate cleanly; `dbt_utils.accepted_range`
-# is surfaced as an `UnsupportedTest` warning — not stubbed in the toml.
+# Exercises the importer's test mapping. `unique` and `not_null` translate
+# cleanly; `dbt_utils.accepted_range` now maps to a native `[[tests]]` block
+# of type `in_range` on the emitted model sidecar (was an UnsupportedTest
+# warning in earlier versions).
 models:
   - name: stg_orders
     description: Staged orders with one branched-by-target predicate.

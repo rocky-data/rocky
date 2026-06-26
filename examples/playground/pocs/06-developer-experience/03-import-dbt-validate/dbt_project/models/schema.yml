@@ -1,8 +1,8 @@
 version: 2
 
 # Demonstrates `rocky import-dbt` mapping each of dbt's four canonical
-# generic tests onto Rocky `[[tests]]` blocks plus surfacing one
-# non-canonical test as a structured warning.
+# generic tests onto Rocky `[[tests]]` blocks, plus mapping a common
+# `dbt_utils` test (`accepted_range`) onto a native `in_range` block.
 models:
   - name: stg_orders
     description: Staged orders, one row per order, with a normalised status.
@@ -31,7 +31,7 @@ models:
               field: customer_id
       - name: total_revenue
         tests:
-          # Non-canonical: must surface as an `UnsupportedTest` warning,
-          # not stubbed in the emitted rocky.toml.
+          # Non-canonical but supported: maps to a native `[[tests]]`
+          # block of type `in_range` on the emitted model sidecar.
           - dbt_utils.accepted_range:
               min_value: 0

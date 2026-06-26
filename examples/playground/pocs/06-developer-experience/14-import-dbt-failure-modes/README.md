@@ -9,26 +9,35 @@
 
 `rocky import-dbt` is opinionated about what it translates: canonical
 generic tests + `{{ ref }}` / `{{ source }}` / `{{ config }}` /
-`is_incremental()` translate cleanly; everything else is deliberately
-out of scope. This POC throws all the out-of-scope cases at the importer
-in one go and verifies the importer handles each one cleanly:
+`is_incremental()` translate cleanly, a growing set of common dbt
+constructs now **map** to native Rocky equivalents, and a small residue
+of genuinely runtime-only Jinja stays out of scope. This POC throws the
+edge cases at the importer in one go and verifies each is handled
+cleanly — distinguishing the constructs that map from the ones that warn
+or are refused:
 
-- A model with `{% if target.name == 'prod' %}` — surfaced as a
-  `JinjaControlFlow` warning, body emitted verbatim with a
+- A model with `{% if target.name == 'prod' %}` — still out of scope:
+  surfaced as a `JinjaControlFlow` warning, body emitted verbatim with a
   `-- TODO: dbt-jinja-not-translated` marker.
-- A model with `{{ var('cutoff') }}` — surfaced as an
-  `UnsupportedMacro` warning, the `{{ var() }}` expression rewritten
-  to a TODO placeholder.
-- `schema.yml` with `dbt_utils.accepted_range` — surfaced as an
-  `UnsupportedTest` warning, not stubbed in the emitted toml.
+- A model with `{{ var('cutoff') }}` — now **mapped** to Rocky's native
+  `@var(cutoff)` per-run variable marker, surfaced as an informational
+  `MappedConstruct` warning (supply the value with
+  `rocky run --var cutoff=...`, or an inline `@var(name, default)`).
+- `schema.yml` with `dbt_utils.accepted_range` — now **mapped** to a
+  native `[[tests]]` block of type `in_range` on the model sidecar; no
+  longer surfaced as an `UnsupportedTest` warning.
+- A model with `{% for %}` loops (`stg_loop`) — **refused** rather than
+  half-rendered into broken SQL; it lands under "Failed models".
 - `snapshots/`, `dbt_packages/`, and `tests/` (singular tests) trees —
   silently ignored. The importer walks `models/` only.
 
-The POC's `run.sh` asserts each of these end-to-end. The emitted SQL
-deliberately contains TODO-replaced fragments that won't `rocky compile`
-cleanly; the whole point is that out-of-scope dbt features need a
-manual follow-up pass. The happy-path counterpart that does compile
-end-to-end is [`03-import-dbt-validate`](../03-import-dbt-validate/).
+The POC's `run.sh` asserts each of these end-to-end. The `{% if %}`
+emission deliberately contains a TODO-replaced fragment that won't
+`rocky compile` cleanly; the point is that genuinely runtime-only Jinja
+needs a manual follow-up pass, while constructs like `var()` and
+`accepted_range` now arrive as native Rocky. The happy-path counterpart
+that does compile end-to-end is
+[`03-import-dbt-validate`](../03-import-dbt-validate/).
 
 ## Why it's distinctive vs `03-import-dbt-validate`
 
@@ -49,9 +58,10 @@ before pointing it at a real codebase.
 │   ├── dbt_project.yml
 │   ├── models/
 │   │   ├── sources.yml
-│   │   ├── schema.yml                      dbt_utils.accepted_range (unsupported test)
+│   │   ├── schema.yml                      dbt_utils.accepted_range (mapped to in_range)
 │   │   ├── stg_orders.sql                  {% if target.name == 'prod' %}
-│   │   └── stg_variables.sql               {{ var('cutoff') }}
+│   │   ├── stg_variables.sql               {{ var('cutoff') }} (mapped to @var)
+│   │   └── stg_loop.sql                    {% for %} loop (refused)
 │   ├── snapshots/orders_snapshot.sql       Out of scope — silently ignored
 │   ├── dbt_packages/dbt_utils/macros/star.sql   Out of scope — silently ignored
 │   └── tests/assert_revenue_positive.sql   Out of scope — singular test
@@ -67,17 +77,18 @@ before pointing it at a real codebase.
 ## Expected output
 
 ```
-=== rocky import-dbt (regex path, deliberately bad inputs) ===
+=== rocky import-dbt (regex path, edge-case inputs) ===
 {
   "version": "...",
   "command": "import-dbt",
   "import_method": "Regex",
   "imported": 2,
-  "warnings": 3,
-  "failed": 0,
+  "warnings": 2,
+  "failed": 1,
   "tests_found": 3,
-  "tests_converted": 2,
-  "tests_skipped": 1,
+  "tests_converted": 3,
+  "tests_converted_custom": 1,
+  "tests_skipped": 0,
   "warning_details": [
     {
       "model": "stg_orders",
@@ -87,15 +98,15 @@ before pointing it at a real codebase.
     },
     {
       "model": "stg_variables",
-      "category": "UnsupportedMacro",
-      "message": "contains {{ var() }} — not supported, replaced with TODO",
-      "suggestion": "replace with a literal value or use manifest.json import path"
-    },
+      "category": "MappedConstruct",
+      "message": "contains {{ var() }} — mapped to Rocky's `@var()` per-run variable marker",
+      "suggestion": "supply values at run time with `rocky run --var name=value`, or rely on an inline default `@var(name, default)`"
+    }
+  ],
+  "failed_details": [
     {
-      "model": "stg_orders",
-      "category": "UnsupportedTest",
-      "message": "dbt test 'dbt_utils.accepted_range' on column 'amount' is outside the supported set ...",
-      "suggestion": "rewrite as a Rocky `[[tests]]` of type `expression` or as a custom check in a quality pipeline"
+      "name": "stg_loop",
+      "reason": "contains unsupported Jinja control flow ({% for %} or {% set %}) ..."
     }
   ],
   ...
@@ -106,12 +117,13 @@ before pointing it at a real codebase.
 - **dbt generic tests outside the canonical four** ...
 - **Singular tests** in `tests/` (custom SQL) — copy and rewrite manually.
 - **dbt macros / `dbt_packages/`** — Rocky has no Jinja runtime. ...
-- **`{% if %}` / `{{ var() }}`** — emitted with a TODO marker (the `{% if %}` body applies unconditionally — review it).
+- **`{% if %}`** — emitted with a TODO marker (the body applies unconditionally — review it).
 - **`{% for %}` / `{% set %}`** — **refused** (listed under "Failed models") rather than half-rendered into broken SQL; `stg_loop` here demonstrates the refusal. Re-run after `dbt compile`.
 ## Warnings
 - `stg_orders` — JinjaControlFlow: ...
-- `stg_variables` — UnsupportedMacro: ...
-- `stg_orders` — UnsupportedTest: ...
+- `stg_variables` — MappedConstruct: {{ var() }} mapped to `@var()` ...
+## Failed models
+- `stg_loop` — contains unsupported Jinja control flow ({% for %} or {% set %}) ...
 
 === Emitted models/stg_orders.sql (target.name branch flagged) ===
 -- TODO: dbt-jinja-not-translated — see MIGRATION-NOTES.md
