@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
 # 14-import-dbt-failure-modes — exercise `rocky import-dbt`'s handling of the
-# deliberately out-of-scope dbt features:
+# dbt features that sit at (or just outside) the edge of what it translates:
 #   - models with `{% if target.name %}` branching (JinjaControlFlow warning,
-#     emitted with a TODO marker)
+#     body emitted verbatim with a TODO marker)
 #   - models with `{% for %}` loops (REFUSED — would half-render to broken SQL)
-#   - models with `{{ var() }}` references (UnsupportedMacro warning)
-#   - schema.yml tests outside the canonical four (UnsupportedTest warning)
+#   - models with `{{ var() }}` references — now MAPPED to Rocky's native
+#     `@var(name)` per-run variable marker (MappedConstruct, informational)
+#   - schema.yml `dbt_utils.accepted_range` — now MAPPED to a native
+#     `[[tests]]` of type `in_range`, not surfaced as a warning
 #   - `snapshots/`, `dbt_packages/`, and `tests/` trees (silently ignored)
 #
 # Success criteria — all checked at the bottom of the script:
 #   - importer exits 0
-#   - 3 structured warnings: JinjaControlFlow + UnsupportedMacro + UnsupportedTest
-#   - 0 failed models (out-of-scope trees ignored, not failed)
+#   - 2 structured warnings: JinjaControlFlow + MappedConstruct
+#   - 1 failed model — the `{% for %}` model `stg_loop` is refused; the
+#     out-of-scope trees (snapshots/dbt_packages/tests) are ignored, not failed
 #   - MIGRATION-NOTES.md has the "Known limitations" heading and no "v0"
-#   - emitted SQL carries `-- TODO: dbt-jinja-not-translated` markers
+#   - the `{% if %}` model carries a `-- TODO: dbt-jinja-not-translated` marker
+#   - the `{{ var() }}` model carries a native `@var(` marker
 #
-# Note: the emission deliberately contains TODO-replaced SQL that won't
-# `rocky compile` cleanly — the whole point of the POC is that out-of-scope
-# features need a manual follow-up pass. The happy-path counterpart that
-# does compile end-to-end is `03-import-dbt-validate/`.
+# Note: the `{% if %}` emission deliberately contains a TODO-replaced fragment
+# that won't `rocky compile` cleanly — the point of the POC is that genuinely
+# out-of-scope Jinja control flow needs a manual follow-up pass, while several
+# constructs that used to warn (var(), accepted_range) now map to native Rocky
+# equivalents. The happy-path counterpart that compiles end-to-end is
+# `03-import-dbt-validate/`.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
@@ -46,7 +52,7 @@ echo "=== Emitted models/stg_orders.sql (target.name branch flagged) ==="
 cat imported/models/stg_orders.sql
 
 echo
-echo "=== Emitted models/stg_variables.sql ({{ var() }} flagged) ==="
+echo "=== Emitted models/stg_variables.sql ({{ var() }} mapped to @var()) ==="
 cat imported/models/stg_variables.sql
 
 echo
@@ -63,16 +69,29 @@ if grep -q -i '\bv0\b' imported/MIGRATION-NOTES.md; then
     fail=1
 fi
 
-for marker_file in imported/models/stg_orders.sql imported/models/stg_variables.sql; do
-    if ! grep -q 'TODO: dbt-jinja-not-translated' "$marker_file"; then
-        echo "FAIL: $marker_file missing 'dbt-jinja-not-translated' marker"
-        fail=1
-    fi
-done
+# The `{% if %}` model (stg_orders) keeps its TODO marker — that Jinja
+# control flow is still out of scope and emitted verbatim for review.
+if ! grep -q 'TODO: dbt-jinja-not-translated' imported/models/stg_orders.sql; then
+    echo "FAIL: imported/models/stg_orders.sql missing 'dbt-jinja-not-translated' marker"
+    fail=1
+fi
 
-# Non-canonical schema.yml test must NOT be stubbed as a [[tests]] block.
-if grep -qi 'accepted_range\|dbt_utils' imported/models/stg_orders.toml; then
-    echo "FAIL: stg_orders.toml should not stub non-canonical tests as [[tests]] blocks"
+# The `{{ var() }}` model (stg_variables) is now MAPPED, not stubbed: the
+# `{{ var('cutoff') }}` reference becomes Rocky's native `@var(cutoff)` marker
+# (supply the value at run time with `rocky run --var cutoff=...`).
+if ! grep -q '@var(' imported/models/stg_variables.sql; then
+    echo "FAIL: imported/models/stg_variables.sql missing the mapped '@var(' marker"
+    fail=1
+fi
+if grep -q 'TODO: dbt-jinja-not-translated' imported/models/stg_variables.sql; then
+    echo "FAIL: stg_variables.sql should map {{ var() }} to @var(), not stub it with a TODO marker"
+    fail=1
+fi
+
+# `dbt_utils.accepted_range` is now MAPPED to a native [[tests]] type=in_range
+# block on the model sidecar — it is no longer surfaced as an UnsupportedTest.
+if ! grep -q 'in_range' imported/models/stg_orders.toml; then
+    echo "FAIL: stg_orders.toml should map dbt_utils.accepted_range to a native [[tests]] type=in_range block"
     fail=1
 fi
 
