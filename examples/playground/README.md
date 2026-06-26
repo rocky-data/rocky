@@ -38,11 +38,11 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**82 of 94 POCs run with no external credentials.** See each POC's README for prerequisites.
+**84 of 96 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
-### 00 — Foundations (16 POCs · DuckDB)
+### 00 — Foundations (17 POCs · DuckDB)
 
 DSL syntax, materialization basics, playground baseline, the trust-arc 1 storage primitives, file-format ingest and per-tenant routing, plus the plan/apply deployment workflow and project scaffolding.
 
@@ -64,8 +64,9 @@ DSL syntax, materialization basics, playground baseline, the trust-arc 1 storage
 | [12-init-scaffolding](pocs/00-foundations/12-init-scaffolding) | `rocky init --template duckdb` scaffolds a project that validates + compiles out of the box; `--template snowflake` shows the layout changes per warehouse |
 | [13-surrogate-keys](pocs/00-foundations/13-surrogate-keys) | A model sidecar `[[surrogate_key]]` block injects a deterministic, dbt_utils-identical MD5 hash column into the materialized table at `rocky run` |
 | [14-config-groups](pocs/00-foundations/14-config-groups) | One `models/groups/*.toml` fans `schema_template` + strategy + tags to N members via per-model `[args]`; `broken/` siblings show the `enforce` and pinned-schema-plus-args load guards |
+| [15-run-variables](pocs/00-foundations/15-run-variables) | Per-run `@var(name)` / `@var(name, default)` markers resolved by `rocky run --var` (and `compile` / `emit-sql`); a required var with no value fails compile with E028 — distinct from config-time `${ENV}` |
 
-### 01 — Quality (10 POCs · DuckDB)
+### 01 — Quality (11 POCs · DuckDB)
 
 Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, standalone quality pipeline, freshness SLAs, cross-source overlap.
 
@@ -81,6 +82,7 @@ Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, sta
 | [08-cross-source-overlap](pocs/01-quality/08-cross-source-overlap) | The same data arriving via two sibling sources — `cross_source_overlap` flags a business key shared across siblings (which per-table `unique` can't see) + `unique_expr` catches a derived-key duplicate, both at replication time |
 | [09-named-tests](pocs/01-quality/09-named-tests) | Define a check once in `test_definitions.toml`, apply it across models via `[[use_test]]` (column/severity overrides) alongside inline `[[tests]]` |
 | [10-unit-tests](pocs/01-quality/10-unit-tests) | Fixture-driven `[[test]]` blocks (`given` rows → `expect` rows) run by `rocky test` — multiset by default, positional with `ordered` |
+| [11-fail-loud-on-compile-error](pocs/01-quality/11-fail-loud-on-compile-error) | A model that fails to compile (E020) makes `rocky run` exit non-zero with status `partial_failure` and a `compile-error`; the broken table is never built while the clean model's data still lands |
 
 ### 02 — Performance (14 POCs · DuckDB)
 

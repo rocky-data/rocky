@@ -1,0 +1,24 @@
+# 15-run-variables — per-run `@var()` variables substituted into model SQL.
+#
+# `regional_sales` filters on two run variables:
+#   - @var(region)          a REQUIRED variable (no inline default)
+#   - @var(min_amount, 0)   an OPTIONAL variable with an inline default of 0
+#
+# `rocky run --var region=us` renders `WHERE region = 'us' AND amount >= 0` and
+# materializes only the matching rows. Omitting `--var region` is a compile
+# error (E028) naming the variable, while the optional `min_amount` falls back
+# to its inline default.
+#
+# `@var()` is a RUN-TIME substitution and is deliberately distinct from the
+# config-time `${ENV}` interpolation rocky.toml performs while parsing.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+type = "transformation"
+models = "models/**"
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true

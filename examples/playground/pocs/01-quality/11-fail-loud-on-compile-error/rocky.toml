@@ -1,0 +1,28 @@
+# 11-fail-loud-on-compile-error — Rocky's "fail loud, never silently drop data" guarantee.
+#
+# This POC runs a transformation pipeline with two independent models:
+#   - stg_orders     — a clean full_refresh model that materializes
+#   - daily_revenue  — a time_interval model with a real compile error (E020):
+#                      its declared time_column `order_date` is absent from the
+#                      model's SELECT output.
+#
+# When `rocky run` hits the broken model it does NOT pretend the run
+# succeeded. The broken model is excluded from execution and recorded as a
+# `compile-error` failure, the clean model still materializes, and the run
+# exits non-zero with status `partial_failure`. A pipeline that can't build
+# every model surfaces that fact instead of reporting a green run over a
+# half-built warehouse.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+type = "transformation"
+models = "models/**"
+
+[pipeline.poc.target.governance]
+auto_create_schemas = true
+
+[pipeline.poc.execution]
+concurrency = 4
