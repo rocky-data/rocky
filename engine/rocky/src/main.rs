@@ -601,13 +601,14 @@ enum Command {
         /// for late-arriving data.
         #[arg(long)]
         lookback: Option<u32>,
-        /// Concurrency for warehouse-bound work (default 1, fully serial).
+        /// Concurrency for warehouse-bound work (default 4; pass
+        /// `--parallel 1` to force fully serial, or any N to override).
         /// Drives both per-partition execution for `time_interval` models
         /// and intra-layer concurrency for transformation models: models in
         /// the same dependency layer run up to N at a time, with a barrier
         /// at each layer boundary. Warehouse-query parallelism only — state
         /// writes serialize through redb, and DuckDB always runs serial.
-        #[arg(long, default_value = "1")]
+        #[arg(long, default_value = "4")]
         parallel: u32,
 
         /// Run all pipelines as a unified DAG, in dependency order.
@@ -3950,5 +3951,29 @@ mod tests {
         assert!(all);
         assert!(dag);
         assert_eq!(parallel, 4);
+    }
+
+    /// `rocky run` defaults `--parallel` to a modest concurrent value (4),
+    /// while `--parallel 1` still forces serial and an explicit `N` overrides.
+    #[test]
+    fn run_parallel_defaults_to_four_and_is_overridable() {
+        fn run_parallel(args: &[&str]) -> u32 {
+            match try_parse_with_big_stack(args).command {
+                Command::Run { parallel, .. } => parallel,
+                _ => panic!("expected Run subcommand"),
+            }
+        }
+
+        assert_eq!(run_parallel(&["rocky", "run"]), 4, "default should be 4");
+        assert_eq!(
+            run_parallel(&["rocky", "run", "--parallel", "1"]),
+            1,
+            "--parallel 1 must still force serial"
+        );
+        assert_eq!(
+            run_parallel(&["rocky", "run", "--parallel", "8"]),
+            8,
+            "explicit value must override the default"
+        );
     }
 }
