@@ -25,6 +25,17 @@
 //! A `@var(name)` reference with no supplied value and no inline default is a
 //! **missing** variable: [`substitute_run_vars`] reports its name so the
 //! compiler can raise a clear error naming it.
+//!
+//! ## Trust boundary
+//!
+//! The substitution is **textual, with no escaping of the substituted value** —
+//! by design, for parity with dbt's `{{ var() }}`. The operator owns SQL
+//! quoting and casting; only the variable *name* is validated (as a SQL
+//! identifier). This is safe for the operator-supplied CLI `--var` values that
+//! are the only source today. If a future caller ever feeds `--var` values
+//! from a less-trusted source — for example a Dagster `run_vars` passthrough
+//! driven by partition keys or external config — those values must be escaped
+//! or bound before substitution rather than spliced in raw.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;

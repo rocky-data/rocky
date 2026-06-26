@@ -238,6 +238,13 @@ pub struct RunOutput {
     pub filter: String,
     pub duration_ms: u64,
     pub tables_copied: usize,
+    /// Total number of failed tables/models for the run, **including**
+    /// pre-execution compile failures: a model that fails to type-check is
+    /// counted here even though it never reached the execution phase. This is
+    /// the authoritative failure count — consumers should key overall pass/fail
+    /// on the top-level `tables_failed` / `status` / `errors`, not on
+    /// `execution.tables_failed`, which counts only execution-phase (copy /
+    /// runtime) failures and excludes models excluded before execution.
     pub tables_failed: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub tables_skipped: usize,
@@ -434,6 +441,12 @@ fn is_zero(v: &usize) -> bool {
 pub struct ExecutionSummary {
     pub concurrency: usize,
     pub tables_processed: usize,
+    /// Tables that failed during the **execution phase** — copy or runtime
+    /// failures while materializing. This does **not** include models excluded
+    /// before execution started (for example, a model that failed to compile);
+    /// those are counted only in the top-level `RunOutput.tables_failed`. For
+    /// overall run pass/fail, read the top-level `tables_failed` / `status`,
+    /// not this `execution.tables_failed`.
     pub tables_failed: usize,
     /// Whether adaptive concurrency (AIMD throttle) was enabled for this run.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
