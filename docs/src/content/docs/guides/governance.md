@@ -652,6 +652,31 @@ When a model belongs to a group, its resolved tags are the group's `[tags]` with
 
 Resolved tags are emitted on `rocky compile --output json` as `models_detail[].tags`. The `dagster-rocky` integration projects them onto each derived asset's first-class Dagster tags, so the same attribute is usable in asset selection (for example `tag:domain=finance`). Alongside the governance tags, the translator synthesizes `rocky/`-namespaced tags for the model name, target catalog, target schema, and strategy. The `rocky/` prefix keeps those from ever colliding with a governance key. The result is that a tag applied once in a sidecar or group is visible end-to-end, from the typed model graph through `rocky compile` to the orchestrator.
 
+### Per-model warehouse tags: `[governance.tags]`
+
+Model `[tags]` are orchestrator-facing and never touch the warehouse. When you want a tag written onto a model's **own** target table or view in Unity Catalog, declare a `[governance.tags]` block in the model sidecar:
+
+```toml
+# models/fct_orders.toml
+name = "fct_orders"
+
+[governance.tags]
+domain = "finance"
+tier = "gold"
+```
+
+After the model materializes, `rocky apply` emits view-aware tag DDL against its target securable — `ALTER VIEW ... SET TAGS (...)` for view-format models, `ALTER TABLE ... SET TAGS (...)` otherwise. Keys and values are applied verbatim (no prefix). This is the per-model counterpart to the catalog- and schema-level [tagging strategy](#9-tagging-strategy) above (`[pipeline.*.target.governance.tags]`).
+
+The three tag surfaces are independent and reach different consumers — keep them apart:
+
+| Block | Where it lives | What it does |
+|---|---|---|
+| `[tags]` | Model sidecar / config group | Dagster asset tags + `rocky compile` JSON. Never written to the warehouse. |
+| `[governance.tags]` | Model sidecar | `ALTER VIEW/TABLE ... SET TAGS` on the model's own securable, post-materialize. |
+| `[pipeline.*.target.governance.tags]` | Pipeline target | `ALTER CATALOG/SCHEMA/TABLE ... SET TAGS` during replication, used for catalog discovery. |
+
+Application of `[governance.tags]` is best-effort: a failure warns but never aborts the run, matching the classification and retention governance posture. An empty block is skipped (Unity Catalog rejects `SET TAGS ()`).
+
 ## 12. Quality Checks
 
 Rocky runs data quality checks inline during replication. Checks execute immediately after each table is copied, and results are included in the run output.

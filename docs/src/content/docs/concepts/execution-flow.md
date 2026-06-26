@@ -138,10 +138,12 @@ Rocky calls `WarehouseAdapter::execute_statement(sql)`. The adapter handles conn
 
 For Databricks, this calls `POST /api/2.0/sql/statements` and polls for the result. Adaptive concurrency control (AIMD: additive increase on success, multiplicative decrease on 429/throttle) prevents overloading the warehouse.
 
-Failed execution produces a `failure_kind` (the `FailureKind` enum in `output.rs`: `AuthFailed`, `ConnectionFailed`, `QueryRejected`, `QuotaExceeded`, `NotFound`, `Transient`, `Unknown`). Rocky branches on this:
+Failed execution produces a `failure_kind` (the `FailureKind` enum in `output.rs`: `AuthFailed`, `ConnectionFailed`, `QueryRejected`, `QuotaExceeded`, `NotFound`, `Transient`, `CompileError`, `Unknown`; serialized to kebab-case on the wire, e.g. `auth-failed`, `compile-error`). Rocky branches on this:
 - `Transient` → retry with backoff
 - `AuthFailed` → stop immediately, surface the error
 - `QuotaExceeded` → surface the error and back off (a 429 or tripped circuit breaker maps here)
+
+A model that fails to compile when its turn comes (`CompileError`) never reaches the warehouse: it is counted in `tables_failed` and reported as a failed model rather than silently skipped, so the run exits non-zero.
 
 ### 6f. Quality checks
 
@@ -192,7 +194,7 @@ Rocky serializes the `RunOutput` struct to JSON on stdout. Illustrative shape (t
   "materializations": [
     { "model": "orders_summary",  "status": "completed", "reason": "..." },
     { "model": "product_stats",   "status": "skipped",   "reason": "unchanged" },
-    { "model": "customer_totals", "status": "failed",    "failure_kind": "QueryRejected" }
+    { "model": "customer_totals", "status": "failed",    "failure_kind": "query-rejected" }
   ],
   "check_results": [...],
   "drift": [...],

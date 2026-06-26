@@ -81,7 +81,9 @@ The `.toml` file specifies the model name, dependencies, materialization strateg
 | `partition_columns` | list of strings | `[]` | Logical partition columns for content-addressed tables. Empty for unpartitioned tables. Optional for `"content_addressed"`. |
 
 :::note[Lakehouse formats]
-Warehouse-managed table shapes (**Delta tables**, **Iceberg tables**, **materialized views**, **streaming tables**, **plain views**) are modeled as a separate `format` axis on the `LakehouseFormat` enum. `[strategy]` controls how Rocky writes data into the table; `format` controls the physical table shape. The two are orthogonal. The engine-side DDL generator (`rocky-core::lakehouse::generate_lakehouse_ddl`) handles each format; end-to-end TOML wiring varies by adapter, so consult the per-adapter guides before committing to one.
+Warehouse-managed table shapes (**Delta tables**, **Iceberg tables**, **materialized views**, **streaming tables**, **plain views**) are modeled as a separate `format` axis (a top-level `format = "delta_table"` / `"iceberg_table"` key plus an optional `[format_options]` block for partitioning, clustering, table properties, and a comment). `[strategy]` controls how Rocky writes data into the table; `format` controls the physical table shape. The two are orthogonal. The engine-side DDL generator (`rocky-core::lakehouse::generate_lakehouse_ddl`) handles each format; end-to-end TOML wiring varies by adapter, so consult the per-adapter guides before committing to one.
+
+The chosen `format` and `format_options` are now applied on the **first** materialization of incremental-family models (`incremental`, `delete_insert`, `microbatch`, `time_interval`), not just on full-create strategies — so the table that bootstraps an incremental model is created as the requested Delta or Iceberg shape from the start, rather than as a plain table that only later gains the format.
 :::
 
 **`[target]`** -- Output table:
@@ -144,6 +146,28 @@ table   = "${ROCKY_TABLE_OVERRIDE:-customer_facts}"
 ```
 
 See [Environment Variables](/reference/configuration/#environment-variables) for the canonical syntax reference and [`examples/playground/pocs/00-foundations/07-config-layering/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations/07-config-layering) for a runnable three-layer example.
+
+### `@var()` run variables
+
+A model body can carry per-run placeholders of the form `@var(name)` or `@var(name, default)`. They are bound at run time by `rocky run --var name=value` (repeatable) and substituted into the SQL before it reaches the warehouse:
+
+```sql
+-- models/orders.sql
+SELECT *
+FROM raw.orders
+WHERE region = '@var(region)'
+  AND status = '@var(status, shipped)'
+```
+
+```bash
+rocky run --var region=emea --var status=delivered
+```
+
+Here `@var(region)` has no default and must be supplied; `@var(status, shipped)` falls back to `shipped` when `--var status=...` is omitted.
+
+The substitution is **textual** — Rocky replaces the marker with the supplied string verbatim, so you own the surrounding quoting and casting (the example quotes the marker because the value is a string literal). Only the variable *name* is validated, as a SQL identifier.
+
+This is deliberately distinct from config-time `${ENV}` substitution. `${ENV}` resolves connection and routing values while Rocky parses `rocky.toml` and the sidecars, before any model is seen; `@var()` resolves a run's logical inputs at compile/render time and stays visible in the model source (the same family as the `@start_date` / `@end_date` markers used by `time_interval` models). A `@var(name)` with no `--var` binding and no inline default is a **compile error** that names the missing variable, so a forgotten value fails fast rather than running with a blank. `rocky import-dbt` maps dbt's `{{ var('name') }}` / `{{ var('name', default) }}` onto these markers.
 
 ### Config groups
 
@@ -254,6 +278,27 @@ owner = "data-eng"
 | `<tag_name>` | string | Free-form governance attribute. Merged over any [config-group `[tags]`](#group-tags) baseline (sidecar > group). |
 
 Resolved tags are emitted on `rocky compile --output json` as `models_detail[].tags`. The `dagster-rocky` integration projects them onto the derived asset's Dagster tags, so the same attribute drives both Rocky's view of the model and the orchestrator's. Tags are inherited from a model's config group when it belongs to one — see [Group tags](#group-tags).
+
+`[tags]` never touches the warehouse. For tags that should land on the warehouse securable itself, use [`[governance.tags]`](#governancetags).
+
+### `[governance.tags]`
+
+Where `[tags]` is orchestrator-facing metadata, the `[governance.tags]` block writes Unity Catalog tags onto the model's **own target securable** after it materializes. The DDL is view-aware: `ALTER VIEW ... SET TAGS (...)` for view-format models, `ALTER TABLE ... SET TAGS (...)` otherwise.
+
+```toml
+# models/fct_orders.toml
+name = "fct_orders"
+
+[governance.tags]
+domain = "finance"
+tier = "gold"
+```
+
+| Key pattern | Value type | Description |
+|---|---|---|
+| `<tag_name>` | string | Unity Catalog tag applied to this model's target table or view. Keys and values are used verbatim — no prefix. |
+
+This is the per-model counterpart to the pipeline-level [tagging strategy](/guides/governance/#9-tagging-strategy) (`[pipeline.*.target.governance.tags]`), which tags catalogs and schemas during replication. Application is best-effort: a failure warns but never aborts the run, matching the classification and retention governance posture. An empty block is skipped (Unity Catalog rejects `SET TAGS ()`). Distinct from `[tags]`, which is projected onto Dagster asset metadata and never written to the warehouse.
 
 ### `[[surrogate_key]]`
 

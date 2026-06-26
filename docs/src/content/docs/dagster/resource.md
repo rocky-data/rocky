@@ -71,7 +71,7 @@ Runs Rocky in buffered mode (`subprocess.run`) and returns the full execution re
 | `latest` | `bool` | `False` | Run the partition containing `now()` (UTC) |
 | `missing` | `bool` | `False` | Run partitions missing from the state store |
 | `lookback` | `int \| None` | `None` | Recompute the previous N partitions in addition to the selected ones |
-| `parallel` | `int \| None` | `None` | Run N partitions concurrently |
+| `parallel` | `int \| None` | `None` | Run N partitions concurrently. Left as `None`, the `--parallel` flag is omitted and the engine applies its own default of 4 concurrent partitions (earlier engine versions defaulted to serial). Pass `1` to force serial execution; DuckDB runs serially regardless. |
 
 ### `run_streaming(context, filter, governance_override=None, *, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None) -> RunResult`
 

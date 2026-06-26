@@ -89,6 +89,8 @@ rocky import-dbt --dbt-project <PATH> [flags]
 | `--overwrite` | `bool` | `false` | Replace contents of `--output-dir` if it already exists and is non-empty. Without this flag, the importer refuses to write into a non-empty directory so it never silently clobbers existing work. |
 | `--manifest <PATH>` | `PathBuf` | auto-detect | Path to `target/manifest.json`. When present, the importer uses dbt's compiled manifest (Jinja already resolved). Auto-detected from `<dbt_project>/target/` if omitted. |
 | `--no-manifest` | `bool` | `false` | Force regex-based import (skip `manifest.json` even if available). Useful when the manifest is stale or you want to verify the regex path. |
+| `--microbatch-as <KIND>` | `string` | `merge` | How to map dbt `materialized='microbatch'` models. `merge` reuses the dbt `unique_key` for an idempotent key-upsert; `time_interval` maps the batch onto Rocky's partition-window strategy. |
+| `--skip-unit-tests` | `bool` | `false` | Don't convert dbt `manifest.unit_tests` (1.8+) into Rocky `[[test]]` blocks. The unit-test counters still report what was found and skipped. Useful when you want to port unit tests by hand. |
 
 ### Emitted layout
 
@@ -105,7 +107,9 @@ rocky import-dbt --dbt-project <PATH> [flags]
 
 Connection secrets (passwords, API tokens, service-account JSON) are emitted as `${VAR}` env-var placeholders in `rocky.toml`; they are **never inlined**. The required env vars are listed in `MIGRATION-NOTES.md` so users know what to export before `rocky plan` + `rocky apply`.
 
-`materialized` mapping: `view → ephemeral`, `table → full_refresh`, `incremental` (with `unique_key`) → `merge`, `incremental` (without) → `incremental`. Anything else falls back to `full_refresh` with a TODO line in `MIGRATION-NOTES.md`. Profile types Rocky doesn't natively support stub a DuckDB `[adapter]` so the project still compiles, with the original type preserved under "Not Translated".
+`materialized` mapping: `view → ephemeral`, `table → full_refresh`, `incremental` (with `unique_key`) → `merge`, `incremental` (without) → `incremental`, `microbatch` → `merge` (default) or `time_interval`, selected by [`--microbatch-as`](#flags). Anything else falls back to `full_refresh` with a TODO line in `MIGRATION-NOTES.md`. Profile types Rocky doesn't natively support stub a DuckDB `[adapter]` so the project still compiles, with the original type preserved under "Not Translated".
+
+When reading `profiles.yml`, the importer resolves YAML anchors/aliases (`&anchor` / `*alias`) and `{{ env_var('VAR', 'default') }}` expressions in the adapter `type` field, so a profile that templates its warehouse type detects the right adapter instead of silently stubbing DuckDB. Override detection entirely with `--target-adapter`.
 
 ### Known limitations
 
@@ -113,8 +117,9 @@ Listed in every emitted `MIGRATION-NOTES.md`:
 
 - Singular dbt tests (custom SQL files in `tests/`): not translated.
 - Macros and `dbt_packages/`: skipped. The [hybrid-dbt-packages POC](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/06-hybrid-dbt-packages) is the documented escape hatch.
+- dbt model contracts (`contract: {enforced}`, column `data_type`, `constraints`): not carried over to Rocky's contract model. Each is reported with a warning and counted in `contracts_dropped` (JSON output and `MIGRATION-NOTES.md`) so you know which models had a contract to re-author by hand.
 
-The four built-in dbt generic tests (`unique`, `not_null`, `accepted_values`, `relationships`) translate to native Rocky `[[checks]]` on the matching per-model sidecar (shipped in engine v1.27.0). Tests referencing columns Rocky didn't translate are listed in `MIGRATION-NOTES.md` under "Not Translated" rather than silently dropped.
+The four built-in dbt generic tests (`unique`, `not_null`, `accepted_values`, `relationships`) translate to native Rocky `[[tests]]` on the matching per-model sidecar. So do several common `dbt_utils` / `dbt_expectations` tests: `accepted_range` / `expect_column_values_to_be_between` → `in_range`, `expect_column_values_to_match_regex` → `regex_match`, `expect_column_values_to_be_in_set` → `accepted_values`, `dbt_utils.expression_is_true` → `expression`, and `unique_combination_of_columns` → a `composite` uniqueness test. Tests with no native equivalent, or that reference columns Rocky didn't translate, are surfaced as `UnsupportedTest` warnings and listed in `MIGRATION-NOTES.md` rather than silently dropped. See the full [generic test mapping](/guides/migrate-from-dbt/#generic-test-mapping).
 
 ### Examples
 

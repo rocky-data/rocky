@@ -396,7 +396,13 @@ table = "dim_date"
 [[columns]]
 name = "date_key"
 data_type = "DATE"
+
+# SQL run on the warehouse around the load
+pre_hook  = ["CREATE SCHEMA IF NOT EXISTS warehouse.reference"]
+post_hook = ["ANALYZE warehouse.reference.dim_date"]
 ```
+
+**Seed hooks.** `pre_hook` and `post_hook` are lists of SQL statements the seed runs against the target warehouse, in order. Each `pre_hook` statement runs **before** the seed writes anything; each `post_hook` runs **after** the table loads successfully. A failing `pre_hook` aborts the seed before any data is written, so a guard like `pre_hook = ["SELECT 1 / COUNT(*) FROM warehouse.reference.dim_date"]` (which errors on an empty source) stops the load rather than replacing the table with bad data. These are seed-scoped relatives of the pipeline lifecycle [hooks](/concepts/hooks/), which fire shell commands and webhooks on run events rather than SQL around a single seed.
 
 **JSON output:**
 ```json

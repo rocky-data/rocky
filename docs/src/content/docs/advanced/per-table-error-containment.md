@@ -49,7 +49,7 @@ The exit code is non-zero (partial success), but every other table in the run ma
 
 ## `failure_kind` taxonomy
 
-`failure_kind` is a coarse classifier over the failure surface. The seven kebab-case variants partition the connector error spaces for Databricks and Snowflake, with a fallback for failures that reach the output layer type-erased.
+`failure_kind` is a coarse classifier over the failure surface. Most variants partition the connector error spaces for Databricks and Snowflake; `compile-error` covers a model that fails to compile mid-run (not a connector failure at all); and `unknown` is the fallback for failures that reach the output layer type-erased.
 
 | Variant | Meaning | Retry-safe? |
 |---|---|---|
@@ -59,6 +59,7 @@ The exit code is non-zero (partial success), but every other table in the run ma
 | `transient` | Retry-worthy failure -- 5xx, network glitch, statement aborted by a transient warehouse condition, statement timeout, circuit-breaker open. | Yes. |
 | `quota-exceeded` | Rate limit hit or a configured cap reached -- 429, retry-budget exhaustion, account-level quota. | Yes, with extended backoff and an alert. |
 | `not-found` | Requested catalog / schema / table not present -- 404 from the warehouse, often an upstream rename. | No. Re-discovery or human triage needed. |
+| `compile-error` | The model failed to compile during the run -- a type error, unresolved reference, or other `Error`-severity diagnostic surfaced while building this model. No warehouse call was attempted. The diagnostic is carried in `error`. | No. Fix the model SQL or its upstream; re-running won't help. |
 | `unknown` | The failure could not be classified -- e.g. errors raised outside the connector layer that reach the output struct type-erased. | Depends. Surface the raw `error` string. |
 
 The classifier walks the `anyhow::Error` chain on each per-table failure, downcasts to `AdapterError`, and probes `.inner()` for the typed connector enum. Errors built via `anyhow::anyhow!("...{e}")` (which stringify and drop the type) fall through to `unknown`; errors propagated via `?` / `.context(...)` preserve the typed source and classify correctly. As of engine `v1.34`, the 23 sites in `run.rs` that previously stringified adapter errors have been converted to type-preserving wraps, so `failure_kind` returns a non-`unknown` value for every real production adapter error.
@@ -71,7 +72,7 @@ Map each variant to one of four actions:
 |---|---|
 | **Retry with backoff** | `transient`, `connection-failed` |
 | **Retry with extended backoff and alert** | `quota-exceeded` |
-| **Don't retry; alert the model owner** | `auth-failed`, `query-rejected`, `not-found` |
+| **Don't retry; alert the model owner** | `auth-failed`, `query-rejected`, `not-found`, `compile-error` |
 | **Surface raw `error` for triage** | `unknown` |
 
 Treat `connection-failed` as retry-safe even though the warehouse never saw the request: `reqwest::is_connect()` is the discriminator, which fires on actual TCP / TLS / DNS failures, not on credentials issues (which land on `auth-failed` instead).
@@ -85,7 +86,7 @@ import dagster as dg
 from dagster_rocky import RockyResource
 
 RETRY_KINDS = {"transient", "connection-failed", "quota-exceeded"}
-ALERT_KINDS = {"auth-failed", "query-rejected", "not-found"}
+ALERT_KINDS = {"auth-failed", "query-rejected", "not-found", "compile-error"}
 
 
 @dg.asset

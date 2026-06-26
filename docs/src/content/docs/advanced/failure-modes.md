@@ -49,6 +49,8 @@ The categories are **independent**: a single pipeline can hit several at once, a
 
 **Why this matters first.** Every other category in the taxonomy assumes compile is green. A `rocky apply` against a project with compile errors aborts before any warehouse work, so it's pointless to debug runtime symptoms while diagnostics are red.
 
+**Per-model compile failure during a run.** The whole-project abort above is the common case. A model that compiles in isolation but fails to compile when its turn comes during a run (for example after an upstream change shifts a type) is now contained at the table boundary rather than passed over: it's counted in `tables_failed`, gets an `errors[*]` entry with [`failure_kind: "compile-error"`](./per-table-error-containment#failure_kind-taxonomy) carrying the diagnostic, and the run exits non-zero (status `Failure`, or `PartialFailure` when other models succeeded). Earlier engine versions skipped the model and still reported the run as a success.
+
 ---
 
 ## 2. Contract violations
