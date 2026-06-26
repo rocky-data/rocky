@@ -157,6 +157,43 @@ pub(crate) fn run_status_exit_result(output: &RunOutput, run_id: &str) -> Result
     }
 }
 
+/// Merge `execute_models`' compile-error bookkeeping into the replication
+/// path's parallel-copy tallies, then stamp the terminal `status`.
+///
+/// The replication path runs the compiled `--models` / `--all` set through
+/// [`execute_models`], which records each per-model compile failure (e.g.
+/// E020 — a `time_interval` model whose `time_column` is absent from its
+/// SELECT output) on `output.errors` with [`crate::output::FailureKind::CompileError`]
+/// and bumps `output.tables_failed` once per distinct failing model — exactly
+/// as on the transformation / model-only paths. The parallel-copy bookkeeping
+/// then used to *overwrite* both fields with only its own `table_errors`,
+/// silently dropping those compile failures and flipping a broken project back
+/// to `status = Success` / exit 0.
+///
+/// This merges instead: it keeps the already-recorded compile-error entries,
+/// folds their count (held in `output.tables_failed` at call time, since
+/// nothing but the compile section mutates it before the merge) into the total
+/// alongside the copy failures, appends the parallel-copy errors, and
+/// re-derives `output.status` so a `--output json` consumer reads the right
+/// terminal status (not the `RunOutput::new` default of `success`). A clean
+/// run still derives `Success`; a copy-only failure behaves exactly as before.
+fn merge_replication_compile_and_copy_errors(output: &mut RunOutput, table_errors: &[TableError]) {
+    let compile_failed_count = output.tables_failed;
+    output
+        .errors
+        .retain(|e| e.failure_kind == crate::output::FailureKind::CompileError);
+    output.tables_failed = compile_failed_count + table_errors.len();
+    output
+        .errors
+        .extend(table_errors.iter().map(|e| TableErrorOutput {
+            asset_key: e.asset_key.clone(),
+            error: e.error.clone(),
+            failure_kind: e.failure_kind,
+            cooldown_seconds: e.cooldown_seconds,
+        }));
+    output.status = output.derive_run_status();
+}
+
 /// Arm a background watcher that hard-exits with code 130 on a *second*
 /// SIGINT. The first signal (SIGINT or SIGTERM) is handled by the outer
 /// `tokio::select!` branch — this watcher gives the user an out when
@@ -3781,16 +3818,13 @@ pub async fn run(
         output.execution.final_concurrency = Some(t.current());
         output.execution.rate_limits_detected = Some(t.rate_limits_total());
     }
-    output.tables_failed = table_errors.len();
-    output.errors = table_errors
-        .iter()
-        .map(|e| TableErrorOutput {
-            asset_key: e.asset_key.clone(),
-            error: e.error.clone(),
-            failure_kind: e.failure_kind,
-            cooldown_seconds: e.cooldown_seconds,
-        })
-        .collect();
+    // Merge `execute_models`' compile-error bookkeeping with the parallel-copy
+    // `table_errors` (see [`merge_replication_compile_and_copy_errors`]) rather
+    // than overwriting it, then stamp `output.status`. This keeps a model that
+    // fails to type-check (E020) a first-class failure on the replication
+    // `--models` path instead of letting the copy bookkeeping clobber it back
+    // to status=Success / exit 0.
+    merge_replication_compile_and_copy_errors(&mut output, &table_errors);
 
     // Populate per-model / per-run cost attribution and run the
     // configured `[budget]` check. Populate always; propagate the
@@ -3915,6 +3949,27 @@ pub async fn run(
         anyhow::bail!(
             "{count} table(s) failed during parallel execution (run_id: {run_id}, use --resume {run_id} to retry)"
         );
+    }
+
+    // Compile-only failure on the replication path. The block above only
+    // fires when at least one source *copy* failed; a `--models` run where a
+    // model fails to compile (E020) but every source copied cleanly leaves
+    // `table_errors` empty while `output.tables_failed` is non-zero from the
+    // merged compile errors. Without this guard such a run would print its
+    // JSON (already carrying the compile errors + a non-`success` status) and
+    // then fall through to `Ok(())` / exit 0 — exactly the silent skip this
+    // change closes. Re-derive the exit contract from the merged tallies so it
+    // fails loudly, matching the transformation / model-only paths.
+    if output.tables_failed > 0 {
+        let msg = format!(
+            "{} model(s) failed to compile (run_id: {run_id}, see the `errors` array in the JSON output)",
+            output.tables_failed
+        );
+        let _ = hook_registry
+            .fire(&HookContext::pipeline_error(&run_id, pipeline_name, &msg))
+            .await;
+        let _ = hook_registry.wait_async_webhooks().await;
+        return run_status_exit_result(&output, &run_id);
     }
 
     // §P2.6 emit: pipeline_complete on happy-path exit. Drain async
@@ -9128,6 +9183,133 @@ merge_keys = ["id"]
         total.tables_failed = 1;
         let err = super::run_status_exit_result(&total, "r").unwrap_err();
         assert!(err.downcast_ref::<PartialFailure>().is_none());
+    }
+
+    /// Build a parallel-copy `TableError` for the merge tests below.
+    fn copy_table_error(asset: &str) -> TableError {
+        TableError {
+            asset_key: vec![asset.to_string()],
+            error: format!("copy of {asset} failed"),
+            task_index: None,
+            failure_kind: crate::output::FailureKind::QueryRejected,
+            cooldown_seconds: None,
+        }
+    }
+
+    /// Seed a `RunOutput` with the compile-error bookkeeping `execute_models`
+    /// records on the replication path before the parallel-copy merge runs:
+    /// one E020 entry on `errors` + a bumped `tables_failed`.
+    fn output_with_compile_error() -> RunOutput {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_failed = 1;
+        out.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec!["broken".to_string()],
+            error: "[E020] time_interval time_column absent".to_string(),
+            failure_kind: crate::output::FailureKind::CompileError,
+            cooldown_seconds: None,
+        });
+        out
+    }
+
+    /// The replication-path merge preserves `execute_models`' compile-error
+    /// entries instead of clobbering them with the parallel-copy errors. This
+    /// is the regression guard for the silent-skip on the replication +
+    /// `--models` path: a compile-erroring model under a replication pipeline
+    /// must survive into `tables_failed` / `errors` and flip `status` off
+    /// `Success`, even when a source copy also failed.
+    #[test]
+    fn merge_preserves_compile_errors_alongside_copy_errors() {
+        let mut out = output_with_compile_error();
+        // A model materialized (progress) so the run is a PartialFailure.
+        out.tables_copied = 1;
+        let copy_errors = vec![copy_table_error("orders")];
+
+        super::merge_replication_compile_and_copy_errors(&mut out, &copy_errors);
+
+        // The compile failure was NOT dropped: both error kinds survive and
+        // the count folds in (1 compile + 1 copy).
+        assert_eq!(out.tables_failed, 2, "compile + copy failures both counted");
+        assert!(
+            out.errors.iter().any(
+                |e| e.failure_kind == crate::output::FailureKind::CompileError
+                    && e.error.contains("E020")
+            ),
+            "the E020 compile error must survive the merge: {:?}",
+            out.errors
+        );
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.failure_kind == crate::output::FailureKind::QueryRejected),
+            "the parallel-copy error must also be present: {:?}",
+            out.errors
+        );
+        // Status is stamped off the merged tallies (progress + failures).
+        assert!(matches!(
+            out.status,
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+    }
+
+    /// A compile-only failure (no source copy failed) on the replication path
+    /// still flips `status` off `Success` and keeps a non-zero `tables_failed`
+    /// after the merge — the caller's guard then maps it to a non-zero exit.
+    #[test]
+    fn merge_compile_only_failure_is_not_success() {
+        let mut out = output_with_compile_error();
+        let no_copy_errors: Vec<TableError> = Vec::new();
+
+        super::merge_replication_compile_and_copy_errors(&mut out, &no_copy_errors);
+
+        assert_eq!(out.tables_failed, 1, "the compile failure is preserved");
+        assert_eq!(out.errors.len(), 1);
+        assert_eq!(
+            out.errors[0].failure_kind,
+            crate::output::FailureKind::CompileError
+        );
+        // No progress + a failure → total Failure, never Success.
+        assert!(matches!(out.status, rocky_core::state::RunStatus::Failure));
+    }
+
+    /// A clean replication run (no compile errors, no copy errors) stays
+    /// `Success` after the merge — no false failure regression.
+    #[test]
+    fn merge_clean_run_stays_success() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 3;
+        let no_errors: Vec<TableError> = Vec::new();
+
+        super::merge_replication_compile_and_copy_errors(&mut out, &no_errors);
+
+        assert_eq!(out.tables_failed, 0);
+        assert!(out.errors.is_empty());
+        assert!(matches!(out.status, rocky_core::state::RunStatus::Success));
+    }
+
+    /// A copy-only failure (no compile errors) behaves as before the fix:
+    /// the copy errors populate `errors` / `tables_failed` and drive the
+    /// status, with nothing spuriously preserved.
+    #[test]
+    fn merge_copy_only_failure_behaves_as_before() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 2;
+        let copy_errors = vec![copy_table_error("a"), copy_table_error("b")];
+
+        super::merge_replication_compile_and_copy_errors(&mut out, &copy_errors);
+
+        assert_eq!(out.tables_failed, 2);
+        assert_eq!(out.errors.len(), 2);
+        assert!(
+            out.errors
+                .iter()
+                .all(|e| e.failure_kind == crate::output::FailureKind::QueryRejected),
+            "no phantom compile errors: {:?}",
+            out.errors
+        );
+        assert!(matches!(
+            out.status,
+            rocky_core::state::RunStatus::PartialFailure
+        ));
     }
 
     /// End-to-end: a model declaring a `[[surrogate_key]]` block materializes a
