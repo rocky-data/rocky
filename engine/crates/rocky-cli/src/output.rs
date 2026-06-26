@@ -488,6 +488,12 @@ pub enum FailureKind {
     QuotaExceeded,
     /// Requested catalog / schema / table not present.
     NotFound,
+    /// A model failed to compile (parse / type-check / contract
+    /// diagnostic) before any SQL was issued — e.g. a `time_interval`
+    /// model whose `time_column` is absent from its SELECT output
+    /// (E020). The model never reached the warehouse; the run surfaces
+    /// it as a failure instead of silently skipping it.
+    CompileError,
     /// Fallback when the failure could not be classified — e.g. errors
     /// raised outside the connector layer that reach this struct
     /// type-erased through `anyhow::Error`.
@@ -4406,8 +4412,15 @@ impl RunOutput {
     /// end-state counters. Interrupt (`self.interrupted`) with no
     /// materializations → `Failure`; with at least one → `PartialFailure`.
     /// Same rule for failed-table counts. Clean completion → `Success`.
+    ///
+    /// "Progress" is either a replicated table (`tables_copied`) or a
+    /// materialized transformation model (`materializations`) — the
+    /// transformation path tracks built models in `materializations`
+    /// rather than `tables_copied`, so a partial transformation run (one
+    /// model built, another failed to compile) correctly reports
+    /// `PartialFailure` instead of a total `Failure`.
     pub fn derive_run_status(&self) -> rocky_core::state::RunStatus {
-        let has_progress = self.tables_copied > 0;
+        let has_progress = self.tables_copied > 0 || !self.materializations.is_empty();
         let has_problem = self.interrupted || self.tables_failed > 0;
         match (has_progress, has_problem) {
             (_, false) => rocky_core::state::RunStatus::Success,
@@ -5074,6 +5087,27 @@ mod run_record_tests {
         let mut out = RunOutput::new(String::new(), 0, 1);
         out.tables_failed = 2;
         assert!(matches!(out.derive_run_status(), RunStatus::Failure));
+    }
+
+    #[test]
+    fn derive_run_status_materialized_model_with_failure_is_partial() {
+        // The transformation path records progress in `materializations`
+        // (not `tables_copied`). A run that built one model and failed
+        // another (e.g. a compile error) must be a PartialFailure, not a
+        // total Failure.
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.materializations
+            .push(mat(&["", "marts", "good"], 10, Some("h"), fixed_start()));
+        out.tables_failed = 1;
+        assert!(matches!(out.derive_run_status(), RunStatus::PartialFailure));
+    }
+
+    #[test]
+    fn compile_error_failure_kind_serializes_kebab_case() {
+        // The codegen-driven wire contract: `FailureKind::CompileError`
+        // must serialize as the kebab-case literal Dagster/VS Code branch on.
+        let json = serde_json::to_string(&FailureKind::CompileError).unwrap();
+        assert_eq!(json, "\"compile-error\"");
     }
 
     #[test]

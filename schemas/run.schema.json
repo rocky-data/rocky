@@ -420,6 +420,13 @@
           "type": "string"
         },
         {
+          "description": "A model failed to compile (parse / type-check / contract diagnostic) before any SQL was issued — e.g. a `time_interval` model whose `time_column` is absent from its SELECT output (E020). The model never reached the warehouse; the run surfaces it as a failure instead of silently skipping it.",
+          "enum": [
+            "compile-error"
+          ],
+          "type": "string"
+        },
+        {
           "description": "Fallback when the failure could not be classified — e.g. errors raised outside the connector layer that reach this struct type-erased through `anyhow::Error`.",
           "enum": [
             "unknown"

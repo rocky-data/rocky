@@ -128,6 +128,72 @@ pub struct PartialFailure {
     pub run_id: String,
 }
 
+/// Map a finalized [`RunOutput`]'s derived status onto the CLI exit-code
+/// contract for the transformation / model-only execution paths.
+///
+/// - `Success` → `Ok(())` (exit 0).
+/// - `PartialFailure` (some models built, some failed) → the
+///   [`PartialFailure`] sentinel `main.rs` maps to exit 2.
+/// - `Failure` (nothing built) → an `anyhow` error (exit 1).
+///
+/// Callers MUST have already emitted the JSON `RunOutput` on stdout before
+/// invoking this — the returned error short-circuits the rest of the path,
+/// so the structured payload (status, `tables_failed`, `errors`) is what a
+/// JSON consumer reads regardless of exit code. This is what makes a
+/// compile-failed model a first-class run failure instead of a silently
+/// skipped no-op that still reported `status: "Success"`, exit 0.
+pub(crate) fn run_status_exit_result(output: &RunOutput, run_id: &str) -> Result<()> {
+    match output.derive_run_status() {
+        rocky_core::state::RunStatus::PartialFailure => Err(PartialFailure {
+            count: output.tables_failed,
+            run_id: run_id.to_string(),
+        }
+        .into()),
+        rocky_core::state::RunStatus::Failure => anyhow::bail!(
+            "{} model(s) failed (run_id: {run_id}, see the `errors` array in the JSON output)",
+            output.tables_failed
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Merge `execute_models`' compile-error bookkeeping into the replication
+/// path's parallel-copy tallies, then stamp the terminal `status`.
+///
+/// The replication path runs the compiled `--models` / `--all` set through
+/// [`execute_models`], which records each per-model compile failure (e.g.
+/// E020 — a `time_interval` model whose `time_column` is absent from its
+/// SELECT output) on `output.errors` with [`crate::output::FailureKind::CompileError`]
+/// and bumps `output.tables_failed` once per distinct failing model — exactly
+/// as on the transformation / model-only paths. The parallel-copy bookkeeping
+/// then used to *overwrite* both fields with only its own `table_errors`,
+/// silently dropping those compile failures and flipping a broken project back
+/// to `status = Success` / exit 0.
+///
+/// This merges instead: it keeps the already-recorded compile-error entries,
+/// folds their count (held in `output.tables_failed` at call time, since
+/// nothing but the compile section mutates it before the merge) into the total
+/// alongside the copy failures, appends the parallel-copy errors, and
+/// re-derives `output.status` so a `--output json` consumer reads the right
+/// terminal status (not the `RunOutput::new` default of `success`). A clean
+/// run still derives `Success`; a copy-only failure behaves exactly as before.
+fn merge_replication_compile_and_copy_errors(output: &mut RunOutput, table_errors: &[TableError]) {
+    let compile_failed_count = output.tables_failed;
+    output
+        .errors
+        .retain(|e| e.failure_kind == crate::output::FailureKind::CompileError);
+    output.tables_failed = compile_failed_count + table_errors.len();
+    output
+        .errors
+        .extend(table_errors.iter().map(|e| TableErrorOutput {
+            asset_key: e.asset_key.clone(),
+            error: e.error.clone(),
+            failure_kind: e.failure_kind,
+            cooldown_seconds: e.cooldown_seconds,
+        }));
+    output.status = output.derive_run_status();
+}
+
 /// Arm a background watcher that hard-exits with code 130 on a *second*
 /// SIGINT. The first signal (SIGINT or SIGTERM) is handled by the outer
 /// `tokio::select!` branch — this watcher gives the user an out when
@@ -1192,11 +1258,19 @@ pub async fn run(
         )
         .await;
 
+        // Stamp the terminal status so the JSON payload reports the run
+        // outcome directly (a compile-failed target makes this `Failure`).
+        output.status = output.derive_run_status();
         if output_json {
             print_json(&output)?;
         }
         budget_result?;
-        return Ok(());
+        // Same run-status exit contract as the transformation path: a
+        // model-only run (`rocky run --model <X>`) whose target failed to
+        // compile is recorded in `output.errors` / `tables_failed` by
+        // `execute_models`; propagate the non-zero exit so it doesn't
+        // report exit 0 with a JSON payload that says the model failed.
+        return run_status_exit_result(&output, &run_id);
     }
 
     let (pipeline_name, pipeline_config) =
@@ -3744,16 +3818,13 @@ pub async fn run(
         output.execution.final_concurrency = Some(t.current());
         output.execution.rate_limits_detected = Some(t.rate_limits_total());
     }
-    output.tables_failed = table_errors.len();
-    output.errors = table_errors
-        .iter()
-        .map(|e| TableErrorOutput {
-            asset_key: e.asset_key.clone(),
-            error: e.error.clone(),
-            failure_kind: e.failure_kind,
-            cooldown_seconds: e.cooldown_seconds,
-        })
-        .collect();
+    // Merge `execute_models`' compile-error bookkeeping with the parallel-copy
+    // `table_errors` (see [`merge_replication_compile_and_copy_errors`]) rather
+    // than overwriting it, then stamp `output.status`. This keeps a model that
+    // fails to type-check (E020) a first-class failure on the replication
+    // `--models` path instead of letting the copy bookkeeping clobber it back
+    // to status=Success / exit 0.
+    merge_replication_compile_and_copy_errors(&mut output, &table_errors);
 
     // Populate per-model / per-run cost attribution and run the
     // configured `[budget]` check. Populate always; propagate the
@@ -3878,6 +3949,27 @@ pub async fn run(
         anyhow::bail!(
             "{count} table(s) failed during parallel execution (run_id: {run_id}, use --resume {run_id} to retry)"
         );
+    }
+
+    // Compile-only failure on the replication path. The block above only
+    // fires when at least one source *copy* failed; a `--models` run where a
+    // model fails to compile (E020) but every source copied cleanly leaves
+    // `table_errors` empty while `output.tables_failed` is non-zero from the
+    // merged compile errors. Without this guard such a run would print its
+    // JSON (already carrying the compile errors + a non-`success` status) and
+    // then fall through to `Ok(())` / exit 0 — exactly the silent skip this
+    // change closes. Re-derive the exit contract from the merged tallies so it
+    // fails loudly, matching the transformation / model-only paths.
+    if output.tables_failed > 0 {
+        let msg = format!(
+            "{} model(s) failed to compile (run_id: {run_id}, see the `errors` array in the JSON output)",
+            output.tables_failed
+        );
+        let _ = hook_registry
+            .fire(&HookContext::pipeline_error(&run_id, pipeline_name, &msg))
+            .await;
+        let _ = hook_registry.wait_async_webhooks().await;
+        return run_status_exit_result(&output, &run_id);
     }
 
     // §P2.6 emit: pipeline_complete on happy-path exit. Drain async
@@ -4409,11 +4501,40 @@ pub(crate) async fn execute_models(
     let mut compile_result = match rocky_compiler::compile::compile(&compile_config) {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, "model compilation failed — skipping model execution");
+            // A whole-project compile failure (couldn't even produce a
+            // result — bad models dir, unparseable project) means nothing
+            // can execute. Surface it as a first-class run failure instead
+            // of returning `Ok(())`: record an error entry + bump
+            // `tables_failed` so `derive_run_status()` yields `Failure`,
+            // the caller emits the JSON, and the process exits non-zero.
+            // Without this a broken project reported `status: "Success"`,
+            // exit 0, with zero data materialized.
+            warn!(error = %e, "model compilation failed — no models can execute");
+            output.tables_failed += 1;
+            output.errors.push(crate::output::TableErrorOutput {
+                asset_key: vec!["<compile>".to_string()],
+                error: format!("model compilation failed: {e:#}"),
+                failure_kind: crate::output::FailureKind::CompileError,
+                cooldown_seconds: None,
+            });
             return Ok(());
         }
     };
 
+    // Per-model compile errors are first-class run failures, not silent
+    // skips. Each model that fails to type-check (e.g. E020 — a
+    // `time_interval` model whose `time_column` is absent from its SELECT
+    // output) is recorded in `output.errors` with the diagnostic, counted
+    // in `tables_failed`, and excluded from execution. Models that compiled
+    // cleanly still build, so a mixed project is a `PartialFailure` (good
+    // models materialize) rather than a green run that dropped data.
+    //
+    // Before this, `execute_models` warned and `return`ed `Ok(())`, so the
+    // run reported `status: "Success"`, exit 0, `materializations: []` —
+    // an orchestrator consuming `--output json` saw fully green while zero
+    // data materialized.
+    let mut compile_failed_models: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     if compile_result.has_errors {
         for d in &compile_result.diagnostics {
             if d.is_error() {
@@ -4423,10 +4544,24 @@ pub(crate) async fn execute_models(
                     message = &*d.message,
                     "compile error"
                 );
+                // Surface every error diagnostic as a run error so JSON
+                // consumers see the code + message; count each distinct
+                // model once toward `tables_failed`.
+                if compile_failed_models.insert(d.model.clone()) {
+                    output.tables_failed += 1;
+                }
+                output.errors.push(crate::output::TableErrorOutput {
+                    asset_key: vec![d.model.clone()],
+                    error: format!("[{}] {}", &*d.code, &*d.message),
+                    failure_kind: crate::output::FailureKind::CompileError,
+                    cooldown_seconds: None,
+                });
             }
         }
-        warn!("model compilation had errors — skipping model execution");
-        return Ok(());
+        warn!(
+            failed_models = compile_failed_models.len(),
+            "model(s) failed to compile — excluded from execution; run will report failure"
+        );
     }
 
     // `--defer`: rewrite the selected models' bare upstream `ref()`s to point
@@ -4561,6 +4696,11 @@ pub(crate) async fn execute_models(
         let matched: Vec<(usize, &String, &rocky_core::models::Model)> = layer
             .iter()
             .filter(|name| model_name_filter.is_none_or(|target| target == name.as_str()))
+            // Exclude models that failed to compile — they're already
+            // recorded as failures in `output.errors` above. A downstream
+            // model that `ref()`s an excluded one will fail at execution
+            // (missing table) and surface through the normal error path.
+            .filter(|name| !compile_failed_models.contains(name.as_str()))
             .filter_map(|name| compile_result.project.model(name).map(|m| (name, m)))
             .enumerate()
             .map(|(idx, (name, model))| (idx, name, model))
@@ -9018,6 +9158,160 @@ merge_keys = ["id"]
         .expect("write model toml");
     }
 
+    /// `run_status_exit_result` maps the derived run status onto the CLI
+    /// exit-code contract: Success → Ok, PartialFailure → the
+    /// `PartialFailure` sentinel (exit 2), Failure → an error (exit 1).
+    #[test]
+    fn run_status_exit_result_maps_status_to_exit_contract() {
+        // Clean run → Ok.
+        let mut ok = RunOutput::new(String::new(), 0, 1);
+        ok.tables_copied = 1;
+        assert!(super::run_status_exit_result(&ok, "r").is_ok());
+
+        // Some progress + a failure → PartialFailure sentinel (exit 2).
+        let mut partial = RunOutput::new(String::new(), 0, 1);
+        partial.tables_copied = 1;
+        partial.tables_failed = 1;
+        let err = super::run_status_exit_result(&partial, "r").unwrap_err();
+        assert!(
+            err.downcast_ref::<PartialFailure>().is_some(),
+            "PartialFailure must map to the exit-2 sentinel, got: {err:#}"
+        );
+
+        // No progress + a failure → a plain error (exit 1).
+        let mut total = RunOutput::new(String::new(), 0, 1);
+        total.tables_failed = 1;
+        let err = super::run_status_exit_result(&total, "r").unwrap_err();
+        assert!(err.downcast_ref::<PartialFailure>().is_none());
+    }
+
+    /// Build a parallel-copy `TableError` for the merge tests below.
+    fn copy_table_error(asset: &str) -> TableError {
+        TableError {
+            asset_key: vec![asset.to_string()],
+            error: format!("copy of {asset} failed"),
+            task_index: None,
+            failure_kind: crate::output::FailureKind::QueryRejected,
+            cooldown_seconds: None,
+        }
+    }
+
+    /// Seed a `RunOutput` with the compile-error bookkeeping `execute_models`
+    /// records on the replication path before the parallel-copy merge runs:
+    /// one E020 entry on `errors` + a bumped `tables_failed`.
+    fn output_with_compile_error() -> RunOutput {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_failed = 1;
+        out.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec!["broken".to_string()],
+            error: "[E020] time_interval time_column absent".to_string(),
+            failure_kind: crate::output::FailureKind::CompileError,
+            cooldown_seconds: None,
+        });
+        out
+    }
+
+    /// The replication-path merge preserves `execute_models`' compile-error
+    /// entries instead of clobbering them with the parallel-copy errors. This
+    /// is the regression guard for the silent-skip on the replication +
+    /// `--models` path: a compile-erroring model under a replication pipeline
+    /// must survive into `tables_failed` / `errors` and flip `status` off
+    /// `Success`, even when a source copy also failed.
+    #[test]
+    fn merge_preserves_compile_errors_alongside_copy_errors() {
+        let mut out = output_with_compile_error();
+        // A model materialized (progress) so the run is a PartialFailure.
+        out.tables_copied = 1;
+        let copy_errors = vec![copy_table_error("orders")];
+
+        super::merge_replication_compile_and_copy_errors(&mut out, &copy_errors);
+
+        // The compile failure was NOT dropped: both error kinds survive and
+        // the count folds in (1 compile + 1 copy).
+        assert_eq!(out.tables_failed, 2, "compile + copy failures both counted");
+        assert!(
+            out.errors.iter().any(
+                |e| e.failure_kind == crate::output::FailureKind::CompileError
+                    && e.error.contains("E020")
+            ),
+            "the E020 compile error must survive the merge: {:?}",
+            out.errors
+        );
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.failure_kind == crate::output::FailureKind::QueryRejected),
+            "the parallel-copy error must also be present: {:?}",
+            out.errors
+        );
+        // Status is stamped off the merged tallies (progress + failures).
+        assert!(matches!(
+            out.status,
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+    }
+
+    /// A compile-only failure (no source copy failed) on the replication path
+    /// still flips `status` off `Success` and keeps a non-zero `tables_failed`
+    /// after the merge — the caller's guard then maps it to a non-zero exit.
+    #[test]
+    fn merge_compile_only_failure_is_not_success() {
+        let mut out = output_with_compile_error();
+        let no_copy_errors: Vec<TableError> = Vec::new();
+
+        super::merge_replication_compile_and_copy_errors(&mut out, &no_copy_errors);
+
+        assert_eq!(out.tables_failed, 1, "the compile failure is preserved");
+        assert_eq!(out.errors.len(), 1);
+        assert_eq!(
+            out.errors[0].failure_kind,
+            crate::output::FailureKind::CompileError
+        );
+        // No progress + a failure → total Failure, never Success.
+        assert!(matches!(out.status, rocky_core::state::RunStatus::Failure));
+    }
+
+    /// A clean replication run (no compile errors, no copy errors) stays
+    /// `Success` after the merge — no false failure regression.
+    #[test]
+    fn merge_clean_run_stays_success() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 3;
+        let no_errors: Vec<TableError> = Vec::new();
+
+        super::merge_replication_compile_and_copy_errors(&mut out, &no_errors);
+
+        assert_eq!(out.tables_failed, 0);
+        assert!(out.errors.is_empty());
+        assert!(matches!(out.status, rocky_core::state::RunStatus::Success));
+    }
+
+    /// A copy-only failure (no compile errors) behaves as before the fix:
+    /// the copy errors populate `errors` / `tables_failed` and drive the
+    /// status, with nothing spuriously preserved.
+    #[test]
+    fn merge_copy_only_failure_behaves_as_before() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        out.tables_copied = 2;
+        let copy_errors = vec![copy_table_error("a"), copy_table_error("b")];
+
+        super::merge_replication_compile_and_copy_errors(&mut out, &copy_errors);
+
+        assert_eq!(out.tables_failed, 2);
+        assert_eq!(out.errors.len(), 2);
+        assert!(
+            out.errors
+                .iter()
+                .all(|e| e.failure_kind == crate::output::FailureKind::QueryRejected),
+            "no phantom compile errors: {:?}",
+            out.errors
+        );
+        assert!(matches!(
+            out.status,
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+    }
+
     /// End-to-end: a model declaring a `[[surrogate_key]]` block materializes a
     /// table that carries the injected, dialect-resolved hash column.
     #[cfg(feature = "duckdb")]
@@ -9044,6 +9338,114 @@ merge_keys = ["id"]
         assert_eq!(r.rows.len(), 1);
         let sk = r.rows[0][0].as_str().unwrap_or_default();
         assert_eq!(sk.len(), 32, "md5 hex should be 32 chars, got {sk:?}");
+    }
+
+    /// Write a `[strategy] time_interval` model whose `time_column` is
+    /// absent from its SELECT output — guaranteed E020 at type-check.
+    #[cfg(feature = "duckdb")]
+    fn write_e020_model(dir: &std::path::Path, name: &str) {
+        // Output schema is `{id}`; `time_column = "ts"` is not present → E020.
+        std::fs::write(dir.join(format!("{name}.sql")), "SELECT 1 AS id\n")
+            .expect("write model sql");
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            "[strategy]\ntype = \"time_interval\"\ntime_column = \"ts\"\ngranularity = \"day\"\nfirst_partition = \"2026-01-01\"\nlookback = 0\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        )
+        .expect("write model toml");
+    }
+
+    /// A model that fails to compile (E020) is a first-class run failure,
+    /// not a silent skip: it is counted in `tables_failed`, surfaced in
+    /// `errors` with `FailureKind::CompileError` + the diagnostic, and the
+    /// clean sibling model still materializes — so the run is a
+    /// `PartialFailure`, not a green run that dropped data.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn compile_error_model_is_a_partial_failure_not_a_silent_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        // One clean model + one E020 model, independent of each other.
+        write_plain_model(&models, "good", "SELECT 7 AS id");
+        write_e020_model(&models, "broken");
+
+        let db_path = dir.path().join("t.duckdb");
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        // execute_models itself returns Ok — the failure is carried in the
+        // populated `output`, so the caller can still emit the JSON payload
+        // before mapping status to a non-zero exit code.
+        result.expect("execute_models should return Ok (failure carried in output)");
+
+        // The broken model counts once toward `tables_failed` even if it
+        // raised several diagnostics.
+        assert_eq!(output.tables_failed, 1, "the broken model counts as failed");
+        assert!(!output.errors.is_empty(), "diagnostics surfaced in errors");
+        // Every surfaced error belongs to the broken model and is tagged as
+        // a compile failure; at least one carries the E020 code.
+        assert!(output.errors.iter().all(|e| {
+            e.asset_key == vec!["broken".to_string()]
+                && e.failure_kind == crate::output::FailureKind::CompileError
+        }));
+        assert!(
+            output.errors.iter().any(|e| e.error.contains("E020")),
+            "an E020 diagnostic is present: {:?}",
+            output.errors
+        );
+
+        // The clean model still materialized.
+        let mat_names: Vec<String> = output
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(mat_names, vec!["good".to_string()]);
+
+        // Status is PartialFailure (some progress + a failure).
+        assert!(matches!(
+            output.derive_run_status(),
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+
+        // The good table exists; the broken one was never created.
+        let conn = rocky_duckdb::DuckDbConnector::open(&db_path).expect("open db");
+        assert_eq!(
+            conn.execute_sql("SELECT id FROM main.good")
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        assert!(
+            conn.execute_sql("SELECT id FROM main.broken").is_err(),
+            "the compile-failed model must not have been materialized"
+        );
+    }
+
+    /// When every model fails to compile, the run is a total `Failure`:
+    /// nothing materializes, `tables_failed` is bumped, and the diagnostic
+    /// is surfaced in `errors`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn all_models_compile_error_is_a_total_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        write_e020_model(&models, "broken");
+
+        let db_path = dir.path().join("t.duckdb");
+        let (output, result) = run_models_against_duckdb(&models, &db_path, false, 1).await;
+        result.expect("execute_models returns Ok with the failure in output");
+
+        assert_eq!(output.tables_failed, 1);
+        assert!(output.materializations.is_empty());
+        assert_eq!(
+            output.errors[0].failure_kind,
+            crate::output::FailureKind::CompileError
+        );
+        assert!(matches!(
+            output.derive_run_status(),
+            rocky_core::state::RunStatus::Failure
+        ));
     }
 
     /// Materialize all models in `models_dir` against a fresh DuckDB file,
