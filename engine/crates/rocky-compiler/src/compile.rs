@@ -168,12 +168,22 @@ pub fn compile_with_db(
 ) -> Result<CompileResult, CompileError> {
     let total_start = Instant::now();
 
-    // 1. Load and resolve project (salsa-driven for .rocky files).
+    // 1. Load project, substitute per-run variables, then resolve.
+    //
+    //    Substitution happens **before** `Project::from_models` runs
+    //    dependency resolution / lineage extraction, so a bare `@var(...)`
+    //    marker outside a string literal (e.g. `WHERE amount >= @var(min)`)
+    //    is resolved to its value (or the parseable missing sentinel) before
+    //    it ever reaches the SQL parser. Resolving after load is too late:
+    //    lineage extraction on the raw `@var(` text fails and load returns an
+    //    error before `compile_project` can substitute.
     let load_start = Instant::now();
-    let project = Project::load_with_db(&config.models_dir, db)?;
+    let mut models = Project::load_models_with_db(&config.models_dir, db)?;
+    let run_var_diagnostics = substitute_run_vars_into_models(&mut models, &config.run_vars);
+    let project = Project::from_models(models)?;
     let project_load_ms = load_start.elapsed().as_millis() as u64;
 
-    let mut result = compile_project(project, config)?;
+    let mut result = compile_project(project, config, run_var_diagnostics)?;
     result.timings.project_load_ms = project_load_ms;
     result.timings.total_ms = total_start.elapsed().as_millis() as u64;
 
@@ -192,23 +202,24 @@ pub fn compile_with_db(
     Ok(result)
 }
 
-/// Compile a pre-loaded project (useful when models come from other sources).
-pub fn compile_project(
-    mut project: Project,
-    config: &CompilerConfig,
-) -> Result<CompileResult, CompileError> {
-    let mut timings = PhaseTimings::default();
-
-    // 1b. Substitute per-run variables (`@var(name)` / `@var(name, default)`)
-    //     into each model's SQL before any SQL parsing happens, so the
-    //     resolved text flows uniformly through the semantic graph, typecheck,
-    //     and downstream SQL generation. A reference with no supplied value and
-    //     no inline default is recorded and turned into an E028 error
-    //     diagnostic naming the variable. This pass is a no-op (and allocates
-    //     nothing extra beyond the per-model scan) when no model uses `@var()`.
+/// Substitute per-run variables into each model's SQL **before** dependency
+/// resolution / lineage extraction.
+///
+/// Each `@var(name)` / `@var(name, default)` occurrence is replaced with its
+/// supplied value, its inline default, or — when neither exists — a parseable
+/// sentinel (`NULL`). Because the marker is gone before the SQL parser sees
+/// it, a bare reference outside a string literal (`WHERE amount >= @var(min)`)
+/// no longer breaks lineage extraction. Returns one E028 error diagnostic per
+/// required variable that had no supplied value and no inline default, naming
+/// the variable. A no-op (beyond the per-model regex scan) when no model uses
+/// `@var()`.
+fn substitute_run_vars_into_models(
+    models: &mut [rocky_core::models::Model],
+    run_vars: &rocky_core::run_vars::RunVars,
+) -> Vec<Diagnostic> {
     let mut run_var_diagnostics: Vec<Diagnostic> = Vec::new();
-    for model in &mut project.models {
-        let substitution = rocky_core::run_vars::substitute_run_vars(&model.sql, &config.run_vars);
+    for model in models {
+        let substitution = rocky_core::run_vars::substitute_run_vars(&model.sql, run_vars);
         for missing in substitution.missing {
             run_var_diagnostics.push(
                 Diagnostic::error(
@@ -227,6 +238,21 @@ pub fn compile_project(
         }
         model.sql = substitution.sql;
     }
+    run_var_diagnostics
+}
+
+/// Compile a pre-loaded project (useful when models come from other sources).
+///
+/// `run_var_diagnostics` carries the E028 diagnostics produced by
+/// [`substitute_run_vars_into_models`] at load time (before resolution), which
+/// are merged into the final diagnostic set. Callers that don't use per-run
+/// variables pass an empty `Vec`.
+pub fn compile_project(
+    project: Project,
+    config: &CompilerConfig,
+    run_var_diagnostics: Vec<Diagnostic>,
+) -> Result<CompileResult, CompileError> {
+    let mut timings = PhaseTimings::default();
 
     // 2. Build semantic graph
     let sg_start = Instant::now();
@@ -376,8 +402,13 @@ pub fn compile_incremental(
 
     // 1. Load the new project + rebuild the semantic graph. Both are cheap
     //    relative to typecheck — the whole point of the optimization.
+    //    Substitute per-run variables before resolution for the same reason
+    //    as the full-compile path: a bare `@var(...)` must never reach the
+    //    SQL parser during lineage extraction (see `compile_with_db`).
     let load_start = Instant::now();
-    let project = Project::load(&config.models_dir)?;
+    let mut models = Project::load_models(&config.models_dir)?;
+    let run_var_diagnostics = substitute_run_vars_into_models(&mut models, &config.run_vars);
+    let project = Project::from_models(models)?;
     let project_load_ms = load_start.elapsed().as_millis() as u64;
 
     let sg_start = Instant::now();
@@ -516,6 +547,7 @@ pub fn compile_incremental(
     diagnostics.extend(blast_radius_diagnostics);
     diagnostics.extend(classification_diagnostics);
     diagnostics.extend(freshness_diagnostics);
+    diagnostics.extend(run_var_diagnostics);
 
     let has_errors = diagnostics
         .iter()
