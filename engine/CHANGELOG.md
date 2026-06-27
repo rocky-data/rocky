@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.55.1] - 2026-06-27
+
+### Changed
+
+- **Upgraded the `object_store` dependency (0.11 → 0.14).** The S3 conditional-put mode is now pinned to `ETagMatch` (`If-None-Match: *`), making the concurrent-writer `put_if_not_exists` guarantee explicit and version-independent on real S3. (#966)
+
 ### Fixed
 
 - **`rocky run --output json` (including `--dag`) no longer prints a human summary line to stdout before the JSON payload.** Under the unified-DAG path each sub-run (replication load, transformation, seed) printed lines like "Copied N tables …", "transformation pipeline complete …", or "Seed complete …" to stdout ahead of the JSON document, forcing an orchestrator to slice from the first `{`. With `-o json`, stdout is now exactly the JSON document; that progress text goes to stderr. Human/table output is unchanged.
