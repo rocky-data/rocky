@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.55.0] - 2026-06-27
+
 ### Added
 
 - **`rocky run --var name=value` — per-run variables in model SQL.** A model can reference an explicit `@var(name)` (or `@var(name, default)`) placeholder that the compiler resolves to a caller-supplied string at compile time, parallel to dbt's `{{ var() }}`. The substitution is textual — the operator owns SQL quoting — and a referenced variable with no value and no inline default fails the run with a diagnostic naming it. (#976)
