@@ -1211,7 +1211,7 @@ pub async fn run(
             output.idempotency_key = Some(ctx.key.clone());
         }
 
-        execute_models(
+        let exec_result = execute_models(
             mdir,
             warehouse.as_ref(),
             state_store.as_ref(),
@@ -1232,7 +1232,47 @@ pub async fn run(
             rocky_cfg.reuse.enabled && !skip_opts.no_reuse,
             run_vars,
         )
-        .await?;
+        .await;
+
+        // A runtime model failure (warehouse rejected the SQL, an unresolved
+        // upstream, a divide-by-zero, ...) surfaces here as `Err` —
+        // `execute_models` stops at the first failing model and returns the
+        // error with the model named in the chain. Record it as a first-class
+        // run failure (bump `tables_failed`, push the error) so the JSON
+        // `RunOutput` below still emits with `status` / `errors[]` / any
+        // sibling materializations BEFORE the non-zero exit, mirroring the
+        // compile-error path which records into `output` and returns `Ok`.
+        // Without this the `?` short-circuited before `print_json`, leaving an
+        // orchestrator (Dagster) consuming `--output json` with empty stdout on
+        // a runtime failure. The terminal-status exit contract is honoured by
+        // `run_status_exit_result` below.
+        match exec_result {
+            Ok(()) => {
+                // Per-model `[governance.tags]` apply (scoped to the built
+                // model). The model-only path is one of the entry points the
+                // SDK / Dagster drive; without this its tags were silently
+                // dropped. Best-effort; no-op on DuckDB's Noop adapter.
+                let governance_adapter =
+                    adapter_registry.governance_adapter(&target_adapter_name);
+                apply_model_governance_tags(
+                    mdir,
+                    governance_adapter.as_ref(),
+                    &rocky_cfg,
+                    run_vars,
+                    Some(target_model),
+                )
+                .await;
+            }
+            Err(e) => {
+                output.tables_failed += 1;
+                output.errors.push(crate::output::TableErrorOutput {
+                    asset_key: vec![target_model.to_string()],
+                    error: format!("{e:#}"),
+                    failure_kind: crate::output::FailureKind::Unknown,
+                    cooldown_seconds: None,
+                });
+            }
+        }
 
         output.duration_ms = start.elapsed().as_millis() as u64;
 
@@ -3750,6 +3790,33 @@ pub async fn run(
                                 "apply retention policy failed"
                             );
                         }
+
+                    // --- Per-model governance tags ---
+                    //
+                    // Apply each model's `[governance.tags]` to its target
+                    // securable, reusing the governance compile already in
+                    // scope. The `--all`/`--models` path is one of the entry
+                    // points the SDK / Dagster drive; without this its tags
+                    // were silently dropped (only the full-DAG transformation
+                    // path applied them). Strategy-aware dispatch mirrors
+                    // [`apply_model_governance_tags`]; best-effort — a failure
+                    // warns but never aborts. No-op on DuckDB's Noop adapter.
+                    let tags = &model.config.governance.tags;
+                    if !tags.is_empty() {
+                        let tag_target = governance_tag_target(
+                            &model.config.strategy,
+                            &model.config.target.catalog,
+                            &model.config.target.schema,
+                            &model.config.target.table,
+                        );
+                        if let Err(e) = governance_adapter.set_tags(&tag_target, tags).await {
+                            warn!(
+                                model = %model.config.name,
+                                error = %e,
+                                "apply model governance tags failed"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -5544,6 +5611,81 @@ fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static 
 /// merge, materialized-view, dynamic-table, …) produces a table securable and
 /// maps to [`TagTarget::Table`]. Pure so the dispatch is unit-testable without
 /// a warehouse.
+/// Apply each model's `[governance.tags]` to its target securable after the
+/// models materialize.
+///
+/// Dispatch is strategy-aware via [`governance_tag_target`]: view-format
+/// models (`strategy = "view"`) tag via `ALTER VIEW ... SET TAGS`, everything
+/// else via `ALTER TABLE ... SET TAGS`. Models with no `[governance.tags]`
+/// are skipped — Unity Catalog rejects an empty `SET TAGS ()`. The
+/// `NoopGovernanceAdapter` (DuckDB and other non-governed targets) silently
+/// succeeds, so this is a reachable no-op there.
+///
+/// Best-effort: a tag failure warns but never aborts the run, mirroring the
+/// classification/retention governance posture on the replication path. The
+/// model set is re-compiled here (mirroring the classification/masking
+/// reconcile idiom) rather than threading resolved configs out of
+/// [`execute_models`], keeping that hot path's signature unchanged.
+///
+/// `only_model` scopes application to a single built model: `Some(name)` for
+/// the `rocky run --model <X>` path (which builds only `X`, so tagging
+/// unrelated, unbuilt models would target tables this run never created),
+/// `None` for the full-DAG transformation and replication `--all`/`--models`
+/// paths (which build every model).
+pub(crate) async fn apply_model_governance_tags(
+    models_dir: &Path,
+    governance_adapter: &dyn GovernanceAdapter,
+    rocky_cfg: &rocky_core::config::RockyConfig,
+    run_vars: &rocky_core::run_vars::RunVars,
+    only_model: Option<&str>,
+) {
+    let governance_compile =
+        rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+            models_dir: models_dir.to_path_buf(),
+            contracts_dir: None,
+            source_schemas: std::collections::HashMap::new(),
+            source_column_info: std::collections::HashMap::new(),
+            mask: rocky_cfg.mask.clone(),
+            allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
+            project_freshness_default: rocky_cfg.freshness.has_default(),
+            // Resolve `@var()` on the governance reconcile compile too, so it
+            // doesn't re-read raw markers and spuriously report every variable
+            // as missing.
+            run_vars: run_vars.clone(),
+        });
+    match governance_compile {
+        Ok(gov_compile) => {
+            for model in &gov_compile.project.models {
+                if let Some(name) = only_model
+                    && model.config.name != name
+                {
+                    continue;
+                }
+                let tags = &model.config.governance.tags;
+                if tags.is_empty() {
+                    continue;
+                }
+                let target = governance_tag_target(
+                    &model.config.strategy,
+                    &model.config.target.catalog,
+                    &model.config.target.schema,
+                    &model.config.target.table,
+                );
+                if let Err(e) = governance_adapter.set_tags(&target, tags).await {
+                    warn!(
+                        model = %model.config.name,
+                        error = %e,
+                        "apply model governance tags failed"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "governance compile failed; skipping model tag application");
+        }
+    }
+}
+
 pub(crate) fn governance_tag_target(
     strategy: &rocky_core::models::StrategyConfig,
     catalog: &str,
@@ -9528,6 +9670,137 @@ merge_keys = ["id"]
             output.derive_run_status(),
             rocky_core::state::RunStatus::Failure
         ));
+    }
+
+    /// Write a plain model carrying a `[governance.tags]` block.
+    #[cfg(feature = "duckdb")]
+    fn write_tagged_model(dir: &std::path::Path, name: &str, sql: &str) {
+        std::fs::write(dir.join(format!("{name}.sql")), format!("{sql}\n"))
+            .expect("write model sql");
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n\n[governance.tags]\ndomain = \"finance\"\n",
+        )
+        .expect("write model toml");
+    }
+
+    /// Counting [`GovernanceAdapter`] test double — records the table/view
+    /// name of every `set_tags` call so a test can assert exactly which
+    /// models were tagged. Every other trait method is an inert `Ok`.
+    #[cfg(feature = "duckdb")]
+    #[derive(Default)]
+    struct CountingGovernance {
+        tagged: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl rocky_core::traits::GovernanceAdapter for CountingGovernance {
+        async fn set_tags(
+            &self,
+            target: &TagTarget,
+            _tags: &std::collections::BTreeMap<String, String>,
+        ) -> rocky_core::traits::AdapterResult<()> {
+            let name = match target {
+                TagTarget::Table { table, .. } => table.clone(),
+                TagTarget::View { view, .. } => view.clone(),
+                TagTarget::Catalog(catalog) => catalog.clone(),
+                TagTarget::Schema { schema, .. } => schema.clone(),
+            };
+            self.tagged.lock().unwrap().push(name);
+            Ok(())
+        }
+        async fn get_grants(
+            &self,
+            _target: &rocky_ir::ir::GrantTarget,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ir::Grant>> {
+            Ok(vec![])
+        }
+        async fn apply_grants(
+            &self,
+            _grants: &[rocky_ir::ir::Grant],
+        ) -> rocky_core::traits::AdapterResult<()> {
+            Ok(())
+        }
+        async fn revoke_grants(
+            &self,
+            _grants: &[rocky_ir::ir::Grant],
+        ) -> rocky_core::traits::AdapterResult<()> {
+            Ok(())
+        }
+        async fn bind_workspace(
+            &self,
+            _catalog: &str,
+            _workspace_id: u64,
+            _binding_type: &str,
+        ) -> rocky_core::traits::AdapterResult<()> {
+            Ok(())
+        }
+        async fn set_isolation(
+            &self,
+            _catalog: &str,
+            _enabled: bool,
+        ) -> rocky_core::traits::AdapterResult<()> {
+            Ok(())
+        }
+    }
+
+    /// `apply_model_governance_tags` reaches the apply loop and applies each
+    /// tagged model's `[governance.tags]` — and the `only_model` filter scopes
+    /// application to the single built model, never the whole project. This is
+    /// the regression guard for the `rocky run --model <X>` and replication
+    /// `--all` paths, where per-model tags were previously dropped entirely.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn apply_model_governance_tags_respects_only_model_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        // Two tagged models + one untagged.
+        write_tagged_model(&models, "alpha", "SELECT 1 AS id");
+        write_tagged_model(&models, "beta", "SELECT 2 AS id");
+        write_plain_model(&models, "gamma", "SELECT 3 AS id");
+
+        // Minimal config — the helper only reads `mask`, `classifications`,
+        // and `freshness`, which a bare DuckDB config leaves at defaults.
+        std::fs::write(
+            dir.path().join("rocky.toml"),
+            "[adapter]\ntype = \"duckdb\"\npath = \"t.duckdb\"\n",
+        )
+        .unwrap();
+        let cfg = rocky_core::config::parse_rocky_config(&dir.path().join("rocky.toml"))
+            .expect("parse minimal config");
+        let vars = rocky_core::run_vars::RunVars::new();
+
+        // `None` (full-DAG / replication `--all`): every tagged model is
+        // tagged; the untagged one is skipped.
+        let gov = CountingGovernance::default();
+        super::apply_model_governance_tags(&models, &gov, &cfg, &vars, None).await;
+        let mut tagged = gov.tagged.lock().unwrap().clone();
+        tagged.sort();
+        assert_eq!(
+            tagged,
+            vec!["alpha".to_string(), "beta".to_string()],
+            "None filter tags every model with [governance.tags], skips untagged"
+        );
+
+        // `Some(alpha)`: exactly one `set_tags`, for alpha only — beta must
+        // NOT be tagged even though it carries tags (it isn't built this run).
+        let gov = CountingGovernance::default();
+        super::apply_model_governance_tags(&models, &gov, &cfg, &vars, Some("alpha")).await;
+        assert_eq!(
+            *gov.tagged.lock().unwrap(),
+            vec!["alpha".to_string()],
+            "only_model scopes application to the built model"
+        );
+
+        // `Some(gamma)`: gamma has no tags, so zero `set_tags`.
+        let gov = CountingGovernance::default();
+        super::apply_model_governance_tags(&models, &gov, &cfg, &vars, Some("gamma")).await;
+        assert!(
+            gov.tagged.lock().unwrap().is_empty(),
+            "an untagged target issues no set_tags"
+        );
     }
 
     /// Materialize all models in `models_dir` against a fresh DuckDB file,

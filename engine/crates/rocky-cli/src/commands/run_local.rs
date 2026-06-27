@@ -103,7 +103,7 @@ pub async fn run_transformation(
         let store = StateStore::open(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
-        super::run::execute_models(
+        let exec_result = super::run::execute_models(
             &models_dir,
             warehouse_adapter.as_ref(),
             Some(&store),
@@ -121,64 +121,46 @@ pub async fn run_transformation(
             rocky_cfg.reuse.enabled,
             run_vars,
         )
-        .await?;
+        .await;
 
-        // --- Governance: per-model `[governance.tags]` ---
-        //
-        // After every model materializes, apply each model's
-        // `[governance.tags]` to its target securable through the
-        // `GovernanceAdapter`. Dispatch is strategy-aware: view-format models
-        // (`strategy = "view"`) tag via `ALTER VIEW ... SET TAGS`, everything
-        // else via `ALTER TABLE ... SET TAGS` (see [`super::run::governance_tag_target`]).
-        //
-        // Best-effort: a tag failure warns but never aborts the run, mirroring
-        // the classification/retention governance posture on the replication
-        // path. Models with no `[governance.tags]` are skipped — Unity Catalog
-        // rejects an empty `SET TAGS ()`. NoopGovernanceAdapter (DuckDB and
-        // other non-governed targets) silently succeeds.
-        //
-        // The model set is re-compiled here (mirroring `run.rs`'s governance
-        // reconcile idiom) rather than threading resolved configs out of
-        // `execute_models`, keeping that hot path's signature unchanged.
-        let governance_adapter = adapter_registry.governance_adapter(&pipeline.target.adapter);
-        let governance_compile =
-            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
-                models_dir: models_dir.clone(),
-                contracts_dir: None,
-                source_schemas: std::collections::HashMap::new(),
-                source_column_info: std::collections::HashMap::new(),
-                mask: rocky_cfg.mask.clone(),
-                allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
-                project_freshness_default: rocky_cfg.freshness.has_default(),
-                // Resolve `@var()` on the governance reconcile compile too,
-                // so it doesn't re-read raw markers and spuriously report
-                // every variable as missing.
-                run_vars: run_vars.clone(),
-            });
-        match governance_compile {
-            Ok(gov_compile) => {
-                for model in &gov_compile.project.models {
-                    let tags = &model.config.governance.tags;
-                    if tags.is_empty() {
-                        continue;
-                    }
-                    let target = super::run::governance_tag_target(
-                        &model.config.strategy,
-                        &model.config.target.catalog,
-                        &model.config.target.schema,
-                        &model.config.target.table,
-                    );
-                    if let Err(e) = governance_adapter.set_tags(&target, tags).await {
-                        warn!(
-                            model = %model.config.name,
-                            error = %e,
-                            "apply model governance tags failed"
-                        );
-                    }
-                }
+        match exec_result {
+            Ok(()) => {
+                // --- Governance: per-model `[governance.tags]` ---
+                //
+                // After every model materializes, apply each model's
+                // `[governance.tags]` to its target securable. `None` filter:
+                // the full-DAG path builds every model, so every model is
+                // tagged. Best-effort; no-op on DuckDB's Noop adapter.
+                let governance_adapter =
+                    adapter_registry.governance_adapter(&pipeline.target.adapter);
+                super::run::apply_model_governance_tags(
+                    &models_dir,
+                    governance_adapter.as_ref(),
+                    rocky_cfg,
+                    run_vars,
+                    None,
+                )
+                .await;
             }
             Err(e) => {
-                warn!(error = %e, "governance compile failed; skipping model tag application");
+                // A runtime model failure (warehouse rejected the SQL, an
+                // unresolved upstream, ...) surfaces here as `Err`. Record it
+                // as a first-class run failure so the JSON `RunOutput` below
+                // still emits with `status` / `errors[]` / any sibling
+                // materializations BEFORE the non-zero exit, mirroring the
+                // compile-error path which records into `output` and returns
+                // `Ok`. Without this the `?` short-circuited before the JSON
+                // emit, leaving an orchestrator (Dagster) consuming
+                // `--output json` with empty stdout on a runtime failure. The
+                // terminal-status exit contract is honoured by
+                // `run_status_exit_result` below.
+                output.tables_failed += 1;
+                output.errors.push(crate::output::TableErrorOutput {
+                    asset_key: vec!["<runtime>".to_string()],
+                    error: format!("{e:#}"),
+                    failure_kind: crate::output::FailureKind::Unknown,
+                    cooldown_seconds: None,
+                });
             }
         }
 
@@ -1297,5 +1279,155 @@ auto_create_schemas = true
             .or_else(|| r.rows[0][0].as_str().and_then(|s| s.parse().ok()))
             .unwrap();
         assert_eq!(n, 3, "view over the 3-row source must return 3 rows");
+    }
+
+    /// Reached-ness guard for the `rocky run --model <X>` path's per-model
+    /// `[governance.tags]` application — the call site B4 fixed.
+    ///
+    /// Drives `run()` with `model_name_filter = Some("v_orders")` over a view
+    /// model carrying a `[governance.tags]` block. The model-only path must
+    /// reach the new `apply_model_governance_tags` step (no-op on DuckDB's Noop
+    /// adapter) without aborting, and the model must materialize. Before B4
+    /// this path never called the tag loop at all.
+    #[tokio::test]
+    async fn model_only_governance_tags_run_reaches_apply_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = dir.join("t.duckdb");
+        let state_path = dir.join(".rocky-state.redb");
+
+        seed_src(&db, 3).await;
+        std::fs::write(models_dir.join("v_orders.sql"), "SELECT id FROM main.src\n").unwrap();
+        std::fs::write(
+            models_dir.join("v_orders.toml"),
+            "[strategy]\ntype = \"view\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"v_orders\"\n\n\
+             [governance.tags]\ndomain = \"finance\"\ntier = \"gold\"\n",
+        )
+        .unwrap();
+        write_config(dir, &db, "");
+        let config_path = dir.join("rocky.toml");
+
+        let opts = PartitionRunOptions::default();
+        super::super::run::run(
+            &config_path,
+            None,
+            None,
+            &state_path,
+            None,
+            false,             // output_json
+            Some(&models_dir), // models_dir override — model-only path needs it
+            false,             // run_all
+            None,
+            false,
+            None,
+            &opts,
+            Some("v_orders"), // model_name_filter — the path under test
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .await
+        .expect("model-only run must reach the governance.tags apply path and succeed");
+
+        // The view materialized — proving the model-only path ran end-to-end
+        // through the new apply step.
+        let a = DuckDbWarehouseAdapter::open(&db).expect("open db");
+        let r = a
+            .execute_query("SELECT COUNT(*) FROM main.v_orders")
+            .await
+            .expect("view must be queryable after model-only run");
+        let n = r.rows[0][0]
+            .as_i64()
+            .or_else(|| r.rows[0][0].as_str().and_then(|s| s.parse().ok()))
+            .unwrap();
+        assert_eq!(n, 3, "view over the 3-row source must return 3 rows");
+    }
+
+    /// A transformation model with valid SQL that fails at *execution* (it
+    /// reads a table the warehouse can't resolve) is a first-class run
+    /// failure, not a short-circuit that strands the orchestrator with empty
+    /// stdout.
+    ///
+    /// The run must (a) exit non-zero — `run()` returns `Err` — and (b) reach
+    /// the post-execute path: `persist_run_record` runs *before* the JSON emit
+    /// on the fall-through, so a persisted `RunRecord` with status `Failure`
+    /// proves the JSON `RunOutput` was emitted on the runtime-failure path.
+    /// Before the fix the `?` on `execute_models` short-circuited before both,
+    /// so no record was persisted and nothing was written to stdout.
+    #[tokio::test]
+    async fn runtime_failure_persists_failure_record_and_exits_nonzero() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = dir.join("t.duckdb");
+        let state_path = dir.join(".rocky-state.redb");
+
+        // Valid SQL, but `main.does_not_exist_xyz` is absent — DuckDB rejects
+        // it at execute time, a runtime failure (not a compile error).
+        std::fs::write(
+            models_dir.join("bad.sql"),
+            "SELECT * FROM main.does_not_exist_xyz\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("bad.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"bad\"\n",
+        )
+        .unwrap();
+        write_config(dir, &db, "");
+        let config_path = dir.join("rocky.toml");
+
+        let opts = PartitionRunOptions::default();
+        let result = super::super::run::run(
+            &config_path,
+            None,
+            None,
+            &state_path,
+            None,
+            true, // output_json — the path an orchestrator drives
+            None,
+            false,
+            None,
+            false,
+            None,
+            &opts,
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .await;
+
+        // (a) Non-zero exit: the run surfaces as Err.
+        assert!(
+            result.is_err(),
+            "a runtime model failure must exit non-zero, not report success"
+        );
+
+        // (b) The post-execute path was reached (JSON emit + persist), so a
+        // RunRecord exists and its derived status is Failure.
+        let store = StateStore::open(&state_path).expect("open canonical state");
+        let runs = store.list_runs(10).expect("list runs");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the runtime-failing run must still persist a RunRecord \
+             (proving it reached the post-execute JSON-emit path)"
+        );
+        assert!(
+            matches!(runs[0].status, rocky_core::state::RunStatus::Failure),
+            "the persisted run status must be Failure, got {:?}",
+            runs[0].status
+        );
     }
 }
