@@ -39,7 +39,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use md5::{Digest, Md5};
-use object_store::{ObjectStore, path::Path as ObjectPath};
+use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use tracing::debug;
 use url::Url;
 
@@ -118,9 +118,9 @@ impl ObjectStoreCache {
     fn object_path(&self, key: &str) -> ObjectPath {
         let mut p = self.prefix.clone();
         for segment in key.split('/') {
-            // `Path::child` re-encodes each segment, so we don't have
+            // `Path::join` re-encodes each segment, so we don't have
             // to escape `account_hash/destination_id` ourselves.
-            p = p.child(segment);
+            p = p.join(segment);
         }
         // We can't use `set_extension` on `object_store::Path`. Build a
         // new Path from the stringified form to add `.json`.

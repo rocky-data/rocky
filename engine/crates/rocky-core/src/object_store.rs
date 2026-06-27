@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use object_store::{ClientOptions, ObjectStore, PutMode, PutOptions, path::Path as ObjectPath};
+use object_store::{
+    ClientOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path as ObjectPath,
+};
 use thiserror::Error;
 use tracing::debug;
 
@@ -142,7 +144,15 @@ impl ObjectStoreProvider {
             "s3" | "s3a" => {
                 let builder = object_store::aws::AmazonS3Builder::from_env()
                     .with_bucket_name(&bucket)
-                    .with_client_options(default_client_options());
+                    .with_client_options(default_client_options())
+                    // `put_if_not_exists` uses `PutMode::Create`, which needs S3
+                    // conditional put configured. `ETagMatch` emits `If-None-Match: *`
+                    // on `PutObject` (the create-if-absent primitive). We pin it
+                    // explicitly rather than rely on the `object_store` default —
+                    // that default flipped from `None` (→ `NotImplemented`) to
+                    // `ETagMatch` between 0.11 and 0.14, so an unpinned builder makes
+                    // the concurrent-writer guarantee silently version-dependent.
+                    .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch);
                 Arc::new(builder.build()?)
             }
             "gs" | "gcs" => {

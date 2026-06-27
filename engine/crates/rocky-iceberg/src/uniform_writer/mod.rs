@@ -27,7 +27,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use bytes::Bytes;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
 pub mod commit;
 pub mod discover;

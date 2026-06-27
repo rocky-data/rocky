@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 
-use object_store::ObjectStore;
 use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt};
 use serde::Deserialize;
 
 use super::{Result, UniformTableState, UniformWriter, UniformWriterError};

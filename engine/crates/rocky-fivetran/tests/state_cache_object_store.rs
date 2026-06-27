@@ -82,7 +82,7 @@ async fn object_store_hash_dedupe_via_etag_compare() {
     // those ETags will match the MD5 of an unchanged object, so the
     // dedupe branch in `ObjectStoreCache::write` fires.
     //
-    // NOTE: object_store 0.11's LocalFileSystem ETag derivation isn't
+    // NOTE: object_store's LocalFileSystem ETag derivation isn't
     // a content-hash by default — it incorporates file size + mtime.
     // That means two writes of identical bytes a few milliseconds
     // apart produce DIFFERENT ETags from the LocalFS backend, even
