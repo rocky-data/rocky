@@ -1258,6 +1258,13 @@ enum Command {
         /// Pipeline name (only used with --declarative; required if multiple pipelines defined)
         #[arg(long)]
         pipeline: Option<String>,
+        /// Per-run variable substituted into model SQL (repeatable). Resolves
+        /// `@var(name)` markers to the supplied value so a required-`@var`
+        /// model type-checks under `rocky test`, mirroring `rocky compile
+        /// --var` / `rocky run --var`. A required `@var(name)` with no value
+        /// and no inline default is a compile error.
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        var: Vec<String>,
     },
 
     /// Run CI pipeline: compile + test without warehouse credentials
@@ -1269,6 +1276,13 @@ enum Command {
         /// Contracts directory
         #[arg(long)]
         contracts: Option<PathBuf>,
+        /// Per-run variable substituted into model SQL (repeatable). Resolves
+        /// `@var(name)` markers to the supplied value so a required-`@var`
+        /// model passes the CI gate, mirroring `rocky compile --var` / `rocky
+        /// run --var`. A required `@var(name)` with no value and no inline
+        /// default is a compile error.
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        var: Vec<String>,
     },
 
     /// Detect changed models between git refs and generate a structural diff report
@@ -3008,6 +3022,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             model,
             declarative,
             pipeline,
+            var,
         } => {
             if declarative {
                 rocky_cli::commands::run_declarative_tests(
@@ -3019,12 +3034,26 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 )
                 .await
             } else {
-                rocky_cli::commands::run_test(&models, contracts.as_deref(), model.as_deref(), json)
+                let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                rocky_cli::commands::run_test(
+                    &models,
+                    contracts.as_deref(),
+                    model.as_deref(),
+                    json,
+                    &run_vars,
+                )
             }
         }
         #[cfg(feature = "duckdb")]
-        Command::Ci { models, contracts } => {
-            rocky_cli::commands::run_ci(&models, contracts.as_deref(), json)
+        Command::Ci {
+            models,
+            contracts,
+            var,
+        } => {
+            let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            rocky_cli::commands::run_ci(&models, contracts.as_deref(), json, &run_vars)
         }
         Command::CiDiff {
             base_ref,

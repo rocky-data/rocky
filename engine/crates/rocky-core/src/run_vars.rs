@@ -24,7 +24,9 @@
 //!
 //! A `@var(name)` reference with no supplied value and no inline default is a
 //! **missing** variable: [`substitute_run_vars`] reports its name so the
-//! compiler can raise a clear error naming it.
+//! compiler can raise a clear error naming it. References that appear only
+//! inside a SQL comment (`--` line or `/* … */` block) are ignored — they are
+//! neither substituted nor counted as missing.
 //!
 //! ## Trust boundary
 //!
@@ -185,10 +187,38 @@ pub struct Substitution {
 ///
 /// The replacement is always literal text — a value containing `$` is **not**
 /// interpreted as a regex capture reference.
+///
+/// References that fall inside a SQL comment — a `--` line comment or a
+/// `/* … */` block comment — are **ignored**: left in the text verbatim and
+/// never recorded as missing. Only executable SQL (including string literals,
+/// where the operator owns the quoting) drives substitution. A `@var(name)`
+/// mentioned only in a comment therefore does not turn into a missing-variable
+/// error. Comment detection is string-literal-aware, so a `--` or `/*` inside a
+/// `'…'` / `"…"` literal does **not** start a comment.
 #[must_use]
 pub fn substitute_run_vars(sql: &str, vars: &RunVars) -> Substitution {
+    // Fast path: nothing to do (and no comment scan) when the marker is absent.
+    if !sql.contains("@var(") {
+        return Substitution {
+            sql: sql.to_string(),
+            missing: Vec::new(),
+        };
+    }
+
+    let comments = comment_spans(sql);
+    let in_comment = |pos: usize| {
+        comments
+            .iter()
+            .any(|&(start, end)| pos >= start && pos < end)
+    };
+
     let mut missing: Vec<String> = Vec::new();
     let resolved = VAR_RE.replace_all(sql, |caps: &regex::Captures<'_>| {
+        let whole = caps.get(0).expect("group 0 always present");
+        // A reference inside a comment is left exactly as written.
+        if in_comment(whole.start()) {
+            return whole.as_str().to_string();
+        }
         let name = &caps[1];
         if let Some(value) = vars.get(name) {
             return value.to_string();
@@ -205,6 +235,96 @@ pub fn substitute_run_vars(sql: &str, vars: &RunVars) -> Substitution {
         sql: resolved.into_owned(),
         missing,
     }
+}
+
+/// State of the [`comment_spans`] scanner outside of any comment.
+///
+/// String-literal tracking lets the scanner tell a real comment opener from a
+/// `--` / `/*` that merely sits inside a quoted string.
+enum ScanMode {
+    /// Executable SQL (substitution applies here).
+    Code,
+    /// Inside a single-quoted `'…'` string literal.
+    SingleQuote,
+    /// Inside a double-quoted `"…"` identifier/string.
+    DoubleQuote,
+}
+
+/// Byte ranges (`start..end`, half-open) of every SQL comment in `sql`.
+///
+/// Recognises `--` line comments (up to but excluding the terminating newline)
+/// and `/* … */` block comments (an unterminated block runs to end of input).
+/// Comment openers inside a `'…'` or `"…"` literal are not treated as comments.
+/// Returned ranges are non-overlapping and in ascending order; all boundaries
+/// land on ASCII delimiters, so slicing `sql` at them is always char-safe.
+fn comment_spans(sql: &str) -> Vec<(usize, usize)> {
+    let bytes = sql.as_bytes();
+    let n = bytes.len();
+    let mut spans = Vec::new();
+    let mut mode = ScanMode::Code;
+    let mut i = 0;
+    while i < n {
+        match mode {
+            ScanMode::Code => match bytes[i] {
+                b'\'' => {
+                    mode = ScanMode::SingleQuote;
+                    i += 1;
+                }
+                b'"' => {
+                    mode = ScanMode::DoubleQuote;
+                    i += 1;
+                }
+                b'-' if i + 1 < n && bytes[i + 1] == b'-' => {
+                    let start = i;
+                    i += 2;
+                    while i < n && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    spans.push((start, i));
+                }
+                b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                    let start = i;
+                    i += 2;
+                    while i < n && !(bytes[i] == b'*' && i + 1 < n && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    // Consume the closing `*/` when present; an unterminated
+                    // block comment ends at EOF.
+                    if i < n {
+                        i += 2;
+                    }
+                    spans.push((start, i));
+                }
+                _ => i += 1,
+            },
+            ScanMode::SingleQuote => {
+                if bytes[i] == b'\'' {
+                    // A doubled `''` is an escaped quote — stay in the string.
+                    if i + 1 < n && bytes[i + 1] == b'\'' {
+                        i += 2;
+                    } else {
+                        mode = ScanMode::Code;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            ScanMode::DoubleQuote => {
+                if bytes[i] == b'"' {
+                    if i + 1 < n && bytes[i + 1] == b'"' {
+                        i += 2;
+                    } else {
+                        mode = ScanMode::Code;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    spans
 }
 
 #[cfg(test)]
@@ -331,5 +451,66 @@ mod tests {
         let out = substitute_run_vars(sql, &vars);
         assert_eq!(out.sql, sql);
         assert!(out.missing.is_empty());
+    }
+
+    #[test]
+    fn var_in_line_comment_is_ignored() {
+        // The headline B3 case: a comment mentions @var but the executable
+        // SQL has none, so it must compile clean (no missing, no rewrite).
+        let vars = RunVars::new();
+        let sql = "-- filter by @var(threshold) later\nSELECT region FROM raw__sales.sales";
+        let out = substitute_run_vars(sql, &vars);
+        assert_eq!(out.sql, sql);
+        assert!(out.missing.is_empty());
+    }
+
+    #[test]
+    fn var_in_block_comment_is_ignored() {
+        let vars = RunVars::new();
+        let sql = "SELECT 1 /* todo: @var(threshold) */ FROM t";
+        let out = substitute_run_vars(sql, &vars);
+        assert_eq!(out.sql, sql);
+        assert!(out.missing.is_empty());
+    }
+
+    #[test]
+    fn var_in_trailing_line_comment_not_missing_but_code_var_is() {
+        // The executable @var is substituted/missing as usual; the commented
+        // one is left verbatim and never counted.
+        let vars = RunVars::new();
+        let sql = "SELECT region FROM t WHERE region = '@var(region)' -- TODO @var(other)";
+        let out = substitute_run_vars(sql, &vars);
+        assert_eq!(
+            out.sql,
+            "SELECT region FROM t WHERE region = 'NULL' -- TODO @var(other)"
+        );
+        assert_eq!(out.missing, vec!["region".to_string()]);
+    }
+
+    #[test]
+    fn var_inside_string_literal_still_substitutes_despite_dashes() {
+        // `--` inside a string literal must NOT start a comment, so the later
+        // @var in executable position is still substituted.
+        let vars = RunVars::parse_pairs(["y=Z"]).unwrap();
+        let out = substitute_run_vars("WHERE note = 'a -- b' AND x = @var(y)", &vars);
+        assert_eq!(out.sql, "WHERE note = 'a -- b' AND x = Z");
+        assert!(out.missing.is_empty());
+    }
+
+    #[test]
+    fn var_inside_string_with_block_marker_still_substitutes() {
+        let vars = RunVars::parse_pairs(["y=Z"]).unwrap();
+        let out = substitute_run_vars("WHERE note = 'a /* b' AND x = @var(y)", &vars);
+        assert_eq!(out.sql, "WHERE note = 'a /* b' AND x = Z");
+        assert!(out.missing.is_empty());
+    }
+
+    #[test]
+    fn comment_spans_skips_markers_inside_strings() {
+        // No comment: the `--` and `/*` live inside string literals.
+        assert!(comment_spans("SELECT '-- not a comment', '/* nor this */'").is_empty());
+        // A real line comment after a string is detected.
+        let spans = comment_spans("SELECT 'x' -- c");
+        assert_eq!(spans.len(), 1);
     }
 }

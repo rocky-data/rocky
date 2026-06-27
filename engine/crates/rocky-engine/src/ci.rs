@@ -58,12 +58,20 @@ impl CiResult {
 }
 
 /// Run the full CI pipeline.
-pub fn run_ci(models_dir: &Path, contracts_dir: Option<&Path>) -> anyhow::Result<CiResult> {
+///
+/// `run_vars` supplies per-run `@var(name)` substitutions so a required-var
+/// model passes `rocky ci --var name=value`; pass
+/// [`rocky_core::run_vars::RunVars::new`] when the caller has none.
+pub fn run_ci(
+    models_dir: &Path,
+    contracts_dir: Option<&Path>,
+    run_vars: &rocky_core::run_vars::RunVars,
+) -> anyhow::Result<CiResult> {
     info!("running CI pipeline");
 
     // Step 1: Compile
     info!("step 1: compile");
-    let test_result = crate::test_runner::run_tests(models_dir, contracts_dir, None)?;
+    let test_result = crate::test_runner::run_tests(models_dir, contracts_dir, None, run_vars)?;
 
     let compile_ok = !test_result
         .diagnostics

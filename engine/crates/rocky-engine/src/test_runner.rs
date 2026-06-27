@@ -58,16 +58,22 @@ pub struct TestResult {
 ///    when `model_filter` is set, so the filtered model's SQL can resolve)
 /// 3. Validate output against contracts (if present)
 /// 4. Report results (filtered to `model_filter` when set)
+///
+/// `run_vars` supplies per-run `@var(name)` substitutions so a required-var
+/// model compiles under `rocky test --var name=value`; pass
+/// [`rocky_core::run_vars::RunVars::new`] when the caller has none.
 pub fn run_tests(
     models_dir: &Path,
     contracts_dir: Option<&Path>,
     model_filter: Option<&str>,
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> anyhow::Result<TestResult> {
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: contracts_dir.map(std::path::Path::to_path_buf),
         source_schemas: HashMap::new(),
         source_column_info: HashMap::new(),
+        run_vars: run_vars.clone(),
         ..Default::default()
     };
 
@@ -571,7 +577,7 @@ mod tests {
     #[test]
     fn full_run_itemizes_passes() {
         let (_tmp, models) = scaffold_two_model_project();
-        let result = run_tests(&models, None, None).unwrap();
+        let result = run_tests(&models, None, None, &rocky_core::run_vars::RunVars::new()).unwrap();
         assert_eq!(result.total, 2);
         assert_eq!(result.passed, 2);
         assert!(result.failures.is_empty());
@@ -591,7 +597,13 @@ mod tests {
     #[test]
     fn model_filter_scopes_results_to_one_model() {
         let (_tmp, models) = scaffold_two_model_project();
-        let result = run_tests(&models, None, Some("good_mart")).unwrap();
+        let result = run_tests(
+            &models,
+            None,
+            Some("good_mart"),
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap();
         assert_eq!(result.total, 1);
         assert_eq!(result.passed, 1);
         assert_eq!(result.model_results.len(), 1);
