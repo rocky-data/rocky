@@ -354,6 +354,35 @@ pub fn build_semantic_graph(
                             });
                         }
                     }
+                } else if !table_ref.derived_sources.is_empty() {
+                    // Derived table whose inner projection is itself an
+                    // unresolved `SELECT *` (e.g. the importer's microbatch
+                    // wrapper `SELECT * FROM (SELECT * FROM up) AS x`). The
+                    // inner star can't be enumerated at the SQL layer, but the
+                    // model/source graph here can: resolve each inner source
+                    // transitively so the outer star isn't an empty schema.
+                    // Columns carry no cross-model edge (their types stay
+                    // Unknown), which is enough for presence checks like E020
+                    // without weakening any type-shape diagnostic.
+                    for inner_name in &table_ref.derived_sources {
+                        if let Some(upstream_schema) = models.get(inner_name.as_str()) {
+                            for col in &upstream_schema.columns {
+                                if output_names.insert(col.name.clone()) {
+                                    output_columns.push(ColumnDef {
+                                        name: col.name.clone(),
+                                    });
+                                }
+                            }
+                        } else if let Some(source_cols) = source_schemas.get(inner_name.as_str()) {
+                            for col in source_cols {
+                                if output_names.insert(col.name.clone()) {
+                                    output_columns.push(ColumnDef {
+                                        name: col.name.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 } else if let Some(source_cols) = source_schemas.get(table_name.as_str()) {
                     // External source with known schema
                     for col in source_cols {

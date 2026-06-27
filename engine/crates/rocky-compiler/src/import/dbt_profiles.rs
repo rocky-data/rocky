@@ -104,14 +104,23 @@ pub struct ProfileResolution {
 /// [`ProfileResolution::fallback_reason`] names the problem — so the caller
 /// warns loudly instead of silently defaulting to duckdb.
 ///
+/// `profile_name` is the `profile:` key declared in `dbt_project.yml`. When
+/// present, the matching profile is selected from `profiles.yml` — a named
+/// profile that is absent from `profiles.yml` is a loud fallback, never a
+/// silent alphabetical pick. When `None` (no `profile:` key), the sole/first
+/// profile is used.
+///
 /// We deliberately do **not** read `~/.dbt/profiles.yml` — the importer is
 /// meant to operate on a self-contained project tree.
-pub fn resolve_from_project(dbt_project: &Path) -> Option<ProfileResolution> {
+pub fn resolve_from_project(
+    dbt_project: &Path,
+    profile_name: Option<&str>,
+) -> Option<ProfileResolution> {
     let profiles_path = dbt_project.join("profiles.yml");
     if !profiles_path.exists() {
         return None;
     }
-    match parse_profiles_file(&profiles_path) {
+    match parse_profiles_file(&profiles_path, profile_name) {
         Ok(resolved) => Some(resolved),
         Err(reason) => {
             tracing::warn!(
@@ -197,7 +206,10 @@ struct RawOutput {
     dataset: Option<String>,
 }
 
-fn parse_profiles_file(path: &Path) -> Result<ProfileResolution, String> {
+fn parse_profiles_file(
+    path: &Path,
+    profile_name: Option<&str>,
+) -> Result<ProfileResolution, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
 
@@ -215,19 +227,41 @@ fn parse_profiles_file(path: &Path) -> Result<ProfileResolution, String> {
         )
     })?;
 
-    let parsed: ProfilesFile = serde_yaml::from_value(value).map_err(|e| {
+    let mut parsed: ProfilesFile = serde_yaml::from_value(value).map_err(|e| {
         format!(
             "failed to read {} after merge-key resolution: {e}",
             path.display()
         )
     })?;
 
-    // Pick the first profile (dbt projects typically have exactly one).
-    let (_profile_name, profile) = parsed
-        .profiles
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("{}: no profiles defined", path.display()))?;
+    // Select the profile named by `dbt_project.yml`'s `profile:` key. dbt
+    // routes every model through that one profile, so honoring it is the only
+    // correct pick — selecting the alphabetically-first profile instead emits
+    // the wrong adapter type and catalog/schema. When no name is supplied (no
+    // `profile:` key), fall back to the sole/first profile (the common case of
+    // a one-profile project).
+    let (_profile_name, profile) = match profile_name {
+        Some(name) => {
+            let profile = parsed.profiles.remove(name).ok_or_else(|| {
+                let available: Vec<&str> = parsed
+                    .profiles
+                    .keys()
+                    .map(std::string::String::as_str)
+                    .collect();
+                format!(
+                    "dbt_project.yml names profile '{name}', but {} defines only: [{}]",
+                    path.display(),
+                    available.join(", ")
+                )
+            })?;
+            (name.to_string(), profile)
+        }
+        None => parsed
+            .profiles
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("{}: no profiles defined", path.display()))?,
+    };
 
     let target_name = profile.target.clone().unwrap_or_else(|| "dev".to_string());
 
@@ -443,7 +477,7 @@ mod tests {
             "ecommerce:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n      path: dev.db\n      schema: main\n",
         )
         .unwrap();
-        let resolved = resolve_from_project(dir.path()).unwrap();
+        let resolved = resolve_from_project(dir.path(), None).unwrap();
         assert_eq!(resolved.kind, AdapterKind::DuckDb);
         assert!(resolved.adapter_toml.contains("type = \"duckdb\""));
         assert!(resolved.env_vars.vars.is_empty());
@@ -458,7 +492,7 @@ mod tests {
             "shop:\n  target: prod\n  outputs:\n    prod:\n      type: databricks\n      host: dbc-x.cloud.databricks.com\n      http_path: /sql/1.0/warehouses/abc\n      catalog: analytics\n      schema: marts\n      token: should-not-leak\n",
         )
         .unwrap();
-        let resolved = resolve_from_project(dir.path()).unwrap();
+        let resolved = resolve_from_project(dir.path(), None).unwrap();
         assert_eq!(resolved.kind, AdapterKind::Databricks);
         // No literal secrets propagated.
         assert!(!resolved.adapter_toml.contains("should-not-leak"));
@@ -481,7 +515,7 @@ mod tests {
             "p:\n  target: dev\n  outputs:\n    dev:\n      type: redshift\n      host: x\n",
         )
         .unwrap();
-        let resolved = resolve_from_project(dir.path()).unwrap();
+        let resolved = resolve_from_project(dir.path(), None).unwrap();
         assert!(matches!(
             resolved.kind,
             AdapterKind::Unmapped(ref s) if s == "redshift"
@@ -493,7 +527,7 @@ mod tests {
     #[test]
     fn missing_profiles_file_returns_none() {
         let dir = tempfile::TempDir::new().unwrap();
-        assert!(resolve_from_project(dir.path()).is_none());
+        assert!(resolve_from_project(dir.path(), None).is_none());
     }
 
     #[test]
@@ -507,7 +541,7 @@ mod tests {
             "shop:\n  target: prod\n  outputs:\n    base: &base\n      type: databricks\n      host: dbc-x.cloud.databricks.com\n      http_path: /sql/1.0/warehouses/abc\n    prod:\n      <<: *base\n      catalog: analytics\n      schema: marts\n",
         )
         .unwrap();
-        let resolved = resolve_from_project(dir.path()).unwrap();
+        let resolved = resolve_from_project(dir.path(), None).unwrap();
         assert_eq!(resolved.kind, AdapterKind::Databricks);
         assert!(resolved.fallback_reason.is_none());
         assert_eq!(resolved.database.as_deref(), Some("analytics"));
@@ -525,7 +559,7 @@ mod tests {
             "p:\n  target: dev\n  outputs:\n    dev:\n      type: \"{{ env_var('ROCKY_ADAPTER', 'snowflake') }}\"\n      schema: marts\n",
         )
         .unwrap();
-        let resolved = resolve_from_project(dir.path()).unwrap();
+        let resolved = resolve_from_project(dir.path(), None).unwrap();
         assert_eq!(resolved.kind, AdapterKind::Snowflake);
         assert!(resolved.fallback_reason.is_none());
     }
@@ -540,7 +574,7 @@ mod tests {
             "p:\n  target: dev\n  outputs:\n    dev:\n      type: \"{{ env_var('ROCKY_ADAPTER') }}\"\n      schema: marts\n",
         )
         .unwrap();
-        let resolved = resolve_from_project(dir.path()).unwrap();
+        let resolved = resolve_from_project(dir.path(), None).unwrap();
         assert_eq!(resolved.kind, AdapterKind::DuckDb);
         let reason = resolved
             .fallback_reason
@@ -552,7 +586,7 @@ mod tests {
     fn unparseable_profiles_surfaces_loud_fallback_reason() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("profiles.yml"), "this: : : not yaml\n").unwrap();
-        let resolved = resolve_from_project(dir.path()).unwrap();
+        let resolved = resolve_from_project(dir.path(), None).unwrap();
         assert_eq!(resolved.kind, AdapterKind::DuckDb);
         assert!(
             resolved.fallback_reason.is_some(),
@@ -578,6 +612,59 @@ mod tests {
             resolve_env_var_template("{{ env_var('X') }}"),
             EnvVarType::NoDefault("X".to_string())
         );
+    }
+
+    #[test]
+    fn named_profile_selected_not_alphabetical_first() {
+        // dbt_project.yml names `my_databricks_proj`, but `aardvark_proj` sorts
+        // earlier. The named profile must win — not the alphabetical pick.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("profiles.yml"),
+            "aardvark_proj:\n  target: dev\n  outputs:\n    dev:\n      type: snowflake\n      database: AARDVARK_DB\n      schema: aardvark_schema\n\
+             my_databricks_proj:\n  target: prod\n  outputs:\n    prod:\n      type: databricks\n      host: dbc-x.cloud.databricks.com\n      http_path: /sql/1.0/warehouses/abc\n      catalog: analytics\n      schema: marts\n",
+        )
+        .unwrap();
+        let resolved = resolve_from_project(dir.path(), Some("my_databricks_proj")).unwrap();
+        assert_eq!(resolved.kind, AdapterKind::Databricks);
+        assert_eq!(resolved.database.as_deref(), Some("analytics"));
+        assert_eq!(resolved.schema.as_deref(), Some("marts"));
+        assert!(resolved.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn named_profile_absent_falls_back_loudly() {
+        // A `profile:` key that names a profile absent from profiles.yml must
+        // surface a loud fallback reason — never a silent alphabetical pick.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("profiles.yml"),
+            "aardvark_proj:\n  target: dev\n  outputs:\n    dev:\n      type: snowflake\n      schema: aardvark_schema\n",
+        )
+        .unwrap();
+        let resolved = resolve_from_project(dir.path(), Some("does_not_exist")).unwrap();
+        assert_eq!(resolved.kind, AdapterKind::DuckDb);
+        let reason = resolved
+            .fallback_reason
+            .expect("named-but-absent profile must carry a loud fallback reason");
+        assert!(
+            reason.contains("does_not_exist"),
+            "reason names the missing profile: {reason}"
+        );
+    }
+
+    #[test]
+    fn no_named_profile_uses_sole_profile() {
+        // No `profile:` key (None) keeps the single-profile behavior.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("profiles.yml"),
+            "shop:\n  target: dev\n  outputs:\n    dev:\n      type: snowflake\n      schema: marts\n",
+        )
+        .unwrap();
+        let resolved = resolve_from_project(dir.path(), None).unwrap();
+        assert_eq!(resolved.kind, AdapterKind::Snowflake);
+        assert!(resolved.fallback_reason.is_none());
     }
 
     #[test]

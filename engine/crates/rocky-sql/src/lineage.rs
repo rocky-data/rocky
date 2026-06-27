@@ -71,6 +71,16 @@ pub struct TableReference {
     /// query's projected columns instead of an empty schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived_columns: Option<Vec<String>>,
+    /// Source table names referenced inside a derived table (subquery in the
+    /// `FROM` clause) whose own projection is an unresolved `SELECT *`.
+    ///
+    /// When [`Self::derived_columns`] can't be enumerated because the inner
+    /// query is itself `SELECT * FROM <up>`, this carries `<up>` so a consumer
+    /// that owns the model/source graph (e.g. the semantic-graph builder) can
+    /// resolve the inner star transitively. Empty for plain table references
+    /// and for derived tables that already resolved their columns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_sources: Vec<String>,
 }
 
 /// Extracts the names of tables referenced in FROM/JOIN clauses.
@@ -150,6 +160,7 @@ fn extract_table_factor(factor: &TableFactor, tables: &mut Vec<TableReference>) 
                 name: name.to_string(),
                 alias: alias.as_ref().map(|a| a.name.value.clone()),
                 derived_columns: None,
+                derived_sources: Vec::new(),
             });
         }
         TableFactor::Derived {
@@ -163,17 +174,37 @@ fn extract_table_factor(factor: &TableFactor, tables: &mut Vec<TableReference>) 
             // inner `SELECT *` (or a nested derived table that doesn't expand)
             // leaves `has_star = true` with no individual columns, in which
             // case we fall back to `None`.
-            let derived_columns = extract_query_lineage(subquery).ok().and_then(|inner| {
+            let inner = extract_query_lineage(subquery).ok();
+            let derived_columns = inner.as_ref().and_then(|inner| {
                 if inner.has_star || inner.columns.is_empty() {
                     None
                 } else {
-                    Some(inner.columns.into_iter().map(|c| c.target_column).collect())
+                    Some(
+                        inner
+                            .columns
+                            .iter()
+                            .map(|c| c.target_column.clone())
+                            .collect(),
+                    )
                 }
             });
+            // When the inner query is an unresolved `SELECT *` (so its columns
+            // can't be enumerated here), keep the inner source-table names so a
+            // model/source-graph-aware consumer can resolve the star
+            // transitively. e.g. the importer's microbatch wrapper
+            // `SELECT * FROM (SELECT * FROM up) AS _rocky_microbatch`.
+            let derived_sources = if derived_columns.is_none() {
+                inner
+                    .map(|inner| inner.source_tables.into_iter().map(|t| t.name).collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             tables.push(TableReference {
                 name: "(subquery)".to_string(),
                 alias: Some(a.name.value.clone()),
                 derived_columns,
+                derived_sources,
             });
         }
         _ => {}
@@ -373,6 +404,28 @@ mod tests {
         assert_eq!(
             result.source_tables[0].derived_columns,
             Some(vec!["ts".to_string(), "id".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_derived_table_inner_star_records_sources() {
+        // When the inner query is itself an unresolved `SELECT *`, its columns
+        // can't be enumerated here — but the inner source names are recorded on
+        // `derived_sources` so a model/source-graph-aware consumer can resolve
+        // the star transitively. This is the import-dbt microbatch wrapper over
+        // a `SELECT *` staging body.
+        let result = extract_lineage(
+            "SELECT * FROM (SELECT * FROM up) AS _rocky_microbatch \
+             WHERE ts >= @start_date AND ts < @end_date",
+        )
+        .unwrap();
+        assert!(result.has_star);
+        assert_eq!(result.source_tables.len(), 1);
+        assert_eq!(result.source_tables[0].name, "(subquery)");
+        assert_eq!(result.source_tables[0].derived_columns, None);
+        assert_eq!(
+            result.source_tables[0].derived_sources,
+            vec!["up".to_string()]
         );
     }
 

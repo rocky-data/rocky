@@ -300,6 +300,25 @@ pub struct ImportedModel {
 // Import from manifest (fast path)
 // ---------------------------------------------------------------------------
 
+/// Read the `profile:` key declared in `<dbt_project>/dbt_project.yml`.
+///
+/// Returns `None` when the file is absent, unparseable, or carries no
+/// `profile:` key. Used to select the matching profile from `profiles.yml`
+/// instead of guessing the alphabetically-first one.
+pub fn read_project_profile_name(dbt_project: &Path) -> Option<String> {
+    let yml_path = dbt_project.join("dbt_project.yml");
+    if !yml_path.exists() {
+        return None;
+    }
+    match dbt_project::from_yaml(&yml_path) {
+        Ok(cfg) => cfg.profile,
+        Err(e) => {
+            tracing::warn!("failed to parse dbt_project.yml for profile selection: {e}");
+            None
+        }
+    }
+}
+
 /// Import models from a parsed dbt manifest.
 ///
 /// Uses `compiled_code` (all Jinja resolved) for each model node, falling

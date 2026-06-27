@@ -250,7 +250,11 @@ fn resolve_profile(dbt_project: &Path, target_adapter: Option<&str>) -> ProfileR
         };
     }
 
-    match dbt_profiles::resolve_from_project(dbt_project) {
+    // Honor `dbt_project.yml`'s `profile:` key so the emitted adapter matches
+    // the warehouse dbt actually targets — not the alphabetically-first profile
+    // in profiles.yml.
+    let profile_name = dbt::read_project_profile_name(dbt_project);
+    match dbt_profiles::resolve_from_project(dbt_project, profile_name.as_deref()) {
         Some(resolved) => resolved,
         None => dbt_profiles::stub_resolution(StubReason::ProfilesAbsent),
     }
