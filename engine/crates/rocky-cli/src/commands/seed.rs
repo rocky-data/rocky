@@ -246,9 +246,13 @@ async fn load_single_seed(
 
     let mut total_rows = 0usize;
     for stmt in &insert_stmts {
-        // Count rows by counting value tuples (lines starting with '(').
-        let batch_rows =
-            stmt.matches("\n(").count() + if stmt.contains("VALUES\n(") { 1 } else { 0 };
+        // Count the value tuples in this batch. `generate_insert_sql` joins
+        // one `(..)` tuple per row with `,\n`, so adjacent tuples are
+        // separated by exactly `),\n(`. The row count is (separators + 1) —
+        // every non-empty statement holds at least one tuple. (The previous
+        // heuristic double-counted the first row via a spurious `VALUES\n(`
+        // term, reporting N+1.)
+        let batch_rows = stmt.matches("),\n(").count() + 1;
         adapter
             .execute_statement(stmt)
             .await
@@ -388,6 +392,29 @@ mod tests {
 
         // The DB is the source of truth: all 3 CSV rows landed.
         assert_eq!(row_count(&conn, "seeds.widgets"), 3);
+    }
+
+    /// The reported row count equals the number of CSV *data* rows (header
+    /// excluded), for both a 2-row and a 5-row file. Regression guard for the
+    /// off-by-one heuristic that reported N+1 (B9).
+    #[tokio::test]
+    async fn reported_row_count_matches_data_rows() {
+        for (csv, expected) in [
+            ("id,name\n1,Alice\n2,Bob\n", 2usize),
+            ("id,name\n1,A\n2,B\n3,C\n4,D\n5,E\n", 5usize),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+            let seed = seed_with_hooks(dir.path(), csv, vec![], vec![]);
+            let dialect = adapter.dialect();
+            let (rows, _schema) = load_single_seed(&seed, dialect, &adapter, "", "seeds")
+                .await
+                .expect("seed should load");
+            assert_eq!(rows, expected, "row count mismatch for {expected}-row CSV");
+            // Cross-check against the database itself.
+            let conn = adapter.shared_connector();
+            assert_eq!(row_count(&conn, "seeds.widgets"), expected as i64);
+        }
     }
 
     /// (c) A post_hook runs after a successful load.
