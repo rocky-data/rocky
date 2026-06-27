@@ -59,12 +59,4 @@ Run `rocky validate` to check that at least one authentication method is properl
 
 ## Source Adapter Authentication
 
-Authentication for source adapters is separate from warehouse authentication. Each source adapter is its own `[adapter.NAME]` block. For Fivetran, authentication uses HTTP Basic Auth with `api_key` and `api_secret`. DuckDB and `manual` sources require no authentication.
-
-```toml
-[adapter.fivetran]
-type = "fivetran"
-destination_id = "${FIVETRAN_DESTINATION_ID}"
-api_key = "${FIVETRAN_API_KEY}"
-api_secret = "${FIVETRAN_API_SECRET}"
-```
+Authentication for source adapters is separate from warehouse authentication. Each source adapter is its own `[adapter.NAME]` block. Fivetran uses HTTP Basic Auth with `api_key` and `api_secret` (see [`type = "fivetran"`](/reference/configuration/#type--fivetran) for the full block); DuckDB and `manual` sources require no authentication.

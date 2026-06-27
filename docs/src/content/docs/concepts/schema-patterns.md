@@ -215,7 +215,7 @@ group = "daily_marts"
 region = "emea"   # fills {region} -> schema "mart_emea"
 ```
 
-A group's `schema_template` uses the same `{name}` / `{name:SEP}` placeholder grammar as the target templates on this page, and resolves through the same engine code. The difference is the input: a config group substitutes the explicit single-valued strings a model declares under `[args]`, not components parsed out of a source schema name. Use schema patterns when the routing information is encoded in source schema names; use config groups when a fan-out of models shares one routing and materialization that you set by hand.
+A group's `schema_template` uses the same `{name}` / `{name:SEP}` placeholder grammar as the target templates on this page and resolves through the same engine code. Use schema patterns when the routing information is encoded in source schema names; use config groups when a fan-out of models shares one routing and materialization that you set by hand.
 
 See [Config groups](/reference/model-format/#config-groups) in the model format reference for the full `[args]` rules, precedence, enforced groups, and shared tags.
 

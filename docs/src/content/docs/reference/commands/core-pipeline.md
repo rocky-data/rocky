@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-The core pipeline commands cover the full lifecycle of a Rocky pipeline: project initialization, configuration validation, source discovery, dry-run planning, execution, and state inspection.
+Commands covering the full lifecycle of a Rocky pipeline, from `init` through execution and state inspection.
 
 ## Global Flags
 
@@ -419,7 +419,7 @@ rocky run --filter client=acme --shadow
 rocky compare --filter client=acme
 ```
 
-Or run against a named branch (the persistent, named analogue of `--shadow`):
+Or run against a named branch:
 
 ```bash
 rocky branch create fix-price --description "testing reprice migration"

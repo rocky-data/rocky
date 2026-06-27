@@ -15,7 +15,7 @@ Rocky provides a single binary with subcommands for the full pipeline lifecycle.
 - **Administration**: `history`, `replay`, `trace`, `metrics`, `optimize`, `compact`, `profile-storage`, `archive`, `compliance`, `retention-status`
 - **Diagnostics**: `doctor`, `compare`
 
-This page is the complete reference: every command and flag, with examples and JSON output. The pages under **Reference → Commands** cover the same commands grouped by category.
+The pages under **Reference → Commands** group these same commands by category.
 
 ## Global Flags
 
@@ -647,7 +647,7 @@ rocky docs --models models/ --output site/api.html  # Custom paths
 
 ### `rocky emit-sql`
 
-Render the runnable SQL each transformation model would produce, without a warehouse connection and without running anything. This is the tested exit path: a Rocky project always reduces to plain SQL files you can run directly or hand to a dbt / hand-SQL fallback, so adopting Rocky is never a one-way door. See [No lock-in](/guides/no-lock-in/) for the full workflow.
+Render the runnable SQL each transformation model would produce, without a warehouse connection and without running anything. Rocky always reduces to plain SQL you can run directly. See [No lock-in](/guides/no-lock-in/) for the full workflow.
 
 ```bash
 rocky emit-sql                                   # Print SQL for every model to stdout

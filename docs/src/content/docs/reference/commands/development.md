@@ -5,7 +5,7 @@ sidebar:
   order: 4
 ---
 
-The development commands support local workflows: creating sample projects, importing existing dbt projects, running the semantic graph HTTP server, IDE integration via LSP, and scaffolding new warehouse adapter crates.
+Commands for local development workflows: sample projects, dbt import, the semantic-graph server, LSP, and adapter scaffolding.
 
 ---
 

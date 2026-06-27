@@ -93,7 +93,7 @@ The embedded database (`redb`) where Rocky keeps run records, watermarks, and pl
 
 ### Surrogate key
 
-A computed column whose value is a deterministic MD5 hash over a set of input columns, declared in a `[[surrogate_key]]` sidecar block (`name` plus `columns`). Modeled on dbt-utils' `generate_surrogate_key`: each input is coerced to text and NULL-coalesced to a fixed sentinel before hashing, so on a given warehouse the output matches dbt-utils over the same columns. Rocky injects the hash into the model's SELECT at `rocky run` and on the emit-SQL path, so you don't hand-write it. See [`[[surrogate_key]]`](/reference/model-format/#surrogate_key).
+A computed column whose value is a deterministic MD5 hash over a set of input columns, declared in a `[[surrogate_key]]` sidecar block. Compatible with dbt-utils' `generate_surrogate_key`, and injected into the model's SELECT automatically. See [`[[surrogate_key]]`](/reference/model-format/#surrogate_key).
 
 ### Trust plane
 

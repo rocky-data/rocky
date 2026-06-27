@@ -5,7 +5,7 @@ sidebar:
   order: 6
 ---
 
-Several Rocky commands accept a `--filter` flag to scope execution to a subset of sources. This page is the complete reference for the syntax, the keys you can filter on, and how multi-valued components are matched.
+Several Rocky commands accept a `--filter` flag to scope execution to a subset of sources.
 
 ## Commands that accept `--filter`
 

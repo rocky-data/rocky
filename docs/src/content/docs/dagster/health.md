@@ -85,6 +85,5 @@ location as unhealthy and routes traffic away from it.
 
 `rocky_healthcheck` lives outside `RockyResource` because the resource is a
 frozen Pydantic model; extending it with new methods on every iteration
-churns the resource module. The standalone wrapper pattern keeps health
-probes decoupled from the core resource shape and can be promoted to a
-method later if it stabilizes.
+churns the resource module. It can be promoted to a method later if it
+stabilizes.

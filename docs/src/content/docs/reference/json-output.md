@@ -254,7 +254,7 @@ A transformation model that fails to compile during a run is now a counted failu
 
 #### Cross-checking BigQuery cost against `bq show -j`
 
-`job_ids` lets operators reconcile rocky's reported `bytes_scanned` against the figure BigQuery's own job statistics return, useful for confirming the cost numbers `rocky run` reports match the GCP console before they show up on the bill.
+`job_ids` lets operators reconcile rocky's reported `bytes_scanned` against BigQuery's own job statistics.
 
 ```sh
 # Capture the first job id from a run.
@@ -308,7 +308,7 @@ Additional fields vary by check type:
 
 ## Every other command
 
-`discover` and `run` above are representative. Every other `--output json` command returns the same versioned envelope (a `version` and `command` field plus a typed payload), and is documented in two places:
+Every other `--output json` command returns the same versioned envelope and is documented in two places:
 
 - **Machine-readable schemas:** [`schemas/*.schema.json`](https://github.com/rocky-data/rocky/tree/main/schemas), one per command, exported via `rocky export-schemas`. These generate the Dagster Pydantic models and the VS Code TypeScript types, so they are the contract to validate against.
 - **Per-command examples:** each command's entry in the [CLI Reference](/reference/cli/) and the category pages under [Reference → Commands](/reference/commands/core-pipeline/) shows a worked JSON example.

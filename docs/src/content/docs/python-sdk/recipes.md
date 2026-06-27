@@ -116,6 +116,4 @@ def rocky_pipeline(tenants: list[str]):
 ```
 
 These are illustrative — they need `apache-airflow` / `prefect` installed and the
-`rocky` binary on `PATH`. The pattern holds for any framework: construct a
-`RockyClient`, call the method you need, and branch on the typed result or the
-typed exception.
+`rocky` binary on `PATH`.

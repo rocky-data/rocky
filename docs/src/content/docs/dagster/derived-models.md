@@ -5,14 +5,13 @@ sidebar:
   order: 18
 ---
 
-`dagster-rocky` historically only surfaced source-replication tables
-(one `AssetSpec` per discovered Fivetran/connector table). Derived models
-(the `*.sql` / `*.rocky` files Rocky compiles from your `models/`
-directory) were invisible to the asset graph. The
-**`surface_derived_models`** flag on `RockyComponent` closes that gap:
-every entry in `compile.models_detail` becomes its own Dagster asset,
-grouped by partitioning shape so each multi-asset has a single
-consistent `PartitionsDefinition`.
+`dagster-rocky` historically surfaced only source-replication tables
+(one `AssetSpec` per discovered Fivetran/connector table), leaving derived
+models (the `*.sql` / `*.rocky` files Rocky compiles from your `models/`
+directory) off the asset graph. The **`surface_derived_models`** flag on
+`RockyComponent` makes every entry in `compile.models_detail` its own
+Dagster asset, grouped by partitioning shape so each multi-asset has a
+single consistent `PartitionsDefinition`.
 
 ## Quickstart
 

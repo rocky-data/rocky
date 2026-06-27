@@ -7,7 +7,7 @@ sidebar:
 
 `rocky-sdk` is a typed Python client for the Rocky engine. `RockyClient` wraps the `rocky` binary (subprocess plus `--output json`) behind one method per CLI command, parses the output into Pydantic models, and raises typed errors. It is for human Python callers: notebooks, scripts, and orchestrators other than Dagster.
 
-It is also the foundation the [`dagster-rocky`](/dagster/introduction/) integration is built on: `RockyResource` is a thin Dagster adapter over `RockyClient`. Dagster is the one *turnkey* integration — every other orchestrator (Airflow, Prefect, Flyte, a cron script) integrates with Rocky by wrapping this client in a task. See [Recipes](/python-sdk/recipes/) for streaming, error handling, `rocky serve` mode, and Airflow/Prefect examples. For AI agents, use `rocky mcp`; to call Rocky from another language over HTTP, use `rocky serve`.
+It is also the foundation the [`dagster-rocky`](/dagster/introduction/) integration is built on: `RockyResource` is a thin Dagster adapter over `RockyClient`. Dagster is the one *turnkey* integration — every other orchestrator (Airflow, Prefect, Flyte, a cron script) integrates with Rocky by wrapping this client in a task. See [Recipes](/python-sdk/recipes/) for streaming, error handling, `rocky serve` mode, and Airflow/Prefect examples.
 
 ## Install
 

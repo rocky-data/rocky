@@ -5,7 +5,7 @@ sidebar:
   order: 10
 ---
 
-Rocky supports multiple incremental processing strategies to avoid reprocessing data that has not changed. The simplest is watermark-based append, where only rows newer than a stored timestamp are copied. More advanced strategies include partition-level checksums and column-level change propagation.
+Rocky supports multiple incremental processing strategies to avoid reprocessing data that has not changed.
 
 ## Materialization strategies
 

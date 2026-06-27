@@ -14,9 +14,6 @@ picked up automatically, and backfills walk the range chronologically.
 This is the strategy you reach for when:
 
 - Your model aggregates by date and you need per-day rebuilds
-- Rows can arrive late (e.g., a CDC feed that takes hours to settle)
-- You need to backfill historical periods without `full_refresh`-ing the
-  entire table
 - You want per-partition cost / row-count observability
 
 For pure append-only patterns where rows never arrive late, `incremental`

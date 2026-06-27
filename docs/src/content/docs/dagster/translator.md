@@ -31,7 +31,7 @@ Returns tags to attach to the asset.
 
 The derived-model counterpart to `get_tags`. It takes a `ModelDetail` rather than a source and table, and projects the model's resolved `[tags]` (its own tags merged over any config-group baseline) onto the derived-model `AssetSpec` as first-class Dagster tags, so a governance tag is usable in asset selection (for example `tag:domain=finance`). Both keys and values are sanitized to Dagster's tag charset `[A-Za-z0-9_.-]`: any other character (whitespace, `@`, `:`, `/`, and so on) collapses to `_`, and each is truncated to 63 characters. A key that sanitizes to empty is dropped; an empty value is kept.
 
-Rocky also synthesizes its own metadata tags: `rocky/model_name`, `rocky/target_catalog`, `rocky/target_schema`, plus `rocky/strategy` when the model declares a materialization strategy. The synthesized keys always contain a `/`, and a sanitized governance key never can (its `/` collapses to `_`), so a governance tag can never clobber Rocky's metadata. A governance key written as `rocky/owner` sanitizes to `rocky_owner`, clear of the synthesized `rocky/*` keys.
+Rocky also synthesizes its own metadata tags: `rocky/model_name`, `rocky/target_catalog`, `rocky/target_schema`, plus `rocky/strategy` when the model declares a materialization strategy. The synthesized keys always contain a `/`, and a sanitized governance key never can (its `/` collapses to `_`), so a governance tag can never clobber Rocky's metadata.
 
 **Default:** the model's sanitized `[tags]` plus `rocky/model_name`, `rocky/target_catalog`, `rocky/target_schema`, and (when present) `rocky/strategy`
 

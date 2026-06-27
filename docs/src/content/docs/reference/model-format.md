@@ -135,17 +135,7 @@ deterministic = true    # owner asserts the SQL is pure → re-eligible despite 
 
 ### Environment variables
 
-Sidecar `.toml` files (and `models/_defaults.toml`) go through the same `${VAR}` / `${VAR:-default}` substitution as `rocky.toml`. This lets an orchestrator inject per-model `[target]` values via subprocess env without templating the sidecar:
-
-```toml
-# models/customer_facts.toml
-[target]
-catalog = "${ROCKY_TARGET_CATALOG:-warehouse}"
-schema  = "${ROCKY_TARGET_SCHEMA:-marts}"
-table   = "${ROCKY_TABLE_OVERRIDE:-customer_facts}"
-```
-
-See [Environment Variables](/reference/configuration/#environment-variables) for the canonical syntax reference and [`examples/playground/pocs/00-foundations/07-config-layering/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations/07-config-layering) for a runnable three-layer example.
+Sidecar `.toml` files (and `models/_defaults.toml`) go through the same `${VAR}` / `${VAR:-default}` substitution as `rocky.toml`, so an orchestrator can inject per-model `[target]` values via subprocess env without templating the sidecar. See [Environment Variables](/reference/configuration/#environment-variables) for the syntax and a sidecar example, and [`examples/playground/pocs/00-foundations/07-config-layering/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations/07-config-layering) for a runnable three-layer example.
 
 ### `@var()` run variables
 

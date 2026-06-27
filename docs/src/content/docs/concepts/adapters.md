@@ -143,8 +143,6 @@ Rocky follows the `cargo`-subcommand convention: any executable on your `PATH` n
 {"jsonrpc": "2.0", "id": 1, "result": {"columns": ["1"], "rows": [["1"]]}}
 ```
 
-This enables adapters in Python, Go, Java, or any language that can read/write JSON.
-
 ## Conformance tests
 
 The SDK includes 26 test specifications (19 core + 7 optional):
