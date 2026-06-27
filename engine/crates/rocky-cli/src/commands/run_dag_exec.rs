@@ -30,6 +30,15 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// the unified-DAG path shares the project's canonical state with every other
 /// `rocky run` invocation — it must never invent its own `.rocky_state` file.
 pub async fn run_with_dag(config_path: &Path, state_path: &Path, json: bool) -> Result<()> {
+    // Under `-o json` the orchestrator contract is that stdout is exactly one
+    // JSON document (the `DagRunOutput` below). Sub-runs are dispatched with
+    // `json = false` so they don't each emit their own JSON payload, which
+    // means they take their human-summary branch — route those lines to stderr
+    // so they can't precede the JSON on stdout. See `crate::status_line!`.
+    if json {
+        crate::output::reserve_stdout_for_json();
+    }
+
     let cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
         config_path.display()

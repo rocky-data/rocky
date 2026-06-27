@@ -4697,6 +4697,52 @@ pub fn print_json<T: Serialize>(output: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Process-global flag: when set, stdout is reserved exclusively for the JSON
+/// document, so human-readable progress/summary lines must go to stderr.
+///
+/// The unified-DAG path (`rocky run --dag`, `rocky apply`) drives each node as
+/// a sub-run with `json = false`, so those sub-runs take their human-summary
+/// branch and would otherwise print "transformation pipeline complete: …",
+/// "Copied N tables …", "Seed complete: …" etc. to stdout *before* the outer
+/// `DagRunOutput` JSON payload. With `-o json` the orchestrator contract is
+/// that stdout is exactly one JSON document, so we flip this flag once at the
+/// top of a JSON-mode run and have the summary printers emit to stderr via
+/// [`status_line!`] instead. Human (table) mode never sets it.
+static STDOUT_RESERVED_FOR_JSON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Reserve stdout for the JSON document — see [`STDOUT_RESERVED_FOR_JSON`].
+///
+/// Idempotent and set-only: called once when a run resolves to JSON output.
+pub fn reserve_stdout_for_json() {
+    STDOUT_RESERVED_FOR_JSON.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether human progress/summary lines must be routed to stderr instead of
+/// stdout — see [`STDOUT_RESERVED_FOR_JSON`]. Consulted by [`status_line!`].
+pub fn is_stdout_reserved_for_json() -> bool {
+    STDOUT_RESERVED_FOR_JSON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Print a human-readable progress/summary line, honoring the
+/// stdout-reserved-for-JSON contract.
+///
+/// Identical to `println!` in human/table mode. When stdout is reserved for a
+/// JSON document (see [`reserve_stdout_for_json`]) the line is routed to stderr
+/// so it can't precede or corrupt the JSON payload an orchestrator parses from
+/// stdout. Use this for every run-path summary line that lives in a
+/// non-`output_json` branch.
+#[macro_export]
+macro_rules! status_line {
+    ($($arg:tt)*) => {{
+        if $crate::output::is_stdout_reserved_for_json() {
+            eprintln!($($arg)*);
+        } else {
+            println!($($arg)*);
+        }
+    }};
+}
+
 #[cfg(test)]
 mod cost_finalize_tests {
     use super::*;

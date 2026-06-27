@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rocky run --output json` (including `--dag`) no longer prints a human summary line to stdout before the JSON payload.** Under the unified-DAG path each sub-run (replication load, transformation, seed) printed lines like "Copied N tables …", "transformation pipeline complete …", or "Seed complete …" to stdout ahead of the JSON document, forcing an orchestrator to slice from the first `{`. With `-o json`, stdout is now exactly the JSON document; that progress text goes to stderr. Human/table output is unchanged.
+
 ## [1.55.0] - 2026-06-27
 
 ### Added

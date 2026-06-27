@@ -63,7 +63,7 @@ pub async fn run_seed(
             };
             print_json(&output)?;
         } else {
-            println!("No seed files found in {}", seeds_dir.display());
+            crate::status_line!("No seed files found in {}", seeds_dir.display());
         }
         return Ok(());
     }
@@ -171,18 +171,24 @@ pub async fn run_seed(
         };
         print_json(&output)?;
     } else {
-        println!(
+        crate::status_line!(
             "\nSeed complete: {} loaded, {} failed ({} ms)",
-            tables_loaded, tables_failed, duration_ms
+            tables_loaded,
+            tables_failed,
+            duration_ms
         );
         for t in &table_results {
             let status = if t.error.is_some() { "FAIL" } else { "OK" };
-            println!(
+            crate::status_line!(
                 "  [{status}] {} -> {} ({} rows, {} cols, {} ms)",
-                t.name, t.target, t.rows, t.columns, t.duration_ms
+                t.name,
+                t.target,
+                t.rows,
+                t.columns,
+                t.duration_ms
             );
             if let Some(ref err) = t.error {
-                println!("       {err}");
+                crate::status_line!("       {err}");
             }
         }
     }

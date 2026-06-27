@@ -1049,6 +1049,15 @@ pub async fn run(
     // resolves and behavior is byte-identical.
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
+    // With `-o json` stdout is reserved for the JSON payload — route any
+    // human-readable summary/progress line (e.g. a `depends_on` upstream
+    // pipeline's "Copied …") to stderr so it can't precede the JSON document.
+    // Sub-runs under the unified DAG are invoked with `output_json = false`,
+    // so this is a no-op for them; the outer `run_with_dag` already reserved.
+    if output_json {
+        crate::output::reserve_stdout_for_json();
+    }
+
     let start = Instant::now();
     let started_at = Utc::now();
     // Unified run_id minted up front so the idempotency claim and every
@@ -3991,18 +4000,18 @@ pub async fn run(
         print_json(&output)?;
     } else {
         if let Some(ref resumed_from) = output.resumed_from {
-            println!(
+            crate::status_line!(
                 "Resumed from {resumed_from} (skipped {} tables)",
                 output.tables_skipped
             );
         }
-        println!(
+        crate::status_line!(
             "Copied {} tables in {:.1}s (run_id: {run_id})",
             output.tables_copied,
             output.duration_ms as f64 / 1000.0
         );
         if output.drift.tables_drifted > 0 {
-            println!(
+            crate::status_line!(
                 "Drift: {}/{} tables drifted",
                 output.drift.tables_drifted, output.drift.tables_checked
             );
