@@ -2114,6 +2114,89 @@ mod tests {
     }
 
     #[test]
+    fn test_e020_not_fired_for_select_star_over_derived_select_star() {
+        // The dbt-importer microbatch wrapper shape:
+        // `SELECT * FROM (SELECT * FROM <model>) AS x`. The inner `SELECT *`
+        // can't be enumerated at the SQL layer, but the upstream model's
+        // schema is known here, so the derived star resolves transitively and
+        // E020 must not fire for a time_column the upstream clearly projects.
+        let mut ti = make_time_interval_select_star_model(
+            "ti",
+            "ts",
+            "SELECT * FROM (SELECT * FROM up) AS _rocky_microbatch \
+             WHERE ts >= @start_date AND ts < @end_date",
+        );
+        // The import-dbt path emits the upstream dependency explicitly (the
+        // ref is buried in the derived subquery), which fixes execution order.
+        ti.config.depends_on = vec!["up".to_string()];
+        let models = vec![make_model("up", "SELECT id, ts FROM source.raw.base"), ti];
+        let project = Project::from_models(models).unwrap();
+        let mut external = HashMap::new();
+        external.insert(
+            "source.raw.base".to_string(),
+            vec![
+                rocky_ir::ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "BIGINT".to_string(),
+                    nullable: false,
+                },
+                rocky_ir::ColumnInfo {
+                    name: "ts".to_string(),
+                    data_type: "DATE".to_string(),
+                    nullable: false,
+                },
+            ],
+        );
+        let graph = build_semantic_graph(&project, &external).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        let ti_cols = result.typed_models.get("ti").unwrap();
+        assert!(
+            ti_cols.iter().any(|c| c.name == "ts"),
+            "expected ts in output schema via transitive star, got: {ti_cols:?}"
+        );
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "E020"),
+            "E020 must not fire when the upstream projects ts: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_e020_fires_for_select_star_over_derived_select_star_missing_column() {
+        // The transitive resolution must not weaken E020: when the upstream
+        // genuinely lacks the time_column, it still errors.
+        let mut ti = make_time_interval_select_star_model(
+            "ti",
+            "ts",
+            "SELECT * FROM (SELECT * FROM up) AS _rocky_microbatch \
+             WHERE ts >= @start_date AND ts < @end_date",
+        );
+        ti.config.depends_on = vec!["up".to_string()];
+        let models = vec![make_model("up", "SELECT id FROM source.raw.base"), ti];
+        let project = Project::from_models(models).unwrap();
+        let mut external = HashMap::new();
+        external.insert(
+            "source.raw.base".to_string(),
+            vec![rocky_ir::ColumnInfo {
+                name: "id".to_string(),
+                data_type: "BIGINT".to_string(),
+                nullable: false,
+            }],
+        );
+        let graph = build_semantic_graph(&project, &external).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        assert!(
+            result.diagnostics.iter().any(|d| &*d.code == "E020"),
+            "E020 must still fire when the upstream omits the time_column: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
     fn test_e020_still_fires_when_inner_query_omits_time_column() {
         // The fix must not weaken E020: a genuinely-absent time_column still
         // errors even with a SELECT * over a derived table.

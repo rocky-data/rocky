@@ -36,9 +36,10 @@ fn emit_runnable_repo_from_rich_fixture() {
     let dbt_dir = fixture_root();
     let out_dir = tempfile::TempDir::new().unwrap();
 
-    // Resolve adapter from profiles.yml.
-    let profile =
-        dbt_profiles::resolve_from_project(&dbt_dir).expect("dbt-rich fixture ships profiles.yml");
+    // Resolve adapter from profiles.yml, honoring dbt_project.yml's profile key.
+    let profile_name = dbt::read_project_profile_name(&dbt_dir);
+    let profile = dbt_profiles::resolve_from_project(&dbt_dir, profile_name.as_deref())
+        .expect("dbt-rich fixture ships profiles.yml");
     assert_eq!(profile.kind, dbt_profiles::AdapterKind::DuckDb);
 
     let default_target = TargetConfig {
