@@ -1619,6 +1619,7 @@ mod tests {
     // OWN ledger row (its correct `file_path`/`commit_version`), not whichever
     // row the redb key order happens to surface first.
 
+    use object_store::ObjectStoreExt;
     use object_store::PutPayload;
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjPath;
