@@ -7,8 +7,13 @@ use anyhow::Result;
 use crate::output::{CiOutput, TestFailure, print_json};
 
 /// Execute `rocky ci`.
-pub fn run_ci(models_dir: &Path, contracts_dir: Option<&Path>, output_json: bool) -> Result<()> {
-    let result = rocky_engine::ci::run_ci(models_dir, contracts_dir)?;
+pub fn run_ci(
+    models_dir: &Path,
+    contracts_dir: Option<&Path>,
+    output_json: bool,
+    run_vars: &rocky_core::run_vars::RunVars,
+) -> Result<()> {
+    let result = rocky_engine::ci::run_ci(models_dir, contracts_dir, run_vars)?;
 
     if output_json {
         let failures: Vec<TestFailure> = result

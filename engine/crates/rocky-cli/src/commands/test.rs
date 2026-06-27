@@ -60,7 +60,12 @@ pub fn test_output(
     contracts_dir: Option<&Path>,
     model_filter: Option<&str>,
 ) -> Result<TestOutput> {
-    let result = rocky_engine::test_runner::run_tests(models_dir, contracts_dir, model_filter)?;
+    let result = rocky_engine::test_runner::run_tests(
+        models_dir,
+        contracts_dir,
+        model_filter,
+        &rocky_core::run_vars::RunVars::new(),
+    )?;
     let failures: Vec<TestFailure> = result
         .failures
         .iter()
@@ -85,8 +90,10 @@ pub fn run_test(
     contracts_dir: Option<&Path>,
     model_filter: Option<&str>,
     output_json: bool,
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<()> {
-    let result = rocky_engine::test_runner::run_tests(models_dir, contracts_dir, model_filter)?;
+    let result =
+        rocky_engine::test_runner::run_tests(models_dir, contracts_dir, model_filter, run_vars)?;
     let unit_run = rocky_engine::test_runner::run_unit_tests(models_dir, model_filter)?;
     let unit_failed = unit_run.total() - unit_run.passed();
 
