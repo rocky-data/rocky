@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-06-27
+
+### Changed
+
+- **Regenerated `types_generated/` for engine 1.55.0.** `RunOutput.errors[].failure_kind` gains the `compile-error` variant — `rocky run` now reports a model that fails to compile as a first-class run failure (non-zero exit, `status` `failure`/`partial_failure`), surfacing the diagnostic in `errors[]` so a `RockyClient` consumer can parse and classify it. Additive; older binaries that don't emit it are unaffected. (engine #975)
+
 ## [0.1.5] — 2026-06-23
 
 ### Added
