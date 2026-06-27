@@ -1,0 +1,13 @@
+depends_on = []
+
+[[sources]]
+catalog = ""
+schema = "raw__sales"
+table = "sales"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "poc"
+schema = "main"

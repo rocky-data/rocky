@@ -1,0 +1,19 @@
+depends_on = []
+
+[[sources]]
+catalog = ""
+schema = "raw__sales"
+table = "orders"
+
+[strategy]
+type = "time_interval"
+# Declared partition column. The SELECT in daily_revenue.sql does NOT output
+# this column, which is exactly the mistake Rocky catches as E020.
+time_column = "order_date"
+granularity = "day"
+first_partition = "2026-04-04"
+lookback = 0
+
+[target]
+catalog = "poc"
+schema = "main"
