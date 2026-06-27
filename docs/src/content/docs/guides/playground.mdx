@@ -71,7 +71,7 @@ auto_create_schemas = true
 concurrency = 4
 ```
 
-This is a `transformation` pipeline: the unnamed `[adapter]` block auto-wraps as the default adapter, and `models = "models/**"` builds the model DAG from the `models/` directory. Because every model lands in the database's default schema, an upstream can be referenced by bare name (`from raw_orders`).
+This is a `transformation` pipeline: the unnamed `[adapter]` block auto-wraps as the default adapter, and `models = "models/**"` builds the model DAG from the `models/` directory.
 
 The same `playground.duckdb` file backs the whole run. `rocky test` ignores `path` and runs models against an in-memory database; `rocky run` materializes them into the file. Both auto-load `data/seed.sql`, so the playground works end-to-end with no manual seeding step.
 
@@ -92,7 +92,7 @@ SELECT
 FROM raw__orders.orders
 ```
 
-The `data/seed.sql` file creates the `raw__orders.orders` table; `rocky test` and `rocky run` both load it automatically, so this model has data to read from the first run.
+The `data/seed.sql` file creates the `raw__orders.orders` table this model reads from.
 
 **raw_orders.toml:**
 
@@ -172,7 +172,7 @@ The contract declares two rules:
 - **required**: These columns must exist with the specified types. The compiler fails if they are missing or have the wrong type.
 - **protected**: These columns cannot be removed in future changes. The compiler warns if a protected column disappears from the model's output.
 
-The columns are marked `nullable = true` because the upstream `raw__orders` model selects from a schema the compiler cannot introspect, so it cannot prove non-nullability. A strict-contract walkthrough that pins types and nullability lives in the dedicated POCs.
+The columns are marked `nullable = true` (the TOML comment above explains why). A strict-contract walkthrough that pins types and nullability lives in the dedicated POCs.
 
 ## 3. Compile the Models
 

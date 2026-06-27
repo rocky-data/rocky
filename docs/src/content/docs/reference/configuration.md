@@ -106,8 +106,6 @@ backend = "${ROCKY_STATE_BACKEND:-local}"
 s3_bucket = "${ROCKY_STATE_BUCKET:-}"
 ```
 
-If `ROCKY_STATE_BACKEND` is not set, it defaults to `"local"`. If `ROCKY_STATE_BUCKET` is not set, it defaults to an empty string.
-
 ---
 
 ## `[adapter.NAME]`
@@ -794,7 +792,7 @@ resource "google_storage_bucket" "rocky_state" {
 
 redb permits **one writer per state file**. Fanning out one `rocky run` process per pipeline or client against the single global state file (`<models>/.rocky-state.redb`) forces those independent runs to serialize on one advisory lock. Namespacing gives each pipeline (or each client/tenant) its own state file, with its own lock, its own redb handle, and its own remote object key, so runs on distinct namespaces proceed concurrently with zero shared corruption surface.
 
-Namespacing is **opt-in and default-off**. With `namespacing = "none"` (or the key omitted), behavior is **byte-identical** to a project that never set it.
+Namespacing is **opt-in and default-off**.
 
 | Mode | Behavior |
 |---|---|
@@ -889,7 +887,7 @@ It does **not** attest that a fresh re-run would reproduce those bytes. Even whe
 enabled = false   # default; preview-only, not live-verified — leave off in production
 ```
 
-The per-invocation `--no-reuse` flag forces every model to build (the escape hatch parallel to `--force-rebuild` for `--skip-unchanged`); the decision path it guards is not yet live, per the caveat above, so today it changes nothing. The provenance side this records is what an auditor reads in [Verify a run](/guides/verify-a-run/).
+The per-invocation `--no-reuse` flag forces every model to build (the escape hatch parallel to `--force-rebuild` for `--skip-unchanged`). The provenance side this records is what an auditor reads in [Verify a run](/guides/verify-a-run/).
 
 ---
 
@@ -933,10 +931,7 @@ ttl_seconds = 3600   # 1h TTL for teams with high-DDL churn
 replicate = true     # opt in to share cache via the remote state backend
 ```
 
-Note: a separate Valkey-backed runtime cache (`ValkeyCacheConfig`) exists in
-the codebase for future three-tier caching of API responses but is not
-wired into `rocky.toml` today. When that surface lands it'll live under a
-sibling key (e.g. `[cache.valkey]`).
+Note: a Valkey-backed runtime cache exists in the codebase but is not yet wired into `rocky.toml`; it is reserved for a future `[cache.valkey]` key.
 
 ---
 
@@ -1087,11 +1082,7 @@ Advisory settings for the column-classification feature. Distinct from the per-m
 allow_unmasked = ["internal", "lineage_only"]
 ```
 
-Use this escape hatch for tags that exist only for discovery or lineage tracking; Rocky still surfaces them on `rocky compliance` reports, just without enforcing a masking strategy.
-
-### `[classifications.allow_unmasked]` on the compliance resolver
-
-`rocky compliance` suppresses exceptions for every tag in `allow_unmasked`. The flag is advisory; it doesn't pretend those columns are enforced, it just keeps them off the exception list. See [`rocky compliance`](/reference/cli/#rocky-compliance).
+Use this escape hatch for tags that exist only for discovery or lineage tracking. Rocky still surfaces them on [`rocky compliance`](/reference/cli/#rocky-compliance) reports but suppresses their exceptions, without pretending the columns are enforced.
 
 ---
 

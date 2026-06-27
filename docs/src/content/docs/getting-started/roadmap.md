@@ -5,7 +5,7 @@ sidebar:
   order: 4
 ---
 
-We are explicit about the line between what Rocky ships and what's still coming. The trust primitives (compiler, branches, run records, lineage, contracts, cost attribution) are production-grade on Databricks. Here is the honest state of everything else.
+The trust primitives (compiler, branches, run records, lineage, contracts, cost attribution) are production-grade on Databricks. Here is the state of everything else.
 
 ## Shipped and production-grade
 
@@ -39,4 +39,4 @@ We are explicit about the line between what Rocky ships and what's still coming.
 
 ## Tell us where it hurts
 
-The roadmap is shaped by where production pipelines are actually getting hurt. If one of these gaps blocks your team, [open a discussion](https://github.com/rocky-data/rocky/discussions) and tell us where.
+The roadmap is shaped by where production pipelines are getting hurt. If one of these gaps blocks your team, [open a discussion](https://github.com/rocky-data/rocky/discussions).

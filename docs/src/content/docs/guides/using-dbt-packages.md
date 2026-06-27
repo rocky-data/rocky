@@ -20,8 +20,6 @@ Rocky's SQL resolver classifies table references by how they are qualified:
 
 Two-part and three-part table references are always treated as external. Rocky reads from them but does not attempt to build, refresh, or manage them. Only bare names that match another Rocky model in the project become DAG edges.
 
-This means your Rocky models can reference any table in the warehouse -- regardless of what tool created it.
-
 ## Example: Rocky on top of Fivetran dbt packages
 
 ### The setup
@@ -140,7 +138,7 @@ dbt_stripe.stg_stripe__charges   --(external)---> stripe_revenue_daily
                                                 combined_marketing_revenue
 ```
 
-External sources appear in lineage but not in the execution DAG. Rocky only schedules and executes models it owns.
+External sources appear in lineage but not in the execution DAG.
 
 ## Pipeline configuration
 
@@ -184,8 +182,6 @@ steps:
       rocky apply "$plan_id"
 ```
 
-Each tool manages its own models independently. dbt owns the package-generated staging layer; Rocky owns the analytics layer on top.
-
 ## Lineage across the boundary
 
 Rocky traces column-level lineage through external sources when schema information is available. Run:
@@ -221,8 +217,6 @@ For full type checking of columns from external sources, Rocky can introspect th
 | Simple `ref()`-based models with no Jinja | Good candidates for conversion via `rocky import-dbt` |
 | Models using `{{ var() }}`, `{% for %}`, or custom macros | Keep in dbt or use the [manifest fast path](/guides/migrate-from-dbt/#manifest-fast-path) |
 | New analytics models built on existing tables | Write directly in Rocky |
-
-The pragmatic path: let dbt packages handle what they're good at (vendor-maintained staging models), and use Rocky for the transformation layer you own and maintain.
 
 ## Try it locally
 

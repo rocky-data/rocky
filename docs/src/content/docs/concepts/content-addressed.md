@@ -7,7 +7,7 @@ sidebar:
 
 `materialization = "content_addressed"` is a write strategy that lands the model's SELECT result as **content-addressed Parquet files plus a Delta log commit** under an object-store prefix you control. Cross-engine readers (DuckDB `iceberg_scan`, Trino, Spark, anything that reads Iceberg or Delta) read the same files directly without going through Rocky.
 
-Shipped end-to-end in engine v1.30.0 across Phases 1–5 of the `rocky-iceberg` writer: scaffold, bootstrap-commit discovery, `write_batch()`, `sync_iceberg_metadata()`, partitioned tables, rowTracking, and post-ALTER schema evolution.
+Shipped end-to-end in engine v1.30.0, including partitioned tables, rowTracking, and post-ALTER schema evolution.
 
 ## When to use it
 
@@ -29,7 +29,7 @@ On each run, the runtime:
 4. Emits a Delta log commit referencing the new files. Existing Delta protocol features (partitioning, rowTracking) are honored when the underlying table declares them.
 5. Calls `sync_iceberg_metadata()` so Iceberg-compatible readers see the new snapshot.
 
-The writer's `discover()` step reads the bootstrap Delta commit to pick up the table's schema, partition spec, and rowTracking configuration. Subsequent writes adapt to schema changes (added columns, type widening) applied to the underlying Delta table between runs. That's Phase 5 schema evolution.
+The writer's `discover()` step reads the bootstrap Delta commit to pick up the table's schema, partition spec, and rowTracking configuration. Subsequent writes adapt to schema changes (added columns, type widening) applied to the underlying Delta table between runs.
 
 ## Configuration
 

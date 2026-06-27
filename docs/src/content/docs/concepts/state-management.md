@@ -82,29 +82,17 @@ Value: [
 
 ## Watermark lifecycle
 
-### 1. Read watermark
-
 At the start of each table's replication, Rocky reads the watermark from the state store.
 
-### 2. No watermark (first run)
+1. **No watermark (first run).** Rocky performs a full refresh, copying all rows from the source.
+2. **Watermark exists (incremental run).** Rocky generates an incremental query that copies only rows newer than the stored watermark:
 
-If no watermark exists for a table, Rocky performs a full refresh: it copies all rows from the source.
-
-### 3. Watermark exists (incremental run)
-
-If a watermark exists, Rocky generates an incremental query:
-
-```sql
-SELECT *, CAST(NULL AS STRING) AS _loaded_by
-FROM fivetran_catalog.src__acme__us_west__shopify.orders
-WHERE _fivetran_synced > TIMESTAMP '2025-03-15T14:30:00Z'
-```
-
-Only rows with a timestamp newer than the stored watermark are copied.
-
-### 4. Update watermark
-
-After a successful copy, Rocky updates the watermark to the current timestamp. The next run will pick up from this point.
+   ```sql
+   SELECT *, CAST(NULL AS STRING) AS _loaded_by
+   FROM fivetran_catalog.src__acme__us_west__shopify.orders
+   WHERE _fivetran_synced > TIMESTAMP '2025-03-15T14:30:00Z'
+   ```
+3. **Update.** After a successful copy, Rocky advances the watermark to the current timestamp, and the next run picks up from there.
 
 ## Inspecting state
 
@@ -182,10 +170,8 @@ s3_bucket = "${ROCKY_STATE_BUCKET}"
 
 The `tiered` backend combines Valkey (fast) with S3 (durable):
 
-- **Download**: Try Valkey first. If miss or error, fall back to S3.
-- **Upload**: Write to both Valkey (best-effort) and S3 (required).
-
-This gives you sub-millisecond reads from Valkey in the common case, with S3 as a reliable fallback if Valkey is unavailable.
+- **Download**: try Valkey first (sub-millisecond reads); on miss or error, fall back to S3.
+- **Upload**: write to both Valkey (best-effort) and S3 (required).
 
 ### Sync Lifecycle
 
@@ -237,10 +223,7 @@ Run `rocky doctor --check state_rw` at cold start to catch IAM / reachability pr
 
 ## State Per Environment
 
-Each environment (dev, staging, prod) maintains its own state. There is no shared state across environments.
-
-This means:
+Each environment (dev, staging, prod) maintains its own state, with no coordination between them:
 - A fresh deployment starts with no watermarks (full refresh on first run)
 - Dev environments can be reset independently by deleting the state file
 - Remote backends allow state to survive pod restarts in ephemeral environments
-- No coordination required between environments

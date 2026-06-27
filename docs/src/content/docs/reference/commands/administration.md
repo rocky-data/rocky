@@ -941,7 +941,7 @@ When `--state-path` is omitted, Rocky resolves the state file via `rocky_core::s
 Explicit `--state-path <PATH>` always wins; no resolver logic is applied.
 
 :::note[Upgrading to v1.16.0 state paths]
-Fresh projects land on `<models>/.rocky-state.redb`. Existing users with a CWD `.rocky-state.redb` will see a one-time deprecation warning on stderr and can either move the file into `models/` to silence the warning, or keep using the CWD location (it continues to work). If both files exist, CWD wins on collision; delete one to silence the louder reconcile warning. Passing `--state-path` explicitly bypasses the resolver.
+If you have an existing CWD `.rocky-state.redb`, move it into `models/` to silence the one-time deprecation warning, or keep it where it is (it still works).
 :::
 
 ### Related Commands

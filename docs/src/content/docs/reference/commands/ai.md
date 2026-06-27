@@ -371,9 +371,9 @@ The server is **stateless**: every tool call resolves the project from the confi
 `rocky mcp` runs entirely **locally against your own infrastructure**. There is no Rocky-hosted service:
 
 - Warehouse-touching tools hit **your own warehouse** with the credentials in your `rocky.toml`.
-- The draft generators call the Anthropic API using **your own `ANTHROPIC_API_KEY`** from the server environment. There is no Rocky vendor in the loop. Without the key set, those tools return a null/empty draft and a `message` explaining why.
+- The draft generators call the Anthropic API using **your own `ANTHROPIC_API_KEY`** from the server environment. Without the key set, those tools return a null/empty draft and a `message` explaining why.
 
-What leaves your machine is bounded: warehouse queries go to your warehouse; the generators send your model's SQL and schema (and, for `draft_contract`, aggregate column counts: row / null / distinct) to **your own** Anthropic key. **No generator sends raw cell values**; `draft_contract` profiles columns to counts only.
+What leaves your machine is bounded: warehouse queries go to your warehouse; the generators send your model's SQL and schema to **your own** Anthropic key, and for `draft_contract` only aggregate column counts (row / null / distinct), **never raw cell values**.
 
 ### Safety model: read-only and propose-only
 

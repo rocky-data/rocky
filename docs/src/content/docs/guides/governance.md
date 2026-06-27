@@ -15,8 +15,6 @@ The five governance pillars live on the pipeline target and across project-level
 4. **Role-graph reconciliation** -- hierarchical `[role.<name>]` declarations flattened and reconciled.
 5. **Data retention** -- model-sidecar `retention = "<N>[dy]"` applied as adapter-native TBLPROPERTIES.
 
-This guide walks through each governance feature with configuration examples.
-
 ## 1. Schema Patterns
 
 Schema patterns control how source schemas map to target catalogs and schemas. They are the foundation of Rocky's multi-tenant routing.
@@ -361,7 +359,7 @@ EXCEPTIONS:
 
 `MaskStrategy::None` (explicit identity) counts as **masked** for compliance purposes. The rationale: choosing "do not mask" is a deliberate policy decision, not a gap. A tag with no mapping in `[mask]` at all is the gap that produces an exception.
 
-The `[classifications] allow_unmasked = [...]` list suppresses exceptions for specific tags without pretending the columns are enforced. Use it for tags you've deliberately excluded from the mask policy (e.g., `"internal"` data that is explicitly open within the workspace).
+The `[classifications] allow_unmasked = [...]` list suppresses exceptions for tags you've deliberately excluded from the mask policy, without pretending the columns are enforced.
 
 ### JSON output
 
@@ -412,22 +410,12 @@ Cycles and unknown parents are caught at config-load time, regardless of whether
 
 ### Databricks v1: log-only
 
-The Databricks implementation of `GovernanceAdapter::reconcile_role_graph` validates each flattened role's `rocky_role_<name>` principal syntax and emits `debug!` log entries with the resolved permission set. It does not yet:
+The Databricks `reconcile_role_graph` validates each flattened role's `rocky_role_<name>` principal syntax and logs the resolved permission set. It does not yet:
 
 - Create SCIM groups for each role
 - Emit per-catalog / per-schema `GRANT` statements from the flattened role graph
 
-SCIM group creation and GRANT emission are a follow-up. If you need grants applied today, use the `[pipeline.*.target.governance.grants]` blocks from Pillar 1.
-
-Other adapters default to no-op.
-
-### Why ship the resolver first
-
-Landing the resolver ahead of the warehouse-side apply means teams can:
-
-- Design role hierarchies in `rocky.toml` now with confidence that cycles and typos are rejected early.
-- Inspect `rocky.toml` with `rocky list pipelines` / `rocky validate` and know the graph compiles.
-- Migrate to the full Databricks apply when the follow-up lands without rewriting their config.
+If you need grants applied today, use the `[pipeline.*.target.governance.grants]` blocks from Pillar 1. When the follow-up lands, the same config migrates to the full apply without a rewrite. Other adapters default to no-op.
 
 ## 7. Data Retention (Pillar 5 of 5)
 
@@ -489,9 +477,7 @@ Flags:
 
 ### `--drift` is a v2 feature
 
-The v2 plan for `--drift` is a warehouse probe that reads the currently-applied TBLPROPERTIES / session parameter and fills `warehouse_days` in the report, so teams can detect drift between `rocky.toml` and the live table.
-
-Today the flag is plumbed through with a stable schema (`warehouse_days: Option<u32>` on the report), but the probe itself is deferred. Wire your CI around the configured-days column for now; the warehouse-drift check will slot in without a schema change when the probe lands.
+The v2 plan for `--drift` is a warehouse probe that reads the currently-applied TBLPROPERTIES / session parameter and fills `warehouse_days` in the report, so teams can detect drift between `rocky.toml` and the live table. The report schema (`warehouse_days: Option<u32>`) is already stable, so the probe will slot in without a schema change. Wire your CI around the configured-days column for now.
 
 ## 8. Workspace Isolation
 
@@ -615,7 +601,7 @@ It applies to every model in the group regardless of whether the model is writte
 
 ## 11. Model Tags
 
-Model tags are free-form governance attributes that describe a model as a whole (`domain`, `tier`, `owner`, anything your governance model needs). They are distinct from the [tagging strategy](#9-tagging-strategy) in the previous section: those tags live under `[pipeline.*.target.governance.tags]` and land on Unity Catalog catalogs, schemas, and tables via `ALTER ... SET TAGS`, used for catalog discovery. Model tags live in the model sidecar (or its config group) and flow into Rocky's model graph, the orchestrator's asset tags, and the `rocky compile` JSON. They use a different config location and a different mechanism, and reach a different consumer.
+Model tags are free-form governance attributes that describe a model as a whole (`domain`, `tier`, `owner`, anything your governance model needs). They are distinct from the [tagging strategy](#9-tagging-strategy) in the previous section: those tags live under `[pipeline.*.target.governance.tags]` and land on Unity Catalog catalogs, schemas, and tables via `ALTER ... SET TAGS`, used for catalog discovery. Model tags live in the model sidecar (or its config group) and flow into Rocky's model graph, the orchestrator's asset tags, and the `rocky compile` JSON.
 
 ### Sidecar `[tags]`
 
@@ -1027,15 +1013,7 @@ phone = "pii"
 ssn = "confidential"
 ```
 
-This configuration ensures:
-- Catalogs and schemas are created automatically with appropriate tags
-- Access is controlled via declarative grants with automatic reconciliation
-- Catalogs are isolated to specific workspaces
-- Classified columns are tagged and masked per environment
-- Role hierarchies are validated at config load (cycles + unknown parents rejected)
-- Retention is applied to every model that declares it
-- Data quality is validated after every replication
-- History and metrics provide a complete audit trail, including 8 governance fields per run
+This single configuration exercises every governance feature in this guide: schema routing, declarative grants with reconciliation, workspace isolation, classification and masking per environment, role-graph validation at config load, retention, inline quality checks, and a full audit trail.
 
 ## 15. CI Gate Example
 
@@ -1072,7 +1050,7 @@ The gate exits `0` when every classified column has a resolved strategy (or is l
 rocky compliance --env prod --exceptions-only
 ```
 
-When everything is compliant, this prints the summary counters and an empty exceptions list. When exceptions exist, the `per_column` table is filtered to just the rows that produced them, so you see what needs attention without scrolling through the full classified-column inventory.
+When everything is compliant this prints just the summary counters; when exceptions exist, the `per_column` table is filtered to the offending rows.
 
 ### Machine-readable gate
 

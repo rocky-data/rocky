@@ -61,16 +61,10 @@ spec = dg.AssetSpec(
 
 ## Why dedicated helpers?
 
-The helpers are intentionally tiny; they exist to:
-
-1. **Document the canonical mapping** in one place, so users don't need to
-   know which Dagster condition variant is canonical for Rocky-managed assets.
-2. **Avoid the deprecated API** entirely. Dagster's `AutoMaterializePolicy`
-   was deprecated in 1.8 in favor of `AutomationCondition`; both still exist
-   but the new shape is the path forward.
-3. **Stable Rocky-side names** that callers can import without coupling to
-   the underlying Dagster condition shape, in case the canonical mapping
-   evolves between Rocky releases.
+The helpers are tiny on purpose: they document the canonical
+`AutomationCondition` mapping in one place, keep callers off the
+deprecated `AutoMaterializePolicy` (deprecated in Dagster 1.8), and give
+a stable Rocky-side import that won't shift if the mapping evolves.
 
 ## Sensor + Schedule + AutomationCondition: which to use?
 

@@ -23,20 +23,11 @@ rocky ai "Calculate monthly revenue per customer from orders, joined with custom
 
 The LLM receives context about available models, source tables, and the target format. It produces source code that Rocky immediately attempts to compile. If compilation fails, the diagnostics are fed back to the LLM for correction, up to a configurable number of attempts (default: 3).
 
-This compile-verify loop is the key safety mechanism. The LLM might generate syntactically valid but semantically wrong SQL. The compiler catches type mismatches, missing columns, and contract violations before the code is ever shown to the user as a success.
+This compile-verify loop is the key safety mechanism: the LLM might generate semantically wrong SQL, and the compiler catches it before the code is shown as a success.
 
 ### Level 2: Compile-verify loop
 
-The compile-verify loop is not just for generation. It runs whenever AI produces or modifies code:
-
-1. LLM generates or modifies source code
-2. Rocky compiles the result
-3. If compilation succeeds, the output is accepted
-4. If compilation fails, diagnostics (with codes, messages, and suggestions) are sent back to the LLM
-5. The LLM adjusts its output based on the diagnostics
-6. Repeat until success or max attempts exhausted
-
-This means the compiler acts as a type-safe guardrail. The LLM operates freely within the bounds the compiler enforces.
+The loop isn't just for generation; it runs whenever AI produces or modifies code. Rocky compiles each result and feeds any diagnostics back to the LLM until it passes or hits the attempt limit, so the compiler acts as a type-safe guardrail the LLM operates freely within. See [The compile-verify safety net](#the-compile-verify-safety-net) below for the full flow.
 
 ### Level 3: Intent as metadata
 
@@ -155,7 +146,7 @@ The compiler catches:
 - **Contract violations** -- the generated model is missing a required column or has the wrong type
 - **Broken lineage** -- the generated model references a model that does not exist in the project
 
-Because diagnostics include machine-readable codes and human-readable suggestions, the LLM can often self-correct on the second attempt. The compile-verify loop typically converges within 1-2 iterations.
+Because diagnostics include machine-readable codes and human-readable suggestions, the LLM typically self-corrects within 1-2 attempts.
 
 ## Configuration
 

@@ -15,8 +15,6 @@ The wedge in five steps:
 4. **Adopt `rocky lineage-diff` in PR review.** Per-changed-column downstream blast radius. Drops into a PR comment. This is the moment your team stops reviewing changes blind.
 5. **Turn on `rocky preview cost`.** Per-PR cost projection: catch expensive plans before they ship instead of explaining them after.
 
-Everything below is the mechanics. The point holds throughout: you don't rewrite, you import and adopt.
-
 ## Prerequisites
 
 Before starting, make sure you have:
@@ -29,7 +27,7 @@ Rocky does not require dbt to be installed. The importer reads `.sql` files dire
 
 ## Walkthrough: end-to-end against a tiny dbt project
 
-Before working through the per-step guide below, here is the full path against a real, runnable example. This mirrors the POC at [`examples/playground/pocs/06-developer-experience/03-import-dbt-validate/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/03-import-dbt-validate). Every command and snippet here was captured from that POC running against the current `rocky` build.
+This walks the full path against a real, runnable example, mirroring the POC at [`examples/playground/pocs/06-developer-experience/03-import-dbt-validate/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/03-import-dbt-validate). Every command and snippet here was captured from that POC running against the current `rocky` build.
 
 ### Setup: the input dbt project
 
@@ -281,8 +279,6 @@ By design, the importer does not translate the following. Rocky has no Jinja run
 The importer prefers `manifest.json` (Jinja already resolved). A manifest that was only *parsed*, not *compiled*, carries no compiled SQL — every model then falls back to the lower-fidelity regex render, which can mis-render Jinja. The importer now warns loudly when it detects a manifest with no compiled SQL, but regenerate it with `dbt compile` (including any required `--vars`) before importing.
 :::
 
-The remainder of this guide walks each phase in detail (mapping `profiles.yml` to `rocky.toml`, handling unsupported Jinja, converting tests to contracts, cutover strategy), reading top-to-bottom as a migration playbook.
-
 ## 1. Import the dbt Project
 
 Run `rocky import-dbt` pointing at your dbt project directory:
@@ -409,11 +405,7 @@ schema = "default"
 table = "orders"
 ```
 
-Notice several changes:
-- The `{{ config() }}` block became the `[strategy]` section
-- The `{{ source() }}` call became a fully qualified table reference
-- The `{% if is_incremental() %}` block was removed. Rocky handles incremental logic based on the strategy config and watermark column
-- The `{{ this }}` reference was removed. Rocky generates the target table reference from `[target]`
+Notice that the `{{ config() }}` block became `[strategy]` and `{{ source() }}` became a fully qualified reference. The `is_incremental()` guard and `{{ this }}` are gone: Rocky derives incremental logic from `[strategy]` and the target table from `[target]`.
 
 ## 3. Handle Unsupported Jinja
 
@@ -660,7 +652,7 @@ Then compare row counts, column types, and data values between the dbt-generated
 
 `rocky import-dbt` translates two kinds of dbt tests onto Rocky sidecars:
 
-- The **four canonical column-level generic tests** (`unique`, `not_null`, `accepted_values`, `relationships`), plus a handful of common `dbt_utils` / `dbt_expectations` tests that have a native Rocky equivalent (`accepted_range` / `expect_column_values_to_be_between` → `in_range`, `expect_column_values_to_match_regex` → `regex_match`, `expect_column_values_to_be_in_set` → `accepted_values`, `expression_is_true` → `expression`, `unique_combination_of_columns` → `composite`), are emitted as `[[tests]]` blocks on each model sidecar. See [Generic test mapping](#generic-test-mapping).
+- The **four canonical column-level generic tests** (`unique`, `not_null`, `accepted_values`, `relationships`), plus a handful of common `dbt_utils` / `dbt_expectations` tests with a native Rocky equivalent, are emitted as `[[tests]]` blocks on each model sidecar. See [Generic test mapping](#generic-test-mapping) for the full list.
 - **Unit tests from `manifest.unit_tests`** (dbt 1.8+) are emitted as `[[test]]` blocks on the matching model sidecar. Manifest-only; the regex path does not see unit tests.
 
 Anything else (column-level type and nullability contracts, project-defined generics, singular tests) still needs a manual step.

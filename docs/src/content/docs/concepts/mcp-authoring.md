@@ -7,7 +7,7 @@ sidebar:
 
 `rocky mcp` runs Rocky as a [Model Context Protocol](https://modelcontextprotocol.io) server: a set of typed tools that an MCP-capable agent (Claude Desktop, an IDE assistant, your own client) can call to author and evolve Rocky models against your real warehouse. It is the substrate that lets an agent do the inspect → sample → write SQL → compile → plan → propose loop with the same compiler and warehouse Rocky already uses, and stop at a human approval gate.
 
-This page explains what the substrate is, what it deliberately is not, and where its safety boundaries sit. For the CLI-level `rocky ai` / `ai-sync` / `ai-explain` / `ai-test` commands (a separate, non-MCP surface), see [AI Commands](/reference/commands/ai/).
+For the CLI-level `rocky ai` / `ai-sync` / `ai-explain` / `ai-test` commands (a separate, non-MCP surface), see [AI Commands](/reference/commands/ai/).
 
 ## Local, and bring-your-own-key
 
@@ -17,7 +17,7 @@ There is no Rocky-hosted agent and no Rocky-hosted inference. `rocky mcp` is a s
 - **Your key.** The tools that call an LLM (the generators below) require `ANTHROPIC_API_KEY` in the *server's own environment*. Rocky does not ship a key, does not bill for inference, and does not route prompts through a Rocky service. Without the key set, those tools degrade gracefully (they return empty drafts rather than erroring), so the read-only verification tools keep working.
 - **No vendor egress of your data.** The server runs next to your warehouse. The only place row-derived information leaves your environment is the LLM call you opted into by setting your own key, and even there the payload is constrained (see [Egress discipline](#egress-discipline)).
 
-In short: `rocky mcp` is a typed local tool surface, not a SaaS. The agent is whatever client you connect; the model is whatever your key points at.
+The agent is whatever client you connect; the model is whatever your key points at.
 
 ## The tool families
 
@@ -97,7 +97,7 @@ The grounding and generator tools are deliberately constrained in what leaves yo
 - **`governance_preview` and `drift_preview` are read-only** and never call an LLM at all.
 - **The verify/ground tools never call an LLM** either. `sample_rows` and `profile_column` read your warehouse to inform the *agent*; whether any of that reaches an LLM is governed by the client you connect and the prompts you run, under your key.
 
-The one intentional egress is the LLM call you enabled by setting your own `ANTHROPIC_API_KEY`, and for `draft_contract` even that is restricted to aggregates.
+The one intentional egress is the LLM call you enabled by setting your own `ANTHROPIC_API_KEY`.
 
 ## Where this sits
 
@@ -106,5 +106,3 @@ The one intentional egress is the LLM call you enabled by setting your own `ANTH
 - The [AI Commands](/reference/commands/ai/) (`rocky ai`, `ai-sync`, `ai-explain`, `ai-test`) are CLI verbs you run directly: a separate surface from MCP, not a reference for the `rocky mcp` tools.
 - [AI and Intent](/concepts/ai-intent/) explains the compiler-as-guardrail compile-verify loop that both surfaces rely on.
 - [Preview a PR](/guides/preview-a-pr/) and [Verify a Run](/guides/verify-a-run/) cover the review and audit steps that sit downstream of any proposed plan.
-
-The through-line is the same one Rocky leads with everywhere: the agent operates freely inside bounds the compiler enforces, and nothing it authors reaches production without a human approving it.

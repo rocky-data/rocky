@@ -24,7 +24,7 @@ Benchmarked on Apple Silicon (12-core, 36 GB RAM) with a synthetic 4-layer medal
 
 ## Why Rocky Is Faster Than dbt
 
-Rocky doesn't make the warehouse faster. It makes everything *around* the warehouse faster. The actual SQL execution time is the same. What's different is the compile-plan-execute overhead.
+Rocky doesn't make the warehouse faster; it cuts the compile-plan-execute overhead around it. The SQL execution time itself is unchanged.
 
 A note on which dbt: the per-tool numbers below compare against **dbt Core 1.x** (Python). dbt-fusion (the Rust runtime now open-sourced as dbt Core v2.0) closes the startup gap (it is in the table above at ~12 ms), but at 10k models it still trails Rocky on compile (~38×) and memory (~7×). The Python-specific overheads called out below (interpreter load, GC, dict duplication) are dbt Core 1.x; the remaining gap to the Rust fusion engine comes from Rocky's own design: parallel-by-layer compilation, string interning, and no on-disk manifest.
 
@@ -38,8 +38,6 @@ A note on which dbt: the per-tool numbers below compare against **dbt Core 1.x**
 
 ## Why Rocky Needs Less CPU and Memory
 
-This is the more interesting story, because it's about architectural choices, not just "Rust is faster than Python."
-
 **No Python runtime overhead.** dbt loads the entire Python interpreter, its dependency tree (Jinja2, agate, networkx, protobuf, etc.), and the adapter plugin system before it does anything useful. Rocky is a single ~15 MB static binary compiled with `opt-level = 3`, thin LTO, and `panic = "abort"`. Startup is 14ms with no interpreter, no GC, no import chain.
 
 **String interning.** In a large project, identifiers like `catalog.schema.table` and column names repeat thousands of times across model metadata. Rocky interns them via [lasso](https://github.com/Kixiron/lasso): each unique string is stored once, and every reference is a cheap integer handle. dbt duplicates these strings across Python dicts and dataclass instances, ballooning memory proportionally to project size. This is why Rocky uses 4.3x less memory.
@@ -52,7 +50,7 @@ This is the more interesting story, because it's about architectural choices, no
 
 **No GC pressure.** Python's garbage collector must periodically scan and collect dbt's in-memory graph. Rocky uses Rust's ownership model: memory is freed deterministically at scope exit. No GC pauses, no memory fragmentation over long runs.
 
-> dbt's resource consumption scales with project size (more models → bigger manifest → more memory → slower parsing). Rocky's resource consumption scales with execution complexity (more parallel layers → more threads, but memory stays flat because of interning and mmap). A 10,000-model Rocky project compiles in roughly the same memory as a 100-model one.
+> dbt's resource consumption scales with project size (more models → bigger manifest → more memory → slower parsing). Rocky's resource consumption scales with execution complexity (more parallel layers → more threads, but memory stays flat because of interning and mmap).
 
 This matters most in CI (where you're paying per vCPU-minute) and in orchestrators like Dagster (where the Rocky subprocess is a lightweight sidecar, not a memory-hungry Python process competing with the scheduler for resources).
 

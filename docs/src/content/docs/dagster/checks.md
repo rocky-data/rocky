@@ -58,11 +58,4 @@ def replicate(context, rocky: RockyResource):
     return result.tables_copied
 ```
 
-Both functions return lists, so you can also inspect or filter events before logging them:
-
-```python
-mats = emit_materializations(result)
-context.log.info(f"Emitting {len(mats)} materializations")
-for mat in mats:
-    context.log_event(mat)
-```
+Both functions return lists, so you can inspect or filter the events before logging them.

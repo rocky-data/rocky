@@ -17,7 +17,7 @@ Rocky does not extract data from external systems. It operates on data that has 
 rocky discover  →  rocky plan  →  rocky apply
 ```
 
-1. **Discover.** Finds what schemas and tables are available for processing. For `fivetran` adapters, it calls the Fivetran REST API to list connectors and enabled tables. For `duckdb` adapters, it queries `information_schema`. For `manual` adapters, it reads inline schema and table definitions. Discovery is metadata-only: it identifies what exists, it does not extract data.
+1. **Discover.** Finds what schemas and tables are available for processing. For `fivetran` adapters, it calls the Fivetran REST API to list connectors and enabled tables. For `duckdb` adapters, it queries `information_schema`. For `manual` adapters, it reads inline schema and table definitions.
 2. **Plan.** Parses source schema names, resolves target catalogs and schemas, and generates SQL statements. Records a deterministic plan keyed by `plan_id`.
 3. **Apply.** Executes the plan by id: creates catalogs and schemas, copies data, runs quality checks, updates watermarks. The `rocky run` alias collapses plan and apply into a single invocation for local iteration and automation.
 
@@ -134,4 +134,4 @@ SELECT * FROM {{ source('shopify', 'orders') }}
 
 Multiply that by every table, every source, every tenant. For a multi-tenant setup with 50 connectors and 20 tables each, that's 1,000 SQL files that all look the same.
 
-In Rocky, the entire bronze layer is config-driven. Zero SQL files. The `rocky.toml` configuration handles all source-to-target mapping, and Rocky generates the appropriate SQL at runtime.
+In Rocky, the entire bronze layer is config-driven. Zero SQL files.

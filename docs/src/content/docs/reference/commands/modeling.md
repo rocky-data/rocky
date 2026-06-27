@@ -72,7 +72,7 @@ rocky compile
 }
 ```
 
-`models_detail` carries the stable, declarative shape of each compiled model: its name, materialization `strategy` (the wire form `{"type": "..."}`), `target` coordinates, and direct `depends_on` list. Optional fields appear only when present: `freshness` when the model declares a freshness expectation, `contract_source` (`"auto"` for a sibling `.contract.toml`, `"explicit"` for one passed via `--contracts`) when a contract applies, `incrementality_hint` when a `full_refresh` model has a monotonic-looking column, and `cost_hint` when upstream statistics support a heuristic estimate. The `tags` object holds the model's `[tags]` block merged over any config-group baseline (sidecar wins), so a governed key like `domain` or `owner` declared once on a group is visible to consumers such as `dagster-rocky`. Empty `tags`, `depends_on`, and absent optional fields are omitted from the JSON.
+`models_detail` carries each compiled model's declarative shape: `name`, materialization `strategy` (wire form `{"type": "..."}`), `target` coordinates, and direct `depends_on`. Optional fields appear only when present: `freshness`, `contract_source` (`"auto"` for a sibling `.contract.toml`, `"explicit"` for one passed via `--contracts`), `incrementality_hint` (a `full_refresh` model with a monotonic-looking column), and `cost_hint` (when upstream statistics support an estimate). The `tags` object holds the model's `[tags]` merged over any config-group baseline (sidecar wins). Empty `tags`, `depends_on`, and absent optional fields are omitted.
 
 Compile a single model with contracts, showing a warning diagnostic:
 
@@ -133,7 +133,7 @@ rocky compile --target-dialect bq
 }
 ```
 
-Both the `--target-dialect` flag and the `[portability]` config block (see [Configuration](/reference/configuration/)) drive the same check; the flag wins when both are set. Project-wide allow-lists and per-model `-- rocky-allow: …` pragmas exempt specific constructs. See [Portability linting](/concepts/linters/#p001--dialect-portability).
+The `--target-dialect` flag and the `[portability]` config block (see [Configuration](/reference/configuration/)) drive the same check. Project-wide allow-lists and per-model `-- rocky-allow: …` pragmas exempt specific constructs. See [Portability linting](/concepts/linters/#p001--dialect-portability).
 
 Compile with seeded source schemas so leaf `.sql` models pick up real types:
 
@@ -359,7 +359,7 @@ rocky catalog --out build/catalog
 
 ## `rocky emit-sql`
 
-Render the runnable SQL each transformation model would emit, without a warehouse connection and without running anything. This is Rocky's tested exit path: a project can always be reduced to plain, dialect-correct SQL files that feed a hand-SQL or dbt fallback, so adopting Rocky is never a one-way door. The SQL is generated through the same path `rocky run` uses, including declared surrogate-key columns wrapped exactly as they are at materialization.
+Render the runnable SQL each transformation model would emit, without a warehouse connection and without running anything. The SQL is generated through the same path `rocky run` uses, including declared surrogate-key columns wrapped exactly as they are at materialization.
 
 ```bash
 rocky emit-sql [flags]
@@ -789,7 +789,7 @@ Sampled row-level diff plus structural (column-level) diff for every model in th
 rocky preview diff --name preview-fix-price --output markdown
 ```
 
-The JSON shape (`PreviewDiffOutput`) carries the same data plus the per-model `sampling_window` block with `coverage_warning`. The `markdown` field embeds the rendered report verbatim, so `rocky preview diff --output json | jq -r .markdown` is equivalent to `--output markdown`.
+The JSON shape (`PreviewDiffOutput`) carries the same data plus the per-model `sampling_window` block with `coverage_warning`, and `rocky preview diff --output json | jq -r .markdown` reproduces the `--output markdown` report.
 
 ### `rocky preview cost`
 

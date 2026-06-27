@@ -33,7 +33,7 @@ Each AI command runs a compile-verify retry loop (up to 3 attempts). To bound th
 max_tokens = 8192
 ```
 
-`max_tokens` doubles as the per-request cap on the Anthropic Messages API and as the cumulative output-token ceiling: when the running total of `output_tokens` across retry attempts exceeds this value, Rocky fail-stops with a `TokenBudgetExceeded` error instead of paying for another retry. See [`[ai]`](/reference/configuration/#ai) in the configuration reference.
+`max_tokens` also serves as the per-request cap on the Anthropic Messages API; exceeding the cumulative budget fail-stops with a `TokenBudgetExceeded` error rather than paying for another retry. See [`[ai]`](/reference/configuration/#ai) in the configuration reference.
 
 ### Verify the setup
 
@@ -147,7 +147,7 @@ rocky ai "monthly revenue by category" --models models
 
 A second mechanism runs after generation: `rocky ai`'s `ValidationContext` typechecks the candidate SQL against the live project graph. If the LLM references a model or column that doesn't exist, the diagnostic flows back into the compile-verify loop as retry feedback instead of reaching your files.
 
-Rocky's typechecker is lenient on unresolved columns today, so schema grounding in the prompt is the primary mechanism preventing hallucinated columns; project-aware validation catches hallucinated *model* references in the project graph.
+The typechecker is lenient on unresolved columns today, so schema grounding in the prompt is the primary guard against hallucinated columns.
 
 ## 4. The Compile-Verify Loop
 
@@ -180,10 +180,6 @@ The compiler catches:
 - **Invalid functions**: Unrecognized SQL functions or wrong argument counts
 
 If all attempts fail, Rocky reports the best attempt and the remaining errors. No AI-generated code reaches your warehouse without passing the type checker.
-
-### Why this matters
-
-LLMs occasionally generate plausible-looking SQL that is semantically wrong -- a column name that does not exist, a JOIN on mismatched types, or an aggregation without a GROUP BY. The compile-verify loop catches these errors before you see the output.
 
 ## 5. Add Intent to Existing Models
 
@@ -310,26 +306,22 @@ Models without intent are skipped because the AI has no context to make intellig
 
 ### Example scenario
 
-Suppose an upstream model `stg_orders` renames `unit_price` to `unit_price_local` as part of a currency normalization effort:
+Suppose an upstream model `stg_orders` renames `unit_price` to `unit_price_local`. `rocky compile` fails because downstream models still reference `unit_price`; `rocky ai-sync --models models` detects the rename and proposes a minimal diff:
 
-1. `rocky compile` fails -- downstream models reference `unit_price` which no longer exists
-2. `rocky ai-sync --models models` detects the rename and proposes updates:
+```diff
+--- models/fct_daily_revenue.sql
++++ models/fct_daily_revenue.sql
+@@ -4,7 +4,7 @@
+ SELECT
+     o.order_date,
+     p.category,
+-    SUM(o.quantity * o.unit_price * (1 - o.discount)) as revenue,
++    SUM(o.quantity * o.unit_price_local * (1 - o.discount)) as revenue,
+     COUNT(*) as order_count
+ FROM stg_orders o
+```
 
-   ```diff
-   --- models/fct_daily_revenue.sql
-   +++ models/fct_daily_revenue.sql
-   @@ -4,7 +4,7 @@
-    SELECT
-        o.order_date,
-        p.category,
-   -    SUM(o.quantity * o.unit_price * (1 - o.discount)) as revenue,
-   +    SUM(o.quantity * o.unit_price_local * (1 - o.discount)) as revenue,
-        COUNT(*) as order_count
-    FROM stg_orders o
-   ```
-
-3. Review the diff and apply with `--apply`
-4. `rocky compile` passes again
+Review it, apply with `--apply`, and `rocky compile` passes again.
 
 ## 7. Generate Test Assertions
 

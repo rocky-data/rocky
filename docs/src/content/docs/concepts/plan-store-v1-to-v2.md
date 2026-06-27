@@ -7,8 +7,6 @@ sidebar:
 
 `rocky plan` persists each plan to `.rocky/plans/<plan-id>.json` for `rocky apply` to read back. The typed-IR **v2** envelope is the only loadable shape for `rocky compact` / `rocky archive` plans; the legacy **v1** inline-SQL envelope has been retired and the `[plan_store]` config block that selected between them has been removed.
 
-This page explains what changed, how to upgrade from a v1-shaped plan on disk, and the timeline that got us here.
-
 ## What's changed
 
 - **The v1 inline-SQL envelope is no longer readable.** Compact / archive plans written by Rocky < engine-v1.35.0 (the v1 default era) error out at `rocky apply <plan-id>` with a clear migration message. Re-run `rocky compact` / `rocky archive` to write a fresh v2 plan.
@@ -19,12 +17,10 @@ Stdout JSON (`rocky plan --output json`, `rocky compact --output json`, `rocky a
 
 ## Format recap
 
-The plan store is the on-disk envelope that `rocky plan` writes and `rocky apply` reads back. The path (`.rocky/plans/<plan-id>.json`) and the blake3-content-addressed `plan-id` are unchanged; only the body shape changed:
+The path (`.rocky/plans/<plan-id>.json`) and the blake3-content-addressed `plan-id` are unchanged; only the body shape changed:
 
 - **v1 (legacy, retired)** — the envelope shipped **inline SQL** as the canonical payload. `rocky apply` read the SQL out of the plan and submitted it to the warehouse verbatim. This is the shape Rocky < engine-v1.35.0 produced by default.
 - **v2 (typed IR, now the only loadable shape)** — the envelope ships the **typed-IR payload** (`CompactPlanIr` for `rocky compact` plans, `ArchivePlanIr` for `rocky archive` plans). `rocky apply` regenerates SQL from the IR at execution time via the `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}` helpers in the `rocky-ir` crate.
-
-Only `CompactPlan` and `ArchivePlan` were ever affected by the v1/v2 split. `PromotePlan` (governance) and `RunPlan` (already IR-only) sit outside this surface.
 
 ## Migration recipe
 
