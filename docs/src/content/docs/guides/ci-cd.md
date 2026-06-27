@@ -70,7 +70,7 @@ Each finding has a tagged `change.kind` (e.g. `column_dropped`, `column_type_cha
 rocky plan --semantic --base main --output json | jq '.breaking_verdict'
 ```
 
-This is **reporting-only**: the verdict never gates the plan. Planned statements and the exit code are unchanged even on a `breaking` finding, and `breaking_verdict` is omitted (never fabricated) when no baseline is available: no `models/` directory, or the `--base` ref's models don't compile. The hard gate is still `rocky plan promote` (below).
+This is **reporting-only**: the verdict never gates the plan, and `breaking_verdict` is omitted (never fabricated) when no baseline is available: no `models/` directory, or the `--base` ref's models don't compile. The hard gate is still `rocky plan promote` (below).
 
 :::caution[The classifier diffs OUTPUT SCHEMA; it is blind to value changes]
 The breaking-change classifier compares the typed **output schema** of each model (columns, types, nullability, materialization keys, masks, target). It is **blind to schema-stable value changes**: a `WHERE` / `JOIN`-key / `CASE` rewrite that changes every output row but leaves the column list and types untouched produces **no finding**. An empty `breaking_verdict.findings` therefore means "no output-schema change was detected"; it is **not** a completeness or safety signal that the data is unchanged. The verdict carries this statement verbatim in its `caveat` field so a JSON-only consumer can't miss it. To see whether values moved, pair it with [`rocky preview`](/guides/preview-a-pr/) (row-level diff on real data).

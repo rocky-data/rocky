@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-The administration commands provide observability into past pipeline runs, quality metrics trends, storage optimization recommendations, table compaction, storage profiling, and data archival.
+Commands for observability into past runs, storage optimization, compaction, and archival.
 
 ---
 

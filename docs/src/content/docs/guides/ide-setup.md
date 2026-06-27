@@ -288,7 +288,7 @@ Three more AI commands work on existing models, each saving its result back into
 - **Rocky: Explain Model (Generate Intent)** -- write a plain-English `intent` for a model from its code (`rocky ai-explain`)
 - **Rocky: Generate Tests from Intent** -- derive `[[tests]]` assertions from a model's intent (`rocky ai-test`)
 
-You can also trigger these -- plus data-grounded contract drafting and "build a downstream model" -- by right-clicking a node in the Inspector's lineage canvas.
+These actions are also available by right-clicking a node in the Inspector's lineage canvas.
 
 ### All commands
 

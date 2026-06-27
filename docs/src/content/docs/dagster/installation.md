@@ -19,8 +19,6 @@ The package requires:
 - `pydantic >= 2.0`
 - `pygments >= 2.20.0`
 
-These are installed automatically as package dependencies.
-
 ## Install the Rocky binary
 
 The `rocky` binary must be installed separately. It is not bundled with the Python package. See the [Installation](/getting-started/installation/) page for instructions on installing Rocky for your platform.

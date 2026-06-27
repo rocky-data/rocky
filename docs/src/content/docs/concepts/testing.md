@@ -260,7 +260,7 @@ To apply the same assertion across many models, define it once in `models/test_d
 
 ### `[[test]]` vs `[[tests]]`
 
-The singular and plural keys are two different test mechanisms. The names are close, so keep the distinction in mind:
+The singular and plural keys are two different test mechanisms:
 
 | | `[[test]]` (singular) | `[[tests]]` (plural) |
 |---|---|---|
@@ -361,5 +361,3 @@ A typical development workflow combines contracts, testing, and CI:
 3. Run `rocky test` locally to verify everything compiles and executes
 4. Commit and push -- CI runs `rocky ci` to catch regressions
 5. Optionally, run `rocky ai-test --save` to generate additional assertions from intent
-
-Contracts serve as the stable interface between your model and its downstream consumers. If a model change would break a contract, the compiler catches it before anything reaches the warehouse.

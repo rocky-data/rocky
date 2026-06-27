@@ -117,7 +117,7 @@ The [Playground](/guides/playground/) runs the same flow against a local DuckDB 
 
 ## Plan and apply, or just run
 
-`rocky plan` then `rocky apply` is the auditable two-step for production and PR gating: the persisted plan is reviewable before anything writes. For local iteration and automation, `rocky run` does the same work in one step:
+For local iteration and automation, `rocky run` does the same work as the `rocky plan` + `rocky apply` two-step (steps 5–6) in one command:
 
 ```bash
 rocky run --filter tenant=acme

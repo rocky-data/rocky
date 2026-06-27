@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-This page traces what happens inside the engine from the moment you type `rocky run` to the moment the warehouse is updated and JSON is emitted. The goal is to make the execution model concrete enough that you can reason about failures, retries, and performance.
+This page traces what happens inside the engine from the moment you type `rocky run` to the moment the warehouse is updated and JSON is emitted.
 
 ## The high-level flow
 

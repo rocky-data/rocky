@@ -146,6 +146,4 @@ Cache failures are fail-open: the HTTP path runs regardless. Failures show up as
 
 ## Volume reduction
 
-The cache layer dedupes correctness. It prevents redundant writes when the bytes haven't changed. The cold-start herd reduction depends on the per-host rate-limit budget (shipped in engine-v1.37.0) serializing concurrent fetches so the first process pays the API cost and subsequent processes see the populated cache.
-
 For a 57-connector tenant with 5 active processes and 2-8 sensor triggers per hour, the combined effect cuts steady-state Fivetran call volume from ~600-2400 calls/hour to ~80 calls/hour.

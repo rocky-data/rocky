@@ -5,7 +5,7 @@ sidebar:
   order: 2
 ---
 
-The modeling commands work with Rocky's SQL model system: compiling models to resolve dependencies and type-check, tracing column-level lineage, running local tests via DuckDB, and executing CI pipelines without warehouse credentials.
+Commands for working with Rocky's SQL models: compile, lineage, local tests, and CI.
 
 ---
 

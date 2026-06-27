@@ -7,7 +7,7 @@ sidebar:
 
 ## Where to start
 
-The right entry point depends on what you want to change. Use this table to orient yourself before diving into the code.
+The right entry point depends on what you want to change.
 
 | You want to change | Start here |
 |---|---|

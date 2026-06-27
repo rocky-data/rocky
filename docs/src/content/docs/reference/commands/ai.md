@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-The AI commands use large language models to generate Rocky models from natural language, detect and reconcile schema changes against declared intent, explain existing model logic, and generate test assertions. These commands require an AI provider to be configured.
+AI-assisted commands for generating, reconciling, explaining, and testing Rocky models. These commands require an AI provider to be configured.
 
 ---
 
