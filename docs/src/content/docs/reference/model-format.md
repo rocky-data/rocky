@@ -167,7 +167,7 @@ Here `@var(region)` has no default and must be supplied; `@var(status, shipped)`
 
 The substitution is **textual** — Rocky replaces the marker with the supplied string verbatim, so you own the surrounding quoting and casting (the example quotes the marker because the value is a string literal). Only the variable *name* is validated, as a SQL identifier.
 
-This is deliberately distinct from config-time `${ENV}` substitution. `${ENV}` resolves connection and routing values while Rocky parses `rocky.toml` and the sidecars, before any model is seen; `@var()` resolves a run's logical inputs at compile/render time and stays visible in the model source (the same family as the `@start_date` / `@end_date` markers used by `time_interval` models). A `@var(name)` with no `--var` binding and no inline default is a **compile error** that names the missing variable, so a forgotten value fails fast rather than running with a blank. `rocky import-dbt` maps dbt's `{{ var('name') }}` / `{{ var('name', default) }}` onto these markers.
+This is deliberately distinct from config-time `${ENV}` substitution: `${ENV}` resolves config values while Rocky parses `rocky.toml` and the sidecars, before any model is seen; `@var()` resolves a run's logical inputs at compile/render time and stays visible in the model source. A `@var(name)` with no `--var` binding and no inline default is a **compile error** that names the missing variable, so a forgotten value fails fast. `rocky import-dbt` maps dbt's `{{ var('name') }}` / `{{ var('name', default) }}` onto these markers.
 
 ### Config groups
 
@@ -231,7 +231,7 @@ domain = "finance"
 tier = "gold"
 ```
 
-A member model's own `[tags]` override the group per key (sidecar > group) without dropping the rest of the group's tags — so one model can set `tier = "silver"` and still inherit `domain = "finance"`. The resolved tags appear on the `rocky compile` JSON output (`models_detail[].tags`), and `dagster-rocky` projects them onto each derived asset's Dagster tags — making the governed fan-out visible to the orchestrator end-to-end. See [`[tags]`](#tags) for the model-level block.
+A member model's own `[tags]` override the group per key (sidecar > group) without dropping the rest of the group's tags — so one model can set `tier = "silver"` and still inherit `domain = "finance"`. See [`[tags]`](#tags) for how resolved tags surface on `models_detail[].tags` and project onto Dagster assets.
 
 A group carries `schema_template`, `strategy`, `tags`, and `enforce`. An unrecognized key in a group file is rejected at load so typos surface immediately.
 
@@ -323,7 +323,7 @@ schema = "marts"
 table = "dim_customers"
 ```
 
-At `rocky run` (and on the emit-SQL path), Rocky appends `CAST(md5(...) AS <string_type>) AS <name>` to the model's projection, computed over the input columns. The hash expression is dialect-correct: it uses the warehouse's variable-length string type (`STRING` on Databricks and BigQuery, `VARCHAR` on Snowflake, DuckDB, and Trino) and BigQuery's `to_hex(...)` / `concat(...)` form where the default `||` concatenation doesn't apply. On a given warehouse the hash value is the same one `dbt_utils.generate_surrogate_key` produces over the same columns, so a surrogate key keeps the same values whether it was built by Rocky or a prior dbt project and a key Rocky computes joins against the same key in an upstream dbt model. NULL inputs coalesce to a fixed sentinel before hashing, matching dbt-utils.
+At `rocky run` (and on the emit-SQL path), Rocky appends `CAST(md5(...) AS <string_type>) AS <name>` to the model's projection, computed over the input columns. The hash expression is dialect-correct: it uses the warehouse's variable-length string type (`STRING` on Databricks and BigQuery, `VARCHAR` on Snowflake, DuckDB, and Trino) and BigQuery's `to_hex(...)` / `concat(...)` form where the default `||` concatenation doesn't apply. On a given warehouse the hash value matches what `dbt_utils.generate_surrogate_key` produces over the same columns, so keys join across Rocky and dbt models either way. NULL inputs coalesce to a fixed sentinel before hashing, matching dbt-utils.
 
 A `[[surrogate_key]]` block uses `deny_unknown_fields`: a typo such as `colums = [...]` fails the load rather than silently hashing nothing. An empty `columns` list or a `name` / column that isn't a valid identifier is rejected at load with a clear diagnostic. Declare multiple blocks to inject more than one key column.
 
@@ -449,7 +449,7 @@ rows = [
 ]
 ```
 
-The runner seeds DuckDB with each `given` fixture, executes the model SQL, and asserts the result matches `expect`. A test may declare several `[[test.given]]` blocks to mock more than one upstream, and a model may declare several `[[test]]` blocks.
+A test may declare several `[[test.given]]` blocks to mock more than one upstream, and a model may declare several `[[test]]` blocks.
 
 ### `[columns.<name>]`
 
@@ -536,7 +536,7 @@ The inline format uses the same fields as the sidecar TOML file. The SQL query f
 
 The frontmatter block supports the same `${VAR}` / `${VAR:-default}` substitution as sidecar `.toml` files (see [Environment Variables](/reference/configuration/#environment-variables)); the SQL body below the closing `---` is **not** substituted, so any `${VAR}` token in the query stays literal.
 
-This format is supported for backward compatibility. The sidecar format is preferred because it keeps SQL files portable and free of non-SQL syntax.
+This format is supported for backward compatibility; prefer the sidecar format.
 
 ---
 

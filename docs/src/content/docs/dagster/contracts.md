@@ -131,10 +131,6 @@ UI shows contract slots **before any compile or run**. Users see at a
 glance which models have contracts and which contract kinds are
 expected, even on a fresh deployment.
 
-The alternative (emitting check results without pre-declared specs)
-would be hidden until the first materialization completes, which
-defeats the purpose of contracts as a documentation surface.
-
 ## When does the wiring fire?
 
 `RockyComponent` matches contracts to assets by **table name**: a
@@ -147,10 +143,8 @@ ends with `orders`. Today this means:
   release), every model with a contract file gets the wiring
   automatically.
 
-This is a known limitation: dagster-rocky's RockyComponent surfaces
-source replication tables but not derived models. The contract wiring
-is correct for both cases; it just doesn't have many derived-model
-assets to attach to today.
+The wiring is correct for both cases; today there just aren't many
+derived-model assets to attach to.
 
 ## Defensive parsing
 

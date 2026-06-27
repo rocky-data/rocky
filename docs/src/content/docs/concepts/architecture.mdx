@@ -7,7 +7,7 @@ sidebar:
 
 import pocCounts from "../../../data/poc-counts.json";
 
-Rocky is a Cargo workspace composed of several crates, each with a focused responsibility. This page describes what each crate does and how they connect.
+Rocky is a Cargo workspace composed of several crates, each with a focused responsibility.
 
 ## How data flows
 
@@ -120,15 +120,15 @@ engine/
 
 ### rocky-ir
 
-The typed Intermediate Representation. Extracted from `rocky-core` in engine v1.30.0 (Phase G1) so adapter crates can depend on the IR without pulling in the SQL-generation surface.
+The typed Intermediate Representation.
 
 - **`ModelIr`**: single in-memory plan representation; replaced the legacy `Plan` enum + `ReplicationPlan` / `TransformationPlan` structs (deleted in v1.30.0).
-- **`MaterializationStrategy`**: `FullRefresh`, `Incremental`, `Merge`, `MaterializedView`, `DynamicTable`, `TimeInterval`, `Ephemeral`, `DeleteInsert`, `Microbatch`, `ContentAddressed`.
+- **`MaterializationStrategy`**: the strategy enum (full list in the [MaterializationStrategy](#materializationstrategy) section below).
 - Source / target descriptors and partition windows.
 
 ### rocky-core
 
-The warehouse-agnostic transformation engine. This crate has no knowledge of specific warehouses or sources; it works entirely through adapter abstractions, consuming IR from `rocky-ir` and producing dialect-specific SQL.
+The warehouse-agnostic transformation engine, consuming IR from `rocky-ir` and producing dialect-specific SQL.
 
 Key modules:
 
@@ -310,13 +310,7 @@ The full enum lives in `rocky-ir::ir::MaterializationStrategy`. SQL generation (
 
 ### Adapter SDK
 
-The `rocky-adapter-sdk` crate provides stable, versioned traits for building custom warehouse adapters:
-
-- **`WarehouseAdapter`**: execute SQL, describe tables, manage catalog objects
-- **`SqlDialect`**: format SQL for a specific warehouse (table refs, DDL, DML, type mapping)
-- **`DiscoveryAdapter`**: discover connectors and tables from a source
-- **`GovernanceAdapter`**: manage tags, grants, and workspace bindings
-- **`AdapterManifest`**: declares capabilities per adapter (which traits it implements)
+The [`rocky-adapter-sdk`](#rocky-adapter-sdk) crate provides the stable, versioned traits (`WarehouseAdapter`, `SqlDialect`, `DiscoveryAdapter`, `GovernanceAdapter`) plus an `AdapterManifest` that declares which traits each adapter implements.
 
 Adapters can be built in Rust (direct trait implementation) or in any language via the **process adapter protocol** (JSON-RPC over stdio).
 

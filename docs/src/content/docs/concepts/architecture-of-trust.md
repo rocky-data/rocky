@@ -5,7 +5,7 @@ sidebar:
   order: 2
 ---
 
-This page is for the engineer who has already lost a weekend to a silent schema change, and who reads vendor docs with a healthy suspicion. It walks through how Rocky earns trust, primitive by primitive, and grades every load-bearing claim against what actually ships. Where something is partial, this page says so. Where something is roadmap, this page says that too.
+Rocky earns trust primitive by primitive. Each claim below is graded against what ships today; where something is partial or still on the roadmap, this page says so.
 
 ## The failures worth designing against
 
@@ -18,7 +18,7 @@ Four are worth naming because they recur on every team that reaches real scale:
 - **The un-auditable change.** An auditor asks who altered `fct_revenue.amount`, when, and on whose approval. The honest answer involves `git blame`, a Slack thread, and a screenshot.
 - **The contract broken without warning.** A model promises a column to its consumers. Someone removes it, or changes its type, or relaxes its nullability. The consumers find out in production.
 
-These are not edge cases. They are the load-bearing risks that make a platform team cautious, and they are the failures Rocky is built to convert from production incidents into things you catch before merge.
+These are not edge cases. They are the load-bearing risks Rocky is built to convert from production incidents into things you catch before merge.
 
 ## The mental model: code, typed IR, warehouse
 
@@ -118,13 +118,11 @@ The VS Code extension renders the lineage graph and overlays four trust signals 
 3. **Replay**: the last recorded run for each model.
 4. **Governance**: compliance and masking status.
 
-Four overlays, not more. Each maps to a command the extension already drives.
-
 **Shipped (four overlays).**
 
 ## The honesty grade
 
-Every load-bearing claim, in one table. Read the partial and not-yet rows carefully; they are where teams get surprised, and naming them is the whole point of this page.
+Every load-bearing claim, in one table. The partial and not-yet rows are where teams get surprised.
 
 | Claim | Grade | What that means |
 |---|---|---|
@@ -143,14 +141,7 @@ Every load-bearing claim, in one table. Read the partial and not-yet rows carefu
 
 ## What to lead with
 
-If you are deciding whether Rocky is worth your team's time, the differentiation worth weighing is concrete:
-
-- **Branches** for isolated development and review without touching production tables.
-- **Replay** as deterministic recording plus content-addressed verification, with re-execution coming.
-- **Per-model cost** as a property of the model rather than an invoice line.
-- **Declarative governance** as code, deepest on Databricks.
-- **Dialect-divergence lint** (`P001`): the day you start a warehouse migration it is useful, and the day you finish one it is essential.
-- **Compile-time contracts** that turn a broken promise into a red CI check.
+If you are deciding whether Rocky is worth your team's time, lead with the enforcement plane: branches, content-addressed replay, per-model cost, declarative governance, the dialect-divergence lint (`P001`), and compile-time contracts. The lint alone is useful the day you start a warehouse migration and essential the day you finish one.
 
 Rocky being written in Rust matters for speed and for the existence of a real LSP, but it is not the reason to choose it. The reason is that the failure modes above become compile errors and CI gates.
 
@@ -162,7 +153,7 @@ A sophisticated reader will already be holding Rocky up against a few specific t
 
 In June 2026 dbt Labs open-sourced the Fusion runtime as dbt Core v2.0 (Rust, Apache 2.0, alpha); the recommended Fusion distribution is a genuine compiler with multi-dialect SQL validation, a real LSP, and column-level lineage in the editor, and it is the closest thing in the dbt ecosystem to what Rocky does. The differentiation is in the enforcement plane: named branches, content-addressed recording and ledger verification, per-model cost budgets that fail the build, a dialect-portability lint, and declarative governance and masking under Apache 2.0 rather than gated behind a paid platform tier. Fusion still uses Jinja templating, so its strictest, build-failing analysis is opt-in; Rocky keeps SQL first-class with no Jinja, and offers an optional typed DSL only where SQL does not fit.
 
-Always read "dbt" with the qualifier. dbt Core 1.x is a templating engine and cannot catch the failures above at compile time by design. dbt Core v2.0 is a faster Rust binary but still renders Jinja; the SQL comprehension that catches some of these (type-checking and column-level lineage) lives in the Fusion extension and requires opting into its `strict` mode (the default `baseline` mode is lighter and warn-only). Fusion is the actual head-to-head. They are structurally different tools.
+Always read "dbt" with the qualifier. dbt Core 1.x is a templating engine and cannot catch the failures above at compile time by design. dbt Core v2.0 (the Fusion runtime) is the actual head-to-head; the type-checking and column-level lineage that catch some of these live in its Fusion extension and require opting into `strict` mode (the default `baseline` mode is lighter and warn-only). They are structurally different tools.
 
 ### Databricks LakeFlow (head-to-head, with a caveat)
 
@@ -170,7 +161,7 @@ LakeFlow is warehouse-coupled and comes free with the platform. If portability a
 
 ### Polaris and the open table formats (category clarification)
 
-This one is a category question, not a head-to-head. Polaris is Snowflake's Iceberg REST catalog; Iceberg and Delta are open table formats. Rocky is none of those. Rocky targets them. It writes content-addressed Delta and UniForm that Iceberg-compatible readers can consume, and it treats the format and catalog as the substrate it sits above. Confusing Rocky with a table format or a catalog gets the layering wrong, which is exactly what the next sentence is meant to fix.
+This one is a category question, not a head-to-head. Polaris is Snowflake's Iceberg REST catalog; Iceberg and Delta are open table formats. Rocky is none of those. Rocky targets them. It writes content-addressed Delta and UniForm that Iceberg-compatible readers can consume, and it treats the format and catalog as the substrate it sits above.
 
 ---
 

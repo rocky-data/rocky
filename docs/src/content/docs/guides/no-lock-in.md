@@ -5,7 +5,7 @@ sidebar:
   order: 8
 ---
 
-Adopting a transformation tool shouldn't be a one-way door. Rocky compiles your models to ordinary SQL, and `rocky emit-sql` hands you that SQL directly. If you ever need to step away from the engine, you keep runnable artifacts, not a proprietary format.
+Rocky compiles your models to ordinary SQL, and `rocky emit-sql` hands you that SQL directly. If you ever need to step away from the engine, you keep runnable artifacts, not a proprietary format.
 
 ## `rocky emit-sql`
 
@@ -54,8 +54,6 @@ For full-refresh models this is exact: a CI test emits the SQL and executes it d
 ## What it doesn't cover
 
 `emit-sql` renders transformation models. Replication pipelines (incremental source-to-target copies) are driven by the engine's watermark state, so their SQL preview lives behind the live `rocky plan` path instead. Models that produce no standalone statement are reported on stderr rather than dropped silently: ephemeral models (inlined as CTEs) and strategies that need a live connection to render, such as Snowflake dynamic tables that resolve a compute-warehouse name at runtime.
-
-For incremental and merge models, remember the limits above: the emitted statement assumes the target already exists and carries no watermark, so reproducing a run from scratch means creating the target first (and, for incremental, deciding how to seed it).
 
 ## Related
 

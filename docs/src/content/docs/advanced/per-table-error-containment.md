@@ -7,8 +7,6 @@ sidebar:
 
 `rocky run` (and the canonical `rocky plan` + `rocky apply` flow it backs) treats each table as an isolated unit of work. One table failing does not crash the run. The other tables in the same invocation keep going, the run finishes with a partial-success exit code, and the per-table failures are enumerated on `RunOutput.errors[*]` with a typed `failure_kind` discriminator so orchestrators can branch on the kind of failure without parsing the free-form `error` string.
 
-This page documents that contract and shows how downstream consumers (Dagster assets, custom scripts, alerting) should branch on it.
-
 ## The containment property
 
 The per-table loop in `commands/run.rs` dispatches every table through `process_table` inside a `tokio::JoinSet`. The match arm that handles a task's `Result` has three branches:
@@ -17,7 +15,7 @@ The per-table loop in `commands/run.rs` dispatches every table through `process_
 - **Adapter error** (`Ok((idx, Err(e)))`) -- the error is classified into a [`FailureKind`](#failure_kind-taxonomy) **before** stringification (so the typed connector variant is preserved), then a `TableError { asset_key, error, failure_kind }` is pushed onto `table_errors`. The loop continues with the remaining tables.
 - **Task panic** (`Err(JoinError)`) -- the panic message is captured into a `TableError` with `failure_kind = "unknown"`. The loop continues.
 
-The only path that aborts the run early is `--fail-fast` (which calls `JoinSet::abort_all()` on the first error). With the default behaviour, a run of N models can finish with K (< N) failures; the remaining N-K still succeed, and `RunOutput.errors[*]` enumerates the K. The exit code is non-zero so callers can distinguish partial success from clean success, but the JSON output is still well-formed.
+The only path that aborts the run early is `--fail-fast` (which calls `JoinSet::abort_all()` on the first error). Otherwise the run finishes with a non-zero exit code so callers can distinguish partial success from clean success, while the JSON output stays well-formed.
 
 This is true for every adapter (Databricks, Snowflake, BigQuery, DuckDB) -- the loop is adapter-agnostic and catches `anyhow::Error` from any source, including connector errors, schema-drift failures, governance reconciliation errors, and worker-task panics.
 
@@ -44,8 +42,6 @@ This is true for every adapter (Databricks, Snowflake, BigQuery, DuckDB) -- the 
   ]
 }
 ```
-
-The exit code is non-zero (partial success), but every other table in the run materialized to completion.
 
 ## `failure_kind` taxonomy
 

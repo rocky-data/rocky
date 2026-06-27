@@ -22,7 +22,6 @@ sidebar:
 ## Behavior
 
 - All methods return strongly-typed Pydantic models (see [Type Reference](/dagster/types/)).
-- Default subprocess timeout is 3600 seconds (1 hour).
 - On CLI failure, raises `dagster.Failure` with stderr attached as metadata.
 - If the binary is not found on `PATH`, raises `Failure` with a link to the installation instructions.
 - **Partial success**: Rocky can exit non-zero but still emit valid JSON (e.g., when some tables succeed and others fail). Methods like `run()`, `compile()`, `test()`, and `ci()` handle this automatically, returning the parsed result so callers can distinguish successes from failures.
@@ -327,8 +326,6 @@ The resource provides three execution modes, all sharing the same partition and 
 | **Buffered** | `run()` | Scripts, tests, notebooks. No Dagster context needed. |
 | **Streaming** | `run_streaming()` | Long Dagster runs. Live stderr forwarding to `context.log`. |
 | **Pipes** | `run_pipes()` | Full Dagster Pipes. Structured `MaterializationEvent` and `AssetCheckEvaluation` per table. |
-
-Choose `run()` for simple cases, `run_streaming()` when you want live log visibility in the Dagster UI, and `run_pipes()` when you want per-table materialization events.
 
 ## HTTP fallback
 

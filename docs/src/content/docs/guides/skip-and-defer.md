@@ -10,7 +10,7 @@ sidebar:
 - **`--skip-unchanged`** skips re-materializing a model when both its logic and its upstream data look unchanged, an incremental cost-saving optimization.
 - **`--defer`** builds only the models you selected and reads every unbuilt upstream from production, a development inner-loop convenience.
 
-Both are **off by default**: a plain `rocky run` is byte-identical to one without these flags. This guide covers when to reach for each, the safety contract behind `--skip-unchanged`, and the limitations to know before you rely on either.
+Both are **off by default**: a plain `rocky run` is byte-identical to one without these flags.
 
 :::caution[Skipping is a best-effort optimization, not a correctness guarantee]
 `--skip-unchanged` decides *not to rebuild* a model from heuristics (a logic-hash and an upstream-freshness signal). A wrong skip is silent production staleness, the worst failure a transformation engine can have. The gate is therefore built to **fail safe**: every missing, unreadable, or ambiguous input forces a **rebuild**, never a skip. Read the [safety contract](#the-skip-unchanged-safety-contract) before you turn it on.
@@ -63,7 +63,7 @@ A `full_refresh` model **is** eligible: a deterministic full-refresh whose logic
 Eligibility is a conservative static check. A model is **not** skip-eligible (it always rebuilds, fail-safe) when any of these is true:
 
 - **Non-deterministic SQL.** The model calls a volatile builtin whose output can differ run to run: `CURRENT_TIMESTAMP`, `NOW`, `GETDATE`, `CURRENT_DATE`, `RANDOM`, `UUID` / `GEN_RANDOM_UUID`, `CURRENT_USER`, `CURRENT_CATALOG`, and similar. Any function not on Rocky's pure-function allowlist is treated as non-deterministic.
-- **Order- or tie-break-unstable aggregates.** `ANY_VALUE`, `ARRAY_AGG`, `COLLECT_LIST`, `COLLECT_SET`, and `MODE` are deliberately absent from the pure allowlist: without a `WITHIN GROUP (ORDER BY …)` their output ordering (or `MODE`'s tie-break) is engine-defined and can differ run to run. A model using them rebuilds. This is one concrete reason the gate is best-effort, not a result-equivalence proof: the static scan excludes them rather than risk a wrong skip.
+- **Order- or tie-break-unstable aggregates.** `ANY_VALUE`, `ARRAY_AGG`, `COLLECT_LIST`, `COLLECT_SET`, and `MODE` are deliberately absent from the pure allowlist: without a `WITHIN GROUP (ORDER BY …)` their output ordering (or `MODE`'s tie-break) is engine-defined and can differ run to run. A model using them rebuilds.
 - **An unordered row limit.** A `LIMIT` / `TOP` / `FETCH` with no total `ORDER BY` returns implementation-defined rows.
 - **The lineage isn't provably complete.** The freshness check (B3) trusts a model's `FROM`/`JOIN` enumeration only when it can prove that walk surfaces *every* upstream: a single plain `SELECT` over bare tables, no CTEs, no sub-queries anywhere. Anything else could read an upstream the walk never examined: a CTE, a sub-query in `FROM`, a `PIVOT` / `UNNEST` / nested-join table factor, an `IN (SELECT …)` / `EXISTS` / scalar sub-select, or a set operation (`UNION` / `INTERSECT` / `EXCEPT`). On any of these the model rebuilds rather than risk skipping on an input it didn't check.
 - **Content-addressed or time-interval strategies.** These use the per-partition / content-addressed paths, not the skip gate.
@@ -142,7 +142,7 @@ A `full_refresh` model rebuilds its whole table every run (`CREATE OR REPLACE TA
 | Guarantee a model rebuilds (overriding the skip gate) | `--force-rebuild` | n/a |
 | Rebuild a table from scratch every run | `full_refresh` strategy | — |
 
-`--skip-unchanged` and `--defer` serve opposite loops (scheduled/CI runs versus the local inner loop) and are independent flags: both are off until you ask for them, and neither changes the other's default. A plain `rocky run` is byte-identical to its pre-flag behaviour.
+`--skip-unchanged` and `--defer` serve opposite loops (scheduled/CI runs versus the local inner loop) and are independent: enabling one never changes the other's default.
 
 ## Related
 

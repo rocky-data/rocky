@@ -5,9 +5,9 @@ sidebar:
   order: 9
 ---
 
-This guide is for auditors: compliance, governance, or finance reviewers who need to verify what a Rocky pipeline did, without trusting (or installing) the `rocky` binary. Everything below uses general-purpose tools (a small redb reader, a SQL client, and a Parquet hasher) to answer the questions an audit actually asks.
+This guide shows a compliance, governance, or finance reviewer how to verify what a Rocky pipeline did without trusting (or installing) the `rocky` binary, using general-purpose tools (a small redb reader, a SQL client, and a Parquet hasher) to answer the questions an audit actually asks.
 
-The premise is deliberate. Rocky records every run into an embedded ledger and, on the content-addressed write path, names output files by the hash of their bytes. Both facts are verifiable with off-the-shelf tools. You do not have to take Rocky's word for any of it.
+Rocky records every run into an embedded ledger and, on the content-addressed write path, names output files by the hash of their bytes. Both facts are verifiable with off-the-shelf tools.
 
 ## The audit question
 
@@ -26,7 +26,7 @@ The first three come straight out of Rocky's state ledger. The fourth is confirm
 
 None of these is the `rocky` binary.
 
-1. **A redb reader.** Rocky's ledger is an [redb](https://github.com/cberner/redb) embedded key-value store, written to `.rocky-state.redb` (local backend). redb has no ubiquitous CLI, so the reader below is a ~30-line Rust program using the open-source `redb` crate and `serde_json`. The reader opens tables and decodes their values; it has no dependency on Rocky.
+1. **A redb reader.** Rocky's ledger is an [redb](https://github.com/cberner/redb) embedded key-value store, written to `.rocky-state.redb` (local backend). redb has no ubiquitous CLI, so the reader below is a ~30-line Rust program using the open-source `redb` crate and `serde_json`. The reader opens tables and decodes their values.
 2. **A SQL client.** Whatever speaks to your warehouse: `duckdb`, `snowsql`, the `bq` CLI, or the Databricks SQL CLI (`dbsqlcli`). Used to confirm the output table's schema and row count.
 3. **A Parquet hasher.** For the content-addressed path (last section), a `blake3` hasher such as [`b3sum`](https://github.com/BLAKE3-team/BLAKE3) plus any Parquet viewer.
 
@@ -184,7 +184,7 @@ The matching `output_artifacts` ledger row carries the same hash plus the join k
 }
 ```
 
-Because the filename *is* the hash, and the ledger row carries that hash, three independent things must agree: the filename, your own `b3sum` of the bytes, and the recorded `blake3_hash`. Any divergence means the bytes changed since the run.
+Because the filename *is* the hash and the ledger row carries it, any divergence between the filename, your own `b3sum`, and the recorded `blake3_hash` means the bytes changed since the run.
 
 This stronger guarantee applies specifically to the content-addressed materialization path. A general run against DuckDB, Snowflake, BigQuery, or Databricks records the ledger and `sql_hash` (the walkthrough above), but does not emit a hash-named Parquet.
 
@@ -282,5 +282,3 @@ Every load-bearing claim above, graded against what ships today:
 | Reuse *decision*: actually reusing a prior run's bytes instead of re-executing | **Experimental, not production-ready** — a fail-closed decision path exists on the Databricks-Iceberg content-addressed path but is not yet live-verified; do not enable `[reuse]` in production |
 | `bytes_written` per model | Not yet — `null` on every adapter today |
 | Warehouse-native zero-copy clones for branches | Not yet — branches are isolated schema prefixes, not engine-native clones |
-
-The ledger inspection and the content-addressed hash check are real and verifiable now. The experimental `[reuse]` provenance record is recorded (default-off, Databricks-Iceberg content-addressed path) and offline-recomputable, but reuse is not yet live-verified. Do not enable it in production. The execution and live reuse claims (re-execution, native clones, byte-reuse) are deliberately excluded from what this guide promises.

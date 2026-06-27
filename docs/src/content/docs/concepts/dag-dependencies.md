@@ -90,9 +90,7 @@ Not every table reference creates a dependency. Rocky classifies references base
 | `dbt_fivetran.stg_facebook_ads__ad_history` | Two-part external | Ignored by DAG |
 | `analytics.dbt_fivetran.stg_facebook_ads__ad_history` | Three-part external | Ignored by DAG |
 
-**Bare names** are resolved against the project's models. If a match is found, a dependency edge is created. If no model matches, the reference is treated as external.
-
-**Two-part** (`schema.table`) and **three-part** (`catalog.schema.table`) references are always treated as external sources. Rocky reads from them but does not manage, build, or schedule them.
+Rocky reads from external tables but does not manage, build, or schedule them.
 
 This distinction enables hybrid workflows where Rocky models consume tables produced by other tools (dbt packages, Fivetran connectors, manual ETL) without needing to convert or import them. External tables appear in column-level lineage but are excluded from execution planning.
 
@@ -135,4 +133,4 @@ The differences:
 | SQL purity | SQL mixed with Jinja | Pure SQL, no template language |
 | Editor support | Requires dbt LSP for `ref()` | Standard SQL tooling works |
 
-Rocky's approach means the DAG is validated early and independently of SQL parsing. You can run `rocky validate` to check the entire dependency graph without connecting to any warehouse.
+You can run `rocky validate` to check the entire dependency graph without connecting to any warehouse.

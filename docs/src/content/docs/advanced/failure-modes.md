@@ -47,7 +47,7 @@ The categories are **independent**: a single pipeline can hit several at once, a
 3. Fix the model SQL or the upstream contract that triggered the diagnostic.
 4. Re-run `rocky compile` until clean.
 
-**Why this matters first.** Every other category in the taxonomy assumes compile is green. A `rocky apply` against a project with compile errors aborts before any warehouse work, so it's pointless to debug runtime symptoms while diagnostics are red.
+A `rocky apply` against a project with compile errors aborts before any warehouse work, so fix red diagnostics before debugging runtime symptoms.
 
 **Per-model compile failure during a run.** The whole-project abort above is the common case. A model that compiles in isolation but fails to compile when its turn comes during a run (for example after an upstream change shifts a type) is now contained at the table boundary rather than passed over: it's counted in `tables_failed`, gets an `errors[*]` entry with [`failure_kind: "compile-error"`](./per-table-error-containment#failure_kind-taxonomy) carrying the diagnostic, and the run exits non-zero (status `Failure`, or `PartialFailure` when other models succeeded). Earlier engine versions skipped the model and still reported the run as a success.
 
@@ -75,7 +75,7 @@ The categories are **independent**: a single pipeline can hit several at once, a
    - update the contract, only if the schema change is intentional and downstream consumers have been migrated.
 4. Re-run `rocky compile` to confirm.
 
-**Why contracts get their own category.** Contract violations are the load-bearing trust signal for downstream consumers. A passing contract is the lever that lets you refactor a model's internals without breaking everyone reading from it. Treating contract failures as their own category (rather than lumping them with general compile errors) keeps the recovery focused on whether the contract is still right, not just whether the compiler is happy.
+Contract violations are the load-bearing trust signal for downstream consumers: a passing contract is the lever that lets you refactor a model's internals without breaking everyone reading from it.
 
 ---
 
@@ -100,7 +100,7 @@ The `drifted_columns` array names which columns changed and what the divergence 
 - **`DropAndRecreate`**: Rocky will full-refresh the target on the next run. If the table is large or downstream consumers can't tolerate the temporary unavailability, schedule the next run during a maintenance window.
 - For columns in the **grace period** (`grace_period_columns`), decide before the deadline whether to keep them (re-adding upstream restores the column) or accept the drop.
 
-**Why this is its own category.** Schema drift is the only category where the runtime takes a corrective action *automatically*; every other category requires human or LLM intervention. The playbook is mostly "audit Rocky's plan, then let it run."
+Schema drift is the only category where the runtime takes a corrective action *automatically*. The playbook is mostly "audit Rocky's plan, then let it run."
 
 ---
 
@@ -146,8 +146,6 @@ The dispatched adapter classifies its own failures:
 4. For **quota** failures, check the warehouse-side quota dashboard. Rocky's adaptive concurrency (Databricks AIMD throttle) automatically backs off, but a hard quota reset is a warehouse-side action.
 5. For **statement timeouts**, increase `timeout_secs` on the adapter, or better, re-evaluate whether the model's materialization strategy is right (a multi-hour `FullRefresh` is often a missed `Merge` or `Incremental` opportunity; `rocky optimize` will surface the recommendation).
 
-**Why this category is broad.** Adapter failures are inherently warehouse-specific and can't be normalised away; Rocky surfaces them faithfully and lets the per-adapter docs / playbook take over. The playbook here is the *triage shape*, not a per-error fix list.
-
 ---
 
 ## 6. State store failures
@@ -187,7 +185,7 @@ The dispatched adapter classifies its own failures:
 3. If the hook is a **webhook**, check the receiver's logs for the actual rejection. Rocky surfaces only the HTTP status; the receiver's body usually has the actionable message.
 4. If a hook is **flaky** (network blip, third-party rate limit), set `on_failure = "warn"` so transient failures don't gate the run, and rely on `hook_results[]` in your dagster fixture / observability stack to flag the regression.
 
-**Why hooks are a separate category.** Hook failures look like runtime failures but live in a different recovery shape: the fix is in your hook script or webhook receiver, not in the pipeline. Treating them separately keeps the warehouse-runtime playbook focused.
+Hook failures look like runtime failures, but the fix is in your hook script or webhook receiver, not in the pipeline.
 
 ---
 
@@ -231,7 +229,7 @@ The dispatched adapter classifies its own failures:
 3. **Mask mismatch.** Re-run `rocky plan --env <env>` to preview what Rocky would apply. The active env's `[mask.<env>]` overrides the workspace `[mask]` defaults; if the override isn't taking effect, double-check the env name spelling and the inheritance order documented in the [governance guide](../../guides/governance).
 4. **Retention sweep failure.** Usually a missing partition column or a permissions issue on the target. Run `rocky doctor --output json` to confirm the adapter has the right grants on the target schema.
 
-**Why governance is last.** Permissions and masking apply *after* materialisation succeeded; a governance failure means the data landed but isn't fully wired into your access model. The recovery is rarely time-critical (the warehouse is in a defined state), but the failure must close before the next compliance audit.
+Permissions and masking apply *after* materialisation succeeded, so a governance failure means the data landed but isn't fully wired into your access model. Recovery is rarely time-critical, but the failure must close before the next compliance audit.
 
 ---
 

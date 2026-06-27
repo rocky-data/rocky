@@ -96,21 +96,11 @@ rocky.run(filter="tenant=acme", shadow_suffix=suffix)
 
 ## Why detection only?
 
-The original T5.3 plan called for a full branch-deployment workflow
-including GitHub PR comment posting with diff summaries. **That part
-was descoped per the v0.4 review** for three reasons:
-
-1. **Credential surface**: PR commenting needs a GitHub token with
-   the right scope; managing token rotation is brittle.
-2. **Git host portability**: GitHub Enterprise, GitLab, and Bitbucket
-   each have different APIs. A Rocky-side wrapper would need three
-   implementations and ongoing maintenance.
-3. **Duplication**: Dagster+ branch deployments already render the
-   asset diff in the UI. PR-comment posting just rebroadcasts it.
-
-The detection + shadow-suffix derivation is the genuinely useful
-Rocky-specific piece that doesn't depend on a particular Git host or
-require any credentials.
+PR-comment posting with diff summaries was descoped: it needs
+per-Git-host credentials (GitHub, GitLab, and Bitbucket each differ)
+and just rebroadcasts the asset diff Dagster+ already renders in the UI.
+Detection plus shadow-suffix derivation is the credential-free,
+host-agnostic piece worth shipping.
 
 ## Future work
 

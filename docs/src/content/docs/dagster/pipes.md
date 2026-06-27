@@ -12,10 +12,9 @@ Rust `tracing` layer writes `info!()` / `warn!()` macros) to
 `context.log.info` line-by-line as the run progresses, and parses the
 final stdout JSON into a `RunResult` after the subprocess exits.
 
-This gives long-running pipelines live progress visibility. Without it,
-the Dagster run viewer shows nothing for the duration of a 30-minute
-`rocky run` and dumps the entire log at the end. With it, users see each
-model copy / contract check / drift action as it happens.
+This gives long-running pipelines live progress: instead of the run
+viewer dumping the whole log only after a 30-minute `rocky run` finishes,
+users see each model copy / contract check / drift action as it happens.
 
 ## Quickstart
 
@@ -160,10 +159,8 @@ def my_asset(context, rocky: RockyResource):
     return result.tables_copied
 ```
 
-Spawns rocky via `subprocess.Popen`, forwards stderr line-by-line to
-`context.log.info` for live progress, parses the final stdout JSON into
-a `RunResult` after the subprocess exits. Doesn't depend on Pipes
-message emission; works against any rocky binary.
+Live progress with a batch result. Doesn't depend on Pipes message
+emission, so it works against any rocky binary.
 
 ### `run_pipes()`: full Dagster Pipes (structured events)
 
@@ -183,15 +180,11 @@ reviewers can click straight from the materialization back to the plan
 artifact that produced it.
 
 The rocky engine (v0.4+) detects the Pipes env vars and emits structured
-Pipes messages on the messages channel:
-
-* `report_asset_materialization` per copied table: appears as a
-  `MaterializationEvent` in the run viewer with structured metadata
-  (strategy, duration_ms, rows_copied, target_table_full_name,
-  sql_hash, partition_key)
-* `report_asset_check` per Rocky check: appears as
-  `AssetCheckEvaluation` in the run viewer
-* `log` events for run start, completion, and drift actions
+Pipes messages on the messages channel; see [Engine-side
+emission](#engine-side-dagster-pipes-message-emission) for the message
+types. In the run viewer these surface as `MaterializationEvent`s (with
+strategy, duration_ms, rows_copied, sql_hash, partition_key) and
+`AssetCheckEvaluation`s.
 
 Returns a `PipesClientCompletedInvocation`. Call `.get_results()` to
 extract the materialization events Dagster constructed from the Pipes
@@ -201,8 +194,6 @@ On replication-only projects (no `models/` directory), `rocky plan`
 cannot persist a plan, so `run_pipes` falls back to a single
 `rocky run` Pipes invocation. No `plan_id` is attached to `extras` in
 that case.
-
-This is the canonical Dagster Pipes integration pattern.
 
 ## Engine-side: Dagster Pipes message emission
 
@@ -223,16 +214,14 @@ no external dependency. On a run it:
    overhead for non-Dagster callers.
 
 The current engine emission is **batch at end of run** (events emit
-right before the JSON output payload, not as each table completes).
-This gives Dagster the structured events without requiring the larger
-refactor to thread the emitter through the async parallel execution
-path. Future v0.5 work can upgrade to per-event streaming with no
-wire-protocol or consumer changes.
+right before the JSON output payload, not as each table completes). A
+future v0.5 can upgrade to per-event streaming with no wire-protocol or
+consumer changes.
 
 ## RockyComponent default
 
-`RockyComponent` users get `run_streaming` automatically; no decision
-needed. To get full Pipes integration with structured events, switch
-to a hand-rolled `@dg.asset` that calls `rocky.run_pipes()` directly.
-A future RockyComponent flag (`pipes_mode=True`) can flip the default
-once we've shaken out the integration in the wild.
+To get full Pipes integration with structured events from a
+`RockyComponent`, switch to a hand-rolled `@dg.asset` that calls
+`rocky.run_pipes()` directly. A future RockyComponent flag
+(`pipes_mode=True`) can flip the default once we've shaken out the
+integration in the wild.

@@ -24,7 +24,7 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 Rocky exists because the most expensive failures in modern data platforms aren't slow queries. They're trust failures. A column type changes upstream and a revenue dashboard quietly diverges for three days. A `SELECT *` pulls a new column nobody designed for. A Snowflake-only function lands in a Databricks-targeted project and only fails in prod. Warehouse spend doubles and nobody can attribute which model caused it. An auditor asks who changed `fct_revenue.amount` and when.
 
-**Rocky moves correctness into the compiler.** The disasters above become things you catch before a row is written: a column-type change is `E013` at compile, a rename's blast radius is a `rocky lineage-diff` comment on the PR, a cost spike is a `[budget]` block that fails the run, and every run leaves a content-addressed record. These failures are invisible to the warehouse and out of reach of the templating layer above it. Rocky is the typed graph in between.
+**Rocky moves correctness into the compiler.** Each disaster above becomes something you catch before a row is written, invisible to the warehouse and out of reach of the templating layer above it. Rocky is the typed graph in between.
 
 <CardGrid>
   <Card title="Typed compiler, not a templating engine" icon="approve-check">
@@ -49,7 +49,7 @@ Rocky exists because the most expensive failures in modern data platforms aren't
     Tests are declarative TOML and Rocky generates the assertion SQL for your target dialect. Define an assertion once in `models/test_definitions.toml` and apply it by name with `[[use_test]]`. Fixture-driven `[[test]]` blocks seed mock inputs, run the model SQL, and compare the rows on `rocky test` via DuckDB, no warehouse required. A `[[surrogate_key]]` block injects a deterministic hash into your SELECT whose value matches `dbt_utils.generate_surrogate_key` on the same warehouse.
   </Card>
   <Card title="A tested exit door, not a one-way door" icon="cloud-download">
-    `rocky emit-sql` renders the compiled SQL for your transformation models with no warehouse connection. The output is plain runnable SQL with no Rocky-specific syntax, so adopting Rocky never locks you in. A CI test emits the full-refresh SQL and runs it directly against DuckDB, so the exit path stays runnable as the engine evolves.
+    `rocky emit-sql` renders the compiled SQL for your transformation models with no warehouse connection. The output is plain runnable SQL with no Rocky-specific syntax, so adopting Rocky never locks you in.
   </Card>
 </CardGrid>
 
@@ -70,7 +70,7 @@ No credentials needed; the playground is DuckDB-backed and seeds itself on first
 
 ## One trace, one cost graph, one replay handle
 
-`rocky run` writes a single `RunRecord` to the state store. Three read commands project that record from different angles: `rocky trace` for causality and concurrency, `rocky cost` for per-model warehouse spend, and `rocky replay` for the byte-for-byte reproduction. One record, three views. Walk through it end-to-end in [POC #17 (trace + cost + replay against the same run_id)](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo).
+`rocky run` writes a single `RunRecord` to the state store. Three read commands project that record from different angles: `rocky trace` for causality and concurrency, `rocky cost` for per-model warehouse spend, and `rocky replay` for the byte-for-byte reproduction. Walk through it end-to-end in [POC #17 (trace + cost + replay against the same run_id)](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo).
 
 <video src="/trace-cost-replay-combo.mp4" controls width="720"></video>
 

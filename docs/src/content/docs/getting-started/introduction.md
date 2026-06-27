@@ -18,7 +18,7 @@ The expensive failures in modern data platforms aren't slow queries. They're tru
 - Warehouse spend doubles in a month and nobody can attribute which model caused it.
 - An auditor asks who changed `fct_revenue.amount`, when, and why, and the honest answer is `git blame` and screenshots.
 
-**Rocky's answer is to make each of these failures a compile error or a CI gate**, caught before it ships. A column-type change is `E013` at compile; a rename's blast radius is a `rocky lineage-diff` comment on the PR; an unbudgeted cost spike is a `[budget]` block that fails the run; classified PII with no mask strategy fails `rocky compliance`. These are failures the warehouse can't see and the templating layer above it can't catch at compile time, the gap Rocky fills as the typed graph between your code and your data. For how Rocky stacks up against dbt Core, dbt Fusion, and SQLMesh, see the [comparison](/getting-started/comparison/).
+**Rocky's answer is to make each of these failures a compile error or a CI gate**, caught before it ships. A column-type change is `E013` at compile; a rename's blast radius is a `rocky lineage-diff` comment on the PR; an unbudgeted cost spike is a `[budget]` block that fails the run; classified PII with no mask strategy fails `rocky compliance`. These are failures the warehouse can't see and the templating layer above it can't catch at compile time. For how Rocky stacks up against dbt Core, dbt Fusion, and SQLMesh, see the [comparison](/getting-started/comparison/).
 
 ## Who Rocky is for
 
@@ -30,9 +30,9 @@ Rocky is **not** a fit for: greenfield analytics shops with no scale pain, singl
 
 ## What Rocky is
 
-A typed compiler that drives your warehouse. Storage and compute stay where they are. Rocky owns the graph: dependencies, compile-time types, drift handling, incremental logic, lineage, cost, contracts, and governance.
+Rocky owns the graph: dependencies, compile-time types, drift handling, incremental logic, lineage, cost, contracts, and governance. Storage and compute stay with your warehouse.
 
-**Rocky is not a warehouse, not a table format, not a query engine.** It's the typed graph between your code and whichever of those you've chosen.
+**Rocky is not a warehouse, not a table format, not a query engine.**
 
 ## Scope on the ELT spectrum
 
@@ -45,7 +45,7 @@ A typed compiler that drives your warehouse. Storage and compute stay where they
 | Quality | ✅ | Inline assertions during `rocky apply`; no separate test step |
 | Orchestration | Partial | First-class Dagster integration; `rocky serve` for small standalone teams |
 
-Quality is more than the inline runtime gate. Alongside the assertions that run during `rocky apply`, models can declare fixture-driven unit tests (`[[test]]` blocks that mock upstream rows and assert the expected output) and declarative data tests (`[[tests]]` blocks of not-null, uniqueness, accepted-values, and similar assertions, with reusable named definitions applied by name through `[[use_test]]`). Unit tests exercise a model's SQL against fixtures you control and run locally on DuckDB with `rocky test`; declarative tests check the rows already in your warehouse and run with `rocky test --declarative`. Both give you a pre-deployment and CI surface that complements the inline checks. See [Testing and Contracts](/concepts/testing/).
+Quality is more than the inline runtime gate. Models can also declare fixture-driven unit tests (`rocky test`, run locally on DuckDB) and declarative data tests like not-null and uniqueness checks against warehouse rows (`rocky test --declarative`). See [Testing and Contracts](/concepts/testing/).
 
 ## The seven trust dimensions
 
@@ -61,7 +61,7 @@ Quality is more than the inline runtime gate. Alongside the assertions that run 
 
 The trust primitives (compiler, branches, replay, lineage, contracts, cost) are production-grade on Databricks. Snowflake, BigQuery, and Trino are Beta: the core run loop works, and conformance coverage is still growing. The wider AI workflow, Iceberg-native writes, and a semantic layer are on the roadmap.
 
-See the [Roadmap](/getting-started/roadmap/) for the full breakdown of what's shipped, what's Beta, and what's coming.
+See the [Roadmap](/getting-started/roadmap/) for the full breakdown.
 
 ## Practical differentiators
 
@@ -95,10 +95,8 @@ Full side-by-side comparison: [features/comparison](/getting-started/comparison/
 ## Design principles
 
 1. **Adapter-based.** Source adapters (Fivetran, Airbyte, DuckDB, Iceberg, manual) handle discovery. Warehouse adapters (Databricks, Snowflake, BigQuery, Trino, DuckDB) handle execution. The core engine is warehouse-agnostic.
-2. **Config over code.** Bronze layer replication needs no SQL, just TOML.
-3. **Pure SQL models.** Silver-layer transformations use standard SQL plus a `.toml` sidecar.
-4. **Inline quality checks.** Data checks run during replication, not as a separate step.
-5. **Structured output.** Every command emits versioned JSON for orchestrator consumption.
+2. **Inline quality checks.** Data checks run during replication, not as a separate step.
+3. **Structured output.** Every command emits versioned JSON for orchestrator consumption.
 
 ## Supported adapters
 

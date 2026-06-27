@@ -34,7 +34,7 @@ freshness = { threshold_seconds = 86400 }
 
 Compares `COUNT(*)` between source and target tables. The check passes if counts match.
 
-Rocky uses batched queries with `UNION ALL`. Instead of running one query per table (5N queries for N tables), it batches up to 200 tables per query, reducing the total to roughly 3 queries for a typical pipeline.
+Rocky uses batched queries with `UNION ALL`. Instead of running one query per table (5N queries for N tables), it batches up to 200 tables per query, reducing the total to roughly 3 queries for a typical pipeline. Freshness checks batch the same way.
 
 ```json
 {
@@ -92,10 +92,6 @@ custom = [
 ```
 
 The check passes if the query result is less than or equal to the threshold.
-
-### Batched execution
-
-Row count and freshness checks use batched `UNION ALL` queries in groups of 200 tables. This minimizes round trips to the warehouse even when replicating hundreds of tables in a single run.
 
 ## Model-level declarative assertions (DQX parity)
 

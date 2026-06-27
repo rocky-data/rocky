@@ -7,7 +7,7 @@ sidebar:
 
 Rocky talks to warehouses through a small set of traits in the `rocky-adapter-sdk` crate. Implementing those traits gives you a working warehouse adapter, the same way `rocky-databricks`, `rocky-snowflake`, `rocky-bigquery`, `rocky-trino`, and `rocky-duckdb` are wired today.
 
-This guide walks a Rust developer from "I want a ClickHouse adapter" to a compiling skeleton with passing tests in roughly fifteen minutes. The runnable skeleton lives at [`examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton) and is shaped after ClickHouse, but the same shape works for Redshift, StarRocks, MotherDuck, or any SQL warehouse Rocky doesn't ship in-tree. (Trino is in-tree as of engine v1.28.0; see the [`rocky-trino` crate](/concepts/architecture/#rocky-trino).)
+This guide walks a Rust developer from "I want a ClickHouse adapter" to a compiling skeleton with passing tests. The runnable skeleton lives at [`examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton) and is shaped after ClickHouse, but the same shape works for Redshift, StarRocks, MotherDuck, or any SQL warehouse Rocky doesn't ship in-tree. (Trino is in-tree as of engine v1.28.0; see the [`rocky-trino` crate](/concepts/architecture/#rocky-trino).)
 
 ## When to reach for the SDK
 
@@ -204,8 +204,6 @@ Two looser paths if upstreaming isn't an option yet:
 A dynamic registration path (declarative config + crates.io discovery) is on the roadmap but unscheduled. Until it lands, the SDK's job is to keep the trait surface stable enough that your fork is forward-compatible.
 
 ## Gotchas worth knowing about
-
-These are real and surface during implementation. Flagging them up front so you don't lose half a day debugging.
 
 - **The SDK trait surface now mirrors most of the in-tree one.** `rocky-adapter-sdk/src/traits.rs` is the public, marketed contract; `rocky-core/src/traits.rs` is what the in-tree adapters use. The SDK gained default-impl methods for `execute_statement_with_stats` (and `ExecutionStats`), `ping`, `explain` (and `ExplainResult`), `is_experimental`, `warehouse_name`, and `list_tables`, so out-of-tree adapters get the same shape in-tree adapters use. A few methods still differ pending cross-crate type unification (`fetch_arrow_batch`, `clone_table_for_branch`, and the `merge_into` signature), plus a handful of duplicated types (`TableRef`, `ColumnInfo`, `Grant`, `MetadataColumn`). Target the SDK surface and treat those as not-yet-stable.
 - **Identifier validation is not optional.** Anything you splice into SQL must pass `[A-Za-z0-9_]+` (or your warehouse's equivalent). The skeleton's `validate_ident` shows the pattern. SQL-injection-bearing string literals were the subject of [a real CVE-class fix](https://github.com/rocky-data/rocky/pull/293); don't reinvent that hole.

@@ -119,7 +119,7 @@ Listed in every emitted `MIGRATION-NOTES.md`:
 - Macros and `dbt_packages/`: skipped. The [hybrid-dbt-packages POC](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/06-hybrid-dbt-packages) is the documented escape hatch.
 - dbt model contracts (`contract: {enforced}`, column `data_type`, `constraints`): not carried over to Rocky's contract model. Each is reported with a warning and counted in `contracts_dropped` (JSON output and `MIGRATION-NOTES.md`) so you know which models had a contract to re-author by hand.
 
-The four built-in dbt generic tests (`unique`, `not_null`, `accepted_values`, `relationships`) translate to native Rocky `[[tests]]` on the matching per-model sidecar. So do several common `dbt_utils` / `dbt_expectations` tests: `accepted_range` / `expect_column_values_to_be_between` → `in_range`, `expect_column_values_to_match_regex` → `regex_match`, `expect_column_values_to_be_in_set` → `accepted_values`, `dbt_utils.expression_is_true` → `expression`, and `unique_combination_of_columns` → a `composite` uniqueness test. Tests with no native equivalent, or that reference columns Rocky didn't translate, are surfaced as `UnsupportedTest` warnings and listed in `MIGRATION-NOTES.md` rather than silently dropped. See the full [generic test mapping](/guides/migrate-from-dbt/#generic-test-mapping).
+The four built-in dbt generic tests (`unique`, `not_null`, `accepted_values`, `relationships`) translate to native Rocky `[[tests]]` on the matching per-model sidecar, as do several common `dbt_utils` / `dbt_expectations` tests. Tests with no native equivalent, or that reference columns Rocky didn't translate, are surfaced as `UnsupportedTest` warnings and listed in `MIGRATION-NOTES.md` rather than silently dropped. See the full [generic test mapping](/guides/migrate-from-dbt/#generic-test-mapping).
 
 ### Examples
 
@@ -197,7 +197,7 @@ rocky serve [flags]
 `rocky serve` binds **`127.0.0.1` (loopback) by default**. Every endpoint except `/api/v1/health` requires a Bearer token. Two operating modes:
 
 - **Loopback only (default)** — bind stays on `127.0.0.1`. Authentication is still on, so external processes (LSP, dashboards) need the token, but a misconfigured network won't expose model SQL to the LAN.
-- **Non-loopback bind** — `--host 0.0.0.0` (or any non-loopback address) **requires `--token <secret>`** (or the `ROCKY_SERVE_TOKEN` env var). `rocky serve` refuses to start otherwise. This prevents the "I just wanted to try it from another machine" foot-gun shipping model SQL to the LAN unauthenticated.
+- **Non-loopback bind** — `--host 0.0.0.0` (or any non-loopback address) **requires `--token <secret>`** (or the `ROCKY_SERVE_TOKEN` env var); `rocky serve` refuses to start otherwise.
 
 CORS is empty-by-default. Browser apps must declare every allowed origin via `--allowed-origin <ORIGIN>`. Permitted methods: `GET`, `POST`, `OPTIONS`. Permitted headers: `Authorization`, `Content-Type`.
 
@@ -237,8 +237,6 @@ Call an authenticated endpoint:
 ```bash
 curl -H "Authorization: Bearer $ROCKY_SERVE_TOKEN" http://127.0.0.1:8080/api/models
 ```
-
-`/api/v1/health` is exempt and reachable without the token.
 
 Start with file watching on a custom port:
 

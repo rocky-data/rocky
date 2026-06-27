@@ -45,7 +45,7 @@ The closest published commercial analogue is Fivetran's [Smart Run for dbt Core]
 | Data diff | Not surfaced in the article | First-class output ([`PreviewDiffOutput`](#output-shapes)) |
 | PR comment | Not described in the article | Pre-rendered Markdown in every output |
 
-The article does not document Smart Run's internal mechanism beyond the conceptual diagram and the "manifest-independent" claim, so the rows above hedge accordingly. The structural advantages (column-level pruning, compile-time type-equivalence detection, warehouse-native clones) are reachable because Rocky has its own compiler. They are unreachable from inside dbt without rewriting dbt's compiler.
+The article does not document Smart Run's internal mechanism beyond the conceptual diagram and the "manifest-independent" claim, so the rows above hedge accordingly. The structural advantages above are reachable because Rocky owns its compiler; they are unreachable from inside dbt without rewriting dbt's.
 
 ## Two diff algorithms
 

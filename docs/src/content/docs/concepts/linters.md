@@ -16,11 +16,11 @@ Rocky ships two built-in lints that catch the two most common silent-breakage cl
 
 ## Semantic lints, not style lints
 
-A SQL style linter such as SQLFluff checks the text of a query: indentation, alias conventions, ambiguous references, unused columns. It runs before the warehouse executes anything and reasons only about the SQL as written. That work is worth doing, and Rocky doesn't replace it. Run a style linter alongside Rocky if you want consistent formatting.
+A SQL style linter such as SQLFluff checks the text of a query: indentation, alias conventions, ambiguous references, unused columns. That work is worth doing, and Rocky doesn't replace it; run a style linter alongside Rocky if you want consistent formatting.
 
 Rocky's lints answer a different question. P001 and P002 are **semantic**: they read the compiled model graph, not a single query in isolation, so they catch breakage a style linter can't see. P001 knows a construct won't run on your target warehouse. P002 knows a `SELECT *` will silently propagate an upstream schema change to a specific downstream consumer. A query can be perfectly well-formatted and still fail both.
 
-These compile-time lints are the first of three layers. Beyond them, Rocky enforces at run time: [data-quality checks](/concepts/data-quality-checks/) and [schema-drift detection](/concepts/schema-drift/) verify that a model's actual output still matches what it declared. A style linter checks that the SQL is well-formed. Rocky's lints check it won't break the graph. The contract layer checks the data itself is what you promised.
+These compile-time lints are the first of three layers. Beyond them, Rocky enforces at run time: [data-quality checks](/concepts/data-quality-checks/) and [schema-drift detection](/concepts/schema-drift/) verify that a model's actual output still matches what it declared.
 
 ---
 
