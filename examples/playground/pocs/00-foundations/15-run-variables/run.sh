@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 # 15-run-variables — per-run `@var()` variables substituted into model SQL.
 #
-# The model `regional_sales` filters on two run variables:
-#   @var(region)        REQUIRED  — no inline default
-#   @var(channel, web)  OPTIONAL  — inline default of `web`
+# The model `regional_sales` filters on three run variables:
+#   @var(region)         REQUIRED  — no inline default, inside a string literal
+#   @var(channel, web)   OPTIONAL  — inline default of `web`, inside a literal
+#   @var(min_amount, 0)  OPTIONAL  — inline default of `0`, BARE (numeric, no
+#                                    surrounding quotes)
 #
 # This script proves:
 #   1. `rocky run --var region=us` materializes ONLY the matching rows
-#      (the optional channel defaults to `web`)
+#      (the optional channel defaults to `web`, min_amount to `0`)
 #   2. a repeated `--var` (region + channel) changes which rows land
-#   3. `rocky emit-sql --var region=us` shows the RESOLVED values, not the
-#      literal `@var(...)` markers
-#   4. `@var(channel, web)` resolves to its inline DEFAULT when --var is omitted
-#   5. a REQUIRED `@var(region)` with no --var makes `rocky compile` fail with
+#   3. a BARE `@var(min_amount, 0)` in numeric position works on the run path:
+#      `--var min_amount=200` filters to amounts >= 200
+#   4. `rocky emit-sql --var region=us` shows the RESOLVED values, not the
+#      literal `@var(...)` markers — both quoted and bare
+#   5. `@var(channel, web)` resolves to its inline DEFAULT when --var is omitted
+#   6. a REQUIRED `@var(region)` with no --var makes `rocky compile` fail with
 #      a clear E028 error naming the variable
 set -euo pipefail
 
@@ -66,25 +70,45 @@ fi
 echo "OK: overriding the optional channel var changed the materialized slice"
 
 echo
-echo "==== 4. emit-sql --var region=us — markers resolve to literal values ===="
+echo "==== 4. a BARE @var(min_amount, 0) in numeric position works on the run path ===="
+# min_amount is bare (no surrounding quotes): `amount >= @var(min_amount, 0)`.
+# Supplying --var min_amount=200 keeps only us/web rows with amount >= 200.
+rocky -c rocky.toml -o json run --models models/ --var region=us --var min_amount=200 \
+    > expected/run-us-min200.json 2> expected/run-us-min200.log
+MIN_ROWS="$(duckdb -noheader -list poc.duckdb 'SELECT count(*) FROM poc.main.regional_sales')"
+MIN_CUST="$(duckdb -noheader -list poc.duckdb 'SELECT customer FROM poc.main.regional_sales')"
+echo "rows with region=us AND amount >= 200: $MIN_ROWS ($MIN_CUST)"
+if [ "$MIN_ROWS" -ne 1 ] || [ "$MIN_CUST" != "bob" ]; then
+    echo "FAIL: expected the single us/web row with amount >= 200 (bob), got $MIN_ROWS [$MIN_CUST]" >&2
+    exit 1
+fi
+echo "OK: a bare numeric @var filtered the run — no string-literal wrapper needed"
+
+echo
+echo "==== 5. emit-sql --var region=us — markers resolve to literal values ===="
 rocky emit-sql --models models/ --var region=us --out-dir build > /dev/null 2>&1
 # Strip the model's preserved `--` comment lines (which legitimately mention
 # the @var() markers) so the assertions look only at the executable SQL.
 EXEC_SQL="$(grep -v '^[[:space:]]*--' build/regional_sales.sql)"
 echo "emitted WHERE clause (comments stripped):"
-echo "$EXEC_SQL" | grep -i "where\|region\|channel"
+echo "$EXEC_SQL" | grep -i "where\|region\|channel\|amount"
 if ! echo "$EXEC_SQL" | grep -q "region  = 'us'"; then
     echo "FAIL: emitted SQL did not resolve @var(region) to 'us'" >&2
+    exit 1
+fi
+# The bare @var(min_amount, 0) renders into numeric position — no quotes.
+if ! echo "$EXEC_SQL" | grep -q "amount >= 0"; then
+    echo "FAIL: bare @var(min_amount, 0) did not resolve to numeric 'amount >= 0'" >&2
     exit 1
 fi
 if echo "$EXEC_SQL" | grep -q "@var("; then
     echo "FAIL: emitted SQL still contains a literal @var() marker" >&2
     exit 1
 fi
-echo "OK: @var(region) resolved to 'us'; no @var() marker remains in the executable SQL"
+echo "OK: quoted @var(region) -> 'us' and bare @var(min_amount, 0) -> amount >= 0; no marker remains"
 
 echo
-echo "==== 5. the optional @var(channel, web) resolved to its inline DEFAULT ===="
+echo "==== 6. the optional @var(channel, web) resolved to its inline DEFAULT ===="
 # channel was NOT passed to emit-sql above, so it falls back to web.
 if ! echo "$EXEC_SQL" | grep -q "channel = 'web'"; then
     echo "FAIL: @var(channel, web) did not fall back to its inline default 'web'" >&2
@@ -93,7 +117,7 @@ fi
 echo "OK: @var(channel, web) resolved to 'web' with no --var supplied"
 
 echo
-echo "==== 6. a REQUIRED @var with no --var is a compile error (E028) ===="
+echo "==== 7. a REQUIRED @var with no --var is a compile error (E028) ===="
 set +e
 rocky -o json compile --models models/ > expected/compile-missing.json 2> expected/compile-missing.log
 COMPILE_EXIT=$?

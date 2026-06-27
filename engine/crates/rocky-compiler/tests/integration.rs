@@ -688,3 +688,116 @@ fn run_var_inline_default_used_when_unset() {
         "an inline default satisfies the reference; no E028"
     );
 }
+
+/// Write a two-model project: a clean root `up` and a downstream `down` whose
+/// SQL the caller supplies (it should reference `up`). Neither sidecar sets
+/// `depends_on`, so the `up → down` edge can only come from lineage extraction
+/// over `down`'s SQL — which is exactly what we want to prove survives `@var`
+/// substitution.
+fn temp_linear_two_model_project(down_sql: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let models = dir.path().join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    std::fs::write(models.join("up.sql"), "SELECT 1 AS id, 100 AS amount").unwrap();
+    std::fs::write(
+        models.join("up.toml"),
+        "name = \"up\"\n\n[target]\ncatalog = \"cat\"\nschema = \"sch\"\ntable = \"up\"\n",
+    )
+    .unwrap();
+    std::fs::write(models.join("down.sql"), down_sql).unwrap();
+    std::fs::write(
+        models.join("down.toml"),
+        "name = \"down\"\n\n[target]\ncatalog = \"cat\"\nschema = \"sch\"\ntable = \"down\"\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// Regression: a BARE `@var(...)` marker outside any string literal
+/// (`WHERE amount >= @var(threshold)`) must compile clean. Before run-var
+/// substitution was moved ahead of lineage extraction, this crashed compile
+/// with a sqlparser `Expected: end of statement, found: (` error during
+/// dependency resolution — the raw `@var(` text reached the parser. The
+/// existing `run_vars` unit test never caught it because it exercised
+/// `substitute_run_vars` in isolation, not the lineage → compile path.
+#[test]
+fn bare_run_var_outside_string_literal_compiles_and_keeps_dependency() {
+    let dir =
+        temp_linear_two_model_project("SELECT id, amount FROM up WHERE amount >= @var(threshold)");
+    let config = CompilerConfig {
+        models_dir: dir.path().join("models"),
+        run_vars: rocky_core::run_vars::RunVars::parse_pairs(["threshold=100"]).unwrap(),
+        ..Default::default()
+    };
+
+    // The crux: this used to return `Err(CompileError::Project(..))`.
+    let result = compile(&config).unwrap();
+
+    assert!(
+        !result.has_errors,
+        "a bare @var must compile clean: {:?}",
+        result.diagnostics
+    );
+
+    let down = result.project.model("down").unwrap();
+    assert_eq!(
+        down.sql, "SELECT id, amount FROM up WHERE amount >= 100",
+        "the bare @var(threshold) marker must resolve to the supplied value"
+    );
+    assert!(
+        !down.sql.contains("@var("),
+        "no @var() marker may remain in the executable SQL"
+    );
+
+    // The `up → down` dependency must still be auto-resolved from the
+    // substituted SQL: a bare @var sitting next to a real table ref doesn't
+    // drop the edge.
+    let up_pos = result
+        .project
+        .execution_order
+        .iter()
+        .position(|n| n == "up")
+        .expect("up must be in the execution order");
+    let down_pos = result
+        .project
+        .execution_order
+        .iter()
+        .position(|n| n == "down")
+        .expect("down must be in the execution order");
+    assert!(
+        up_pos < down_pos,
+        "up must resolve as a dependency of down and execute first"
+    );
+}
+
+/// A missing required BARE `@var` renders to the parseable `NULL` sentinel, so
+/// compile returns `Ok` with an E028 diagnostic naming the variable rather
+/// than crashing in lineage extraction.
+#[test]
+fn missing_bare_run_var_yields_e028_not_a_parser_crash() {
+    let dir =
+        temp_linear_two_model_project("SELECT id, amount FROM up WHERE amount >= @var(threshold)");
+    let config = CompilerConfig {
+        models_dir: dir.path().join("models"),
+        // No `threshold` supplied and no inline default.
+        ..Default::default()
+    };
+
+    let result = compile(&config).unwrap();
+
+    assert!(
+        result.has_errors,
+        "a missing required bare var must fail compile"
+    );
+    let e028: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| &*d.code == "E028")
+        .collect();
+    assert_eq!(e028.len(), 1, "exactly one E028 for the one missing var");
+    assert!(
+        e028[0].message.contains("threshold"),
+        "the error must name the missing variable: {}",
+        e028[0].message
+    );
+}

@@ -103,6 +103,21 @@ impl Project {
         models_dir: &Path,
         db: &mut crate::salsa_compile::RockyDatabase,
     ) -> Result<Self, ProjectError> {
+        Self::from_models(Self::load_models_with_db(models_dir, db)?)
+    }
+
+    /// Load every model from a directory **without** resolving dependencies.
+    ///
+    /// Returns the raw `Model` set (`.sql` sidecars + `.rocky` files) before
+    /// `resolve_dependencies` / lineage extraction has run. Callers that need
+    /// to mutate model SQL ahead of resolution — e.g. substituting per-run
+    /// `@var()` variables so a bare marker never reaches the SQL parser — load
+    /// here, transform, then call [`Project::from_models`]. Most callers want
+    /// [`Project::load_with_db`], which chains the two.
+    pub fn load_models_with_db(
+        models_dir: &Path,
+        db: &mut crate::salsa_compile::RockyDatabase,
+    ) -> Result<Vec<Model>, ProjectError> {
         let mut models = models::load_models_from_dir(models_dir)?;
 
         // Also load .rocky files via the salsa pipeline
@@ -118,7 +133,17 @@ impl Project {
             });
         }
 
-        Self::from_models(models)
+        Ok(models)
+    }
+
+    /// Load every model from a directory **without** resolving dependencies,
+    /// using a transient salsa database for the `.rocky` parse pipeline.
+    ///
+    /// The non-`db` counterpart to [`Project::load_models_with_db`] — mirrors
+    /// [`Project::load`]'s relationship to [`Project::load_with_db`].
+    pub fn load_models(models_dir: &Path) -> Result<Vec<Model>, ProjectError> {
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        Self::load_models_with_db(models_dir, &mut db)
     }
 
     /// Build a project from pre-loaded models.
