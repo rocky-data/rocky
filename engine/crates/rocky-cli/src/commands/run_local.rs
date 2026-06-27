@@ -230,13 +230,13 @@ pub async fn run_transformation(
     if output_json {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!(
+        crate::status_line!(
             "transformation pipeline complete: {} model(s) executed in {}ms",
             output.materializations.len(),
             output.duration_ms
         );
         for m in &output.materializations {
-            println!("  {} ({})", m.asset_key.join("."), m.metadata.strategy);
+            crate::status_line!("  {} ({})", m.asset_key.join("."), m.metadata.strategy);
         }
     }
 
@@ -471,7 +471,7 @@ pub async fn run_quality(
                 output.quarantine.len()
             )
         };
-        println!(
+        crate::status_line!(
             "quality pipeline complete: {total_checks} check(s) across {} table(s), {error_failures} error / {warning_failures} warning failed{quarantine_summary}, in {}ms",
             output.check_results.len(),
             output.duration_ms
@@ -865,7 +865,7 @@ pub async fn run_snapshot(
     if output_json {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!(
+        crate::status_line!(
             "snapshot pipeline complete: {}.{}.{} -> {}.{}.{} in {}ms",
             pipeline.source.catalog,
             pipeline.source.schema,
