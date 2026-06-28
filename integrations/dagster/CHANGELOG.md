@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.53.0] — 2026-06-28
+
 ### Added
 
+- **`rocky_source_sensor`'s `BacklogCap` now counts only the sensor's own runs.** A stable `rocky/sensor=<name>` tag is stamped on every emitted `RunRequest` and AND-ed into the in-flight count, so a co-tagged run from another job no longer inflates the cap — the false back-pressure that hit any multi-job deployment sharing a tag key. Adds an optional `BacklogCap.scope_tags` for further narrowing; the self-scoped count is the default. (#995, FR-028)
 - **`TenantConfig.scope_runs_to_selection`** (opt-in, default off) scopes a tenant-collapse run to the connectors the host actually selected, emitting one `rocky run --filter id=<source>` per selected connector instead of re-copying the whole tenant on every partition run. The narrowing only kicks in when the host selected a *strict subset* of the tenant's connectors; a full or empty selection still runs the whole tenant via `{component}={value}`. Each `id=` filter targets the active partition's own source, so per-tenant physical isolation is preserved. Default off keeps the existing full-tenant behavior. (FR-048)
 
 ## [1.52.0] — 2026-06-23
