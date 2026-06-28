@@ -88,6 +88,7 @@ Core features are production-ready on Databricks: the checker, named branches, r
 
 - **Databricks is the 2026 focus.** Snowflake, BigQuery, and Trino work for the core loop but aren't as thorough yet. [Talk to us](https://github.com/rocky-data/rocky/discussions) if you need them in production now.
 - **AI features are early.** Generate → check → fix is shipped. Mass refactoring, auto-migration on type changes, and assertion generation are on the roadmap.
+- **Replay records and verifies; it doesn't re-execute yet.** Every run leaves a content-addressed record that `rocky replay` inspects and verifies against the ledger. Re-executing a past run from that record is on the roadmap.
 - **Iceberg.** Reading from a catalog is Beta. Writing straight to Iceberg is planned for 2026.
 - **No built-in metrics layer.** Use Cube, the dbt Semantic Layer, or whatever you have.
 - **Dagster is the one built-in scheduler integration** ([`dagster-rocky`](integrations/dagster/)). For anything else, use the [`rocky-sdk`](sdk/python/) Python client or `rocky serve`.

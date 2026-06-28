@@ -30,7 +30,7 @@ Rocky turns each of these into a compile error or a blocked PR before it ships: 
 | Quality | ✅ | Inline assertions during `rocky run` |
 | Orchestration | Partial | First-class Dagster integration; `rocky serve` standalone |
 
-## The seven trust dimensions
+## The trust dimensions
 
 1. **SQL as a typed, compiled language.** Real type inference, diagnostic codes (`E###` errors, `W###` warnings, `P###` portability lints), and a real LSP, not text macros or runtime checks.
 2. **Compile-time column-level lineage.** Rocky knows every column's lineage before a row is written, so `rocky lineage-diff main` can block a PR when a downstream contract breaks.

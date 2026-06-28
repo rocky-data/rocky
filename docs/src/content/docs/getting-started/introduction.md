@@ -47,7 +47,7 @@ Rocky owns the graph: dependencies, compile-time types, drift handling, incremen
 
 Quality is more than the inline runtime gate. Models can also declare fixture-driven unit tests (`rocky test`, run locally on DuckDB) and declarative data tests like not-null and uniqueness checks against warehouse rows (`rocky test --declarative`). See [Testing and Contracts](/concepts/testing/).
 
-## The seven trust dimensions
+## The trust dimensions
 
 1. **SQL as a typed, compiled language.** Column-level type inference across the full DAG. 35+ diagnostic codes (`E###` errors, `W###` warnings, `P###` portability lints) with actionable suggestions. Not text macros, but a real compiler with a real LSP.
 2. **Compile-time column-level lineage.** Every column traced through every transformation, before execution. `rocky lineage-diff main` lists per-column downstream blast radius for PR review. That CI gate is impossible without a compiled engine.
