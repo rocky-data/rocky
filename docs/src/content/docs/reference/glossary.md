@@ -29,7 +29,7 @@ A data-quality assertion that runs inline during a run (row counts, column match
 
 ### Compile-time contract
 
-A schema agreement Rocky enforces before any row is written. A missing required column or an unsafe type change becomes a compile error (`E010`, `E013`) that blocks the PR. See [Testing and contracts](/concepts/testing/).
+A schema agreement Rocky enforces before any row is written. A missing required column or an unsafe type change becomes a compile error (`E010`, `E011`) that blocks the PR. See [Testing and contracts](/concepts/testing/).
 
 ### Config group
 

@@ -10,7 +10,7 @@ Most teams adopting Rocky have a dbt project today, so the day-one question is "
 The wedge in five steps:
 
 1. **Run `rocky import-dbt`.** Jinja `{{ ref() }}` and `{{ source() }}` resolve to bare references; configs become TOML sidecars; the importer writes `MIGRATION-NOTES.md` listing anything that didn't translate.
-2. **Run `rocky compile`.** First time through, expect real diagnostics: `E013` on type mismatches, `P002` on `SELECT *` blast radius, `P001` on dialect-portability issues. Each one is something dbt Core couldn't catch.
+2. **Run `rocky compile`.** First time through, expect real diagnostics: `E011` on type mismatches, `P002` on `SELECT *` blast radius, `P001` on dialect-portability issues. Each one is something dbt Core couldn't catch.
 3. **Add contracts on the boundary models.** `[contract] required_columns = […]`, `protected_columns = […]`. From here, the column rename that quietly breaks 47 downstream models becomes an `E010` in CI before it ships.
 4. **Adopt `rocky lineage-diff` in PR review.** Per-changed-column downstream blast radius. Drops into a PR comment. This is the moment your team stops reviewing changes blind.
 5. **Turn on `rocky preview cost`.** Per-PR cost projection: catch expensive plans before they ship instead of explaining them after.
