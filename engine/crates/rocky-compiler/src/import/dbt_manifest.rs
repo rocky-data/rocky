@@ -60,6 +60,12 @@ pub struct DbtManifestNode {
     pub tags: Vec<String>,
     pub schema: String,
     pub database: String,
+    /// dbt's fully-qualified, adapter-quoted physical relation — e.g.
+    /// `"db"."schema"."table"` on duckdb, backtick-quoted on databricks. dbt
+    /// resolves `{{ ref() }}` to this exact string inside `compiled_code`, so
+    /// the importer matches against it to rewrite compiled upstream refs back
+    /// to bare Rocky model names. `None` on manifests that predate the field.
+    pub relation_name: Option<String>,
 }
 
 /// Dependency information for a manifest node.
@@ -287,6 +293,8 @@ struct RawNode {
     schema: Option<String>,
     #[serde(default)]
     database: Option<String>,
+    #[serde(default)]
+    relation_name: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -593,6 +601,7 @@ fn convert_node(raw: RawNode) -> DbtManifestNode {
         tags: raw.tags,
         schema: raw.schema.unwrap_or_default(),
         database: raw.database.unwrap_or_default(),
+        relation_name: raw.relation_name.filter(|s| !s.is_empty()),
     }
 }
 
