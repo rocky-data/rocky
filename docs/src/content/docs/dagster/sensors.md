@@ -149,6 +149,8 @@ sensor = rocky_source_sensor(
 
 Before each emit, the sensor counts in-flight runs matching `tag_key=<value>` in the non-terminal statuses (`QUEUED`, `NOT_STARTED`, `STARTING`, `STARTED` by default; override via `BacklogCap.statuses`). If the count is at or above `max_in_flight`, the `RunRequest` is suppressed.
 
+The count is scoped to **this sensor's own runs**: every `RunRequest` the sensor emits carries a stable `rocky/sensor=<name>` tag, and the in-flight count filters on it, so a co-tagged run from an unrelated job never trips the cap. Pass `BacklogCap(scope_tags={...})` to narrow the count further with extra exact-match tag filters.
+
 **The cursor still advances on suppression**: the in-flight run picks up the latest data via Rocky's per-source state. Freezing the cursor would compound the failure: the next tick would re-detect the same sync, retry the same suppressed emit, and never recover until the queue drains below cap.
 
 `BacklogCap` is opt-in. Default behavior (no cap) is unchanged.

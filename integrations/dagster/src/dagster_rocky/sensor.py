@@ -31,7 +31,7 @@ from .resource import RockyResource
 from .translator import RockyDagsterTranslator, strip_tenant_component
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from dagster._core.definitions.asset_selection import CoercibleToAssetSelection
 
@@ -39,6 +39,11 @@ if TYPE_CHECKING:
 
 
 Granularity = Literal["per_source", "per_group"]
+
+# Stable marker tag stamped on every RunRequest the sensor emits, set to the
+# sensor's own ``name``. The backlog cap ANDs this into its in-flight count so
+# the cap only ever counts runs THIS sensor launched (FR-028).
+SENSOR_MARKER_TAG = "rocky/sensor"
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +64,20 @@ class BacklogCap(NamedTuple):
     will pick up the latest data via Rocky's per-source state. Suppressing
     the emit *and* freezing the cursor would create a stuck-tick where
     nothing progresses until the in-flight queue drains below cap.
+
+    The count is always scoped to **this sensor's own emitted runs**: every
+    RunRequest the sensor returns carries a stable ``rocky/sensor=<name>``
+    tag, and the in-flight count filters on that marker in addition to
+    ``tag_key``. So a foreign job that happens to tag its runs with the same
+    ``tag_key`` value never inflates the count — without this, a co-tagged
+    run from an unrelated job (the normal multi-job tenant topology) would
+    trigger false back-pressure. This self-scoping is the primary,
+    zero-config behavior; ``scope_tags`` is an optional further narrowing.
+
+    ``scope_tags`` adds extra exact-match tag filters that are AND-ed into
+    the in-flight count (count-site only — they are not stamped onto emitted
+    RunRequests). ``None`` is normalized to an empty mapping at use, so it
+    never becomes a shared mutable default.
     """
 
     tag_key: str
@@ -69,6 +88,7 @@ class BacklogCap(NamedTuple):
         dg.DagsterRunStatus.STARTING,
         dg.DagsterRunStatus.STARTED,
     )
+    scope_tags: Mapping[str, str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -159,9 +179,13 @@ def rocky_source_sensor(
             Defaults to ``STOPPED`` so users opt in explicitly.
         backlog_cap: Opt-in :class:`BacklogCap` config to suppress emits
             when too many in-flight runs already share a tag value.
-            Defaults to ``None`` (no suppression). The cursor still
-            advances when an emit is suppressed so the in-flight run
-            picks up the latest data via Rocky's per-source state.
+            Defaults to ``None`` (no suppression). The in-flight count is
+            scoped to this sensor's own emitted runs (via the stable
+            ``rocky/sensor=<name>`` tag every RunRequest carries), so a
+            co-tagged run from an unrelated job never trips the cap. The
+            cursor still advances when an emit is suppressed so the
+            in-flight run picks up the latest data via Rocky's per-source
+            state.
         on_run_request_emitted: Optional best-effort callback fired once
             per RunRequest the sensor will return (after suppression
             decisions). Exceptions are caught and logged at WARN — a
@@ -289,6 +313,7 @@ def rocky_source_sensor(
                 tenant_partitions_name=tenant_partitions_name,
                 sync_partitions=sync_partitions_from_discover,
                 context=context,
+                sensor_name=name,
             )
             # Roll back the cursor for sources we did NOT emit (skipped because
             # their partition doesn't exist yet under sync-off, or a non-scalar
@@ -301,10 +326,10 @@ def rocky_source_sensor(
                     new_cursor.pop(sid, None)
         elif granularity == "per_source":
             request_pairs: list[tuple[dg.RunRequest, tuple[SourceInfo, ...]]] = [
-                (_per_source_request(source, translator), (source,)) for source in triggered
+                (_per_source_request(source, translator, name), (source,)) for source in triggered
             ]
         else:
-            request_pairs = list(_per_group_request_pairs(triggered, translator))
+            request_pairs = list(_per_group_request_pairs(triggered, translator, name))
 
         # FR-015: opt-in per-tag-key in-flight backlog cap. Suppresses the
         # emit but advances the cursor — the in-flight run will pick up
@@ -320,7 +345,15 @@ def rocky_source_sensor(
                 in_flight = len(
                     context.instance.get_runs(
                         filters=dg.RunsFilter(
-                            tags={backlog_cap.tag_key: tag_value},
+                            # Self-scope the count to runs THIS sensor launched
+                            # (rocky/sensor=name), so a foreign job co-tagging
+                            # runs with the same tag_key value can't inflate the
+                            # count and trigger false back-pressure (FR-028).
+                            tags={
+                                SENSOR_MARKER_TAG: name,
+                                backlog_cap.tag_key: tag_value,
+                                **(backlog_cap.scope_tags or {}),
+                            },
                             statuses=list(backlog_cap.statuses),
                         ),
                         limit=backlog_cap.max_in_flight + 1,
@@ -391,6 +424,7 @@ def _iso_before(earlier_iso: str, later_iso: str) -> bool:
 def _per_source_request(
     source: SourceInfo,
     translator: RockyDagsterTranslator,
+    sensor_name: str,
 ) -> dg.RunRequest:
     """Build one ``RunRequest`` for a single triggered source."""
     asset_keys = [translator.get_asset_key(source, table) for table in source.tables]
@@ -399,6 +433,7 @@ def _per_source_request(
         run_key=f"{source.id}-{sync_iso}",
         asset_selection=asset_keys,
         tags={
+            SENSOR_MARKER_TAG: sensor_name,
             "rocky/source_id": source.id,
             "rocky/sync_at": sync_iso,
         },
@@ -408,6 +443,7 @@ def _per_source_request(
 def _per_group_request_pairs(
     triggered: Sequence[SourceInfo],
     translator: RockyDagsterTranslator,
+    sensor_name: str,
 ) -> Iterator[tuple[dg.RunRequest, tuple[SourceInfo, ...]]]:
     """Group triggered sources by translator group; yield ``(RunRequest, sources)`` pairs."""
     by_group: dict[str, list[SourceInfo]] = defaultdict(list)
@@ -428,6 +464,7 @@ def _per_group_request_pairs(
             run_key=f"{group_name}-{sync_iso}",
             asset_selection=asset_keys,
             tags={
+                SENSOR_MARKER_TAG: sensor_name,
                 "rocky/group": group_name,
                 "rocky/sync_at": sync_iso,
             },
@@ -445,6 +482,7 @@ def _tenant_partition_request(
     translator: RockyDagsterTranslator,
     tenant_component: str,
     partition_key: str,
+    sensor_name: str,
 ) -> dg.RunRequest:
     """Build one ``RunRequest`` materialising a tenant partition of the
     collapsed asset.
@@ -467,6 +505,7 @@ def _tenant_partition_request(
         asset_selection=asset_keys,
         partition_key=partition_key,
         tags={
+            SENSOR_MARKER_TAG: sensor_name,
             f"rocky/{tenant_component}": str(raw_value),
             "rocky/source_id": source.id,
             "rocky/sync_at": sync_iso,
@@ -482,6 +521,7 @@ def _tenant_request_pairs(
     tenant_partitions_name: str,
     sync_partitions: bool,
     context: dg.SensorEvaluationContext,
+    sensor_name: str,
 ) -> tuple[
     list[tuple[dg.RunRequest, tuple[SourceInfo, ...]]],
     list[dg.AddDynamicPartitionsRequest],
@@ -533,7 +573,9 @@ def _tenant_request_pairs(
             queued_new.add(partition_key)
         pairs.append(
             (
-                _tenant_partition_request(source, translator, tenant_component, partition_key),
+                _tenant_partition_request(
+                    source, translator, tenant_component, partition_key, sensor_name
+                ),
                 (source,),
             )
         )

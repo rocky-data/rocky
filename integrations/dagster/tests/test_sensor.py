@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import dagster as dg
+from dagster._core.test_utils import create_run_for_test
 
 from dagster_rocky import (
     BacklogCap,
@@ -408,10 +409,15 @@ def test_backlog_cap_suppresses_when_in_flight_at_or_above_max():
     assert result.run_requests == []
     # …but cursor still advances so we don't re-detect on the next tick
     assert json.loads(result.cursor)["s1"] == "2026-04-08T10:00:00+00:00"
-    # And the cap was actually consulted with the correct filter shape
+    # And the cap was actually consulted with the correct filter shape —
+    # self-scoped to this sensor's own runs via the rocky/sensor marker
+    # (default sensor name) AND the configured tag_key (FR-028).
     instance.get_runs.assert_called_once()
     call = instance.get_runs.call_args
-    assert call.kwargs["filters"].tags == {"rocky/source_id": "s1"}
+    assert call.kwargs["filters"].tags == {
+        "rocky/sensor": "rocky_source_sensor",
+        "rocky/source_id": "s1",
+    }
     assert call.kwargs["limit"] == 3  # max_in_flight + 1
 
 
@@ -535,6 +541,188 @@ def test_backlog_cap_per_group_cursors_advance_independently():
     cursor = json.loads(result.cursor)
     assert cursor["s1"] == "2026-04-08T10:00:00+00:00"
     assert cursor["s2"] == "2026-04-08T11:00:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# FR-028 — backlog cap is scoped to the sensor's OWN emitted runs
+#
+# These exercise the REAL count path against a live ``DagsterInstance`` with
+# planted runs (no ``get_runs`` mock), so they prove the self-scoping holds
+# end-to-end: ``RunsFilter`` AND-semantics + the ``rocky/sensor`` marker the
+# sensor stamps on every emit.
+# ---------------------------------------------------------------------------
+
+
+def _plant_run(
+    instance: dg.DagsterInstance,
+    *,
+    tags: dict[str, str],
+    status: dg.DagsterRunStatus = dg.DagsterRunStatus.STARTED,
+) -> None:
+    """Plant one Dagster run carrying ``tags`` in ``status`` on the instance."""
+    create_run_for_test(instance, job_name="planted_job", status=status, tags=tags)
+
+
+def test_backlog_cap_ignores_foreign_run_without_sensor_marker():
+    """A foreign run tagged ``{tag_key: value}`` but WITHOUT ``rocky/sensor``
+    is not counted toward the cap — so it cannot trigger false back-pressure
+    on this sensor's legitimate emit (FR-028)."""
+    rocky = RockyResource()
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)))
+    instance = dg.DagsterInstance.ephemeral()
+    # Co-tagged by an unrelated job — same tag_key value, no rocky/sensor.
+    _plant_run(instance, tags={"rocky/source_id": "s1"})
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            backlog_cap=BacklogCap(tag_key="rocky/source_id", max_in_flight=1),
+        )
+        result = sensor(dg.build_sensor_context(cursor=None, instance=instance))
+
+    # The foreign run is invisible to the self-scoped count → emit goes through.
+    assert len(result.run_requests) == 1
+    assert result.run_requests[0].tags["rocky/source_id"] == "s1"
+
+
+def test_backlog_cap_counts_own_in_flight_runs_and_suppresses():
+    """The sensor's OWN in-flight runs (carrying ``rocky/sensor=<name>``) ARE
+    counted and DO suppress the emit at ``max_in_flight`` (FR-028)."""
+    rocky = RockyResource()
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 11)))
+    instance = dg.DagsterInstance.ephemeral()
+    # A run this very sensor launched earlier, still in flight.
+    _plant_run(instance, tags={"rocky/sensor": "my_sensor", "rocky/source_id": "s1"})
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = rocky_source_sensor(
+            rocky_resource=rocky,
+            name="my_sensor",
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            backlog_cap=BacklogCap(tag_key="rocky/source_id", max_in_flight=1),
+        )
+        result = sensor(dg.build_sensor_context(cursor=None, instance=instance))
+
+    # One own run in flight, cap=1 → suppressed, but cursor still advances.
+    assert result.run_requests == []
+    assert json.loads(result.cursor)["s1"] == "2026-04-08T11:00:00+00:00"
+
+
+def test_backlog_cap_does_not_cross_count_between_distinct_sensors():
+    """Two sensors with DISTINCT names do not cross-count: sensor B's
+    in-flight run does not suppress sensor A's emit (FR-028)."""
+    rocky = RockyResource()
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)))
+    instance = dg.DagsterInstance.ephemeral()
+    # An in-flight run owned by a DIFFERENT sensor (sensor_b), same tag_key value.
+    _plant_run(instance, tags={"rocky/sensor": "sensor_b", "rocky/source_id": "s1"})
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor_a = rocky_source_sensor(
+            rocky_resource=rocky,
+            name="sensor_a",
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            backlog_cap=BacklogCap(tag_key="rocky/source_id", max_in_flight=1),
+        )
+        result = sensor_a(dg.build_sensor_context(cursor=None, instance=instance))
+
+    # sensor_b's run is out of sensor_a's scope → sensor_a still emits.
+    assert len(result.run_requests) == 1
+    assert result.run_requests[0].tags["rocky/source_id"] == "s1"
+    assert result.run_requests[0].tags["rocky/sensor"] == "sensor_a"
+
+
+def test_backlog_cap_scope_tags_narrows_the_count():
+    """``scope_tags`` AND-s extra exact-match filters into the count. A run
+    that carries the sensor marker + tag_key but NOT the scope tag falls out
+    of the count; one that carries all three is counted (FR-028)."""
+    rocky = RockyResource()
+    discover = _discover(_source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)))
+
+    # Case 1: in-flight own run lacks the scope tag → not counted → emit.
+    inst_unscoped = dg.DagsterInstance.ephemeral()
+    _plant_run(inst_unscoped, tags={"rocky/sensor": "my_sensor", "rocky/source_id": "s1"})
+
+    # Case 2: in-flight own run also carries team=alpha → counted → suppress.
+    inst_scoped = dg.DagsterInstance.ephemeral()
+    _plant_run(
+        inst_scoped,
+        tags={"rocky/sensor": "my_sensor", "rocky/source_id": "s1", "team": "alpha"},
+    )
+
+    def _build() -> dg.SensorDefinition:
+        return rocky_source_sensor(
+            rocky_resource=rocky,
+            name="my_sensor",
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            backlog_cap=BacklogCap(
+                tag_key="rocky/source_id",
+                max_in_flight=1,
+                scope_tags={"team": "alpha"},
+            ),
+        )
+
+    with patch.object(RockyResource, "discover", return_value=discover):
+        sensor = _build()
+        unscoped = sensor(dg.build_sensor_context(cursor=None, instance=inst_unscoped))
+        scoped = sensor(dg.build_sensor_context(cursor=None, instance=inst_scoped))
+
+    # Scope tag narrows the count: the un-scoped run is invisible, the
+    # team=alpha run is counted and trips the cap.
+    assert len(unscoped.run_requests) == 1
+    assert scoped.run_requests == []
+
+
+def test_emitted_run_requests_carry_sensor_marker_in_all_modes():
+    """Every emitted RunRequest carries ``rocky/sensor=<name>`` — in
+    per_source, per_group, AND tenant-as-partition mode (FR-028 stamping)."""
+    rocky = RockyResource()
+    discover = _discover(
+        _source("s1", "acme", ["orders"], _ts(2026, 4, 8, 10)),
+        _source("s2", "globex", ["invoices"], _ts(2026, 4, 8, 11)),
+    )
+
+    # per_source
+    with patch.object(RockyResource, "discover", return_value=discover):
+        per_source = rocky_source_sensor(
+            rocky_resource=rocky,
+            name="marker_sensor",
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            granularity="per_source",
+            minimum_interval_seconds=60,
+        )(dg.build_sensor_context(cursor=None))
+    assert per_source.run_requests
+    assert all(req.tags["rocky/sensor"] == "marker_sensor" for req in per_source.run_requests)
+
+    # per_group
+    with patch.object(RockyResource, "discover", return_value=discover):
+        per_group = rocky_source_sensor(
+            rocky_resource=rocky,
+            name="marker_sensor",
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            granularity="per_group",
+            minimum_interval_seconds=60,
+        )(dg.build_sensor_context(cursor=None))
+    assert per_group.run_requests
+    assert all(req.tags["rocky/sensor"] == "marker_sensor" for req in per_group.run_requests)
+
+    # tenant-as-partition mode
+    with patch.object(RockyResource, "discover", return_value=discover):
+        tenant = rocky_source_sensor(
+            rocky_resource=rocky,
+            name="marker_sensor",
+            target=dg.AssetSelection.assets(dg.AssetKey(["fivetran", "acme"])),
+            minimum_interval_seconds=60,
+            tenant_component="tenant",
+            tenant_partitions_name="tenants",
+        )(dg.build_sensor_context(cursor=None, instance=dg.DagsterInstance.ephemeral()))
+    assert tenant.run_requests
+    assert all(req.tags["rocky/sensor"] == "marker_sensor" for req in tenant.run_requests)
 
 
 # ---------------------------------------------------------------------------
