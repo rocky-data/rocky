@@ -341,12 +341,20 @@ pub fn compile_project(
         config.project_freshness_default,
     );
 
-    // 9. Merge all diagnostics.
+    // 9. Managed-Iceberg format_options (E035). Reject `format_options` the
+    //    Databricks warehouse rejects at execution (partition_by + cluster_by
+    //    together; engine-managed `write.format.*` properties) so the error
+    //    surfaces at compile time, naming the offending option, instead of as
+    //    a first-run warehouse rejection. (FR-044)
+    let lakehouse_diagnostics = typecheck::check_lakehouse_format_options(&project.models);
+
+    // 10. Merge all diagnostics.
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
     diagnostics.extend(blast_radius_diagnostics);
     diagnostics.extend(classification_diagnostics);
     diagnostics.extend(freshness_diagnostics);
+    diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
 
     let has_errors = diagnostics
@@ -542,11 +550,16 @@ pub fn compile_incremental(
         config.project_freshness_default,
     );
 
+    // E035: managed-Iceberg format_options, mirroring the full-compile path so
+    // the LSP (incremental) surface matches `rocky compile`. (FR-044)
+    let lakehouse_diagnostics = typecheck::check_lakehouse_format_options(&project.models);
+
     let mut diagnostics = type_check.diagnostics.clone();
     diagnostics.extend(contract_diagnostics.iter().cloned());
     diagnostics.extend(blast_radius_diagnostics);
     diagnostics.extend(classification_diagnostics);
     diagnostics.extend(freshness_diagnostics);
+    diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
 
     let has_errors = diagnostics

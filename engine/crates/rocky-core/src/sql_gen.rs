@@ -2270,7 +2270,9 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             LakehouseFormat::IcebergTable,
             LakehouseOptions {
                 partition_by: vec!["event_date".into()],
-                table_properties: vec![("write.format.default".into(), "parquet".into())],
+                // Benign (non-`write.format.*`) property — managed Iceberg
+                // rejects engine-managed `write.format.*` keys (FR-044).
+                table_properties: vec![("team".into(), "growth".into())],
                 ..LakehouseOptions::default()
             },
             MaterializationStrategy::Microbatch {
@@ -2300,14 +2302,16 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         // Core guarantee: an Incremental model declaring iceberg_table
         // format yields USING ICEBERG plus its format_options on first-run
         // initial DDL — the same code path the runtime invokes when the
-        // target is missing.
+        // target is missing. Managed Iceberg forbids PARTITIONED BY +
+        // CLUSTER BY together and engine-managed `write.format.*` properties
+        // (FR-044), so this fixture uses partitioning + a benign property.
         let plan = lakehouse_ir(
             LakehouseFormat::IcebergTable,
             LakehouseOptions {
                 partition_by: vec!["region".into()],
-                cluster_by: vec!["id".into()],
-                table_properties: vec![("write.format.default".into(), "parquet".into())],
+                table_properties: vec![("team".into(), "growth".into())],
                 comment: Some("Incremental orders mart".into()),
+                ..LakehouseOptions::default()
             },
             MaterializationStrategy::Incremental {
                 timestamp_column: "updated_at".into(),
@@ -2325,11 +2329,11 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             "should include partitioning: {sql}"
         );
         assert!(
-            sql.contains("CLUSTER BY (id)"),
-            "should include clustering: {sql}"
+            sql.contains("COMMENT 'Incremental orders mart'"),
+            "should include comment: {sql}"
         );
         assert!(
-            sql.contains("write.format.default"),
+            sql.contains("TBLPROPERTIES"),
             "should include format_options table properties: {sql}"
         );
     }

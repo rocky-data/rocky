@@ -18,8 +18,8 @@ use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
-    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, I001, I002, SourceSpan, W001, W002,
-    W003, W004, W005,
+    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, I001, I002, SourceSpan, W001,
+    W002, W003, W004, W005,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
@@ -941,6 +941,35 @@ pub fn check_freshness_coverage(
         diagnostics.push(
             Diagnostic::warning(W005, &model.config.name, message).with_suggestion(suggestion),
         );
+    }
+    diagnostics
+}
+
+/// E035 — reject managed-Iceberg `format_options` that the Databricks
+/// warehouse rejects at execution, so `rocky compile` surfaces a clear
+/// diagnostic before any warehouse call.
+///
+/// Delegates the constraint logic to
+/// [`rocky_ir::lakehouse::validate_managed_iceberg_options`] — the same
+/// function the DDL generator guards with — so the compile-time and run-time
+/// checks can never drift. Emits one error diagnostic per violation; each
+/// message names the offending option(s). Models without a lakehouse `format`
+/// (or without `format_options`) are skipped.
+pub fn check_lakehouse_format_options(models: &[rocky_core::models::Model]) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for model in models {
+        let Some(format) = &model.config.format else {
+            continue;
+        };
+        let Some(options) = &model.config.format_options else {
+            continue;
+        };
+        for violation in rocky_ir::lakehouse::validate_managed_iceberg_options(format, options) {
+            diagnostics.push(
+                Diagnostic::error(E035, &model.config.name, violation.message)
+                    .with_suggestion(violation.suggestion),
+            );
+        }
     }
     diagnostics
 }
@@ -3299,5 +3328,98 @@ mod tests {
             diags.is_empty(),
             "a project-level [freshness] default should suppress all W005s, got: {diags:?}"
         );
+    }
+
+    // ----- E035: managed-Iceberg format_options -----
+
+    fn make_iceberg_model(name: &str, options: rocky_ir::LakehouseOptions) -> Model {
+        let mut m = make_model(name, "SELECT 1 AS id");
+        m.config.format = Some(rocky_ir::LakehouseFormat::IcebergTable);
+        m.config.format_options = Some(options);
+        m
+    }
+
+    #[test]
+    fn e035_partition_and_cluster_together_emits_error_naming_options() {
+        let models = vec![make_iceberg_model(
+            "fct_events",
+            rocky_ir::LakehouseOptions {
+                partition_by: vec!["event_date".into()],
+                cluster_by: vec!["user_id".into()],
+                ..Default::default()
+            },
+        )];
+        let diags = check_lakehouse_format_options(&models);
+        assert_eq!(diags.len(), 1, "expected one E035, got: {diags:?}");
+        let d = &diags[0];
+        assert_eq!(&*d.code, "E035");
+        assert!(d.is_error());
+        assert_eq!(d.model, "fct_events");
+        let msg = d.message.as_ref();
+        assert!(msg.contains("partition_by"), "names partition_by: {msg}");
+        assert!(msg.contains("cluster_by"), "names cluster_by: {msg}");
+        assert!(d.suggestion.is_some());
+    }
+
+    #[test]
+    fn e035_write_format_property_emits_error_naming_key() {
+        let models = vec![make_iceberg_model(
+            "fct_events",
+            rocky_ir::LakehouseOptions {
+                table_properties: vec![("write.format.default".into(), "parquet".into())],
+                ..Default::default()
+            },
+        )];
+        let diags = check_lakehouse_format_options(&models);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(&*diags[0].code, "E035");
+        assert!(
+            diags[0].message.contains("write.format.default"),
+            "names the offending key: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn e035_valid_iceberg_options_emit_nothing() {
+        let models = vec![
+            make_iceberg_model(
+                "partitioned",
+                rocky_ir::LakehouseOptions {
+                    partition_by: vec!["event_date".into()],
+                    table_properties: vec![("delta.enableChangeDataFeed".into(), "true".into())],
+                    ..Default::default()
+                },
+            ),
+            make_iceberg_model(
+                "clustered",
+                rocky_ir::LakehouseOptions {
+                    cluster_by: vec!["user_id".into()],
+                    ..Default::default()
+                },
+            ),
+        ];
+        let diags = check_lakehouse_format_options(&models);
+        assert!(
+            diags.is_empty(),
+            "valid combos emit nothing, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn e035_non_iceberg_and_formatless_models_skipped() {
+        // Delta with partition+cluster+write.format is fine; a model with no
+        // lakehouse format is skipped entirely.
+        let mut delta = make_model("delta_m", "SELECT 1 AS id");
+        delta.config.format = Some(rocky_ir::LakehouseFormat::DeltaTable);
+        delta.config.format_options = Some(rocky_ir::LakehouseOptions {
+            partition_by: vec!["region".into()],
+            cluster_by: vec!["id".into()],
+            table_properties: vec![("write.format.default".into(), "parquet".into())],
+            ..Default::default()
+        });
+        let plain = make_model("plain_m", "SELECT 1 AS id");
+        let diags = check_lakehouse_format_options(&[delta, plain]);
+        assert!(diags.is_empty(), "got: {diags:?}");
     }
 }

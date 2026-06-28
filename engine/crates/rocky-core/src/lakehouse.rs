@@ -65,6 +65,19 @@ pub fn generate_lakehouse_ddl(
     // Validate option identifiers up front.
     validate_options(options)?;
 
+    // Reject managed-Iceberg `format_options` that the Databricks warehouse
+    // rejects at execution (partition_by + cluster_by together; engine-managed
+    // `write.format.*` properties). This is the run-path guard: the same
+    // constraints are surfaced earlier as `rocky compile` diagnostics (E035),
+    // but if compile is bypassed we still fail with a clear Rocky error here
+    // instead of a raw warehouse rejection on the first run.
+    if let Some(violation) = rocky_ir::lakehouse::validate_managed_iceberg_options(format, options)
+        .into_iter()
+        .next()
+    {
+        return Err(LakehouseError::ManagedIcebergUnsupported(violation.message));
+    }
+
     match format {
         LakehouseFormat::DeltaTable => generate_delta_ddl(target, select_sql, options),
         LakehouseFormat::IcebergTable => generate_iceberg_ddl(target, select_sql, options),
@@ -579,10 +592,9 @@ mod tests {
     }
 
     #[test]
-    fn test_iceberg_table_with_partitioning_and_clustering() {
+    fn test_iceberg_table_partition_only() {
         let opts = LakehouseOptions {
             partition_by: vec!["event_date".into()],
-            cluster_by: vec!["user_id".into()],
             ..default_opts()
         };
         let stmts = generate_lakehouse_ddl(
@@ -597,7 +609,127 @@ mod tests {
         let sql = &stmts[0];
         assert!(sql.contains("USING ICEBERG"));
         assert!(sql.contains("PARTITIONED BY (event_date)"));
+        assert!(!sql.contains("CLUSTER BY"));
+    }
+
+    #[test]
+    fn test_iceberg_table_cluster_only() {
+        let opts = LakehouseOptions {
+            cluster_by: vec!["user_id".into()],
+            ..default_opts()
+        };
+        let stmts = generate_lakehouse_ddl(
+            &LakehouseFormat::IcebergTable,
+            "cat.sch.events",
+            "SELECT * FROM cat.raw.events",
+            &opts,
+            &dialect(),
+        )
+        .unwrap();
+
+        let sql = &stmts[0];
+        assert!(sql.contains("USING ICEBERG"));
         assert!(sql.contains("CLUSTER BY (user_id)"));
+        assert!(!sql.contains("PARTITIONED BY"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Managed-Iceberg format_options guard (FR-044)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_iceberg_partition_and_cluster_together_is_rejected() {
+        // Databricks managed Iceberg rejects PARTITIONED BY + CLUSTER BY
+        // together at the warehouse; `generate_lakehouse_ddl` must fail fast
+        // with a clear error that names both options instead of emitting DDL.
+        let opts = LakehouseOptions {
+            partition_by: vec!["event_date".into()],
+            cluster_by: vec!["user_id".into()],
+            ..default_opts()
+        };
+        let err = generate_lakehouse_ddl(
+            &LakehouseFormat::IcebergTable,
+            "cat.sch.events",
+            "SELECT * FROM cat.raw.events",
+            &opts,
+            &dialect(),
+        )
+        .expect_err("partition + cluster on Iceberg must be rejected");
+
+        match err {
+            LakehouseError::ManagedIcebergUnsupported(msg) => {
+                assert!(msg.contains("partition_by"), "names partition_by: {msg}");
+                assert!(msg.contains("cluster_by"), "names cluster_by: {msg}");
+            }
+            other => panic!("expected ManagedIcebergUnsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_iceberg_write_format_property_is_rejected() {
+        let opts = LakehouseOptions {
+            table_properties: vec![("write.format.default".into(), "parquet".into())],
+            ..default_opts()
+        };
+        let err = generate_lakehouse_ddl(
+            &LakehouseFormat::IcebergTable,
+            "cat.sch.events",
+            "SELECT * FROM cat.raw.events",
+            &opts,
+            &dialect(),
+        )
+        .expect_err("engine-managed write.format.* property must be rejected");
+
+        match err {
+            LakehouseError::ManagedIcebergUnsupported(msg) => {
+                assert!(
+                    msg.contains("write.format.default"),
+                    "names the offending key: {msg}"
+                );
+            }
+            other => panic!("expected ManagedIcebergUnsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_iceberg_benign_property_is_accepted() {
+        // A non-`write.format.*` property (and partition-only) must still emit.
+        let opts = LakehouseOptions {
+            partition_by: vec!["event_date".into()],
+            table_properties: vec![("delta.enableChangeDataFeed".into(), "true".into())],
+            ..default_opts()
+        };
+        let stmts = generate_lakehouse_ddl(
+            &LakehouseFormat::IcebergTable,
+            "cat.sch.events",
+            "SELECT * FROM cat.raw.events",
+            &opts,
+            &dialect(),
+        )
+        .expect("benign Iceberg options must compile");
+        assert!(stmts[0].contains("USING ICEBERG"));
+    }
+
+    #[test]
+    fn test_delta_partition_and_cluster_together_is_allowed() {
+        // The managed-Iceberg rules must not touch Delta — partition + cluster
+        // together is a supported Delta combo.
+        let opts = LakehouseOptions {
+            partition_by: vec!["region".into()],
+            cluster_by: vec!["id".into()],
+            ..default_opts()
+        };
+        let stmts = generate_lakehouse_ddl(
+            &LakehouseFormat::DeltaTable,
+            "cat.sch.orders",
+            "SELECT * FROM cat.raw.orders",
+            &opts,
+            &dialect(),
+        )
+        .expect("Delta partition + cluster must still compile");
+        let sql = &stmts[0];
+        assert!(sql.contains("PARTITIONED BY (region)"));
+        assert!(sql.contains("CLUSTER BY (id)"));
     }
 
     // -----------------------------------------------------------------------
