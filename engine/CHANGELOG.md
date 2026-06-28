@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.55.2] - 2026-06-28
+
 ### Fixed
 
 - **`rocky compile` now rejects managed-Iceberg `format_options` that Databricks rejects at the warehouse — `partition_by` + `cluster_by` set together, and engine-managed TBLPROPERTIES (e.g. `write.format.default`) — with a clear diagnostic instead of a runtime warehouse rejection.** The check fires at compile time (diagnostic E035, naming the offending option) before any warehouse call, and the lakehouse DDL generator carries the same guard so the run path fails with a clear Rocky error if compile is bypassed. (FR-044)
