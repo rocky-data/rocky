@@ -18,7 +18,7 @@ The expensive failures in modern data platforms aren't slow queries. They're tru
 - Warehouse spend doubles in a month and nobody can attribute which model caused it.
 - An auditor asks who changed `fct_revenue.amount`, when, and why, and the honest answer is `git blame` and screenshots.
 
-**Rocky's answer is to make each of these failures a compile error or a CI gate**, caught before it ships. A column-type change is `E013` at compile; a rename's blast radius is a `rocky lineage-diff` comment on the PR; an unbudgeted cost spike is a `[budget]` block that fails the run; classified PII with no mask strategy fails `rocky compliance`. These are failures the warehouse can't see and the templating layer above it can't catch at compile time. For how Rocky stacks up against dbt Core, dbt Fusion, and SQLMesh, see the [comparison](/getting-started/comparison/).
+**Rocky's answer is to make each of these failures a compile error or a CI gate**, caught before it ships. A column-type change is `E011` at compile; a rename's blast radius is a `rocky lineage-diff` comment on the PR; an unbudgeted cost spike is a `[budget]` block that fails the run; classified PII with no mask strategy fails `rocky compliance`. These are failures the warehouse can't see and the templating layer above it can't catch at compile time. For how Rocky stacks up against dbt Core, dbt Fusion, and SQLMesh, see the [comparison](/getting-started/comparison/).
 
 ## Who Rocky is for
 
@@ -84,7 +84,7 @@ See the [Roadmap](/getting-started/roadmap/) for the full breakdown.
 | State | `manifest.json` + `target/` | Embedded `redb` database |
 | Branches | — | `rocky branch create`, `rocky run --branch <name>` |
 | Column-level lineage | Table-level (`dbt docs`); column-level needs Fusion or paid Catalog | Compile-time output, queryable per column |
-| Schema drift | Silent | `E013` at compile, blocks the PR |
+| Schema drift | Silent | Detected at run, rebuilt safely |
 | Cost attribution | — | Per-model, every run |
 | Replay | — | Content-addressed run record (re-execution on the roadmap) |
 

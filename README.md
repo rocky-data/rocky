@@ -62,7 +62,7 @@ Compare two versions of your project and get a list of which downstream tables a
 ### More demos
 
 - [Schema drift recovery](examples/playground/pocs/02-performance/06-schema-drift-recover/): source column type changes upstream; Rocky detects it and rebuilds safely.
-- [Data contracts](examples/playground/pocs/01-quality/01-data-contracts-strict/): missing required columns, dropped protected columns, or unsafe type changes surface as errors (`E010` / `E013`) before a row is written.
+- [Data contracts](examples/playground/pocs/01-quality/01-data-contracts-strict/): missing required columns, dropped protected columns, or unsafe type changes surface as errors (`E010`, `E011`, `E013`) before a row is written.
 - [BigQuery cost to the byte](examples/playground/pocs/07-adapters/05-bigquery-native-queries/): `bytes_scanned` in the run receipt matches BigQuery's billing number exactly (requires credentials).
 - [Named branches + replay](examples/playground/pocs/00-foundations/06-branches-replay-lineage/): run against an isolated schema copy, inspect, then drop or promote.
 - [Column lineage](examples/playground/pocs/06-developer-experience/01-lineage-column-level/): trace a column in a downstream model back to its source.
@@ -98,7 +98,7 @@ Core features are production-ready on Databricks: the checker, named branches, r
 
 | Problem | dbt Core | Rocky |
 |---|---|---|
-| Source column type changes | Silent | `E013` at check time, blocks PR |
+| Source column type changes | Silent | Detected at run, rebuilt safely |
 | Required column disappears | Opt-in `contract: enforced` | `E010` at check time, blocks PR |
 | Column renamed, unknown blast radius | Table-level lineage, post-hoc | `rocky lineage-diff` at PR time, column-level |
 | `SELECT *` pulls an unexpected column | Silent | `P002` warning, downstream models named |
