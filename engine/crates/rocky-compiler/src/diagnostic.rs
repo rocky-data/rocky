@@ -117,6 +117,20 @@ pub const E033: &str = "E033";
 /// — upgrade rocky to read the producer's newer snapshot format.
 pub const E034: &str = "E034";
 
+/// Managed-Iceberg `format_options` declares a combination the warehouse
+/// rejects at execution.
+///
+/// Emitted by `rocky compile` when a model sets `format = "iceberg_table"`
+/// with `format_options` that Databricks managed Iceberg refuses: `partition_by`
+/// and `cluster_by` set together (mutually exclusive), or an engine-managed
+/// `write.format.*` table property. Surfacing this at compile time turns a
+/// first-run warehouse error into a clear diagnostic that names the offending
+/// option, before any warehouse call. The constraint logic is shared with the
+/// DDL generator's run-path guard via
+/// [`rocky_ir::lakehouse::validate_managed_iceberg_options`], so the two checks
+/// can never drift. (FR-044)
+pub const E035: &str = "E035";
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";
