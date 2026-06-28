@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rocky import-dbt` now ports dbt unit tests with null fixture cells instead of dropping them as UnserializableUnitTest** — TOML has no null, so null cells are omitted on emit and the run-side fixture builder unions the column set across rows, materializing absent cells as SQL NULL. (FR-045)
+
 ## [1.55.1] - 2026-06-27
 
 ### Changed

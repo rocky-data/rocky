@@ -24,6 +24,8 @@
 //! ]
 //! ```
 
+use std::collections::BTreeSet;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -120,32 +122,44 @@ pub fn json_to_sql_literal(value: &JsonValue) -> String {
 ///
 /// Returns a `CREATE TABLE <ref> AS SELECT ... UNION ALL ...` statement
 /// that the test runner can execute before running the model.
+///
+/// The column set is the **union** of object keys across all rows, sorted for
+/// deterministic SQL. Every per-row `SELECT` projects that same union, emitting
+/// [`json_to_sql_literal`] for a present cell and SQL `NULL` for an absent one.
+/// This keeps all `UNION ALL` branches column-consistent even when rows differ
+/// in shape — a cell that is `null` in some rows but set in others (or a key
+/// omitted by the dbt-import emitter because its value was JSON `null`)
+/// materializes as SQL `NULL` rather than dropping the column or skewing the
+/// `SELECT` width. (FR-045)
 pub fn fixture_to_sql(fixture: &TestFixture) -> Option<String> {
     if fixture.rows.is_empty() {
         return None;
     }
 
-    // Extract column names from the first row
-    let first_row = fixture.rows[0].as_object()?;
-    let columns: Vec<&str> = first_row.keys().map(std::string::String::as_str).collect();
+    // Union of column names across every row (sorted → deterministic SQL).
+    let mut col_set: BTreeSet<&str> = BTreeSet::new();
+    for row in &fixture.rows {
+        let obj = row.as_object()?;
+        for key in obj.keys() {
+            col_set.insert(key.as_str());
+        }
+    }
+    if col_set.is_empty() {
+        return None;
+    }
+    let columns: Vec<&str> = col_set.into_iter().collect();
 
     let mut selects = Vec::with_capacity(fixture.rows.len());
     for row in &fixture.rows {
         let table = row.as_object()?;
-        let values: Vec<String> = columns
-            .iter()
-            .map(|col| match table.get(*col) {
-                Some(JsonValue::String(s)) => format!("'{}'", s.replace('\'', "''")),
-                Some(JsonValue::Number(n)) => n.to_string(),
-                Some(JsonValue::Bool(b)) => b.to_string(),
-                _ => "NULL".to_string(),
-            })
-            .collect();
-
         let col_exprs: Vec<String> = columns
             .iter()
-            .zip(values.iter())
-            .map(|(col, val)| format!("{val} AS {col}"))
+            .map(|col| {
+                let lit = table
+                    .get(*col)
+                    .map_or_else(|| "NULL".to_string(), json_to_sql_literal);
+                format!("{lit} AS {col}")
+            })
             .collect();
         selects.push(format!("SELECT {}", col_exprs.join(", ")));
     }
@@ -221,5 +235,57 @@ mod tests {
         };
         let sql = fixture_to_sql(&fixture).unwrap();
         assert!(sql.contains("O''Brien")); // escaped single quote
+    }
+
+    #[test]
+    fn test_fixture_to_sql_union_of_keys_missing_key_is_null() {
+        // Row 1 omits `email` (a null cell omitted on emit, or genuinely
+        // absent); row 2 sets it. The union must carry `email`, and row 1
+        // must project it as SQL NULL so both SELECTs share one column set.
+        let fixture = TestFixture {
+            model_ref: "users".into(),
+            rows: vec![
+                serde_json::json!({ "id": 1 }),
+                serde_json::json!({ "id": 2, "email": "a@b.com" }),
+            ],
+        };
+        let sql = fixture_to_sql(&fixture).unwrap();
+
+        // Union column order is sorted: email before id.
+        let selects: Vec<&str> = sql.split("UNION ALL").collect();
+        assert_eq!(selects.len(), 2);
+        // Both branches project the same two columns in the same order.
+        assert!(selects[0].contains("NULL AS email"));
+        assert!(selects[0].contains("1 AS id"));
+        assert!(selects[1].contains("'a@b.com' AS email"));
+        assert!(selects[1].contains("2 AS id"));
+        // Every SELECT lists email then id (consistent shape across the union).
+        for sel in &selects {
+            let email_at = sel.find("AS email").expect("email column");
+            let id_at = sel.find("AS id").expect("id column");
+            assert!(email_at < id_at, "columns must be in stable union order");
+        }
+    }
+
+    #[test]
+    fn test_fixture_to_sql_explicit_null_cell_is_null() {
+        // An explicit JSON null cell renders as SQL NULL (json_to_sql_literal's
+        // catch-all arm), matching an omitted key.
+        let fixture = TestFixture {
+            model_ref: "users".into(),
+            rows: vec![serde_json::json!({ "id": 1, "email": serde_json::Value::Null })],
+        };
+        let sql = fixture_to_sql(&fixture).unwrap();
+        assert!(sql.contains("NULL AS email"));
+        assert!(sql.contains("1 AS id"));
+    }
+
+    #[test]
+    fn test_fixture_to_sql_all_empty_rows_is_none() {
+        let fixture = TestFixture {
+            model_ref: "empty".into(),
+            rows: vec![serde_json::json!({})],
+        };
+        assert!(fixture_to_sql(&fixture).is_none());
     }
 }

@@ -683,15 +683,22 @@ pub fn apply_dbt_unit_tests(
 
 /// Check that a converted unit test round-trips to the sidecar TOML the
 /// emitter writes. Returns `Err(reason)` when the `toml` crate rejects the
-/// shape — most commonly a `null` value inside a fixture/expectation row,
-/// which TOML cannot express. Mirrors the emitter's `[[test]]` wrapper so a
-/// pass here guarantees the emit-time serialize won't fail.
+/// shape *after* null-stripping — e.g. a nested array/object TOML cannot
+/// express.
+///
+/// Null fixture/expectation cells are no longer fatal: TOML has no `null`
+/// type, so the emitter omits `null`-valued keys ([`emit::strip_null_fixture_cells`])
+/// and the run-side fixture builder materializes the absent cell back to SQL
+/// `NULL`. This check applies the same strip before serializing, so a test
+/// whose only obstacle was a null cell now passes here and ports as
+/// `CONVERTED`. (FR-045)
 fn check_unit_test_serializable(test: &UnitTestDef) -> Result<(), String> {
     #[derive(serde::Serialize)]
     struct Wrapper<'a> {
         test: [&'a UnitTestDef; 1],
     }
-    toml::to_string(&Wrapper { test: [test] })
+    let stripped = crate::import::emit::strip_null_fixture_cells(test);
+    toml::to_string(&Wrapper { test: [&stripped] })
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
@@ -3863,13 +3870,13 @@ FROM {{ ref('stg_events') }}
         assert_eq!(imported.unit_tests.len(), 1);
     }
 
-    /// A `null` fixture value (TOML has no null type) must NOT abort the
-    /// import. The offending unit test is skipped + counted; every other
-    /// model/seed/test still imports — and a sibling null-free unit test in
-    /// the same manifest round-trips cleanly. Regression for the
-    /// `toml::to_string … unsupported unit type` import-abort bug.
+    /// FR-045: a `null` fixture/expectation cell (TOML has no null type) is no
+    /// longer dropped. The null key is omitted on emit and the run-side builder
+    /// materializes it back to SQL NULL, so the test ports as CONVERTED — not
+    /// UnserializableUnitTest. Covers the mixed/union case (a column null in
+    /// some rows, set in others) and asserts the emitted sidecar TOML is clean.
     #[test]
-    fn test_apply_dbt_unit_tests_null_fixture_value_skips_not_aborts() {
+    fn test_apply_dbt_unit_tests_null_fixture_value_converts() {
         let manifest = serde_json::json!({
             "metadata": { "project_name": "p" },
             "nodes": {
@@ -3886,16 +3893,95 @@ FROM {{ ref('stg_events') }}
             },
             "sources": {},
             "unit_tests": {
-                // Offending: a `null` field value inside an expectation row.
+                // Null cells in BOTH given and expect, plus the mixed/union
+                // case: `note` is set in row 1 but null in row 2.
                 "unit_test.p.m.has_null": {
                     "unique_id": "unit_test.p.m.has_null",
                     "name": "has_null",
                     "model": "m",
-                    "given": [{ "input": "ref('u')", "rows": [{ "id": 1, "note": "x" }] }],
+                    "given": [{ "input": "ref('u')", "rows": [
+                        { "id": 1, "note": "x" },
+                        { "id": 2, "note": null }
+                    ] }],
                     "expect": { "rows": [{ "id": 1, "note": null }], "format": "dict" },
                     "tags": []
+                }
+            }
+        });
+
+        let result = import_from_manifest_json(&manifest);
+
+        let imported = result
+            .imported
+            .iter()
+            .find(|m| m.name == "m")
+            .expect("model imported");
+
+        // Counters: seen and CONVERTED, none skipped.
+        assert_eq!(result.unit_tests_found, 1);
+        assert_eq!(result.unit_tests_converted, 1);
+        assert_eq!(result.unit_tests_skipped, 0);
+
+        // No UnserializableUnitTest warning — the null cell is no longer fatal.
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.category == WarningCategory::UnserializableUnitTest),
+            "null fixture cells must not trigger UnserializableUnitTest"
+        );
+
+        assert_eq!(imported.unit_tests.len(), 1);
+        assert_eq!(imported.unit_tests[0].name, "has_null");
+
+        // The emitted sidecar TOML serializes cleanly with the null key omitted.
+        let emitted = crate::import::emit::render_unit_tests("m", &imported.unit_tests);
+        assert!(
+            emitted.contains("[[test]]") && emitted.contains("has_null"),
+            "has_null test must serialize to a [[test]] block:\n{emitted}"
+        );
+        // The omitted null cell renders the row WITHOUT a `note = ` for that
+        // entry — re-parsing the sidecar must succeed (no stray null literal).
+        let parsed: toml::Value =
+            toml::from_str(&emitted).expect("emitted unit-test TOML must re-parse");
+        assert!(
+            parsed.get("test").is_some(),
+            "parsed sidecar carries [[test]]"
+        );
+    }
+
+    /// A test still genuinely unrepresentable after null-stripping (a `null`
+    /// nested inside an array, which a key-strip can't reach) is still dropped
+    /// with an UnserializableUnitTest warning, and never aborts the import.
+    #[test]
+    fn test_apply_dbt_unit_tests_nested_null_array_still_skips() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": {
+                "model.p.m": {
+                    "unique_id": "model.p.m",
+                    "name": "m",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT 1",
+                    "raw_code": "SELECT 1",
+                    "depends_on": { "nodes": [], "macros": [] },
+                    "config": { "materialized": "table" },
+                    "columns": {}, "tags": [], "schema": "s", "database": "d"
+                }
+            },
+            "sources": {},
+            "unit_tests": {
+                // A null INSIDE an array — key-strip can't reach it, so TOML
+                // still can't express the row.
+                "unit_test.p.m.nested": {
+                    "unique_id": "unit_test.p.m.nested",
+                    "name": "nested",
+                    "model": "m",
+                    "given": [{ "input": "ref('u')", "rows": [{ "id": 1, "tags": [null] }] }],
+                    "expect": { "rows": [{ "id": 1 }], "format": "dict" },
+                    "tags": []
                 },
-                // Valid sibling: null-free, no description — must round-trip.
+                // Valid sibling: must still round-trip.
                 "unit_test.p.m.clean": {
                     "unique_id": "unit_test.p.m.clean",
                     "name": "clean",
@@ -3908,38 +3994,24 @@ FROM {{ ref('stg_events') }}
         });
 
         let result = import_from_manifest_json(&manifest);
-
-        // Exit-0 behavior: the import completed, the model is present.
         let imported = result
             .imported
             .iter()
             .find(|m| m.name == "m")
             .expect("model still imported despite the unserializable unit test");
 
-        // Counters: both seen, one converted, one skipped.
         assert_eq!(result.unit_tests_found, 2);
         assert_eq!(result.unit_tests_converted, 1);
         assert_eq!(result.unit_tests_skipped, 1);
-
-        // Only the clean test is attached.
         assert_eq!(imported.unit_tests.len(), 1);
         assert_eq!(imported.unit_tests[0].name, "clean");
-
-        // A structured warning explains the skip.
         assert!(
             result
                 .warnings
                 .iter()
                 .any(|w| w.category == WarningCategory::UnserializableUnitTest
-                    && w.message.contains("has_null")),
+                    && w.message.contains("nested")),
             "expected an UnserializableUnitTest warning naming the dropped test"
-        );
-
-        // The retained test round-trips to the sidecar TOML the emitter writes.
-        let emitted = crate::import::emit::render_unit_tests("m", &imported.unit_tests);
-        assert!(
-            emitted.contains("[[test]]") && emitted.contains("clean"),
-            "clean test must serialize to a [[test]] block:\n{emitted}"
         );
     }
 
