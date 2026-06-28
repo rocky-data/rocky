@@ -372,8 +372,19 @@ pub fn import_from_manifest(
         .filter(|n| n.compiled_code.is_some())
         .count();
 
+    // Map every imported model's dbt `unique_id` to its bare Rocky name + the
+    // compiled relation strings to search for, so each node's compiled body can
+    // have its qualified upstream model refs rewritten to bare names. (FR-046)
+    let model_relations = build_model_relation_map(manifest, default_target);
+
     for node in manifest.nodes.values() {
-        import_manifest_node(node, default_target, microbatch_mode, &mut result);
+        import_manifest_node(
+            node,
+            default_target,
+            microbatch_mode,
+            &model_relations,
+            &mut result,
+        );
     }
 
     if model_count > 0 && with_compiled == 0 {
@@ -787,16 +798,22 @@ fn attach_intent(result: &mut ImportResult, model_name: &str, description: Optio
     }
 }
 
-fn import_manifest_node(
+/// An imported upstream model's identity for the compiled-body FQN→bare
+/// rewrite: the bare Rocky name plus the compiled relation strings to search
+/// for in a downstream body (longest first). (FR-046)
+struct UpstreamModel {
+    bare_name: String,
+    fqn_candidates: Vec<String>,
+}
+
+/// Resolve a model node's output `(catalog, schema, table)` the way the emitted
+/// Rocky `[target]` block does: dbt `alias` overrides the table name, while
+/// `config.schema` / `database` fall back to the import default target. Shared
+/// by node emission and the FQN-fallback path so the two never drift.
+fn resolve_node_coords(
     node: &DbtManifestNode,
     default_target: &TargetConfig,
-    microbatch_mode: MicrobatchMode,
-    result: &mut ImportResult,
-) {
-    // Resolve the model's output coordinates up front so the raw-code fallback
-    // (for {{ this }}) and the emitted target use the same values. dbt `alias`
-    // overrides the relation name; dropping it silently lands the data in a
-    // table named after the node.
+) -> (String, String, String) {
     let schema = node
         .config
         .schema
@@ -812,11 +829,173 @@ fn import_manifest_node(
         .alias
         .clone()
         .unwrap_or_else(|| node.name.clone());
+    (catalog, schema, table)
+}
+
+/// Build the upstream-model lookup keyed by dbt `unique_id`. Only `model.*`
+/// nodes appear (the manifest parser already drops tests/seeds/sources), so a
+/// `depends_on` scan that consults this map rewrites only genuine model
+/// references and leaves `source()` FQNs qualified. (FR-046)
+fn build_model_relation_map(
+    manifest: &DbtManifest,
+    default_target: &TargetConfig,
+) -> HashMap<String, UpstreamModel> {
+    manifest
+        .nodes
+        .iter()
+        .map(|(id, node)| {
+            (
+                id.clone(),
+                UpstreamModel {
+                    bare_name: node.name.clone(),
+                    fqn_candidates: relation_candidates(node, default_target),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The compiled-relation strings to match for an upstream model, longest first.
+///
+/// dbt emits `compiled_code` using the node's `relation_name` verbatim, so that
+/// exact (adapter-quoted) form is the primary candidate; a de-quoted variant
+/// (`a.b.c`) covers adapters/manifests that don't quote. When `relation_name`
+/// is absent (older manifests) the FQN is reconstructed from the resolved
+/// coordinates as a fallback. (FR-046)
+fn relation_candidates(node: &DbtManifestNode, default_target: &TargetConfig) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    match node
+        .relation_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(relation) => {
+            candidates.push(relation.to_string());
+            let dequoted = dequote_relation(relation);
+            if dequoted != relation {
+                candidates.push(dequoted);
+            }
+        }
+        None => {
+            let (catalog, schema, table) = resolve_node_coords(node, default_target);
+            candidates.push(format!("{catalog}.{schema}.{table}"));
+        }
+    }
+    candidates.retain(|c| !c.is_empty());
+    // Longest first so a quoted relation is tried before its shorter de-quoted
+    // form (the body only carries one, but ordering keeps the scan unambiguous).
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.len()));
+    candidates.dedup();
+    candidates
+}
+
+/// Strip identifier quoting (`"` and backtick) from a relation string:
+/// `"db"."s"."t"` → `db.s.t`, `` `db`.`s`.`t` `` → `db.s.t`.
+fn dequote_relation(relation: &str) -> String {
+    relation
+        .chars()
+        .filter(|c| *c != '"' && *c != '`')
+        .collect()
+}
+
+/// Rewrite dbt's compiled, fully-qualified upstream model references in a model
+/// body back to bare Rocky model names.
+///
+/// dbt's `compiled_code` resolves `{{ ref('up') }}` to the upstream's physical
+/// relation (`"db"."schema"."up"` on duckdb, backtick-quoted on databricks),
+/// but Rocky resolves model references by BARE name — a qualified ref is treated
+/// as an external/source table. Left as-is, a `SELECT *` over a qualified
+/// upstream can't resolve its schema (E020 on microbatch/incremental models) and
+/// imported unit-test fixtures (mocked by bare name) fail to bind with
+/// "Catalog … does not exist".
+///
+/// For every `model.*` entry in this node's `depends_on` that was itself
+/// imported, the upstream's relation FQN (and a de-quoted variant) is replaced
+/// with the bare name. Genuine `source()` references stay qualified because
+/// sources are `source.*` unique_ids and never appear in `models`. A `{{ this }}`
+/// self-reference also stays untouched (the node isn't in its own
+/// `depends_on`), which is correct — Rocky resolves the model's own physical
+/// relation at run time. (FR-046)
+fn rewrite_upstream_refs_to_bare(
+    body: &str,
+    node: &DbtManifestNode,
+    models: &HashMap<String, UpstreamModel>,
+) -> String {
+    let mut out = body.to_string();
+    for upstream_id in &node.depends_on.nodes {
+        if !upstream_id.starts_with("model.") {
+            continue;
+        }
+        let Some(upstream) = models.get(upstream_id) else {
+            continue;
+        };
+        for needle in &upstream.fqn_candidates {
+            out = replace_relation_ref(&out, needle, &upstream.bare_name);
+        }
+    }
+    out
+}
+
+/// Replace every standalone occurrence of `needle` in `haystack` with
+/// `replacement`, refusing matches that sit inside a longer identifier (a
+/// neighbouring `[A-Za-z0-9_]`). The adapter-quoted relation form is already
+/// self-bounding (the closing quote terminates it); the guard matters for the
+/// de-quoted `a.b.c` variant, which must not clobber the prefix of
+/// `a.b.c_daily`. (FR-046)
+fn replace_relation_ref(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() || !haystack.contains(needle) {
+        return haystack.to_string();
+    }
+    let mut out = String::with_capacity(haystack.len());
+    let mut rest = haystack;
+    while let Some(pos) = rest.find(needle) {
+        // `before` is the char just left of the match: take it from the slice
+        // we're about to keep, or from the already-emitted output when the
+        // match sits at the start of `rest`.
+        let before = if pos > 0 {
+            rest[..pos].chars().next_back()
+        } else {
+            out.chars().next_back()
+        };
+        let after = rest[pos + needle.len()..].chars().next();
+        let standalone = before.is_none_or(|c| !is_relation_ident_char(c))
+            && after.is_none_or(|c| !is_relation_ident_char(c));
+        out.push_str(&rest[..pos]);
+        out.push_str(if standalone { replacement } else { needle });
+        rest = &rest[pos + needle.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Identifier characters for the relation-ref boundary guard. A relation match
+/// is only rewritten when neither neighbour is one of these.
+fn is_relation_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn import_manifest_node(
+    node: &DbtManifestNode,
+    default_target: &TargetConfig,
+    microbatch_mode: MicrobatchMode,
+    model_relations: &HashMap<String, UpstreamModel>,
+    result: &mut ImportResult,
+) {
+    // Resolve the model's output coordinates up front so the raw-code fallback
+    // (for {{ this }}) and the emitted target use the same values. dbt `alias`
+    // overrides the relation name; dropping it silently lands the data in a
+    // table named after the node.
+    let (catalog, schema, table) = resolve_node_coords(node, default_target);
     let this_ref = format!("{catalog}.{schema}.{table}");
 
-    // Use compiled_code (Jinja resolved) if available, else raw_code.
+    // Use compiled_code (Jinja resolved) if available, else raw_code. dbt's
+    // compiled body carries qualified upstream model refs (`"db"."schema"."up"`);
+    // rewrite those back to bare Rocky names so the imported repo compiles and
+    // unit-tests. The raw_code fallback already lowers `{{ ref() }}` to a bare
+    // name via `convert_jinja_to_sql`, so it needs no rewrite. (FR-046)
     let mut sql = match &node.compiled_code {
-        Some(code) => code.clone(),
+        Some(code) => rewrite_upstream_refs_to_bare(code, node, model_relations),
         None => {
             result.warnings.push(ImportWarning {
                 model: node.name.clone(),
@@ -4146,6 +4325,274 @@ FROM {{ ref('stg_events') }}
         assert!(
             result.imported.iter().any(|m| m.name == "ok"),
             "the real model should still be imported"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // FR-046: compiled upstream model FQNs rewritten to bare model refs
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_dequote_relation_strips_quotes_and_backticks() {
+        assert_eq!(dequote_relation("\"db\".\"s\".\"t\""), "db.s.t");
+        assert_eq!(dequote_relation("`cat`.`s`.`t`"), "cat.s.t");
+        assert_eq!(dequote_relation("db.s.t"), "db.s.t");
+    }
+
+    #[test]
+    fn test_replace_relation_ref_quoted_unquoted_and_boundary() {
+        // Quoted (self-bounding) and unquoted forms both rewrite.
+        assert_eq!(
+            replace_relation_ref(
+                "SELECT * FROM \"dev\".\"marts\".\"up\"",
+                "\"dev\".\"marts\".\"up\"",
+                "up"
+            ),
+            "SELECT * FROM up"
+        );
+        assert_eq!(
+            replace_relation_ref("SELECT * FROM dev.marts.up", "dev.marts.up", "up"),
+            "SELECT * FROM up"
+        );
+        // A same-prefix sibling must NOT be clobbered: `dev.marts.up` is not a
+        // standalone ref inside `dev.marts.up_daily`.
+        assert_eq!(
+            replace_relation_ref("SELECT * FROM dev.marts.up_daily", "dev.marts.up", "up"),
+            "SELECT * FROM dev.marts.up_daily"
+        );
+        // The quoted form is self-bounding: the closing quote means it's never
+        // a substring of a longer quoted relation.
+        assert_eq!(
+            replace_relation_ref("FROM \"d\".\"s\".\"up2\"", "\"d\".\"s\".\"up\"", "up"),
+            "FROM \"d\".\"s\".\"up2\""
+        );
+    }
+
+    /// Build a minimal `DbtManifestNode` for the rewrite-helper unit test.
+    fn bare_node(name: &str, deps: Vec<&str>) -> DbtManifestNode {
+        DbtManifestNode {
+            unique_id: format!("model.p.{name}"),
+            name: name.to_string(),
+            resource_type: "model".to_string(),
+            compiled_code: None,
+            raw_code: String::new(),
+            depends_on: dbt_manifest::DbtDependsOn {
+                nodes: deps.into_iter().map(String::from).collect(),
+                macros: vec![],
+            },
+            config: DbtNodeConfig {
+                materialized: "table".to_string(),
+                schema: None,
+                unique_key: None,
+                incremental_strategy: None,
+                event_time: None,
+                batch_size: None,
+                lookback: None,
+                partition_by: None,
+                databricks_tags: Default::default(),
+                pre_hook: vec![],
+                post_hook: vec![],
+                on_schema_change: None,
+                alias: None,
+                merge_update_columns: None,
+                merge_exclude_columns: None,
+                contract: None,
+            },
+            columns: HashMap::new(),
+            description: None,
+            tags: vec![],
+            schema: String::new(),
+            database: String::new(),
+            relation_name: None,
+        }
+    }
+
+    #[test]
+    fn test_rewrite_upstream_refs_rewrites_models_preserves_sources() {
+        // `dn` depends on a model (`up`) and a source (`raw.events`). Only the
+        // model ref is rewritten to a bare name; the source FQN is preserved.
+        let mut models = HashMap::new();
+        models.insert(
+            "model.p.up".to_string(),
+            UpstreamModel {
+                bare_name: "up".to_string(),
+                fqn_candidates: vec![
+                    "\"dev\".\"marts\".\"up\"".to_string(),
+                    "dev.marts.up".to_string(),
+                ],
+            },
+        );
+        let node = bare_node("dn", vec!["model.p.up", "source.p.raw.events"]);
+
+        let body = "SELECT u.id FROM \"dev\".\"marts\".\"up\" u \
+                    JOIN \"raw_db\".\"raw_schema\".\"events\" e ON u.id = e.id";
+        let rewritten = rewrite_upstream_refs_to_bare(body, &node, &models);
+        assert!(
+            rewritten.contains("FROM up u"),
+            "model ref must become bare: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("\"dev\".\"marts\".\"up\""),
+            "no qualified model ref may remain: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("\"raw_db\".\"raw_schema\".\"events\""),
+            "source FQN must stay qualified: {rewritten}"
+        );
+    }
+
+    /// A manifest mirroring real `dbt compile` output (duckdb, double-quoted
+    /// relations): a microbatch `mb` (`SELECT * FROM {{ ref('up') }}`), a plain
+    /// `dn` that refs `up`, an `up` that refs a `source()`, and a `src_model`
+    /// that refs a different `source()`. (FR-046)
+    fn fr046_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "metadata": { "project_name": "fr046" },
+            "nodes": {
+                "model.fr046.up": {
+                    "unique_id": "model.fr046.up", "name": "up", "resource_type": "model",
+                    "relation_name": "\"dev\".\"marts\".\"up\"",
+                    "compiled_code": "SELECT id, ts FROM \"raw_db\".\"raw_schema\".\"base\"",
+                    "raw_code": "SELECT id, ts FROM {{ source('raw','base') }}",
+                    "depends_on": { "nodes": ["source.fr046.raw.base"], "macros": [] },
+                    "config": { "materialized": "table", "event_time": "ts" },
+                    "columns": {}, "tags": [], "schema": "marts", "database": "dev"
+                },
+                "model.fr046.mb": {
+                    "unique_id": "model.fr046.mb", "name": "mb", "resource_type": "model",
+                    "relation_name": "\"dev\".\"marts\".\"mb\"",
+                    "compiled_code": "SELECT * FROM \"dev\".\"marts\".\"up\"",
+                    "raw_code": "SELECT * FROM {{ ref('up') }}",
+                    "depends_on": { "nodes": ["model.fr046.up"], "macros": [] },
+                    "config": { "materialized": "microbatch", "event_time": "ts", "batch_size": "day", "unique_key": "id" },
+                    "columns": {}, "tags": [], "schema": "marts", "database": "dev"
+                },
+                "model.fr046.dn": {
+                    "unique_id": "model.fr046.dn", "name": "dn", "resource_type": "model",
+                    "relation_name": "\"dev\".\"marts\".\"dn\"",
+                    "compiled_code": "SELECT id, ts FROM \"dev\".\"marts\".\"up\"",
+                    "raw_code": "SELECT id, ts FROM {{ ref('up') }}",
+                    "depends_on": { "nodes": ["model.fr046.up"], "macros": [] },
+                    "config": { "materialized": "table" },
+                    "columns": {}, "tags": [], "schema": "marts", "database": "dev"
+                },
+                "model.fr046.src_model": {
+                    "unique_id": "model.fr046.src_model", "name": "src_model", "resource_type": "model",
+                    "relation_name": "\"dev\".\"marts\".\"src_model\"",
+                    "compiled_code": "SELECT event_id, ts FROM \"raw_db\".\"raw_schema\".\"events\"",
+                    "raw_code": "SELECT event_id, ts FROM {{ source('raw','events') }}",
+                    "depends_on": { "nodes": ["source.fr046.raw.events"], "macros": [] },
+                    "config": { "materialized": "table" },
+                    "columns": {}, "tags": [], "schema": "marts", "database": "dev"
+                }
+            },
+            "sources": {
+                "source.fr046.raw.base": { "unique_id": "source.fr046.raw.base", "name": "base", "source_name": "raw", "database": "raw_db", "schema": "raw_schema" },
+                "source.fr046.raw.events": { "unique_id": "source.fr046.raw.events", "name": "events", "source_name": "raw", "database": "raw_db", "schema": "raw_schema" }
+            }
+        })
+    }
+
+    #[test]
+    fn test_import_dbt_rewrites_compiled_model_fqn_to_bare_ref() {
+        // Drives the REAL importer (manifest parse → import) and asserts the
+        // emitted bodies reference bare model names while genuine source FQNs
+        // stay qualified — the regression #984's typecheck test couldn't catch
+        // because it hand-mocked a bare upstream instead of importer output.
+        let result =
+            import_from_manifest_json_with_mode(&fr046_manifest(), MicrobatchMode::TimeInterval);
+
+        let model = |name: &str| {
+            result
+                .imported
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("model '{name}' should have imported"))
+        };
+
+        // (a) microbatch body: bare `up`, no qualified FQN, wrapped for the
+        // time_interval window.
+        let mb = model("mb");
+        assert!(
+            !mb.sql.contains("\"dev\".\"marts\".\"up\"") && !mb.sql.contains("dev.marts.up"),
+            "microbatch body must not keep the qualified upstream FQN: {}",
+            mb.sql
+        );
+        assert!(
+            mb.sql.contains("FROM up"),
+            "microbatch body must reference the bare model name: {}",
+            mb.sql
+        );
+        assert!(
+            mb.sql.contains("@start_date") && mb.sql.contains("@end_date"),
+            "microbatch body must still carry the time_interval window: {}",
+            mb.sql
+        );
+
+        // (b) a plain downstream model resolves to a bare upstream ref.
+        assert_eq!(model("dn").sql, "SELECT id, ts FROM up");
+
+        // (c) genuine source() refs stay qualified — both the standalone
+        // src_model and an upstream model's own source ref.
+        assert!(
+            model("src_model")
+                .sql
+                .contains("\"raw_db\".\"raw_schema\".\"events\""),
+            "source FQN must stay qualified: {}",
+            model("src_model").sql
+        );
+        assert!(
+            model("up")
+                .sql
+                .contains("\"raw_db\".\"raw_schema\".\"base\""),
+            "an upstream model's own source ref must stay qualified: {}",
+            model("up").sql
+        );
+    }
+
+    #[test]
+    fn test_import_dbt_output_compiles_without_e020() {
+        // The end-to-end proof #984 lacked: take the REAL importer output and
+        // run it through the compiler. Before FR-046 the microbatch body kept
+        // `SELECT * FROM "dev"."marts"."up"`, so SELECT* schema inference
+        // couldn't resolve `up` and E020 fired. With bare refs, `up` resolves
+        // transitively and E020 stays silent.
+        use crate::project::Project;
+        use crate::semantic::build_semantic_graph;
+        use crate::typecheck::typecheck_project_with_models;
+        use rocky_core::models::Model;
+
+        let result =
+            import_from_manifest_json_with_mode(&fr046_manifest(), MicrobatchMode::TimeInterval);
+        let models: Vec<Model> = result
+            .imported
+            .iter()
+            .map(|im| Model {
+                config: im.config.clone(),
+                sql: im.sql.clone(),
+                file_path: format!("models/{}.sql", im.name),
+                contract_path: None,
+            })
+            .collect();
+
+        let project = Project::from_models(models).expect("imported models form a valid project");
+        let graph = build_semantic_graph(&project, &HashMap::new())
+            .expect("semantic graph builds from importer output");
+        let typed =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        assert!(
+            typed
+                .typed_models
+                .get("mb")
+                .is_some_and(|cols| cols.iter().any(|c| c.name == "ts")),
+            "microbatch output schema must expose `ts` via the bare upstream: {:?}",
+            typed.typed_models.get("mb")
+        );
+        assert!(
+            !typed.diagnostics.iter().any(|d| &*d.code == "E020"),
+            "E020 must not fire once the upstream ref is bare: {:?}",
+            typed.diagnostics
         );
     }
 }
