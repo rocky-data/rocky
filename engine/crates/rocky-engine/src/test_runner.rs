@@ -682,4 +682,56 @@ mod tests {
         let run = run_unit_tests(&models, None).unwrap();
         assert_eq!(run.total(), 0);
     }
+
+    /// FR-045: the fixture sidecar omits a `note` key on row 1 (a null cell
+    /// dropped on emit) but sets it on row 2. The run-side builder must UNION
+    /// the column set across rows so `note` is present, materializing the
+    /// absent row-1 cell as SQL NULL. The model under test does null-handling
+    /// (`COALESCE(note, 'EMPTY')`); the test passes only if the built fixture
+    /// table actually carries a SQL NULL in row 1. The old `rows[0]`-only
+    /// column logic would have dropped the `note` column and failed model
+    /// execution outright.
+    #[test]
+    fn unit_test_union_of_keys_materializes_absent_cell_as_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+
+        std::fs::write(models.join("orders.sql"), "SELECT 0 AS id, '' AS note").unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog=\"wh\"\nschema=\"main\"\n",
+        )
+        .unwrap();
+
+        // Model under test exercises NULL handling on the mocked column.
+        std::fs::write(
+            models.join("filled.sql"),
+            "SELECT id, COALESCE(note, 'EMPTY') AS note_filled FROM orders",
+        )
+        .unwrap();
+        // Row 1 OMITS `note` (the post-emit shape of a null cell); row 2 sets
+        // it. Only the union builder keeps the `note` column for both rows.
+        std::fs::write(
+            models.join("filled.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\
+             [target]\ncatalog = \"wh\"\nschema = \"main\"\n\n\
+             [[test]]\nname = \"null_coalesces\"\n\n\
+             [[test.given]]\nref = \"orders\"\n\
+             rows = [ { id = 1 }, { id = 2, note = \"hi\" } ]\n\n\
+             [test.expect]\n\
+             rows = [ { id = 1, note_filled = \"EMPTY\" }, { id = 2, note_filled = \"hi\" } ]\n",
+        )
+        .unwrap();
+
+        let run = run_unit_tests(&models, None).unwrap();
+        assert_eq!(run.total(), 1);
+        assert_eq!(
+            run.passed(),
+            1,
+            "union-of-keys NULL handling failed: {:?}",
+            run.results[0].error
+        );
+        assert!(run.results[0].passed);
+    }
 }

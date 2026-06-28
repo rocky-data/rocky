@@ -238,11 +238,18 @@ fn write_model_files(model: &ImportedModel, models_dir: &Path) -> Result<(), Str
 /// crate so the array-of-tables nesting (`[[test]]`, `[[test.given]]`,
 /// `[test.expect]`) matches what the [`UnitTestDef`] deserializer expects.
 ///
-/// Each test is serialized individually so a single unrepresentable test
-/// (e.g. a `null` fixture value, which TOML can't express) is skipped with
-/// a warning rather than aborting the whole import. The upstream importer
-/// already drops such tests in `apply_dbt_unit_tests`; this is the
-/// defense-in-depth backstop so emission can never fail on a stray shape.
+/// TOML has no `null` type, so before serializing each test we strip
+/// `null`-valued object keys from every fixture/expectation row (see
+/// [`strip_null_fixture_cells`]). A null cell ports cleanly as an omitted
+/// key; the run-side fixture builder unions the column set across rows and
+/// materializes the absent cell back to SQL `NULL`. (FR-045)
+///
+/// Each test is serialized individually so a single test that is *still*
+/// unrepresentable after null-stripping (e.g. a nested array/object TOML
+/// can't express) is skipped with a warning rather than aborting the whole
+/// import. The upstream importer already filters such tests in
+/// `apply_dbt_unit_tests`; this is the defense-in-depth backstop so emission
+/// can never fail on a stray shape.
 pub(crate) fn render_unit_tests(model: &str, tests: &[UnitTestDef]) -> String {
     #[derive(Serialize)]
     struct Wrapper<'a> {
@@ -250,7 +257,8 @@ pub(crate) fn render_unit_tests(model: &str, tests: &[UnitTestDef]) -> String {
     }
     let mut out = String::new();
     for test in tests {
-        match toml::to_string(&Wrapper { test: [test] }) {
+        let stripped = strip_null_fixture_cells(test);
+        match toml::to_string(&Wrapper { test: [&stripped] }) {
             Ok(body) => {
                 out.push('\n');
                 out.push_str(&body);
@@ -264,6 +272,37 @@ pub(crate) fn render_unit_tests(model: &str, tests: &[UnitTestDef]) -> String {
                 );
             }
         }
+    }
+    out
+}
+
+/// Return a copy of `test` with `null`-valued object keys removed from every
+/// fixture (`given`) and expectation (`expect`) row.
+///
+/// TOML has no `null` type, so a row carrying a JSON `null` cell can't
+/// serialize to the sidecar (`toml` fails the whole document with
+/// "unsupported unit type"). Omitting the key lets the row port as
+/// `CONVERTED`; the run-side fixture builder ([`fixture_to_sql`]) unions the
+/// column set across rows and emits SQL `NULL` for any absent cell, so a
+/// stripped cell round-trips to a NULL at test time. Non-null shapes (and any
+/// `null` nested inside an array, which a key-strip can't reach) are left
+/// untouched, preserving the genuine "still unserializable" signal. (FR-045)
+///
+/// [`fixture_to_sql`]: rocky_core::unit_test::fixture_to_sql
+pub(crate) fn strip_null_fixture_cells(test: &UnitTestDef) -> UnitTestDef {
+    fn strip_row_nulls(row: &mut serde_json::Value) {
+        if let Some(obj) = row.as_object_mut() {
+            obj.retain(|_, v| !v.is_null());
+        }
+    }
+    let mut out = test.clone();
+    for given in &mut out.given {
+        for row in &mut given.rows {
+            strip_row_nulls(row);
+        }
+    }
+    for row in &mut out.expect.rows {
+        strip_row_nulls(row);
     }
     out
 }
@@ -1333,6 +1372,83 @@ mod tests {
         assert_eq!(ut.given.len(), 1);
         assert_eq!(ut.given[0].model_ref, "int_orders");
         assert_eq!(ut.expect.rows.len(), 1);
+    }
+
+    /// FR-045: `null` fixture/expectation cells are stripped before serialize
+    /// (TOML has no null type), so the test serializes cleanly with the null
+    /// key omitted — and the rest of the row survives.
+    #[test]
+    fn render_unit_tests_strips_null_cells_and_serializes() {
+        use rocky_core::unit_test::{TestExpectation, TestFixture, UnitTestDef};
+
+        let test = UnitTestDef {
+            name: "null_handling".into(),
+            description: None,
+            given: vec![TestFixture {
+                model_ref: "u".into(),
+                // `note` set in row 1, null in row 2 (the union/mixed case).
+                rows: vec![
+                    serde_json::json!({ "id": 1, "note": "x" }),
+                    serde_json::json!({ "id": 2, "note": null }),
+                ],
+            }],
+            expect: TestExpectation {
+                rows: vec![serde_json::json!({ "id": 1, "note": null })],
+                ordered: false,
+            },
+        };
+
+        let emitted = render_unit_tests("m", std::slice::from_ref(&test));
+        assert!(
+            emitted.contains("[[test]]") && emitted.contains("null_handling"),
+            "null-bearing test must serialize:\n{emitted}"
+        );
+
+        // Re-parse: the null key is gone, the non-null cells remain.
+        #[derive(serde::Deserialize)]
+        struct UnitTestsOnly {
+            #[serde(default)]
+            test: Vec<UnitTestDef>,
+        }
+        let parsed: UnitTestsOnly = toml::from_str(&emitted).expect("emitted TOML re-parses");
+        assert_eq!(parsed.test.len(), 1);
+        let given_row2 = parsed.test[0].given[0].rows[1].as_object().unwrap();
+        assert!(
+            !given_row2.contains_key("note"),
+            "the null `note` key must be omitted: {given_row2:?}"
+        );
+        assert_eq!(
+            given_row2.get("id").and_then(serde_json::Value::as_i64),
+            Some(2)
+        );
+        let expect_row = parsed.test[0].expect.rows[0].as_object().unwrap();
+        assert!(!expect_row.contains_key("note"), "expect null cell omitted");
+    }
+
+    #[test]
+    fn strip_null_fixture_cells_leaves_non_null_untouched() {
+        use rocky_core::unit_test::{TestExpectation, TestFixture, UnitTestDef};
+
+        let test = UnitTestDef {
+            name: "t".into(),
+            description: None,
+            given: vec![TestFixture {
+                model_ref: "u".into(),
+                rows: vec![serde_json::json!({ "id": 1, "name": "a", "flag": false })],
+            }],
+            expect: TestExpectation {
+                rows: vec![serde_json::json!({ "id": 1 })],
+                ordered: false,
+            },
+        };
+        let stripped = strip_null_fixture_cells(&test);
+        let row = stripped.given[0].rows[0].as_object().unwrap();
+        assert_eq!(row.len(), 3, "no keys dropped when nothing is null");
+        // `false` is not null and must survive.
+        assert_eq!(
+            row.get("flag").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]
