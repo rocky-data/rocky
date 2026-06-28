@@ -2516,6 +2516,18 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             // malformed pair (no `=`, empty/invalid name) is a clear CLI error.
             let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // `--var` is only threaded through the standard run path. The `--dag`
+            // and `--watch` dispatch paths compile their sub-runs with an empty
+            // `RunVars`, so a supplied `--var` would be silently dropped —
+            // resolving to inline defaults (wrong data reported as success) or
+            // failing a required var that was in fact supplied. Reject the
+            // combination loudly until `--var` is threaded through those paths.
+            if !var.is_empty() && (dag || watch) {
+                anyhow::bail!(
+                    "--var is not yet supported with --dag or --watch (it would be \
+                     silently dropped); run without --dag/--watch, or remove --var"
+                );
+            }
             // --idempotency-key is mutually exclusive with --resume / --resume-latest:
             // a resume is an explicit override and should never be short-circuited.
             if idempotency_key.is_some() && (resume.is_some() || resume_latest) {
