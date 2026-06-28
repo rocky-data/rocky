@@ -1,6 +1,6 @@
 [package]
 name = "rocky-mcp"
-version = "1.55.1"
+version = "1.55.2"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
