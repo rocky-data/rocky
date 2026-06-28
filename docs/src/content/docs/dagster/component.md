@@ -66,6 +66,8 @@ class MyRockyComponent(RockyComponent):
 
 Hook exceptions are logged and swallowed so a failing side-effect (typically the S3/Valkey push) cannot block code-server boot.
 
+When you use the tenant-as-partition collapse (`tenant:` / `TenantConfig`), set `tenant.scope_runs_to_selection: true` (default off) to scope a tenant partition run to the connectors the host actually selected, emitting one `rocky run --filter id=<source>` per selected connector instead of re-copying the whole tenant. It only narrows on a strict subset of the tenant's connectors (a full or empty selection still runs the whole tenant), and each `id=` targets that partition's own source, so per-tenant isolation is preserved.
+
 ## State storage
 
 By default, the component stores its state on the local filesystem. The `defs_state` mechanism in Dagster makes this configurable for alternative storage backends.

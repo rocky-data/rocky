@@ -280,6 +280,19 @@ class _GroupBuild:
     #: table name → collapsed asset key, the run-time fallback for engine
     #: materialization keys whose tenant is not yet in the load-time map.
     collapsed_key_by_table: dict[str, dg.AssetKey] = field(default_factory=dict)
+    #: Per-partition selection map for the opt-in connector scoping:
+    #: ``partition key (tenant) → {collapsed asset key → that tenant's
+    #: source id}``. Lets a tenant-collapse run narrow to the host-selected
+    #: connectors via ``id=`` filters that stay tenant-correct — each id is
+    #: the *active partition's* own source — even though the collapsed key is
+    #: itself tenant-agnostic. Populated only on the collapse path; the
+    #: default path (and the no-tenant path) leave it empty.
+    partition_key_to_selection_source_ids: dict[str, dict[dg.AssetKey, str]] = field(
+        default_factory=dict
+    )
+    #: Mirrors ``TenantConfig.scope_runs_to_selection`` onto the group so
+    #: :func:`_tenant_partition_filters` can read the opt-in at run time.
+    scope_runs_to_selection: bool = False
 
 
 @dataclass
@@ -357,11 +370,21 @@ class TenantConfig(dg.Model, dg.Resolvable):
             component's sensor adds newly-discovered tenant values to the
             partition set on each tick (via ``dynamic_partitions_requests``).
             Set ``False`` to manage the partition set out-of-band.
+        scope_runs_to_selection: When ``True``, a tenant partition run scopes
+            to the connectors the host actually selected — emitting one
+            ``rocky run --filter id=<source>`` per selected connector (each
+            source id is that tenant's own catalog, so physical isolation
+            holds) — instead of re-copying the whole tenant. The narrowing
+            only kicks in when the host selected a *strict subset* of the
+            tenant's connectors; a full or empty selection still runs the
+            whole tenant via ``{component}={value}``. Default ``False``
+            preserves the original full-tenant behavior.
     """
 
     component: str
     partitions_name: str
     sync_partitions_from_discover: bool = True
+    scope_runs_to_selection: bool = False
 
 
 class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
@@ -1772,6 +1795,7 @@ def _build_collapsed_group_contexts(
         group.partitions_def = partitions_def
         group.tenant_component = tenant.component
         group.source_ids = {m.id for m in members}
+        group.scope_runs_to_selection = tenant.scope_runs_to_selection
 
         # Single chokepoint for the tenant key: translator.get_partition_key
         # (default None → raw component value). Map each key back to the raw
@@ -1841,12 +1865,28 @@ def _build_collapsed_group_contexts(
         # table) → the shared collapsed spec key; at run time only the
         # active partition's keys are emitted.
         for member in members:
+            # Re-derive this member's partition key exactly as the
+            # partition_key_to_filter_value loop above does (translator
+            # override, else the raw component value) so the selection map is
+            # keyed by the SAME partition key the run later sees in
+            # ``context.partition_key``.
+            raw_value = member.components[tenant.component]
+            assert isinstance(raw_value, str)  # guarded above
+            override = translator.get_partition_key(member)
+            member_partition_key = raw_value if override is None else override
             for member_table in member.tables:
                 spec_key = spec_key_by_table.get(member_table.name)
                 if spec_key is not None:
                     group.rocky_key_to_dagster_key[_native_rocky_key(member, member_table.name)] = (
                         spec_key
                     )
+                    # {collapsed key → this tenant's source id} so a
+                    # host-selected connector subset can scope the run via a
+                    # tenant-correct ``id=`` filter (the collapsed key alone
+                    # is tenant-agnostic and would lose the active tenant).
+                    group.partition_key_to_selection_source_ids.setdefault(
+                        member_partition_key, {}
+                    )[spec_key] = member.id
         groups.append(group)
 
     return groups
@@ -1907,6 +1947,7 @@ def _coalesce_collapsed_groups(
     merged = _GroupBuild(name=name)
     merged.partitions_def = groups[0].partitions_def
     merged.tenant_component = groups[0].tenant_component
+    merged.scope_runs_to_selection = groups[0].scope_runs_to_selection
 
     spec_keys: set[dg.AssetKey] = set()
     # table name → its single collapsed key, or None once a second distinct key
@@ -1915,6 +1956,16 @@ def _coalesce_collapsed_groups(
 
     for group in groups:
         merged.source_ids |= group.source_ids
+
+        # Union the per-partition selection map. Each group is a distinct
+        # connector (keyed by its non-tenant components), so within a given
+        # partition the groups' collapsed keys are disjoint — there is no real
+        # (partition_key, key) collision. ``setdefault`` keeps the first
+        # defensively, matching the spec / native-key merges below.
+        for pkey, key_source_ids in group.partition_key_to_selection_source_ids.items():
+            dest = merged.partition_key_to_selection_source_ids.setdefault(pkey, {})
+            for spec_key, source_id in key_source_ids.items():
+                dest.setdefault(spec_key, source_id)
 
         for spec in group.specs:
             if spec.key in spec_keys:
@@ -2341,7 +2392,7 @@ def _make_rocky_asset(
         # partition key (→ that tenant's own catalog); the default path
         # uses the group / per-source filter.
         if group.partitions_def is not None and group.tenant_component is not None:
-            filters = _tenant_partition_filters(group, context)
+            filters = _tenant_partition_filters(group, context, selected_keys)
         else:
             filters = _select_filters(group, selected_keys, context)
 
@@ -2644,6 +2695,7 @@ def _select_filters(
 def _tenant_partition_filters(
     group: _GroupBuild,
     context: dg.AssetExecutionContext,
+    selected_keys: set[dg.AssetKey],
 ) -> list[str]:
     """Build the per-tenant ``--filter`` for a collapsed, partitioned run.
 
@@ -2657,6 +2709,19 @@ def _tenant_partition_filters(
     multi-run backfill), so exactly one partition key is present.
     ``BackfillPolicy.single_run()`` (a partition *range* in one run) is
     rejected: a single ``--filter`` value cannot span tenant catalogs.
+
+    Connector scoping (opt-in, off by default): when
+    :attr:`_GroupBuild.scope_runs_to_selection` is set AND the host
+    selected a *strict subset* of this tenant's connectors, return one
+    ``id=<source>`` filter per selected connector instead of the whole
+    tenant. Each id is looked up in
+    :attr:`_GroupBuild.partition_key_to_selection_source_ids` for the
+    *active partition*, so the source it targets is that tenant's own
+    catalog — ``id`` is globally unique, so isolation holds even though the
+    collapsed asset key is tenant-agnostic. A full selection (every
+    connector) or an empty / unmapped selection (e.g. a brand-new tenant
+    not yet in the map) falls back to the whole-tenant filter — fewer runs,
+    and the safe default when the subset can't be resolved.
     """
     if not context.has_partition_key:
         raise dg.Failure(
@@ -2671,10 +2736,33 @@ def _tenant_partition_filters(
     partition_key = context.partition_key
     filter_value = group.partition_key_to_filter_value.get(partition_key, partition_key)
     assert group.tenant_component is not None  # set whenever partitions_def is
-    context.log.info(
-        f"Tenant partition '{partition_key}' → --filter {group.tenant_component}={filter_value}"
-    )
-    return [f"{group.tenant_component}={filter_value}"]
+    tenant_filter = f"{group.tenant_component}={filter_value}"
+
+    if group.scope_runs_to_selection:
+        # Source ids for THIS partition's connectors only — the strict-subset
+        # comparison must be against the active tenant's source set, never the
+        # group-wide ``source_ids`` (which spans every tenant).
+        partition_source_ids = group.partition_key_to_selection_source_ids.get(partition_key, {})
+        needed_source_ids = {
+            partition_source_ids[k] for k in selected_keys if k in partition_source_ids
+        }
+        partition_source_set = set(partition_source_ids.values())
+        if needed_source_ids and needed_source_ids != partition_source_set:
+            scoped = [f"id={sid}" for sid in sorted(needed_source_ids)]
+            context.log.info(
+                f"Tenant partition '{partition_key}': scoping to "
+                f"{len(needed_source_ids)}/{len(partition_source_set)} selected "
+                f"connectors → {scoped}"
+            )
+            return scoped
+        context.log.info(
+            f"Tenant partition '{partition_key}': selection covers the whole tenant "
+            f"(or is unresolved) → --filter {tenant_filter}"
+        )
+        return [tenant_filter]
+
+    context.log.info(f"Tenant partition '{partition_key}' → --filter {tenant_filter}")
+    return [tenant_filter]
 
 
 def _run_filters(

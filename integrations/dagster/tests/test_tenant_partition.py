@@ -31,6 +31,7 @@ from dagster_rocky.component import (
     _coalesce_collapsed_groups,
     _CompileState,
     _make_rocky_asset,
+    _run_filters,
     _tenant_partition_filters,
 )
 from dagster_rocky.translator import RockyDagsterTranslator
@@ -247,7 +248,7 @@ class _FakeCtx:
 
 def test_tenant_partition_filters_maps_key_to_filter():
     groups, _ = _collapse(_discover(_source("coca_cola", ["orders"]), _source("pepsi", ["orders"])))
-    filters = _tenant_partition_filters(groups[0], _FakeCtx("pepsi"))
+    filters = _tenant_partition_filters(groups[0], _FakeCtx("pepsi"), set())
     assert filters == ["client=pepsi"]
 
 
@@ -255,14 +256,266 @@ def test_tenant_partition_filters_uses_raw_value_for_unknown_key():
     # A brand-new tenant partition (added by the sensor before the next state
     # refresh) isn't in the map yet → fall back to the key itself.
     groups, _ = _collapse(_discover(_source("coca_cola", ["orders"])))
-    filters = _tenant_partition_filters(groups[0], _FakeCtx("newtenant"))
+    filters = _tenant_partition_filters(groups[0], _FakeCtx("newtenant"), set())
     assert filters == ["client=newtenant"]
 
 
 def test_tenant_partition_filters_rejects_single_run_backfill():
     groups, _ = _collapse(_discover(_source("coca_cola", ["orders"])))
     with pytest.raises(dg.Failure, match="single_run"):
-        _tenant_partition_filters(groups[0], _FakeCtx(None))
+        _tenant_partition_filters(groups[0], _FakeCtx(None), set())
+
+
+# --------------------------------------------------------------------------- #
+# Connector scoping: tenant run honours the host's asset-selection (opt-in)
+# --------------------------------------------------------------------------- #
+
+
+def _scoped_source(client: str, connector: str, tables: list[str]) -> SourceInfo:
+    # Each ``connector`` is a distinct non-tenant ``source`` component, so the
+    # collapsed (tenant-stripped) keys differ per connector. Source id encodes
+    # both axes so the per-partition map is easy to assert on.
+    return SourceInfo(
+        id=f"{client}__{connector}",
+        components={"client": client, "region": "usa", "source": connector},
+        source_type="fivetran",
+        last_sync_at=None,
+        tables=[TableInfo(name=t, row_count=1) for t in tables],
+    )
+
+
+def _tenant_scoped() -> TenantConfig:
+    return TenantConfig(
+        component="client",
+        partitions_name="rocky_clients",
+        scope_runs_to_selection=True,
+    )
+
+
+def _scoped_key(connector: str) -> dg.AssetKey:
+    return dg.AssetKey(["fivetran", "usa", connector, "orders"])
+
+
+def _scoped_merged_group(tenant: TenantConfig):
+    """Two tenants × three connectors, built through the REAL collapse +
+    coalesce path (not a synthetic ``_GroupBuild``) so the tests prove the
+    selection map is actually wired — it was empty on the collapse path
+    before, which would make the opt-in inert in production."""
+    discover = _discover(
+        *[
+            _scoped_source(client, connector, ["orders"])
+            for client in ("acme", "widgets")
+            for connector in ("connector_a", "connector_b", "connector_c")
+        ]
+    )
+    pdef = dg.DynamicPartitionsDefinition(name="rocky_clients")
+    groups = _build_collapsed_group_contexts(discover, RockyDagsterTranslator(), tenant, pdef)
+    merged = _coalesce_collapsed_groups(groups, name="tenant_rocky_clients")
+    assert len(merged) == 1
+    return merged[0]
+
+
+def _empty_run_result(filter_str: str) -> RunResult:
+    return RunResult.model_validate(
+        {
+            "version": "0.3.0",
+            "command": "run",
+            "filter": filter_str,
+            "duration_ms": 1,
+            "tables_copied": 0,
+            "tables_failed": 0,
+            "materializations": [],
+            "check_results": [],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+
+
+def test_selection_source_id_map_populated_through_real_builders():
+    # Wiring proof: the per-partition selection map is populated by the real
+    # collapse + coalesce path (and the opt-in is mirrored onto the group).
+    merged = _scoped_merged_group(_tenant_scoped())
+    assert merged.scope_runs_to_selection is True
+    assert set(merged.partition_key_to_selection_source_ids) == {"acme", "widgets"}
+    assert merged.partition_key_to_selection_source_ids["widgets"] == {
+        _scoped_key("connector_a"): "widgets__connector_a",
+        _scoped_key("connector_b"): "widgets__connector_b",
+        _scoped_key("connector_c"): "widgets__connector_c",
+    }
+
+
+def test_tenant_scope_off_ignores_selection():
+    # Back-compat: with the opt-in OFF, a connector subset still runs the whole
+    # tenant — unchanged from before.
+    merged = _scoped_merged_group(_tenant())  # scope_runs_to_selection defaults False
+    assert merged.scope_runs_to_selection is False
+    filters = _tenant_partition_filters(merged, _FakeCtx("widgets"), {_scoped_key("connector_a")})
+    assert filters == ["client=widgets"]
+
+
+def test_tenant_scope_on_strict_subset_returns_partition_scoped_id():
+    merged = _scoped_merged_group(_tenant_scoped())
+    filters = _tenant_partition_filters(merged, _FakeCtx("widgets"), {_scoped_key("connector_a")})
+    # The selected connector's source id for THIS partition (widgets) only —
+    # not acme's, not the other connectors, not the whole-tenant filter.
+    assert filters == ["id=widgets__connector_a"]
+
+
+def test_tenant_scope_on_two_of_three_subset_is_sorted():
+    merged = _scoped_merged_group(_tenant_scoped())
+    filters = _tenant_partition_filters(
+        merged,
+        _FakeCtx("widgets"),
+        {_scoped_key("connector_c"), _scoped_key("connector_a")},
+    )
+    assert filters == ["id=widgets__connector_a", "id=widgets__connector_c"]
+
+
+def test_tenant_scope_on_full_selection_runs_whole_tenant():
+    merged = _scoped_merged_group(_tenant_scoped())
+    all_keys = {_scoped_key(c) for c in ("connector_a", "connector_b", "connector_c")}
+    filters = _tenant_partition_filters(merged, _FakeCtx("widgets"), all_keys)
+    assert filters == ["client=widgets"]
+
+
+def test_tenant_scope_on_empty_selection_runs_whole_tenant():
+    merged = _scoped_merged_group(_tenant_scoped())
+    filters = _tenant_partition_filters(merged, _FakeCtx("widgets"), set())
+    assert filters == ["client=widgets"]
+
+
+def test_tenant_scope_on_is_partition_specific():
+    # Same selected connector, different partition → that partition's own
+    # source id. Proves the id= filter follows the active tenant (so isolation
+    # holds), rather than a fixed first-seen tenant.
+    merged = _scoped_merged_group(_tenant_scoped())
+    acme = _tenant_partition_filters(merged, _FakeCtx("acme"), {_scoped_key("connector_b")})
+    widgets = _tenant_partition_filters(merged, _FakeCtx("widgets"), {_scoped_key("connector_b")})
+    assert acme == ["id=acme__connector_b"]
+    assert widgets == ["id=widgets__connector_b"]
+
+
+def test_tenant_scope_on_guard_still_rejects_missing_partition_key():
+    merged = _scoped_merged_group(_tenant_scoped())
+    with pytest.raises(dg.Failure, match="single_run"):
+        _tenant_partition_filters(merged, _FakeCtx(None), {_scoped_key("connector_a")})
+
+
+def test_run_filters_issues_one_rocky_run_per_id_filter():
+    # A 2-element id= list (the scoped tenant subset) runs as two separate,
+    # scoped `rocky run` invocations.
+    rocky = MagicMock()
+    rocky.run.side_effect = lambda *, filter: _empty_run_result(filter)
+    filters = ["id=widgets__connector_a", "id=widgets__connector_b"]
+    results, cooldown = _run_filters(_FakeCtx("widgets"), rocky, filters, streaming=False)
+    assert [call.kwargs["filter"] for call in rocky.run.call_args_list] == filters
+    assert rocky.run.call_count == 2
+    assert cooldown is None
+    assert [r.filter for r in results] == filters
+
+
+def _scoped_two_connector_state(tmp_path):
+    discover = {
+        "version": "0.3.0",
+        "command": "discover",
+        "sources": [
+            {
+                "id": "acme__connector_a",
+                "source_type": "fivetran",
+                "components": {"client": "acme", "region": "usa", "source": "connector_a"},
+                "tables": [{"name": "orders"}],
+            },
+            {
+                "id": "acme__connector_b",
+                "source_type": "fivetran",
+                "components": {"client": "acme", "region": "usa", "source": "connector_b"},
+                "tables": [{"name": "leads"}],
+            },
+        ],
+    }
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"discover": discover}))
+    return state_file
+
+
+def test_scope_on_subset_materialization_runs_scoped_id_filter(tmp_path):
+    # End-to-end through the real op: opt-in ON + a one-connector subset
+    # selection on a tenant partition issues a single `rocky run --filter
+    # id=<that connector's source>` instead of the whole-tenant filter. This
+    # is the composition the unit tests don't cover (selection → call site →
+    # _tenant_partition_filters → scoped run), and the seam that was inert
+    # before the per-partition map.
+    state_file = _scoped_two_connector_state(tmp_path)
+    component = RockyComponent(
+        config_path="rocky.toml",
+        tenant=TenantConfig(
+            component="client",
+            partitions_name="rocky_clients",
+            scope_runs_to_selection=True,
+        ),
+    )
+    defs = component.build_defs_from_state(context=None, state_path=state_file)
+    asset_defs = [a for a in (defs.assets or []) if isinstance(a, dg.AssetsDefinition)]
+    assert len(asset_defs) == 1
+    a = dg.AssetKey(["fivetran", "usa", "connector_a", "orders"])
+    b = dg.AssetKey(["fivetran", "usa", "connector_b", "leads"])
+    assert {a, b} <= {k for ad in asset_defs for k in ad.keys}
+
+    run_result = RunResult.model_validate(
+        {
+            "version": "0.3.0",
+            "command": "run",
+            "filter": "id=acme__connector_a",
+            "duration_ms": 10,
+            "tables_copied": 1,
+            "tables_failed": 0,
+            "materializations": [
+                {
+                    "asset_key": ["fivetran", "acme", "usa", "connector_a", "orders"],
+                    "rows_copied": 10,
+                    "duration_ms": 5,
+                    "metadata": {"strategy": "full_refresh"},
+                }
+            ],
+            "check_results": [],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 1, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+
+    instance = dg.DagsterInstance.ephemeral()
+    instance.add_dynamic_partitions("rocky_clients", ["acme"])
+
+    mock_run = MagicMock(return_value=run_result)
+    with (
+        patch.object(RockyResource, "run_streaming", mock_run),
+        patch.object(RockyResource, "run", return_value=run_result),
+    ):
+        result = dg.materialize(
+            asset_defs,
+            resources={"rocky": RockyResource(config_path="rocky.toml")},
+            selection=[a],  # subset: one of the tenant's two connectors
+            partition_key="acme",
+            instance=instance,
+            raise_on_error=False,
+        )
+
+    assert result.success
+    # Exactly one run, scoped to the selected connector's OWN source id.
+    assert mock_run.call_count == 1
+    assert mock_run.call_args.kwargs["filter"] == "id=acme__connector_a"
+    assert {e.asset_key for e in result.get_asset_materialization_events()} == {a}
 
 
 # --------------------------------------------------------------------------- #
