@@ -986,7 +986,7 @@
     "vscode:prepublish": "npm run compile && npm run bundle"
   },
   "dependencies": {
-    "vscode-languageclient": "^10.0.0"
+    "vscode-languageclient": "^10.0.1"
   },
   "devDependencies": {
     "@dagrejs/dagre": "^3.0.0",
@@ -995,7 +995,7 @@
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/mocha": "^10.0.10",
-    "@types/node": "^26.0.0",
+    "@types/node": "^26.0.1",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@types/vscode": "1.125.0",
@@ -1003,7 +1003,7 @@
     "@vscode/vsce": "^3.9.1",
     "@xyflow/react": "^12.11.1",
     "esbuild": "^0.28.1",
-    "eslint": "^10.4.1",
+    "eslint": "^10.6.0",
     "glob": "^13.0.6",
     "jsdom": "^29.1.1",
     "json-schema-to-typescript": "^15.0.4",
