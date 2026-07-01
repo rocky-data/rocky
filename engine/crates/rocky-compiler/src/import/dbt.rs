@@ -2155,8 +2155,13 @@ pub fn detect_is_incremental(sql: &str) -> (String, Option<IncrementalDetection>
             None => String::new(),
         };
 
+        // `NoExpand` so a `$` in the operator's else-block SQL (dollar-quoted
+        // literals, Snowflake positional `$1`, a literal `$100`) is copied
+        // verbatim instead of being interpreted as a capture-group reference.
+        // Matches the guard already applied to the ref-rewrite at the bottom of
+        // `convert_jinja_to_sql`.
         processed = incr_re
-            .replace(&processed, replacement.as_str())
+            .replace(&processed, regex::NoExpand(replacement.as_str()))
             .to_string();
     }
 
@@ -2442,6 +2447,36 @@ pub fn write_imported_models(models: &[ImportedModel], output_dir: &Path) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_is_incremental_does_not_expand_dollar_in_else_block() {
+        // Regression: the else-block SQL was passed as a `&str` replacement to
+        // `Regex::replace`, so a `$` sequence was interpreted as a capture-group
+        // reference and silently corrupted the imported SQL. `NoExpand` copies
+        // it verbatim.
+        let sql = "{% if is_incremental() %} WHERE synced > 1 \
+                   {% else %} WHERE note = 'costs $100' {% endif %}";
+        let (processed, _) = detect_is_incremental(sql);
+        assert!(
+            processed.contains("costs $100"),
+            "`$100` must survive verbatim, got: {processed}"
+        );
+    }
+
+    #[test]
+    fn detect_is_incremental_preserves_dollar_quoted_and_positional() {
+        let (processed, _) = detect_is_incremental(
+            "{% if is_incremental() %}x{% else %} WHERE a = $1 AND tag = $$active$$ {% endif %}",
+        );
+        assert!(
+            processed.contains("$1"),
+            "positional `$1` preserved: {processed}"
+        );
+        assert!(
+            processed.contains("$$active$$"),
+            "dollar-quoted preserved: {processed}"
+        );
+    }
 
     // --- Jinja conversion tests ---
 
