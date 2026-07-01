@@ -4,7 +4,8 @@ use thiserror::Error;
 use crate::lakehouse::{self, LakehouseError};
 use crate::traits::{AdapterError, SqlDialect};
 use rocky_ir::{
-    ArchivePlanIr, CompactPlanIr, MaterializationStrategy, ModelIr, ModelIrVariant, PartitionWindow,
+    ArchivePlanIr, ColumnSelection, CompactPlanIr, MaterializationStrategy, ModelIr,
+    ModelIrVariant, PartitionWindow,
 };
 
 /// Build the canonical `expected X ModelIr for \`name\`, found <actual>` error
@@ -181,6 +182,26 @@ pub fn generate_create_table_as_sql(
 ///
 /// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
 /// a replication-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
+/// Expand an implicit `ColumnSelection::All` for a `merge` to an explicit list
+/// built from the model's typed output columns. Returns the selection unchanged
+/// when it is already explicit or when `typed_columns` is empty (a partial
+/// typecheck), so the dialect's own behavior — including Snowflake/DuckDB's and
+/// BigQuery's clear "UPDATE SET * unsupported" error — still stands in that case.
+fn resolve_merge_columns(
+    update_columns: &ColumnSelection,
+    typed_columns: &[rocky_ir::types::TypedColumn],
+) -> ColumnSelection {
+    match update_columns {
+        ColumnSelection::All if !typed_columns.is_empty() => ColumnSelection::Explicit(
+            typed_columns
+                .iter()
+                .map(|c| std::sync::Arc::from(c.name.as_str()))
+                .collect(),
+        ),
+        _ => update_columns.clone(),
+    }
+}
+
 pub fn generate_merge_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
@@ -332,7 +353,15 @@ pub fn generate_transformation_sql_with_warehouse(
             unique_key,
             update_columns,
         } => {
-            let stmt = dialect.merge_into(&target, &model_ir.sql, unique_key, update_columns)?;
+            // Resolve an implicit `ColumnSelection::All` against the model's
+            // typed output columns so every dialect receives an explicit column
+            // list. BigQuery has no `UPDATE SET *` form and Snowflake/DuckDB
+            // reject it; the replication path resolves `All` against the
+            // discovered source schema, the transformation path against
+            // `typed_columns`. Without this a transformation `merge` with no
+            // explicit `update_columns` is broken on every adapter but Databricks.
+            let resolved = resolve_merge_columns(update_columns, &model_ir.typed_columns);
+            let stmt = dialect.merge_into(&target, &model_ir.sql, unique_key, &resolved)?;
             Ok(vec![stmt])
         }
         MaterializationStrategy::View => Ok(vec![generate_view_sql(model_ir, dialect)?]),
@@ -1450,6 +1479,56 @@ mod tests {
         };
         let sql = generate_select_sql(&ir, &dialect(), None).unwrap();
         assert!(!sql.contains("WHERE")); // merge SELECT is a full scan
+    }
+
+    #[test]
+    fn resolve_merge_columns_expands_all_from_typed_columns() {
+        use rocky_ir::types::{RockyType, TypedColumn};
+        let typed = vec![
+            TypedColumn {
+                name: "id".into(),
+                data_type: RockyType::Int64,
+                nullable: false,
+            },
+            TypedColumn {
+                name: "amount".into(),
+                data_type: RockyType::Int64,
+                nullable: true,
+            },
+        ];
+        match resolve_merge_columns(&ColumnSelection::All, &typed) {
+            ColumnSelection::Explicit(cols) => {
+                assert_eq!(cols.len(), 2);
+                assert_eq!(&*cols[0], "id");
+                assert_eq!(&*cols[1], "amount");
+            }
+            ColumnSelection::All => panic!("All should have resolved to Explicit"),
+        }
+    }
+
+    #[test]
+    fn resolve_merge_columns_keeps_all_when_typed_empty() {
+        // A partial typecheck (no columns) leaves `All`, so the dialect's own
+        // clear error (Snowflake/DuckDB/BigQuery) still fires rather than a
+        // silently-wrong empty column list.
+        assert!(matches!(
+            resolve_merge_columns(&ColumnSelection::All, &[]),
+            ColumnSelection::All
+        ));
+    }
+
+    #[test]
+    fn resolve_merge_columns_leaves_explicit_untouched() {
+        use rocky_ir::types::{RockyType, TypedColumn};
+        let typed = vec![TypedColumn {
+            name: "id".into(),
+            data_type: RockyType::Int64,
+            nullable: false,
+        }];
+        match resolve_merge_columns(&ColumnSelection::Explicit(vec!["x".into()]), &typed) {
+            ColumnSelection::Explicit(cols) => assert_eq!(cols.len(), 1),
+            ColumnSelection::All => panic!("Explicit must stay Explicit"),
+        }
     }
 
     #[test]

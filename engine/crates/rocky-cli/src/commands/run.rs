@@ -3686,15 +3686,25 @@ pub async fn run(
             }
             .await;
             if let Err(e) = exec_result {
-                let _ = hook_registry
-                    .fire(&HookContext::pipeline_error(
-                        &run_id,
-                        pipeline_name,
-                        &format!("{e:#}"),
-                    ))
-                    .await;
-                let _ = hook_registry.wait_async_webhooks().await;
-                return Err(e);
+                // Record the runtime model failure as a table error and fall
+                // through to the terminal emit instead of returning raw `Err`.
+                // `execute_models` stops at the first failing model, having
+                // already recorded the earlier successes in `output`; returning
+                // `Err` here skipped `print_json` + `persist_run_record`, so
+                // `--output json` stdout was empty and the process exited 1
+                // instead of the PartialFailure sentinel (exit 2). Routing
+                // through `table_errors` lets the existing merge + terminal
+                // machinery report it like any other partial failure (the
+                // copy-failure block below fires `pipeline_error` + drains
+                // webhooks once for the accumulated failures), mirroring the
+                // model-only path.
+                table_errors.push(TableError {
+                    asset_key: vec![pipeline_name.to_string()],
+                    error: format!("{e:#}"),
+                    task_index: None,
+                    failure_kind: crate::output::FailureKind::Unknown,
+                    cooldown_seconds: None,
+                });
             }
 
             // Governance: column classification + masking reconcile (§1.1 + §1.2).
@@ -5782,6 +5792,15 @@ async fn execute_one_plain_model(
     exec_ctx: ExecutionContext<'_>,
 ) -> Result<MaterializationOutput> {
     let mut model_ir = model.to_model_ir();
+    // Enrich typed columns from the typechecker (bare `to_model_ir()` leaves
+    // them empty) so a `merge` strategy with an implicit all-columns update set
+    // resolves to an explicit per-column list at SQL-gen. Mirrors
+    // `typed_model_ir` / `project_ir_from_compile`. Without it, BigQuery emits
+    // an invalid `UPDATE SET target = source` and Snowflake/DuckDB reject
+    // `UPDATE SET *` for a transformation merge with no explicit columns.
+    if let Some(cols) = exec_ctx.typed_models.get(model_name) {
+        model_ir.typed_columns = cols.clone();
+    }
     // Inject declared surrogate-key columns by wrapping the model's SELECT.
     // Transformation models materialize their raw SQL directly (never the
     // replication-only metadata-column path), so the wrap is what surfaces the

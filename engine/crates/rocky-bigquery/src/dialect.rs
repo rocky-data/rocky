@@ -55,7 +55,19 @@ impl SqlDialect for BigQueryDialect {
             .join(" AND ");
 
         let update_set = match update_cols {
-            ColumnSelection::All => "target = source".to_string(),
+            // BigQuery MERGE has no `UPDATE SET *` / whole-row form (unlike
+            // Databricks). The runner resolves `ColumnSelection::All` against
+            // the model's columns before SQL-gen; reaching here with `All`
+            // means none were resolvable, so fail fast with a clear message
+            // instead of emitting the invalid `UPDATE SET target = source`.
+            // Mirrors the Snowflake and DuckDB dialects.
+            ColumnSelection::All => {
+                return Err(AdapterError::msg(
+                    "BigQuery MERGE does not support UPDATE SET * — no update \
+                     columns could be resolved. Specify update_columns explicitly \
+                     on the model's [strategy].",
+                ));
+            }
             ColumnSelection::Explicit(cols) => cols
                 .iter()
                 .map(|c| format!("target.{c} = source.{c}"))
@@ -383,17 +395,40 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_into() {
+    fn test_merge_rejects_update_set_star() {
+        // Regression: BigQuery has no `UPDATE SET *` / whole-row form, so an
+        // unresolved `ColumnSelection::All` must fail fast (like Snowflake and
+        // DuckDB) instead of emitting the invalid `UPDATE SET target = source`.
         let d = BigQueryDialect;
-        let sql = d
+        let err = d
             .merge_into(
                 "`p`.`d`.`t`",
                 "SELECT * FROM src",
                 &["id".into()],
                 &ColumnSelection::All,
             )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("UPDATE SET *"),
+            "expected a clear fail-fast error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_merge_into_explicit_columns() {
+        let d = BigQueryDialect;
+        let sql = d
+            .merge_into(
+                "`p`.`d`.`t`",
+                "SELECT * FROM src",
+                &["id".into()],
+                &ColumnSelection::Explicit(vec!["status".into(), "amount".into()]),
+            )
             .unwrap();
         assert!(sql.contains("MERGE INTO"));
+        assert!(sql.contains(
+            "WHEN MATCHED THEN UPDATE SET target.status = source.status, target.amount = source.amount"
+        ));
         assert!(sql.contains("WHEN NOT MATCHED THEN INSERT ROW"));
     }
 
