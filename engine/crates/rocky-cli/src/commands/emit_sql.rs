@@ -136,6 +136,24 @@ fn emit_models(
         }
     };
 
+    // A successful compile can still carry error diagnostics — e.g. E028 for a
+    // required `@var(...)` with no supplied value, which substitutes the
+    // MISSING_SENTINEL ("NULL") into the SQL. `rocky compile`/`run` refuse to
+    // proceed in that case; emit-sql must too, rather than emitting (and, with
+    // `--out-dir`, persisting) provably-wrong SQL. Mirrors the compile command.
+    if result.has_errors {
+        let errors: Vec<String> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.is_error())
+            .map(|d| format!("{}: {} ({})", d.code, d.message, d.model))
+            .collect();
+        anyhow::bail!(
+            "emit-sql: compilation failed with errors:\n  {}",
+            errors.join("\n  ")
+        );
+    }
+
     // Iterate in the project's topological execution order so the emitted files
     // are runnable in sequence (a model never precedes one it reads). Models not
     // listed in `execution_order` (defensive) fall to the end in IR order.
@@ -170,12 +188,14 @@ fn emit_models(
 
     let mut emitted = Vec::new();
     let mut skipped = Vec::new();
+    let mut filter_matched = false;
     for model_ir in ordered {
         let model_name = model_ir.name.as_ref();
-        if let Some(f) = model_filter
-            && model_name != f
-        {
-            continue;
+        if let Some(f) = model_filter {
+            if model_name != f {
+                continue;
+            }
+            filter_matched = true;
         }
 
         let mut model_ir = model_ir.clone();
@@ -217,6 +237,16 @@ fn emit_models(
             }
         }
     }
+    // An explicit `--model <name>` that matched nothing is a user error (a
+    // typo, or a model that doesn't exist), not an empty success — otherwise
+    // `emit-sql --model X --out-dir out/` writes nothing and exits 0 while a
+    // deploy script believes it emitted. Mirrors `rocky cost --model`.
+    if let Some(f) = model_filter
+        && !filter_matched
+    {
+        anyhow::bail!("emit-sql: model '{f}' not found (no transformation model with that name)");
+    }
+
     Ok(EmitResult {
         models: emitted,
         skipped,
@@ -430,6 +460,40 @@ mod tests {
         .models;
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].name, "b");
+    }
+
+    #[test]
+    fn unknown_model_filter_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model(dir.path(), "a", "SELECT 1 AS id", "");
+        // Regression: a `--model` that matches nothing must error, not silently
+        // succeed with an empty result (which a deploy script reads as success).
+        let err = emit_models(
+            None,
+            dir.path(),
+            Some("nope"),
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .err()
+        .expect("unknown --model must error");
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn missing_required_var_errors_instead_of_emitting_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model(dir.path(), "m", "SELECT '@var(region)' AS r", "");
+        // Regression: emit-sql must honor compile errors (E028) rather than
+        // emit the MISSING_SENTINEL ("NULL") for a required @var with no value.
+        let err = emit_models(
+            None,
+            dir.path(),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .err()
+        .expect("missing required @var must error");
+        assert!(err.to_string().contains("compilation failed"), "{err}");
     }
 
     #[test]

@@ -298,7 +298,14 @@ fn comment_spans(sql: &str) -> Vec<(usize, usize)> {
                 _ => i += 1,
             },
             ScanMode::SingleQuote => {
-                if bytes[i] == b'\'' {
+                // A backslash escapes the next byte on warehouses that honor
+                // C-style string escapes (Databricks/Spark, Snowflake,
+                // BigQuery), so `\'` does not close the string — skip both
+                // bytes. (DuckDB treats `\` literally; that is a pre-existing
+                // Rocky-parser-vs-dialect gap, independent of @var.)
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i += 2;
+                } else if bytes[i] == b'\'' {
                     // A doubled `''` is an escaped quote — stay in the string.
                     if i + 1 < n && bytes[i + 1] == b'\'' {
                         i += 2;
@@ -311,7 +318,9 @@ fn comment_spans(sql: &str) -> Vec<(usize, usize)> {
                 }
             }
             ScanMode::DoubleQuote => {
-                if bytes[i] == b'"' {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i += 2;
+                } else if bytes[i] == b'"' {
                     if i + 1 < n && bytes[i + 1] == b'"' {
                         i += 2;
                     } else {
@@ -412,6 +421,23 @@ mod tests {
         assert_eq!(out.missing, vec!["region".to_string()]);
         // Sentinel keeps the SQL parseable.
         assert_eq!(out.sql, "WHERE region = 'NULL'");
+    }
+
+    #[test]
+    fn substitute_var_inside_backslash_escaped_string() {
+        // Regression: the comment scanner treated `\'` as a closing quote, so a
+        // `@var` after a `--` that is actually inside a backslash-escaped string
+        // literal was misclassified as comment content and silently skipped. On
+        // warehouses that honor `\'` (Databricks/Snowflake/BigQuery) the whole
+        // literal is one string, so the var must still substitute.
+        let vars = RunVars::parse_pairs(["z=42"]).unwrap();
+        let out = substitute_run_vars(r"SELECT 'x\'y -- @var(z)' AS c FROM t", &vars);
+        assert!(
+            out.sql.contains("42"),
+            "var inside a backslash-escaped string must substitute: {}",
+            out.sql
+        );
+        assert!(out.missing.is_empty());
     }
 
     #[test]

@@ -55,6 +55,46 @@ pub fn render_or_serialize(
     }
 }
 
+/// Like [`render_template`] but JSON-escapes every substituted value. Use this
+/// when the template is a JSON document (a webhook body / built-in preset): the
+/// template's own structure stays literal while interpolated data-derived
+/// values (error text, table/model names, anomaly descriptions) become safe
+/// JSON string content. Without it a value containing a `"`, `\`, or newline —
+/// common in a stringified warehouse error — breaks or injects into the payload.
+pub fn render_template_json(
+    template: &str,
+    context: &HookContext,
+) -> Result<String, TemplateError> {
+    let lookup = build_lookup(context)?;
+    let after_conditionals = resolve_conditionals(template, &lookup)?;
+    Ok(substitute_fields_inner(&after_conditionals, &lookup, true))
+}
+
+/// JSON-body variant of [`render_or_serialize`]: renders the provided template
+/// with JSON-escaped values, or serializes the full context when none is given.
+pub fn render_or_serialize_json(
+    template: Option<&str>,
+    context: &HookContext,
+) -> Result<String, TemplateError> {
+    match template {
+        Some(t) => render_template_json(t, context),
+        None => Ok(serde_json::to_string(context)?),
+    }
+}
+
+/// Escape a string as JSON string content (without the surrounding quotes) so a
+/// data-derived value substituted into a JSON body can't break out of its
+/// string. Delegates to `serde_json` so quotes, backslashes, control characters
+/// and newlines are all handled.
+fn json_escape(s: &str) -> String {
+    let quoted = serde_json::Value::String(s.to_string()).to_string();
+    // `Value::String` always serializes as `"…"`; strip the outer quotes.
+    quoted
+        .get(1..quoted.len().saturating_sub(1))
+        .unwrap_or("")
+        .to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Internal: build flat lookup map
 // ---------------------------------------------------------------------------
@@ -153,6 +193,14 @@ fn resolve_conditionals(
 // ---------------------------------------------------------------------------
 
 fn substitute_fields(input: &str, lookup: &HashMap<String, String>) -> String {
+    substitute_fields_inner(input, lookup, false)
+}
+
+fn substitute_fields_inner(
+    input: &str,
+    lookup: &HashMap<String, String>,
+    json_escape_values: bool,
+) -> String {
     const OPEN: &str = "{{";
     const CLOSE: &str = "}}";
 
@@ -175,7 +223,11 @@ fn substitute_fields(input: &str, lookup: &HashMap<String, String>) -> String {
 
         let field = field_raw.trim();
         if let Some(value) = lookup.get(field) {
-            result.push_str(value);
+            if json_escape_values {
+                result.push_str(&json_escape(value));
+            } else {
+                result.push_str(value);
+            }
         }
         // else: empty string (intentionally no output for unknown fields).
 
@@ -318,5 +370,33 @@ mod tests {
         let template = r#"{"text": "{{model}} failed: {{error}}"}"#;
         let result = render_template(template, &ctx).unwrap();
         assert_eq!(result, r#"{"text": "my_model failed: timeout after 30s"}"#);
+    }
+
+    #[test]
+    fn test_json_body_escapes_quotes_and_newlines() {
+        // Regression: a data-derived error with a `"` / newline used to break
+        // or inject into the JSON webhook payload. `render_template_json` must
+        // escape substituted values so the body stays valid JSON.
+        let mut ctx = HookContext::materialize_error(
+            "run-1",
+            "pipe",
+            "cat.sch.t",
+            "boom \"quote\" and\nnewline",
+        );
+        ctx.model = Some("my_model".to_string());
+        let template = r#"{"text": "{{model}}: {{error}}"}"#;
+        let result = render_template_json(template, &ctx).unwrap();
+        // The rendered body must parse as JSON and preserve the raw value.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("rendered webhook body must be valid JSON");
+        assert_eq!(parsed["text"], "my_model: boom \"quote\" and\nnewline");
+    }
+
+    #[test]
+    fn test_plain_render_still_unescaped() {
+        // Non-JSON rendering path is unchanged (values inserted raw).
+        let ctx = test_context();
+        let result = render_template("Model: {{model}}", &ctx).unwrap();
+        assert_eq!(result, "Model: my_model");
     }
 }

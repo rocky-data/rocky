@@ -185,6 +185,16 @@ pub async fn run_transformation(
         .unwrap_or_default();
     output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
 
+    // Enforce the global run-level `[budget]`. The replication (run.rs) and
+    // model-only paths both run this after cost population; without it the
+    // guardrail is a silent no-op on the transformation path — the highest-
+    // compute pipeline type, exactly where a scan/cost/duration cap matters
+    // most. `check_and_record_budget` records any breach into
+    // `output.budget_breaches` (surfaced in the JSON) and returns `Err` when
+    // `on_breach = "error"`; the error is propagated after the JSON is emitted
+    // (below) so a consumer still sees the final payload.
+    let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(run_id));
+
     // Persist the RunRecord (after cost population, so the recorded
     // `ModelExecution` entries carry cost + `skip_hash` + upstream
     // freshness signatures). Mirrors the replication / model-only call
@@ -239,6 +249,11 @@ pub async fn run_transformation(
             crate::status_line!("  {} ({})", m.asset_key.join("."), m.metadata.strategy);
         }
     }
+
+    // Propagate a hard `[budget]` breach (`on_breach = "error"`) now that the
+    // JSON payload has been emitted, matching the replication / model-only
+    // ordering.
+    budget_result?;
 
     // Honour the run-status exit-code contract. A model that failed to
     // compile (recorded in `output.errors` / `tables_failed` by
@@ -515,16 +530,21 @@ pub(crate) async fn run_custom_checks(
             Ok(result) => {
                 let result_value =
                     cell_as_u64(result.rows.first().and_then(|r| r.first())).unwrap_or(0);
-                results.push(CheckResult {
-                    name: custom.name.clone(),
-                    passed: result_value >= custom.threshold,
-                    severity,
-                    details: CheckDetails::Custom {
-                        query: sql,
-                        result_value,
-                        threshold: custom.threshold,
-                    },
-                });
+                // Delegate to the single canonical custom-check evaluator so the
+                // wired path and `checks::check_custom` can't drift on the pass
+                // condition again. `threshold` is the MAX allowed failing-row
+                // count, so the check passes iff `result_value <= threshold`
+                // (with the default `threshold = 0`, a violation-counting check
+                // passes only when it finds zero rows). `check_custom` defaults
+                // severity to Error; restore the check's configured severity.
+                let mut check = rocky_core::checks::check_custom(
+                    &custom.name,
+                    &sql,
+                    result_value,
+                    custom.threshold,
+                );
+                check.severity = severity;
+                results.push(check);
             }
             Err(e) => {
                 warn!(error = %e, check = custom.name.as_str(), "custom check query failed");

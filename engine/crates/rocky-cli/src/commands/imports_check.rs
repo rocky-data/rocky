@@ -273,13 +273,22 @@ pub fn imports_diagnostics(
             }
 
             let reference = match rocky_sql::lineage::extract_lineage(&model.sql) {
-                Ok(lineage) if !lineage.has_star => Reference::Columns(
-                    lineage
-                        .columns
-                        .iter()
-                        .map(|c| c.source_column.to_lowercase())
-                        .collect(),
-                ),
+                Ok(lineage) if !lineage.has_star => {
+                    // Build the read-set from a COMPLETE column walk (WHERE /
+                    // JOIN ON / GROUP BY / HAVING / ORDER BY / every expression
+                    // operand), not `lineage.columns` — which captures only the
+                    // top-level projection's first-traceable refs and would let
+                    // a breaking change to a column read elsewhere (a WHERE
+                    // filter, a 2nd function arg, a CASE/arithmetic operand)
+                    // slip the gate silently. An empty result (no columns
+                    // resolved) falls back to the conservative Unfiltered.
+                    let cols = rocky_sql::lineage::referenced_columns(&model.sql);
+                    if cols.is_empty() {
+                        Reference::Unfiltered
+                    } else {
+                        Reference::Columns(cols)
+                    }
+                }
                 // `SELECT *` or unparsable SQL: be conservative.
                 _ => Reference::Unfiltered,
             };

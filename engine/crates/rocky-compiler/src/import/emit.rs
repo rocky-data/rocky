@@ -217,6 +217,19 @@ fn prepare_out_dir(out_dir: &Path, policy: OverwritePolicy) -> Result<(), String
 }
 
 fn write_model_files(model: &ImportedModel, models_dir: &Path) -> Result<(), String> {
+    // A dbt manifest is a third-party build artifact; its node `name` flows
+    // straight into these filesystem paths. Reject a name that is not a plain
+    // filename component so a hostile or garbled manifest can't traverse
+    // outside `models_dir` (`../../x`, `/etc/x`, `a/b`) with attacker-controlled
+    // content — the write-side mirror of the read-side `safe_join_under` guard.
+    if !is_safe_model_file_stem(&model.name) {
+        return Err(format!(
+            "model name {:?} is not a safe file name — model names may not \
+             contain path separators, parent-dir (`..`), or absolute-path \
+             components",
+            model.name
+        ));
+    }
     let sql_path = models_dir.join(format!("{}.sql", model.name));
     let toml_path = models_dir.join(format!("{}.toml", model.name));
 
@@ -322,22 +335,20 @@ fn annotate_unsupported_jinja(sql: &str) -> String {
 fn render_model_sidecar(config: &ModelConfig) -> String {
     // Lean serializer — matches the pattern used by `rocky ai` for sidecars
     // (see CHANGELOG #414): we deliberately do NOT serialize empty default
-    // collections (`depends_on = []`, etc.) so the file stays compact.
+    // collections (`depends_on = []`, etc.) so the file stays compact. Every
+    // manifest-derived string value goes through `toml_escape`.
     let mut out = String::new();
-    out.push_str(&format!("name = \"{}\"\n", config.name));
+    out.push_str(&format!("name = \"{}\"\n", toml_escape(&config.name)));
     if !config.depends_on.is_empty() {
         let quoted: Vec<String> = config
             .depends_on
             .iter()
-            .map(|s| format!("\"{s}\""))
+            .map(|s| format!("\"{}\"", toml_escape(s)))
             .collect();
         out.push_str(&format!("depends_on = [{}]\n", quoted.join(", ")));
     }
     if let Some(intent) = &config.intent {
-        out.push_str(&format!(
-            "intent = \"{}\"\n",
-            intent.replace('\\', "\\\\").replace('"', "\\\"")
-        ));
+        out.push_str(&format!("intent = \"{}\"\n", toml_escape(intent)));
     }
     out.push('\n');
 
@@ -348,17 +359,26 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
         }
         StrategyConfig::Incremental { timestamp_column } => {
             out.push_str("type = \"incremental\"\n");
-            out.push_str(&format!("timestamp_column = \"{timestamp_column}\"\n"));
+            out.push_str(&format!(
+                "timestamp_column = \"{}\"\n",
+                toml_escape(timestamp_column)
+            ));
         }
         StrategyConfig::Merge {
             unique_key,
             update_columns,
         } => {
             out.push_str("type = \"merge\"\n");
-            let keys: Vec<String> = unique_key.iter().map(|k| format!("\"{k}\"")).collect();
+            let keys: Vec<String> = unique_key
+                .iter()
+                .map(|k| format!("\"{}\"", toml_escape(k)))
+                .collect();
             out.push_str(&format!("unique_key = [{}]\n", keys.join(", ")));
             if let Some(cols) = update_columns {
-                let cs: Vec<String> = cols.iter().map(|c| format!("\"{c}\"")).collect();
+                let cs: Vec<String> = cols
+                    .iter()
+                    .map(|c| format!("\"{}\"", toml_escape(c)))
+                    .collect();
                 out.push_str(&format!("update_columns = [{}]\n", cs.join(", ")));
             }
         }
@@ -373,14 +393,17 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
         }
         StrategyConfig::DynamicTable { target_lag } => {
             out.push_str("type = \"dynamic_table\"\n");
-            out.push_str(&format!("target_lag = \"{target_lag}\"\n"));
+            out.push_str(&format!("target_lag = \"{}\"\n", toml_escape(target_lag)));
         }
         StrategyConfig::Microbatch {
             timestamp_column,
             granularity,
         } => {
             out.push_str("type = \"microbatch\"\n");
-            out.push_str(&format!("timestamp_column = \"{timestamp_column}\"\n"));
+            out.push_str(&format!(
+                "timestamp_column = \"{}\"\n",
+                toml_escape(timestamp_column)
+            ));
             let g = match granularity {
                 rocky_ir::TimeGrain::Hour => "hour",
                 rocky_ir::TimeGrain::Day => "day",
@@ -391,7 +414,10 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
         }
         StrategyConfig::DeleteInsert { partition_by } => {
             out.push_str("type = \"delete_insert\"\n");
-            let keys: Vec<String> = partition_by.iter().map(|k| format!("\"{k}\"")).collect();
+            let keys: Vec<String> = partition_by
+                .iter()
+                .map(|k| format!("\"{}\"", toml_escape(k)))
+                .collect();
             out.push_str(&format!("partition_by = [{}]\n", keys.join(", ")));
         }
         StrategyConfig::TimeInterval {
@@ -402,7 +428,7 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
             first_partition,
         } => {
             out.push_str("type = \"time_interval\"\n");
-            out.push_str(&format!("time_column = \"{time_column}\"\n"));
+            out.push_str(&format!("time_column = \"{}\"\n", toml_escape(time_column)));
             let g = match granularity {
                 rocky_ir::TimeGrain::Hour => "hour",
                 rocky_ir::TimeGrain::Day => "day",
@@ -413,7 +439,7 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
             out.push_str(&format!("lookback = {lookback}\n"));
             out.push_str(&format!("batch_size = {}\n", batch_size.get()));
             if let Some(first) = first_partition {
-                out.push_str(&format!("first_partition = \"{first}\"\n"));
+                out.push_str(&format!("first_partition = \"{}\"\n", toml_escape(first)));
             }
         }
         // ContentAddressed doesn't arise from the dbt importer today; if we
@@ -428,9 +454,18 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
     out.push('\n');
 
     out.push_str("[target]\n");
-    out.push_str(&format!("catalog = \"{}\"\n", config.target.catalog));
-    out.push_str(&format!("schema = \"{}\"\n", config.target.schema));
-    out.push_str(&format!("table = \"{}\"\n", config.target.table));
+    out.push_str(&format!(
+        "catalog = \"{}\"\n",
+        toml_escape(&config.target.catalog)
+    ));
+    out.push_str(&format!(
+        "schema = \"{}\"\n",
+        toml_escape(&config.target.schema)
+    ));
+    out.push_str(&format!(
+        "table = \"{}\"\n",
+        toml_escape(&config.target.table)
+    ));
 
     if !config.tags.is_empty() {
         out.push('\n');
@@ -444,7 +479,7 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
             } else {
                 format!("{k:?}")
             };
-            out.push_str(&format!("{key} = \"{v}\"\n"));
+            out.push_str(&format!("{key} = \"{}\"\n", toml_escape(v)));
         }
     }
 
@@ -452,9 +487,9 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
         out.push('\n');
         for src in &config.sources {
             out.push_str("[[sources]]\n");
-            out.push_str(&format!("catalog = \"{}\"\n", src.catalog));
-            out.push_str(&format!("schema = \"{}\"\n", src.schema));
-            out.push_str(&format!("table = \"{}\"\n", src.table));
+            out.push_str(&format!("catalog = \"{}\"\n", toml_escape(&src.catalog)));
+            out.push_str(&format!("schema = \"{}\"\n", toml_escape(&src.schema)));
+            out.push_str(&format!("table = \"{}\"\n", toml_escape(&src.table)));
         }
     }
 
@@ -467,9 +502,39 @@ fn render_model_sidecar(config: &ModelConfig) -> String {
     out
 }
 
-/// Escape a string for a double-quoted TOML basic string (backslash + quote).
+/// True when `name` is safe to use as a single `<name>.sql` / `<name>.toml`
+/// filename component: non-empty, no path separators, no parent-/absolute-path
+/// escape. A dbt manifest node name is third-party input, so a name failing
+/// this (`../x`, `/etc/x`, `a/b`) must not reach a `models_dir.join(...)`.
+fn is_safe_model_file_stem(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !Path::new(name).is_absolute()
+        && Path::new(name).components().count() == 1
+        && Path::new(name).file_name().and_then(|n| n.to_str()) == Some(name)
+}
+
+/// Escape a string for a double-quoted TOML basic string. dbt-manifest-derived
+/// values (model/target/column names, refs, tag values) are not guaranteed to
+/// be quote-, backslash-, or newline-free, so every interpolated value must go
+/// through this — otherwise such a value could break, or inject extra keys
+/// into, the generated sidecar TOML. Control characters (incl. a raw newline,
+/// which is invalid inside a TOML basic string) are escaped too.
 fn toml_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Serialise a [`TestDecl`] as a `[[tests]]` block matching the canonical
@@ -491,7 +556,7 @@ fn render_test_decl(test: &TestDecl) -> String {
             out.push_str("type = \"accepted_values\"\n");
             let escaped: Vec<String> = values
                 .iter()
-                .map(|v| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")))
+                .map(|v| format!("\"{}\"", toml_escape(v)))
                 .collect();
             out.push_str(&format!("values = [{}]\n", escaped.join(", ")));
         }
@@ -500,8 +565,8 @@ fn render_test_decl(test: &TestDecl) -> String {
             to_column,
         } => {
             out.push_str("type = \"relationships\"\n");
-            out.push_str(&format!("to_table = \"{to_table}\"\n"));
-            out.push_str(&format!("to_column = \"{to_column}\"\n"));
+            out.push_str(&format!("to_table = \"{}\"\n", toml_escape(to_table)));
+            out.push_str(&format!("to_column = \"{}\"\n", toml_escape(to_column)));
         }
         TestType::Composite { kind, columns } => {
             out.push_str("type = \"composite\"\n");
@@ -509,7 +574,10 @@ fn render_test_decl(test: &TestDecl) -> String {
                 CompositeKind::Unique => "unique",
             };
             out.push_str(&format!("kind = \"{kind_str}\"\n"));
-            let cols: Vec<String> = columns.iter().map(|c| format!("\"{c}\"")).collect();
+            let cols: Vec<String> = columns
+                .iter()
+                .map(|c| format!("\"{}\"", toml_escape(c)))
+                .collect();
             out.push_str(&format!("columns = [{}]\n", cols.join(", ")));
         }
         // dbt_expectations / dbt_utils long-tail mappings.
@@ -543,16 +611,13 @@ fn render_test_decl(test: &TestDecl) -> String {
         }
     }
     if let Some(col) = &test.column {
-        out.push_str(&format!("column = \"{col}\"\n"));
+        out.push_str(&format!("column = \"{}\"\n", toml_escape(col)));
     }
     if test.severity != TestSeverity::Error {
         out.push_str("severity = \"warning\"\n");
     }
     if let Some(filter) = &test.filter {
-        out.push_str(&format!(
-            "filter = \"{}\"\n",
-            filter.replace('\\', "\\\\").replace('"', "\\\"")
-        ));
+        out.push_str(&format!("filter = \"{}\"\n", toml_escape(filter)));
     }
     out
 }
@@ -953,6 +1018,33 @@ fn write_migration_notes(path: &Path, ctx: &MigrationContext<'_>) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_safe_model_file_stem_rejects_traversal() {
+        assert!(is_safe_model_file_stem("stg_orders"));
+        assert!(is_safe_model_file_stem("dim_customer_v2"));
+        // Regression: a manifest node name must not traverse out of models_dir.
+        assert!(!is_safe_model_file_stem("../../escaped"));
+        assert!(!is_safe_model_file_stem("/etc/passwd"));
+        assert!(!is_safe_model_file_stem("a/b"));
+        assert!(!is_safe_model_file_stem("a\\b"));
+        assert!(!is_safe_model_file_stem(".."));
+        assert!(!is_safe_model_file_stem(""));
+    }
+
+    #[test]
+    fn toml_escape_escapes_quotes_backslash_and_newline() {
+        // Regression: an unescaped manifest value with a quote/newline could
+        // break — or inject keys into — the generated sidecar TOML.
+        assert_eq!(toml_escape(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(toml_escape(r"a\b"), r"a\\b");
+        assert_eq!(toml_escape("a\nb"), r"a\nb");
+        // The escaped value round-trips through a TOML parse as one string.
+        let escaped = toml_escape("evil\"\nname = \"injected");
+        let doc = format!("name = \"{escaped}\"\n");
+        let parsed: toml::Value = toml::from_str(&doc).unwrap();
+        assert!(parsed.get("injected").is_none(), "must not inject a key");
+    }
     use crate::import::dbt::ImportMethod;
     use crate::import::dbt_profiles::{AdapterKind, resolution_for_kind};
     use rocky_core::models::{ModelConfig, StrategyConfig, TargetConfig};

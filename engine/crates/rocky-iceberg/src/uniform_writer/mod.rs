@@ -260,6 +260,22 @@ impl UniformWriter {
                     .to_string(),
             ));
         }
+        // Scope guard: this writer allocates each partition group's baseRowId
+        // range from the per-call `state.row_tracking_next_id`, so it cannot
+        // sequence globally-disjoint ranges across >=2 groups — colliding
+        // ranges plus an under-counted rowIdHighWaterMark silently corrupt
+        // Delta row-tracking metadata. Refuse rowTracking here, mirroring
+        // `commit_pointer_with_state`; the caller must fall back to a normal
+        // build.
+        if state.row_tracking_enabled {
+            return Err(UniformWriterError::DeltaLog(
+                "partitioned content-addressed write does not support rowTracking \
+                 tables (per-group baseRowId allocation cannot be globally \
+                 sequenced across partition groups); falling back to a normal \
+                 build is the caller's responsibility"
+                    .to_string(),
+            ));
+        }
         // Validate keys match the table's partition columns.
         let table_partitions: HashSet<&str> =
             state.partition_columns.iter().map(String::as_str).collect();
@@ -862,6 +878,42 @@ mod tests {
             }
             other => panic!("expected PartitionedUnsupported, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn write_partitioned_batch_rejects_row_tracking() {
+        // Regression: a partitioned + rowTracking table allocates each
+        // group's baseRowId range from the per-call next-id and cannot
+        // globally sequence them, so it must be refused (like the point-to
+        // writer) rather than silently corrupt Delta row-tracking metadata.
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let writer = UniformWriter::new(
+            UniformWriterConfig {
+                catalog: "c".into(),
+                schema: "s".into(),
+                table: "t".into(),
+                prefix: "tbl".into(),
+                engine_info: "rocky-iceberg/test".into(),
+            },
+            store.clone() as Arc<dyn ObjectStore>,
+            Arc::new(PanicSqlClient),
+        );
+        let state = UniformTableState {
+            physical: HashMap::new(),
+            field_id: HashMap::new(),
+            partition_columns: vec!["region".to_string()],
+            row_tracking_enabled: true,
+            deletion_vectors_enabled: false,
+            next_commit_version: 1,
+            row_tracking_next_id: 0,
+        };
+        let mut pv = HashMap::new();
+        pv.insert("region".to_string(), "eu".to_string());
+        let err = writer
+            .write_partitioned_batch_with_state(make_partitioned_batch("eu", 1), pv, state)
+            .await
+            .expect_err("rowTracking partitioned write must be refused");
+        assert!(err.to_string().contains("rowTracking"), "{err}");
     }
 
     #[tokio::test]

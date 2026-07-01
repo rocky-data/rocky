@@ -2109,7 +2109,13 @@ fn format_env_var_hint(substitutions: &[EnvVarSubstitution]) -> String {
         .filter(|sub| seen.insert(&sub.name))
         .map(|sub| {
             let truncated = if sub.value.len() > MAX_VALUE_LEN {
-                format!("{}…", &sub.value[..MAX_VALUE_LEN])
+                // Truncate on a UTF-8 char boundary — a fixed byte slice panics
+                // when byte MAX_VALUE_LEN lands inside a multibyte character.
+                let end = (0..=MAX_VALUE_LEN)
+                    .rev()
+                    .find(|&i| sub.value.is_char_boundary(i))
+                    .unwrap_or(0);
+                format!("{}…", &sub.value[..end])
             } else {
                 sub.value.clone()
             };
@@ -5046,6 +5052,21 @@ impl ReplicationPipelineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_env_var_hint_truncates_on_char_boundary() {
+        // Regression: a fixed `&value[..40]` slice panicked when byte 40 landed
+        // inside a multibyte character. A long value with multibyte chars
+        // spanning the boundary must truncate cleanly (no panic).
+        let value = "é".repeat(30); // 60 bytes; byte 40 is mid-character
+        let subs = vec![EnvVarSubstitution {
+            name: "SECRET".to_string(),
+            value,
+        }];
+        let hint = format_env_var_hint(&subs); // must not panic
+        assert!(hint.contains("SECRET"));
+        assert!(hint.contains('…'));
+    }
 
     #[test]
     fn test_imports_block_parses() {
