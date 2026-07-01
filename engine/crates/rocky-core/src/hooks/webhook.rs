@@ -188,8 +188,11 @@ pub async fn fire_webhook(
     ctx: &HookContext,
     http: &reqwest::Client,
 ) -> Result<(HookResult, Option<AsyncWebhookHandle>), WebhookError> {
-    // Render the body
-    let body = template::render_or_serialize(config.body_template.as_deref(), ctx)?;
+    // Render the body. The webhook is always sent as `application/json`, so
+    // JSON-escape substituted values — a data-derived value (a stringified
+    // warehouse error, a table/model name) containing a `"` or newline would
+    // otherwise break, or inject into, the payload.
+    let body = template::render_or_serialize_json(config.body_template.as_deref(), ctx)?;
 
     if config.async_mode {
         let url = config.url.clone();
