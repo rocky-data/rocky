@@ -96,6 +96,15 @@ impl LowerContext {
                 }
             }
             PipelineStep::Derive(derivations) => {
+                // `derive` ADDS computed columns while PRESERVING existing ones
+                // (per the DSL spec). If no explicit column set has been
+                // established yet (no prior `select`/`group`), seed `*` so the
+                // base columns survive alongside the derived ones — otherwise
+                // `build_sql`, which emits `*` only when `select_columns` is
+                // empty, would drop every source column.
+                if self.select_columns.is_empty() {
+                    self.select_columns.push("*".to_string());
+                }
                 for (name, expr) in derivations {
                     let sql_expr = lower_expr(expr);
                     self.select_columns.push(format!("{sql_expr} AS {name}"));
@@ -505,6 +514,14 @@ derive {
         .unwrap();
         let sql = lower_to_sql(&file).unwrap();
         assert!(sql.contains("amount * quantity AS total"));
+        // Regression: `derive` must PRESERVE existing columns (per the DSL
+        // spec), so with no prior `select`/`group` the base columns survive via
+        // a leading `*`. Previously the derived column REPLACED the projection,
+        // silently dropping every source column.
+        assert!(
+            sql.contains('*'),
+            "derive must keep base columns (expected `SELECT *, ...`): {sql}"
+        );
     }
 
     #[test]
