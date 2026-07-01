@@ -366,9 +366,98 @@ fn extract_expr_lineage(
     }
 }
 
+/// Every source column a single-source consumer model references, lowercased —
+/// collected from the WHOLE statement (projection, `WHERE`, `JOIN ... ON`,
+/// `GROUP BY`, `HAVING`, `ORDER BY`, and every operand of a function call,
+/// binary op, or `CASE`), not just the top-level projection that
+/// [`extract_lineage`] walks.
+///
+/// This exists for the cross-team-contract gate (`rocky compile` / `rocky ci`),
+/// which must know *every* producer column a consumer touches so a breaking
+/// change to a column read only in — say — a `WHERE` filter or a `COALESCE`'s
+/// second argument is still flagged. [`extract_lineage`] deliberately captures
+/// only projection output columns (for the Inspector / lineage surfaces), so it
+/// under-reports for this purpose.
+///
+/// Returns an empty set on a parse failure; the caller treats an empty result
+/// conservatively (all producer columns considered read).
+pub fn referenced_columns(sql: &str) -> std::collections::BTreeSet<String> {
+    use std::ops::ControlFlow;
+
+    use sqlparser::ast::{Ident, Visit, Visitor};
+
+    struct ColumnRefVisitor {
+        columns: std::collections::BTreeSet<String>,
+    }
+
+    impl Visitor for ColumnRefVisitor {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            match expr {
+                Expr::Identifier(Ident { value, .. }) => {
+                    self.columns.insert(value.to_lowercase());
+                }
+                // `t.col` / `cat.sch.t.col` — the trailing part is the column.
+                Expr::CompoundIdentifier(parts) => {
+                    if let Some(last) = parts.last() {
+                        self.columns.insert(last.value.to_lowercase());
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = ColumnRefVisitor {
+        columns: std::collections::BTreeSet::new(),
+    };
+    if let Ok(statement) = crate::parser::parse_single_statement(sql) {
+        let _: ControlFlow<()> = statement.visit(&mut visitor);
+    }
+    visitor.columns
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn referenced_columns_captures_where_and_all_function_args() {
+        // Regression: `extract_lineage` walked only the projection and only a
+        // function's FIRST arg, so `region` (WHERE) and `amount` (COALESCE 2nd
+        // arg) were dropped from the cross-team-contract read-set.
+        let cols = referenced_columns(
+            "SELECT id, COALESCE(id, amount) AS a FROM shop.core.orders WHERE region = 'US'",
+        );
+        assert!(cols.contains("id"));
+        assert!(cols.contains("amount"), "2nd COALESCE arg must be captured");
+        assert!(cols.contains("region"), "WHERE column must be captured");
+    }
+
+    #[test]
+    fn referenced_columns_captures_binary_and_case_operands() {
+        let cols = referenced_columns(
+            "SELECT price * quantity AS total, CASE WHEN status = 'x' THEN 1 ELSE 0 END AS f \
+             FROM shop.core.orders",
+        );
+        for c in ["price", "quantity", "status"] {
+            assert!(cols.contains(c), "operand `{c}` must be captured");
+        }
+    }
+
+    #[test]
+    fn referenced_columns_captures_compound_identifier_column() {
+        let cols = referenced_columns("SELECT o.id FROM shop.core.orders o WHERE o.region = 'US'");
+        assert!(cols.contains("id"));
+        assert!(cols.contains("region"));
+    }
+
+    #[test]
+    fn referenced_columns_empty_on_unparsable() {
+        assert!(referenced_columns("SELCT FROM").is_empty());
+    }
 
     #[test]
     fn test_simple_select() {
