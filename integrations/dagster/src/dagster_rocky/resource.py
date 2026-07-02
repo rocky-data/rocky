@@ -292,6 +292,7 @@ def _collect_supplied_run_kwargs(
     shadow_suffix: str | None,
     governance_override: dict | None,
     idempotency_key: str | None,
+    timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Build the ``kwargs`` dict handed to :meth:`RockyResource._apply_resolvers`.
 
@@ -308,6 +309,8 @@ def _collect_supplied_run_kwargs(
         kwargs["governance_override"] = governance_override
     if idempotency_key is not None:
         kwargs["idempotency_key"] = idempotency_key
+    if timeout_seconds is not None:
+        kwargs["timeout_seconds"] = timeout_seconds
     return kwargs
 
 
@@ -476,11 +479,17 @@ class RockyResource(dg.ConfigurableResource):
         contracts_dir: Optional directory containing contract files.
         server_url: Optional URL for a running ``rocky serve`` instance. When set,
             ``compile()``, ``lineage()`` and ``metrics()`` use the HTTP API.
-        timeout_seconds: Subprocess timeout for any one CLI invocation.
+        timeout_seconds: Default subprocess timeout for any one CLI invocation.
         shadow_suffix_fn: Optional resolver that produces ``shadow_suffix`` per
             call when the caller doesn't supply one. Returning ``None`` is a no-op.
         governance_override_fn: Optional resolver for ``governance_override``.
         idempotency_key_fn: Optional resolver for ``idempotency_key``.
+        timeout_fn: Optional resolver that produces a per-call ``timeout_seconds``
+            watchdog budget. Fires when the caller omits ``timeout_seconds``;
+            returning ``None`` falls back to the static :attr:`timeout_seconds`.
+            Lets a tenant-collapsed pipeline grant only its heavy tenants a larger
+            copy budget while keeping a tight hang-detection watchdog everywhere
+            else — e.g. ``lambda ctx: 5400 if ctx.filter in HEAVY else 900``.
     """
 
     binary_path: str = "rocky"
@@ -522,6 +531,12 @@ class RockyResource(dg.ConfigurableResource):
     shadow_suffix_fn: Annotated[Resolver | None, "resource_dependency"] = None
     governance_override_fn: Annotated[Resolver | None, "resource_dependency"] = None
     idempotency_key_fn: Annotated[Resolver | None, "resource_dependency"] = None
+    #: Optional resolver that produces a per-call ``timeout_seconds`` watchdog
+    #: budget. Unlike the three resolvers above (which inject CLI-argument
+    #: kwargs), the resolved value is threaded to the SDK watchdog as a per-call
+    #: override — ``timeout_seconds`` is not a CLI flag. Fires only when the
+    #: caller omits ``timeout_seconds``; ``None`` falls back to the static field.
+    timeout_fn: Annotated[Resolver | None, "resource_dependency"] = None
 
     # Lazily-built SDK client, cached per resource instance. Dagster rebuilds the
     # resource per asset; each rebuild gets a fresh client (re-resolves the
@@ -592,6 +607,10 @@ class RockyResource(dg.ConfigurableResource):
             ("shadow_suffix", self.shadow_suffix_fn),
             ("governance_override", self.governance_override_fn),
             ("idempotency_key", self.idempotency_key_fn),
+            # ``timeout_seconds`` is not a CLI flag: the run methods read the
+            # resolved value out of ``kwargs`` and thread it to the SDK watchdog
+            # as a per-call override, never to ``_build_run_args``.
+            ("timeout_seconds", self.timeout_fn),
         ):
             if fn is None or kw in kwargs:
                 continue
@@ -710,15 +729,24 @@ class RockyResource(dg.ConfigurableResource):
         """Build the argv for ``rocky plan`` (delegates to the client)."""
         return self._get_client()._build_plan_args(filter, **kwargs)
 
-    def _run_rocky(self, args: list[str], *, allow_partial: bool = False) -> str:
+    def _run_rocky(
+        self, args: list[str], *, allow_partial: bool = False, timeout_seconds: int | None = None
+    ) -> str:
         """Execute a Rocky CLI command and return stdout (errors → ``dg.Failure``).
 
         Streams the binary's stderr to the ``dagster_rocky`` module logger
         line-by-line. Used for read-only invocations without a Dagster context;
         for live ``context.log`` streaming see :meth:`_run_rocky_streaming`.
+
+        ``timeout_seconds`` overrides the client's static watchdog budget for this
+        one invocation; forwarded only when set so the default path is unchanged.
         """
         with _translating():
-            return self._get_client().run_cli(args, allow_partial=allow_partial)
+            if timeout_seconds is None:
+                return self._get_client().run_cli(args, allow_partial=allow_partial)
+            return self._get_client().run_cli(
+                args, allow_partial=allow_partial, timeout_seconds=timeout_seconds
+            )
 
     def _run_rocky_streaming(
         self,
@@ -800,6 +828,7 @@ class RockyResource(dg.ConfigurableResource):
         idempotency_key: str | None = None,
         defer: bool = False,
         defer_to: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> RunResult:
         """Run ``rocky run --filter <key=value>`` and return the parsed result.
 
@@ -819,6 +848,10 @@ class RockyResource(dg.ConfigurableResource):
                 do NOT put secrets in idempotency keys.
             defer / defer_to: Resolve unbuilt ``ref()`` upstreams against an
                 existing schema instead of rebuilding.
+            timeout_seconds: Per-call watchdog budget (positive seconds) for this
+                one run. Overrides both :attr:`timeout_seconds` and any
+                :attr:`timeout_fn` resolver. When omitted, ``timeout_fn`` (if set)
+                resolves the budget, else the static :attr:`timeout_seconds`.
 
         Note on resolver interaction:
             Per-call resolvers registered on the resource fire for the matching
@@ -834,6 +867,7 @@ class RockyResource(dg.ConfigurableResource):
                 shadow_suffix=shadow_suffix,
                 governance_override=governance_override,
                 idempotency_key=idempotency_key,
+                timeout_seconds=timeout_seconds,
             ),
         )
         _validate_governance_override(resolved.get("governance_override"))
@@ -842,6 +876,7 @@ class RockyResource(dg.ConfigurableResource):
                 filter,
                 governance_override=resolved.get("governance_override"),
                 pipeline=pipeline,
+                timeout_seconds=resolved.get("timeout_seconds"),
                 run_models=run_models,
                 partition=partition,
                 partition_from=partition_from,
@@ -874,6 +909,7 @@ class RockyResource(dg.ConfigurableResource):
         idempotency_key: str | None = None,
         defer: bool = False,
         defer_to: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> RunResult:
         """``rocky run`` with live stderr streaming to ``context.log``.
 
@@ -883,6 +919,9 @@ class RockyResource(dg.ConfigurableResource):
         Dagster ``@multi_asset`` / ``@op`` for runs longer than a few seconds. For
         full Dagster Pipes integration with structured events, use
         :meth:`run_pipes`.
+
+        ``timeout_seconds`` (and the :attr:`timeout_fn` resolver) apply here in
+        full: the whole ``rocky run`` — copy plus finalize — is watchdog-bound.
         """
         resolved = self._apply_resolvers(
             context=context,
@@ -892,6 +931,7 @@ class RockyResource(dg.ConfigurableResource):
                 shadow_suffix=shadow_suffix,
                 governance_override=governance_override,
                 idempotency_key=idempotency_key,
+                timeout_seconds=timeout_seconds,
             ),
         )
         _validate_governance_override(resolved.get("governance_override"))
@@ -916,6 +956,7 @@ class RockyResource(dg.ConfigurableResource):
                 idempotency_key=resolved.get("idempotency_key"),
                 defer=defer,
                 defer_to=defer_to,
+                timeout_seconds=resolved.get("timeout_seconds"),
                 log_callback=_sink,
             )
 
@@ -986,6 +1027,7 @@ class RockyResource(dg.ConfigurableResource):
         idempotency_key: str | None = None,
         defer: bool = False,
         defer_to: str | None = None,
+        timeout_seconds: int | None = None,
         pipes_client: dg.PipesSubprocessClient | None = None,
         asset_key_fn: Callable[[list[str]], dg.AssetKey | None] | None = None,
         include_keys: set[dg.AssetKey] | None = None,
@@ -1002,12 +1044,13 @@ class RockyResource(dg.ConfigurableResource):
             def my_warehouse_data(context: dg.AssetExecutionContext, rocky: RockyResource):
                 yield from rocky.run_pipes(context, filter="tenant=acme").get_results()
 
-        **Timeout contract.** ``timeout_seconds`` does **not** apply to the apply
-        step in Pipes mode — ``PipesSubprocessClient`` owns the subprocess and
-        exposes no kill hook. The plan step still routes through :meth:`_run_rocky`
+        **Timeout contract.** Neither ``timeout_seconds`` nor the
+        :attr:`timeout_fn` resolver bounds the apply step in Pipes mode —
+        ``PipesSubprocessClient`` owns the subprocess and exposes no kill hook.
+        Both bound only the plan step, which routes through :meth:`_run_rocky`
         and is watchdog-bound. Configure a Dagster-side run timeout for hard
-        bounding, or use :meth:`run_streaming` if you need the resource-level
-        watchdog.
+        bounding, or use :meth:`run_streaming` if you need a resource-level
+        watchdog around the copy.
 
         Args:
             context: Dagster execution context (required for Pipes injection).
@@ -1032,6 +1075,7 @@ class RockyResource(dg.ConfigurableResource):
                 shadow_suffix=shadow_suffix,
                 governance_override=governance_override,
                 idempotency_key=idempotency_key,
+                timeout_seconds=timeout_seconds,
             ),
         )
         _validate_governance_override(resolved.get("governance_override"))
@@ -1072,7 +1116,9 @@ class RockyResource(dg.ConfigurableResource):
             client = dg.PipesSubprocessClient()
         # Plan step is buffered and a separate subprocess (the engine's Pipes
         # emitter is a no-op on ``rocky plan`` — only ``rocky apply`` reports).
-        plan_stdout = self._run_rocky(plan_args)
+        # The per-call timeout bounds this watchdog-backed plan step (the apply
+        # step below is Pipes-owned and unbounded — see the timeout contract).
+        plan_stdout = self._run_rocky(plan_args, timeout_seconds=resolved.get("timeout_seconds"))
         plan_id = self._extract_plan_id(plan_stdout)
         if plan_id is None:
             raise dg.Failure(

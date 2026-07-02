@@ -208,6 +208,59 @@ def test_run_cli_timeout_when_watchdog_kills():
     assert exc.value.timeout_seconds == client.timeout_seconds
 
 
+def test_run_cli_per_call_timeout_overrides_static():
+    """A per-call ``timeout_seconds`` supersedes the construction-time budget."""
+    client = _client(timeout_seconds=3600)
+    proc = _fake_popen(stdout="", stderr="slow\n", returncode=-signal.SIGKILL)
+    with (
+        patch("rocky_sdk.client.os.name", "posix"),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        pytest.raises(RockyTimeoutError) as exc,
+    ):
+        client.run_cli(["run"], allow_partial=True, timeout_seconds=5)
+    # The error carries the effective (per-call) budget, not the static 3600.
+    assert exc.value.timeout_seconds == 5
+
+
+def test_run_cli_none_timeout_uses_static_budget():
+    """``timeout_seconds=None`` leaves the construction-time budget in force."""
+    client = _client(timeout_seconds=1234)
+    proc = _fake_popen(stdout="", stderr="", returncode=-signal.SIGKILL)
+    with (
+        patch("rocky_sdk.client.os.name", "posix"),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        pytest.raises(RockyTimeoutError) as exc,
+    ):
+        client.run_cli(["run"], allow_partial=True, timeout_seconds=None)
+    assert exc.value.timeout_seconds == 1234
+
+
+@pytest.mark.parametrize("bad", [0, -1, -900])
+def test_run_cli_rejects_nonpositive_timeout(bad):
+    """A resolver bug returning a non-positive budget fails loudly, not silently."""
+    client = _client()
+    with (
+        patch("rocky_sdk.client.subprocess.Popen") as popen,
+        pytest.raises(ValueError, match="timeout_seconds must be a positive"),
+    ):
+        client.run_cli(["run"], timeout_seconds=bad)
+    # Rejected before any subprocess is spawned.
+    popen.assert_not_called()
+
+
+def test_run_forwards_per_call_timeout_to_watchdog():
+    """``run()`` threads its ``timeout_seconds`` down to the watchdog boundary."""
+    client = _client(timeout_seconds=3600)
+    proc = _fake_popen(stdout="", stderr="", returncode=-signal.SIGKILL)
+    with (
+        patch("rocky_sdk.client.os.name", "posix"),
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        pytest.raises(RockyTimeoutError) as exc,
+    ):
+        client.run("client=cocacola", timeout_seconds=42)
+    assert exc.value.timeout_seconds == 42
+
+
 def test_run_cli_binary_not_found():
     client = _client()
     with (

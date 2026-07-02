@@ -90,14 +90,19 @@ def _capture_run_args() -> tuple[list[list[str]], Any]:
 
     Resolver tests assert against ``captured[0]`` (the run argv). The fake
     stands in for :meth:`RockyClient.run_cli`, since ``rocky.run`` now delegates
-    resource -> client -> ``run_cli``.
+    resource -> client -> ``run_cli``. Each call's per-call ``timeout_seconds``
+    (forwarded by the SDK only when set) is recorded on ``fake_run.timeouts`` so
+    ``timeout_fn`` tests can assert what reached the watchdog boundary.
     """
     captured: list[list[str]] = []
+    timeouts: list[int | None] = []
 
-    def fake_run(self, args, *, allow_partial=False, log_callback=None):
+    def fake_run(self, args, *, allow_partial=False, log_callback=None, timeout_seconds=None):
         captured.append(args)
+        timeouts.append(timeout_seconds)
         return _empty_run_json()
 
+    fake_run.timeouts = timeouts  # type: ignore[attr-defined]
     return captured, fake_run
 
 
@@ -594,3 +599,165 @@ def test_resolvers_survive_dagster_materialize_lifecycle():
     assert "--shadow-suffix" in captured[0]
     idx = captured[0].index("--shadow-suffix")
     assert captured[0][idx + 1] == "_dagster_pr_xyz"
+
+
+# ---------------------------------------------------------------------------
+# timeout_fn — per-call watchdog budget (unlike the three above, the resolved
+# value is threaded to the SDK watchdog as a per-call override, not an argv flag)
+# ---------------------------------------------------------------------------
+
+
+def test_timeout_fn_resolves_per_call_budget():
+    calls: list[ResolverContext] = []
+
+    def fn(rc: ResolverContext) -> int:
+        calls.append(rc)
+        return 5400
+
+    rocky = RockyResource(timeout_fn=fn)
+    captured, fake_run = _capture_run_args()
+
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
+        rocky.run(filter="client=cocacola")
+
+    assert len(calls) == 1
+    assert fake_run.timeouts == [5400]
+    # Not a CLI flag: nothing timeout-shaped is threaded into the run argv.
+    assert not any("timeout" in tok for tok in captured[0])
+
+
+def test_timeout_fn_skipped_when_caller_supplies_value():
+    """Caller-supplied ``timeout_seconds`` wins — resolver must not fire."""
+    calls: list[ResolverContext] = []
+
+    def fn(rc: ResolverContext) -> int:
+        calls.append(rc)
+        return 5400
+
+    rocky = RockyResource(timeout_fn=fn)
+    _, fake_run = _capture_run_args()
+
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
+        rocky.run(filter="client=cocacola", timeout_seconds=99)
+
+    assert calls == []  # resolver never fired
+    assert fake_run.timeouts == [99]
+
+
+def test_timeout_fn_none_return_falls_back_to_static():
+    """A resolver returning ``None`` fires but leaves the static budget in force
+    (the SDK then omits the per-call override, so ``run_cli`` sees ``None``).
+    """
+    calls: list[str] = []
+
+    def fn(_rc: ResolverContext) -> int | None:
+        calls.append("fired")
+        return None
+
+    rocky = RockyResource(timeout_fn=fn)
+    _, fake_run = _capture_run_args()
+
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
+        rocky.run(filter="waltdisney")
+
+    assert calls == ["fired"]
+    assert fake_run.timeouts == [None]
+
+
+def test_timeout_absent_leaves_static_budget():
+    """No resolver and no caller value → no per-call override reaches the SDK."""
+    rocky = RockyResource()
+    _, fake_run = _capture_run_args()
+
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
+        rocky.run(filter="waltdisney")
+
+    assert fake_run.timeouts == [None]
+
+
+def test_timeout_fn_keys_on_filter_for_heavy_tenants():
+    """The FR's canonical shape: tight budget for light tenants, generous for
+    the handful of heavy ones, keyed off the run filter.
+    """
+    heavy = {"client=cocacola", "client=pfizer"}
+
+    def fn(rc: ResolverContext) -> int:
+        return 5400 if rc.filter in heavy else 900
+
+    rocky = RockyResource(timeout_fn=fn)
+    _, fake_run = _capture_run_args()
+
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
+        rocky.run(filter="client=cocacola")
+        rocky.run(filter="client=waltdisney")
+
+    assert fake_run.timeouts == [5400, 900]
+
+
+def test_timeout_fn_fires_on_run_streaming():
+    rocky = RockyResource(timeout_fn=lambda _rc: 4242)
+    context = _captured_log_context()
+    _, fake_run = _capture_run_args()
+
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
+        rocky.run_streaming(context, filter="client=cocacola")
+
+    assert fake_run.timeouts == [4242]
+
+
+def test_timeout_fn_bounds_run_pipes_plan_step():
+    """In Pipes mode the resolved budget bounds the watchdog-backed plan step
+    (the Pipes-owned apply step is unbounded — see the timeout contract).
+    """
+    rocky = RockyResource(timeout_fn=lambda _rc: 3333)
+    context = MagicMock()
+    pipes_client = MagicMock()
+    pipes_client.run = MagicMock(return_value=MagicMock())
+    seen: list[tuple[str, int | None]] = []
+
+    def fake_run(self, args, *, allow_partial=False, log_callback=None, timeout_seconds=None):
+        seen.append((args[0], timeout_seconds))
+        return _plan_json() if args[0] == "plan" else _empty_run_json()
+
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
+        rocky.run_pipes(context, filter="client=cocacola", pipes_client=pipes_client)
+
+    # Only the plan step routes through run_cli; apply goes via pipes_client.run.
+    assert seen == [("plan", 3333)]
+
+
+def test_timeout_fn_nonpositive_value_surfaces_error():
+    """A resolver bug returning a non-positive budget fails loudly (the SDK
+    guard raises before any subprocess spawns); it is not a ``RockyError`` so it
+    is not translated to ``dg.Failure``.
+    """
+    rocky = RockyResource(timeout_fn=lambda _rc: 0)
+
+    with pytest.raises(ValueError, match="timeout_seconds must be a positive"):
+        rocky.run(filter="client=cocacola")
+
+
+def test_timeout_fn_survives_dagster_materialize_lifecycle():
+    """The ``Annotated`` resolver field survives Dagster's resource rebuild at
+    execution time (mirrors ``test_resolvers_survive_dagster_materialize_lifecycle``).
+    """
+
+    def my_timeout_resolver(_rc: ResolverContext) -> int:
+        return 5400
+
+    rocky = RockyResource(
+        binary_path="rocky",
+        config_path="rocky.toml",
+        timeout_fn=my_timeout_resolver,
+    )
+    _, fake_run = _capture_run_args()
+
+    @dg.asset
+    def my_asset(rocky: RockyResource) -> None:
+        rocky.run(filter="client=cocacola")
+
+    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
+        result = dg.materialize([my_asset], resources={"rocky": rocky})
+
+    assert result.success
+    assert fake_run.timeouts == [5400]

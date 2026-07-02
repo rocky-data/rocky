@@ -1409,7 +1409,7 @@ def test_run_pipes_threads_all_partition_flags():
 
     captured_plan_args: list[list[str]] = []
 
-    def fake_run_rocky(self, args, *, allow_partial=False):
+    def fake_run_rocky(self, args, *, allow_partial=False, timeout_seconds=None):
         captured_plan_args.append(args)
         return _plan_json()
 
@@ -1561,7 +1561,7 @@ def test_run_pipes_with_shadow_suffix():
 
     captured_plan_args: list[list[str]] = []
 
-    def fake_run_rocky(self, args, *, allow_partial=False):
+    def fake_run_rocky(self, args, *, allow_partial=False, timeout_seconds=None):
         captured_plan_args.append(args)
         return _plan_json()
 
