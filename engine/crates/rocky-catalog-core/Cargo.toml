@@ -1,6 +1,6 @@
 [package]
 name = "rocky-catalog-core"
-version = "1.55.2"
+version = "1.56.0"
 description = "Catalog client abstraction for Rocky (Iceberg REST, Unity Catalog, Polaris, Nessie)"
 edition.workspace = true
 license.workspace = true
