@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.54.1] — 2026-07-02
+
 ### Fixed
 
 - **A `rocky run` watchdog timeout now surfaces as a non-retryable `dg.Failure`.** `_rocky_error_to_failure` builds the `RockyTimeoutError` branch with `allow_retries=False`, so a blanket op `RetryPolicy` no longer retries a deterministic over-budget run. Re-running at the same budget re-fails by construction, so the old default turned one over-budget run into roughly 4x the budget in futile retries. The remedy for a genuinely borderline run is a larger per-call budget via `timeout_fn` (added in 1.54.0), not a same-budget re-run. The transient circuit-breaker path (`retry_after_seconds`) stays retryable, and consumers without a `RetryPolicy` are unaffected. (#1021)
