@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.54.0] — 2026-07-02
+
+### Added
+
+- **`RockyResource.timeout_fn` — a per-call watchdog-budget resolver.** Mirrors the existing per-call resolver pattern (`shadow_suffix_fn` / `governance_override_fn` / `idempotency_key_fn`), but the resolved value is threaded to the SDK watchdog as a per-call `timeout_seconds` override rather than a CLI argument (`timeout_seconds` is not a CLI flag). `run` / `run_streaming` / `run_pipes` also accept an explicit `timeout_seconds` (caller value wins; the resolver fires when omitted; `None` falls back to the static `timeout_seconds`). Lets a tenant-collapsed pipeline keep a tight hang-detection watchdog for the light tenants and grant only the heavy handful a larger copy budget, without a blanket relaxation. In Pipes mode the budget bounds only the watchdog-backed plan step, consistent with the documented apply-step contract. (#1012)
+
+### Changed
+
+- Floor `rocky-sdk>=0.1.7` — `timeout_fn` forwards the resolved budget to `RockyClient.run(timeout_seconds=…)`, the per-call override added in rocky-sdk 0.1.7.
+
 ## [1.53.0] — 2026-06-28
 
 ### Added

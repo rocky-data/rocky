@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.33.4] — 2026-07-02
+
+### Changed
+
+- Maintenance: bumped the dependency group (`vscode-languageclient`, `@types/node`, `eslint`, `vscode-languageserver-protocol`) and refreshed the generated CLI type bindings for `import-dbt` (structured-warning variants) and `run` (the `compile-error` failure kind). No user-facing behavior change. (#1004, engine #972/#975)
+
 ## [1.33.3] — 2026-06-23
 
 ### Changed

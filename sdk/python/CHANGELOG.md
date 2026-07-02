@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-07-02
+
+### Added
+
+- **Per-call `timeout_seconds` override on `RockyClient.run()` / `run_cli()`.** The watchdog budget could previously only be set once at client construction, so a single wall-clock had to cover the whole `rocky run` (discover → copy every table → state upload). A tenant-collapsed run that copies a heavy tenant's tables in one invocation could not have both fast hang detection and a generous copy budget. `run()` / `run_cli()` now accept an optional `timeout_seconds` that overrides the construction-time budget for that one invocation — it is what the watchdog waits on and what `RockyTimeoutError` reports. Unset preserves the existing behavior exactly (forwarded only when supplied). Non-positive values raise `ValueError` before any subprocess spawns. (#1012)
+
 ## [0.1.6] — 2026-06-27
 
 ### Changed
