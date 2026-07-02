@@ -22,8 +22,11 @@ A Rocky file is a sequence of pipeline steps. Data flows from the top step downw
 ```
 from orders
 where status == "completed"
+derive {
+    total: amount * quantity
+}
 group customer_id {
-    revenue: sum(amount * quantity),
+    revenue: sum(total),
     order_count: count()
 }
 sort revenue desc
@@ -92,6 +95,8 @@ derive {
     is_large: amount > 1000
 }
 ```
+
+A derived name can be referenced by a later step — a `group` aggregation, a `where`, a `select`, or another `derive` — where it inlines to its expression (`group c { revenue: sum(total) }` becomes `SUM(amount * quantity)`). A terminal `derive` keeps the source columns and appends the computed ones (`SELECT *, ...`).
 
 ### select
 
