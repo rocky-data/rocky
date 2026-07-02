@@ -986,16 +986,16 @@
     "vscode:prepublish": "npm run compile && npm run bundle"
   },
   "dependencies": {
-    "vscode-languageclient": "^10.0.1"
+    "vscode-languageclient": "^10.1.0"
   },
   "devDependencies": {
     "@dagrejs/dagre": "^3.0.0",
-    "@tailwindcss/cli": "^4.3.0",
+    "@tailwindcss/cli": "^4.3.2",
     "@tailwindplus/elements": "^1.0.22",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/mocha": "^10.0.10",
-    "@types/node": "^26.0.1",
+    "@types/node": "^26.1.0",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@types/vscode": "1.120.0",
@@ -1012,7 +1012,7 @@
     "react-dom": "^19.2.7",
     "tailwindcss": "^4.3.0",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.62.0",
+    "typescript-eslint": "^8.62.1",
     "vitest": "^4.1.9"
   },
   "overrides_comment": "Force-patch transitive deps that haven't been bumped upstream yet — fixes Dependabot alerts #17 (jsdiff DoS), #18 (serialize-javascript RCE), #19 (serialize-javascript CPU exhaustion), and the GHSA-q3j6-qgpj-74h6 / GHSA-v39h-62p7-jpjc fast-uri path-traversal/host-confusion advisories (transitive via ajv → @vscode/test-electron). Drop these once upstreams ship the bumps.",
