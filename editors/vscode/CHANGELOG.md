@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.33.4] — 2026-07-02
+## [1.33.5] — 2026-07-02
+
+> 1.33.4 was tagged but never published — its release build failed at `vsce package`
+> on the `@types/vscode` engines-floor mismatch fixed below. 1.33.5 re-releases the
+> same content.
 
 ### Changed
 
