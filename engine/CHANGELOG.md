@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.56.0] - 2026-07-02
+
+### Added
+
+- **A DSL `derive` alias can be referenced by a later pipeline step.** A `derive`d name used in a `group` aggregation, a `where` / `having`, a `select`, or a subsequent `derive` inlines to its expression, so `derive { total: amount * quantity }` followed by `group customer_id { revenue: sum(total) }` lowers to `SUM(amount * quantity)` and executes. A terminal `derive` preserves the source columns and appends the computed ones (`SELECT *, <expr> AS <name>`), matching the documented "adds computed columns without removing existing ones" contract. (#1009)
+
+### Changed
+
+- **Transformation `merge` with no explicit `update_columns` now resolves the column set on every adapter.** A `merge` model that omitted `update_columns` (meaning "all columns") emitted invalid SQL on BigQuery (`UPDATE SET target = source`) and errored on Snowflake/DuckDB; only Databricks worked. The transformation path now resolves the implicit set from the model's typed output columns, and BigQuery fails fast with a clear message if none can be resolved. (#1007)
+- **A replication `rocky run --all` that fails at model-execution time now reports a partial failure.** A runtime model failure on the replication path exited 1 with empty stdout under `--output json`; it now emits the `RunOutput` JSON (copied tables plus the error) and exits 2, matching the model-only and transformation paths. (#1007)
+
+### Fixed
+
+- **DSL `derive` no longer drops the source columns.** A terminal `derive` previously projected only the computed columns, silently discarding every source column, and a `derive` alias referenced by a later `select` produced SQL referencing a non-existent column. Both now follow the documented contract. (#1007, #1009)
+- **The cross-team-contract gate now flags breaking changes to columns read outside a consumer's projection.** `rocky compile` / `rocky ci` built the "columns the consumer reads" set from the top-level projection only (and only a function's first argument), so a producer change to a column read via a `WHERE` filter, a later function argument, arithmetic, or `CASE` passed the E030/E031/E032 gate silently. The read-set is now derived from a complete walk of the consumer's SQL. (#1007)
+- **A configured `[[checks.custom]]` now fails when it should.** The custom-check evaluator inverted its comparison, so a violation-counting check reported as passing — and with the default `threshold = 0` it could never fail. It now passes only when the returned count is within the threshold. (#1007)
+- **A global `[budget]` is now enforced on transformation runs.** The transformation path never evaluated the configured budget, making a cost/duration/scan cap a silent no-op there; it now runs the check and fails the run on an `on_breach = "error"` breach. (#1007)
+- **`rocky import-dbt` validates manifest-derived model names and escapes generated sidecars.** A dbt `manifest.json` node name flowed unvalidated into output file paths and into the generated sidecar TOML; imports now reject unsafe file-name components (no path separators, `..`, or absolute paths) and escape every manifest-derived value. (#1007)
+- **`rocky import-dbt` no longer corrupts model SQL containing `$`.** On the no-manifest path a `$` in an `is_incremental()` else block (a dollar-quoted literal, a positional parameter, a literal like `$100`) was interpreted as a regex capture-group reference and dropped; it is now copied verbatim. (#1007)
+- **`rocky emit-sql` fails on a compile error and on an unknown `--model`.** It previously emitted (and with `--out-dir`, wrote) the missing-`@var` sentinel `NULL` when a required variable had no value, and silently succeeded when `--model` matched nothing. (#1007)
+- **`@var(...)` inside a backslash-escaped string literal is now substituted.** The comment scanner treated `\'` as closing a string, so a `@var` after `--` inside such a literal (honored on Databricks/Snowflake/BigQuery) was misclassified as a comment and skipped. (#1007)
+- **Webhook payloads escape data-derived values.** Templated webhook bodies (including the built-in Slack/PagerDuty/Datadog/Teams presets) substituted values such as error text and table names raw, so a value with a quote or newline could break or inject into the JSON payload; substituted values are now JSON-escaped. (#1007)
+- **Content-addressed writes refuse an unsupported partitioned + row-tracking table** instead of silently corrupting Delta row-tracking metadata. (#1007)
+- **A config load no longer panics on a long multibyte environment-variable value.** The substitution hint truncated on a fixed byte offset, panicking when it fell inside a multibyte character; it now truncates on a character boundary. (#1007)
+
 ## [1.55.2] - 2026-06-28
 
 ### Fixed
