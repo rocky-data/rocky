@@ -482,6 +482,7 @@ class RockyClient:
         *,
         allow_partial: bool = False,
         log_callback: Callable[[str], None] | None = None,
+        timeout_seconds: int | None = None,
     ) -> str:
         """Execute the Rocky CLI and return stdout.
 
@@ -499,14 +500,27 @@ class RockyClient:
                 with valid JSON (Rocky's partial-success semantics).
             log_callback: Per-stderr-line sink. Defaults to the client's logger
                 (``"rocky: <line>"`` at INFO).
+            timeout_seconds: Per-call wall-clock override for the watchdog. When
+                ``None`` (default), the client's construction-time
+                ``timeout_seconds`` governs. When set it must be positive, and
+                overrides that budget for this one invocation only.
 
         Raises:
             RockyBinaryNotFoundError: The binary is missing.
-            RockyTimeoutError: The subprocess exceeded ``timeout_seconds``.
+            RockyTimeoutError: The subprocess exceeded the effective timeout (the
+                per-call ``timeout_seconds`` when given, else the client default).
+            ValueError: ``timeout_seconds`` was supplied and non-positive.
             RockyPartialFailure: Non-zero exit with parseable JSON and
                 ``allow_partial=False``.
             RockyCommandError: Any other non-zero exit.
         """
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError(
+                f"timeout_seconds must be a positive number of seconds, got {timeout_seconds!r}"
+            )
+        # A per-call override wins for this invocation only; otherwise the
+        # construction-time budget governs the watchdog and the timeout error.
+        effective_timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         self._verify_engine_version()
         cmd = self._build_cmd(args)
         sink = log_callback or (lambda line: self._logger.info("rocky: %s", line))
@@ -537,7 +551,7 @@ class RockyClient:
         self._logger.info(
             "rocky subprocess started: pid=%s timeout_s=%s cmd=%s",
             proc.pid,
-            self.timeout_seconds,
+            effective_timeout,
             " ".join(redact_argv(cmd)),
         )
 
@@ -566,7 +580,7 @@ class RockyClient:
         fired = threading.Event()
 
         def _watchdog() -> None:
-            if not fired.wait(self.timeout_seconds):
+            if not fired.wait(effective_timeout):
                 kill_process_group(proc)
                 fired.set()
 
@@ -613,7 +627,7 @@ class RockyClient:
 
         if killed_by_watchdog:
             raise RockyTimeoutError(
-                self.timeout_seconds,
+                effective_timeout,
                 stderr_tail=stderr_tail,
                 duration_ms=duration_ms,
                 pid=proc.pid,
@@ -737,6 +751,7 @@ class RockyClient:
         defer: bool = False,
         defer_to: str | None = None,
         log_callback: Callable[[str], None] | None = None,
+        timeout_seconds: int | None = None,
     ) -> RunResult:
         """Run ``rocky run --filter <key=value>`` and return the parsed result.
 
@@ -757,6 +772,11 @@ class RockyClient:
             defer / defer_to: Resolve unbuilt ``ref()`` upstreams against an
                 existing schema instead of rebuilding.
             log_callback: Per-stderr-line sink for live progress (e.g. ``print``).
+            timeout_seconds: Per-call watchdog override (positive seconds). When
+                ``None`` (default), the client's construction-time
+                ``timeout_seconds`` governs this run. A tenant-collapsed run that
+                copies a heavy client's tables in one invocation can pass a larger
+                budget here without relaxing it for every other run.
         """
         _validate_governance_override(governance_override)
         run_args = self._build_run_args(
@@ -776,7 +796,17 @@ class RockyClient:
             defer=defer,
             defer_to=defer_to,
         )
-        stdout = self.run_cli(run_args, allow_partial=True, log_callback=log_callback)
+        # Forward the per-call override only when supplied so the default path
+        # calls ``run_cli`` exactly as before (construction-time budget wins).
+        if timeout_seconds is None:
+            stdout = self.run_cli(run_args, allow_partial=True, log_callback=log_callback)
+        else:
+            stdout = self.run_cli(
+                run_args,
+                allow_partial=True,
+                log_callback=log_callback,
+                timeout_seconds=timeout_seconds,
+            )
         return _parse_run_or_apply(stdout, command="run")
 
     def run_model(
