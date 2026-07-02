@@ -22,11 +22,8 @@ A Rocky file is a sequence of pipeline steps. Data flows from the top step downw
 ```
 from orders
 where status == "completed"
-derive {
-    total: amount * quantity
-}
 group customer_id {
-    revenue: sum(total),
+    revenue: sum(amount * quantity),
     order_count: count()
 }
 sort revenue desc
