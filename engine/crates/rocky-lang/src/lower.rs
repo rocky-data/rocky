@@ -65,6 +65,12 @@ struct LowerContext {
     is_replicate: bool,
     // Tracks whether we've hit a GROUP BY (subsequent WHERE becomes HAVING)
     has_group: bool,
+    // Tracks whether a `derive` added computed columns, so `build_sql` can keep
+    // the base columns (`*, <derived>`) — but only when no explicit `select` or
+    // `group` established the projection.
+    has_derive: bool,
+    // Set by an explicit `select { ... }`, which replaces the projection.
+    explicit_select: bool,
 }
 
 impl LowerContext {
@@ -97,20 +103,18 @@ impl LowerContext {
             }
             PipelineStep::Derive(derivations) => {
                 // `derive` ADDS computed columns while PRESERVING existing ones
-                // (per the DSL spec). If no explicit column set has been
-                // established yet (no prior `select`/`group`), seed `*` so the
-                // base columns survive alongside the derived ones — otherwise
-                // `build_sql`, which emits `*` only when `select_columns` is
-                // empty, would drop every source column.
-                if self.select_columns.is_empty() {
-                    self.select_columns.push("*".to_string());
-                }
+                // (per the DSL spec). `build_sql` prepends `*` for a terminal
+                // derive (no following `select`/`group`) so the base columns
+                // survive; a following `select` replaces the projection and a
+                // following `group` establishes its own, so neither wants `*`.
+                self.has_derive = true;
                 for (name, expr) in derivations {
                     let sql_expr = lower_expr(expr);
                     self.select_columns.push(format!("{sql_expr} AS {name}"));
                 }
             }
             PipelineStep::Select(items) => {
+                self.explicit_select = true;
                 self.select_columns.clear();
                 for item in items {
                     match item {
@@ -200,6 +204,13 @@ impl LowerContext {
         if self.select_columns.is_empty() {
             sql.push('*');
         } else {
+            // A terminal `derive` (computed columns, no explicit `select` and no
+            // `group`) must keep the base columns, so prepend `*`. A `select`
+            // replaces the projection and a `group` establishes its own, so
+            // neither gets `*` (a `SELECT *` with GROUP BY is invalid SQL).
+            if self.has_derive && !self.explicit_select && !self.has_group {
+                sql.push_str("*, ");
+            }
             sql.push_str(&self.select_columns.join(", "));
         }
 
@@ -522,6 +533,51 @@ derive {
             sql.contains('*'),
             "derive must keep base columns (expected `SELECT *, ...`): {sql}"
         );
+    }
+
+    #[test]
+    fn test_lower_derive_then_group_has_no_wildcard() {
+        // A `derive` followed by a `group` must NOT emit `SELECT *` — a wildcard
+        // with GROUP BY is invalid SQL. The group establishes the projection, so
+        // the base-column-preserving `*` from a terminal derive must not apply.
+        let file = parse(
+            r#"from orders
+derive {
+    total: amount * quantity
+}
+group customer_id {
+    revenue: sum(total)
+}"#,
+        )
+        .unwrap();
+        let sql = lower_to_sql(&file).unwrap();
+        assert!(sql.contains("GROUP BY customer_id"), "{sql}");
+        assert!(
+            !sql.contains("SELECT *") && !sql.contains("*, "),
+            "derive+group must not emit a wildcard projection: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_lower_derive_then_select_replaces() {
+        // An explicit `select` replaces the projection, so no base-column `*`.
+        let file = parse(
+            r#"from orders
+derive {
+    doubled: amount * 2
+}
+select {
+    id,
+    doubled
+}"#,
+        )
+        .unwrap();
+        let sql = lower_to_sql(&file).unwrap();
+        assert!(
+            !sql.contains('*'),
+            "explicit select replaces the projection (no wildcard): {sql}"
+        );
+        assert!(sql.contains("id, doubled"), "{sql}");
     }
 
     #[test]
