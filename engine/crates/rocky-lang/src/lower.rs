@@ -17,7 +17,6 @@
 //! threaded through this module because there is no reachable path from the
 //! parser to a `format!` here that admits an unsafe identifier.
 
-#[cfg(test)]
 use std::sync::Arc;
 
 use crate::ast::*;
@@ -71,6 +70,95 @@ struct LowerContext {
     has_derive: bool,
     // Set by an explicit `select { ... }`, which replaces the projection.
     explicit_select: bool,
+    // Pre-group `derive`d aliases (name → resolved expression AST), in
+    // definition order. A pre-group derive is an inlinable intermediate: it is
+    // substituted into any later reference (a group aggregation, `where` /
+    // `having`, `select`, a subsequent `derive`) and is only *projected* by the
+    // terminal build path (`SELECT *, <derived>`). A derive that comes AFTER a
+    // group is not stored here — it is projected directly (see `apply_step`).
+    derived: Vec<(String, Expr)>,
+}
+
+/// Look up a pre-group derived alias by name.
+fn lookup_derived<'a>(derived: &'a [(String, Expr)], name: &str) -> Option<&'a Expr> {
+    derived.iter().find(|(n, _)| n == name).map(|(_, e)| e)
+}
+
+/// Return a copy of `expr` with every bare-column reference to a `derive`d
+/// alias replaced by that alias's (already-resolved) expression, recursively.
+/// Qualified columns (`alias.col`) are real table references from a join and
+/// are never substituted; literals pass through unchanged.
+fn substitute_derived(expr: &Expr, derived: &[(String, Expr)]) -> Expr {
+    match expr {
+        Expr::Column(name) => match lookup_derived(derived, name) {
+            Some(replacement) => replacement.clone(),
+            None => expr.clone(),
+        },
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Arc::new(substitute_derived(left, derived)),
+            op: op.clone(),
+            right: Arc::new(substitute_derived(right, derived)),
+        },
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op: op.clone(),
+            expr: Arc::new(substitute_derived(inner, derived)),
+        },
+        Expr::FunctionCall { name, args } => Expr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| substitute_derived(a, derived))
+                .collect(),
+        },
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Expr::IsNull {
+            expr: Arc::new(substitute_derived(inner, derived)),
+            negated: *negated,
+        },
+        Expr::InList {
+            expr: inner,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Arc::new(substitute_derived(inner, derived)),
+            list: list
+                .iter()
+                .map(|x| substitute_derived(x, derived))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::WindowFunction { name, args, over } => Expr::WindowFunction {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| substitute_derived(a, derived))
+                .collect(),
+            over: over.clone(),
+        },
+        Expr::Match { expr: inner, arms } => Expr::Match {
+            expr: Arc::new(substitute_derived(inner, derived)),
+            arms: arms
+                .iter()
+                .map(|arm| MatchArm {
+                    pattern: match &arm.pattern {
+                        MatchPattern::Comparison(op, val) => {
+                            MatchPattern::Comparison(op.clone(), substitute_derived(val, derived))
+                        }
+                        MatchPattern::Wildcard => MatchPattern::Wildcard,
+                    },
+                    result: substitute_derived(&arm.result, derived),
+                })
+                .collect(),
+        },
+        Expr::QualifiedColumn(..)
+        | Expr::StringLit(_)
+        | Expr::NumberLit(_)
+        | Expr::DateLit(_)
+        | Expr::BoolLit(_)
+        | Expr::Null => expr.clone(),
+    }
 }
 
 impl LowerContext {
@@ -81,7 +169,12 @@ impl LowerContext {
                 self.from_alias = from.alias.clone();
             }
             PipelineStep::Where(expr) => {
-                let sql = lower_expr(expr);
+                // Inline any pre-group derived alias: a `where` runs against the
+                // FROM columns and cannot reference a SELECT-level alias, so
+                // `where c > 10` for a derived `c` must lower to its expression.
+                // A post-group `where` (HAVING) referencing an aggregation alias
+                // is left as-is (that alias is not a derive).
+                let sql = lower_expr(&substitute_derived(expr, &self.derived));
                 if self.has_group {
                     self.having_clauses.push(sql);
                 } else {
@@ -95,22 +188,35 @@ impl LowerContext {
                 for key in &group.keys {
                     self.select_columns.push(key.clone());
                 }
-                // Add aggregations to select
+                // Add aggregations to select, inlining any pre-group derived
+                // alias the aggregation references (`sum(total)` where `total`
+                // was derived becomes `SUM(<total's expr>)`).
                 for (name, expr) in &group.aggregations {
-                    let sql_expr = lower_expr(expr);
+                    let sql_expr = lower_expr(&substitute_derived(expr, &self.derived));
                     self.select_columns.push(format!("{sql_expr} AS {name}"));
                 }
             }
             PipelineStep::Derive(derivations) => {
-                // `derive` ADDS computed columns while PRESERVING existing ones
-                // (per the DSL spec). `build_sql` prepends `*` for a terminal
-                // derive (no following `select`/`group`) so the base columns
-                // survive; a following `select` replaces the projection and a
-                // following `group` establishes its own, so neither wants `*`.
-                self.has_derive = true;
-                for (name, expr) in derivations {
-                    let sql_expr = lower_expr(expr);
-                    self.select_columns.push(format!("{sql_expr} AS {name}"));
+                // `derive` ADDS computed columns while PRESERVING existing ones.
+                if self.has_group {
+                    // A derive AFTER a group computes over the grouped result and
+                    // may reference aggregation output aliases; project it
+                    // directly (it is not an inlinable pre-aggregation
+                    // intermediate).
+                    for (name, expr) in derivations {
+                        let sql_expr = lower_expr(&substitute_derived(expr, &self.derived));
+                        self.select_columns.push(format!("{sql_expr} AS {name}"));
+                    }
+                } else {
+                    // A pre-group / terminal derive is an inlinable alias:
+                    // recorded (resolved against prior derives) and either
+                    // inlined into a later step or projected by the terminal
+                    // build path (`SELECT *, <derived>`).
+                    self.has_derive = true;
+                    for (name, expr) in derivations {
+                        let resolved = substitute_derived(expr, &self.derived);
+                        self.derived.push((name.clone(), resolved));
+                    }
                 }
             }
             PipelineStep::Select(items) => {
@@ -119,7 +225,16 @@ impl LowerContext {
                 for item in items {
                     match item {
                         SelectItem::Star => self.select_columns.push("*".to_string()),
-                        SelectItem::Column(name) => self.select_columns.push(name.clone()),
+                        // A selected derived alias resolves to its expression
+                        // (`select { doubled }` for a derived `doubled` becomes
+                        // `<expr> AS doubled`), since the alias is not a real
+                        // column of the source.
+                        SelectItem::Column(name) => match lookup_derived(&self.derived, name) {
+                            Some(expr) => self
+                                .select_columns
+                                .push(format!("{} AS {name}", lower_expr(expr))),
+                            None => self.select_columns.push(name.clone()),
+                        },
                         SelectItem::QualifiedColumn(alias, col) => {
                             self.select_columns.push(format!("{alias}.{col}"));
                         }
@@ -201,16 +316,24 @@ impl LowerContext {
         if self.is_distinct {
             sql.push_str("DISTINCT ");
         }
-        if self.select_columns.is_empty() {
+        // A terminal `derive` (pre-group computed columns, no explicit `select`
+        // and no `group`) preserves the base columns and appends each derived
+        // column: `SELECT *, <expr> AS <name>`. An explicit `select` replaces
+        // the projection and a `group` establishes its own, so neither path
+        // emits `*` (a `SELECT *` with GROUP BY is invalid SQL).
+        let terminal_derive = self.has_derive && !self.explicit_select && !self.has_group;
+        if terminal_derive {
+            sql.push('*');
+            for (name, expr) in &self.derived {
+                sql.push_str(&format!(", {} AS {name}", lower_expr(expr)));
+            }
+            // Any join-`keep` columns follow (rare in combination with derive).
+            for col in &self.select_columns {
+                sql.push_str(&format!(", {col}"));
+            }
+        } else if self.select_columns.is_empty() {
             sql.push('*');
         } else {
-            // A terminal `derive` (computed columns, no explicit `select` and no
-            // `group`) must keep the base columns, so prepend `*`. A `select`
-            // replaces the projection and a `group` establishes its own, so
-            // neither gets `*` (a `SELECT *` with GROUP BY is invalid SQL).
-            if self.has_derive && !self.explicit_select && !self.has_group {
-                sql.push_str("*, ");
-            }
             sql.push_str(&self.select_columns.join(", "));
         }
 
@@ -536,10 +659,10 @@ derive {
     }
 
     #[test]
-    fn test_lower_derive_then_group_has_no_wildcard() {
-        // A `derive` followed by a `group` must NOT emit `SELECT *` — a wildcard
-        // with GROUP BY is invalid SQL. The group establishes the projection, so
-        // the base-column-preserving `*` from a terminal derive must not apply.
+    fn test_lower_derive_inlines_into_group() {
+        // A `derive`d alias referenced by a group aggregation is INLINED into
+        // the aggregation (`sum(total)` -> `SUM(amount * quantity)`), so the
+        // derive need not be projected — no wildcard with GROUP BY.
         let file = parse(
             r#"from orders
 derive {
@@ -553,14 +676,20 @@ group customer_id {
         let sql = lower_to_sql(&file).unwrap();
         assert!(sql.contains("GROUP BY customer_id"), "{sql}");
         assert!(
+            sql.contains("SUM(amount * quantity) AS revenue"),
+            "derived alias must inline into the aggregation: {sql}"
+        );
+        assert!(
             !sql.contains("SELECT *") && !sql.contains("*, "),
             "derive+group must not emit a wildcard projection: {sql}"
         );
     }
 
     #[test]
-    fn test_lower_derive_then_select_replaces() {
-        // An explicit `select` replaces the projection, so no base-column `*`.
+    fn test_lower_derive_then_select_resolves_alias() {
+        // An explicit `select` of a derived alias resolves to the alias's
+        // expression (`select { doubled }` -> `amount * 2 AS doubled`), since
+        // the alias is not a real column of the source. No base-column `*`.
         let file = parse(
             r#"from orders
 derive {
@@ -574,10 +703,59 @@ select {
         .unwrap();
         let sql = lower_to_sql(&file).unwrap();
         assert!(
-            !sql.contains('*'),
-            "explicit select replaces the projection (no wildcard): {sql}"
+            !sql.contains("SELECT *"),
+            "explicit select has no wildcard: {sql}"
         );
-        assert!(sql.contains("id, doubled"), "{sql}");
+        assert!(
+            sql.contains("id, amount * 2 AS doubled"),
+            "selected derived alias must resolve to its expression: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_lower_derive_after_group_is_projected() {
+        // A `derive` AFTER a group computes over the grouped result (referencing
+        // aggregation output aliases) and must be projected directly — it is not
+        // an inlinable pre-aggregation intermediate.
+        let file = parse(
+            r#"from orders
+group customer_id {
+    revenue: sum(amount),
+    cost: sum(cost_amount)
+}
+derive {
+    margin: revenue - cost
+}"#,
+        )
+        .unwrap();
+        let sql = lower_to_sql(&file).unwrap();
+        assert!(
+            sql.contains("revenue - cost AS margin"),
+            "post-group derive must be projected referencing agg aliases: {sql}"
+        );
+        assert!(sql.contains("GROUP BY customer_id"), "{sql}");
+        assert!(!sql.contains("SELECT *"), "no wildcard with group: {sql}");
+    }
+
+    #[test]
+    fn test_lower_chained_derive_resolves() {
+        // A derive that references a prior derived alias resolves transitively.
+        let file = parse(
+            r#"from orders
+derive {
+    base: amount * 2
+}
+derive {
+    bumped: base + 1
+}"#,
+        )
+        .unwrap();
+        let sql = lower_to_sql(&file).unwrap();
+        assert!(sql.contains("amount * 2 AS base"), "{sql}");
+        assert!(
+            sql.contains("amount * 2 + 1 AS bumped"),
+            "chained derive must resolve the prior alias: {sql}"
+        );
     }
 
     #[test]
@@ -1265,8 +1443,9 @@ derive {
 
     #[test]
     fn test_lower_match_derive_then_select() {
-        // A select after derive replaces the column set — the CASE expression
-        // only lives in the derive layer, and select narrows to named columns.
+        // A select that names a derived alias resolves it to its expression —
+        // here the derived `tier` (a CASE) is inlined into the select, since a
+        // bare `tier` is not a real column of `orders`.
         let file = parse(
             r#"from orders
 derive {
@@ -1279,10 +1458,9 @@ select { id, tier }"#,
         )
         .unwrap();
         let sql = lower_to_sql(&file).unwrap();
-        // select replaces derive columns; the final SQL only references id, tier
         assert!(
-            sql.contains("SELECT id, tier"),
-            "select should replace the derive column set, got: {sql}"
+            sql.contains("id, CASE WHEN amount > 10000 THEN 'high' ELSE 'low' END AS tier"),
+            "selected derived alias must resolve to its CASE expression, got: {sql}"
         );
     }
 
