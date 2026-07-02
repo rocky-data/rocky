@@ -59,6 +59,11 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # @types/vscode must stay <= engines.vscode (^1.120.0), or `vsce package`
+      # fails at release time. Bump it by hand in lockstep with engines.vscode
+      # and the test-electron pin (src/test/runTest.ts), never via dependabot.
+      - dependency-name: "@types/vscode"
 
   # --- GitHub Actions (root workflows) ---
   - package-ecosystem: github-actions
