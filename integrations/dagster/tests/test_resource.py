@@ -27,11 +27,17 @@ from rocky_sdk.client import (
     DEFAULT_HTTP_TIMEOUT_SECONDS,
     _parse_run_or_apply,
 )
-from rocky_sdk.exceptions import RockyOutputParseError, RockyServerError
+from rocky_sdk.exceptions import (
+    RockyCommandError,
+    RockyOutputParseError,
+    RockyServerError,
+    RockyTimeoutError,
+)
 
 from dagster_rocky.resource import (
     MIN_ROCKY_VERSION,
     RockyResource,
+    _rocky_error_to_failure,
     _truncate_stderr_for_metadata,
     _validate_governance_override,
 )
@@ -2514,3 +2520,42 @@ def test_run_rocky_failure_truncates_oversize_stderr_in_metadata():
     text = metadata["stderr_tail"].text
     assert len(text) <= 8300
     assert "truncated" in text
+
+
+# ---------------------------------------------------------------------------
+# Error translation: retryability
+# ---------------------------------------------------------------------------
+
+
+def test_timeout_failure_is_non_retryable():
+    """A watchdog timeout surfaces as a *non-retryable* ``dg.Failure``.
+
+    A timeout is a deterministic "too slow": re-running the same command at the
+    same budget re-fails by construction, so a blanket op ``RetryPolicy`` must
+    not retry it (otherwise one over-budget run becomes ~4x the budget in futile
+    retries). The fix adds ``allow_retries=False`` without dropping the
+    operator-debugging metadata the branch has always carried.
+    """
+    failure = _rocky_error_to_failure(
+        RockyTimeoutError(900, stderr_tail="copying orders…", duration_ms=901_234, pid=4242)
+    )
+
+    assert failure.allow_retries is False
+    assert "timed out after 900s" in failure.description
+    # Metadata preserved by the fix (regression guard against dropping the block).
+    assert failure.metadata["duration_ms"].value == 901_234
+    assert failure.metadata["pid"].value == 4242
+    assert "stderr_tail" in failure.metadata
+
+
+def test_non_timeout_failures_stay_retryable():
+    """The ``allow_retries`` opt-out is surgical to the timeout branch.
+
+    A plain command failure can be transient (a flaky warehouse statement), so
+    it keeps Dagster's default retry behavior (``allow_retries`` left at its
+    default, which allows retries). Pins that the timeout fix did not make every
+    ``RockyError`` non-retryable.
+    """
+    failure = _rocky_error_to_failure(RockyCommandError(1, stderr_tail="boom", duration_ms=12))
+
+    assert failure.allow_retries is not False

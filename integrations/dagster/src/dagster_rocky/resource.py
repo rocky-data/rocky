@@ -190,6 +190,15 @@ def _rocky_error_to_failure(exc: RockyError) -> dg.Failure:
     if isinstance(exc, RockyTimeoutError):
         return dg.Failure(
             description=f"Rocky command timed out after {exc.timeout_seconds}s (watchdog-killed)",
+            # A watchdog timeout is a deterministic "too slow", not a transient
+            # error: re-running the same over-budget command at the same budget
+            # re-fails by construction. Opt out of Dagster's retry machinery so a
+            # blanket op RetryPolicy doesn't turn one over-budget run into 4x the
+            # budget in futile retries. The remedy for a genuinely borderline run
+            # is a larger budget (per-call via `timeout_fn`), not a same-budget
+            # re-run. The retryable path (a transient circuit-breaker breach) is a
+            # distinct raise in `component._quota_breach_failure` and is unaffected.
+            allow_retries=False,
             metadata={
                 "stderr_tail": dg.MetadataValue.text(
                     _truncate_stderr_for_metadata(exc.stderr_tail)
