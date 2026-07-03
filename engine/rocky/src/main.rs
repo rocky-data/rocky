@@ -734,6 +734,14 @@ enum Command {
         #[arg(long)]
         no_reuse: bool,
 
+        /// Force a full replication pass for this invocation, disabling
+        /// `[pipeline] prune_unchanged` skip-unchanged pruning even when the
+        /// config opts in. Use after a manual target-side mutation to re-copy
+        /// every table regardless of whether its source changed. No effect
+        /// when `prune_unchanged` is off. Default OFF.
+        #[arg(long)]
+        no_prune: bool,
+
         /// Per-run variable substituted into model SQL. Repeatable:
         /// `--var region=us --var since=2024-01-01`.
         ///
@@ -2510,6 +2518,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             skip_unchanged,
             force_rebuild,
             no_reuse,
+            no_prune,
             var,
         } => {
             // Parse `--var name=value` pairs into the run-variable map. A
@@ -2588,6 +2597,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 skip_unchanged,
                 force_rebuild,
                 no_reuse,
+                no_prune,
             };
 
             if watch {

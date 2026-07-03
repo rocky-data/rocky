@@ -367,6 +367,28 @@ pub trait WarehouseAdapter: Send + Sync {
     /// Describe a table's columns (name, type, nullable).
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>>;
 
+    /// A cheap, opaque change-marker for a source table, used by the
+    /// replication runner's skip-unchanged pruning (`prune_unchanged`) to
+    /// decide whether a source has been written since the last successful
+    /// copy.
+    ///
+    /// The value is treated as opaque and compared only for equality — its
+    /// internal shape is not interpreted. Adapters that have no cheap change
+    /// signal return `Ok(None)`, in which case the runner always copies and
+    /// never prunes. The marker MUST advance on every source data write and
+    /// stay stable when the source is untouched; a marker that misses a write
+    /// would let the runner skip a changed table, so adapters must err toward
+    /// a marker that changes too often rather than too rarely.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AdapterError` if the metadata query fails. The runner treats a
+    /// hard error the same as `None` (copy, don't prune) so a transient
+    /// metadata failure never causes a false skip.
+    async fn source_change_marker(&self, _table: &TableRef) -> AdapterResult<Option<String>> {
+        Ok(None)
+    }
+
     /// Cheap connectivity check. Exercises the auth path and verifies
     /// the warehouse is reachable without doing real work.
     ///

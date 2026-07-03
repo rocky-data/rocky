@@ -10,6 +10,13 @@ use crate::schema_cache::SchemaCacheEntry;
 use rocky_ir::WatermarkState;
 
 const WATERMARKS: TableDefinition<&str, &[u8]> = TableDefinition::new("watermarks");
+/// Per-table opaque source change-markers recorded after each successful
+/// replication copy. The `prune_unchanged` skip-unchanged pruning compares the
+/// live [`WarehouseAdapter::source_change_marker`] against the recorded value
+/// to decide whether a source is unchanged since the last copy. Synced to
+/// remote state like [`WATERMARKS`] so a distributed run reads a consistent
+/// last-copied marker.
+const SOURCE_MARKERS: TableDefinition<&str, &str> = TableDefinition::new("source_markers");
 const CHECK_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("check_history");
 const RUN_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("run_history");
 const QUALITY_HISTORY: TableDefinition<&str, &[u8]> = TableDefinition::new("quality_history");
@@ -202,7 +209,13 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   untouched. Both tables are dormant in Stage 1 — populated on a
 ///   successful run when `[reuse]` is enabled, never read for a reuse
 ///   decision yet.
-const CURRENT_SCHEMA_VERSION: u32 = 9;
+/// - **v10** — adds the [`SOURCE_MARKERS`] table for replication skip-unchanged
+///   pruning (`prune_unchanged`): per-table source change-markers recorded
+///   after each successful copy. Pure additive schema change: v9 databases
+///   auto-create the empty table on next open and stamp themselves as v10. No
+///   blob migration needed; existing tables are untouched. Empty until a
+///   `prune_unchanged` pipeline runs, so pre-existing state resumes unchanged.
+const CURRENT_SCHEMA_VERSION: u32 = 10;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -576,6 +589,7 @@ impl StateStore {
             // EXPECTED_TABLES. A table created lazily on first write would not
             // appear in a fresh DB and would silently escape the golden.
             let _table = txn.open_table(WATERMARKS)?;
+            let _table = txn.open_table(SOURCE_MARKERS)?;
             let _table = txn.open_table(CHECK_HISTORY)?;
             let _table = txn.open_table(RUN_HISTORY)?;
             let _table = txn.open_table(QUALITY_HISTORY)?;
@@ -622,6 +636,28 @@ impl StateStore {
         {
             let mut table = txn.open_table(WATERMARKS)?;
             table.insert(table_key, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Gets the recorded source change-marker for a table (keyed by
+    /// `catalog.schema.table`), written after the last successful copy.
+    pub fn get_source_marker(&self, table_key: &str) -> Result<Option<String>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(SOURCE_MARKERS)?;
+        Ok(table.get(table_key)?.map(|v| v.value().to_string()))
+    }
+
+    /// Records the source change-marker for a table after a successful copy.
+    /// Store the marker read at the copy's decision point (not a post-copy
+    /// re-read): if the source advanced mid-copy the recorded marker stays
+    /// behind, so the next run copies again rather than skipping a change.
+    pub fn set_source_marker(&self, table_key: &str, marker: &str) -> Result<(), StateError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SOURCE_MARKERS)?;
+            table.insert(table_key, marker)?;
         }
         txn.commit()?;
         Ok(())
@@ -3471,6 +3507,36 @@ mod tests {
     }
 
     #[test]
+    fn source_marker_round_trip_and_absent_is_none() {
+        let (store, _dir) = temp_store();
+        // Absent → None (so an unrecorded table always copies, never prunes).
+        assert!(store.get_source_marker("cat.sch.orders").unwrap().is_none());
+        // Round-trips, and overwriting reflects the latest recorded marker.
+        store
+            .set_source_marker("cat.sch.orders", "2026-01-01T00:00:00Z|3|2048")
+            .unwrap();
+        assert_eq!(
+            store
+                .get_source_marker("cat.sch.orders")
+                .unwrap()
+                .as_deref(),
+            Some("2026-01-01T00:00:00Z|3|2048")
+        );
+        store
+            .set_source_marker("cat.sch.orders", "2026-01-02T00:00:00Z|4|4096")
+            .unwrap();
+        assert_eq!(
+            store
+                .get_source_marker("cat.sch.orders")
+                .unwrap()
+                .as_deref(),
+            Some("2026-01-02T00:00:00Z|4|4096")
+        );
+        // Keyed per table — a different key stays independent.
+        assert!(store.get_source_marker("cat.sch.other").unwrap().is_none());
+    }
+
+    #[test]
     fn test_set_and_get_watermark() {
         let (store, _dir) = temp_store();
         let now = Utc::now();
@@ -6233,7 +6299,7 @@ mod tests {
         // The pinned format contract. Update DELIBERATELY: a table-set change
         // is an on-disk break that needs a `CURRENT_SCHEMA_VERSION` bump + a
         // migration path, not just an edit here.
-        const EXPECTED_VERSION: u32 = 9;
+        const EXPECTED_VERSION: u32 = 10;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
@@ -6252,6 +6318,7 @@ mod tests {
             "run_progress",
             "run_progress_entries",
             "schema_cache",
+            "source_markers",
             "watermarks",
         ];
 

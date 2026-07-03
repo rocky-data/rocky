@@ -185,6 +185,13 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
             .map_err(AdapterError::new)
     }
 
+    async fn source_change_marker(&self, table: &TableRef) -> AdapterResult<Option<String>> {
+        self.connector
+            .describe_detail_marker(&table.catalog, &table.schema, &table.table)
+            .await
+            .map_err(AdapterError::new)
+    }
+
     async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
         // Try the Unity REST path first when a catalog client is wired —
         // `GET /api/2.1/unity-catalog/tables/{full_name}` returns the column

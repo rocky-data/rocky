@@ -39,6 +39,38 @@ struct PendingCheck {
     checks: Vec<rocky_core::checks::CheckResult>,
 }
 
+/// Outcome of processing one replication table: it was either materialized
+/// (copied, with full [`TableResult`] detail) or pruned as unchanged since the
+/// last successful copy (`prune_unchanged` skip-unchanged pruning). The large
+/// `Materialized` payload is boxed so the enum stays small.
+enum TableOutcome {
+    Materialized(Box<TableResult>),
+    Pruned(PrunedTable),
+}
+
+/// A table skipped by `prune_unchanged` pruning because its source is unchanged
+/// since the last successful copy. Recorded on `RunOutput.excluded_tables` with
+/// reason `"unchanged_since_last_copy"`; emits no materialization, so the
+/// orchestrator's `satisfy_empty_outputs` provides the 0-row continuity signal.
+struct PrunedTable {
+    asset_key: Vec<String>,
+    source_schema: String,
+    table_name: String,
+}
+
+/// Record a skip-unchanged pruned table on the run output. It lands in
+/// `excluded_tables` with reason `"unchanged_since_last_copy"` (the free-form
+/// reason field, so no schema change) and emits no materialization — the
+/// orchestrator's `satisfy_empty_outputs` stamps the 0-row continuity signal.
+fn record_pruned(output: &mut RunOutput, pruned: PrunedTable) {
+    output.excluded_tables.push(ExcludedTableOutput {
+        asset_key: pruned.asset_key,
+        source_schema: pruned.source_schema,
+        table_name: pruned.table_name,
+        reason: "unchanged_since_last_copy".to_string(),
+    });
+}
+
 /// Result of processing a single table (returned from parallel tasks).
 struct TableResult {
     materialization: MaterializationOutput,
@@ -362,6 +394,11 @@ pub struct SkipRunOptions {
     /// enabled in config — clause 1 of the fail-closed gate. The escape
     /// hatch that forces every content-addressed model to BUILD.
     pub no_reuse: bool,
+    /// Whether `--no-prune` was passed. Forces a full replication pass for
+    /// this invocation, disabling `[pipeline] prune_unchanged` skip-unchanged
+    /// pruning even when the config opts in — e.g. after a manual target-side
+    /// mutation. No effect when `prune_unchanged` is off.
+    pub no_prune: bool,
 }
 
 /// Fully-resolved configuration for the model-skip gate, assembled in
@@ -2345,7 +2382,11 @@ pub async fn run(
     let shared_state = Arc::new(Mutex::new(state_store));
     let shared_run_id = run_id.clone();
     let shared_pipeline = Arc::new(pipeline.clone());
-    let mut join_set: JoinSet<(usize, Result<TableResult, anyhow::Error>)> = JoinSet::new();
+    // Skip-unchanged pruning is active only when the pipeline opts in
+    // (`prune_unchanged`) and the run didn't force a full pass (`--no-prune`).
+    // Threaded into every `process_table` call in the concurrent loop below.
+    let prune_enabled = shared_pipeline.prune_unchanged && !skip_opts.no_prune;
+    let mut join_set: JoinSet<(usize, Result<TableOutcome, anyhow::Error>)> = JoinSet::new();
 
     // Background state sync — flush watermarks to remote storage.
     //
@@ -2486,7 +2527,8 @@ pub async fn run(
 
         join_set.spawn(async move {
             let _permit = permit;
-            let result = process_table(warehouse.as_ref(), &state, &pipeline_ref, &task).await;
+            let result =
+                process_table(warehouse.as_ref(), &state, &pipeline_ref, &task, prune_enabled).await;
             (idx, result)
         });
     }
@@ -2524,7 +2566,19 @@ pub async fn run(
         total_completed += 1;
 
         match result {
-            Ok((_, Ok(tr))) => {
+            Ok((_, Ok(TableOutcome::Pruned(pruned)))) => {
+                // A prune is a cheap successful metadata read, not real work —
+                // signal the throttle so it can widen concurrency, then record
+                // the skip. No materialization is emitted: the orchestrator's
+                // satisfy_empty_outputs stamps the 0-row continuity signal.
+                if let Some(t) = &throttle {
+                    t.on_success();
+                    adjust_semaphore(t, &semaphore, &mut semaphore_capacity);
+                }
+                record_pruned(&mut output, pruned);
+            }
+            Ok((_, Ok(TableOutcome::Materialized(tr)))) => {
+                let tr = *tr;
                 // Signal success to the adaptive throttle
                 if let Some(t) = &throttle {
                     t.on_success();
@@ -2931,10 +2985,24 @@ pub async fn run(
                     &shared_state,
                     &shared_pipeline,
                     task,
+                    // Retry still honours pruning. A failed copy is atomic
+                    // (Delta commits don't half-apply), so on failure the target
+                    // sits at the last successful copy; if the source marker
+                    // still matches that copy the target is already correct and
+                    // the table prunes, otherwise the source changed and the
+                    // retry copies. Either outcome records the marker on a
+                    // successful copy, so a transient failure doesn't force a
+                    // re-copy every run thereafter.
+                    prune_enabled,
                 )
                 .await
                 {
-                    Ok(tr) => {
+                    Ok(TableOutcome::Pruned(pruned)) => {
+                        record_pruned(&mut output, pruned);
+                        info!(table = task.table_name.as_str(), "retry pruned as unchanged");
+                    }
+                    Ok(TableOutcome::Materialized(tr)) => {
+                        let tr = *tr;
                         output.tables_copied += 1;
                         rocky_observe::metrics::METRICS.inc_tables_processed();
                         output.materializations.push(tr.materialization);
@@ -6720,7 +6788,8 @@ async fn process_table(
     state: &Mutex<StateStore>,
     pipeline: &ReplicationPipelineConfig,
     task: &TableTask,
-) -> Result<TableResult> {
+    prune_enabled: bool,
+) -> Result<TableOutcome> {
     let table_start = Instant::now();
     let table_started_at = Utc::now();
     let dialect = warehouse.dialect();
@@ -6738,6 +6807,49 @@ async fn process_table(
 
     let mut asset_key = task.asset_key_prefix.clone();
     asset_key.push(task.table_name.clone());
+
+    // --- Skip-unchanged pruning (config `prune_unchanged`, off by default) ---
+    //
+    // Before doing any copy work, ask the adapter for a cheap change-marker on
+    // the source (a `DESCRIBE DETAIL`-derived marker on Databricks; `None` on
+    // adapters without one → never prune). If it matches the marker recorded at
+    // the last successful copy, the source is unchanged: skip the copy, drift
+    // check, and data checks entirely, emitting no materialization. The
+    // orchestrator's `satisfy_empty_outputs` stamps the 0-row continuity signal
+    // for the selected-but-unmaterialized key. A metadata-fetch error is
+    // treated as `None` (copy) so a transient failure never causes a false
+    // skip. `live_marker` is threaded to the success path and recorded there.
+    let live_marker = if prune_enabled {
+        match warehouse.source_change_marker(&source_table).await {
+            Ok(marker) => marker,
+            Err(e) => {
+                tracing::warn!(
+                    table = %task.table_name,
+                    error = %e,
+                    "source_change_marker failed; copying this table (no prune)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(live) = &live_marker {
+        let recorded = {
+            let guard = state.lock().await;
+            guard
+                .get_source_marker(&target_table.state_key())
+                .ok()
+                .flatten()
+        };
+        if recorded.as_deref() == Some(live.as_str()) {
+            return Ok(TableOutcome::Pruned(PrunedTable {
+                asset_key,
+                source_schema: task.source_schema.clone(),
+                table_name: task.table_name.clone(),
+            }));
+        }
+    }
 
     // Drift detection — use pre-fetched columns when available (batch
     // information_schema query), falling back to individual DESCRIBE TABLE
@@ -7223,7 +7335,27 @@ async fn process_table(
     };
 
     let target_table_full_name = target_table.full_name();
-    Ok(TableResult {
+
+    // Record the source change-marker captured at the prune decision point
+    // (not a post-copy re-read): if the source advanced mid-copy the recorded
+    // marker stays behind, so the next run copies again rather than skipping a
+    // change. Written only on this success path — a copy failure early-returns
+    // above, leaving the prior marker so the table is retried.
+    if let Some(marker) = &live_marker {
+        let recorded = state
+            .lock()
+            .await
+            .set_source_marker(&target_table.state_key(), marker);
+        if let Err(e) = recorded {
+            tracing::warn!(
+                table = %task.table_name,
+                error = %e,
+                "failed to record source change-marker; table will re-copy next run"
+            );
+        }
+    }
+
+    Ok(TableOutcome::Materialized(Box::new(TableResult {
         materialization: MaterializationOutput {
             asset_key: asset_key.clone(),
             rows_copied: None,
@@ -7269,7 +7401,7 @@ async fn process_table(
         },
         deferred_tags,
         deferred_watermark,
-    })
+    })))
 }
 
 /// Adjusts the semaphore capacity to match the throttle's current recommendation.
@@ -7330,7 +7462,7 @@ fn adjust_semaphore(
 /// arrive while we're still spawning tasks.
 #[allow(clippy::too_many_arguments)]
 async fn process_completed_result(
-    result: Result<(usize, Result<TableResult, anyhow::Error>), tokio::task::JoinError>,
+    result: Result<(usize, Result<TableOutcome, anyhow::Error>), tokio::task::JoinError>,
     tables_to_process: &[TableTask],
     throttle: &Option<AdaptiveThrottle>,
     semaphore: &Semaphore,
@@ -7351,7 +7483,15 @@ async fn process_completed_result(
     *total_completed += 1;
 
     match result {
-        Ok((_, Ok(tr))) => {
+        Ok((_, Ok(TableOutcome::Pruned(pruned)))) => {
+            if let Some(t) = &throttle {
+                t.on_success();
+                adjust_semaphore(t, semaphore, semaphore_capacity);
+            }
+            record_pruned(output, pruned);
+        }
+        Ok((_, Ok(TableOutcome::Materialized(tr)))) => {
+            let tr = *tr;
             if let Some(t) = &throttle {
                 t.on_success();
                 adjust_semaphore(t, semaphore, semaphore_capacity);

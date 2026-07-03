@@ -989,6 +989,7 @@ mod tests {
             skip_unchanged,
             force_rebuild: false,
             no_reuse: false,
+            no_prune: false,
         };
         super::super::run::run(
             config_path,

@@ -968,6 +968,7 @@ mod tests {
             execution: ExecutionConfig::default(),
             depends_on: depends_on.into_iter().map(String::from).collect(),
             table_overrides: vec![],
+            prune_unchanged: false,
         }))
     }
 
