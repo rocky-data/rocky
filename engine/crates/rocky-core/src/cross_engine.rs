@@ -546,6 +546,7 @@ mod tests {
             execution: ExecutionConfig::default(),
             depends_on,
             table_overrides: vec![],
+            prune_unchanged: false,
         }))
     }
 

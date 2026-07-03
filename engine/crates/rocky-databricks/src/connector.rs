@@ -830,6 +830,79 @@ impl DatabricksConnector {
         Ok(Some(DescribeDetailStats { size_bytes }))
     }
 
+    /// Fetch an opaque change-marker for a table via `DESCRIBE DETAIL`.
+    ///
+    /// Combines `lastModified` (advances on every Delta commit / data write)
+    /// with `numFiles` and `sizeInBytes` so any write moves the marker even in
+    /// the (vanishingly rare) event of two commits sharing a millisecond
+    /// `lastModified`. The replication runner's `prune_unchanged` pruning
+    /// compares this for equality against the value recorded at the last
+    /// successful copy.
+    ///
+    /// Returns `Ok(None)` when the table is absent, or when the response has no
+    /// `lastModified` (a non-Delta table or a view) — the runner then always
+    /// copies rather than risking a false skip. Propagates [`ConnectorError`]
+    /// on network / API failures.
+    pub async fn describe_detail_marker(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<String>, ConnectorError> {
+        let fqn = format!("`{catalog}`.`{schema}`.`{table}`");
+        let sql = format!("DESCRIBE DETAIL {fqn}");
+
+        let result = match self.execute_sql(&sql).await {
+            Ok(r) => r,
+            Err(ConnectorError::StatementFailed { message, .. })
+                if message.to_uppercase().contains("TABLE_OR_VIEW_NOT_FOUND")
+                    || message.to_uppercase().contains("DELTA_TABLE_NOT_FOUND")
+                    || message.to_uppercase().contains("DOES NOT EXIST")
+                    || message.to_uppercase().contains("NOT FOUND") =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let Some(row) = result.rows.first() else {
+            return Ok(None);
+        };
+        let cell = |name: &str| -> Option<String> {
+            let idx = result
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))?;
+            let v = row.get(idx)?;
+            if v.is_null() {
+                return None;
+            }
+            if let Some(s) = v.as_str() {
+                return Some(s.to_string());
+            }
+            if let Some(n) = v.as_u64() {
+                return Some(n.to_string());
+            }
+            if let Some(n) = v.as_i64() {
+                return Some(n.to_string());
+            }
+            Some(v.to_string())
+        };
+
+        // `lastModified` is the primary signal; its absence means the object
+        // has no Delta commit timestamp (view / non-Delta) — no reliable
+        // marker, so fall back to "always copy".
+        let Some(last_modified) = cell("lastModified") else {
+            return Ok(None);
+        };
+        let marker = format!(
+            "{last_modified}|{}|{}",
+            cell("numFiles").unwrap_or_default(),
+            cell("sizeInBytes").unwrap_or_default(),
+        );
+        Ok(Some(marker))
+    }
+
     /// Cancels a running statement.
     pub async fn cancel_statement(&self, statement_id: &str) -> Result<(), ConnectorError> {
         let token = self.auth.get_token().await?;

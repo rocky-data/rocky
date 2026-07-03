@@ -3679,6 +3679,22 @@ pub struct ReplicationPipelineConfig {
     /// cost.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub table_overrides: Vec<TableOverride>,
+
+    /// When `true`, the replication runner skips ("prunes") any table whose
+    /// source is provably unchanged since the last successful copy — detected
+    /// via the adapter's `source_change_marker` (a `DESCRIBE DETAIL`-derived
+    /// marker on Databricks; adapters without a cheap change signal always
+    /// copy). A pruned table emits no materialization, keeps its checks
+    /// skipped (the prior results stand), and is recorded under
+    /// `excluded_tables` with reason `"unchanged_since_last_copy"`.
+    ///
+    /// Defaults to `false` — opt in per pipeline, since silently skipping
+    /// copies is a behavior change. The marker is compared against the
+    /// target's recorded last-copied value (never wall-clock), so a failed
+    /// prior run cannot cause a false skip. Pass `--no-prune` to `rocky run`
+    /// to force a full pass (e.g. after a manual target-side mutation).
+    #[serde(default)]
+    pub prune_unchanged: bool,
 }
 
 /// Backward-compatible alias for [`ReplicationPipelineConfig`].
