@@ -162,6 +162,7 @@ def _engine_schema_mismatch_failure(command: str, exc: ValidationError) -> dg.Fa
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
+    from collections.abc import Set as AbstractSet
 
 #: Metadata key stamped on the zero-row ``MaterializeResult`` that the
 #: ``satisfy_empty_outputs`` mode emits for a *selected* output Rocky did
@@ -3098,6 +3099,18 @@ def _emit_results(
     # actually a hidden failure — so we skip the empty-emit for that whole
     # batch and let the downstream skip exactly as today. A visible skip
     # beats a zero-row success that masks a failure.
+    # Tables the engine pruned as unchanged since the last successful copy
+    # (`prune_unchanged`). They emit no materialization but are not failures:
+    # treat them as unchanged — a distinct zero-row continuity stamp, and their
+    # declared checks keep their prior result rather than flipping to a WARN
+    # placeholder (see `_emit_placeholder_checks`).
+    pruned_keys = {
+        remap(et.asset_key)
+        for r in results
+        for et in r.excluded_tables
+        if et.reason == "unchanged_since_last_copy"
+    } & selected_keys
+
     if satisfy_empty_outputs:
         unattributable = any(r.tables_failed > len(r.errors) for r in results)
         if unattributable:
@@ -3113,18 +3126,31 @@ def _emit_results(
         else:
             errored_keys = {remap(err.asset_key) for r in results for err in r.errors}
             empty_keys = selected_keys - materialized_keys - errored_keys
-            yield from _empty_output_results(empty_keys)
+            yield from _empty_output_results(empty_keys, pruned_keys)
+    elif pruned_keys:
+        # Pruning produced skipped tables but there is no empty-output pass to
+        # stamp them, so their assets aren't materialized this run and a same-run
+        # downstream will skip. Make the coupling visible.
+        _log.warning(
+            "prune_unchanged skipped %d table(s) this run, but satisfy_empty_outputs "
+            "is off — their assets are not materialized, so same-run downstreams will "
+            "skip. Enable satisfy_empty_outputs (streaming mode) to emit the zero-row "
+            "continuity signal for pruned tables.",
+            len(pruned_keys),
+        )
 
     yield from _emit_placeholder_checks(
         check_specs=check_specs,
         selected_keys=selected_keys,
         yielded_checks=yielded_checks,
         materialized_keys=materialized_keys,
+        pruned_keys=pruned_keys,
     )
 
 
 def _empty_output_results(
     empty_keys: Iterable[dg.AssetKey],
+    pruned_keys: AbstractSet[dg.AssetKey] = frozenset(),
 ) -> Iterator[dg.MaterializeResult]:
     """Yield a zero-row, dependency-satisfying result per absent key.
 
@@ -3134,15 +3160,25 @@ def _empty_output_results(
     yielded in a deterministic (sorted) order so the emitted event stream
     doesn't depend on set-iteration order. The caller is responsible for
     having already removed copied and errored keys from ``empty_keys``.
+
+    Keys in ``pruned_keys`` were skipped by ``prune_unchanged`` because the
+    source was unchanged since the last copy — a different situation from a
+    genuinely absent/empty table, so they carry a distinct reason and a
+    ``rocky/pruned_unchanged`` flag. The prior copy's data still stands.
     """
     for key in sorted(empty_keys, key=lambda k: k.to_user_string()):
+        pruned = key in pruned_keys
+        reason = (
+            "source unchanged since last copy — pruned by prune_unchanged; prior data stands"
+            if pruned
+            else "no rows copied for this partition (table absent or empty in the filtered run)"
+        )
         yield dg.MaterializeResult(
             asset_key=key,
             metadata={
                 EMPTY_FOR_PARTITION_METADATA_KEY: dg.MetadataValue.bool(True),
-                "rocky/reason": dg.MetadataValue.text(
-                    "no rows copied for this partition (table absent or empty in the filtered run)"
-                ),
+                "rocky/reason": dg.MetadataValue.text(reason),
+                "rocky/pruned_unchanged": dg.MetadataValue.bool(pruned),
                 "dagster/row_count": dg.MetadataValue.int(0),
             },
         )
@@ -3209,16 +3245,37 @@ def _emit_placeholder_checks(
     selected_keys: set[dg.AssetKey],
     yielded_checks: set[tuple[dg.AssetKey, str]],
     materialized_keys: set[dg.AssetKey],
+    pruned_keys: AbstractSet[dg.AssetKey] = frozenset(),
 ) -> Iterator[dg.AssetCheckResult]:
     """Emit placeholders for declared checks Rocky did not produce.
 
     Without these, Dagster logs "did not yield expected outputs" warnings
     for any pre-declared check that the actual run didn't cover.
+
+    A check on a ``prune_unchanged``-pruned table is neither run nor a failure:
+    the source is unchanged, so the last real evaluation still holds. Those emit
+    ``passed=True`` with a "not re-checked" status rather than the WARN /
+    ``passed=False`` placeholder an unmaterialized table would otherwise get —
+    so pruning doesn't overwrite a passing check with a spurious failure.
     """
     for cs in check_specs:
         if cs.asset_key not in selected_keys:
             continue
         if (cs.asset_key, cs.name) in yielded_checks:
+            continue
+
+        if cs.asset_key in pruned_keys:
+            yield dg.AssetCheckResult(
+                asset_key=cs.asset_key,
+                check_name=cs.name,
+                passed=True,
+                metadata={
+                    "status": dg.MetadataValue.text(
+                        "not re-checked: source unchanged since last copy "
+                        "(prune_unchanged) — prior result stands"
+                    )
+                },
+            )
             continue
 
         materialized = cs.asset_key in materialized_keys

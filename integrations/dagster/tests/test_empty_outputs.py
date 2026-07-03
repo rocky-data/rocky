@@ -40,6 +40,7 @@ def _run_result(
     materializations: list[dict] | None = None,
     errors: list[dict] | None = None,
     tables_failed: int | None = None,
+    excluded_tables: list[dict] | None = None,
 ) -> RunResult:
     mats = materializations or []
     errs = errors or []
@@ -57,6 +58,7 @@ def _run_result(
             "materializations": mats,
             "check_results": [],
             "errors": errs,
+            "excluded_tables": excluded_tables or [],
             "permissions": {
                 "grants_added": 0,
                 "grants_revoked": 0,
@@ -469,3 +471,101 @@ def test_satisfy_empty_outputs_resolves_from_yaml():
     assert on.satisfy_empty_outputs is True
     off = RockyComponent.resolve_from_yaml("config_path: rocky.toml\n")
     assert off.satisfy_empty_outputs is False
+
+
+# --------------------------------------------------------------------------- #
+# prune_unchanged — a pruned (source-unchanged) table is distinct from absent,
+# and keeps its prior check result rather than flipping to a WARN placeholder.
+# --------------------------------------------------------------------------- #
+
+
+def _excluded(name: str, reason: str = "unchanged_since_last_copy") -> dict:
+    return {
+        "asset_key": [name],
+        "source_schema": "raw__sw",
+        "table_name": name,
+        "reason": reason,
+    }
+
+
+def test_pruned_table_gets_distinct_empty_stamp():
+    """A pruned (unchanged) table and a genuinely-absent table both get a
+    zero-row continuity stamp, but the pruned one carries the distinct reason +
+    ``rocky/pruned_unchanged=True`` so it isn't confused with absent/empty."""
+    a_raw, b_raw, c_raw = (dg.AssetKey([x]) for x in ("a_raw", "b_raw", "c_raw"))
+    mapping = {("a_raw",): a_raw, ("b_raw",): b_raw, ("c_raw",): c_raw}
+    # a_raw copied, b_raw pruned (unchanged), c_raw genuinely absent.
+    run_result = _run_result(
+        materializations=[_mat("a_raw")],
+        excluded_tables=[_excluded("b_raw")],
+    )
+
+    events = list(
+        _emit_results(
+            results=[run_result],
+            check_specs=[],
+            selected_keys={a_raw, b_raw, c_raw},
+            rocky_key_to_dagster_key=mapping,
+            satisfy_empty_outputs=True,
+        )
+    )
+    by_key = {
+        e.asset_key: e
+        for e in events
+        if isinstance(e, dg.MaterializeResult) and e.metadata.get(EMPTY_FOR_PARTITION_METADATA_KEY)
+    }
+    # Both b_raw (pruned) and c_raw (absent) get a continuity stamp...
+    assert set(by_key) == {b_raw, c_raw}
+    # ...but only b_raw is flagged pruned, with the distinct reason.
+    assert by_key[b_raw].metadata["rocky/pruned_unchanged"].value is True
+    assert "unchanged since last copy" in by_key[b_raw].metadata["rocky/reason"].value
+    assert by_key[c_raw].metadata["rocky/pruned_unchanged"].value is False
+    assert "absent or empty" in by_key[c_raw].metadata["rocky/reason"].value
+
+
+def test_pruned_table_check_passes_not_warns():
+    """A declared check on a pruned table emits passed=True (prior result
+    stands), NOT the passed=False/WARN placeholder an unmaterialized table would
+    otherwise get — pruning must not overwrite a passing check with a failure."""
+    b_raw = dg.AssetKey(["b_raw"])
+    mapping = {("b_raw",): b_raw}
+    run_result = _run_result(excluded_tables=[_excluded("b_raw")])
+
+    events = list(
+        _emit_results(
+            results=[run_result],
+            check_specs=[dg.AssetCheckSpec(name="row_count", asset=b_raw)],
+            selected_keys={b_raw},
+            rocky_key_to_dagster_key=mapping,
+            satisfy_empty_outputs=True,
+        )
+    )
+    checks = [e for e in events if isinstance(e, dg.AssetCheckResult)]
+    assert len(checks) == 1
+    assert checks[0].asset_key == b_raw
+    assert checks[0].check_name == "row_count"
+    assert checks[0].passed is True
+    assert "unchanged" in checks[0].metadata["status"].value
+
+
+def test_prune_without_satisfy_empty_outputs_warns(caplog):
+    """When pruning skips tables but satisfy_empty_outputs is off, the pruned
+    assets aren't materialized and same-run downstreams skip — surface the
+    coupling with a warning so it isn't a silent gap."""
+    import logging
+
+    b_raw = dg.AssetKey(["b_raw"])
+    mapping = {("b_raw",): b_raw}
+    run_result = _run_result(excluded_tables=[_excluded("b_raw")])
+
+    with caplog.at_level(logging.WARNING, logger="dagster_rocky.component"):
+        list(
+            _emit_results(
+                results=[run_result],
+                check_specs=[],
+                selected_keys={b_raw},
+                rocky_key_to_dagster_key=mapping,
+                satisfy_empty_outputs=False,
+            )
+        )
+    assert any("prune_unchanged skipped" in r.message for r in caplog.records)
