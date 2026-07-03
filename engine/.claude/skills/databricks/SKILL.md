@@ -1,5 +1,5 @@
 ---
-name: databricks-api
+name: databricks
 description: Databricks REST API and SQL reference for Rocky's warehouse adapter. Use when implementing SQL execution, Unity Catalog management, workspace bindings, authentication, permission reconciliation, or any Databricks integration in the rocky-databricks crate.
 ---
 
@@ -171,11 +171,10 @@ Content-Type: application/json
 -- Create
 CREATE CATALOG IF NOT EXISTS <catalog>
 
--- Tag
+-- Tag (keys/values come from [governance.tags] in rocky.toml; 'managed_by' is always set)
 ALTER CATALOG <catalog> SET TAGS (
-    'client' = '<client>',
-    'product' = '<product_name>',
     'managed_by' = '<pipeline_name>'
+    -- plus any tags declared under [governance.tags]
 )
 
 -- Inspect
@@ -194,15 +193,12 @@ WHERE tag_name = 'managed_by' AND tag_value = '<pipeline_name>'
 -- Create
 CREATE SCHEMA IF NOT EXISTS <catalog>.<schema>
 
--- Tag (dynamic hierarchy tags)
+-- Tag (keys/values come from [governance.tags]; Rocky always sets 'managed_by')
 ALTER SCHEMA <catalog>.<schema> SET TAGS (
-    'client' = '<client>',
     'layer' = 'raw',
-    'hierarchy-1' = '<h1>',
-    'hierarchy-2' = '<h2>',
     'connector' = '<connector>',
-    'product' = '<product_name>',
     'managed_by' = '<pipeline_name>'
+    -- plus any tags declared under [governance.tags]
 )
 
 -- List schemas
@@ -211,19 +207,18 @@ SHOW SCHEMAS IN <catalog>
 
 ### Incremental Copy (Core Operation)
 
+Rocky reads the prior watermark (`MAX(<timestamp_col>)` from the previous run) out of its redb state store and threads it into the generated SQL **as a literal** — it does **not** subquery the target table. See `rocky-core/src/sql_gen.rs`; a regression test asserts the generated SQL does not contain `SELECT COALESCE(MAX(...))`.
+
 ```sql
 -- Full refresh
-SELECT *, CAST(NULL AS STRING) AS audit_key
-FROM <source_catalog>.<source_schema>.<table>
+SELECT * FROM <source_catalog>.<source_schema>.<table>
 
--- Incremental (append new rows since last watermark)
-SELECT *, CAST(NULL AS STRING) AS audit_key
-FROM <source_catalog>.<source_schema>.<table>
-WHERE _fivetran_synced > (
-    SELECT COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01')
-    FROM <target_catalog>.<target_schema>.<table>
-)
+-- Incremental (append rows newer than the stored watermark)
+SELECT * FROM <source_catalog>.<source_schema>.<table>
+WHERE _fivetran_synced > TIMESTAMP '<prior_watermark_literal>'
 ```
+
+After the copy, Rocky re-queries `MAX(<timestamp_col>)` from the source and records it as the next watermark.
 
 ### Schema Drift Detection
 
@@ -232,10 +227,14 @@ WHERE _fivetran_synced > (
 DESCRIBE TABLE <catalog>.<schema>.<table>
 -- Returns rows: (col_name, data_type, comment)
 
--- On type mismatch between source and target:
+-- On a SAFE type widening (e.g. INT -> BIGINT): evolve in place
+ALTER TABLE <target_catalog>.<target_schema>.<table> ALTER COLUMN <col> TYPE <wider_type>
+
+-- On an UNSAFE type change: drop, then full refresh on next run
 DROP TABLE IF EXISTS <target_catalog>.<target_schema>.<table>
--- Then full refresh on next run
 ```
+
+The safe-vs-unsafe decision is `drift.rs::is_safe_type_widening()`.
 
 ### Permission Reconciliation
 

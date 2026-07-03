@@ -7,13 +7,13 @@ description: Playbook for when `cargo clippy -- -D warnings` fires in the Rocky 
 
 ## The CI rule
 
-`.github/workflows/engine-ci.yml:62` runs:
+`.github/workflows/engine-ci.yml` runs:
 
 ```
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-That means **any** clippy warning in **any** target (lib, bin, tests, examples, benches) fails CI. There is no per-lint exception list, no `clippy.toml`, and **no `[workspace.lints]` table** in `engine/Cargo.toml` (verified). The policy is "default clippy, zero warnings."
+That means **any** clippy warning in **any** target (lib, bin, tests, examples, benches), across all feature combinations, fails CI. Baseline lint policy lives in a `[workspace.lints.clippy]` table in `engine/Cargo.toml` — `correctness = "deny"` plus a few warn-level lints (`needless_pass_by_value`, `redundant_closure_for_method_calls`, `cloned_instead_of_copied`, `large_enum_variant`). There is no `clippy.toml`. The policy is "correctness is a hard error; zero warnings overall."
 
 ## When CI goes red — triage order
 
@@ -69,18 +69,19 @@ pub fn build_plan(
 
 ### 4. The lint is consistently wrong for Rocky
 
-If the same lint keeps getting `#[allow]`'d across the workspace with the same reason, that's the signal to add a **workspace-level policy** instead of per-site allows. The right mechanism is a `[workspace.lints]` table in `engine/Cargo.toml`:
+If the same lint keeps getting `#[allow]`'d across the workspace with the same reason, that's the signal to adjust the **workspace-level policy** in the existing `[workspace.lints.clippy]` table in `engine/Cargo.toml` (currently `correctness = "deny"` + a few warn-level style/perf lints) instead of sprinkling per-site allows:
 
 ```toml
 [workspace.lints.clippy]
-# Example — DO NOT add without Hugo review.
-# large_enum_variant = "allow"  # SQL AST enums intentionally have size-asymmetric variants.
+correctness = { level = "deny", priority = -1 }
+needless_pass_by_value = "warn"
+# tune a lint here rather than repeating a per-site #[allow]
 ```
 
 **Rules:**
 
-- **Never** add `[workspace.lints]` on your own. Propose it to Hugo first — the project deliberately has no lint table today, and adding one is a policy change, not a fix.
-- If you do end up adding one, each entry needs a comment explaining why, with a link to at least one example that triggered it.
+- Changing `[workspace.lints]` is a **policy change, not a fix** — propose it to Hugo first. Widening (e.g. demoting a lint to `allow`) affects every crate.
+- Each entry needs a comment explaining why, with at least one example that triggered it.
 - Crate-specific lint policy goes in that crate's `Cargo.toml` under `[lints]`, not in `[workspace.lints]` — workspace-level is for rules that apply to every crate.
 
 ### 5. The lint fires in generated code
@@ -97,7 +98,7 @@ Never silence lints globally just because generated code trips them in one place
 ```bash
 # From inside engine/:
 cargo clippy --all-targets                 # see warnings without -D (fast iterate)
-cargo clippy --all-targets -- -D warnings  # same command CI runs
+cargo clippy --all-targets --all-features -- -D warnings  # same command CI runs
 cargo clippy -p rocky-core --all-targets   # scope to one crate while iterating
 cargo clippy --fix --allow-dirty           # auto-apply safe suggestions (review the diff!)
 ```
@@ -115,7 +116,7 @@ cargo fmt -- --check
 …which fails CI just as reliably as clippy does. Before pushing, always run:
 
 ```bash
-cargo fmt && cargo clippy --all-targets -- -D warnings
+cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 `cargo fmt` has no per-file config in Rocky — it uses the default `rustfmt.toml` behavior. Don't introduce a `rustfmt.toml` without Hugo review for the same reason as `[workspace.lints]`: it's a policy change.

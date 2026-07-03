@@ -633,13 +633,10 @@ SELECT
     total_amount,
     _fivetran_synced
 FROM raw_catalog.src__acme__us_west__shopify.orders
-WHERE _fivetran_synced > (
-    SELECT COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01')
-    FROM analytics.warehouse.fct_orders
-)
+WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'
 ```
 
-On the first run (when the target table does not exist), Rocky performs a full refresh automatically.
+The watermark literal is the previous run's `MAX(_fivetran_synced)`, read from Rocky's state store — not a subquery against the target. On the first run (when the target table does not exist), Rocky performs a full refresh automatically.
 
 ---
 

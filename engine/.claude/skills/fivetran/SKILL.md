@@ -1,5 +1,5 @@
 ---
-name: fivetran-api
+name: fivetran
 description: Fivetran REST API reference for Rocky's source adapter. Use when implementing connector discovery, schema config parsing, sync detection, pagination, or any Fivetran API integration in the rocky-fivetran crate.
 ---
 
@@ -12,7 +12,7 @@ For complete endpoint details, request/response examples, and parameters:
 
 ## Authentication
 
-Basic Auth with API key and secret:
+Basic Auth with API key and secret. Rocky reads `FIVETRAN_API_KEY` and `FIVETRAN_API_SECRET` (plus `FIVETRAN_DESTINATION_ID` for the destination group), typically via `${VAR}` substitution in `rocky.toml`:
 
 ```
 Authorization: Basic base64({api_key}:{api_secret})
@@ -35,7 +35,7 @@ Key fields in connector response:
 - `id` — Connector ID
 - `group_id` — Destination/group ID
 - `service` — Connector type (e.g., "facebook_ads")
-- `schema` — Schema name (e.g., "q__raw__acme__na__fb_ads")
+- `schema` — Schema name (e.g., "src__acme__us_west__shopify")
 - `status.setup_state` — "connected", "incomplete", etc.
 - `status.sync_state` — "syncing", "scheduled", "paused"
 - `succeeded_at` — Last successful sync timestamp (ISO 8601)
@@ -103,7 +103,7 @@ When `next_cursor` is absent or null, you've reached the last page.
 
 - 100 requests per minute
 - Implement exponential backoff on HTTP 429
-- Cache GET responses (5-min TTL in memory, shared via Valkey)
+- Cache GET responses (5-min TTL in memory, shared via a Valkey distributed cache)
 
 ## Response Format
 
@@ -118,8 +118,8 @@ Error codes: `NotFound`, `BadRequest`, `Unauthorized`, `RateLimitExceeded`
 
 ## Implementation Notes for Rocky
 
-1. **Connector discovery** — List all connectors in the destination group, filter by schema pattern (`q__raw__*`)
+1. **Connector discovery** — List all connectors in the destination group, filter by the configured `schema_pattern` prefix (e.g. `src__*`)
 2. **Schema config** — Fetch per-connector, parse nested structure to get enabled tables
 3. **Sync detection** — Compare `succeeded_at` against cursor timestamp
-4. **Caching** — Cache connector list and schema configs in memory (5-min TTL) and Valkey (shared across pods)
+4. **Caching** — Cache connector list and schema configs in memory (5-min TTL) and Valkey (shared distributed cache)
 5. **Error handling** — Fivetran API can return HTML on 5xx errors; handle non-JSON responses gracefully

@@ -276,7 +276,7 @@ rocky plan --filter client=acme
     {
       "purpose": "incremental_copy",
       "target": "acme_warehouse.staging__us_west__shopify.orders",
-      "sql": "SELECT *, CAST(NULL AS STRING) AS _loaded_by FROM source_catalog.src__acme__us_west__shopify.orders WHERE _fivetran_synced > (SELECT COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01') FROM acme_warehouse.staging__us_west__shopify.orders)"
+      "sql": "SELECT *, CAST(NULL AS STRING) AS _loaded_by FROM source_catalog.src__acme__us_west__shopify.orders WHERE _fivetran_synced > TIMESTAMP '1970-01-01 00:00:00'"
     }
   ]
 }

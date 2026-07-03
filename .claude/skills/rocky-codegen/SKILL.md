@@ -22,7 +22,7 @@ If you edit a Rust output struct and forget to regenerate, the `codegen-drift` w
 engine/crates/rocky-cli/src/output.rs       (Rust source of truth)
         │
         ▼  cargo run -- export-schemas schemas/
-schemas/*.schema.json                        (60 JSON Schemas, committed)
+schemas/*.schema.json                        (committed)
         │
         ├──▶  sdk/python/src/rocky_sdk/types_generated/   (Pydantic v2)
         └──▶  editors/vscode/src/types/generated/                       (TypeScript)
@@ -43,11 +43,11 @@ just codegen
 git status
 #   engine/crates/rocky-cli/src/output.rs        ← your edit
 #   schemas/<command>.schema.json                 ← regenerated
-#   integrations/dagster/.../types_generated/…    ← regenerated
+#   sdk/python/src/rocky_sdk/types_generated/…    ← regenerated
 #   editors/vscode/src/types/generated/…          ← regenerated
 
 # 4. Commit all of it in ONE commit
-git add engine/ schemas/ integrations/ editors/
+git add engine/ schemas/ sdk/ integrations/ editors/
 git commit -m "feat(engine): add <field> to <command>Output"
 ```
 
@@ -59,7 +59,7 @@ Three recipes in `justfile`, runnable individually:
 
 | Recipe | What it does |
 |---|---|
-| `just codegen-rust` | `cargo run --release --bin rocky -- export-schemas schemas/` — rebuilds engine in release mode (shared with `regen-fixtures`), then writes the JSON schemas to `schemas/` (currently 60; run `ls schemas/*.schema.json | wc -l` to verify). |
+| `just codegen-rust` | `cargo run --release --bin rocky -- export-schemas schemas/` — rebuilds engine in release mode (shared with `regen-fixtures`), then writes the JSON schemas to `schemas/` (run `ls schemas/*.schema.json | wc -l` to count). |
 | `just codegen-sdk` | Runs `datamodel-codegen` over `schemas/*.schema.json` into `sdk/python/src/rocky_sdk/types_generated/`. Self-heals the curated `__init__.py` barrel via `git checkout`. |
 | `just codegen-vscode` | Runs `json2ts` per schema into `editors/vscode/src/types/generated/`. Self-heals the curated `index.ts` barrel via `git checkout`. |
 
@@ -74,7 +74,7 @@ Both `codegen-sdk` and `codegen-vscode` intentionally overwrite the output direc
    ```
 2. Register it in `engine/crates/rocky-cli/src/commands/export_schemas.rs::schemas()`.
 3. Run `just codegen`.
-4. For the **dagster** consumer: re-export the new type from `integrations/dagster/src/dagster_rocky/types.py` (in the round 9 bridge section near the bottom), then add a dispatch entry in `parse_rocky_output()`, add a `RockyResource` method in `resource.py`, and a fixture + test (see `integrations/dagster/CLAUDE.md` for the 9-step checklist).
+4. For the **dagster** consumer: re-export the new type from `integrations/dagster/src/dagster_rocky/types.py` (in the re-export section near the bottom), then add a dispatch entry in `parse_rocky_output()`, add a `RockyResource` method in `resource.py`, and a fixture + test (see `integrations/dagster/CLAUDE.md` for the 9-step checklist).
 5. For the **vscode** consumer: no extra wiring — `src/types/rockyJson.ts` is already a 100% type-alias shim over `src/types/generated/index.ts`.
 
 ## Fixture drift (related but distinct)

@@ -1,6 +1,6 @@
 ---
 name: tailwind-plus-elements
-description: Using TailwindPlus Elements (@tailwindplus/elements) in the Rocky VS Code webviews. Use when building or upgrading an interactive webview component — a command palette / model search, a confirmation dialog, an autocomplete or select model picker, a dropdown/popover menu, a collapsible disclosure, or tabs. Covers the esbuild-bundle install (no CSP change vs the CDN), the --vscode-* theming + Tailwind v3.4 data-variant nuance, React 19 custom-element interop (boolean attrs, native events via ref, the elements:ready gate), and which element fits which Rocky surface.
+description: Using TailwindPlus Elements (@tailwindplus/elements) in the Rocky VS Code webviews. Use when building or upgrading an interactive webview component — a command palette / model search, a confirmation dialog, an autocomplete or select model picker, a dropdown/popover menu, a collapsible disclosure, or tabs. Covers the esbuild-bundle install (no CSP change vs the CDN), the --vscode-* theming + Tailwind v4 data-variant nuance, React 19 custom-element interop (boolean attrs, native events via ref, the elements:ready gate), and which element fits which Rocky surface.
 ---
 
 # TailwindPlus Elements in Rocky webviews
@@ -31,7 +31,7 @@ Do **not** add the jsDelivr `<script src="…/@tailwindplus/elements">` CDN tag 
 
 The elements paint no palette of their own, so theming is just our normal classes. Style the `<el-*>` wrappers and the native `<dialog>`/`<input>`/`<button>` they slot with the `--vscode-*`-aliased Tailwind classes from `webview-ui/styles/base.css`. Preflight is **off**, so the base.css `<button>` + border reset already applies to the native elements inside — theme them like any other control.
 
-Transitions use read-only `data-closed` / `data-enter` / `data-leave` / `data-transition` attributes. We are on **Tailwind v3.4**, so target them with the **arbitrary-variant** form — `data-[closed]:opacity-0`, `transition data-[closed]:scale-95` — **not** the v4 `data-closed:` shorthand the official docs use.
+Transitions use read-only `data-closed` / `data-enter` / `data-leave` / `data-transition` attributes. We are on **Tailwind v4** (`webview-ui/styles/base.css` is the v4 entry). The arbitrary-variant form — `data-[closed]:opacity-0`, `transition data-[closed]:scale-95` — works; v4 also accepts the `data-closed:` boolean-attribute shorthand the official docs use. No webview exercises these yet, so verify against the current v4 docs when you add the first transition.
 
 ## React 19 interop
 

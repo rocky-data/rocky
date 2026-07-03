@@ -17,7 +17,7 @@ This is a **cherry-pick** of Barsky's `rust-style` gist, not a verbatim vendor. 
 |---|---|
 | "Use `for` loops, not iterator chains" | Rocky uses `iter().filter().map().collect()` freely throughout the codebase — it's idiomatic Rust and the codebase is already consistent with it. Swapping to mutable-accumulator loops would be a large and contentious rewrite. |
 | "Avoid the `matches!` macro" | `matches!` is the standard Rust idiom for boolean variant checks. Rocky uses it; removing it would produce more verbose code, not clearer code. |
-| "Always use explicit destructuring for struct field access" | Too strict for a 22-crate workspace. Dot-access is fine for ad-hoc reads; reserve destructuring for match arms and when all fields are consumed. |
+| "Always use explicit destructuring for struct field access" | Too strict for a 23-crate workspace. Dot-access is fine for ad-hoc reads; reserve destructuring for match arms and when all fields are consumed. |
 
 The rules below are the ones that **are** enforced.
 
@@ -94,7 +94,7 @@ let parsed_input = parse(lowercase_input)?;
 
 ## Comments: minimise noise
 
-This matches Rocky's global rule from the top-level `CLAUDE.md`: *"Only add comments where the logic isn't self-evident."*
+Keep comments to what the code can't say for itself.
 
 - No inline comments explaining what obvious code does.
 - No section headers or dividers (`// --- Section ---`).
@@ -198,7 +198,7 @@ If a wildcard seems unavoidable for a Rocky-owned enum, **stop and reconsider** 
 
 ## Code navigation: prefer rust-analyzer LSP
 
-When searching or navigating Rust code in the 22-crate workspace, prefer LSP operations over raw text search — they respect type resolution and paths:
+When searching or navigating Rust code in the 23-crate workspace, prefer LSP operations over raw text search — they respect type resolution and paths:
 
 - `goToDefinition` — find where a symbol is defined
 - `findReferences` — find all references (respects re-exports)
@@ -213,5 +213,5 @@ For structural refactors, see the `rust-analyzer-ssr` skill.
 - **`rust-doc`** — RFC 1574 doc comment conventions for public items
 - **`rust-error-handling`** — `thiserror` (lib) vs `anyhow` (bin) decision tree
 - **`rust-async-tokio`** — Tokio, `#[async_trait]`, AIMD concurrency
-- **`rust-unsafe`** — `SAFETY:` comment conventions for the DuckDB and crypto FFI surfaces
+- **`rust-unsafe`** — `SAFETY:` comment conventions for the engine's few unsafe sites (mmap, a `repr(transparent)` cast, serialised test env mutation)
 - **`rust-clippy-triage`** — playbook when `cargo clippy -D warnings` fires

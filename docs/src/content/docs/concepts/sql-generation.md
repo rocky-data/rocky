@@ -45,17 +45,16 @@ ALTER TABLE <catalog>.<schema>.<table> SET TAGS ('managed_by' = 'rocky')
 
 ## Incremental Copy
 
-The core replication operation. Copies only rows newer than the latest timestamp in the target:
+The core replication operation. Copies only rows newer than the last watermark Rocky recorded for the table:
 
 ```sql
 INSERT INTO <target_catalog>.<target_schema>.<table>
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
 FROM <source_catalog>.<source_schema>.<table>
-WHERE _fivetran_synced > (
-    SELECT COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01')
-    FROM <target_catalog>.<target_schema>.<table>
-)
+WHERE _fivetran_synced > TIMESTAMP '<last watermark>'
 ```
+
+Rocky reads the previous run's `MAX(_fivetran_synced)` from its state store and threads it in as a literal — there is no correlated subquery against the target table.
 
 ## Full Refresh
 

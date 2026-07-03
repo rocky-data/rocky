@@ -8,7 +8,7 @@ Rust SQL transformation engine. Replaces dbt's core responsibilities (DAG resolu
 
 Cargo workspace with 23 library crates + 2 binary crates (`rocky` + `rocky-lsp`) — 25 members total. Rust edition 2024, MSRV 1.88:
 
-The `Plan` enum was deleted in the Phase 3 typed-IR migration; `ModelIr` is now the sole transformation intermediate, dispatched via `ModelIrVariant`. The IR data types (`ModelIr`, `ModelIrVariant`, `ProjectIr`, lakehouse format/options, column lineage, masks, time grains, `RockyType`) live in their own `rocky-ir` crate; `rocky-core` keeps the runtime surface (adapter traits, DAG executor, state store, drift, SQL generation, breaking-change classifier, ci-diff).
+The legacy `Plan` enum is gone; `ModelIr` is the sole transformation intermediate, dispatched via `ModelIrVariant`. The IR data types (`ModelIr`, `ModelIrVariant`, `ProjectIr`, lakehouse format/options, column lineage, masks, time grains, `RockyType`) live in their own `rocky-ir` crate; `rocky-core` keeps the runtime surface (adapter traits, DAG executor, state store, drift, SQL generation, breaking-change classifier, ci-diff).
 
 ```
 engine/                         # this directory, inside the rocky monorepo
@@ -44,11 +44,12 @@ engine/                         # this directory, inside the rocky monorepo
 │   │   │   ├── config.rs       # TOML config parsing (incl. [cost], [execution])
 │   │   │   ├── intern.rs       # String interning for reduced allocations
 │   │   │   ├── mmap.rs         # Memory-mapped file access
-│   │   │   ├── poison.rs       # Poison pill / circuit breaker helpers
+│   │   │   ├── poison.rs       # Poison pill helpers
+│   │   │   ├── circuit_breaker.rs # Circuit breaker for flaky adapters
 │   │   │   ├── traits.rs       # Shared trait definitions
 │   │   │   └── unit_test.rs    # In-process test utilities
 │   │   └── tests/
-│   │       └── e2e.rs          # 20 E2E integration tests (DuckDB-backed, no credentials needed)
+│   │       └── e2e.rs          # E2E integration tests (DuckDB-backed, no credentials needed)
 │   ├── rocky-sql/              # SQL parsing + typed AST (sqlparser-rs)
 │   │   └── src/
 │   │       ├── parser.rs       # sqlparser-rs wrapper with typed extensions
@@ -115,6 +116,8 @@ engine/                         # this directory, inside the rocky monorepo
 │   │   └── src/                # Iceberg metadata + snapshot management
 │   ├── rocky-catalog-core/     # Shared catalog primitives across warehouse adapters
 │   │   └── src/                # Catalog/schema lifecycle, isolation policies, grant primitives
+│   ├── rocky-mcp/              # MCP server (rmcp, stdio transport) — backs `rocky mcp` for AI agents
+│   │   └── src/
 │   ├── rocky-wasm/             # WebAssembly exports
 │   │   └── src/                # WASM-compatible entry points for browser/edge execution
 │   ├── rocky-observe/          # Observability
@@ -126,7 +129,7 @@ engine/                         # this directory, inside the rocky monorepo
 │       └── src/
 │           ├── commands/       # init, validate, discover, plan, run, state, doctor, + ~50 more (one .rs file per subcommand)
 │           │   └── doctor.rs   # Aggregate health checks (config, state, adapters, pipelines)
-│           ├── pipes.rs        # Dagster Pipes protocol emitter (T2) — activates when DAGSTER_PIPES_CONTEXT/MESSAGES env vars set
+│           ├── pipes.rs        # Dagster Pipes protocol emitter — activates when DAGSTER_PIPES_CONTEXT/MESSAGES env vars set
 │           └── output.rs       # JSON / table formatters (incl. MaterializationMetadata + sql_fingerprint helper)
 ├── rocky/                      # Binary crate (the `rocky` CLI)
 │   └── src/
@@ -154,13 +157,14 @@ cargo build
 cargo build --release
 
 # Test
-cargo test                            # All unit + integration tests
+cargo test                            # All unit + integration tests (fine locally)
+cargo nextest run --all-features      # What CI runs (engine-ci.yml)
 cargo test -p rocky-core              # Test specific crate
 cargo test -p rocky-core --test e2e   # E2E integration tests only (DuckDB, no credentials)
 cargo test -- --nocapture             # Show println output
 
-# Lint
-cargo clippy -- -D warnings
+# Lint (match CI — --all-targets lints test code too, --all-features covers gated code)
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt -- --check
 
 # Run
@@ -170,9 +174,8 @@ cargo run -- run --config rocky.toml --filter client=acme
 cargo run -- run --resume-latest --config rocky.toml --filter client=acme  # Resume failed run
 cargo run -- doctor --config rocky.toml --output json   # Health checks
 
-# Release build (cross-compile)
-cargo build --release --target x86_64-unknown-linux-gnu    # Linux (EKS)
-cargo build --release --target aarch64-apple-darwin         # macOS ARM
+# Release binaries are built by CI (engine-release.yml, 5-target matrix) on engine-v* tags.
+# scripts/release.sh is the local fallback — see the rocky-release skill.
 ```
 
 ## Git Conventions
@@ -199,7 +202,7 @@ Rocky has its own transformation language as an alternative to SQL. Files use `.
 
 **Key difference from SQL:** `!=` compiles to `IS DISTINCT FROM` (NULL-safe).
 
-The language spec is at `docs/rocky-lang-spec.md`.
+The language spec is at `../docs/rocky-lang-spec.md`; the published DSL page is `../docs/src/content/docs/concepts/rocky-dsl.md`.
 
 ## CI/CD
 
@@ -208,7 +211,7 @@ GitHub Actions workflows live at the monorepo root in `../.github/workflows/`, p
 - `engine-weekly.yml` — Coverage (tarpaulin) + security audit, runs Monday 08:00 UTC + manual dispatch.
 - `engine-release.yml` — Full 5-target matrix build on tag `engine-v*` (macOS ARM64/Intel, Linux x86_64/ARM64, Windows). `scripts/release.sh` is a local-build fallback.
 - `engine-bench.yml` — Benchmark on PRs labeled `perf` touching `engine/crates/**` or `engine/Cargo.*` (120% alert threshold).
-- `engine-docs.yml` — Build + deploy Astro docs from `docs/` to GitHub Pages.
+- `engine-docs.yml` — Build + deploy Astro docs from `../docs/` to GitHub Pages.
 
 ## Schema Pattern
 
@@ -216,7 +219,7 @@ Rocky uses a configurable schema pattern to map source schemas to target catalog
 
 - **Source:** `<source_catalog>.src__{tenant}__{regions...}__{source}.table`
 - **Target:** `{catalog_template}.raw__{regions}__{source}.table`
-- Example: `src__acme__us_west__shopify` -> `acme_warehouse.staging__us_west__shopify`
+- Example: `src__acme__us_west__shopify` -> `acme_warehouse.raw__us_west__shopify`
 
 ## SQL Patterns Rocky Generates
 
@@ -226,7 +229,7 @@ Rocky uses a configurable schema pattern to map source schemas to target catalog
 
 **Materialized views / dynamic tables:** `CREATE OR REPLACE MATERIALIZED VIEW` (Databricks) or `DYNAMIC TABLE ... TARGET_LAG` (Snowflake).
 
-**Time-interval materialization:** partition-keyed via `@start_date`/`@end_date` placeholders. CLI: `rocky run --partition KEY` / `--from KEY --to KEY` / `--latest` / `--missing`. Per-partition state in the `PARTITIONS` redb table. Compiler diagnostics E020-E026 + W003. See `docs/src/content/docs/features/time-interval.md`.
+**Time-interval materialization:** partition-keyed via `@start_date`/`@end_date` placeholders. CLI: `rocky run --partition KEY` / `--from KEY --to KEY` / `--latest` / `--missing`. Per-partition state in the `PARTITIONS` redb table. Compiler diagnostics E020-E026 + W003. See `../docs/src/content/docs/concepts/time-interval.md`.
 
 **Databricks-specific SQL, REST APIs, and auth:** see the `databricks` skill at `engine/.claude/skills/databricks/SKILL.md` and `crates/rocky-databricks/src/`.
 
@@ -243,13 +246,13 @@ Rocky's CLI output is the interface contract with orchestrators (e.g., Dagster).
 
 To change a CLI output:
 1. Edit the relevant `*Output` struct in `crates/rocky-cli/src/output.rs`.
-2. From the monorepo root, run `just codegen` (or `cd .. && cargo run --bin rocky -- export-schemas schemas/` if `just` isn't installed). This regenerates `../schemas/<command>.schema.json`, the Pydantic models in `../integrations/dagster/src/dagster_rocky/types_generated/`, and the TypeScript interfaces in `../editors/vscode/src/types/generated/`.
+2. From the monorepo root, run `just codegen` (or `cd .. && cargo run --bin rocky -- export-schemas schemas/` if `just` isn't installed). This regenerates `../schemas/<command>.schema.json`, the Pydantic models in `../sdk/python/src/rocky_sdk/types_generated/` (re-exported by `dagster_rocky.types`), and the TypeScript interfaces in `../editors/vscode/src/types/generated/`.
 3. Commit the schema and regenerated bindings together with the Rust change.
 4. The `codegen-drift` CI workflow fails any PR where the committed bindings don't match what the engine produces locally — see `../.github/workflows/codegen-drift.yml`.
 
 To add a new command schema, register the output type in `crates/rocky-cli/src/commands/export_schemas.rs::schemas()` and re-run `just codegen`.
 
-Every Rocky CLI command that emits `--output json` has a typed Rust output struct deriving `JsonSchema`. The table below is a non-exhaustive snapshot — newer schemas (e.g. `branch_*`, `catalog`, `compliance`, `cost`, `preview_*`, `replay`, `retention_status`, `state_*` subcommands, `trace`) live in `schemas/` but aren't enumerated here yet. Current count is 63 schemas; run `ls schemas/*.schema.json | wc -l` to verify.
+Every Rocky CLI command that emits `--output json` has a typed Rust output struct deriving `JsonSchema`. The table below is a non-exhaustive snapshot — newer schemas (e.g. `branch_*`, `catalog`, `compliance`, `cost`, `preview_*`, `replay`, `retention_status`, `state_*` subcommands, `trace`) live in `schemas/` but aren't enumerated here yet. Run `ls schemas/*.schema.json | wc -l` for the current count.
 
 | Command | Output struct |
 |---|---|
@@ -290,7 +293,7 @@ Every Rocky CLI command that emits `--output json` has a typed Rust output struc
 | `rocky estimate --output json` | `EstimateOutput` |
 | `rocky load --output json` | `LoadOutput` |
 
-Plus one shared schema: `adapter_config.schema.json` — generated from `AdapterConfig` (derives `JsonSchema` since Phase 1 of the schemars migration in PR #107). It's embedded in other command outputs rather than emitted standalone.
+Plus one shared schema: `adapter_config.schema.json` — generated from `AdapterConfig` (derives `JsonSchema`). It's embedded in other command outputs rather than emitted standalone.
 
 Test fixtures for the dagster integration are captured from the live binary by `../scripts/regen_fixtures.sh` (runs against `examples/playground/pocs/00-foundations/01-replication-basics/` — the replication-shape POC; `00-playground-default` is now a transformation pipeline).
 
@@ -327,7 +330,7 @@ Implementation in `crates/rocky-server/`.
 
 ## Sibling subprojects in the monorepo
 
-- `../integrations/dagster/` — Dagster integration (Python, wraps the Rocky CLI as a `ConfigurableResource`). The CLI also emits the [Dagster Pipes](https://docs.dagster.io/concepts/dagster-pipes) wire protocol when the dagster client sets `DAGSTER_PIPES_CONTEXT` + `DAGSTER_PIPES_MESSAGES` — see `crates/rocky-cli/src/pipes.rs` and `docs/src/content/docs/dagster/pipes.md`.
+- `../integrations/dagster/` — Dagster integration (Python, wraps the Rocky CLI as a `ConfigurableResource`). The CLI also emits the [Dagster Pipes](https://docs.dagster.io/concepts/dagster-pipes) wire protocol when the dagster client sets `DAGSTER_PIPES_CONTEXT` + `DAGSTER_PIPES_MESSAGES` — see `crates/rocky-cli/src/pipes.rs` and `../docs/src/content/docs/dagster/pipes.md`.
 - `../editors/vscode/` — VS Code extension (TypeScript, LSP client over stdio)
 - `../examples/playground/` — Sample DuckDB pipeline used for smoke tests and benchmarks (no credentials needed)
 

@@ -86,13 +86,10 @@ On the first run (no watermark), Rocky performs a full refresh. On subsequent ru
 INSERT INTO acme_warehouse.staging__us_west__shopify.orders
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
 FROM fivetran_catalog.src__acme__us_west__shopify.orders
-WHERE _fivetran_synced > (
-    SELECT COALESCE(MAX(_fivetran_synced), TIMESTAMP '1970-01-01')
-    FROM acme_warehouse.staging__us_west__shopify.orders
-)
+WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'
 ```
 
-The `_fivetran_synced` column is Fivetran's built-in timestamp that records when each row was synced. Rocky uses it as the watermark column by default (configurable via `timestamp_column`).
+The watermark literal is the previous run's `MAX(_fivetran_synced)`, which Rocky stores in its state store and threads into the query — it does not read it back from the target with a subquery. The `_fivetran_synced` column is Fivetran's built-in timestamp that records when each row was synced. Rocky uses it as the watermark column by default (configurable via `timestamp_column`).
 
 If schema drift is detected (column type mismatch between source and target), Rocky falls back to a full refresh: it drops the target table and recreates it.
 

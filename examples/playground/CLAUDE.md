@@ -24,7 +24,7 @@ rocky.toml     # Minimal POC-specific config (DuckDB by default)
 run.sh         # Executable end-to-end demo (chmod +x)
 models/        # .sql / .rocky files + .toml sidecars
 contracts/     # Only if contracts are part of the feature
-seeds/         # CSV / SQL sample data — keep ≤1000 rows
+data/          # seed.sql — CSV / SQL sample data, keep ≤1000 rows
 expected/      # Captured golden output from run.sh (gitignored)
 ```
 
@@ -41,9 +41,9 @@ Use the scaffolder:
 - POCs must be **runnable** with a single `./run.sh` invocation.
 - The POC's `expected/` directory is for golden JSON output that committed runs would produce — gitignored, regenerated each run.
 
-### Runtime conventions (post-fix rocky 0.1.x)
+### Runtime conventions
 
-The rocky binary now supports DuckDB end-to-end. Use these idioms:
+Use these idioms:
 
 | Goal | Command |
 |---|---|
@@ -119,6 +119,8 @@ For the catalog as a whole:
 ```
 
 Credential-gated POCs should fail fast with a clear `: "${VAR:?Set VAR before running}"` guard at the top of `run.sh`. The parse-validate script keys off that guard to decide which POCs to stub-validate.
+
+**After adding or removing a POC**, run `bash ../../scripts/update-poc-counts.sh` from here and commit the updated root `README.md` — the `poc-counts-drift.yml` CI workflow fails any PR where the counts drift.
 
 ## Git conventions
 
