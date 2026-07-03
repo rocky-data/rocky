@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::Utc;
 
-use rocky_core::config::GovernanceOverride;
+use rocky_core::config::{GovernanceOverride, resolve_table_override};
 use rocky_core::source::DiscoveredConnector;
 use rocky_core::sql_gen;
+use rocky_core::traits::SqlDialect;
 use rocky_ir::*;
 
 use crate::output::*;
@@ -192,15 +193,47 @@ pub async fn plan(
                 })
                 .collect();
 
-            let (strategy, purpose) = match pipeline.strategy.as_str() {
-                "incremental" => (
-                    MaterializationStrategy::Incremental {
-                        timestamp_column: pipeline.timestamp_column.clone(),
-                    },
-                    "incremental_copy",
-                ),
-                _ => (MaterializationStrategy::FullRefresh, "full_refresh_copy"),
+            let target_label = if effective_target_catalog.is_empty() {
+                format!("{target_schema}.{}", table.name)
+            } else {
+                format!("{effective_target_catalog}.{target_schema}.{}", table.name)
             };
+
+            // Resolve the per-table override and the effective strategy the
+            // SAME way `rocky run` does (`build_replication_strategy_with_override`),
+            // so the preview reflects `merge` and per-table `[[table_overrides]]`
+            // instead of always rendering full_refresh. plan and run MUST agree —
+            // divergence is the bug this closes.
+            let effective_override = resolve_table_override(
+                &pipeline.table_overrides,
+                &conn.id,
+                &conn.schema,
+                &table.name,
+            );
+            let strategy = match super::run::build_replication_strategy_with_override(
+                pipeline,
+                &effective_override,
+            ) {
+                Ok(strategy) => strategy,
+                Err(e) => {
+                    // The builder rejects this strategy on a replication pipeline
+                    // (`dynamic_table`, or `merge` with no resolvable merge_keys).
+                    // `rocky run` fails this table via the same builder, so
+                    // reflect that rather than a spurious full_refresh CTAS.
+                    tracing::warn!(
+                        table = %table.name,
+                        error = %e,
+                        "plan: strategy unsupported on replication; run will fail this table"
+                    );
+                    output.statements.push(PlannedStatement {
+                        purpose: "unsupported".into(),
+                        target: target_label,
+                        sql: format!("-- {}: {e} (rocky run will fail this table)", table.name),
+                    });
+                    continue;
+                }
+            };
+            let purpose = replication_copy_purpose(&strategy);
 
             // sql_gen consumes the typed IR directly.
             let model_ir = ModelIr::replication(
@@ -209,7 +242,7 @@ pub async fn plan(
                     schema: target_schema.clone(),
                     table: table.name.clone(),
                 },
-                strategy.clone(),
+                strategy,
                 SourceRef {
                     catalog: effective_source_catalog.clone(),
                     schema: conn.schema.clone(),
@@ -224,30 +257,12 @@ pub async fn plan(
                 },
             );
 
-            // Pick the right SQL generator for the materialization strategy.
-            // Full refresh uses CREATE OR REPLACE TABLE AS so the target doesn't
-            // need to exist; incremental uses INSERT INTO which requires the
-            // target to already exist (created on the first full-refresh run).
-            //
-            // `plan` is forward-looking — it renders the SQL the runner would
-            // emit on a fresh run, so we pass `None` for the watermark to
-            // surface the 1970-01-01 sentinel literal. The runner reads the
-            // actual prior watermark from state at execute time.
-            let sql = match &strategy {
-                MaterializationStrategy::FullRefresh => {
-                    sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
-                }
-                MaterializationStrategy::Incremental { .. } => {
-                    sql_gen::generate_insert_sql(&model_ir, dialect, None)?
-                }
-                _ => sql_gen::generate_insert_sql(&model_ir, dialect, None)?,
-            };
+            // Forward-looking copy SQL matching what `rocky run` executes for
+            // the resolved strategy (full_refresh → CTAS, incremental → INSERT
+            // with the 1970 sentinel watermark the runner replaces at execute
+            // time, merge → MERGE INTO, view / materialized_view → their DDL).
+            let sql = replication_copy_sql(&model_ir, dialect)?;
 
-            let target_label = if effective_target_catalog.is_empty() {
-                format!("{target_schema}.{}", table.name)
-            } else {
-                format!("{effective_target_catalog}.{target_schema}.{}", table.name)
-            };
             output.statements.push(PlannedStatement {
                 purpose: purpose.into(),
                 target: target_label,
@@ -535,6 +550,139 @@ fn strategy_purpose(strategy: &MaterializationStrategy) -> &'static str {
         MaterializationStrategy::Microbatch { .. } => "microbatch",
         MaterializationStrategy::ContentAddressed { .. } => "content_addressed",
     }
+}
+
+/// Map a resolved replication-copy [`MaterializationStrategy`] to the `purpose`
+/// label used on a [`PlannedStatement`].
+///
+/// `build_replication_strategy_with_override` produces `FullRefresh`,
+/// `Incremental`, `Merge`, `View`, or `MaterializedView` for a replication
+/// pipeline (its only `Err` — `dynamic_table` — is handled at the call site, so
+/// it never reaches here). The catch-all is a defensive fallback.
+fn replication_copy_purpose(strategy: &MaterializationStrategy) -> &'static str {
+    match strategy {
+        MaterializationStrategy::Incremental { .. } => "incremental_copy",
+        MaterializationStrategy::Merge { .. } => "merge_copy",
+        MaterializationStrategy::View => "view",
+        MaterializationStrategy::MaterializedView => "materialized_view",
+        _ => "full_refresh_copy",
+    }
+}
+
+/// Render the forward-looking copy SQL for one replication table, matching the
+/// dialect and strategy `rocky run` will execute: `full_refresh` → `CREATE OR
+/// REPLACE TABLE AS`, `incremental` → `INSERT` with the 1970 sentinel watermark
+/// (the runner threads the real prior watermark at execute time), `merge` →
+/// `MERGE INTO`, `view` / `materialized_view` → their DDL (mirrors
+/// `run.rs::process_table`).
+///
+/// `plan` is offline and has no live source schema, so a `Merge` is rendered
+/// with `ColumnSelection::All` (`UPDATE SET *`). A dialect whose MERGE requires
+/// an explicit column list (DuckDB, Snowflake, BigQuery — anything except
+/// Databricks today) cannot be previewed exactly, because the runner resolves
+/// that list from the live source at execute time; those degrade to a canonical
+/// shape preview via [`preview_merge_shape`] rather than erroring the whole
+/// plan. `materialized_view` DDL likewise degrades to a note on dialects that
+/// don't support it (DuckDB, Trino), where `rocky run` fails the table too.
+fn replication_copy_sql(model_ir: &ModelIr, dialect: &dyn SqlDialect) -> Result<String> {
+    let sql = match &model_ir.materialization {
+        MaterializationStrategy::FullRefresh => {
+            sql_gen::generate_create_table_as_sql(model_ir, dialect)?
+        }
+        MaterializationStrategy::Incremental { .. } => {
+            sql_gen::generate_insert_sql(model_ir, dialect, None)?
+        }
+        MaterializationStrategy::Merge { .. } => {
+            match sql_gen::generate_merge_sql(model_ir, dialect) {
+                Ok(sql) => sql,
+                // The dialect rejected `UPDATE SET *` (needs explicit columns
+                // the offline plan can't know) or a merge key is invalid;
+                // `preview_merge_shape` renders the canonical shape or a note
+                // instead of erroring the whole plan.
+                Err(_) => preview_merge_shape(model_ir, dialect)?,
+            }
+        }
+        MaterializationStrategy::View => {
+            let (target, body) = replication_target_and_body(model_ir, dialect)?;
+            dialect.view_ddl(&target, &body)?
+        }
+        MaterializationStrategy::MaterializedView => {
+            let (target, body) = replication_target_and_body(model_ir, dialect)?;
+            match dialect.materialized_view_ddl(&target, &body) {
+                Ok(sql) => sql,
+                Err(_) => format!(
+                    "-- MATERIALIZED VIEW {target}: not supported by {} \
+                     (rocky run will fail this table)",
+                    dialect.name()
+                ),
+            }
+        }
+        // `build_replication_strategy_with_override` never returns another
+        // variant for a replication pipeline; defensive fallback.
+        _ => sql_gen::generate_create_table_as_sql(model_ir, dialect)?,
+    };
+    Ok(sql)
+}
+
+/// The `(target_ref, "SELECT …\nFROM source_ref")` pair `rocky run` builds for a
+/// replication view / materialized-view / merge body. Kept in one place so the
+/// preview and the runner stay in lockstep.
+fn replication_target_and_body(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+) -> Result<(String, String)> {
+    let columns = model_ir
+        .columns
+        .as_ref()
+        .expect("Replication variant guarantees `columns` is Some");
+    let source = model_ir
+        .source
+        .as_ref()
+        .expect("Replication variant guarantees `source` is Some");
+    let target = dialect.format_table_ref(
+        &model_ir.target.catalog,
+        &model_ir.target.schema,
+        &model_ir.target.table,
+    )?;
+    let source_ref = dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?;
+    let select = dialect.select_clause(columns, &model_ir.metadata_columns)?;
+    Ok((target, format!("{select}\nFROM {source_ref}")))
+}
+
+/// Canonical `MERGE INTO … WHEN MATCHED THEN UPDATE SET *` preview for dialects
+/// whose `merge_into` requires an explicit column list an offline plan cannot
+/// resolve. Mirrors the shape `rocky run` emits once it has read the live source
+/// schema, with a trailing note that the explicit columns resolve at execute
+/// time — so the reviewer sees the table upserts, not full-refreshes.
+///
+/// Merge keys are validated up front (as the real dialect `merge_into` does), so
+/// a bad `merge_key` surfaces as a note rather than a healthy-looking preview
+/// that `rocky run` would reject.
+fn preview_merge_shape(model_ir: &ModelIr, dialect: &dyn SqlDialect) -> Result<String> {
+    let MaterializationStrategy::Merge { unique_key, .. } = &model_ir.materialization else {
+        return Ok(sql_gen::generate_create_table_as_sql(model_ir, dialect)?);
+    };
+    if let Some(bad) = unique_key
+        .iter()
+        .find(|k| rocky_sql::validation::validate_identifier(k).is_err())
+    {
+        return Ok(format!(
+            "-- MERGE INTO {}.{}: invalid merge key {bad:?} (rocky run will fail this table)",
+            model_ir.target.schema, model_ir.target.table
+        ));
+    }
+    let (target, body) = replication_target_and_body(model_ir, dialect)?;
+    let on = unique_key
+        .iter()
+        .map(|k| format!("t.{k} = s.{k}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    Ok(format!(
+        "MERGE INTO {target} AS t\nUSING (\n{body}\n) AS s\nON {on}\n\
+         WHEN MATCHED THEN UPDATE SET *\nWHEN NOT MATCHED THEN INSERT *\n\
+         -- preview: {} resolves explicit UPDATE/INSERT columns from the live source at run time",
+        dialect.name()
+    ))
 }
 
 /// Side-effect-free SQL preview core: compile the project in-process and render
@@ -1648,8 +1796,213 @@ pub(crate) async fn build_promote_plan_inner(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use rocky_ir::MaskStrategy;
+
+    // ------------------------------------------------------------------
+    // replication copy preview — strategy / override fidelity (bug fix:
+    // `rocky plan` must reflect `merge` + `[[table_overrides]]`, not always
+    // render full_refresh)
+    // ------------------------------------------------------------------
+
+    fn replication_ir(strategy: MaterializationStrategy) -> ModelIr {
+        ModelIr::replication(
+            TargetRef {
+                catalog: "cat".into(),
+                schema: "staging".into(),
+                table: "orders".into(),
+            },
+            strategy,
+            SourceRef {
+                catalog: "cat".into(),
+                schema: "raw".into(),
+                table: "orders".into(),
+            },
+            ColumnSelection::All,
+            vec![],
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+        )
+    }
+
+    fn merge_ir() -> ModelIr {
+        replication_ir(MaterializationStrategy::Merge {
+            unique_key: vec![Arc::from("order_id")],
+            update_columns: ColumnSelection::All,
+        })
+    }
+
+    #[test]
+    fn replication_copy_purpose_maps_every_builder_strategy() {
+        // Must cover every variant build_replication_strategy_with_override can
+        // return (its only Err — dynamic_table — is handled at the call site).
+        assert_eq!(
+            replication_copy_purpose(&MaterializationStrategy::FullRefresh),
+            "full_refresh_copy"
+        );
+        assert_eq!(
+            replication_copy_purpose(&MaterializationStrategy::Incremental {
+                timestamp_column: "ts".into(),
+            }),
+            "incremental_copy"
+        );
+        assert_eq!(
+            replication_copy_purpose(&MaterializationStrategy::Merge {
+                unique_key: vec![Arc::from("id")],
+                update_columns: ColumnSelection::All,
+            }),
+            "merge_copy"
+        );
+        assert_eq!(
+            replication_copy_purpose(&MaterializationStrategy::View),
+            "view"
+        );
+        assert_eq!(
+            replication_copy_purpose(&MaterializationStrategy::MaterializedView),
+            "materialized_view"
+        );
+    }
+
+    #[test]
+    fn replication_full_refresh_and_incremental_preview_sql() {
+        let dialect = dialect_for_adapter_type("databricks");
+        let full = replication_copy_sql(
+            &replication_ir(MaterializationStrategy::FullRefresh),
+            dialect.as_ref(),
+        )
+        .expect("full_refresh sql");
+        assert!(
+            full.to_uppercase().contains("CREATE OR REPLACE TABLE"),
+            "full_refresh must render CTAS, got:\n{full}"
+        );
+
+        let incr = replication_copy_sql(
+            &replication_ir(MaterializationStrategy::Incremental {
+                timestamp_column: "_updated_at".into(),
+            }),
+            dialect.as_ref(),
+        )
+        .expect("incremental sql");
+        assert!(
+            incr.contains("INSERT INTO") && incr.contains("1970"),
+            "incremental must be an INSERT with the 1970 sentinel watermark, got:\n{incr}"
+        );
+    }
+
+    #[test]
+    fn replication_merge_preview_is_exact_on_databricks() {
+        // Databricks accepts `UPDATE SET *`, so the offline preview is the exact
+        // dialect SQL — no degrade note, byte-identical to generate_merge_sql.
+        let ir = merge_ir();
+        let dialect = dialect_for_adapter_type("databricks");
+        let preview = replication_copy_sql(&ir, dialect.as_ref()).expect("merge preview");
+        let exact =
+            sql_gen::generate_merge_sql(&ir, dialect.as_ref()).expect("databricks accepts `*`");
+        assert_eq!(
+            preview, exact,
+            "databricks merge preview must be the exact dialect MERGE, not a degrade"
+        );
+        assert!(preview.contains("MERGE INTO") && preview.contains("UPDATE SET *"));
+        assert!(
+            !preview.contains("-- preview:"),
+            "databricks is exact and must not carry the degrade note"
+        );
+    }
+
+    #[test]
+    fn replication_merge_preview_degrades_when_dialect_needs_explicit_columns() {
+        // Snowflake (like DuckDB / BigQuery) rejects `UPDATE SET *`; the explicit
+        // column list is only knowable from the live source, so the offline
+        // preview degrades to the canonical shape + note — never errors.
+        let ir = merge_ir();
+        let dialect = dialect_for_adapter_type("snowflake");
+        assert!(
+            sql_gen::generate_merge_sql(&ir, dialect.as_ref()).is_err(),
+            "precondition: snowflake generate_merge_sql rejects ColumnSelection::All"
+        );
+        let preview = replication_copy_sql(&ir, dialect.as_ref())
+            .expect("degrade path must not error the whole plan");
+        assert!(preview.contains("MERGE INTO"), "got:\n{preview}");
+        assert!(
+            preview.contains("-- preview:"),
+            "the degrade path must carry the run-time-resolution note, got:\n{preview}"
+        );
+    }
+
+    #[test]
+    fn replication_view_preview_renders_view_ddl_not_insert() {
+        let ir = replication_ir(MaterializationStrategy::View);
+        let dialect = dialect_for_adapter_type("databricks");
+        let sql = replication_copy_sql(&ir, dialect.as_ref()).expect("view preview");
+        let up = sql.to_uppercase();
+        assert!(
+            up.contains("CREATE") && up.contains("VIEW"),
+            "view strategy must preview as VIEW DDL, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("INSERT INTO"),
+            "view must not preview as an INSERT (the pre-fix regression), got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn table_override_merge_resolves_to_merge_strategy() {
+        // Guards the resolution wiring plan() and run() share: a per-table
+        // `[[table_overrides]]` merge on a full_refresh base must resolve to
+        // Merge for the matched table and stay FullRefresh for others. A revert
+        // of the plan-loop override call would leave this green but the CLI
+        // e2e (in the PR) red — this pins the resolution itself.
+        let toml = r#"
+[adapter.duck]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[[pipeline.p.table_overrides]]
+match.table = "orders"
+strategy = "merge"
+merge_keys = ["order_id"]
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+catalog_template = "c"
+schema_template = "s__{source}"
+"#;
+        let cfg: rocky_core::config::RockyConfig = toml::from_str(toml).expect("parse config");
+        let (_name, pipeline) =
+            crate::registry::resolve_replication_pipeline(&cfg, None).expect("resolve pipeline");
+
+        let matched =
+            resolve_table_override(&pipeline.table_overrides, "conn", "raw__orders", "orders");
+        let s = crate::commands::run::build_replication_strategy_with_override(pipeline, &matched)
+            .expect("build strategy");
+        assert!(
+            matches!(s, MaterializationStrategy::Merge { .. }),
+            "matched table_override must resolve to Merge, got {s:?}"
+        );
+
+        let unmatched =
+            resolve_table_override(&pipeline.table_overrides, "conn", "raw__other", "widgets");
+        let s2 =
+            crate::commands::run::build_replication_strategy_with_override(pipeline, &unmatched)
+                .expect("build strategy");
+        assert!(
+            matches!(s2, MaterializationStrategy::FullRefresh),
+            "non-matching table must stay FullRefresh, got {s2:?}"
+        );
+    }
 
     // ------------------------------------------------------------------
     // render_retention_preview — warehouse dispatch
