@@ -1,21 +1,24 @@
 ---
 name: rust-unsafe
-description: `unsafe` conventions in the Rocky engine — SAFETY comment rules, the two legitimate unsafe sites today (mmap + test env-var mutation), and when to push back on new unsafe. Use when auditing, reviewing, or adding any `unsafe` block/function in the engine crates.
+description: `unsafe` conventions in the Rocky engine — SAFETY comment rules, the legitimate unsafe categories (a memory-map, a repr(transparent) cast, and serialised test env-var mutation), and when to push back on new unsafe. Use when auditing, reviewing, or adding any `unsafe` block/function in the engine crates.
 ---
 
 # `unsafe` in the Rocky engine
 
 ## Reality check
 
-Rocky has **very little** `unsafe` on purpose. As of this skill's authoring, there are exactly three files in `engine/crates/` with `unsafe`:
+Rocky keeps `unsafe` **minimal and boring** on purpose. It falls into two buckets — get the live list with `rg -n '\bunsafe\b' crates/` from `engine/` rather than trusting a hardcoded count (the set drifts as tests are added):
 
-| File | What's unsafe | Why it's justified |
+**Production unsafe — two sites, both in `rocky-core`:**
+
+| Site | What's unsafe | Why it's justified |
 |---|---|---|
-| `rocky-core/src/mmap.rs` | `memmap2::Mmap::map(&file)` for project files ≥ 4 KB | Reading 50k+ SQL/TOML files during compile needs mmap for throughput; the race is read-only project data, worst case is a parse error. |
-| `rocky-core/src/config.rs` (tests only) | `std::env::{set_var, remove_var}` | These became `unsafe` in Rust 1.82+ because POSIX env mutation is not thread-safe. Test-only, serial. |
-| `rocky-cli/src/pipes.rs` (tests only) | `std::env::{set_var, remove_var}` | Same reason. |
+| `rocky-core/src/mmap.rs` | `memmap2::Mmap::map(&file)` for project files | Reading many SQL/TOML files during compile wants mmap for throughput; the mapped bytes are read-only project source — worst case is a garbled read → parse error, not UB. |
+| `rocky-core/src/column_map.rs` | `&*(s as *const str as *const CiStr)` — cast to a `#[repr(transparent)]` case-insensitive `str` newtype | Layout-compatible by `repr(transparent)`; the borrow never outlives the input `str`. |
 
-**There is no FFI unsafe.** The `duckdb` crate, `jsonwebtoken`, and `rsa` all wrap their underlying C / crypto surfaces in safe APIs — Rocky calls those safe APIs and does not reach into `duckdb_sys` or similar. If you find yourself writing an FFI binding from scratch, **stop** and ask whether the upstream crate has a safe wrapper already.
+**Test-only unsafe — the majority of sites:** `std::env::{set_var, remove_var}` inside `#[cfg(test)]` modules across many crates (`config.rs`, `models.rs`, `pipes.rs`, `object_store.rs`, `rocky-observe`, `rocky-server/src/lsp.rs`, several `rocky-cli` commands, and integration tests). Env mutation became `unsafe` in the 2024 edition because it races with concurrent reads; every one is serialised under a module `ENV_LOCK` (or a single-threaded test) and restores state before returning.
+
+**There is no FFI unsafe.** The `duckdb` crate, `jsonwebtoken`, and `rsa` all wrap their C / crypto surfaces in safe APIs — Rocky calls those and never reaches into `duckdb_sys` or similar. If you find yourself writing an FFI binding from scratch, **stop** and check whether the upstream crate already has a safe wrapper.
 
 Keep this list short. Every new `unsafe` site is a reviewer tax and a future soundness bug waiting to happen.
 

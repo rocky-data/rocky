@@ -6,7 +6,7 @@ Rocky is a typed-program layer above the warehouse. It owns the DAG: compile-tim
 
 - **Adapter-based ELT** — source adapters discover what data is available (metadata only, no extraction); warehouse adapters execute SQL and manage governance. Rocky operates on data already in the warehouse — it does not extract from external systems
 - **No model files for raw layer** — Rocky discovers tables at runtime from source adapters (Fivetran, manual config), no SQL files needed
-- **Silver layer uses `.sql` + `.toml` sidecar files** — pure SQL (no templating) with TOML config for strategy/dependencies
+- **Silver layer models** — either a `.sql` + `.toml` sidecar pair (pure SQL, no templating) or a `.rocky` DSL file; SQL stays first-class
 - **Config-driven** — `rocky.toml` defines source, warehouse, target patterns, checks, and contracts
 - **Schema patterns** — configurable prefix/separator/components parse schema names into structured data for routing
 
@@ -44,6 +44,7 @@ rocky playground [path]              # Create a sample DuckDB project
 rocky import-dbt --dbt-project <p>   # Convert a dbt project to Rocky
 rocky serve                          # HTTP API server with watch mode
 rocky lsp                            # Language Server Protocol for IDE integration
+rocky mcp                            # Model Context Protocol server over stdio (for AI agents)
 rocky init-adapter <name>            # Scaffold a new warehouse adapter crate
 ```
 
@@ -78,7 +79,7 @@ my-project/
 
 `rocky.toml` uses `${ENV_VAR}` for environment variable substitution (with optional defaults: `${VAR:-default}`). Two main sections:
 
-- `[adapter]` — warehouse connection (type: duckdb/databricks/snowflake, auth, host, http_path). Unnamed `[adapter]` auto-wraps as `adapter.default`.
+- `[adapter]` — warehouse connection (type: duckdb/databricks/snowflake/bigquery/trino, auth, host, http_path). Unnamed `[adapter]` auto-wraps as `adapter.default`.
 - `[pipeline.<name>]` — pipeline definition (strategy, timestamp_column, metadata_columns)
   - `[pipeline.<name>.source]` — type (fivetran/manual), API credentials, schema_pattern
   - `[pipeline.<name>.target]` — catalog_template, schema_template (with `{variable}` placeholders)
@@ -134,9 +135,12 @@ rocky-cache        — Three-tier caching (memory LRU → Valkey → API)
 rocky-observe      — Structured JSON logging, metrics, tracing
 rocky-airbyte      — Airbyte source adapter (protocol integration)
 rocky-iceberg      — Apache Iceberg table format adapter (metadata + snapshot management)
+rocky-catalog-core — Shared catalog/schema lifecycle, isolation policies, grant primitives across warehouse adapters
 rocky-cli          — CLI commands + JSON/table output formatters + Dagster Pipes protocol
+rocky-mcp          — MCP server (rmcp, stdio transport) — backs `rocky mcp` for AI agents
 rocky-wasm         — WebAssembly exports for browser/edge execution
 rocky              — CLI binary
+rocky-lsp          — LSP server binary (backs `rocky lsp`)
 ```
 
 ## When Helping Users
@@ -146,4 +150,4 @@ rocky              — CLI binary
 - **New tables not appearing** → check source type, schema prefix, connector status
 - **Check failures** → look at JSON output `check_results` for details
 - **DAG errors** → check `depends_on` in model TOML files for cycles or unknown refs
-- **Drift** → column type changes between source and target trigger full refresh
+- **Drift** → safe type widenings become `ALTER COLUMN TYPE`; unsafe changes trigger full refresh

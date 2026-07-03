@@ -38,13 +38,14 @@ Concise cheat sheet for the `rocky` binary. For full detail:
 | `rocky compact <fqn>` / `rocky compact --catalog <name>` | OPTIMIZE/VACUUM SQL plan (single table or every Rocky-managed table in a catalog) |
 | `rocky archive --older-than <span>` (`<fqn>` / `--catalog <name>`) | DELETE + VACUUM SQL plan (single table or catalog-wide) |
 | `rocky profile-storage` | Column encoding recommendations |
-| `rocky import-dbt <path>` | dbt → Rocky migration |
+| `rocky import-dbt --dbt-project <path>` | dbt → Rocky migration |
 | `rocky validate-migration` | Validate a dbt → Rocky migration |
 | `rocky hooks list` / `rocky hooks test <event>` | Hook management |
 | `rocky ai "<intent>"` | AI-assisted model generation (needs `ANTHROPIC_API_KEY`) |
 | `rocky ai-sync` / `ai-explain` / `ai-test` | AI intent layer sub-commands |
 | `rocky test-adapter <name>` | Adapter conformance suite |
 | `rocky lsp` | Language Server Protocol server over stdio (for the VS Code extension) |
+| `rocky mcp` | Model Context Protocol server over stdio (for AI agents) |
 | `rocky serve` | HTTP API mode |
 | `rocky export-schemas <dir>` | Export JSON schemas for all `*Output` types (used by `just codegen`) |
 
@@ -70,7 +71,7 @@ Concise cheat sheet for the `rocky` binary. For full detail:
 
 ## JSON output shape
 
-Every `--output json` command emits a struct with `version` + `command` fields plus a command-specific payload. There are **60 schemas** total; full list in `engine/CLAUDE.md` → "JSON Output Schema". Highlights:
+Every `--output json` command emits a struct with `version` + `command` fields plus a command-specific payload. Full list in `engine/CLAUDE.md` → "JSON Output Schema" (`ls schemas/*.schema.json | wc -l` for the count). Highlights:
 
 ```
 discover  → { connectors: [{ id, client, components, tables, excluded_tables }] }
@@ -153,4 +154,4 @@ See `integrations/dagster/CLAUDE.md` for the layer architecture.
 - **`rocky-new-cli-command`** — Adding a new `rocky <verb>`
 - **`rocky-dsl-change`** — Changing `.rocky` DSL syntax
 - **`rocky-release`** — Tag-namespaced release workflow
-- **`databricks-api`** / **`fivetran-api`** (this same engine-local skills dir) — REST API details for the two main adapters
+- **`databricks`** / **`fivetran`** (this same engine-local skills dir) — REST API details for the two main adapters

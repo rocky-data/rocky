@@ -28,7 +28,6 @@ Two mandatory sections (`[adapter]` + at least one `[pipeline.<name>]`) plus opt
 
 # Optional globals:
 [state]                  # Embedded state store backend
-[plan_store]             # Persisted plan-artifact format (`format = "v1" | "v2"`)
 [cache]                  # Valkey cache for adapter responses
 [cost]                   # Cost model for `rocky optimize`
 [governance]             # Tags, grants, workspace bindings (Databricks)
@@ -313,7 +312,7 @@ fail_fast             = false
 error_rate_abort_pct  = 50
 table_retries         = 1
 # adaptive_concurrency is planned but not yet a config field.
-# The AIMD throttle primitive exists but isn't wired. See Plan 23.
+# The AIMD throttle primitive exists but isn't wired.
 ```
 
 ## Governance (Databricks Unity Catalog)
@@ -363,20 +362,6 @@ namespacing = "pipeline"   # each pipeline gets its own .rocky-state/<pipeline>.
 ```
 
 `namespacing` (`StateNamespacing`, default `"none"`) controls state-file fan-out. redb allows one writer per file, so running one `rocky run` per pipeline/client against the single global `<models>/.rocky-state.redb` serializes them on one lock. `"pipeline"` gives each pipeline its own `<models>/.rocky-state/<pipeline>.redb`. `"none"` is byte-identical to omitting the key. For per-client fan-out use the per-invocation `--state-namespace <key>` flag (overrides this config); an explicit `--state-path` disables namespacing for that run.
-
-## Plan store
-
-```toml
-# Default (legacy envelope with inline SQL — omit to keep default)
-[plan_store]
-format = "v1"
-
-# Opt in to typed-IR payloads; SQL regenerated at apply time
-[plan_store]
-format = "v2"
-```
-
-Controls how `rocky plan` persists plan artifacts to `.rocky/plans/<plan-id>.json`. Default `"v1"` keeps the legacy `CompactOutput` / `ArchiveOutput` envelope with inline SQL. Opt-in `"v2"` writes typed-IR payloads (`CompactPlanIr` / `ArchivePlanIr`); `rocky apply` regenerates SQL from the IR via `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}`. Stdout JSON is unchanged in both formats; the reader accepts both regardless of writer config. `PromotePlan` (governance) and `RunPlan` (already IR-only) are intentionally untouched.
 
 ## Run-skip gate (`[run]` + per-model `[skip]`)
 

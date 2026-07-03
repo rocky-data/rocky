@@ -109,7 +109,7 @@ If credentials are required, fail fast at the top of `run.sh`:
 
 And mark the credential requirement prominently in `README.md`.
 
-## Runtime idioms (post-fix rocky 0.1.x)
+## Runtime idioms
 
 | Goal | Command |
 |---|---|

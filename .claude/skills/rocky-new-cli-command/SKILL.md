@@ -73,10 +73,10 @@ This rebuilds the engine in release mode, writes `schemas/diff.schema.json`, reg
 1. `*Output` struct exists (step 2 above). ✓
 2. Registered in `export_schemas.rs::schemas()`. ✓
 3. `just codegen-sdk` ran. ✓
-4. Re-export the new type from `integrations/dagster/src/dagster_rocky/types.py` in the round 9 bridge section near the bottom — both the generated name (`DiffOutput`) and a legacy Python-flavored alias (`DiffResult`) for forward-compat.
+4. Re-export the new type from `integrations/dagster/src/dagster_rocky/types.py` in the re-export section near the bottom — both the generated name (`DiffOutput`) and a legacy Python-flavored alias (`DiffResult`) for forward-compat.
 5. Add a route in `parse_rocky_output()` to dispatch `"diff"` → `DiffOutput`.
-6. `just regen-fixtures` from the monorepo root to capture a fresh fixture — or hand-write one at `integrations/dagster/tests/fixtures/diff.json` if the playground POC doesn't produce that command naturally.
-7. Add the fixture to `integrations/dagster/tests/conftest.py`.
+6. `just regen-fixtures` from the monorepo root to capture a fresh fixture — or add a hand-crafted scenario dict to `integrations/dagster/tests/scenarios.py` if the playground POC doesn't produce that command naturally.
+7. Expose it as a `*_json` pytest fixture via `integrations/dagster/tests/conftest.py`.
 8. Add parsing tests in `integrations/dagster/tests/test_types.py`.
 9. Add a method to `RockyResource` in `integrations/dagster/src/dagster_rocky/resource.py` that calls the CLI and returns the parsed `DiffOutput`. Follow the existing pattern (see `run`, `plan`, or `discover`).
 
@@ -94,11 +94,11 @@ Conventions:
 - The subprocess helper `src/rockyCli.ts` already exists — reuse it.
 - Type the result as the generated interface (`import { DiffOutput } from '../types/generated'`).
 - If the command takes editor context (current file), get it via `vscode.window.activeTextEditor`.
-- Follow the existing 25-command pattern — see `commands/run.ts` or `commands/ops.ts` for templates.
+- Follow the existing command pattern — see `commands/run.ts` or `commands/ops.ts` for templates.
 
 ## Step 7 — Docs + engine README
 
-- `docs/src/content/docs/commands/<name>.md` (Astro/Starlight) — user-facing reference.
+- `docs/src/content/docs/reference/commands/<name>.md` (Astro/Starlight) — user-facing reference.
 - `engine/README.md` and monorepo `README.md` if the command is user-prominent enough to warrant a top-level mention.
 
 ## Final check — run everything

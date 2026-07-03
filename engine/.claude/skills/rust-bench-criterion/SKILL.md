@@ -32,7 +32,9 @@ jobs:
     # ...
     steps:
       - name: Run benchmarks
-        run: cargo bench --bench compile -p rocky-cli -- --output-format bencher | tee bench-output.txt
+        run: |
+          cargo bench --bench compile -p rocky-cli -- --output-format bencher | tee bench-output.txt
+          cargo bench --bench state_store -p rocky-core -- --output-format bencher | tee -a bench-output.txt
       - name: Store benchmark results
         uses: benchmark-action/github-action-benchmark@...
         with:
@@ -43,7 +45,7 @@ jobs:
 **The rules you actually need to know:**
 
 1. **Benches only run when the `perf` label is on the PR.** Adding a bench doesn't automatically run it on PR. To exercise it, add the `perf` label.
-2. **The action runs `cargo bench --bench compile -p rocky-cli`** — that's hardcoded to the existing bench target. If you add a new `[[bench]]` in a different crate, the workflow **will not** run it until the workflow is updated to also invoke it.
+2. **The action runs two benches** — `cargo bench --bench compile -p rocky-cli` and `cargo bench --bench state_store -p rocky-core` — hardcoded to those targets. If you add a new `[[bench]]` in another crate (or a third one here), the workflow **will not** run it until you add another invocation.
 3. **Alert threshold is 120% of the stored baseline**, with `fail-on-alert: false` — regressions post a PR comment but don't block merge. The comment is how you learn the baseline drifted.
 4. **Binary startup bench assumes `cargo run` works from the working directory** — it's advisory, not load-bearing; don't panic if it reports noisy numbers.
 
@@ -114,7 +116,7 @@ jobs:
 
 ## Adding a bench in a **new** crate
 
-The CI workflow currently hardcodes `cargo bench --bench compile -p rocky-cli`. If you add a bench in, say, `rocky-sql`, the workflow won't invoke it. You have two options:
+The CI workflow currently hardcodes two invocations (`--bench compile -p rocky-cli` and `--bench state_store -p rocky-core`). If you add a bench in, say, `rocky-sql`, the workflow won't invoke it. You have two options:
 
 1. **Add a second invocation to the workflow** (preferred) — append another `cargo bench` line and a second `github-action-benchmark` step with a different `output-file-path`. Review with Hugo since it extends the perf budget.
 2. **Put the bench in `rocky-cli/benches/compile.rs`** — acceptable if the bench is logically "compile-adjacent" and you can drive it through the existing compile entrypoint. Not acceptable for benchmarks that need to import from a crate `rocky-cli` doesn't already depend on.

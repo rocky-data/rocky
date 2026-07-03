@@ -15,7 +15,7 @@ This skill is the decision tree: when to reach for which, what `From` impls to d
 
 | Layer | Crate | Error crate | Why |
 |---|---|---|---|
-| Library | `rocky-core`, `rocky-sql`, `rocky-compiler`, `rocky-lang`, `rocky-adapter-sdk`, `rocky-databricks`, `rocky-snowflake`, `rocky-fivetran`, `rocky-duckdb`, `rocky-cache`, `rocky-engine`, `rocky-ai`, `rocky-observe`, `rocky-server` | `thiserror` | Library errors need to be matchable by callers, namable, and stable. |
+| Library | every library crate — `rocky-core`, `rocky-ir`, `rocky-sql`, `rocky-compiler`, `rocky-lang`, `rocky-adapter-sdk`, the adapter crates (`rocky-databricks`, `rocky-snowflake`, `rocky-bigquery`, `rocky-trino`, `rocky-duckdb`, `rocky-fivetran`, `rocky-airbyte`, `rocky-iceberg`), `rocky-catalog-core`, `rocky-cache`, `rocky-engine`, `rocky-ai`, `rocky-observe`, `rocky-server`, `rocky-mcp` | `thiserror` | Library errors need to be matchable by callers, namable, and stable. |
 | Binary / CLI | `rocky-cli`, `rocky` | `anyhow` | The CLI is the top of the call stack — we don't care about matching errors, we care about printing them with context. |
 
 If a crate imports both `thiserror` and `anyhow`, that's usually a smell — check whether the library's error enum is leaking into the binary uselessly, or whether an `anyhow::Error` is being stashed into a `#[error(transparent)]` variant.
@@ -104,7 +104,7 @@ pub fn run(config_path: &Path) -> Result<RunOutput> {
 
 The CLI emits JSON on stdout for every `--output json` invocation. When a handler returns `Err(anyhow::Error)`:
 
-1. `rocky-cli/src/main.rs` prints the error chain to **stderr** with all `.context()` layers.
+1. The `rocky` binary's entry point (`rocky/src/main.rs`) prints the error chain to **stderr** with all `.context()` layers.
 2. The process exits with code **1** (hard failure) or **2** (partial success — some tables failed, but a valid `RunOutput` JSON was still written to stdout).
 3. The Dagster integration at `integrations/dagster/` reads the exit code and (for code 2) the partial-success JSON. It has `allow_partial=True` handling specifically for this case.
 
