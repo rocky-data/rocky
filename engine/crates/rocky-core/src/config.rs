@@ -3684,9 +3684,15 @@ pub struct ReplicationPipelineConfig {
     /// source is provably unchanged since the last successful copy — detected
     /// via the adapter's `source_change_marker` (a `DESCRIBE DETAIL`-derived
     /// marker on Databricks; adapters without a cheap change signal always
-    /// copy). A pruned table emits no materialization, keeps its checks
-    /// skipped (the prior results stand), and is recorded under
-    /// `excluded_tables` with reason `"unchanged_since_last_copy"`.
+    /// copy). A pruned table runs no copy and no data checks: the runner emits
+    /// no materialization and records it under `excluded_tables` with reason
+    /// `"unchanged_since_last_copy"`.
+    ///
+    /// Downstream continuity — and preserving the table's prior check results —
+    /// is then the orchestrator's job. The Dagster integration treats a pruned,
+    /// unmaterialized key as unchanged via `satisfy_empty_outputs`; enabling
+    /// pruning without an orchestrator that handles unmaterialized keys drops
+    /// the table from the run.
     ///
     /// Defaults to `false` — opt in per pipeline, since silently skipping
     /// copies is a behavior change. The marker is compared against the

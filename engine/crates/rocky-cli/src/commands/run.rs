@@ -2985,15 +2985,19 @@ pub async fn run(
                     &shared_state,
                     &shared_pipeline,
                     task,
-                    // Never prune on retry — the table failed attempt 1, so
-                    // force a real copy rather than trusting an unchanged marker.
-                    false,
+                    // Retry still honours pruning. A failed copy is atomic
+                    // (Delta commits don't half-apply), so on failure the target
+                    // sits at the last successful copy; if the source marker
+                    // still matches that copy the target is already correct and
+                    // the table prunes, otherwise the source changed and the
+                    // retry copies. Either outcome records the marker on a
+                    // successful copy, so a transient failure doesn't force a
+                    // re-copy every run thereafter.
+                    prune_enabled,
                 )
                 .await
                 {
                     Ok(TableOutcome::Pruned(pruned)) => {
-                        // Unreachable while retry passes prune_enabled = false;
-                        // handled defensively rather than panicking.
                         record_pruned(&mut output, pruned);
                         info!(table = task.table_name.as_str(), "retry pruned as unchanged");
                     }
