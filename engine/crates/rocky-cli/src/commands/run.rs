@@ -6483,7 +6483,7 @@ fn build_replication_strategy(
 /// T3 fail-fast lives here — an effective `strategy = "merge"` with
 /// no reachable merge_keys returns an error so the table fails (the
 /// pipeline keeps running and other tables continue).
-fn build_replication_strategy_with_override(
+pub(crate) fn build_replication_strategy_with_override(
     pipeline: &ReplicationPipelineConfig,
     override_: &ResolvedTableOverride,
 ) -> Result<MaterializationStrategy> {
