@@ -209,7 +209,13 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   untouched. Both tables are dormant in Stage 1 — populated on a
 ///   successful run when `[reuse]` is enabled, never read for a reuse
 ///   decision yet.
-const CURRENT_SCHEMA_VERSION: u32 = 9;
+/// - **v10** — adds the [`SOURCE_MARKERS`] table for replication skip-unchanged
+///   pruning (`prune_unchanged`): per-table source change-markers recorded
+///   after each successful copy. Pure additive schema change: v9 databases
+///   auto-create the empty table on next open and stamp themselves as v10. No
+///   blob migration needed; existing tables are untouched. Empty until a
+///   `prune_unchanged` pipeline runs, so pre-existing state resumes unchanged.
+const CURRENT_SCHEMA_VERSION: u32 = 10;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -6293,7 +6299,7 @@ mod tests {
         // The pinned format contract. Update DELIBERATELY: a table-set change
         // is an on-disk break that needs a `CURRENT_SCHEMA_VERSION` bump + a
         // migration path, not just an edit here.
-        const EXPECTED_VERSION: u32 = 9;
+        const EXPECTED_VERSION: u32 = 10;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
@@ -6312,6 +6318,7 @@ mod tests {
             "run_progress",
             "run_progress_entries",
             "schema_cache",
+            "source_markers",
             "watermarks",
         ];
 
