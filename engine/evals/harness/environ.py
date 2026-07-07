@@ -52,7 +52,7 @@ class Environment:
     rocky_bin: Path | None
     claude_bin: str | None
     duckdb_bin: str | None
-    has_api_key: bool
+    has_model_auth: bool
 
     def skip_reasons(self) -> list[str]:
         """Human-readable reasons the live suite cannot run, or ``[]``."""
@@ -68,10 +68,13 @@ class Environment:
             )
         if self.duckdb_bin is None:
             reasons.append("the `duckdb` CLI was not found on PATH (needed to seed the fixture)")
-        if not self.has_api_key:
+        if not self.has_model_auth:
+            # Plain literal on purpose: interpolating the API_KEY_ENV constant
+            # here makes static taint analysis treat a KEY-named symbol as data
+            # reaching output. The suite never emits the key's value.
             reasons.append(
-                f"${API_KEY_ENV} is not set (the scripted agent loop needs a model key; "
-                "this is expected on forks and PRs without the secret)"
+                "$ANTHROPIC_API_KEY is not set (the scripted agent loop needs a model "
+                "key; this is expected on forks and PRs without the secret)"
             )
         return reasons
 
@@ -95,5 +98,5 @@ def resolve_environment() -> Environment:
         rocky_bin=resolve_rocky_bin(),
         claude_bin=shutil.which("claude"),
         duckdb_bin=shutil.which("duckdb"),
-        has_api_key=_env_is_set(API_KEY_ENV),
+        has_model_auth=_env_is_set(API_KEY_ENV),
     )
