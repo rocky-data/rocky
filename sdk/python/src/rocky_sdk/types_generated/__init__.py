@@ -61,6 +61,10 @@ from .ci_diff_schema import CiDiffOutput, DiffResult, DiffSummary
 # Column lineage (per-column shape of `rocky lineage --column <col>`)
 from .column_lineage_schema import ColumnLineageOutput
 
+# serve HTTP API — structured error body + /meta feature-detection payload
+from .error_envelope_schema import ErrorEnvelope
+from .meta_schema import MetaOutput
+
 # DAG command — unified pipeline DAG with enriched orchestration metadata
 from .dag_schema import (
     DagEdgeOutput,
@@ -319,6 +323,9 @@ __all__ = [
     "DiffSummary",
     # column lineage
     "ColumnLineageOutput",
+    # serve HTTP API
+    "ErrorEnvelope",
+    "MetaOutput",
     # dag
     "DagEdgeOutput",
     "DagNodeOutput",

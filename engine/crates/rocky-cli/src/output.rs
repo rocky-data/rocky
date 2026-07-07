@@ -7175,6 +7175,56 @@ impl PreviewCostOutput {
     }
 }
 
+/// Structured error body returned by the `rocky serve` HTTP API.
+///
+/// Every non-2xx `/api/v1` response carries this envelope: the HTTP status
+/// line carries the error *class* (`400`/`401`/`404`/`409`/`500`/`503`) and
+/// the body carries a stable machine token plus a human message and an
+/// optional actionable hint. Embedders switch on [`code`](Self::code) and
+/// surface [`message`](Self::message) / [`remediation_hint`](Self::remediation_hint)
+/// to operators.
+///
+/// Stable codes emitted today: `engine_not_ready` (no compile available
+/// yet), `engine_busy` (state locked by a running job — retryable),
+/// `model_not_found`, `unauthorized`, `internal_error`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ErrorEnvelope {
+    /// Stable machine token, e.g. `"model_not_found"`.
+    pub code: String,
+    /// Human-readable description of what went wrong.
+    pub message: String,
+    /// Actionable next step, or `null` when none applies.
+    pub remediation_hint: Option<String>,
+}
+
+/// Feature-detection payload for `GET /api/v1/meta`.
+///
+/// Fingerprints the running engine + bound config so an embedder can pin
+/// against a build without version-sniffing. Every field is computed at
+/// request time — none are baked literals — so `state_schema_version`,
+/// `schemas_hash`, and `config_hash` track the live engine and the on-disk
+/// config even across a long-running sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MetaOutput {
+    /// Engine release (`CARGO_PKG_VERSION`).
+    pub engine_version: String,
+    /// Current state-store schema version, read from the engine's
+    /// `current_schema_version()` getter at request time (never a literal).
+    pub state_schema_version: u32,
+    /// Fingerprint of the exported JSON-schema set (the `schemas/*.schema.json`
+    /// contract). Derived from the live registered schemas, so it moves on
+    /// every codegen; embedders detect an output-shape change without
+    /// version-sniffing.
+    pub schemas_hash: String,
+    /// Fingerprint of the resolved `rocky.toml` (contents + path) this
+    /// sidecar bound, recomputed per request. `null` when no config resolved.
+    pub config_hash: Option<String>,
+    /// Feature/capability tokens the build advertises.
+    pub capabilities: Vec<String>,
+    /// The `/api/v1` routes this build serves.
+    pub routes: Vec<String>,
+}
+
 #[cfg(test)]
 mod failure_kind_tests {
     //! Mapping coverage for [`FailureKind`] against every variant of

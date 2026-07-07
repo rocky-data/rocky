@@ -43,7 +43,6 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-reqwest = { workspace = true }
 tempfile = "3"
 
 [lints]
