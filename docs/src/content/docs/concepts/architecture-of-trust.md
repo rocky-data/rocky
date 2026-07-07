@@ -99,6 +99,8 @@ Replay is two distinct things, and being precise about which one ships matters.
 
 The first is deterministic recording with ledger verification. Rocky records each run's per-model SQL hashes, row counts, bytes, and timings, and content-addresses the written artifacts so that the same inputs and code produce the same physical files. `rocky replay <run_id>` inspects that record and verifies it against the ledger. That ships today.
 
+Alongside the run record, every materialization stamps a recipe-identity triple: `recipe_hash` (a fingerprint of the model's canonical typed IR, so the same program hashes the same no matter when it ran), `input_hash` (the inputs it read), and `env_hash` (the engine, adapter, and dialect it ran under). `rocky history --recipe <hash>` answers the audit question directly — "what produced this, and every other time this exact program ran." The triple is honest about strength: an `input_hash` proven by an observed freshness signature is tagged `heuristic` and is never presented as a byte-content claim, while a content-addressed input is `strong`. This is an identity and audit primitive, not a reproducibility claim.
+
 The second is re-execution from the pinned record: replaying a past run by feeding the recorded inputs back through the engine to reproduce its outputs from scratch. That is the follow-up. It arrives on top of the content-addressed write path, and it is not what `rocky replay` does now.
 
 In short: deterministic recording and content-addressed verification today, re-execution from the record next.

@@ -1,0 +1,22 @@
+# 10-recipe-provenance — every materialization records a recipe-identity triple
+# (recipe_hash, input_hash, env_hash). `rocky history --recipe <hash>` then
+# answers "what produced this?" — every execution of that exact program.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.demo]
+type = "transformation"
+models = "models/**"
+
+[pipeline.demo.target.governance]
+auto_create_schemas = true
+
+# Turn on the skip-unchanged gate so each run observes its upstream signature.
+# That observation is what populates the input side of the triple — recorded
+# with an honest `heuristic` proof-class, never presented as a byte-content
+# claim. Without an observed input, the triple honestly records two-of-three.
+[run]
+skip_unchanged = true
+skip_rowcount_fallback = true
