@@ -13,7 +13,12 @@
         {
           "model_name": "orders",
           "duration_ms": 0,
-          "status": "success"
+          "status": "success",
+          "recipe_identity": {
+            "recipe_hash": "d865beb2232b3960e696688b18df6a65fbd0a0eee523c13fbce3b398346ba30e",
+            "env_hash": "envhash-SENTINEL",
+            "hash_scheme": "v1"
+          }
         }
       ]
     },
@@ -28,7 +33,12 @@
         {
           "model_name": "orders",
           "duration_ms": 0,
-          "status": "success"
+          "status": "success",
+          "recipe_identity": {
+            "recipe_hash": "d865beb2232b3960e696688b18df6a65fbd0a0eee523c13fbce3b398346ba30e",
+            "env_hash": "envhash-SENTINEL",
+            "hash_scheme": "v1"
+          }
         }
       ]
     }

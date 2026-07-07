@@ -1152,6 +1152,8 @@ from .types_generated import (  # noqa: E402, F401
     PromotePlan,
     PromoteTarget,
     PromoteTargetPlan,
+    RecipeExecutionRecord,
+    RecipeHistoryOutput,
     RejectedApproval,
     ReplayModelOutput,
     ReplayOutput,

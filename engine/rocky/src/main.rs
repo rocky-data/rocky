@@ -1367,6 +1367,12 @@ enum Command {
         /// Filter to a specific model
         #[arg(long)]
         model: Option<String>,
+        /// Show every recorded execution of one exact program, identified by
+        /// its recipe hash (read from any model record's `recipe_identity`
+        /// in `rocky history`/`trace`/`catalog` JSON). The "what produced
+        /// this?" query. Conflicts with `--model`.
+        #[arg(long, conflicts_with = "model")]
+        recipe: Option<String>,
         /// Only show runs since this date (ISO 8601 or YYYY-MM-DD)
         #[arg(long)]
         since: Option<String>,
@@ -3144,6 +3150,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         },
         Command::History {
             model,
+            recipe,
             since,
             audit,
             rolling_stats,
@@ -3155,6 +3162,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             audit,
             rolling_stats,
             window,
+            recipe.as_deref(),
             json,
         ),
         Command::Metrics {

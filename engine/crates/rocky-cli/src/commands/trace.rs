@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 
 use rocky_core::state::{ModelExecution, RunRecord, RunStatus, RunTrigger, StateStore};
 
-use crate::output::{TraceModelEntry, TraceOutput};
+use crate::output::{RecipeIdentityView, TraceModelEntry, TraceOutput};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -71,6 +71,7 @@ fn to_entry(run_start: chrono::DateTime<chrono::Utc>, exec: &ModelExecution) -> 
         rows_affected: exec.rows_affected,
         bytes_scanned: exec.bytes_scanned,
         bytes_written: exec.bytes_written,
+        recipe_identity: RecipeIdentityView::from_execution(exec),
     }
 }
 

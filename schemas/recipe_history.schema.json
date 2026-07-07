@@ -1,13 +1,17 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
-    "ModelExecutionRecord": {
-      "description": "One model execution from the state store, mirroring `rocky_core::state::ModelExecution`.",
+    "RecipeExecutionRecord": {
+      "description": "One execution of a given `recipe_hash`, embedded in [`RecipeHistoryOutput`].",
       "properties": {
         "duration_ms": {
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "model_name": {
+          "description": "Model name as recorded in the run.",
+          "type": "string"
         },
         "recipe_identity": {
           "anyOf": [
@@ -18,7 +22,7 @@
               "type": "null"
             }
           ],
-          "description": "The recipe-identity triple recorded for this execution, when present. See [`RecipeIdentityView`]."
+          "description": "The recipe-identity triple for this execution. Its `recipe_hash` matches the top-level filter; `input_hash` / `env_hash` can differ run-to-run for the same program (different inputs, different engine version)."
         },
         "rows_affected": {
           "format": "uint64",
@@ -27,6 +31,10 @@
             "integer",
             "null"
           ]
+        },
+        "run_id": {
+          "description": "The run this execution belonged to.",
+          "type": "string"
         },
         "sql_hash": {
           "type": "string"
@@ -41,6 +49,8 @@
       },
       "required": [
         "duration_ms",
+        "model_name",
+        "run_id",
         "sql_hash",
         "started_at",
         "status"
@@ -87,83 +97,9 @@
         }
       },
       "type": "object"
-    },
-    "RollingDimension": {
-      "description": "Per-dimension rolling statistics (mean, std dev, latest z-score).",
-      "properties": {
-        "latest_z_score": {
-          "description": "Z-score of the most recent execution relative to the window.\n\n`None` when fewer than 2 samples are available or when `std_dev` is exactly 0 (all samples are equal — no meaningful deviation).",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "mean": {
-          "description": "Population mean over the sample window.",
-          "format": "double",
-          "type": "number"
-        },
-        "std_dev": {
-          "description": "Population standard deviation (÷N) over the sample window.",
-          "format": "double",
-          "type": "number"
-        }
-      },
-      "required": [
-        "mean",
-        "std_dev"
-      ],
-      "type": "object"
-    },
-    "RollingStats": {
-      "description": "Rolling statistics computed over the most recent N successful executions of a model. Populated by `rocky history --model <name> --rolling-stats`.\n\nStatistics use population standard deviation (divided by N, not N-1), so `std_dev` is exactly 0 when all samples are equal.",
-      "properties": {
-        "duration_ms": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/RollingDimension"
-            }
-          ],
-          "description": "Rolling statistics for the `duration_ms` dimension."
-        },
-        "health_score": {
-          "description": "Composite health score in `[0.0, 1.0]`.\n\nComputed as `1.0 - clamp((max(|z_rows|, |z_duration|) - 2.0) / 4.0, 0.0, 1.0)`. A score of `1.0` means both z-scores are within 2σ of the mean; `0.0` means at least one z-score is 6σ or more.",
-          "format": "double",
-          "type": "number"
-        },
-        "rows_affected": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/RollingDimension"
-            }
-          ],
-          "description": "Rolling statistics for the `rows_affected` dimension. Computed only over executions where `rows_affected` is not null."
-        },
-        "samples": {
-          "description": "Actual number of successful executions used (≤ window; may be smaller when model history is shorter than the requested window).",
-          "format": "uint",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "window": {
-          "description": "Maximum number of executions requested for the rolling window.",
-          "format": "uint",
-          "minimum": 0.0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "duration_ms",
-        "health_score",
-        "rows_affected",
-        "samples",
-        "window"
-      ],
-      "type": "object"
     }
   },
-  "description": "JSON output for `rocky history --model <name>`.",
+  "description": "JSON output for `rocky history --recipe <hash>` — every recorded execution of one exact program (`recipe_hash`), across all runs.\n\nThe \"what produced this?\" query: given a `recipe_hash` (read from any model record's [`RecipeIdentityView`]), list every time that exact program ran — newest run first — with the run it belonged to and its per-execution input / environment identity.",
   "properties": {
     "command": {
       "type": "string"
@@ -175,23 +111,13 @@
     },
     "executions": {
       "items": {
-        "$ref": "#/definitions/ModelExecutionRecord"
+        "$ref": "#/definitions/RecipeExecutionRecord"
       },
       "type": "array"
     },
-    "model": {
+    "recipe_hash": {
+      "description": "The `recipe_hash` the history was filtered on, echoed back.",
       "type": "string"
-    },
-    "rolling_stats": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/RollingStats"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Rolling statistics over the most recent N successful executions. Present only when `--rolling-stats` is passed."
     },
     "version": {
       "type": "string"
@@ -201,9 +127,9 @@
     "command",
     "count",
     "executions",
-    "model",
+    "recipe_hash",
     "version"
   ],
-  "title": "ModelHistoryOutput",
+  "title": "RecipeHistoryOutput",
   "type": "object"
 }

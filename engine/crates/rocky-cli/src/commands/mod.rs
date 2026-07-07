@@ -105,7 +105,7 @@ pub use emit_sql::run_emit_sql;
 pub use estimate::run_estimate;
 pub use export_schemas::export_schemas;
 pub use fmt::run_fmt;
-pub use history::{history_runs_output, model_history_output, run_history};
+pub use history::{history_runs_output, model_history_output, recipe_history_output, run_history};
 pub use hooks::{run_hooks_list, run_hooks_test};
 pub use import_dbt::run_import_dbt;
 pub use imports_update::run_imports_update;

@@ -35,7 +35,7 @@ use rocky_core::state::{RunStatus, StateStore};
 
 use crate::output::{
     AssetKind, CatalogAsset, CatalogColumn, CatalogEdge, CatalogOutput, CatalogStats,
-    EdgeConfidence, config_fingerprint,
+    EdgeConfidence, RecipeIdentityView, config_fingerprint,
 };
 use crate::registry::resolve_pipeline;
 use crate::scope::resolve_managed_tables_in_catalog;
@@ -314,6 +314,7 @@ pub fn compute_catalog_output(
             // state-store handle.
             last_materialized_at: None,
             last_run_id: None,
+            recipe_identity: None,
         });
     }
 
@@ -411,23 +412,34 @@ fn enrich_with_state_store(state_path: &Path, assets: &mut [CatalogAsset]) -> Op
     // Per-model: walk runs newest-first and record the first successful
     // (ModelExecution) hit per model. ModelExecution.status is a
     // `String`; production writers use lowercase "success" — see
-    // `RunOutput` materialization handling.
-    let mut by_model: HashMap<String, (String, chrono::DateTime<chrono::Utc>)> = HashMap::new();
+    // `RunOutput` materialization handling. The recipe-identity triple is
+    // captured from that same newest-successful execution.
+    type ModelEnrichment = (
+        String,
+        chrono::DateTime<chrono::Utc>,
+        Option<RecipeIdentityView>,
+    );
+    let mut by_model: HashMap<String, ModelEnrichment> = HashMap::new();
     for run in &runs {
         for me in &run.models_executed {
             if me.status != "success" {
                 continue;
             }
-            by_model
-                .entry(me.model_name.clone())
-                .or_insert_with(|| (run.run_id.clone(), me.finished_at));
+            by_model.entry(me.model_name.clone()).or_insert_with(|| {
+                (
+                    run.run_id.clone(),
+                    me.finished_at,
+                    RecipeIdentityView::from_execution(me),
+                )
+            });
         }
     }
 
     for asset in assets.iter_mut() {
-        if let Some((run_id, finished_at)) = by_model.get(&asset.model_name) {
+        if let Some((run_id, finished_at, recipe_identity)) = by_model.get(&asset.model_name) {
             asset.last_run_id = Some(run_id.clone());
             asset.last_materialized_at = Some(*finished_at);
+            asset.recipe_identity = recipe_identity.clone();
         }
     }
 
@@ -1183,6 +1195,7 @@ mod tests {
                 intent: None,
                 last_materialized_at: None,
                 last_run_id: None,
+                recipe_identity: None,
             }
         }
 
@@ -1300,6 +1313,7 @@ mod tests {
                         intent: None,
                         last_materialized_at: None,
                         last_run_id: None,
+                        recipe_identity: None,
                     },
                     CatalogAsset {
                         fqn: "warehouse_a.public.customer_orders".to_string(),
@@ -1311,6 +1325,7 @@ mod tests {
                         intent: None,
                         last_materialized_at: None,
                         last_run_id: None,
+                        recipe_identity: None,
                     },
                     CatalogAsset {
                         fqn: "warehouse_b.public.revenue_summary".to_string(),
@@ -1322,6 +1337,7 @@ mod tests {
                         intent: None,
                         last_materialized_at: None,
                         last_run_id: None,
+                        recipe_identity: None,
                     },
                 ],
                 edges: vec![
