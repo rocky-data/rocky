@@ -570,6 +570,7 @@ fn seed_run_history(models_dir: &Path) {
             input_proof_class: None,
             env_hash: None,
             hash_scheme: None,
+            output_column_hashes: None,
         }],
         trigger: RunTrigger::Manual,
         config_hash: "cfg".to_string(),

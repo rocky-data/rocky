@@ -226,7 +226,14 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   storage-layout requirement; a leaner precedent (`ModelExecution::tenant`)
 ///   added a blob field without a bump. Guarded by
 ///   `test_v10_model_execution_forward_deserializes_recipe_identity_none`.
-const CURRENT_SCHEMA_VERSION: u32 = 11;
+/// - **v12** — adds `output_column_hashes` (per-output-column content hashes;
+///   see [`ColumnHash`]) to the [`ModelExecution`] blob. Pure additive
+///   blob-field change, same shape as the v11 recipe-identity fields: the new
+///   field is `#[serde(default)]`, so a v11 `RunRecord` forward-deserializes
+///   with it `None` and a v12 blob back-reads cleanly on a v11 binary (serde
+///   ignores the extra key). No new tables, no in-place migration. Guarded by
+///   `test_v11_model_execution_forward_deserializes_output_column_hashes_none`.
+const CURRENT_SCHEMA_VERSION: u32 = 12;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -1044,6 +1051,29 @@ pub struct UpstreamSig {
     pub row_count: Option<u64>,
 }
 
+/// A single output column's content hash, captured on a successful
+/// content-addressed build.
+///
+/// `hash` is `hex(blake3(...))` over the written Arrow column's serialized
+/// content (values + type, in table column order) — content, not schema. Two
+/// columns with byte-identical stored content share a hash; a schema-stable
+/// value change (a WHERE/JOIN/CASE rewrite that keeps the type but moves the
+/// data) flips it. The hash is intentionally over-sensitive: row-order or
+/// encoding differences make it differ even when the logical content is the
+/// same, so a mismatch can only ever cause a (safe) rebuild, never a wrong
+/// skip.
+///
+/// State-internal — never part of any `*Output` JSON schema, so it carries no
+/// codegen (matches the `skip_hash` / `upstream_freshness` / recipe-identity
+/// precedent).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ColumnHash {
+    /// The output column's name, in the table's column order.
+    pub column: String,
+    /// `hex(blake3(...))` of the column's serialized content.
+    pub hash: String,
+}
+
 /// Execution record for a single model within a run.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelExecution {
@@ -1151,6 +1181,22 @@ pub struct ModelExecution {
     /// failed executions and pre-v11 records.
     #[serde(default)]
     pub hash_scheme: Option<String>,
+
+    // --- Output column hashes (schema v12) -------------------------------
+    /// Per-output-column content hashes captured on a successful
+    /// content-addressed build, in the table's column order. The producer
+    /// side of the per-column skip substrate: "what did each of my columns
+    /// hash to when I built?" (see [`ColumnHash`]).
+    ///
+    /// `None` for pre-v12 executions, failed executions, non-content-addressed
+    /// builds, and content-addressed builds that reused a prior run's bytes or
+    /// wrote a partitioned table (both deferred — see the runner). Captured
+    /// only; nothing consults it yet (the consumer-side baseline and skip gate
+    /// are later phases). State-internal — carries no codegen. Serde-defaulted
+    /// so a pre-v12 blob forward-deserializes with it `None`; guarded by
+    /// `test_v11_model_execution_forward_deserializes_output_column_hashes_none`.
+    #[serde(default)]
+    pub output_column_hashes: Option<Vec<ColumnHash>>,
 }
 
 /// A complete pipeline run record.
@@ -3938,6 +3984,7 @@ mod tests {
                 input_proof_class: None,
                 env_hash: None,
                 hash_scheme: None,
+                output_column_hashes: None,
             }],
         );
         store.record_run(&run).unwrap();
@@ -3984,6 +4031,7 @@ mod tests {
                     input_proof_class: None,
                     env_hash: None,
                     hash_scheme: None,
+                    output_column_hashes: None,
                 },
                 ModelExecution {
                     model_name: "customers".to_string(),
@@ -4003,6 +4051,7 @@ mod tests {
                     input_proof_class: None,
                     env_hash: None,
                     hash_scheme: None,
+                    output_column_hashes: None,
                 },
             ],
         );
@@ -4037,6 +4086,7 @@ mod tests {
                     input_proof_class: None,
                     env_hash: None,
                     hash_scheme: None,
+                    output_column_hashes: None,
                 }],
             );
             store.record_run(&run).unwrap();
@@ -4195,6 +4245,44 @@ mod tests {
         assert_eq!(exec.hash_scheme, None);
     }
 
+    /// v11 → v12 forward-compat: a `ModelExecution` blob written before
+    /// `output_column_hashes` existed (a full v11 record carrying the
+    /// recipe-identity triple but no `output_column_hashes` key) must
+    /// forward-deserialize with the field defaulting to `None`.
+    #[test]
+    fn test_v11_model_execution_forward_deserializes_output_column_hashes_none() {
+        let v11_blob = br#"{
+            "model_name": "orders",
+            "started_at": "2024-01-01T12:00:00Z",
+            "finished_at": "2024-01-01T12:00:02Z",
+            "duration_ms": 2000,
+            "rows_affected": 5000,
+            "status": "success",
+            "sql_hash": "legacy-sql-hash",
+            "skip_hash": "logic-key",
+            "upstream_freshness": null,
+            "bytes_scanned": 4096,
+            "bytes_written": 2048,
+            "tenant": "acme",
+            "recipe_hash": "rh",
+            "input_hash": "ih",
+            "input_proof_class": "heuristic",
+            "env_hash": "eh",
+            "hash_scheme": "v1"
+        }"#;
+
+        let exec: ModelExecution = serde_json::from_slice(v11_blob)
+            .expect("pre-v12 ModelExecution must forward-deserialize");
+
+        // Prior fields (incl. the v11 triple) preserved.
+        assert_eq!(exec.model_name, "orders");
+        assert_eq!(exec.recipe_hash.as_deref(), Some("rh"));
+        assert_eq!(exec.hash_scheme.as_deref(), Some("v1"));
+        // The new field defaults to None — a pre-v12 record is treated as
+        // "no output column hashes recorded", never crashes the read.
+        assert_eq!(exec.output_column_hashes, None);
+    }
+
     /// A v11 `ModelExecution` blob (carrying the triple) must back-read on a
     /// binary that predates it: serde ignores the unknown keys, so a v10 reader
     /// never breaks on a v11 row. Emulated by deserializing the full v11 shape
@@ -4219,6 +4307,10 @@ mod tests {
             input_proof_class: Some("heuristic".to_string()),
             env_hash: Some("eh".to_string()),
             hash_scheme: Some("v1".to_string()),
+            output_column_hashes: Some(vec![ColumnHash {
+                column: "id".to_string(),
+                hash: "col-hash".to_string(),
+            }]),
         };
         let json = serde_json::to_string(&exec).unwrap();
         let back: ModelExecution = serde_json::from_str(&json).unwrap();
@@ -4227,6 +4319,13 @@ mod tests {
         assert_eq!(back.input_proof_class.as_deref(), Some("heuristic"));
         assert_eq!(back.env_hash.as_deref(), Some("eh"));
         assert_eq!(back.hash_scheme.as_deref(), Some("v1"));
+        assert_eq!(
+            back.output_column_hashes,
+            Some(vec![ColumnHash {
+                column: "id".to_string(),
+                hash: "col-hash".to_string(),
+            }])
+        );
     }
 
     /// 🔴 Ledger-readability tripwire. The durable ledger's records
@@ -4262,6 +4361,7 @@ mod tests {
             input_proof_class: Some("heuristic".to_string()),
             env_hash: Some("env-ghi".to_string()),
             hash_scheme: Some("v1".to_string()),
+            output_column_hashes: None,
         };
         let exec_json = serde_json::to_string(&exec).unwrap();
 
@@ -4289,7 +4389,7 @@ mod tests {
             return;
         }
 
-        const EXEC_GOLDEN: &str = r#"{"model_name":"fct_orders","started_at":"2024-01-01T12:00:00Z","finished_at":"2024-01-01T12:00:00Z","duration_ms":2000,"rows_affected":10,"status":"success","sql_hash":"sql","skip_hash":"logic-key","upstream_freshness":null,"bytes_scanned":null,"bytes_written":null,"tenant":null,"recipe_hash":"recipe-abc","input_hash":"input-def","input_proof_class":"heuristic","env_hash":"env-ghi","hash_scheme":"v1"}"#;
+        const EXEC_GOLDEN: &str = r#"{"model_name":"fct_orders","started_at":"2024-01-01T12:00:00Z","finished_at":"2024-01-01T12:00:00Z","duration_ms":2000,"rows_affected":10,"status":"success","sql_hash":"sql","skip_hash":"logic-key","upstream_freshness":null,"bytes_scanned":null,"bytes_written":null,"tenant":null,"recipe_hash":"recipe-abc","input_hash":"input-def","input_proof_class":"heuristic","env_hash":"env-ghi","hash_scheme":"v1","output_column_hashes":null}"#;
         const PROV_GOLDEN: &str = r#"{"run_id":"run-1","model_name":"fct_orders","input_hash":"input-def","skip_hash":"logic-key","model_ir_canonical_json":"{\"a\":1}","upstreams":[{"kind":"watermark","upstream_key":"cat.sch.src","max_ts":"2024-01-01T00:00:00Z","row_count":42}],"output_blake3":["out-hash"],"output_path":["s3://b/p.parquet"],"proof_class":"heuristic","recorded_at":"2024-01-01T12:00:00Z"}"#;
         assert_eq!(exec_json, EXEC_GOLDEN, "ModelExecution wire format drifted");
         assert_eq!(
@@ -6516,13 +6616,14 @@ mod tests {
         // is an on-disk break that needs a `CURRENT_SCHEMA_VERSION` bump + a
         // migration path, not just an edit here.
         //
-        // v11 bumps the version for the recipe-identity triple added to the
-        // `ModelExecution` blob. The table set below is deliberately unchanged
-        // — v11 adds no tables, only serde-defaulted blob fields — so the
-        // forward-compat path is the existing default-on-missing behaviour
-        // (guarded by `test_v10_model_execution_forward_deserializes_recipe_identity_none`
+        // v12 bumps the version for the `output_column_hashes` field added to
+        // the `ModelExecution` blob. The table set below is deliberately
+        // unchanged — v12 adds no tables, only a serde-defaulted blob field —
+        // so the forward-compat path is the existing default-on-missing
+        // behaviour (guarded by
+        // `test_v11_model_execution_forward_deserializes_output_column_hashes_none`
         // and the `open_with_policy_*` mismatch tests), not a new migration.
-        const EXPECTED_VERSION: u32 = 11;
+        const EXPECTED_VERSION: u32 = 12;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",

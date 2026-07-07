@@ -973,6 +973,17 @@ pub struct MaterializationOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub recipe_identity: Option<RecipeIdentityInternal>,
+    /// State-internal per-output-column content hashes, co-located with the
+    /// model so [`RunOutput::to_run_record`] can stamp them onto the persisted
+    /// `ModelExecution.output_column_hashes`. Populated only by the
+    /// content-addressed runner on a genuine unpartitioned build; `None`
+    /// everywhere else (every non-content-addressed path, reuse, partitioned).
+    ///
+    /// Never serialized and never part of the JSON schema (via `#[serde(skip)]`
+    /// and `#[schemars(skip)]`) — same pattern as [`Self::recipe_identity`].
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub output_column_hashes: Option<Vec<rocky_core::state::ColumnHash>>,
 }
 
 /// State-internal skip-gate result for one materialized model, carried on
@@ -4501,6 +4512,10 @@ impl RunOutput {
                 hash_scheme: mat.recipe_identity.as_ref().map(|r| r.hash_scheme.clone()),
                 input_hash: input_hash.clone(),
                 input_proof_class,
+                // Per-output-column content hashes, populated by the
+                // content-addressed runner on a genuine unpartitioned build;
+                // `None` on every other path (carried straight through).
+                output_column_hashes: mat.output_column_hashes.clone(),
             });
         }
 
@@ -4533,6 +4548,8 @@ impl RunOutput {
                 input_proof_class: None,
                 env_hash: None,
                 hash_scheme: None,
+                // A failed execution recorded no output columns.
+                output_column_hashes: None,
             });
         }
 
@@ -4904,6 +4921,7 @@ mod cost_finalize_tests {
             job_ids: Vec::new(),
             skip_internal: None,
             recipe_identity: None,
+            output_column_hashes: None,
         }
     }
 
@@ -5118,6 +5136,7 @@ mod run_record_tests {
             job_ids: Vec::new(),
             skip_internal: None,
             recipe_identity: None,
+            output_column_hashes: None,
         }
     }
 
@@ -5253,6 +5272,51 @@ mod run_record_tests {
             Some("acme"),
             "tenant on the materialization must flow onto the persisted ModelExecution"
         );
+    }
+
+    #[test]
+    fn to_run_record_carries_output_column_hashes_onto_model_execution() {
+        let mut out = RunOutput::new(String::new(), 1_000, 1);
+        out.tables_copied = 1;
+        let run_started = fixed_start();
+        let mut m = mat(&["orders"], 1_000, Some("h"), run_started);
+        // A content-addressed build stamps its producer-side per-column hashes
+        // onto the carrier; `to_run_record` must copy them onto the persisted
+        // `ModelExecution.output_column_hashes`.
+        m.output_column_hashes = Some(vec![
+            rocky_core::state::ColumnHash {
+                column: "id".to_string(),
+                hash: "hash-id".to_string(),
+            },
+            rocky_core::state::ColumnHash {
+                column: "amount".to_string(),
+                hash: "hash-amount".to_string(),
+            },
+        ]);
+        out.materializations.push(m);
+
+        let started = fixed_start();
+        let finished = started + chrono::Duration::seconds(1);
+        let record = out.to_run_record(
+            "run-colhash",
+            started,
+            finished,
+            String::new(),
+            RunTrigger::Manual,
+            out.derive_run_status(),
+            RunRecordAudit::test_sentinels(),
+        );
+
+        assert_eq!(record.models_executed.len(), 1);
+        let hashes = record.models_executed[0]
+            .output_column_hashes
+            .as_ref()
+            .expect("output_column_hashes must flow onto the persisted ModelExecution");
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes[0].column, "id");
+        assert_eq!(hashes[0].hash, "hash-id");
+        assert_eq!(hashes[1].column, "amount");
+        assert_eq!(hashes[1].hash, "hash-amount");
     }
 
     #[test]

@@ -468,6 +468,7 @@ mod tests {
                 input_proof_class: None,
                 env_hash: None,
                 hash_scheme: None,
+                output_column_hashes: None,
             }],
             trigger: RunTrigger::Manual,
             config_hash: "cfg-hash".to_string(),
@@ -541,6 +542,7 @@ mod tests {
             input_proof_class: None,
             env_hash: None,
             hash_scheme: None,
+            output_column_hashes: None,
         }
     }
 

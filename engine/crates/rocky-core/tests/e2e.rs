@@ -475,6 +475,7 @@ fn test_run_history_flow() {
                 input_proof_class: None,
                 env_hash: None,
                 hash_scheme: None,
+                output_column_hashes: None,
             },
             ModelExecution {
                 model_name: "customers".to_string(),
@@ -494,6 +495,7 @@ fn test_run_history_flow() {
                 input_proof_class: None,
                 env_hash: None,
                 hash_scheme: None,
+                output_column_hashes: None,
             },
         ],
         trigger: RunTrigger::Manual,

@@ -748,7 +748,14 @@ pub async fn execute_content_addressed_model(
     let total_rows = batch.num_rows();
 
     // 6. Write — split path on partitioned vs unpartitioned.
-    let (last_blake3, last_commit_version, last_file_path, total_size_bytes) =
+    //
+    // `output_column_hashes` is captured only on the unpartitioned path: a
+    // partitioned model writes one file per partition group, and folding the
+    // per-file column hashes into a single per-column table hash is a deferred
+    // correctness surface. Partitioned models therefore record no per-column
+    // hashes (empty ⇒ a safe rebuild in the later skip gate), scoping this
+    // capture to unpartitioned tables first.
+    let (last_blake3, last_commit_version, last_file_path, total_size_bytes, output_column_hashes) =
         if partition_columns.is_empty() {
             let write_result = writer
                 .write_batch_with_state(batch, state)
@@ -759,6 +766,7 @@ pub async fn execute_content_addressed_model(
                 write_result.commit_version,
                 write_result.file_path,
                 write_result.size_bytes,
+                write_result.column_hashes,
             )
         } else {
             // Partitioned: group rows by partition tuple and emit one
@@ -794,6 +802,8 @@ pub async fn execute_content_addressed_model(
                 last_commit_version,
                 last_file_path,
                 total_size_bytes,
+                // Partitioned outputs: no per-column table hash (deferred fold).
+                Vec::new(),
             )
         };
 
@@ -808,6 +818,7 @@ pub async fn execute_content_addressed_model(
         commit_version: last_commit_version,
         file_path: last_file_path,
         size_bytes: total_size_bytes,
+        output_column_hashes,
         // A normal BUILD wrote fresh bytes — no point-to provenance.
         reused_from: None,
     })
@@ -984,6 +995,9 @@ async fn attempt_point_to_reuse(
         commit_version: write_result.commit_version,
         file_path: write_result.file_path,
         size_bytes: write_result.size_bytes,
+        // Point-to reuse references R's already-written bytes; no Arrow batch
+        // is hashed here (R's own build recorded its column hashes).
+        output_column_hashes: write_result.column_hashes,
         reused_from: Some(ReuseProvenance {
             reused_run_id: candidate.run_id.clone(),
             blake3_hash: candidate.blake3_hash.clone(),
@@ -1174,6 +1188,13 @@ pub struct ContentAddressedRunSummary {
     pub commit_version: u64,
     pub file_path: String,
     pub size_bytes: u64,
+    /// Per-output-column content hashes over the written Arrow columns, in
+    /// table column order (see [`rocky_core::state::ColumnHash`]). Populated on
+    /// a genuine **unpartitioned** build; **empty** on a point-to reuse (no
+    /// fresh bytes) and on a partitioned build (per-file fold deferred). The
+    /// runner stamps a non-empty value onto the model's `ModelExecution`;
+    /// nothing consults it yet.
+    pub output_column_hashes: Vec<rocky_core::state::ColumnHash>,
     /// `Some` when this run **reused** a prior run `R`'s bytes via a zero-copy
     /// point-to commit instead of executing the model SQL. `None` for a normal
     /// BUILD (including every reuse-decision fall-back to BUILD). The

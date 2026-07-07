@@ -24,10 +24,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{ArrayRef, RecordBatch};
+use arrow::datatypes::{Field, Schema};
+use arrow::ipc::writer::StreamWriter;
 use bytes::Bytes;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use rocky_core::state::ColumnHash;
 
 pub mod commit;
 pub mod discover;
@@ -102,9 +105,64 @@ pub struct UniformTableState {
 pub struct WriteResult {
     pub file_path: String,
     pub blake3_hash: String,
+    /// Per-output-column content hashes over the written Arrow columns, in
+    /// table column order (see [`rocky_core::state::ColumnHash`]). Computed
+    /// on a genuine build (fresh bytes written); **empty** on a zero-copy
+    /// point-to reuse, which references a prior run's already-written bytes
+    /// and does not recompute them. The whole-body `blake3_hash` above is
+    /// table-granular; these are the per-column signal.
+    pub column_hashes: Vec<ColumnHash>,
     pub commit_version: u64,
     pub num_records: usize,
     pub size_bytes: u64,
+}
+
+/// Compute per-column content hashes for a written [`RecordBatch`], in the
+/// batch's column order.
+///
+/// One [`ColumnHash`] per column. The hash is over the column's serialized
+/// content (type + values), **not** its schema/name — so a schema-stable
+/// value change flips the hash while a rename does not. No normalization in
+/// v1: the column is hashed as written, so the hash is order-sensitive (the
+/// documented over-sensitivity — a mismatch can only ever force a safe
+/// rebuild, never a wrong skip).
+///
+/// # Errors
+///
+/// [`UniformWriterError::Arrow`] if a column cannot be Arrow-IPC-serialized
+/// (not expected for the content-addressed writer's supported types).
+fn compute_column_hashes(batch: &RecordBatch) -> Result<Vec<ColumnHash>> {
+    let schema = batch.schema();
+    let mut out = Vec::with_capacity(batch.num_columns());
+    for (idx, array) in batch.columns().iter().enumerate() {
+        let field = schema.field(idx);
+        out.push(ColumnHash {
+            column: field.name().to_string(),
+            hash: hash_arrow_column(field, array)?,
+        });
+    }
+    Ok(out)
+}
+
+/// blake3 (hex) of a single Arrow column's serialized content.
+///
+/// The column is wrapped in a one-field [`RecordBatch`] — with the field name
+/// normalized to a constant so the hash is over content + type, not the name —
+/// and serialized via Arrow IPC. IPC is a deterministic, type-uniform encoding
+/// that re-bases any slice offset, so the same logical array always hashes the
+/// same regardless of how it was sliced. Padding differences and null-slot
+/// bytes are hashed as-is (no normalization in v1).
+fn hash_arrow_column(field: &Field, array: &ArrayRef) -> Result<String> {
+    let norm_field = Field::new("col", field.data_type().clone(), field.is_nullable());
+    let schema = Arc::new(Schema::new(vec![norm_field]));
+    let one_col = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(array)])?;
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &schema)?;
+        writer.write(&one_col)?;
+        writer.finish()?;
+    }
+    Ok(blake3::hash(&buf).to_hex().to_string())
 }
 
 /// Inputs to a content-addressed *point-to* commit
@@ -433,6 +491,10 @@ impl UniformWriter {
             return Ok(WriteResult {
                 file_path: parquet_path.to_string(),
                 blake3_hash: pointer.blake3_hash.clone(),
+                // Point-to reuse references R's already-written bytes; no
+                // Arrow batch is in hand to hash, so no per-column hashes are
+                // recomputed. R's own successful build recorded them.
+                column_hashes: Vec::new(),
                 commit_version: existing_version,
                 num_records: pointer.num_records,
                 size_bytes: pointer.size_bytes,
@@ -465,6 +527,8 @@ impl UniformWriter {
                     return Ok(WriteResult {
                         file_path: parquet_path.to_string(),
                         blake3_hash: pointer.blake3_hash.clone(),
+                        // Point-to reuse: no fresh Arrow batch to hash.
+                        column_hashes: Vec::new(),
                         commit_version: target_version,
                         num_records: pointer.num_records,
                         size_bytes: pointer.size_bytes,
@@ -491,6 +555,8 @@ impl UniformWriter {
                         return Ok(WriteResult {
                             file_path: parquet_path.to_string(),
                             blake3_hash: pointer.blake3_hash.clone(),
+                            // Point-to reuse: no fresh Arrow batch to hash.
+                            column_hashes: Vec::new(),
                             commit_version: existing_version,
                             num_records: pointer.num_records,
                             size_bytes: pointer.size_bytes,
@@ -550,6 +616,11 @@ impl UniformWriter {
         // 1. Build deterministic Parquet bytes from the input batch.
         let parquet_bytes = parquet_builder::build_parquet(&batch, &state)?;
         let hash = blake3::hash(&parquet_bytes).to_hex().to_string();
+        // Per-column content hashes over the same in-memory Arrow batch,
+        // computed in this pass (the batch is held right here, immediately
+        // before the whole-body blake3 above). Captured on every genuine
+        // build; nothing consults them yet.
+        let column_hashes = compute_column_hashes(&batch)?;
         let add_file_path = path_for_hash(&hash);
         let file_size = parquet_bytes.len() as u64;
         let prefix = self.config.prefix.trim_end_matches('/').to_string();
@@ -614,6 +685,7 @@ impl UniformWriter {
                     return Ok(WriteResult {
                         file_path: parquet_path.to_string(),
                         blake3_hash: hash,
+                        column_hashes: column_hashes.clone(),
                         commit_version: target_version,
                         num_records: batch.num_rows(),
                         size_bytes: file_size,
@@ -639,6 +711,7 @@ impl UniformWriter {
                         return Ok(WriteResult {
                             file_path: parquet_path.to_string(),
                             blake3_hash: hash,
+                            column_hashes: column_hashes.clone(),
                             commit_version: existing_version,
                             num_records: batch.num_rows(),
                             size_bytes: file_size,
@@ -1154,6 +1227,47 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names)]).unwrap()
     }
 
+    #[test]
+    fn compute_column_hashes_is_deterministic_and_value_sensitive() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        // One hash per column, in table column order, keyed by name.
+        let h1 = compute_column_hashes(&batch).unwrap();
+        assert_eq!(h1.len(), 2);
+        assert_eq!(h1[0].column, "id");
+        assert_eq!(h1[1].column, "name");
+        assert!(h1.iter().all(|c| !c.hash.is_empty()));
+
+        // Deterministic: identical content hashes identically.
+        let h2 = compute_column_hashes(&batch).unwrap();
+        assert_eq!(h1, h2);
+
+        // Value-sensitive: changing one column's data (schema unchanged) flips
+        // that column's hash and leaves the other column's hash untouched.
+        let mutated = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "b", "CHANGED"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let h3 = compute_column_hashes(&mutated).unwrap();
+        assert_eq!(h3[0].hash, h1[0].hash, "unchanged column keeps its hash");
+        assert_ne!(h3[1].hash, h1[1].hash, "changed column's hash moves");
+    }
+
     #[tokio::test]
     async fn write_batch_round_trip_against_in_memory_store() {
         let store: Arc<InMemory> = Arc::new(InMemory::new());
@@ -1187,6 +1301,21 @@ mod tests {
         assert!(result.size_bytes > 0);
         assert!(!result.blake3_hash.is_empty());
         assert!(result.file_path.ends_with(".parquet"));
+
+        // Per-column content hashes are computed on the genuine build path,
+        // from the real Arrow columns, in table column order — one per column,
+        // keyed by name, each a non-empty hex blake3.
+        let cols: Vec<&str> = result
+            .column_hashes
+            .iter()
+            .map(|c| c.column.as_str())
+            .collect();
+        assert_eq!(cols, vec!["id", "name"]);
+        assert!(result.column_hashes.iter().all(|c| !c.hash.is_empty()));
+        assert_ne!(
+            result.column_hashes[0].hash, result.column_hashes[1].hash,
+            "distinct columns must hash distinctly"
+        );
 
         // The Parquet file + the new commit should be there.
         let log_path = object_store::path::Path::from(format!(
@@ -1266,6 +1395,17 @@ mod tests {
         assert_eq!(pr.commit_version, 1);
         assert_eq!(pr.blake3_hash, r.blake3_hash, "shared bytes — same blake3");
         assert_eq!(pr.num_records, r.num_records);
+        // R's genuine build computed per-column hashes; the zero-copy point-to
+        // recomputes none (it holds no Arrow batch — R's own build recorded
+        // them). Empty here degrades to a safe rebuild in the later skip gate.
+        assert!(
+            !r.column_hashes.is_empty(),
+            "the build recorded column hashes"
+        );
+        assert!(
+            pr.column_hashes.is_empty(),
+            "point-to reuse recomputes no column hashes"
+        );
 
         // B's _delta_log/...001.json references the SAME content-addressed
         // path R wrote (the file name; the prefix differs per table).

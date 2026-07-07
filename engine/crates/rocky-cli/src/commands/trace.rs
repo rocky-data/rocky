@@ -251,6 +251,7 @@ mod tests {
             input_proof_class: None,
             env_hash: None,
             hash_scheme: None,
+            output_column_hashes: None,
         }
     }
 
