@@ -8,9 +8,13 @@
 /**
  * JSON output for `rocky replay --at <run_id> --execute [--verify]`.
  *
- * Re-execution surface (single-model, DuckDB): for the targeted model(s) it reconstructs the recipe from the recorded [`rocky_core::state::ProvenanceRecord`] — never the working tree — re-executes the recipe's `SELECT` on an ephemeral in-memory DuckDB engine, and re-derives the output artifact's blake3. With `--verify` it compares that digest against the recorded output hash and emits a per-model verdict.
+ * Re-execution surface (DuckDB). Each model's recipe is reconstructed from its recorded [`rocky_core::state::ProvenanceRecord`] — never the working tree — re-executed on an in-memory DuckDB engine, and its output artifact's blake3 re-derived. With `--verify` that digest is compared against the recorded output hash and a per-model verdict is emitted.
  *
- * Nothing is materialized to any warehouse schema: the re-executed rows are hashed in memory and discarded, so no production identity is ever touched (isolation is vacuous for a self-contained `SELECT`). Re-execution is limited to a *self-contained* recipe — one whose SQL reads no recorded upstream tables. A recipe with content upstreams is reported `non_replayable` here, because resolving inputs to their replayed upstream outputs is multi-model DAG replay (a later phase): recorded upstream bytes are never read, and current data is never silently substituted.
+ * Two modes share this shape:
+ *
+ * - `--model <m>` re-executes a single, *self-contained* recipe on a throwaway engine. A recipe with recorded content upstreams is `non_replayable` in this mode — resolving those inputs is the DAG mode below. - no `--model` re-executes the *whole run* in topological order on one shared engine, materializing each upstream's **replayed** output so a downstream `SELECT` reads the replayed bytes (never the recorded object-store bytes, never production). A downstream whose in-run upstream could not be replayed is `non_replayable` (fail-closed cascade); an upstream not produced by any model in this run, or a mutable-source watermark, is likewise `non_replayable` rather than substituted.
+ *
+ * Nothing is materialized to any warehouse schema: the entire in-memory engine is an ephemeral replay namespace, discarded after the run, so no production identity is ever touched.
  */
 export interface ReplayExecuteOutput {
   /**

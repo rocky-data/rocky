@@ -377,22 +377,29 @@ fn deterministic_replay_state(
     }
 }
 
-/// Re-execute a reconstructed recipe on an ephemeral in-memory DuckDB engine
-/// and return `(rows, output_blake3_hex)`.
+/// Re-execute a reconstructed recipe against a caller-owned in-memory DuckDB
+/// engine and return `(rows, output_blake3_hex)`.
 ///
-/// The recipe's `SELECT` runs against a throwaway in-memory database — nothing
-/// is persisted to any schema, so no production identity is touched (isolation
-/// is vacuous for a self-contained `SELECT`). The result rows are converted to
-/// the same Arrow → Parquet encoding the content-addressed writer emits and
-/// hashed with blake3, so the digest is directly comparable to the recorded
-/// output hash.
+/// The recipe's `SELECT` runs against the passed-in `adapter` — nothing is
+/// persisted to any *production* schema, so no production identity is touched.
+/// For single-model replay the caller hands in a throwaway engine (isolation
+/// is vacuous for a self-contained `SELECT`); for DAG replay the caller hands
+/// in a *shared* engine into which upstream outputs have already been
+/// materialized, so `ir.sql`'s `catalog.schema.table` references resolve to the
+/// **replayed** upstream tables rather than to production or recorded bytes.
+/// The whole ephemeral engine is the replay namespace; it is discarded after
+/// the run.
+///
+/// The result rows are converted to the same Arrow → Parquet encoding the
+/// content-addressed writer emits and hashed with blake3, so the digest is
+/// directly comparable to the recorded output hash.
 #[cfg(feature = "duckdb")]
-async fn execute_and_hash(ir: &ModelIr) -> Result<(u64, String)> {
+async fn execute_and_hash(
+    adapter: &rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+    ir: &ModelIr,
+) -> Result<(u64, String)> {
     use rocky_core::traits::WarehouseAdapter;
-    use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
-    let adapter = DuckDbWarehouseAdapter::in_memory()
-        .context("failed to start an in-memory DuckDB engine for replay re-execution")?;
     let result = adapter
         .execute_query(&ir.sql)
         .await
@@ -518,9 +525,24 @@ async fn replay_execute_model(
         }
     }
 
-    // Re-execute + re-derive the output digest. Any failure is fail-closed to
-    // non_replayable — never diverged, never bit_exact.
-    let (rows, computed) = match execute_and_hash(&ir).await {
+    // Re-execute + re-derive the output digest. Single-model replay uses a
+    // fresh, throwaway in-memory engine — the recipe is self-contained (the
+    // `!upstreams.is_empty()` guard above already rejected any recorded
+    // upstream), so no pre-materialized upstream tables are needed. Any failure
+    // is fail-closed to non_replayable — never diverged, never bit_exact.
+    let adapter = match rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory() {
+        Ok(a) => a,
+        Err(e) => {
+            return non_replayable_exec(
+                model_name,
+                check.nondeterministic,
+                vec![format!(
+                    "could not start an in-memory DuckDB engine for replay: {e}"
+                )],
+            );
+        }
+    };
+    let (rows, computed) = match execute_and_hash(&adapter, &ir).await {
         Ok(v) => v,
         Err(e) => {
             return non_replayable_exec(
@@ -594,17 +616,529 @@ async fn replay_execute_model(
     }
 }
 
-/// Execute `rocky replay --execute [--verify]` — single-model DuckDB
-/// re-execution.
+// ---------------------------------------------------------------------------
+// `rocky replay --execute [--verify]` (whole run) — DAG-order multi-model
+// re-execution
+// ---------------------------------------------------------------------------
+
+/// Fully-qualified `catalog.schema.table` identity of a model's output.
 ///
-/// Reconstructs each targeted model's recipe from its recorded
-/// [`ProvenanceRecord`], re-executes the self-contained ones on an ephemeral
-/// in-memory DuckDB engine, and (with `verify`) compares the re-derived output
-/// blake3 against the recorded hash. Nothing is materialized to any warehouse
-/// schema, and the working tree is never consulted. Every verdict — including
-/// `diverged` and `non_replayable` — is a classification, not a tool failure,
-/// so this returns `Ok` (exit 0) unless the run itself cannot be resolved;
-/// callers inspect `verdict` / `bit_exact_count`.
+/// This is the *same* string a downstream model's recorded
+/// [`UpstreamIdentity::Content::upstream_key`] carries (both are built from the
+/// producer's `TargetRef`), so it is the join key for the replay DAG's edges.
+fn target_fqn(ir: &ModelIr) -> String {
+    format!(
+        "{}.{}.{}",
+        ir.target.catalog, ir.target.schema, ir.target.table
+    )
+}
+
+/// A model eligible to be *executed* in the replay DAG: it has a provenance
+/// record, its embedded IR parses, and it materialises a single whole-output
+/// blake3 (unpartitioned content-addressed). Models failing any of these get a
+/// direct `non_replayable` verdict and are never producers in the graph.
+#[cfg(feature = "duckdb")]
+struct DagCandidate {
+    model_name: String,
+    ir: ModelIr,
+    output_fqn: String,
+    recorded_hash: Option<String>,
+    nondeterministic: bool,
+    /// The recorded upstream identities, exactly as folded into the model's
+    /// `input_hash`; resolved into edges vs blocks in pass B.
+    upstreams: Vec<UpstreamIdentity>,
+    /// In-run upstream FQNs (each produced by *another* candidate in this run).
+    in_run_upstreams: Vec<String>,
+    /// A reason this node cannot be executed even though it is a candidate:
+    /// an upstream that no in-run node produces (recorded bytes on object
+    /// storage the creds-free replay never reads) or a mutable-source
+    /// watermark. `Some` ⇒ statically blocked ⇒ `non_replayable`, no table.
+    blocked_reason: Option<String>,
+}
+
+/// Ensure the `catalog.schema` namespace for `ir`'s target exists in the shared
+/// replay engine so a later `CREATE OR REPLACE TABLE catalog.schema.table`
+/// (and the downstream `SELECT`s that reference it) resolve. Each non-default
+/// catalog is `ATTACH`ed as its own throwaway in-memory database exactly once.
+#[cfg(feature = "duckdb")]
+async fn ensure_namespace(
+    adapter: &rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+    ir: &ModelIr,
+    attached_catalogs: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    use rocky_core::traits::WarehouseAdapter;
+
+    let catalog = &ir.target.catalog;
+    // `memory` is DuckDB's built-in in-memory catalog; every other catalog name
+    // is materialised as its own attached `:memory:` database so a 3-part FQN
+    // resolves. The whole engine is ephemeral, so these are all replay-scoped.
+    if catalog != "memory" && attached_catalogs.insert(catalog.clone()) {
+        adapter
+            .execute_statement(&format!("ATTACH ':memory:' AS {catalog}"))
+            .await
+            .map_err(|e| anyhow::anyhow!("could not attach replay catalog {catalog:?}: {e}"))?;
+    }
+    adapter
+        .execute_statement(&format!(
+            "CREATE SCHEMA IF NOT EXISTS {}.{}",
+            ir.target.catalog, ir.target.schema
+        ))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("could not create replay schema for {}: {e}", target_fqn(ir))
+        })?;
+    Ok(())
+}
+
+/// Re-execute the *whole* recorded run in dependency order.
+///
+/// This is the DAG-order path taken when no `--model` filter is given. Each
+/// content-addressed model is reconstructed from its recording and executed on
+/// a **single shared** in-memory DuckDB engine in topological order, so a
+/// downstream model's `SELECT` reads its upstream's **replayed** output
+/// (materialised into the shared engine as `catalog.schema.table`) rather than
+/// the recorded object-store bytes or any production table. That is the real
+/// test of recipe sufficiency: a recipe that under-specifies its inputs
+/// diverges here because it consumed a freshly-replayed upstream.
+///
+/// Fail-closed cascade: a node whose in-run upstream did not materialise
+/// (blocked, errored, or itself `non_replayable`) is reported `non_replayable`
+/// and never runs against a missing/stale table — a divergent or errored
+/// upstream can never let a downstream fabricate a `bit_exact`. An upstream
+/// that *executed* but merely `diverged` still materialises (a diverged replay
+/// is still a replayed output), so its downstream reads those replayed bytes.
+///
+/// The `nondeterministic` flag is a static scan of a node's **own** SQL. A
+/// deterministic downstream of a nondeterministic upstream can therefore
+/// `diverge` without carrying the flag itself — the divergence is inherited
+/// through the replayed input, which is the honest, expected behaviour (the
+/// reason string still reports the byte mismatch). Propagating the flag
+/// transitively is a later refinement.
+///
+/// Isolation carries through from single-model replay: the entire engine is an
+/// ephemeral replay namespace, nothing is written to any warehouse or object
+/// store, and the working tree is never consulted.
+#[cfg(feature = "duckdb")]
+async fn replay_execute_dag(
+    store: &StateStore,
+    record: &RunRecord,
+    verify: bool,
+) -> Vec<ReplayExecuteModelOutput> {
+    use std::collections::{HashMap, HashSet};
+
+    let run_id = &record.run_id;
+    let mut finished: HashMap<String, ReplayExecuteModelOutput> = HashMap::new();
+    let mut candidates: Vec<DagCandidate> = Vec::new();
+
+    // --- Pass A: reconstruct each model; separate executable candidates from
+    // directly-non_replayable models. Reconstruct from the recording only. ---
+    for exec in &record.models_executed {
+        let name = exec.model_name.clone();
+        let Some(prov) = store.get_provenance(run_id, &name).ok().flatten() else {
+            finished.insert(
+                name.clone(),
+                non_replayable_exec(
+                    &name,
+                    false,
+                    vec![
+                        "no provenance recorded for this model (the run was not \
+                         content-addressed, or auditable reuse was disabled)"
+                            .to_string(),
+                    ],
+                ),
+            );
+            continue;
+        };
+        let Ok(ir) = serde_json::from_str::<ModelIr>(&prov.model_ir_canonical_json) else {
+            finished.insert(
+                name.clone(),
+                non_replayable_exec(
+                    &name,
+                    false,
+                    vec![
+                        "embedded canonical ModelIr did not deserialize under the current engine \
+                         (IR forward-compatibility break)"
+                            .to_string(),
+                    ],
+                ),
+            );
+            continue;
+        };
+        let nondeterministic =
+            !ir.sql.trim().is_empty() && !rocky_sql::determinism::is_deterministic(&ir.sql);
+
+        match &ir.materialization {
+            rocky_ir::MaterializationStrategy::ContentAddressed {
+                partition_columns, ..
+            } if partition_columns.is_empty() => {}
+            rocky_ir::MaterializationStrategy::ContentAddressed { .. } => {
+                finished.insert(
+                    name.clone(),
+                    non_replayable_exec(
+                        &name,
+                        nondeterministic,
+                        vec![
+                            "partitioned re-execution is a later phase (the recorded hash is \
+                              per-partition, not a single whole-output digest)"
+                                .to_string(),
+                        ],
+                    ),
+                );
+                continue;
+            }
+            _ => {
+                finished.insert(
+                    name.clone(),
+                    non_replayable_exec(
+                        &name,
+                        nondeterministic,
+                        vec![
+                            "only content-addressed models carry a whole-output blake3 to compare \
+                              against"
+                                .to_string(),
+                        ],
+                    ),
+                );
+                continue;
+            }
+        }
+
+        candidates.push(DagCandidate {
+            model_name: name,
+            output_fqn: target_fqn(&ir),
+            recorded_hash: prov.output_blake3.first().cloned(),
+            nondeterministic,
+            upstreams: prov.upstreams,
+            in_run_upstreams: Vec::new(),
+            blocked_reason: None,
+            ir,
+        });
+    }
+
+    let produced: HashSet<String> = candidates.iter().map(|c| c.output_fqn.clone()).collect();
+
+    // --- Pass B: classify each candidate's upstreams into in-run edges vs a
+    // blocking external/watermark read. `upstreams` is moved out so the loop
+    // can mutate the candidate's other fields without an aliasing borrow. ---
+    for cand in &mut candidates {
+        for upstream in std::mem::take(&mut cand.upstreams) {
+            match upstream {
+                UpstreamIdentity::Content { upstream_key, .. } => {
+                    if produced.contains(&upstream_key) {
+                        cand.in_run_upstreams.push(upstream_key);
+                    } else {
+                        cand.blocked_reason = Some(format!(
+                            "upstream '{upstream_key}' is content-addressed but is not produced by \
+                             any model in this recorded run; its recorded bytes live on object \
+                             storage that the creds-free DAG replay never reads (a warehouse-path \
+                             replay is a later phase)"
+                        ));
+                        break;
+                    }
+                }
+                UpstreamIdentity::Watermark { upstream_key, .. } => {
+                    cand.blocked_reason = Some(format!(
+                        "upstream '{upstream_key}' is resolved by a freshness watermark over a \
+                         mutable source (non-replayable)"
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
+    // --- Topological order over the in-run edges (Kahn). A cycle (which the
+    // real engine's acyclic DAG never produces) leaves its members unordered;
+    // they are handled as an unmaterialised-upstream cascade below. ---
+    let order = topo_order(&candidates);
+
+    // --- Execute in order on ONE shared engine. Upstream outputs are
+    // materialised so downstreams read the replayed bytes. ---
+    let adapter = match rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory() {
+        Ok(a) => a,
+        Err(e) => {
+            // Engine start failed: every candidate is non_replayable. Directly
+            // non_replayable models keep their pass-A verdict.
+            for cand in &candidates {
+                finished.entry(cand.model_name.clone()).or_insert_with(|| {
+                    non_replayable_exec(
+                        &cand.model_name,
+                        cand.nondeterministic,
+                        vec![format!(
+                            "could not start an in-memory DuckDB engine for replay: {e}"
+                        )],
+                    )
+                });
+            }
+            return assemble(record, finished);
+        }
+    };
+    let mut attached: HashSet<String> = HashSet::new();
+    let mut materialized: HashSet<String> = HashSet::new();
+    let by_name: HashMap<&str, &DagCandidate> = candidates
+        .iter()
+        .map(|c| (c.model_name.as_str(), c))
+        .collect();
+
+    for name in order {
+        let cand = by_name[name.as_str()];
+
+        // Statically blocked (external/watermark upstream): non_replayable, no
+        // table — its downstreams cascade.
+        if let Some(reason) = &cand.blocked_reason {
+            finished.insert(
+                cand.model_name.clone(),
+                non_replayable_exec(
+                    &cand.model_name,
+                    cand.nondeterministic,
+                    vec![reason.clone()],
+                ),
+            );
+            continue;
+        }
+
+        // Fail-closed cascade: every in-run upstream must have materialised.
+        if let Some(missing) = cand
+            .in_run_upstreams
+            .iter()
+            .find(|u| !materialized.contains(*u))
+        {
+            finished.insert(
+                cand.model_name.clone(),
+                non_replayable_exec(
+                    &cand.model_name,
+                    cand.nondeterministic,
+                    vec![format!(
+                        "upstream '{missing}' could not be replayed, so its replayed output is \
+                         unavailable to feed this model (cascade)"
+                    )],
+                ),
+            );
+            continue;
+        }
+
+        finished.insert(
+            cand.model_name.clone(),
+            replay_execute_dag_node(&adapter, cand, verify, &mut attached, &mut materialized).await,
+        );
+    }
+
+    assemble(record, finished)
+}
+
+/// Execute one topologically-ready DAG node against the shared engine, compare
+/// to its recorded hash (when `verify`), and materialise its output so
+/// downstream nodes read the replayed bytes. On any execution/materialisation
+/// error the node is `non_replayable` and **no** table is created, so the
+/// fail-closed cascade denies its downstreams.
+#[cfg(feature = "duckdb")]
+async fn replay_execute_dag_node(
+    adapter: &rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+    cand: &DagCandidate,
+    verify: bool,
+    attached: &mut std::collections::HashSet<String>,
+    materialized: &mut std::collections::HashSet<String>,
+) -> ReplayExecuteModelOutput {
+    use rocky_core::traits::WarehouseAdapter;
+
+    if let Err(e) = ensure_namespace(adapter, &cand.ir, attached).await {
+        return non_replayable_exec(
+            &cand.model_name,
+            cand.nondeterministic,
+            vec![format!(
+                "re-execution could not prepare the replay namespace: {e:#}"
+            )],
+        );
+    }
+
+    // Hash the node from a direct `execute_query(sql)` — the same canonical
+    // row order the content-addressed writer recorded — against upstream tables
+    // already materialised in the shared engine.
+    let (rows, computed) = match execute_and_hash(adapter, &cand.ir).await {
+        Ok(v) => v,
+        Err(e) => {
+            return non_replayable_exec(
+                &cand.model_name,
+                cand.nondeterministic,
+                vec![format!(
+                    "re-execution could not reproduce the artifact: {e:#}"
+                )],
+            );
+        }
+    };
+
+    // Materialise this node's output so downstream `SELECT`s resolve its FQN to
+    // the replayed rows. This is an independent re-materialisation of the same
+    // recipe (a second evaluation): byte-identical to the hashed output for a
+    // deterministic recipe; for a nondeterministic one the divergence is the
+    // flagged, expected boundary. A failure here creates no table, so the
+    // downstream cascade denies dependents.
+    let ctas = format!(
+        "CREATE OR REPLACE TABLE {} AS {}",
+        cand.output_fqn, cand.ir.sql
+    );
+    if let Err(e) = adapter.execute_statement(&ctas).await {
+        return non_replayable_exec(
+            &cand.model_name,
+            cand.nondeterministic,
+            vec![format!(
+                "re-executed but could not materialise the replayed output for downstream \
+                 consumers: {e}"
+            )],
+        );
+    }
+    materialized.insert(cand.output_fqn.clone());
+
+    if !verify {
+        return ReplayExecuteModelOutput {
+            model_name: cand.model_name.clone(),
+            verdict: "executed".to_string(),
+            nondeterministic: cand.nondeterministic,
+            recorded_hash: cand.recorded_hash.clone(),
+            computed_hash: Some(computed),
+            rows: Some(rows),
+            reasons: Vec::new(),
+        };
+    }
+
+    let Some(recorded) = cand.recorded_hash.clone() else {
+        return ReplayExecuteModelOutput {
+            model_name: cand.model_name.clone(),
+            verdict: "non_replayable".to_string(),
+            nondeterministic: cand.nondeterministic,
+            recorded_hash: None,
+            computed_hash: Some(computed),
+            rows: Some(rows),
+            reasons: vec!["provenance record carried no output hash to verify against".to_string()],
+        };
+    };
+
+    if computed == recorded {
+        ReplayExecuteModelOutput {
+            model_name: cand.model_name.clone(),
+            verdict: "bit_exact".to_string(),
+            nondeterministic: cand.nondeterministic,
+            recorded_hash: Some(recorded),
+            computed_hash: Some(computed),
+            rows: Some(rows),
+            reasons: Vec::new(),
+        }
+    } else {
+        let mut reasons = vec![format!(
+            "re-executed output blake3 {} != recorded {}",
+            short_hash(&computed),
+            short_hash(&recorded)
+        )];
+        if cand.nondeterministic {
+            reasons.push(
+                "expected: the recipe contains a nondeterministic construct \
+                 (now()/random()/…), so a byte-identical replay is not guaranteed"
+                    .to_string(),
+            );
+        }
+        ReplayExecuteModelOutput {
+            model_name: cand.model_name.clone(),
+            verdict: "diverged".to_string(),
+            nondeterministic: cand.nondeterministic,
+            recorded_hash: Some(recorded),
+            computed_hash: Some(computed),
+            rows: Some(rows),
+            reasons,
+        }
+    }
+}
+
+/// Kahn topological sort of the candidates over their in-run edges. Any node
+/// left over after the queue drains (only possible under a cycle the real
+/// acyclic engine never emits) is appended so it still receives an
+/// unmaterialised-upstream cascade verdict.
+#[cfg(feature = "duckdb")]
+fn topo_order(candidates: &[DagCandidate]) -> Vec<String> {
+    use std::collections::{HashMap, VecDeque};
+
+    let mut indegree: HashMap<&str, usize> = candidates
+        .iter()
+        .map(|c| (c.model_name.as_str(), 0usize))
+        .collect();
+    // Map producer FQN → its model name, to translate upstream FQNs to nodes.
+    let producer: HashMap<&str, &str> = candidates
+        .iter()
+        .map(|c| (c.output_fqn.as_str(), c.model_name.as_str()))
+        .collect();
+    // Edges: producer → consumer. Count only in-run upstreams that map to a
+    // producer (a blocked node's external upstream contributes no edge).
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for c in candidates {
+        for up in &c.in_run_upstreams {
+            if let Some(prod) = producer.get(up.as_str()) {
+                dependents.entry(prod).or_default().push(&c.model_name);
+                *indegree.get_mut(c.model_name.as_str()).unwrap() += 1;
+            }
+        }
+    }
+
+    let mut queue: VecDeque<&str> = candidates
+        .iter()
+        .filter(|c| indegree[c.model_name.as_str()] == 0)
+        .map(|c| c.model_name.as_str())
+        .collect();
+    let mut order: Vec<String> = Vec::with_capacity(candidates.len());
+    while let Some(node) = queue.pop_front() {
+        order.push(node.to_string());
+        if let Some(children) = dependents.get(node) {
+            for child in children {
+                let d = indegree.get_mut(*child).unwrap();
+                *d -= 1;
+                if *d == 0 {
+                    queue.push_back(child);
+                }
+            }
+        }
+    }
+    // Any node not emitted sits in a cycle; append so it still gets a verdict.
+    for c in candidates {
+        if !order.iter().any(|n| n == &c.model_name) {
+            order.push(c.model_name.clone());
+        }
+    }
+    order
+}
+
+/// Assemble the per-model verdicts back into `record.models_executed` order.
+#[cfg(feature = "duckdb")]
+fn assemble(
+    record: &RunRecord,
+    mut finished: std::collections::HashMap<String, ReplayExecuteModelOutput>,
+) -> Vec<ReplayExecuteModelOutput> {
+    record
+        .models_executed
+        .iter()
+        .map(|exec| {
+            finished.remove(&exec.model_name).unwrap_or_else(|| {
+                non_replayable_exec(
+                    &exec.model_name,
+                    false,
+                    vec!["model was not reached by the replay DAG".to_string()],
+                )
+            })
+        })
+        .collect()
+}
+
+/// Execute `rocky replay --execute [--verify]`.
+///
+/// With `--model <m>`, single-model DuckDB re-execution: reconstructs the
+/// targeted model's recipe from its recorded [`ProvenanceRecord`] and, because
+/// a single model cannot resolve a recorded upstream's bytes, replays only the
+/// self-contained case. Without `--model`, the **whole run** replays in
+/// DAG order (see [`replay_execute_dag`]): each downstream reads its upstream's
+/// *replayed* output from a shared ephemeral engine.
+///
+/// In both modes the recipe comes from the recording (never the working tree),
+/// nothing is materialized to any warehouse schema, and every verdict —
+/// including `diverged` and `non_replayable` — is a classification, not a tool
+/// failure, so this returns `Ok` (exit 0) unless the run itself cannot be
+/// resolved; callers inspect `verdict` / `bit_exact_count`.
 #[cfg(feature = "duckdb")]
 pub async fn run_replay_execute(
     state_path: &Path,
@@ -618,21 +1152,22 @@ pub async fn run_replay_execute(
 
     let record = resolve(&store, target)?;
 
-    let mut models: Vec<ReplayExecuteModelOutput> = Vec::new();
-    for exec in &record.models_executed {
-        if let Some(name) = model_filter
-            && exec.model_name != name
-        {
-            continue;
+    let models: Vec<ReplayExecuteModelOutput> = if let Some(name) = model_filter {
+        let mut v: Vec<ReplayExecuteModelOutput> = Vec::new();
+        for exec in &record.models_executed {
+            if exec.model_name == name {
+                v.push(
+                    replay_execute_model(&store, &record.run_id, &exec.model_name, verify).await,
+                );
+            }
         }
-        models.push(replay_execute_model(&store, &record.run_id, &exec.model_name, verify).await);
-    }
-
-    if let Some(name) = model_filter
-        && models.is_empty()
-    {
-        anyhow::bail!("run '{}' did not execute model '{name}'", record.run_id);
-    }
+        if v.is_empty() {
+            anyhow::bail!("run '{}' did not execute model '{name}'", record.run_id);
+        }
+        v
+    } else {
+        replay_execute_dag(&store, &record, verify).await
+    };
 
     let bit_exact_count = models.iter().filter(|m| m.verdict == "bit_exact").count();
 
@@ -994,11 +1529,16 @@ mod tests {
     }
 
     #[cfg(feature = "duckdb")]
+    fn fresh_engine() -> rocky_duckdb::adapter::DuckDbWarehouseAdapter {
+        rocky_duckdb::adapter::DuckDbWarehouseAdapter::in_memory().unwrap()
+    }
+
+    #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn execute_and_hash_is_stable_across_calls() {
         let ir = ca_ir("root", "SELECT CAST(1 AS BIGINT) AS id");
-        let (rows_a, hash_a) = execute_and_hash(&ir).await.unwrap();
-        let (rows_b, hash_b) = execute_and_hash(&ir).await.unwrap();
+        let (rows_a, hash_a) = execute_and_hash(&fresh_engine(), &ir).await.unwrap();
+        let (rows_b, hash_b) = execute_and_hash(&fresh_engine(), &ir).await.unwrap();
         assert_eq!(rows_a, 1);
         assert_eq!(rows_b, 1);
         assert_eq!(
@@ -1013,8 +1553,8 @@ mod tests {
     async fn execute_and_hash_differs_for_different_output() {
         let one = ca_ir("root", "SELECT CAST(1 AS BIGINT) AS id");
         let two = ca_ir("root", "SELECT CAST(2 AS BIGINT) AS id");
-        let (_, h1) = execute_and_hash(&one).await.unwrap();
-        let (_, h2) = execute_and_hash(&two).await.unwrap();
+        let (_, h1) = execute_and_hash(&fresh_engine(), &one).await.unwrap();
+        let (_, h2) = execute_and_hash(&fresh_engine(), &two).await.unwrap();
         assert_ne!(
             h1, h2,
             "different output bytes must yield different digests (content-sensitive hash)"
@@ -1028,7 +1568,9 @@ mod tests {
         let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
         let sql = "SELECT CAST(7 AS BIGINT) AS id";
         // The recorded hash is produced by a genuine prior execution.
-        let (_, real) = execute_and_hash(&ca_ir("root", sql)).await.unwrap();
+        let (_, real) = execute_and_hash(&fresh_engine(), &ca_ir("root", sql))
+            .await
+            .unwrap();
         seed(&store, "r", "root", sql, &[], &real, true);
         let v = replay_execute_model(&store, "r", "root", true).await;
         assert_eq!(v.verdict, "bit_exact");
@@ -1048,9 +1590,12 @@ mod tests {
         // is a function of the re-executed bytes, not an echo of the seed.
         let dir = TempDir::new().unwrap();
         let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
-        let (_, hash_one) = execute_and_hash(&ca_ir("root", "SELECT CAST(1 AS BIGINT) AS id"))
-            .await
-            .unwrap();
+        let (_, hash_one) = execute_and_hash(
+            &fresh_engine(),
+            &ca_ir("root", "SELECT CAST(1 AS BIGINT) AS id"),
+        )
+        .await
+        .unwrap();
         seed(
             &store,
             "r",
