@@ -2157,7 +2157,7 @@
           "type": "string"
         },
         {
-          "description": "Permit only after human review.",
+          "description": "Permit only after human review. The safe default posture.",
           "enum": [
             "require_review"
           ],

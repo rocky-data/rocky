@@ -943,7 +943,7 @@ class PolicyEffect4(StrEnum):
 
 class PolicyEffect5(StrEnum):
     """
-    Permit only after human review.
+    Permit only after human review. The safe default posture.
     """
 
     require_review = "require_review"
