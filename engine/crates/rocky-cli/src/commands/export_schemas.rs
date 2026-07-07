@@ -25,9 +25,9 @@ use crate::output::{
     CompactOutput, CompareOutput, CompileOutput, ComplianceOutput, CostOutput, DagOutput,
     DagRunOutput, DiscoverOutput, DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput,
     HooksTestOutput, ImportDbtOutput, LineageDiffOutput, LineageOutput, LoadOutput, MetricsOutput,
-    ModelHistoryOutput, OptimizeOutput, PlanOutput, PreviewCostOutput, PreviewCreateOutput,
-    PreviewDiffOutput, PreviewRowsOutput, ProfileOutput, ProfileStorageOutput, PromotePlan,
-    RecipeHistoryOutput, ReplayCheckOutput, ReplayExecuteOutput, ReplayOutput,
+    ModelHistoryOutput, OptimizeOutput, PlanOutput, PolicyCheckOutput, PreviewCostOutput,
+    PreviewCreateOutput, PreviewDiffOutput, PreviewRowsOutput, ProfileOutput, ProfileStorageOutput,
+    PromotePlan, RecipeHistoryOutput, ReplayCheckOutput, ReplayExecuteOutput, ReplayOutput,
     RetentionStatusOutput, RetentionSweepOutput, ReviewOutput, RunOutput, SeedOutput, StateOutput,
     TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
 };
@@ -112,6 +112,7 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<RetentionStatusOutput>("retention_status"),
         entry::<RetentionSweepOutput>("state_retention_sweep"),
         entry::<ReviewOutput>("review"),
+        entry::<PolicyCheckOutput>("policy_check"),
         // Plan/apply spine (Cluster 3 B, Phase 2–3)
         entry::<ApplyOutput>("apply"),
         entry::<PromotePlan>("plan_promote"),

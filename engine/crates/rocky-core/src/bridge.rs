@@ -316,6 +316,7 @@ mod tests {
             imports: Default::default(),
             run: Default::default(),
             reuse: Default::default(),
+            policy: None,
         }
     }
 

@@ -208,6 +208,61 @@ enum ComplianceFailOn {
     Exception,
 }
 
+/// CLI spelling of the policy principal for `rocky policy check`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PolicyPrincipalArg {
+    Human,
+    Agent,
+}
+
+impl From<PolicyPrincipalArg> for rocky_core::config::PolicyPrincipal {
+    fn from(value: PolicyPrincipalArg) -> Self {
+        match value {
+            PolicyPrincipalArg::Human => Self::Human,
+            PolicyPrincipalArg::Agent => Self::Agent,
+        }
+    }
+}
+
+/// CLI spelling of the policy capability for `rocky policy check`. The
+/// dotted refinements (`schema_change.additive`, …) keep their wire names.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PolicyCapabilityArg {
+    Read,
+    Propose,
+    Apply,
+    Promote,
+    Backfill,
+    Gc,
+    Retry,
+    Quarantine,
+    #[value(name = "schema_change.additive")]
+    SchemaChangeAdditive,
+    #[value(name = "schema_change.breaking")]
+    SchemaChangeBreaking,
+    #[value(name = "value_change")]
+    ValueChange,
+}
+
+impl From<PolicyCapabilityArg> for rocky_core::config::PolicyCapability {
+    fn from(value: PolicyCapabilityArg) -> Self {
+        use rocky_core::config::PolicyCapability as C;
+        match value {
+            PolicyCapabilityArg::Read => C::Read,
+            PolicyCapabilityArg::Propose => C::Propose,
+            PolicyCapabilityArg::Apply => C::Apply,
+            PolicyCapabilityArg::Promote => C::Promote,
+            PolicyCapabilityArg::Backfill => C::Backfill,
+            PolicyCapabilityArg::Gc => C::Gc,
+            PolicyCapabilityArg::Retry => C::Retry,
+            PolicyCapabilityArg::Quarantine => C::Quarantine,
+            PolicyCapabilityArg::SchemaChangeAdditive => C::SchemaChangeAdditive,
+            PolicyCapabilityArg::SchemaChangeBreaking => C::SchemaChangeBreaking,
+            PolicyCapabilityArg::ValueChange => C::ValueChange,
+        }
+    }
+}
+
 /// Command groups (Plan 22 design)
 ///
 /// These commands will be reorganized into nested subcommand trees in a
@@ -279,6 +334,16 @@ enum Command {
         /// unblocks `rocky apply`. Without this flag the review is a dry run.
         #[arg(long)]
         approve: bool,
+    },
+
+    /// Agent-authority policy plane (explain-mode in v0).
+    ///
+    /// `rocky policy check` reports the effect the policy plane *would*
+    /// resolve for a `(principal, capability, model)` triple against the
+    /// project's `[policy]` block — it does not gate any real command yet.
+    Policy {
+        #[command(subcommand)]
+        subcommand: PolicySubcommand,
     },
 
     /// Validate config without connecting to any APIs
@@ -1902,6 +1967,31 @@ enum PreviewAction {
     },
 }
 
+/// Subcommands under `rocky policy`.
+#[derive(Subcommand)]
+enum PolicySubcommand {
+    /// Explain the policy decision for a `(principal, capability, model)`.
+    ///
+    /// Compiles the project to read the model's attributes (tags,
+    /// classifications, layer, contracted status), evaluates them against
+    /// the `[policy]` block, and prints the resolved effect + winning rule
+    /// + reason. Read-only — nothing is enforced.
+    Check {
+        /// The principal attempting the action.
+        #[arg(long, value_enum)]
+        principal: PolicyPrincipalArg,
+        /// The capability being attempted.
+        #[arg(long, value_enum)]
+        capability: PolicyCapabilityArg,
+        /// The target model name.
+        #[arg(long)]
+        model: String,
+        /// Models directory to compile for model attributes.
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
+    },
+}
+
 /// Subcommands under `rocky plan`.
 #[derive(Subcommand)]
 enum PlanSubcommand {
@@ -2391,6 +2481,21 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             base,
             approve,
         } => rocky_cli::commands::run_review(&cli.config, &plan_id, &base, approve, json).await,
+        Command::Policy { subcommand } => match subcommand {
+            PolicySubcommand::Check {
+                principal,
+                capability,
+                model,
+                models,
+            } => rocky_cli::commands::run_policy_check(
+                &cli.config,
+                &models,
+                principal.into(),
+                capability.into(),
+                &model,
+                json,
+            ),
+        },
         Command::Validate => rocky_cli::commands::validate(&cli.config, json),
         Command::Discover {
             pipeline,

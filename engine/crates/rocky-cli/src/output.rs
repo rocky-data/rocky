@@ -6025,6 +6025,52 @@ pub struct ReviewOutput {
     pub message: Option<String>,
 }
 
+/// JSON output for `rocky policy check`.
+///
+/// Explain-mode only: reports the effect the agent policy plane *would*
+/// resolve for a `(principal, capability, model)` triple, the winning rule
+/// (if any), and why. It does not gate any real command in v0.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyCheckOutput {
+    pub version: String,
+    pub command: String,
+    /// The principal that was checked (`human` / `agent`).
+    pub principal: rocky_core::config::PolicyPrincipal,
+    /// The capability that was checked.
+    pub capability: rocky_core::config::PolicyCapability,
+    /// The model that was checked.
+    pub model: String,
+    /// Resolved effect: `allow`, `require_review`, or `deny`.
+    pub effect: rocky_core::config::PolicyEffect,
+    /// Zero-based index of the winning rule in `[[policy.rules]]`, or
+    /// `null` when the decision came from a short-circuit (`read`) or the
+    /// default posture (no rule matched).
+    pub matched_rule: Option<usize>,
+    /// Human-readable explanation of how the effect was reached.
+    pub reason: String,
+    /// The compiled model attributes the matcher read.
+    pub model_attributes: PolicyModelAttributes,
+}
+
+/// The compiled attributes of the checked model, echoed back so the
+/// explain output is self-contained.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyModelAttributes {
+    /// Model-level governance tags.
+    pub tags: BTreeMap<String, String>,
+    /// Distinct column-classification values present on the model.
+    pub classifications: Vec<String>,
+    /// Medallion/semantic layer (the model's `layer` tag), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// Whether the model sits behind a contract (best-effort: a sibling
+    /// `.contract.toml` exists).
+    pub contracted: bool,
+    /// Direct downstream-consumer count (informational; `max_downstreams`
+    /// is parse-only in v0).
+    pub downstreams: u64,
+}
+
 /// JSON output for `rocky replay <run_id|latest>`.
 ///
 /// Inspection-only surface over the state store's [`RunRecord`]: shows every

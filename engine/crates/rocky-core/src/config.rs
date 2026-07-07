@@ -293,6 +293,23 @@ pub enum ConfigError {
         backend: String,
         field: String,
     },
+
+    #[error("[policy] version = {version} is unsupported; the only supported version is 1")]
+    PolicyUnsupportedVersion { version: u32 },
+
+    #[error(
+        "[policy] rules[{rule_index}] sets scope.any = true alongside other scope keys — \
+         `any` is mutually exclusive with `models`/`tags`/`classifications`/… \
+         (remove `any`, or drop the other keys)"
+    )]
+    PolicyScopeAnyConflict { rule_index: usize },
+
+    #[error(
+        "[policy] rules[{rule_index}] has an empty scope — set `scope.any = true` to match \
+         every model, or add at least one predicate (`models`, `tags`, `classifications`, \
+         `contracted`, `layer`, …)"
+    )]
+    PolicyScopeEmpty { rule_index: usize },
 }
 
 /// Concurrency strategy for table processing.
@@ -2350,6 +2367,15 @@ pub struct RockyConfig {
     /// any doubt. See [`ReuseConfig`].
     #[serde(default)]
     pub reuse: ReuseConfig,
+
+    /// Agent-authority policy plane (explain-mode in v0). Declares, per
+    /// `(principal, capability, scope)`, whether an action is allowed,
+    /// requires human review, or is denied. Absent `[policy]` block ⇒ no
+    /// rules and the default posture applies (agents on mutating actions
+    /// fall to `default_agent_effect`, humans are never gated). See
+    /// [`PolicyConfig`] and [`crate::policy`] for the evaluator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyConfig>,
 }
 
 /// `[run]` — opt-in tuning for the model-skip gate.
@@ -2411,6 +2437,244 @@ pub struct ReuseConfig {
     /// written, no per-model hashing cost is paid, and no model reuses.
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Who is attempting an action.
+///
+/// `agent` is a non-human caller (an AI harness authoring, applying, or
+/// remediating). `human` is a person. In v0 the principal is supplied
+/// explicitly (`rocky policy check --principal …`); auto-detection is a
+/// later phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyPrincipal {
+    /// A person.
+    Human,
+    /// A non-human caller (AI agent / automation).
+    Agent,
+}
+
+/// The class of action a policy rule governs.
+///
+/// `read` is always allowed (short-circuit). The mutating verbs (`propose`
+/// … `quarantine`) name coarse operations; `schema_change.additive`,
+/// `schema_change.breaking`, and `value_change` are *refinements* of the
+/// apply/promote verbs — a rule naming a bare verb (`apply`/`promote`)
+/// matches those refinements too, but a rule naming a refinement matches
+/// only that exact refinement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyCapability {
+    /// Read model output / metadata. Always allowed.
+    Read,
+    /// Draft a plan for later review.
+    Propose,
+    /// Apply a plan against the warehouse.
+    Apply,
+    /// Promote a branch / environment.
+    Promote,
+    /// Backfill historical partitions.
+    Backfill,
+    /// Garbage-collect / reclaim storage.
+    Gc,
+    /// Retry a failed run.
+    Retry,
+    /// Quarantine a partition / model.
+    Quarantine,
+    /// An additive schema change (refinement of apply/promote).
+    #[serde(rename = "schema_change.additive")]
+    SchemaChangeAdditive,
+    /// A breaking schema change (refinement of apply/promote).
+    #[serde(rename = "schema_change.breaking")]
+    SchemaChangeBreaking,
+    /// A value-only data change (refinement of apply/promote).
+    #[serde(rename = "value_change")]
+    ValueChange,
+}
+
+impl PolicyCapability {
+    /// `true` when this capability is a refinement of a bare mutation verb
+    /// (`schema_change.*` / `value_change`). A rule naming a refinement
+    /// carries one extra "capability" constraint over a rule naming the
+    /// bare verb, and only matches its exact refinement input.
+    pub fn is_refinement(self) -> bool {
+        matches!(
+            self,
+            PolicyCapability::SchemaChangeAdditive
+                | PolicyCapability::SchemaChangeBreaking
+                | PolicyCapability::ValueChange
+        )
+    }
+
+    /// Whether a rule naming `self` matches an input capability `input`.
+    ///
+    /// Exact match always holds. Additionally, a rule naming the bare
+    /// `apply` or `promote` verb matches any of the refinement inputs
+    /// (`schema_change.*` / `value_change`) — the refinements happen *at*
+    /// apply/promote time, so a policy on the bare verb governs them too.
+    /// A rule naming a refinement matches only that exact refinement.
+    pub fn matches_input(self, input: PolicyCapability) -> bool {
+        if self == input {
+            return true;
+        }
+        matches!(self, PolicyCapability::Apply | PolicyCapability::Promote) && input.is_refinement()
+    }
+}
+
+/// The verdict a policy rule (or the default posture) yields.
+///
+/// Ordered by restrictiveness for incomparable-rule tie-breaking:
+/// `Deny` is a hard override (handled separately), and among non-deny
+/// verdicts `RequireReview` is more restrictive than `Allow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyEffect {
+    /// Permit the action outright.
+    Allow,
+    /// Permit only after human review. The safe default posture.
+    #[default]
+    RequireReview,
+    /// Refuse the action. A hard override — no `allow` overturns it.
+    Deny,
+}
+
+/// Scope of a policy rule — the AND of every present predicate. A model
+/// matches the scope only when it satisfies *all* set keys.
+///
+/// `any = true` is the empty scope (matches every model, zero
+/// constraints) and is mutually exclusive with every other key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyScope {
+    /// Match every model. Mutually exclusive with all other keys; carries
+    /// zero constraints, so any rule with a real predicate outranks it.
+    #[serde(default)]
+    pub any: bool,
+
+    /// Glob selectors over the model name (`*`/`?`). Satisfied when the
+    /// model name matches at least one pattern.
+    #[serde(default)]
+    pub models: Vec<String>,
+
+    /// Required model tags (AND of `key = value` pairs). Satisfied when the
+    /// model carries every listed tag with the exact value.
+    #[serde(default)]
+    pub tags: std::collections::BTreeMap<String, String>,
+
+    /// Classification guard (positive). Satisfied when the model has at
+    /// least one column classified with any listed value (e.g. `["pii"]`).
+    #[serde(default)]
+    pub classifications: Vec<String>,
+
+    /// Classification guard (negative). Satisfied when the model has *no*
+    /// column classified with any listed value — e.g.
+    /// `exclude_classifications = ["pii"]` matches only non-PII models.
+    #[serde(default)]
+    pub exclude_classifications: Vec<String>,
+
+    /// Contract-boundary guard. Satisfied when the model's contracted
+    /// status equals this value. (v0 reads contracted status best-effort
+    /// from a sibling `.contract.toml`; see [`crate::policy`].)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contracted: Option<bool>,
+
+    /// Medallion/semantic layer guard. Satisfied when the model's `layer`
+    /// tag equals this value (v0 reads layer from the model's `layer` tag).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+
+    /// Blast-radius guard: maximum downstream count. **Parse-only in v0**
+    /// — accepted and validated but not yet evaluated by the matcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_downstreams: Option<u64>,
+}
+
+impl PolicyScope {
+    /// `true` when any key other than `any` is set.
+    fn has_real_predicate(&self) -> bool {
+        !self.models.is_empty()
+            || !self.tags.is_empty()
+            || !self.classifications.is_empty()
+            || !self.exclude_classifications.is_empty()
+            || self.contracted.is_some()
+            || self.layer.is_some()
+            || self.max_downstreams.is_some()
+    }
+}
+
+/// One `[[policy.rules]]` entry: `(principal, capability, scope) → effect`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyRule {
+    /// Who this rule applies to.
+    pub principal: PolicyPrincipal,
+    /// Which capability this rule governs.
+    pub capability: PolicyCapability,
+    /// The models this rule covers. Defaults to the empty scope, which is
+    /// *not* `any` — an all-default scope with no `any = true` matches
+    /// nothing and is rejected at validation.
+    #[serde(default)]
+    pub scope: PolicyScope,
+    /// The verdict when this rule matches.
+    pub effect: PolicyEffect,
+    /// Optional v1 conditional refinements. **Parsed and ignored in v0** —
+    /// captured as opaque JSON so a config authored for v1 still loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<serde_json::Value>,
+}
+
+/// The `[policy]` block: agent-authority policy for this project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyConfig {
+    /// Schema version. Must be `1`.
+    pub version: u32,
+    /// Effect for an `agent` on a mutating capability when no rule matches.
+    /// Defaults to `require_review` (the safe posture).
+    #[serde(default)]
+    pub default_agent_effect: PolicyEffect,
+    /// Ordered list of rules. Evaluated as a set (order only breaks final
+    /// ties); see [`crate::policy::evaluate`].
+    #[serde(default, rename = "rules")]
+    pub rules: Vec<PolicyRule>,
+}
+
+impl PolicyConfig {
+    /// The default posture applied when no `[policy]` block is present:
+    /// version 1, agents on mutating actions require review, no rules.
+    pub fn default_posture() -> Self {
+        PolicyConfig {
+            version: 1,
+            default_agent_effect: PolicyEffect::RequireReview,
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// Validates the `[policy]` block: `version` must be 1, and every rule's
+/// scope must be well-formed (`any = true` is mutually exclusive with all
+/// other scope keys; a scope with neither `any` nor any real predicate is
+/// rejected). Returns every problem found.
+pub fn validate_policy(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    let Some(policy) = &config.policy else {
+        return errors;
+    };
+    if policy.version != 1 {
+        errors.push(ConfigError::PolicyUnsupportedVersion {
+            version: policy.version,
+        });
+    }
+    for (idx, rule) in policy.rules.iter().enumerate() {
+        let has_real = rule.scope.has_real_predicate();
+        if rule.scope.any && has_real {
+            errors.push(ConfigError::PolicyScopeAnyConflict { rule_index: idx });
+        }
+        if !rule.scope.any && !has_real {
+            errors.push(ConfigError::PolicyScopeEmpty { rule_index: idx });
+        }
+    }
+    errors
 }
 
 impl RockyConfig {
@@ -4923,6 +5187,9 @@ pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     if let Some(first) = validate_fivetran_resilience(&config).into_iter().next() {
         return Err(first);
     }
+    if let Some(first) = validate_policy(&config).into_iter().next() {
+        return Err(first);
+    }
     Ok(config)
 }
 
@@ -5316,6 +5583,170 @@ max_retries = ${ROCKY_TEST_BAD_TIMEOUT}
             "expected exactly one kind error, got {errors:?}"
         );
         errors.remove(0)
+    }
+
+    // --- [policy] parsing + validation ---
+
+    #[test]
+    fn policy_block_parses_and_validates_clean() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { contracted = true }
+effect = "deny"
+
+[[policy.rules]]
+principal = "agent"
+capability = "schema_change.additive"
+scope = { layer = "bronze", exclude_classifications = ["pii"] }
+effect = "allow"
+"#,
+        );
+        let policy = cfg.policy.as_ref().expect("[policy] present");
+        assert_eq!(policy.version, 1);
+        assert_eq!(policy.default_agent_effect, PolicyEffect::RequireReview);
+        assert_eq!(policy.rules.len(), 2);
+        assert_eq!(policy.rules[0].capability, PolicyCapability::Apply);
+        assert_eq!(policy.rules[0].scope.contracted, Some(true));
+        assert_eq!(
+            policy.rules[1].capability,
+            PolicyCapability::SchemaChangeAdditive
+        );
+        assert!(validate_policy(&cfg).is_empty());
+    }
+
+    #[test]
+    fn policy_default_agent_effect_defaults_to_require_review() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+"#,
+        );
+        let policy = cfg.policy.as_ref().unwrap();
+        assert_eq!(policy.default_agent_effect, PolicyEffect::RequireReview);
+        assert!(policy.rules.is_empty());
+    }
+
+    #[test]
+    fn policy_rejects_unsupported_version() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 2
+"#,
+        );
+        let errors = validate_policy(&cfg);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::PolicyUnsupportedVersion { version: 2 }]
+            ),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn policy_rejects_any_with_other_scope_keys() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true, contracted = true }
+effect = "deny"
+"#,
+        );
+        let errors = validate_policy(&cfg);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::PolicyScopeAnyConflict { rule_index: 0 }]
+            ),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn policy_rejects_empty_scope() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = {}
+effect = "deny"
+"#,
+        );
+        let errors = validate_policy(&cfg);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::PolicyScopeEmpty { rule_index: 0 }]
+            ),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn policy_rejects_unknown_capability_at_parse_time() {
+        let err = toml::from_str::<RockyConfig>(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "delete_everything"
+scope = { any = true }
+effect = "deny"
+"#,
+        );
+        assert!(err.is_err(), "unknown capability must fail to deserialize");
+    }
+
+    #[test]
+    fn policy_conditions_are_parsed_and_ignored() {
+        // v1 rule `conditions` load without error in v0 (opaque, ignored).
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "require_review"
+conditions = { time_window = "business_hours" }
+"#,
+        );
+        assert!(validate_policy(&cfg).is_empty());
+        assert!(cfg.policy.unwrap().rules[0].conditions.is_some());
+    }
+
+    #[test]
+    fn no_policy_block_leaves_policy_none() {
+        let cfg = parse(
+            r#"
+[adapter.local]
+type = "duckdb"
+"#,
+        );
+        assert!(cfg.policy.is_none());
+        assert!(validate_policy(&cfg).is_empty());
     }
 
     #[test]
