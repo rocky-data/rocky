@@ -845,6 +845,178 @@ class Type26(StrEnum):
     load = "load"
 
 
+class PolicyCapability(StrEnum):
+    """
+    Read model output / metadata. Always allowed.
+    """
+
+    read = "read"
+
+
+class PolicyCapability14(StrEnum):
+    """
+    Draft a plan for later review.
+    """
+
+    propose = "propose"
+
+
+class PolicyCapability15(StrEnum):
+    """
+    Apply a plan against the warehouse.
+    """
+
+    apply = "apply"
+
+
+class PolicyCapability16(StrEnum):
+    """
+    Promote a branch / environment.
+    """
+
+    promote = "promote"
+
+
+class PolicyCapability17(StrEnum):
+    """
+    Backfill historical partitions.
+    """
+
+    backfill = "backfill"
+
+
+class PolicyCapability18(StrEnum):
+    """
+    Garbage-collect / reclaim storage.
+    """
+
+    gc = "gc"
+
+
+class PolicyCapability19(StrEnum):
+    """
+    Retry a failed run.
+    """
+
+    retry = "retry"
+
+
+class PolicyCapability20(StrEnum):
+    """
+    Quarantine a partition / model.
+    """
+
+    quarantine = "quarantine"
+
+
+class PolicyCapability21(StrEnum):
+    """
+    An additive schema change (refinement of apply/promote).
+    """
+
+    schema_change_additive = "schema_change.additive"
+
+
+class PolicyCapability22(StrEnum):
+    """
+    A breaking schema change (refinement of apply/promote).
+    """
+
+    schema_change_breaking = "schema_change.breaking"
+
+
+class PolicyCapability23(StrEnum):
+    """
+    A value-only data change (refinement of apply/promote).
+    """
+
+    value_change = "value_change"
+
+
+class PolicyEffect4(StrEnum):
+    """
+    Permit the action outright.
+    """
+
+    allow = "allow"
+
+
+class PolicyEffect5(StrEnum):
+    """
+    Permit only after human review.
+    """
+
+    require_review = "require_review"
+
+
+class PolicyEffect6(StrEnum):
+    """
+    Refuse the action. A hard override — no `allow` overturns it.
+    """
+
+    deny = "deny"
+
+
+class PolicyPrincipal(StrEnum):
+    """
+    A person.
+    """
+
+    human = "human"
+
+
+class PolicyPrincipal5(StrEnum):
+    """
+    A non-human caller (AI agent / automation).
+    """
+
+    agent = "agent"
+
+
+class PolicyScope(BaseModel):
+    """
+    Scope of a policy rule — the AND of every present predicate. A model matches the scope only when it satisfies *all* set keys.
+
+    `any = true` is the empty scope (matches every model, zero constraints) and is mutually exclusive with every other key.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    any: bool | None = False
+    """
+    Match every model. Mutually exclusive with all other keys; carries zero constraints, so any rule with a real predicate outranks it.
+    """
+    classifications: list[str] | None = []
+    """
+    Classification guard (positive). Satisfied when the model has at least one column classified with any listed value (e.g. `["pii"]`).
+    """
+    contracted: bool | None = None
+    """
+    Contract-boundary guard. Satisfied when the model's contracted status equals this value. (v0 reads contracted status best-effort from a sibling `.contract.toml`; see [`crate::policy`].)
+    """
+    exclude_classifications: list[str] | None = []
+    """
+    Classification guard (negative). Satisfied when the model has *no* column classified with any listed value — e.g. `exclude_classifications = ["pii"]` matches only non-PII models.
+    """
+    layer: str | None = None
+    """
+    Medallion/semantic layer guard. Satisfied when the model's `layer` tag equals this value (v0 reads layer from the model's `layer` tag).
+    """
+    max_downstreams: conint(ge=0) | None = None
+    """
+    Blast-radius guard: maximum downstream count. **Parse-only in v0** — accepted and validated but not yet evaluated by the matcher.
+    """
+    models: list[str] | None = []
+    """
+    Glob selectors over the model name (`*`/`?`). Satisfied when the model name matches at least one pattern.
+    """
+    tags: dict[str, str] | None = {}
+    """
+    Required model tags (AND of `key = value` pairs). Satisfied when the model carries every listed tag with the exact value.
+    """
+
+
 class PortabilityConfig(BaseModel):
     """
     Project-wide dialect portability configuration.
@@ -1805,6 +1977,57 @@ class PipelineSourceConfig(BaseModel):
     """
 
 
+class PolicyRule(BaseModel):
+    """
+    One `[[policy.rules]]` entry: `(principal, capability, scope) → effect`.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    capability: (
+        PolicyCapability
+        | PolicyCapability14
+        | PolicyCapability15
+        | PolicyCapability16
+        | PolicyCapability17
+        | PolicyCapability18
+        | PolicyCapability19
+        | PolicyCapability20
+        | PolicyCapability21
+        | PolicyCapability22
+        | PolicyCapability23
+    )
+    """
+    Which capability this rule governs.
+    """
+    conditions: Any | None = None
+    """
+    Optional v1 conditional refinements. **Parsed and ignored in v0** — captured as opaque JSON so a config authored for v1 still loads.
+    """
+    effect: PolicyEffect4 | PolicyEffect5 | PolicyEffect6
+    """
+    The verdict when this rule matches.
+    """
+    principal: PolicyPrincipal | PolicyPrincipal5
+    """
+    Who this rule applies to.
+    """
+    scope: PolicyScope | None = Field(
+        {
+            "any": False,
+            "classifications": [],
+            "exclude_classifications": [],
+            "models": [],
+            "tags": {},
+        },
+        validate_default=True,
+    )
+    """
+    The models this rule covers. Defaults to the empty scope, which is *not* `any` — an all-default scope with no `any = true` matches nothing and is rejected at validation.
+    """
+
+
 class ProjectFreshnessConfig(BaseModel):
     """
     Project-level freshness defaults.
@@ -2579,6 +2802,30 @@ class PipelineTargetConfig(BaseModel):
     """
 
 
+class PolicyConfig(BaseModel):
+    """
+    The `[policy]` block: agent-authority policy for this project.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    default_agent_effect: PolicyEffect4 | PolicyEffect5 | PolicyEffect6 | None = (
+        "require_review"
+    )
+    """
+    Effect for an `agent` on a mutating capability when no rule matches. Defaults to `require_review` (the safe posture).
+    """
+    rules: list[PolicyRule] | None = Field([], validate_default=True)
+    """
+    Ordered list of rules. Evaluated as a set (order only breaks final ties); see [`crate::policy::evaluate`].
+    """
+    version: conint(ge=0)
+    """
+    Schema version. Must be `1`.
+    """
+
+
 class QualityPipelineConfig(BaseModel):
     """
     Quality pipeline configuration — standalone data quality checks.
@@ -3257,6 +3504,10 @@ class RockyConfig(BaseModel):
     ) = Field({}, validate_default=True)
     """
     Named pipeline configurations (keyed by pipeline name).
+    """
+    policy: PolicyConfig | None = None
+    """
+    Agent-authority policy plane (explain-mode in v0). Declares, per `(principal, capability, scope)`, whether an action is allowed, requires human review, or is denied. Absent `[policy]` block ⇒ no rules and the default posture applies (agents on mutating actions fall to `default_agent_effect`, humans are never gated). See [`PolicyConfig`] and [`crate::policy`] for the evaluator.
     """
     portability: PortabilityConfig | None = Field(
         {"allow": [], "target_dialect": None}, validate_default=True

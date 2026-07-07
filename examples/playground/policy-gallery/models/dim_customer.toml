@@ -1,0 +1,12 @@
+name = "dim_customer"
+
+[target]
+catalog = "poc"
+schema = "silver"
+table = "dim_customer"
+
+[tags]
+layer = "silver"
+
+[classification]
+email = "pii"

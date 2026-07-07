@@ -2526,21 +2526,16 @@ impl PolicyCapability {
 /// Ordered by restrictiveness for incomparable-rule tie-breaking:
 /// `Deny` is a hard override (handled separately), and among non-deny
 /// verdicts `RequireReview` is more restrictive than `Allow`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyEffect {
     /// Permit the action outright.
     Allow,
-    /// Permit only after human review.
+    /// Permit only after human review. The safe default posture.
+    #[default]
     RequireReview,
     /// Refuse the action. A hard override — no `allow` overturns it.
     Deny,
-}
-
-impl Default for PolicyEffect {
-    fn default() -> Self {
-        PolicyEffect::RequireReview
-    }
 }
 
 /// Scope of a policy rule — the AND of every present predicate. A model
@@ -5588,6 +5583,170 @@ max_retries = ${ROCKY_TEST_BAD_TIMEOUT}
             "expected exactly one kind error, got {errors:?}"
         );
         errors.remove(0)
+    }
+
+    // --- [policy] parsing + validation ---
+
+    #[test]
+    fn policy_block_parses_and_validates_clean() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { contracted = true }
+effect = "deny"
+
+[[policy.rules]]
+principal = "agent"
+capability = "schema_change.additive"
+scope = { layer = "bronze", exclude_classifications = ["pii"] }
+effect = "allow"
+"#,
+        );
+        let policy = cfg.policy.as_ref().expect("[policy] present");
+        assert_eq!(policy.version, 1);
+        assert_eq!(policy.default_agent_effect, PolicyEffect::RequireReview);
+        assert_eq!(policy.rules.len(), 2);
+        assert_eq!(policy.rules[0].capability, PolicyCapability::Apply);
+        assert_eq!(policy.rules[0].scope.contracted, Some(true));
+        assert_eq!(
+            policy.rules[1].capability,
+            PolicyCapability::SchemaChangeAdditive
+        );
+        assert!(validate_policy(&cfg).is_empty());
+    }
+
+    #[test]
+    fn policy_default_agent_effect_defaults_to_require_review() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+"#,
+        );
+        let policy = cfg.policy.as_ref().unwrap();
+        assert_eq!(policy.default_agent_effect, PolicyEffect::RequireReview);
+        assert!(policy.rules.is_empty());
+    }
+
+    #[test]
+    fn policy_rejects_unsupported_version() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 2
+"#,
+        );
+        let errors = validate_policy(&cfg);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::PolicyUnsupportedVersion { version: 2 }]
+            ),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn policy_rejects_any_with_other_scope_keys() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true, contracted = true }
+effect = "deny"
+"#,
+        );
+        let errors = validate_policy(&cfg);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::PolicyScopeAnyConflict { rule_index: 0 }]
+            ),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn policy_rejects_empty_scope() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = {}
+effect = "deny"
+"#,
+        );
+        let errors = validate_policy(&cfg);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::PolicyScopeEmpty { rule_index: 0 }]
+            ),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn policy_rejects_unknown_capability_at_parse_time() {
+        let err = toml::from_str::<RockyConfig>(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "delete_everything"
+scope = { any = true }
+effect = "deny"
+"#,
+        );
+        assert!(err.is_err(), "unknown capability must fail to deserialize");
+    }
+
+    #[test]
+    fn policy_conditions_are_parsed_and_ignored() {
+        // v1 rule `conditions` load without error in v0 (opaque, ignored).
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "require_review"
+conditions = { time_window = "business_hours" }
+"#,
+        );
+        assert!(validate_policy(&cfg).is_empty());
+        assert!(cfg.policy.unwrap().rules[0].conditions.is_some());
+    }
+
+    #[test]
+    fn no_policy_block_leaves_policy_none() {
+        let cfg = parse(
+            r#"
+[adapter.local]
+type = "duckdb"
+"#,
+        );
+        assert!(cfg.policy.is_none());
+        assert!(validate_policy(&cfg).is_empty());
     }
 
     #[test]

@@ -41,6 +41,7 @@ mod metrics;
 mod optimize;
 pub mod plan;
 mod playground;
+mod policy;
 mod preview;
 mod preview_rows;
 mod profile;
@@ -125,6 +126,7 @@ pub use plan::{
     PlanRunOptions, plan, plan_preview_output, plan_promote, populate_governance_actions,
 };
 pub use playground::{run_playground, run_playground_with_template};
+pub use policy::run_policy_check;
 pub use preview::{
     PreviewDiffAlgorithmSelector, run_preview_cost, run_preview_create, run_preview_diff,
 };

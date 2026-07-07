@@ -2031,6 +2031,287 @@
       ],
       "description": "Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.\n\nThe flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload references [`PipelineConfig`] directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the five pipeline variants."
     },
+    "PolicyCapability": {
+      "description": "The class of action a policy rule governs.\n\n`read` is always allowed (short-circuit). The mutating verbs (`propose` … `quarantine`) name coarse operations; `schema_change.additive`, `schema_change.breaking`, and `value_change` are *refinements* of the apply/promote verbs — a rule naming a bare verb (`apply`/`promote`) matches those refinements too, but a rule naming a refinement matches only that exact refinement.",
+      "oneOf": [
+        {
+          "description": "Read model output / metadata. Always allowed.",
+          "enum": [
+            "read"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Draft a plan for later review.",
+          "enum": [
+            "propose"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Apply a plan against the warehouse.",
+          "enum": [
+            "apply"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Promote a branch / environment.",
+          "enum": [
+            "promote"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Backfill historical partitions.",
+          "enum": [
+            "backfill"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Garbage-collect / reclaim storage.",
+          "enum": [
+            "gc"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Retry a failed run.",
+          "enum": [
+            "retry"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Quarantine a partition / model.",
+          "enum": [
+            "quarantine"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "An additive schema change (refinement of apply/promote).",
+          "enum": [
+            "schema_change.additive"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A breaking schema change (refinement of apply/promote).",
+          "enum": [
+            "schema_change.breaking"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A value-only data change (refinement of apply/promote).",
+          "enum": [
+            "value_change"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyConfig": {
+      "additionalProperties": false,
+      "description": "The `[policy]` block: agent-authority policy for this project.",
+      "properties": {
+        "default_agent_effect": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PolicyEffect"
+            }
+          ],
+          "default": "require_review",
+          "description": "Effect for an `agent` on a mutating capability when no rule matches. Defaults to `require_review` (the safe posture)."
+        },
+        "rules": {
+          "default": [],
+          "description": "Ordered list of rules. Evaluated as a set (order only breaks final ties); see [`crate::policy::evaluate`].",
+          "items": {
+            "$ref": "#/definitions/PolicyRule"
+          },
+          "type": "array"
+        },
+        "version": {
+          "description": "Schema version. Must be `1`.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "version"
+      ],
+      "type": "object"
+    },
+    "PolicyEffect": {
+      "description": "The verdict a policy rule (or the default posture) yields.\n\nOrdered by restrictiveness for incomparable-rule tie-breaking: `Deny` is a hard override (handled separately), and among non-deny verdicts `RequireReview` is more restrictive than `Allow`.",
+      "oneOf": [
+        {
+          "description": "Permit the action outright.",
+          "enum": [
+            "allow"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Permit only after human review.",
+          "enum": [
+            "require_review"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Refuse the action. A hard override — no `allow` overturns it.",
+          "enum": [
+            "deny"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyPrincipal": {
+      "description": "Who is attempting an action.\n\n`agent` is a non-human caller (an AI harness authoring, applying, or remediating). `human` is a person. In v0 the principal is supplied explicitly (`rocky policy check --principal …`); auto-detection is a later phase.",
+      "oneOf": [
+        {
+          "description": "A person.",
+          "enum": [
+            "human"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A non-human caller (AI agent / automation).",
+          "enum": [
+            "agent"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyRule": {
+      "additionalProperties": false,
+      "description": "One `[[policy.rules]]` entry: `(principal, capability, scope) → effect`.",
+      "properties": {
+        "capability": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PolicyCapability"
+            }
+          ],
+          "description": "Which capability this rule governs."
+        },
+        "conditions": {
+          "description": "Optional v1 conditional refinements. **Parsed and ignored in v0** — captured as opaque JSON so a config authored for v1 still loads."
+        },
+        "effect": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PolicyEffect"
+            }
+          ],
+          "description": "The verdict when this rule matches."
+        },
+        "principal": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PolicyPrincipal"
+            }
+          ],
+          "description": "Who this rule applies to."
+        },
+        "scope": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PolicyScope"
+            }
+          ],
+          "default": {
+            "any": false,
+            "classifications": [],
+            "exclude_classifications": [],
+            "models": [],
+            "tags": {}
+          },
+          "description": "The models this rule covers. Defaults to the empty scope, which is *not* `any` — an all-default scope with no `any = true` matches nothing and is rejected at validation."
+        }
+      },
+      "required": [
+        "capability",
+        "effect",
+        "principal"
+      ],
+      "type": "object"
+    },
+    "PolicyScope": {
+      "additionalProperties": false,
+      "description": "Scope of a policy rule — the AND of every present predicate. A model matches the scope only when it satisfies *all* set keys.\n\n`any = true` is the empty scope (matches every model, zero constraints) and is mutually exclusive with every other key.",
+      "properties": {
+        "any": {
+          "default": false,
+          "description": "Match every model. Mutually exclusive with all other keys; carries zero constraints, so any rule with a real predicate outranks it.",
+          "type": "boolean"
+        },
+        "classifications": {
+          "default": [],
+          "description": "Classification guard (positive). Satisfied when the model has at least one column classified with any listed value (e.g. `[\"pii\"]`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "contracted": {
+          "description": "Contract-boundary guard. Satisfied when the model's contracted status equals this value. (v0 reads contracted status best-effort from a sibling `.contract.toml`; see [`crate::policy`].)",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "exclude_classifications": {
+          "default": [],
+          "description": "Classification guard (negative). Satisfied when the model has *no* column classified with any listed value — e.g. `exclude_classifications = [\"pii\"]` matches only non-PII models.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "layer": {
+          "description": "Medallion/semantic layer guard. Satisfied when the model's `layer` tag equals this value (v0 reads layer from the model's `layer` tag).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_downstreams": {
+          "description": "Blast-radius guard: maximum downstream count. **Parse-only in v0** — accepted and validated but not yet evaluated by the matcher.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "models": {
+          "default": [],
+          "description": "Glob selectors over the model name (`*`/`?`). Satisfied when the model name matches at least one pattern.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tags": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Required model tags (AND of `key = value` pairs). Satisfied when the model carries every listed tag with the exact value.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
     "PortabilityConfig": {
       "additionalProperties": false,
       "description": "Project-wide dialect portability configuration.\n\nLives at the top level because a Rocky project targets one warehouse; per-pipeline overrides aren't supported yet (no demand signal). The `allow` list applies to every model — a per-model override is the `-- rocky-allow: <constructs>` pragma in the model SQL itself, parsed by [`rocky_sql::pragma`].",
@@ -3868,6 +4149,17 @@
       ],
       "default": {},
       "description": "Named pipeline configurations (keyed by pipeline name)."
+    },
+    "policy": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/PolicyConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Agent-authority policy plane (explain-mode in v0). Declares, per `(principal, capability, scope)`, whether an action is allowed, requires human review, or is denied. Absent `[policy]` block ⇒ no rules and the default posture applies (agents on mutating actions fall to `default_agent_effect`, humans are never gated). See [`PolicyConfig`] and [`crate::policy`] for the evaluator."
     },
     "portability": {
       "allOf": [

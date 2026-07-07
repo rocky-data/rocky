@@ -1,0 +1,14 @@
+# A sibling contract makes fct_orders a contracted model — the policy plane's
+# `scope.contracted = true` guard matches it.
+[[columns]]
+name = "order_id"
+type = "Int64"
+nullable = true
+
+[[columns]]
+name = "amount"
+type = "Int64"
+nullable = true
+
+[rules]
+required = ["order_id", "amount"]

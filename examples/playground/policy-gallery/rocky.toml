@@ -1,0 +1,59 @@
+# Policy-plane gallery — a runnable `[policy]` block over three tiny models.
+#
+# Explain-mode only: drive it with `rocky policy check` to see how the agent
+# policy plane resolves a `(principal, capability, model)` triple. Nothing is
+# enforced here — the decision is reported, not applied.
+#
+#   rocky --config rocky.toml policy check \
+#     --principal agent --capability apply --model fct_orders --models models
+#
+# The three models cover the killer cases:
+#   fct_orders   — contracted (sibling .contract.toml), layer=gold
+#   dim_customer — layer=silver, column `email` classified pii
+#   raw_events   — layer=bronze, no classifications
+
+[adapter]
+type = "duckdb"
+path = "playground.duckdb"
+
+[pipeline.gallery]
+type = "transformation"
+models = "models/**"
+
+[pipeline.gallery.target.governance]
+auto_create_schemas = true
+
+[policy]
+version = 1
+default_agent_effect = "require_review"
+
+# An agent may never apply a change to a contracted model — a hard deny that
+# no allow can overturn.
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { contracted = true }
+effect = "deny"
+
+# An agent may make additive schema changes to a bronze, non-PII model.
+[[policy.rules]]
+principal = "agent"
+capability = "schema_change.additive"
+scope = { layer = "bronze", exclude_classifications = ["pii"] }
+effect = "allow"
+
+# An agent may apply to a silver-layer model.
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { layer = "silver" }
+effect = "allow"
+
+# An agent applying to any model that carries PII requires human review.
+# For a silver PII model this overlaps the rule above with an incomparable
+# constraint set, so the most-restrictive effect (require_review) wins.
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { classifications = ["pii"] }
+effect = "require_review"

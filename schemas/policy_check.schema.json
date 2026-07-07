@@ -1,0 +1,245 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "PolicyCapability": {
+      "description": "The class of action a policy rule governs.\n\n`read` is always allowed (short-circuit). The mutating verbs (`propose` … `quarantine`) name coarse operations; `schema_change.additive`, `schema_change.breaking`, and `value_change` are *refinements* of the apply/promote verbs — a rule naming a bare verb (`apply`/`promote`) matches those refinements too, but a rule naming a refinement matches only that exact refinement.",
+      "oneOf": [
+        {
+          "description": "Read model output / metadata. Always allowed.",
+          "enum": [
+            "read"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Draft a plan for later review.",
+          "enum": [
+            "propose"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Apply a plan against the warehouse.",
+          "enum": [
+            "apply"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Promote a branch / environment.",
+          "enum": [
+            "promote"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Backfill historical partitions.",
+          "enum": [
+            "backfill"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Garbage-collect / reclaim storage.",
+          "enum": [
+            "gc"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Retry a failed run.",
+          "enum": [
+            "retry"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Quarantine a partition / model.",
+          "enum": [
+            "quarantine"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "An additive schema change (refinement of apply/promote).",
+          "enum": [
+            "schema_change.additive"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A breaking schema change (refinement of apply/promote).",
+          "enum": [
+            "schema_change.breaking"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A value-only data change (refinement of apply/promote).",
+          "enum": [
+            "value_change"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyEffect": {
+      "description": "The verdict a policy rule (or the default posture) yields.\n\nOrdered by restrictiveness for incomparable-rule tie-breaking: `Deny` is a hard override (handled separately), and among non-deny verdicts `RequireReview` is more restrictive than `Allow`.",
+      "oneOf": [
+        {
+          "description": "Permit the action outright.",
+          "enum": [
+            "allow"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Permit only after human review. The safe default posture.",
+          "enum": [
+            "require_review"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Refuse the action. A hard override — no `allow` overturns it.",
+          "enum": [
+            "deny"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyModelAttributes": {
+      "description": "The compiled attributes of the checked model, echoed back so the explain output is self-contained.",
+      "properties": {
+        "classifications": {
+          "description": "Distinct column-classification values present on the model.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "contracted": {
+          "description": "Whether the model sits behind a contract (best-effort: a sibling `.contract.toml` exists).",
+          "type": "boolean"
+        },
+        "downstreams": {
+          "description": "Direct downstream-consumer count (informational; `max_downstreams` is parse-only in v0).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "layer": {
+          "description": "Medallion/semantic layer (the model's `layer` tag), if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tags": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Model-level governance tags.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "classifications",
+        "contracted",
+        "downstreams",
+        "tags"
+      ],
+      "type": "object"
+    },
+    "PolicyPrincipal": {
+      "description": "Who is attempting an action.\n\n`agent` is a non-human caller (an AI harness authoring, applying, or remediating). `human` is a person. In v0 the principal is supplied explicitly (`rocky policy check --principal …`); auto-detection is a later phase.",
+      "oneOf": [
+        {
+          "description": "A person.",
+          "enum": [
+            "human"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A non-human caller (AI agent / automation).",
+          "enum": [
+            "agent"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "JSON output for `rocky policy check`.\n\nExplain-mode only: reports the effect the agent policy plane *would* resolve for a `(principal, capability, model)` triple, the winning rule (if any), and why. It does not gate any real command in v0.",
+  "properties": {
+    "capability": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PolicyCapability"
+        }
+      ],
+      "description": "The capability that was checked."
+    },
+    "command": {
+      "type": "string"
+    },
+    "effect": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PolicyEffect"
+        }
+      ],
+      "description": "Resolved effect: `allow`, `require_review`, or `deny`."
+    },
+    "matched_rule": {
+      "description": "Zero-based index of the winning rule in `[[policy.rules]]`, or `null` when the decision came from a short-circuit (`read`) or the default posture (no rule matched).",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "model": {
+      "description": "The model that was checked.",
+      "type": "string"
+    },
+    "model_attributes": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PolicyModelAttributes"
+        }
+      ],
+      "description": "The compiled model attributes the matcher read."
+    },
+    "principal": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PolicyPrincipal"
+        }
+      ],
+      "description": "The principal that was checked (`human` / `agent`)."
+    },
+    "reason": {
+      "description": "Human-readable explanation of how the effect was reached.",
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "capability",
+    "command",
+    "effect",
+    "model",
+    "model_attributes",
+    "principal",
+    "reason",
+    "version"
+  ],
+  "title": "PolicyCheckOutput",
+  "type": "object"
+}

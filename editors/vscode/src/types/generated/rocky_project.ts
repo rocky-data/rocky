@@ -307,6 +307,35 @@ export type BindingType = "READ_WRITE" | "READ_ONLY";
  */
 export type LoadFileFormat = "csv" | "parquet" | "json_lines";
 /**
+ * The verdict a policy rule (or the default posture) yields.
+ *
+ * Ordered by restrictiveness for incomparable-rule tie-breaking: `Deny` is a hard override (handled separately), and among non-deny verdicts `RequireReview` is more restrictive than `Allow`.
+ */
+export type PolicyEffect = "allow" | "require_review" | "deny";
+/**
+ * The class of action a policy rule governs.
+ *
+ * `read` is always allowed (short-circuit). The mutating verbs (`propose` … `quarantine`) name coarse operations; `schema_change.additive`, `schema_change.breaking`, and `value_change` are *refinements* of the apply/promote verbs — a rule naming a bare verb (`apply`/`promote`) matches those refinements too, but a rule naming a refinement matches only that exact refinement.
+ */
+export type PolicyCapability =
+  | "read"
+  | "propose"
+  | "apply"
+  | "promote"
+  | "backfill"
+  | "gc"
+  | "retry"
+  | "quarantine"
+  | "schema_change.additive"
+  | "schema_change.breaking"
+  | "value_change";
+/**
+ * Who is attempting an action.
+ *
+ * `agent` is a non-human caller (an AI harness authoring, applying, or remediating). `human` is a person. In v0 the principal is supplied explicitly (`rocky policy check --principal …`); auto-detection is a later phase.
+ */
+export type PolicyPrincipal = "human" | "agent";
+/**
  * Target dialect for transpilation.
  *
  * Serializes lowercase (`databricks`, `snowflake`, `bigquery`, `duckdb`) so the long-form names can sit in `rocky.toml` under the `[portability]` block without translation. The CLI's short-form flag values (`dbx`/`sf`/`bq`/`duckdb`) are kept as ergonomics in the `TargetDialect` clap enum and convert to this type at the boundary.
@@ -421,6 +450,10 @@ export interface RockyConfig {
    * Named pipeline configurations (keyed by pipeline name).
    */
   pipeline?: PipelinesFieldSchema;
+  /**
+   * Agent-authority policy plane (explain-mode in v0). Declares, per `(principal, capability, scope)`, whether an action is allowed, requires human review, or is denied. Absent `[policy]` block ⇒ no rules and the default posture applies (agents on mutating actions fall to `default_agent_effect`, humans are never gated). See [`PolicyConfig`] and [`crate::policy`] for the evaluator.
+   */
+  policy?: PolicyConfig | null;
   /**
    * Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`].
    */
@@ -1733,6 +1766,91 @@ export interface LoadTargetConfig {
    * Optional explicit table name. When omitted, derives from the file name (e.g., `orders.csv` -> table `orders`).
    */
   table?: string | null;
+}
+/**
+ * The `[policy]` block: agent-authority policy for this project.
+ */
+export interface PolicyConfig {
+  /**
+   * Effect for an `agent` on a mutating capability when no rule matches. Defaults to `require_review` (the safe posture).
+   */
+  default_agent_effect?: PolicyEffect & string;
+  /**
+   * Ordered list of rules. Evaluated as a set (order only breaks final ties); see [`crate::policy::evaluate`].
+   */
+  rules?: PolicyRule[];
+  /**
+   * Schema version. Must be `1`.
+   */
+  version: number;
+}
+/**
+ * One `[[policy.rules]]` entry: `(principal, capability, scope) → effect`.
+ */
+export interface PolicyRule {
+  /**
+   * Which capability this rule governs.
+   */
+  capability: PolicyCapability;
+  /**
+   * Optional v1 conditional refinements. **Parsed and ignored in v0** — captured as opaque JSON so a config authored for v1 still loads.
+   */
+  conditions?: {
+    [k: string]: unknown;
+  };
+  /**
+   * The verdict when this rule matches.
+   */
+  effect: PolicyEffect;
+  /**
+   * Who this rule applies to.
+   */
+  principal: PolicyPrincipal;
+  /**
+   * The models this rule covers. Defaults to the empty scope, which is *not* `any` — an all-default scope with no `any = true` matches nothing and is rejected at validation.
+   */
+  scope?: PolicyScope;
+}
+/**
+ * Scope of a policy rule — the AND of every present predicate. A model matches the scope only when it satisfies *all* set keys.
+ *
+ * `any = true` is the empty scope (matches every model, zero constraints) and is mutually exclusive with every other key.
+ */
+export interface PolicyScope {
+  /**
+   * Match every model. Mutually exclusive with all other keys; carries zero constraints, so any rule with a real predicate outranks it.
+   */
+  any?: boolean;
+  /**
+   * Classification guard (positive). Satisfied when the model has at least one column classified with any listed value (e.g. `["pii"]`).
+   */
+  classifications?: string[];
+  /**
+   * Contract-boundary guard. Satisfied when the model's contracted status equals this value. (v0 reads contracted status best-effort from a sibling `.contract.toml`; see [`crate::policy`].)
+   */
+  contracted?: boolean | null;
+  /**
+   * Classification guard (negative). Satisfied when the model has *no* column classified with any listed value — e.g. `exclude_classifications = ["pii"]` matches only non-PII models.
+   */
+  exclude_classifications?: string[];
+  /**
+   * Medallion/semantic layer guard. Satisfied when the model's `layer` tag equals this value (v0 reads layer from the model's `layer` tag).
+   */
+  layer?: string | null;
+  /**
+   * Blast-radius guard: maximum downstream count. **Parse-only in v0** — accepted and validated but not yet evaluated by the matcher.
+   */
+  max_downstreams?: number | null;
+  /**
+   * Glob selectors over the model name (`*`/`?`). Satisfied when the model name matches at least one pattern.
+   */
+  models?: string[];
+  /**
+   * Required model tags (AND of `key = value` pairs). Satisfied when the model carries every listed tag with the exact value.
+   */
+  tags?: {
+    [k: string]: string;
+  };
 }
 /**
  * Project-wide dialect portability configuration.
