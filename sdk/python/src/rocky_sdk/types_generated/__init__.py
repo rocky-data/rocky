@@ -243,6 +243,12 @@ from .replay_check_schema import (
     ReplayCheckOutput,
 )
 
+# Replay execute (single-model re-execution + verify)
+from .replay_execute_schema import (
+    ReplayExecuteModelOutput,
+    ReplayExecuteOutput,
+)
+
 # Compliance — governance rollup over classification + masking policy
 from .compliance_schema import (
     ColumnClassificationStatus,
@@ -453,6 +459,8 @@ __all__ = [
     "ReplayCheckOutput",
     "ReplayCheckModelOutput",
     "ReplayCheckInputOutput",
+    "ReplayExecuteOutput",
+    "ReplayExecuteModelOutput",
     # compliance
     "ComplianceOutput",
     "ComplianceSummary",

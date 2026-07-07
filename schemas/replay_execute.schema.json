@@ -1,0 +1,108 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ReplayExecuteModelOutput": {
+      "description": "Per-model re-execution verdict inside a [`ReplayExecuteOutput`].",
+      "properties": {
+        "computed_hash": {
+          "description": "The blake3 re-derived by this replay execution; `null` when the recipe was not executed (a `non_replayable` verdict).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "nondeterministic": {
+          "description": "Static-scan non-determinism flag (via `rocky_sql::determinism`). When `true`, a `diverged` verdict is expected rather than a failure.",
+          "type": "boolean"
+        },
+        "reasons": {
+          "description": "Human-readable reasons for a `non_replayable` verdict, or a note on an expected `diverged`; empty on a clean `bit_exact`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "recorded_hash": {
+          "description": "The recorded output blake3 carried on the provenance record; `null` when the record held no output hash.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rows": {
+          "description": "Rows produced by the re-execution; `null` when not executed.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "verdict": {
+          "description": "The verdict for this model. One of:\n\n- `bit_exact` — re-execution reproduced the recorded output blake3 (reachable only through a successful re-execution whose digest matched the recording); - `diverged` — re-execution succeeded but the blake3 differs (expected when `nondeterministic` is set; a genuine reproducibility gap otherwise); - `executed` — re-executed without `--verify`, so no comparison was made; - `non_replayable` — the recording alone was insufficient to re-execute the model (see `reasons`).\n\nA `value_equal_order_diff` verdict is reserved for a later order-insensitive refinement; v1 compares the raw blake3 only, so a row-order difference reports `diverged` (over-sensitivity fails safe).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "model_name",
+        "nondeterministic",
+        "reasons",
+        "verdict"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky replay --at <run_id> --execute [--verify]`.\n\nRe-execution surface (single-model, DuckDB): for the targeted model(s) it reconstructs the recipe from the recorded [`rocky_core::state::ProvenanceRecord`] — never the working tree — re-executes the recipe's `SELECT` on an ephemeral in-memory DuckDB engine, and re-derives the output artifact's blake3. With `--verify` it compares that digest against the recorded output hash and emits a per-model verdict.\n\nNothing is materialized to any warehouse schema: the re-executed rows are hashed in memory and discarded, so no production identity is ever touched (isolation is vacuous for a self-contained `SELECT`). Re-execution is limited to a *self-contained* recipe — one whose SQL reads no recorded upstream tables. A recipe with content upstreams is reported `non_replayable` here, because resolving inputs to their replayed upstream outputs is multi-model DAG replay (a later phase): recorded upstream bytes are never read, and current data is never silently substituted.",
+  "properties": {
+    "bit_exact_count": {
+      "description": "Number of models whose re-execution reproduced the recorded output byte-for-byte. Always `0` when `--verify` was not requested.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "command": {
+      "type": "string"
+    },
+    "model_count": {
+      "description": "Total number of models considered (after any `--model` filter).",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "models": {
+      "items": {
+        "$ref": "#/definitions/ReplayExecuteModelOutput"
+      },
+      "type": "array"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "status": {
+      "description": "Recorded run status (`success`, `partial_failure`, ...).",
+      "type": "string"
+    },
+    "verified": {
+      "description": "Whether `--verify` was requested (blake3 comparison performed).",
+      "type": "boolean"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "bit_exact_count",
+    "command",
+    "model_count",
+    "models",
+    "run_id",
+    "status",
+    "verified",
+    "version"
+  ],
+  "title": "ReplayExecuteOutput",
+  "type": "object"
+}
