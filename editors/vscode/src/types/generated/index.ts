@@ -219,6 +219,12 @@ export type {
   ReplayCheckInputOutput,
 } from "./replay_check";
 
+// Replay execute (single-model re-execution + verify)
+export type {
+  ReplayExecuteOutput,
+  ReplayExecuteModelOutput,
+} from "./replay_execute";
+
 // Compliance — governance rollup over classification + masking policy
 export type {
   ColumnClassificationStatus,

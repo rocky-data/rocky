@@ -1533,6 +1533,17 @@ enum Command {
         /// Run a read-only replayability audit instead of the inspection view.
         #[arg(long)]
         check: bool,
+        /// Re-execute the recorded recipe on a local DuckDB engine instead of
+        /// inspecting: reconstructs the recipe from the recording (never the
+        /// working tree), runs its `SELECT` in an ephemeral in-memory engine,
+        /// and re-derives the output hash. Single, self-contained models only.
+        #[arg(long)]
+        execute: bool,
+        /// With `--execute`, compare the re-derived output blake3 against the
+        /// recorded hash and emit a per-model verdict (`bit_exact` /
+        /// `diverged` / `non_replayable`).
+        #[arg(long)]
+        verify: bool,
     },
 
     /// Render a completed run as a timeline.
@@ -3352,13 +3363,27 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             at,
             model,
             check,
+            execute,
+            verify,
         } => {
             let run_ref = at.or(target).ok_or_else(|| {
                 anyhow::anyhow!(
                     "provide a run id (positional or --at <RUN_ID>), or the literal 'latest'"
                 )
             })?;
-            if check {
+            if verify && !execute {
+                anyhow::bail!("`--verify` requires `--execute`");
+            }
+            if execute {
+                rocky_cli::commands::run_replay_execute(
+                    &state_path,
+                    &run_ref,
+                    model.as_deref(),
+                    verify,
+                    json,
+                )
+                .await
+            } else if check {
                 rocky_cli::commands::run_replay_check(&state_path, &run_ref, model.as_deref(), json)
             } else {
                 rocky_cli::commands::run_replay(&state_path, &run_ref, model.as_deref(), json)
