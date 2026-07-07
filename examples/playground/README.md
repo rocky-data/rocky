@@ -38,7 +38,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**84 of 96 POCs run with no external credentials.** See each POC's README for prerequisites.
+**85 of 97 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -118,7 +118,7 @@ AI-powered model generation, intent extraction, schema sync, test generation, sc
 | [05-schema-grounded-validation](pocs/03-ai/05-schema-grounded-validation) | **Trust arc 5** — `ValidationContext` schema grounding + compile-verify retry loop |
 | [06-mcp-grounding](pocs/03-ai/06-mcp-grounding) | `rocky mcp` server — a schema-only model compiles but reconciles wrong; sampling the data via the MCP tools fixes it (creds-free `run.sh`) |
 
-### 04 — Governance (9 POCs · Databricks / DuckDB)
+### 04 — Governance (10 POCs · Databricks / DuckDB)
 
 Unity Catalog grants, schema patterns, workspace isolation, tagging, classification + masking, retention, auto-create schemas.
 
@@ -133,6 +133,7 @@ Unity Catalog grants, schema patterns, workspace isolation, tagging, classificat
 | [07-auto-create-schemas](pocs/04-governance/07-auto-create-schemas) | `[…target.governance] auto_create_schemas = true` on a transformation pipeline targeting a fresh schema (v1.29.0 parity fix) | none |
 | [08-cross-team-contracts](pocs/04-governance/08-cross-team-contracts) | Consumer imports a producer's published IR snapshot via `[imports.<name>]`; `rocky compile` fails with E030 when the producer drops a column the consumer reads (E033 on pin mismatch) | none |
 | [09-model-tags-inheritance](pocs/04-governance/09-model-tags-inheritance) | A config-group `[tags]` baseline inherited by members and overridden per-key by a model's own `[tags]`, surfaced on `rocky compile --output json` as `models_detail[].tags` | none |
+| [10-recipe-provenance](pocs/04-governance/10-recipe-provenance) | Every materialization records a recipe-identity triple (`recipe_hash`, `input_hash`, `env_hash`); `rocky history --recipe <hash>` returns every execution of that exact program — the "what produced this?" audit one-liner, honest about `heuristic` vs `strong` input proof | none |
 
 ### 05 — Orchestration (11 POCs · DuckDB / docker)
 
