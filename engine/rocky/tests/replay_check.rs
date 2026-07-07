@@ -136,6 +136,11 @@ fn model_exec(name: &str) -> ModelExecution {
         bytes_scanned: None,
         bytes_written: None,
         tenant: None,
+        recipe_hash: None,
+        input_hash: None,
+        input_proof_class: None,
+        env_hash: None,
+        hash_scheme: None,
     }
 }
 
