@@ -28,9 +28,8 @@ use crate::output::{
     ModelHistoryOutput, OptimizeOutput, PlanOutput, PreviewCostOutput, PreviewCreateOutput,
     PreviewDiffOutput, PreviewRowsOutput, ProfileOutput, ProfileStorageOutput, PromotePlan,
     RecipeHistoryOutput, ReplayCheckOutput, ReplayExecuteOutput, ReplayOutput,
-    RetentionStatusOutput,
-    RetentionSweepOutput, ReviewOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput,
-    TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
+    RetentionStatusOutput, RetentionSweepOutput, ReviewOutput, RunOutput, SeedOutput, StateOutput,
+    TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
