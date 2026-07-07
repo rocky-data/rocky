@@ -1,0 +1,6 @@
+# Shared target defaults for models authored into this fixture. An agent that
+# writes `<name>.sql` inherits catalog=poc / schema=demo without needing a
+# sidecar, so the compile ground-truth check works on the raw SQL alone.
+[target]
+catalog = "poc"
+schema = "demo"

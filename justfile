@@ -44,6 +44,17 @@ test-vscode:
 test-vscode-electron:
     cd editors/vscode && npm test
 
+# --- Agent conformance evals ---
+
+# Run the agent conformance eval suite (needs a `rocky` build + $ANTHROPIC_API_KEY
+# + the claude/duckdb CLIs; skips cleanly without them). Label-gated in CI.
+evals *ARGS:
+    cd engine/evals && uv run python run_evals.py {{ARGS}}
+
+# Creds-free plumbing check for the eval harness (no model key needed).
+evals-selftest:
+    cd engine/evals && uv run python run_evals.py --selftest
+
 # --- Lint ---
 
 lint: lint-engine lint-sdk lint-dagster lint-vscode
