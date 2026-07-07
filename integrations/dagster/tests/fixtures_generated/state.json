@@ -8,6 +8,6 @@
       "updated_at": "2000-01-01T00:00:00Z"
     }
   ],
-  "schema_version_supported": 10,
-  "schema_version_on_disk": 10
+  "schema_version_supported": 11,
+  "schema_version_on_disk": 11
 }
