@@ -24,11 +24,13 @@
 //! lite structs) — Rocky's 0.8-deriving `*Output` types are projected into
 //! these lite shapes at the tool boundary.
 
+mod error;
 mod result_types;
 mod tools;
 
 use rmcp::{ServiceExt, transport::stdio};
 
+pub use error::{ToolError, ToolErrorCode, ToolResult};
 pub use tools::RockyMcpServer;
 
 /// Serve the Rocky MCP server over stdio until the client disconnects.

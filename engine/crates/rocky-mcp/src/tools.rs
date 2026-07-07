@@ -25,6 +25,7 @@ use rmcp::{
 use rocky_cli::commands;
 use rocky_compiler::compile::{self, CompileResult as CompilerResult, CompilerConfig};
 
+use crate::error::{ToolError, ToolResult};
 use crate::result_types::*;
 
 /// The server's `instructions` — the agent-authoring workflow. Sourced from
@@ -401,10 +402,7 @@ impl RockyMcpServer {
          `target_dialect` (databricks/snowflake/bigquery/duckdb) to additionally run the P001 \
          portability lint on demand: SQL that won't port to that dialect surfaces as P001."
     )]
-    async fn compile(
-        &self,
-        params: Parameters<CompileArgs>,
-    ) -> Result<Json<CompileResult>, String> {
+    async fn compile(&self, params: Parameters<CompileArgs>) -> ToolResult<CompileResult> {
         let args = params.0;
         let model = args.model.as_deref();
         // On-demand portability lint: parse the requested dialect (case-
@@ -430,7 +428,7 @@ impl RockyMcpServer {
             with_seed,
             None,
         )
-        .map_err(|e| format!("{e:#}"))?;
+        .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
         Ok(Json(project_compile_result(&output)))
     }
 
@@ -442,11 +440,11 @@ impl RockyMcpServer {
     async fn plan_preview(
         &self,
         params: Parameters<PlanPreviewArgs>,
-    ) -> Result<Json<PlanPreviewResult>, String> {
+    ) -> ToolResult<PlanPreviewResult> {
         let model = params.0.model.as_deref();
         let output =
             commands::plan_preview_output(Some(&self.config_path), &self.models_dir, model, None)
-                .map_err(|e| format!("{e:#}"))?;
+                .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
         let statements = output
             .statements
             .into_iter()
@@ -464,17 +462,16 @@ impl RockyMcpServer {
          model's columns plus upstream/downstream models and the model-level edge set. With \
          `column`, returns the column trace; set `downstream` to trace consumers instead of sources."
     )]
-    async fn lineage(
-        &self,
-        params: Parameters<LineageArgs>,
-    ) -> Result<Json<LineageResult>, String> {
+    async fn lineage(&self, params: Parameters<LineageArgs>) -> ToolResult<LineageResult> {
         let args = params.0;
-        let result = self.compile_full().map_err(|e| format!("{e:#}"))?;
+        let result = self
+            .compile_full()
+            .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
 
         if let Some(column) = args.column.as_deref() {
             let out =
                 commands::column_lineage_output(&result, &args.model, column, args.downstream)
-                    .map_err(|e| format!("{e:#}"))?;
+                    .map_err(|_| ToolError::model_not_found(&args.model))?;
             let edges = out.trace.iter().map(edge_lite).collect();
             Ok(Json(LineageResult {
                 model: out.model,
@@ -486,8 +483,8 @@ impl RockyMcpServer {
                 edges,
             }))
         } else {
-            let out =
-                commands::lineage_output(&result, &args.model).map_err(|e| format!("{e:#}"))?;
+            let out = commands::lineage_output(&result, &args.model)
+                .map_err(|_| ToolError::model_not_found(&args.model))?;
             let edges = out.edges.iter().map(edge_lite).collect();
             let columns = out.columns.into_iter().map(|c| c.name).collect();
             Ok(Json(LineageResult {
@@ -506,9 +503,14 @@ impl RockyMcpServer {
         description = "Run the project's DuckDB-backed local tests (contracts + assertions) and \
          return pass/fail counts plus per-failure detail. Use after writing or changing a model."
     )]
-    async fn test(&self) -> Result<Json<TestResult>, String> {
-        let output =
-            commands::test_output(&self.models_dir, None, None).map_err(|e| format!("{e:#}"))?;
+    async fn test(&self) -> ToolResult<TestResult> {
+        let output = commands::test_output(&self.models_dir, None, None).map_err(|e| {
+            ToolError::internal(
+                format!("{e:#}"),
+                "The local test runner could not execute; confirm the project compiles (the \
+                 `compile` tool) and any `data/seed.sql` the tests need is present.",
+            )
+        })?;
         let failures = output
             .failures
             .into_iter()
@@ -527,12 +529,12 @@ impl RockyMcpServer {
     #[tool(
         description = "List project entities. `kind` is one of: models, pipelines, adapters, sources."
     )]
-    async fn list(&self, params: Parameters<ListArgs>) -> Result<Json<ListResult>, String> {
+    async fn list(&self, params: Parameters<ListArgs>) -> ToolResult<ListResult> {
         let kind = params.0.kind;
         let entries = match kind.as_str() {
             "models" => {
-                let out =
-                    commands::list_models_output(&self.models_dir).map_err(|e| format!("{e:#}"))?;
+                let out = commands::list_models_output(&self.models_dir)
+                    .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
                 out.models
                     .into_iter()
                     .map(|m| ListEntry {
@@ -546,7 +548,7 @@ impl RockyMcpServer {
             }
             "pipelines" => {
                 let out = commands::list_pipelines_output(&self.config_path)
-                    .map_err(|e| format!("{e:#}"))?;
+                    .map_err(|e| ToolError::config_invalid(format!("{e:#}")))?;
                 out.pipelines
                     .into_iter()
                     .map(|p| ListEntry {
@@ -560,7 +562,7 @@ impl RockyMcpServer {
             }
             "adapters" => {
                 let out = commands::list_adapters_output(&self.config_path)
-                    .map_err(|e| format!("{e:#}"))?;
+                    .map_err(|e| ToolError::config_invalid(format!("{e:#}")))?;
                 out.adapters
                     .into_iter()
                     .map(|a| ListEntry {
@@ -573,7 +575,7 @@ impl RockyMcpServer {
             }
             "sources" => {
                 let out = commands::list_sources_output(&self.config_path)
-                    .map_err(|e| format!("{e:#}"))?;
+                    .map_err(|e| ToolError::config_invalid(format!("{e:#}")))?;
                 out.sources
                     .into_iter()
                     .map(|s| ListEntry {
@@ -585,8 +587,9 @@ impl RockyMcpServer {
                     .collect()
             }
             other => {
-                return Err(format!(
-                    "unknown kind '{other}' — expected models, pipelines, adapters, or sources"
+                return Err(ToolError::invalid_argument(
+                    format!("unknown kind '{other}'"),
+                    "Pass one of: models, pipelines, adapters, sources.",
                 ));
             }
         };
@@ -601,7 +604,7 @@ impl RockyMcpServer {
     async fn inspect_schema(
         &self,
         _params: Parameters<InspectSchemaArgs>,
-    ) -> Result<Json<InspectSchemaResult>, String> {
+    ) -> ToolResult<InspectSchemaResult> {
         let to_entries = |buckets: Vec<(String, Vec<rocky_compiler::types::TypedColumn>)>| {
             buckets
                 .into_iter()
@@ -639,7 +642,7 @@ impl RockyMcpServer {
             Err(e) if e.to_string().contains("no models found") => {
                 (Vec::new(), Vec::new(), std::collections::HashSet::new())
             }
-            Err(e) => return Err(format!("{e:#}")),
+            Err(e) => return Err(ToolError::compile_failed(format!("{e:#}"))),
         };
 
         // Surface the physical warehouse tables so an agent can ground a raw
@@ -672,7 +675,7 @@ impl RockyMcpServer {
     async fn breaking_change(
         &self,
         params: Parameters<BreakingChangeArgs>,
-    ) -> Result<Json<BreakingChangeResult>, String> {
+    ) -> ToolResult<BreakingChangeResult> {
         let base = params.0.base;
         Ok(Json(self.compute_breaking_change(&base)))
     }
@@ -682,19 +685,18 @@ impl RockyMcpServer {
          `lineage`). For each dependent, returns the focal model's columns it reads via \
          `via_columns`. Use to gauge the blast radius of changing a model before editing it."
     )]
-    async fn dependents(
-        &self,
-        params: Parameters<DependentsArgs>,
-    ) -> Result<Json<DependentsResult>, String> {
+    async fn dependents(&self, params: Parameters<DependentsArgs>) -> ToolResult<DependentsResult> {
         let model = params.0.model;
-        let result = self.compile_full().map_err(|e| format!("{e:#}"))?;
+        let result = self
+            .compile_full()
+            .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
 
         // Assert the focal model exists in the semantic graph — same
         // not-found contract as `lineage_output`.
         let schema = result
             .semantic_graph
             .model_schema(&model)
-            .ok_or_else(|| format!("model '{model}' not found"))?;
+            .ok_or_else(|| ToolError::model_not_found(&model))?;
 
         // Downstream model names come straight from the model schema; the
         // per-dependent `via_columns` are the focal model's columns that feed
@@ -730,17 +732,14 @@ impl RockyMcpServer {
          project at once. For the column-level edge trace of a single model use `lineage`; for \
          typed columns alone use `inspect_schema`; for one model's consumers use `dependents`."
     )]
-    async fn catalog(
-        &self,
-        _params: Parameters<CatalogArgs>,
-    ) -> Result<Json<CatalogResult>, String> {
+    async fn catalog(&self, _params: Parameters<CatalogArgs>) -> ToolResult<CatalogResult> {
         let output = commands::compute_catalog_output(
             &self.config_path,
             &self.state_path(),
             &self.models_dir,
             None,
         )
-        .map_err(|e| format!("{e:#}"))?;
+        .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
         Ok(Json(catalog_result(output)))
     }
 
@@ -751,15 +750,19 @@ impl RockyMcpServer {
          operational reality — is this model flaky, slow, recently changed? Empty when nothing has \
          been run yet."
     )]
-    async fn history(
-        &self,
-        params: Parameters<HistoryArgs>,
-    ) -> Result<Json<HistoryResult>, String> {
+    async fn history(&self, params: Parameters<HistoryArgs>) -> ToolResult<HistoryResult> {
         let state_path = self.state_path();
         match params.0.model {
             Some(model) => {
                 let out = commands::model_history_output(&state_path, &model, None, false, 20)
-                    .map_err(|e| format!("{e:#}"))?;
+                    .map_err(|e| {
+                        ToolError::internal(
+                            format!("{e:#}"),
+                            "Could not read the run history from the state store; ensure the \
+                             project has been run at least once (history is empty, not an error, \
+                             before the first run).",
+                        )
+                    })?;
                 let executions = out
                     .executions
                     .into_iter()
@@ -778,8 +781,14 @@ impl RockyMcpServer {
                 }))
             }
             None => {
-                let out = commands::history_runs_output(&state_path, None, false)
-                    .map_err(|e| format!("{e:#}"))?;
+                let out = commands::history_runs_output(&state_path, None, false).map_err(|e| {
+                    ToolError::internal(
+                        format!("{e:#}"),
+                        "Could not read the run history from the state store; ensure the \
+                             project has been run at least once (history is empty, not an error, \
+                             before the first run).",
+                    )
+                })?;
                 let runs = out
                     .runs
                     .into_iter()
@@ -807,10 +816,7 @@ impl RockyMcpServer {
          null-rate alerts. Pass `column` to also get that column's per-run trend. `message` is set \
          (and snapshots empty) when the model has no recorded metrics yet."
     )]
-    async fn metrics(
-        &self,
-        params: Parameters<MetricsArgs>,
-    ) -> Result<Json<MetricsResult>, String> {
+    async fn metrics(&self, params: Parameters<MetricsArgs>) -> ToolResult<MetricsResult> {
         let args = params.0;
         let out = commands::metrics_output(
             &self.state_path(),
@@ -819,7 +825,14 @@ impl RockyMcpServer {
             args.column.as_deref(),
             true,
         )
-        .map_err(|e| format!("{e:#}"))?;
+        .map_err(|e| {
+            ToolError::internal(
+                format!("{e:#}"),
+                "Could not read quality metrics from the state store; ensure the project has been \
+                 run at least once (a model with no recorded metrics returns an empty result with \
+                 a `message`, not an error).",
+            )
+        })?;
 
         let snapshots = out
             .snapshots
@@ -860,16 +873,20 @@ impl RockyMcpServer {
          the reasoning. Use to reason about materialization with Rocky's cost model rather than \
          guessing. `message` is set (and recommendations empty) when there's no run history yet."
     )]
-    async fn optimize(
-        &self,
-        params: Parameters<OptimizeArgs>,
-    ) -> Result<Json<OptimizeResult>, String> {
+    async fn optimize(&self, params: Parameters<OptimizeArgs>) -> ToolResult<OptimizeResult> {
         let out = commands::optimize_output(
             &self.state_path(),
             Some(&self.models_dir),
             params.0.model.as_deref(),
         )
-        .map_err(|e| format!("{e:#}"))?;
+        .map_err(|e| {
+            ToolError::internal(
+                format!("{e:#}"),
+                "Could not compute optimization recommendations; ensure the project compiles and \
+                 has run history (no history returns an empty result with a `message`, not an \
+                 error).",
+            )
+        })?;
         let recommendations = out
             .recommendations
             .into_iter()
@@ -898,7 +915,7 @@ impl RockyMcpServer {
     async fn suggest_freshness_block(
         &self,
         params: Parameters<SuggestFreshnessBlockArgs>,
-    ) -> Result<Json<SuggestFreshnessBlockResult>, String> {
+    ) -> ToolResult<SuggestFreshnessBlockResult> {
         let args = params.0;
 
         // Gate on the API key the same way the LSP's freshness arm does;
@@ -933,11 +950,11 @@ impl RockyMcpServer {
             max_tokens: rocky_ai::client::DEFAULT_MAX_TOKENS,
         };
         let client = rocky_ai::client::LlmClient::new(ai_config)
-            .map_err(|e| format!("AI client init failed: {e}"))?;
+            .map_err(|e| ToolError::ai_error(format!("AI client init failed: {e}")))?;
         let response = client
             .generate(&system_prompt, &user_prompt, None)
             .await
-            .map_err(|e| format!("AI request failed: {e}"))?;
+            .map_err(|e| ToolError::ai_error(format!("AI request failed: {e}")))?;
 
         let extracted = rocky_ai::generate::extract_code(&response.content);
         let snippet = extracted.trim();
@@ -975,7 +992,7 @@ impl RockyMcpServer {
     async fn draft_contract(
         &self,
         params: Parameters<DraftContractArgs>,
-    ) -> Result<Json<DraftContractResult>, String> {
+    ) -> ToolResult<DraftContractResult> {
         let model_name = params.0.model;
 
         let client = match self.make_ai_client() {
@@ -990,20 +1007,20 @@ impl RockyMcpServer {
                     ..Default::default()
                 }));
             }
-            Err(e) => return Err(format!("AI client init failed: {e}")),
+            Err(e) => return Err(ToolError::ai_error(format!("AI client init failed: {e}"))),
         };
 
         // The model's inferred output schema — the basis for compile-verifying
         // the drafted contract.
-        let compiled = self.compile_full().map_err(|e| format!("{e:#}"))?;
+        let compiled = self
+            .compile_full()
+            .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
         let inferred_schema: Vec<rocky_compiler::types::TypedColumn> = compiled
             .type_check
             .typed_models
             .get(&model_name)
             .cloned()
-            .ok_or_else(|| {
-                format!("model '{model_name}' not found in compiled project (or has no schema)")
-            })?;
+            .ok_or_else(|| ToolError::model_not_found(&model_name))?;
 
         // Profile each column against the live target table.
         let profile = match self
@@ -1022,7 +1039,7 @@ impl RockyMcpServer {
 
         let drafted = rocky_ai::contract::draft_contract(&profile, &inferred_schema, &client, 3)
             .await
-            .map_err(|e| format!("contract draft failed: {e}"))?;
+            .map_err(|e| ToolError::ai_error(format!("contract draft failed: {e}")))?;
 
         Ok(Json(DraftContractResult {
             model: model_name,
@@ -1044,7 +1061,7 @@ impl RockyMcpServer {
     async fn generate_tests(
         &self,
         params: Parameters<GenerateTestsArgs>,
-    ) -> Result<Json<GenerateTestsResult>, String> {
+    ) -> ToolResult<GenerateTestsResult> {
         let model_name = params.0.model;
 
         let client = match self.make_ai_client() {
@@ -1059,13 +1076,13 @@ impl RockyMcpServer {
                     ..Default::default()
                 }));
             }
-            Err(e) => return Err(format!("AI client init failed: {e}")),
+            Err(e) => return Err(ToolError::ai_error(format!("AI client init failed: {e}"))),
         };
 
         let (compiled, model) = self.compile_and_find_model(&model_name)?;
         let assertions = rocky_ai::testgen::generate_tests(&model, &compiled, &client)
             .await
-            .map_err(|e| format!("test generation failed: {e}"))?;
+            .map_err(|e| ToolError::ai_error(format!("test generation failed: {e}")))?;
 
         let assertions = assertions
             .into_iter()
@@ -1094,7 +1111,7 @@ impl RockyMcpServer {
     async fn explain_model(
         &self,
         params: Parameters<ExplainModelArgs>,
-    ) -> Result<Json<ExplainModelResult>, String> {
+    ) -> ToolResult<ExplainModelResult> {
         let model_name = params.0.model;
 
         let client = match self.make_ai_client() {
@@ -1109,13 +1126,13 @@ impl RockyMcpServer {
                     ..Default::default()
                 }));
             }
-            Err(e) => return Err(format!("AI client init failed: {e}")),
+            Err(e) => return Err(ToolError::ai_error(format!("AI client init failed: {e}"))),
         };
 
         let (compiled, model) = self.compile_and_find_model(&model_name)?;
         let intent = rocky_ai::explain::explain_model(&model, &compiled, &client)
             .await
-            .map_err(|e| format!("explain failed: {e}"))?;
+            .map_err(|e| ToolError::ai_error(format!("explain failed: {e}")))?;
 
         Ok(Json(ExplainModelResult {
             model: model_name,
@@ -1157,15 +1174,17 @@ impl RockyMcpServer {
     fn compile_and_find_model(
         &self,
         model_name: &str,
-    ) -> Result<(CompilerResult, rocky_core::models::Model), String> {
-        let compiled = self.compile_full().map_err(|e| format!("{e:#}"))?;
+    ) -> Result<(CompilerResult, rocky_core::models::Model), Json<ToolError>> {
+        let compiled = self
+            .compile_full()
+            .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
         let model = compiled
             .project
             .models
             .iter()
             .find(|m| m.config.name == model_name)
             .cloned()
-            .ok_or_else(|| format!("model '{model_name}' not found in project"))?;
+            .ok_or_else(|| ToolError::model_not_found(model_name))?;
         Ok((compiled, model))
     }
 
@@ -1261,11 +1280,11 @@ impl RockyMcpServer {
     async fn governance_preview(
         &self,
         params: Parameters<GovernancePreviewArgs>,
-    ) -> Result<Json<GovernancePreviewResult>, String> {
+    ) -> ToolResult<GovernancePreviewResult> {
         let env = params.0.env;
 
         let cfg = rocky_core::config::load_rocky_config(&self.config_path)
-            .map_err(|e| format!("could not load rocky.toml: {e:#}"))?;
+            .map_err(|e| ToolError::config_invalid(format!("could not load rocky.toml: {e:#}")))?;
         // Resolve the active pipeline's target adapter type — the same input
         // `rocky plan` feeds `populate_governance_actions` so retention's
         // `warehouse_preview` renders the warehouse-native form. This is the
@@ -1295,7 +1314,7 @@ impl RockyMcpServer {
             &adapter_type,
             &mut output,
         )
-        .map_err(|e| format!("governance preview failed: {e:#}"))?;
+        .map_err(|e| ToolError::compile_failed(format!("governance preview failed: {e:#}")))?;
 
         Ok(Json(GovernancePreviewResult {
             env,
@@ -1344,18 +1363,38 @@ impl RockyMcpServer {
     async fn drift_preview(
         &self,
         params: Parameters<DriftPreviewArgs>,
-    ) -> Result<Json<DriftPreviewResult>, String> {
+    ) -> ToolResult<DriftPreviewResult> {
         let args = params.0;
 
         let adapter = self
             .warehouse_adapter()
-            .map_err(|e| format!("could not resolve the warehouse adapter: {e:#}"))?
-            .ok_or_else(|| "could not resolve the target warehouse adapter".to_string())?;
+            .map_err(|e| {
+                ToolError::warehouse_error(
+                    format!("could not resolve the warehouse adapter: {e:#}"),
+                    "Check the [adapter] block in rocky.toml and that the target warehouse's \
+                     credentials are set in the server environment.",
+                )
+            })?
+            .ok_or_else(|| {
+                ToolError::warehouse_error(
+                    "could not resolve the target warehouse adapter",
+                    "Check the [adapter] block in rocky.toml and that the target warehouse's \
+                     credentials are set in the server environment.",
+                )
+            })?;
 
-        let source_ref = parse_table_ref(&args.source_table)
-            .ok_or_else(|| format!("invalid source_table reference '{}'", args.source_table))?;
-        let target_ref = parse_table_ref(&args.target_table)
-            .ok_or_else(|| format!("invalid target_table reference '{}'", args.target_table))?;
+        let source_ref = parse_table_ref(&args.source_table).ok_or_else(|| {
+            ToolError::invalid_argument(
+                format!("invalid source_table reference '{}'", args.source_table),
+                "Pass a qualified `schema.table` or `catalog.schema.table` reference.",
+            )
+        })?;
+        let target_ref = parse_table_ref(&args.target_table).ok_or_else(|| {
+            ToolError::invalid_argument(
+                format!("invalid target_table reference '{}'", args.target_table),
+                "Pass a qualified `schema.table` or `catalog.schema.table` reference.",
+            )
+        })?;
 
         // DESCRIBE both tables. A failed describe on the TARGET means it is not
         // materialized yet (the first run would create it) — that's a clean
@@ -1363,18 +1402,24 @@ impl RockyMcpServer {
         // the SOURCE is a genuine error (you asked to compare against a table
         // that isn't there).
         let source_cols = adapter.describe_table(&source_ref).await.map_err(|e| {
-            format!(
-                "could not describe source_table '{}': {e}",
-                args.source_table
+            ToolError::warehouse_error(
+                format!(
+                    "could not describe source_table '{}': {e}",
+                    args.source_table
+                ),
+                "Confirm the source table exists and the target adapter's credentials can read it.",
             )
         })?;
         // Most adapters `Err` on a missing table, but some report an empty
         // column set instead; treat an empty source as not-found rather than
         // letting it produce a vacuously "no drift" answer that would lie.
         if source_cols.is_empty() {
-            return Err(format!(
-                "source_table '{}' has no columns (table not found or empty schema)",
-                args.source_table
+            return Err(ToolError::warehouse_error(
+                format!(
+                    "source_table '{}' has no columns (table not found or empty schema)",
+                    args.source_table
+                ),
+                "Confirm the source table exists and is not empty.",
             ));
         }
         let target_cols = adapter
@@ -1444,13 +1489,16 @@ impl RockyMcpServer {
     async fn sample_rows(
         &self,
         params: Parameters<SampleRowsArgs>,
-    ) -> Result<Json<SampleRowsResult>, String> {
+    ) -> ToolResult<SampleRowsResult> {
         let args = params.0;
 
-        let prepared = self
-            .prepare_table_query(&args.model)
-            .await
-            .map_err(|e| format!("{e:#}"))?;
+        let prepared = self.prepare_table_query(&args.model).await.map_err(|e| {
+            ToolError::warehouse_error(
+                format!("{e:#}"),
+                "Confirm the model name or `schema.table` reference exists and the target \
+                     adapter in rocky.toml has live warehouse credentials.",
+            )
+        })?;
 
         // Build: SELECT * FROM <ref> [tablesample] LIMIT n. The ref is built
         // only from validated identifiers; never `format!`'d from raw input.
@@ -1469,7 +1517,13 @@ impl RockyMcpServer {
 
         let qr = query_grounding(prepared.adapter.as_ref(), &sql)
             .await
-            .map_err(|e| format!("sample query failed: {e}"))?;
+            .map_err(|e| {
+                ToolError::warehouse_error(
+                    format!("sample query failed: {e}"),
+                    "Confirm the table is materialized and the target adapter's credentials can \
+                     read it.",
+                )
+            })?;
 
         let columns = qr.columns.clone();
         let mut rows: Vec<Vec<String>> = Vec::new();
@@ -1504,16 +1558,24 @@ impl RockyMcpServer {
     async fn profile_column(
         &self,
         params: Parameters<ProfileColumnArgs>,
-    ) -> Result<Json<ProfileColumnResult>, String> {
+    ) -> ToolResult<ProfileColumnResult> {
         let args = params.0;
 
-        let prepared = self
-            .prepare_table_query(&args.model)
-            .await
-            .map_err(|e| format!("{e:#}"))?;
+        let prepared = self.prepare_table_query(&args.model).await.map_err(|e| {
+            ToolError::warehouse_error(
+                format!("{e:#}"),
+                "Confirm the model name or `schema.table` reference exists and the target \
+                     adapter in rocky.toml has live warehouse credentials.",
+            )
+        })?;
 
-        let col = rocky_sql::validation::validate_identifier(&args.column)
-            .map_err(|e| format!("invalid column identifier: {e}"))?;
+        let col = rocky_sql::validation::validate_identifier(&args.column).map_err(|e| {
+            ToolError::invalid_argument(
+                format!("invalid column identifier: {e}"),
+                "Pass a valid column name (letters, digits, and underscores); verify it with \
+                 `inspect_schema`.",
+            )
+        })?;
 
         // Cast to the dialect's string type — `VARCHAR` everywhere except
         // BigQuery, where it is `STRING` (BigQuery rejects `CAST(... AS VARCHAR)`).
@@ -1528,11 +1590,19 @@ impl RockyMcpServer {
 
         let qr = query_grounding(prepared.adapter.as_ref(), &sql)
             .await
-            .map_err(|e| format!("profile query failed: {e}"))?;
-        let row = qr
-            .rows
-            .first()
-            .ok_or_else(|| "profile query returned no rows".to_string())?;
+            .map_err(|e| {
+                ToolError::warehouse_error(
+                    format!("profile query failed: {e}"),
+                    "Confirm the table is materialized and the target adapter's credentials can \
+                     read it.",
+                )
+            })?;
+        let row = qr.rows.first().ok_or_else(|| {
+            ToolError::warehouse_error(
+                "profile query returned no rows",
+                "Confirm the target table is materialized and non-empty.",
+            )
+        })?;
 
         let as_u64 = |v: &serde_json::Value| -> u64 {
             match v {
@@ -1602,13 +1672,14 @@ impl RockyMcpServer {
          (`rocky review <plan_id> --approve`) before `rocky apply <plan_id>` will run it. Surface \
          the plan_id and the review/apply path to the user; never approve on their behalf."
     )]
-    async fn propose(
-        &self,
-        params: Parameters<ProposeArgs>,
-    ) -> Result<Json<ProposeResult>, String> {
-        let result = self.compile_full().map_err(|e| format!("{e:#}"))?;
+    async fn propose(&self, params: Parameters<ProposeArgs>) -> ToolResult<ProposeResult> {
+        let result = self
+            .compile_full()
+            .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
         if result.project.models.is_empty() {
-            return Err("project has no compiled models to propose".to_string());
+            return Err(ToolError::empty_project(
+                "project has no compiled models to propose",
+            ));
         }
         let models: Vec<String> = result
             .project
@@ -1622,7 +1693,7 @@ impl RockyMcpServer {
         if let Some(model) = params.0.model.as_deref()
             && !models.iter().any(|m| m == model)
         {
-            return Err(format!("model '{model}' not found in project"));
+            return Err(ToolError::model_not_found(model));
         }
 
         let run_plan = build_ai_run_plan(params.0.model.clone(), &result);
@@ -1631,7 +1702,12 @@ impl RockyMcpServer {
             rocky_cli::plan_store::PlanKind::AiAuthored,
             &run_plan,
         )
-        .map_err(|e| format!("failed to write AI-authored plan: {e:#}"))?;
+        .map_err(|e| {
+            ToolError::internal(
+                format!("failed to write AI-authored plan: {e:#}"),
+                "Ensure the project directory is writable so the plan store can persist the plan.",
+            )
+        })?;
 
         Ok(Json(ProposeResult { plan_id, models }))
     }
@@ -2175,18 +2251,19 @@ fn json_as_u64(v: &serde_json::Value) -> u64 {
 ///
 /// Accepts the `Dialect` serde vocabulary case-insensitively
 /// (`databricks`/`snowflake`/`bigquery`/`duckdb`). An unrecognised value is a
-/// caller error returned as a `String` (the tool's `Err` arm), naming the
-/// accepted values rather than silently ignoring the request.
-fn parse_target_dialect(raw: &str) -> Result<rocky_sql::transpile::Dialect, String> {
+/// caller error returned as an [`InvalidArgument`](crate::error::ToolErrorCode)
+/// envelope naming the accepted values, rather than silently ignoring the
+/// request.
+fn parse_target_dialect(raw: &str) -> Result<rocky_sql::transpile::Dialect, rmcp::Json<ToolError>> {
     use rocky_sql::transpile::Dialect;
     match raw.trim().to_ascii_lowercase().as_str() {
         "databricks" => Ok(Dialect::Databricks),
         "snowflake" => Ok(Dialect::Snowflake),
         "bigquery" => Ok(Dialect::BigQuery),
         "duckdb" => Ok(Dialect::DuckDB),
-        other => Err(format!(
-            "unknown target_dialect '{other}': expected one of \
-             databricks, snowflake, bigquery, duckdb"
+        other => Err(ToolError::invalid_argument(
+            format!("unknown target_dialect '{other}'"),
+            "Pass one of: databricks, snowflake, bigquery, duckdb.",
         )),
     }
 }
@@ -2472,23 +2549,33 @@ mod tests {
     #[test]
     fn parse_target_dialect_accepts_known_values_case_insensitively() {
         use rocky_sql::transpile::Dialect;
-        assert_eq!(parse_target_dialect("bigquery"), Ok(Dialect::BigQuery));
-        assert_eq!(parse_target_dialect("BigQuery"), Ok(Dialect::BigQuery));
-        assert_eq!(parse_target_dialect(" snowflake "), Ok(Dialect::Snowflake));
-        assert_eq!(parse_target_dialect("DATABRICKS"), Ok(Dialect::Databricks));
-        assert_eq!(parse_target_dialect("duckdb"), Ok(Dialect::DuckDB));
+        // `Json<ToolError>` is not `Debug`, so match rather than `.expect()`.
+        let ok = |s: &str| match parse_target_dialect(s) {
+            Ok(d) => d,
+            Err(_) => panic!("'{s}' should parse to a known dialect"),
+        };
+        assert_eq!(ok("bigquery"), Dialect::BigQuery);
+        assert_eq!(ok("BigQuery"), Dialect::BigQuery);
+        assert_eq!(ok(" snowflake "), Dialect::Snowflake);
+        assert_eq!(ok("DATABRICKS"), Dialect::Databricks);
+        assert_eq!(ok("duckdb"), Dialect::DuckDB);
     }
 
     #[test]
     fn parse_target_dialect_rejects_unknown_value() {
         let err = parse_target_dialect("redshift").expect_err("unknown dialect must error");
+        // The failure is the structured envelope: an invalid_argument code, the
+        // offending value in the message, and the accepted set in the hint.
+        assert_eq!(err.0.code, crate::error::ToolErrorCode::InvalidArgument);
         assert!(
-            err.contains("redshift"),
-            "error should name the input: {err}"
+            err.0.message.contains("redshift"),
+            "message should name the input: {:?}",
+            err.0
         );
         assert!(
-            err.contains("bigquery"),
-            "error should list the accepted values: {err}"
+            err.0.remediation_hint.contains("bigquery"),
+            "hint should list the accepted values: {:?}",
+            err.0
         );
     }
 

@@ -78,6 +78,16 @@ jobs:
         working-directory: engine/evals
         run: uv run python run_evals.py --selftest
 
+      # Creds-free (needs only the `rocky` binary built above): assert the
+      # structured MCP error envelope on bad input. Unlike the live authoring
+      # scenarios, this is deterministic — a failure here is a real contract
+      # regression, so it gates the job.
+      - name: Structured-error contract
+        working-directory: engine/evals
+        env:
+          ROCKY_BIN: ${{ github.workspace }}/engine/target/debug/rocky
+        run: uv run python run_evals.py --error-contract
+
       - name: Run the agent conformance suite
         working-directory: engine/evals
         env:
