@@ -30,6 +30,7 @@ pub mod models;
 pub mod object_store;
 pub mod optimize;
 pub mod plan_partition;
+pub mod policy;
 pub mod preview;
 pub mod quarantine;
 pub mod recipe_identity;

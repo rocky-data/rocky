@@ -743,6 +743,7 @@ mod tests {
             imports: Default::default(),
             run: Default::default(),
             reuse: Default::default(),
+            policy: None,
         };
 
         let models = vec![
@@ -840,6 +841,7 @@ mod tests {
             imports: Default::default(),
             run: Default::default(),
             reuse: Default::default(),
+            policy: None,
         };
 
         let models = vec![Model {
@@ -939,6 +941,7 @@ mod tests {
             imports: Default::default(),
             run: Default::default(),
             reuse: Default::default(),
+            policy: None,
         };
 
         let index = build_doc_index(&[], &config, None, None);
