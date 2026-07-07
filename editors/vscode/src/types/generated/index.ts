@@ -209,6 +209,13 @@ export type {
 // Replay (inspection-only run record)
 export type { ReplayOutput, ReplayModelOutput } from "./replay";
 
+// Replay check (read-only replayability audit)
+export type {
+  ReplayCheckOutput,
+  ReplayCheckModelOutput,
+  ReplayCheckInputOutput,
+} from "./replay_check";
+
 // Compliance — governance rollup over classification + masking policy
 export type {
   ColumnClassificationStatus,

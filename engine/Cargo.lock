@@ -3874,6 +3874,7 @@ name = "rocky"
 version = "1.56.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "clap_complete",
  "duckdb",
@@ -3881,6 +3882,7 @@ dependencies = [
  "miette",
  "rocky-cli",
  "rocky-core",
+ "rocky-ir",
  "rocky-mcp",
  "rocky-observe",
  "rustls",

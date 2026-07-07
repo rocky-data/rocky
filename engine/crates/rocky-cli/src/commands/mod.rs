@@ -132,7 +132,7 @@ pub use preview_rows::run_preview_rows;
 pub use profile::run_profile;
 pub use profile_storage::run_profile_storage;
 pub use publish_ir::run_publish_ir;
-pub use replay::run_replay;
+pub use replay::{run_replay, run_replay_check};
 pub use retention_status::run_retention_status;
 pub use review::run_review;
 // Re-exported so the `rocky` bin can build a clap ValueEnum for

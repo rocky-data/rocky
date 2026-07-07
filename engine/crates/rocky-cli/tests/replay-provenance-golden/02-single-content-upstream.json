@@ -1,0 +1,22 @@
+{
+  "run_id": "golden-run",
+  "model_name": "stg_orders",
+  "input_hash": "77aedfd5f8526d137dc96848ab965ab8c8331d40f0e0b99aaf2c98c214331607",
+  "skip_hash": "0673ee2ed63e176def0f219ca59cbc619ee5978ce6bd2e8238bd6fafa8c36a81",
+  "model_ir_canonical_json": "{\"governance\":{\"auto_create_catalogs\":false,\"auto_create_schemas\":false,\"permissions_file\":null},\"lineage_edges\":[],\"materialization\":{\"partition_columns\":[],\"storage_prefix\":\"s3://bucket/tgt/raw/stg_orders\",\"strategy\":\"ContentAddressed\"},\"name\":\"stg_orders\",\"sources\":[{\"catalog\":\"tgt\",\"schema\":\"raw\",\"table\":\"raw_orders\"}],\"sql\":\"SELECT order_id, customer_id FROM tgt.raw.raw_orders WHERE order_id > 0\",\"target\":{\"catalog\":\"tgt\",\"schema\":\"raw\",\"table\":\"stg_orders\"},\"typed_columns\":[{\"data_type\":\"Int64\",\"name\":\"order_id\",\"nullable\":false},{\"data_type\":\"Int64\",\"name\":\"customer_id\",\"nullable\":true}]}",
+  "upstreams": [
+    {
+      "kind": "content",
+      "upstream_key": "tgt.raw.raw_orders",
+      "blake3_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  ],
+  "output_blake3": [
+    "3333333333333333333333333333333333333333333333333333333333333333"
+  ],
+  "output_path": [
+    "s3://bucket/out/3333333333333333333333333333333333333333333333333333333333333333.parquet"
+  ],
+  "proof_class": "strong",
+  "recorded_at": "2026-01-01T00:00:00Z"
+}

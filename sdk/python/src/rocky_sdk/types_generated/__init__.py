@@ -233,6 +233,13 @@ from .catalog_schema import (
 # Replay (inspection-only run record)
 from .replay_schema import ReplayModelOutput, ReplayOutput
 
+# Replay check (read-only replayability audit)
+from .replay_check_schema import (
+    ReplayCheckInputOutput,
+    ReplayCheckModelOutput,
+    ReplayCheckOutput,
+)
+
 # Compliance — governance rollup over classification + masking policy
 from .compliance_schema import (
     ColumnClassificationStatus,
@@ -438,6 +445,9 @@ __all__ = [
     # replay
     "ReplayOutput",
     "ReplayModelOutput",
+    "ReplayCheckOutput",
+    "ReplayCheckModelOutput",
+    "ReplayCheckInputOutput",
     # compliance
     "ComplianceOutput",
     "ComplianceSummary",
