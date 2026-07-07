@@ -26,21 +26,25 @@
 //! A consumer model declares the producer table it reads via a `[[sources]]`
 //! sidecar entry, whose full name (`catalog.schema.table`) matches the
 //! producer's `TargetRef::full_name()` — the key the classifier reports a
-//! change under. For the single-source case we attribute every column the
-//! model's SQL references (via [`rocky_sql::lineage::extract_lineage`]) to
-//! that one producer target, so the E03x codes fire only for columns the
-//! consumer actually uses.
+//! change under. For the single-source case we attribute the columns the
+//! model's SQL reads (via the consumed-column completeness guard
+//! [`rocky_sql::consumed_columns::consumed_columns`]) to that one producer
+//! target, so the E03x codes fire only for columns the consumer actually uses.
+//! When the guard can't prove the read-set exhaustive (`SELECT *`, a CTE or
+//! sub-query, a `USING`/`NATURAL` join, an ambiguous reference), the model
+//! falls back to unfiltered — every producer change is flagged rather than
+//! risk missing one the walk couldn't see.
 //!
 //! ## Filtered vs unfiltered
 //!
-//! Per-column filtering needs an enumerable column list. When a consumer
-//! model uses `SELECT *` (`has_star`) or joins multiple sources (so an
-//! unqualified column can't be attributed to one producer), we fall back to
-//! the conservative *unfiltered* behaviour: every relevant producer change is
-//! flagged against that consumer model. That over-reports rather than letting
-//! a breaking change slip through silently. W030 (added column) is the
-//! exception — a brand-new column is referenced by no consumer, so it fires
-//! *only* in the unfiltered (`SELECT *`) case, where it shifts positional
+//! Per-column filtering needs a *provably complete* column list. Whenever the
+//! consumed-column guard can't prove one — a `SELECT *`, a CTE or sub-query, a
+//! `USING`/`NATURAL` join, or an unattributable reference — we fall back to the
+//! conservative *unfiltered* behaviour: every relevant producer change is
+//! flagged against that consumer model. That over-reports rather than letting a
+//! breaking change slip through silently. W030 (added column) is the exception
+//! — a brand-new column is referenced by no consumer, so it fires *only* in the
+//! unfiltered case (a `SELECT *` consumer), where it shifts positional
 //! projection.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -272,25 +276,35 @@ pub fn imports_diagnostics(
                 continue;
             }
 
-            let reference = match rocky_sql::lineage::extract_lineage(&model.sql) {
-                Ok(lineage) if !lineage.has_star => {
-                    // Build the read-set from a COMPLETE column walk (WHERE /
-                    // JOIN ON / GROUP BY / HAVING / ORDER BY / every expression
-                    // operand), not `lineage.columns` — which captures only the
-                    // top-level projection's first-traceable refs and would let
-                    // a breaking change to a column read elsewhere (a WHERE
-                    // filter, a 2nd function arg, a CASE/arithmetic operand)
-                    // slip the gate silently. An empty result (no columns
-                    // resolved) falls back to the conservative Unfiltered.
-                    let cols = rocky_sql::lineage::referenced_columns(&model.sql);
+            // Route the read-set through the consumed-column completeness guard:
+            // it returns the proven-complete set of columns the model reads from
+            // its sources — across projection, WHERE, JOIN ON, GROUP BY, HAVING,
+            // window PARTITION BY, and every expression operand — or force-builds
+            // on any shape it can't prove exhaustive. This closes the read-set's
+            // silent blind spots (`USING`/`NATURAL` join keys carried outside the
+            // expression tree; a `SELECT *` inside a CTE) that a flat column walk
+            // missed. When the guard can't prove completeness, we fall back to
+            // the conservative Unfiltered (flag every producer change) rather
+            // than trust a possibly-incomplete set.
+            let reference = match rocky_sql::consumed_columns::consumed_columns(&model.sql) {
+                rocky_sql::consumed_columns::ConsumedColumns::Complete(map) => {
+                    // Single-source consumer (guaranteed by `single_source`
+                    // above): the read-set against the one producer is the union
+                    // of the proven-complete consumed columns. An empty map is a
+                    // source-less `SELECT` that can't reference this producer.
+                    let cols: BTreeSet<String> = map.into_values().flatten().collect();
                     if cols.is_empty() {
                         Reference::Unfiltered
                     } else {
                         Reference::Columns(cols)
                     }
                 }
-                // `SELECT *` or unparsable SQL: be conservative.
-                _ => Reference::Unfiltered,
+                // `SELECT *`, a CTE/sub-query, a `USING`/`NATURAL` join, an
+                // ambiguous reference, or any shape the guard can't prove
+                // exhaustive: flag every producer change (never miss one).
+                rocky_sql::consumed_columns::ConsumedColumns::ForceBuild(_) => {
+                    Reference::Unfiltered
+                }
             };
 
             flag_changes(
@@ -531,6 +545,50 @@ mod tests {
         assert!(
             diags.iter().any(|d| &*d.code == "E030"),
             "SELECT * should conservatively flag the drop, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn using_join_key_drop_is_flagged() {
+        // The `USING (cust_id)` join key is a column name carried outside the
+        // expression tree, so a flat column walk never sees it — dropping
+        // `cust_id` upstream would slip silently. The consumed-column
+        // completeness guard force-builds on `USING` joins, so imports_check
+        // falls back to unfiltered and flags the drop. (This is the soundness
+        // upgrade the guard brings to E030.)
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = producer_snapshot(&["id", "cust_id"]);
+        let current = producer_snapshot(&["id"]); // dropped the join key
+        let config = fixture(dir.path(), &baseline, &current, Some("*"));
+        let model = consumer_model(
+            "SELECT o.id, c.name FROM shop.core.orders o \
+             JOIN shop.core.customers c USING (cust_id)",
+        );
+
+        let diags = imports_diagnostics(&config, dir.path(), &[model]);
+        assert!(
+            diags.iter().any(|d| &*d.code == "E030"),
+            "dropped USING join key must be flagged, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn cte_with_inner_star_conservatively_flags_drop() {
+        // A `SELECT *` inside a CTE surfaces every producer column, but a flat
+        // walk over the outer query never sees it — so a dropped column the
+        // consumer transitively depends on slips silently. The completeness
+        // guard force-builds on the CTE, so the drop is flagged conservatively.
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = producer_snapshot(&["id", "shipped_at"]);
+        let current = producer_snapshot(&["id"]); // dropped shipped_at
+        let config = fixture(dir.path(), &baseline, &current, Some("*"));
+        let model =
+            consumer_model("WITH staged AS (SELECT * FROM shop.core.orders) SELECT id FROM staged");
+
+        let diags = imports_diagnostics(&config, dir.path(), &[model]);
+        assert!(
+            diags.iter().any(|d| &*d.code == "E030"),
+            "CTE-wrapped consumer must conservatively flag the drop, got: {diags:?}"
         );
     }
 
