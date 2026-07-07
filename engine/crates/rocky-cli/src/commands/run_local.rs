@@ -875,6 +875,8 @@ pub async fn run_snapshot(
                 &model_ir,
                 dialect.name(),
             )),
+            // Not the content-addressed write path — no in-process column bytes.
+            output_column_hashes: None,
         });
     } else {
         output.tables_failed = 1;

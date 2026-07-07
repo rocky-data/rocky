@@ -5218,6 +5218,13 @@ pub(crate) async fn execute_models(
                                 &model_ir,
                                 warehouse.dialect().name(),
                             )),
+                            // Producer-side per-output-column content hashes for
+                            // this content-addressed build. Empty (⇒ `None`) on a
+                            // point-to reuse or a partitioned table — both degrade
+                            // to a safe rebuild in the later skip gate. Captured
+                            // only; nothing consults it yet.
+                            output_column_hashes: (!summary.output_column_hashes.is_empty())
+                                .then(|| summary.output_column_hashes.clone()),
                         });
                         // Per-model decision (reporting-only). A
                         // content_addressed model is never skip-eligible, so it
@@ -6065,6 +6072,8 @@ async fn execute_one_plain_model(
             &model_ir,
             warehouse.dialect().name(),
         )),
+        // Not the content-addressed write path — no in-process column bytes.
+        output_column_hashes: None,
     })
 }
 
@@ -6496,6 +6505,8 @@ async fn run_one_partition(
                 &model.to_model_ir(),
                 warehouse.dialect().name(),
             )),
+            // Not the content-addressed write path — no in-process column bytes.
+            output_column_hashes: None,
         }),
     }
 }
@@ -7403,6 +7414,8 @@ async fn process_table(
                 &model_ir,
                 dialect.name(),
             )),
+            // Not the content-addressed write path — no in-process column bytes.
+            output_column_hashes: None,
         },
         drift_checked: true,
         drift_detected: drift_action,
@@ -11226,6 +11239,7 @@ merge_keys = ["id"]
                 input_proof_class: None,
                 env_hash: None,
                 hash_scheme: None,
+                output_column_hashes: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
