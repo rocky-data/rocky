@@ -6,16 +6,33 @@ from __future__ import annotations
 from pydantic import AwareDatetime, BaseModel, conint
 
 
-class ModelExecutionRecord(BaseModel):
+class RecipeIdentityView(BaseModel):
     """
-    One model execution from the state store, mirroring `rocky_core::state::ModelExecution`.
+    The recipe-identity triple surfaced on a model record — the answer to "what exact program, over what inputs, in what environment produced this?".
+
+    Read back from the persisted [`rocky_core::state::ModelExecution`]. Every field is optional: a record written before the triple was captured (state schema predating it) or a failed execution carries none of them, and the input side is absent on the default run path (which observes no inputs). The whole object is omitted from JSON when nothing was recorded — see [`Self::from_execution`] — so output for pre-triple records is unchanged.
     """
 
-    duration_ms: conint(ge=0)
-    rows_affected: conint(ge=0) | None = None
-    sql_hash: str
-    started_at: AwareDatetime
-    status: str
+    env_hash: str | None = None
+    """
+    The **environment** key: blake3 (hex) over the engine version and the adapter / dialect identity. Excludes the hostname by construction.
+    """
+    hash_scheme: str | None = None
+    """
+    The hash-scheme tag (`"v1"`) in force when the triple was computed, so a future canonicalisation change is an explicit new scheme rather than a silent history fork.
+    """
+    input_hash: str | None = None
+    """
+    The **input** key: blake3 (hex) over the run's observed input identities. Present only when the run actually observed inputs (the `--skip-unchanged` gate's upstream freshness signatures, or the content-addressed reuse spine); absent on the default run path.
+    """
+    input_proof_class: str | None = None
+    """
+    Strength of [`Self::input_hash`]: `"strong"` (every observed upstream is a content hash — offline byte-verifiable) or `"heuristic"` (at least one is a freshness signature, attesting freshness rather than byte-identity). Carried so a weak input hash is never presented as a content claim. `None` whenever [`Self::input_hash`] is `None`.
+    """
+    recipe_hash: str | None = None
+    """
+    The program **identity** key: blake3 (hex) of the canonical `ModelIr` JSON. Stable across environments and engine versions for the same program text. The value `rocky history --recipe <hash>` filters on.
+    """
 
 
 class RollingDimension(BaseModel):
@@ -68,6 +85,22 @@ class RollingStats(BaseModel):
     """
     Maximum number of executions requested for the rolling window.
     """
+
+
+class ModelExecutionRecord(BaseModel):
+    """
+    One model execution from the state store, mirroring `rocky_core::state::ModelExecution`.
+    """
+
+    duration_ms: conint(ge=0)
+    recipe_identity: RecipeIdentityView | None = None
+    """
+    The recipe-identity triple recorded for this execution, when present. See [`RecipeIdentityView`].
+    """
+    rows_affected: conint(ge=0) | None = None
+    sql_hash: str
+    started_at: AwareDatetime
+    status: str
 
 
 class ModelHistoryOutput(BaseModel):

@@ -60,6 +60,12 @@ AUDIT_FIELD_SENTINELS: dict[str, str] = {
     # through every captured fixture (otherwise every release PR fails
     # `codegen-drift.yml` until `just regen-fixtures` is re-run).
     "version": "0.0.0-SENTINEL",
+    # `env_hash` (recipe-identity triple) folds the engine version into its
+    # blake3, so it churns on every version bump exactly like `version`.
+    # Sentinel it for the same reason. The other triple fields — `recipe_hash`,
+    # `input_hash`, `input_proof_class`, `hash_scheme` — are version-stable and
+    # stay as real assertions.
+    "env_hash": "envhash-SENTINEL",
 }
 
 # Numeric fields whose value is a deterministic function of a

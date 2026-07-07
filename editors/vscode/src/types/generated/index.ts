@@ -91,6 +91,9 @@ export type { HistoryOutput, RunHistoryRecord, RunModelRecord } from "./history"
 // Model history (per-model)
 export type { ModelHistoryOutput, ModelExecutionRecord } from "./model_history";
 
+// Recipe history (all executions of one exact program — `rocky history --recipe`)
+export type { RecipeHistoryOutput, RecipeExecutionRecord } from "./recipe_history";
+
 // Metrics
 export type {
   MetricsOutput,

@@ -8,8 +8,9 @@ use chrono::{DateTime, Utc};
 use rocky_core::state::{RunRecord, SessionSource, StateStore};
 
 use crate::output::{
-    HistoryOutput, ModelExecutionRecord, ModelHistoryOutput, RollingDimension, RollingStats,
-    RunHistoryRecord, RunModelRecord, print_json,
+    HistoryOutput, ModelExecutionRecord, ModelHistoryOutput, RecipeExecutionRecord,
+    RecipeHistoryOutput, RecipeIdentityView, RollingDimension, RollingStats, RunHistoryRecord,
+    RunModelRecord, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -43,6 +44,7 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
             duration_ms: m.duration_ms,
             rows_affected: m.rows_affected,
             status: m.status.clone(),
+            recipe_identity: RecipeIdentityView::from_execution(m),
         })
         .collect();
     let (
@@ -84,6 +86,16 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
         target_catalog,
         hostname,
         rocky_version,
+    }
+}
+
+/// Truncate a text-table cell to `max` bytes, appending `…` when cut, so
+/// long model names don't break the fixed-column recipe-history layout.
+fn truncate_cell(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max.saturating_sub(1)])
     }
 }
 
@@ -177,6 +189,7 @@ pub fn model_history_output(
             rows_affected: e.rows_affected,
             status: format!("{:?}", e.status),
             sql_hash: e.sql_hash.clone(),
+            recipe_identity: RecipeIdentityView::from_execution(e),
         })
         .collect();
     Ok(ModelHistoryOutput {
@@ -186,6 +199,62 @@ pub fn model_history_output(
         count: executions.len(),
         executions,
         rolling_stats: stats,
+    })
+}
+
+/// How many recent runs `rocky history --recipe <hash>` scans. A recipe can
+/// re-run far more often than the model-agnostic `rocky history` view lists,
+/// so this is deliberately larger than the 50-run default; the redb scan is
+/// cheap and bounded.
+const RECIPE_SCAN_RUN_LIMIT: usize = 500;
+
+/// Build the recipe-scoped output for `rocky history --recipe <hash>` — every
+/// recorded execution of one exact program, across all runs. Pure compute —
+/// no printing — so other surfaces can reuse it.
+///
+/// Runs are scanned newest-first and each run's model executions are visited
+/// in recorded order, so the result is newest-run-first. An unknown hash
+/// yields an empty `executions` list (not an error): "no run produced this
+/// program" is a valid, queryable answer.
+pub fn recipe_history_output(
+    state_path: &Path,
+    recipe_hash: &str,
+    since: Option<&str>,
+) -> Result<RecipeHistoryOutput> {
+    let store = StateStore::open_read_only(state_path)?;
+    let since_ts = parse_since(since)?;
+
+    let runs = store.list_runs(RECIPE_SCAN_RUN_LIMIT)?;
+    let mut executions: Vec<RecipeExecutionRecord> = Vec::new();
+    for run in &runs {
+        if let Some(ts) = since_ts
+            && run.started_at < ts
+        {
+            continue;
+        }
+        for m in &run.models_executed {
+            if m.recipe_hash.as_deref() != Some(recipe_hash) {
+                continue;
+            }
+            executions.push(RecipeExecutionRecord {
+                run_id: run.run_id.clone(),
+                model_name: m.model_name.clone(),
+                started_at: m.started_at,
+                duration_ms: m.duration_ms,
+                rows_affected: m.rows_affected,
+                status: m.status.clone(),
+                sql_hash: m.sql_hash.clone(),
+                recipe_identity: RecipeIdentityView::from_execution(m),
+            });
+        }
+    }
+
+    Ok(RecipeHistoryOutput {
+        version: VERSION.to_string(),
+        command: "history".to_string(),
+        recipe_hash: recipe_hash.to_string(),
+        count: executions.len(),
+        executions,
     })
 }
 
@@ -200,6 +269,7 @@ pub fn model_history_output(
 /// When `rolling_stats` is true and `model_filter` is set, augments
 /// `ModelHistoryOutput` with a [`RollingStats`] block computed over the
 /// `window` most recent successful executions.
+#[allow(clippy::too_many_arguments)]
 pub fn run_history(
     state_path: &Path,
     model_filter: Option<&str>,
@@ -207,8 +277,41 @@ pub fn run_history(
     audit: bool,
     rolling_stats: bool,
     window: usize,
+    recipe: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
+    if let Some(recipe_hash) = recipe {
+        let output = recipe_history_output(state_path, recipe_hash, since)?;
+        if output_json {
+            print_json(&output)?;
+        } else {
+            let short = &recipe_hash[..recipe_hash.len().min(16)];
+            println!("Executions of recipe {short}…:");
+            println!(
+                "{:<14} {:<24} {:<24} {:<10} {:<12} {:<10}",
+                "RUN ID", "MODEL", "STARTED", "DURATION", "STATUS", "INPUT"
+            );
+            println!("{}", "-".repeat(96));
+            for exec in &output.executions {
+                let input_class = exec
+                    .recipe_identity
+                    .as_ref()
+                    .and_then(|r| r.input_proof_class.as_deref())
+                    .unwrap_or("-");
+                println!(
+                    "{:<14} {:<24} {:<24} {:<10} {:<12} {:<10}",
+                    &exec.run_id[..exec.run_id.len().min(13)],
+                    truncate_cell(&exec.model_name, 23),
+                    exec.started_at.format("%Y-%m-%d %H:%M:%S"),
+                    format!("{}ms", exec.duration_ms),
+                    exec.status,
+                    input_class,
+                );
+            }
+            println!("\nTotal executions: {}", output.executions.len());
+        }
+        return Ok(());
+    }
     if let Some(model_name) = model_filter {
         let output = model_history_output(state_path, model_name, since, rolling_stats, window)?;
         if output_json {
@@ -519,6 +622,105 @@ mod tests {
         assert_eq!(session_source_str(SessionSource::Dagster), "dagster");
         assert_eq!(session_source_str(SessionSource::Lsp), "lsp");
         assert_eq!(session_source_str(SessionSource::HttpApi), "http_api");
+    }
+
+    #[test]
+    fn recipe_identity_view_none_when_nothing_recorded() {
+        // A pre-triple / default execution records no recipe identity.
+        let exec = make_exec(1, None, "success");
+        assert!(
+            RecipeIdentityView::from_execution(&exec).is_none(),
+            "no recorded triple → omitted entirely"
+        );
+
+        let mut recorded = make_exec(1, None, "success");
+        recorded.recipe_hash = Some("r-hash".to_string());
+        recorded.env_hash = Some("e-hash".to_string());
+        recorded.hash_scheme = Some("v1".to_string());
+        let view = RecipeIdentityView::from_execution(&recorded).expect("triple present");
+        assert_eq!(view.recipe_hash.as_deref(), Some("r-hash"));
+        assert_eq!(view.env_hash.as_deref(), Some("e-hash"));
+        assert!(view.input_hash.is_none(), "default path observes no inputs");
+    }
+
+    fn exec_with_recipe(model: &str, recipe: &str) -> ModelExecution {
+        let mut e = make_exec(10, Some(5), "success");
+        e.model_name = model.to_string();
+        e.recipe_hash = Some(recipe.to_string());
+        e.env_hash = Some("env-1".to_string());
+        e.hash_scheme = Some("v1".to_string());
+        e
+    }
+
+    fn run_with(run_id: &str, execs: Vec<ModelExecution>) -> RunRecord {
+        RunRecord {
+            run_id: run_id.to_string(),
+            started_at: Utc::now(),
+            finished_at: Utc::now() + chrono::Duration::seconds(1),
+            status: RunStatus::Success,
+            models_executed: execs,
+            trigger: RunTrigger::Manual,
+            config_hash: "cfg".to_string(),
+            triggering_identity: None,
+            session_source: SessionSource::Cli,
+            git_commit: None,
+            git_branch: None,
+            idempotency_key: None,
+            target_catalog: None,
+            hostname: "host".to_string(),
+            rocky_version: "0.0.0-test".to_string(),
+        }
+    }
+
+    #[test]
+    fn recipe_history_filters_by_recipe_hash_across_runs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = rocky_core::state::StateStore::open(&path).unwrap();
+
+        store
+            .record_run(&run_with(
+                "run-1",
+                vec![
+                    exec_with_recipe("customer_orders", "recipe-A"),
+                    exec_with_recipe("raw_orders", "recipe-B"),
+                ],
+            ))
+            .unwrap();
+        // A second run re-executes the same program (recipe-A).
+        store
+            .record_run(&run_with(
+                "run-2",
+                vec![exec_with_recipe("customer_orders", "recipe-A")],
+            ))
+            .unwrap();
+        // Drop the write handle so the read-only query can open the store
+        // (redb is single-writer; a held write handle blocks the reader).
+        drop(store);
+
+        let out = recipe_history_output(&path, "recipe-A", None).unwrap();
+        assert_eq!(out.count, 2, "recipe-A ran in both runs");
+        assert_eq!(out.recipe_hash, "recipe-A");
+        assert!(
+            out.executions
+                .iter()
+                .all(|e| e.model_name == "customer_orders"),
+            "only the recipe-A program's executions are returned"
+        );
+        assert!(
+            out.executions.iter().all(|e| e
+                .recipe_identity
+                .as_ref()
+                .and_then(|r| r.recipe_hash.as_deref())
+                == Some("recipe-A")),
+            "each execution carries its recipe-identity triple"
+        );
+
+        let other = recipe_history_output(&path, "recipe-B", None).unwrap();
+        assert_eq!(other.count, 1);
+
+        let unknown = recipe_history_output(&path, "no-such-hash", None).unwrap();
+        assert_eq!(unknown.count, 0, "an unknown hash is empty, not an error");
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

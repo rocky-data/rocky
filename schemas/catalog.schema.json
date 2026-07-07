@@ -64,6 +64,17 @@
           "description": "Model or source name as it appears in lineage edges.",
           "type": "string"
         },
+        "recipe_identity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RecipeIdentityView"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Recipe-identity triple from the asset's most recent successful materialization, when known. See [`RecipeIdentityView`]. `None` for source-kind assets (no execution) and for models built before the triple was captured."
+        },
         "upstream_models": {
           "items": {
             "type": "string"
@@ -206,6 +217,47 @@
         "Low"
       ],
       "type": "string"
+    },
+    "RecipeIdentityView": {
+      "description": "The recipe-identity triple surfaced on a model record — the answer to \"what exact program, over what inputs, in what environment produced this?\".\n\nRead back from the persisted [`rocky_core::state::ModelExecution`]. Every field is optional: a record written before the triple was captured (state schema predating it) or a failed execution carries none of them, and the input side is absent on the default run path (which observes no inputs). The whole object is omitted from JSON when nothing was recorded — see [`Self::from_execution`] — so output for pre-triple records is unchanged.",
+      "properties": {
+        "env_hash": {
+          "description": "The **environment** key: blake3 (hex) over the engine version and the adapter / dialect identity. Excludes the hostname by construction.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hash_scheme": {
+          "description": "The hash-scheme tag (`\"v1\"`) in force when the triple was computed, so a future canonicalisation change is an explicit new scheme rather than a silent history fork.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_hash": {
+          "description": "The **input** key: blake3 (hex) over the run's observed input identities. Present only when the run actually observed inputs (the `--skip-unchanged` gate's upstream freshness signatures, or the content-addressed reuse spine); absent on the default run path.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_proof_class": {
+          "description": "Strength of [`Self::input_hash`]: `\"strong\"` (every observed upstream is a content hash — offline byte-verifiable) or `\"heuristic\"` (at least one is a freshness signature, attesting freshness rather than byte-identity). Carried so a weak input hash is never presented as a content claim. `None` whenever [`Self::input_hash`] is `None`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recipe_hash": {
+          "description": "The program **identity** key: blake3 (hex) of the canonical `ModelIr` JSON. Stable across environments and engine versions for the same program text. The value `rocky history --recipe <hash>` filters on.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     }
   },
   "description": "JSON output for `rocky catalog`.\n\nA persisted, queryable snapshot of column-level lineage across the project. Emitted to `./.rocky/catalog/catalog.json` (default) so any non-Rocky consumer (BI tool, governance dashboard, PR bot) can read the artifact without invoking the engine. The CLI's own stdout is a one-screen summary; this struct is the structured payload backing `--output json`.",

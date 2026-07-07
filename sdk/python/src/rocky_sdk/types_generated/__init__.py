@@ -101,6 +101,9 @@ from .drift_schema import DriftActionOutput, DriftOutput, DriftSummary
 from .history_schema import HistoryOutput, RunHistoryRecord
 from .model_history_schema import ModelExecutionRecord, ModelHistoryOutput
 
+# RecipeHistory (all executions of one exact program) — `rocky history --recipe`
+from .recipe_history_schema import RecipeExecutionRecord, RecipeHistoryOutput
+
 # Lineage (model-level shape)
 from .lineage_schema import (
     LineageColumnDef,
@@ -344,6 +347,8 @@ __all__ = [
     "RunHistoryRecord",
     "ModelHistoryOutput",
     "ModelExecutionRecord",
+    "RecipeHistoryOutput",
+    "RecipeExecutionRecord",
     # lineage
     "LineageOutput",
     "LineageColumnDef",

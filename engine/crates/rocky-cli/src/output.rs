@@ -2126,6 +2126,10 @@ pub struct RunModelRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows_affected: Option<u64>,
     pub status: String,
+    /// The recipe-identity triple recorded for this execution, when
+    /// present. See [`RecipeIdentityView`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe_identity: Option<RecipeIdentityView>,
 }
 
 /// One model execution from the state store, mirroring
@@ -2138,6 +2142,125 @@ pub struct ModelExecutionRecord {
     pub rows_affected: Option<u64>,
     pub status: String,
     pub sql_hash: String,
+    /// The recipe-identity triple recorded for this execution, when
+    /// present. See [`RecipeIdentityView`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe_identity: Option<RecipeIdentityView>,
+}
+
+// ── Recipe identity surface ─────────────────────────────────────────────────
+//
+// The (recipe_hash, input_hash, env_hash) triple, surfaced on the model
+// records of `history` / `trace` / `catalog` and queried by
+// `rocky history --recipe <hash>`. Read back from the persisted
+// `ModelExecution`; the internal capture path lives in `RecipeIdentityInternal`
+// above. Kept in one contiguous block.
+
+/// The recipe-identity triple surfaced on a model record — the answer to
+/// "what exact program, over what inputs, in what environment produced this?".
+///
+/// Read back from the persisted [`rocky_core::state::ModelExecution`]. Every
+/// field is optional: a record written before the triple was captured (state
+/// schema predating it) or a failed execution carries none of them, and the
+/// input side is absent on the default run path (which observes no inputs).
+/// The whole object is omitted from JSON when nothing was recorded — see
+/// [`Self::from_execution`] — so output for pre-triple records is unchanged.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RecipeIdentityView {
+    /// The program **identity** key: blake3 (hex) of the canonical
+    /// `ModelIr` JSON. Stable across environments and engine versions for
+    /// the same program text. The value `rocky history --recipe <hash>`
+    /// filters on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe_hash: Option<String>,
+    /// The **input** key: blake3 (hex) over the run's observed input
+    /// identities. Present only when the run actually observed inputs (the
+    /// `--skip-unchanged` gate's upstream freshness signatures, or the
+    /// content-addressed reuse spine); absent on the default run path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_hash: Option<String>,
+    /// Strength of [`Self::input_hash`]: `"strong"` (every observed upstream
+    /// is a content hash — offline byte-verifiable) or `"heuristic"` (at
+    /// least one is a freshness signature, attesting freshness rather than
+    /// byte-identity). Carried so a weak input hash is never presented as a
+    /// content claim. `None` whenever [`Self::input_hash`] is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_proof_class: Option<String>,
+    /// The **environment** key: blake3 (hex) over the engine version and the
+    /// adapter / dialect identity. Excludes the hostname by construction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_hash: Option<String>,
+    /// The hash-scheme tag (`"v1"`) in force when the triple was computed,
+    /// so a future canonicalisation change is an explicit new scheme rather
+    /// than a silent history fork.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash_scheme: Option<String>,
+}
+
+impl RecipeIdentityView {
+    /// Read the surfaced triple from a persisted [`ModelExecution`], or
+    /// `None` when the execution recorded no recipe identity at all (a
+    /// pre-triple or failed record). Returning `None` keeps the enclosing
+    /// model record's JSON byte-identical to its pre-triple shape.
+    ///
+    /// [`ModelExecution`]: rocky_core::state::ModelExecution
+    #[must_use]
+    pub fn from_execution(exec: &rocky_core::state::ModelExecution) -> Option<Self> {
+        if exec.recipe_hash.is_none()
+            && exec.input_hash.is_none()
+            && exec.input_proof_class.is_none()
+            && exec.env_hash.is_none()
+            && exec.hash_scheme.is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            recipe_hash: exec.recipe_hash.clone(),
+            input_hash: exec.input_hash.clone(),
+            input_proof_class: exec.input_proof_class.clone(),
+            env_hash: exec.env_hash.clone(),
+            hash_scheme: exec.hash_scheme.clone(),
+        })
+    }
+}
+
+/// JSON output for `rocky history --recipe <hash>` — every recorded
+/// execution of one exact program (`recipe_hash`), across all runs.
+///
+/// The "what produced this?" query: given a `recipe_hash` (read from any
+/// model record's [`RecipeIdentityView`]), list every time that exact program
+/// ran — newest run first — with the run it belonged to and its per-execution
+/// input / environment identity.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RecipeHistoryOutput {
+    pub version: String,
+    pub command: String,
+    /// The `recipe_hash` the history was filtered on, echoed back.
+    pub recipe_hash: String,
+    pub executions: Vec<RecipeExecutionRecord>,
+    pub count: usize,
+}
+
+/// One execution of a given `recipe_hash`, embedded in
+/// [`RecipeHistoryOutput`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RecipeExecutionRecord {
+    /// The run this execution belonged to.
+    pub run_id: String,
+    /// Model name as recorded in the run.
+    pub model_name: String,
+    pub started_at: DateTime<Utc>,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_affected: Option<u64>,
+    pub status: String,
+    pub sql_hash: String,
+    /// The recipe-identity triple for this execution. Its `recipe_hash`
+    /// matches the top-level filter; `input_hash` / `env_hash` can differ
+    /// run-to-run for the same program (different inputs, different engine
+    /// version).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe_identity: Option<RecipeIdentityView>,
 }
 
 /// JSON output for `rocky metrics`.
@@ -2577,6 +2700,12 @@ pub struct CatalogAsset {
     /// when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_run_id: Option<String>,
+    /// Recipe-identity triple from the asset's most recent successful
+    /// materialization, when known. See [`RecipeIdentityView`]. `None` for
+    /// source-kind assets (no execution) and for models built before the
+    /// triple was captured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe_identity: Option<RecipeIdentityView>,
 }
 
 /// A column on a catalog asset.
@@ -6007,6 +6136,10 @@ pub struct TraceModelEntry {
     /// wired it yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
+    /// The recipe-identity triple recorded for this execution, when
+    /// present. See [`RecipeIdentityView`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe_identity: Option<RecipeIdentityView>,
 }
 
 /// JSON output for `rocky cost <run_id|latest>`.
