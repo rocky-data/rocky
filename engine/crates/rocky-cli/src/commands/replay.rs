@@ -149,6 +149,11 @@ mod tests {
                 bytes_scanned: Some(1024),
                 bytes_written: Some(2048),
                 tenant: None,
+                recipe_hash: None,
+                input_hash: None,
+                input_proof_class: None,
+                env_hash: None,
+                hash_scheme: None,
             })
             .collect();
         RunRecord {

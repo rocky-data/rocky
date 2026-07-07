@@ -215,7 +215,18 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   auto-create the empty table on next open and stamp themselves as v10. No
 ///   blob migration needed; existing tables are untouched. Empty until a
 ///   `prune_unchanged` pipeline runs, so pre-existing state resumes unchanged.
-const CURRENT_SCHEMA_VERSION: u32 = 10;
+/// - **v11** — adds the recipe-identity triple
+///   (`recipe_hash` / `input_hash` / `input_proof_class` / `env_hash` /
+///   `hash_scheme`) to the [`ModelExecution`] blob. Pure additive blob-field
+///   change: the new fields are `#[serde(default)]`, so a v10 `RunRecord`
+///   forward-deserializes with them all `None` and a v11 blob back-reads
+///   cleanly on a v10 binary (serde ignores the extra keys). No new tables, no
+///   in-place migration. The version bump is deliberate visibility for the
+///   identity surface (mirroring the v6 audit-trail fields) rather than a
+///   storage-layout requirement; a leaner precedent (`ModelExecution::tenant`)
+///   added a blob field without a bump. Guarded by
+///   `test_v10_model_execution_forward_deserializes_recipe_identity_none`.
+const CURRENT_SCHEMA_VERSION: u32 = 11;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -1094,6 +1105,52 @@ pub struct ModelExecution {
     /// Guarded by `test_pre_tenant_model_execution_forward_deserializes_to_none`.
     #[serde(default)]
     pub tenant: Option<String>,
+
+    // --- Recipe identity (schema v11) ------------------------------------
+    //
+    // The `(recipe_hash, input_hash, env_hash)` triple + its scheme tag,
+    // recorded on every execution so "what exact program, over what inputs,
+    // in what environment produced this table version?" is answerable for
+    // every model on every adapter — not just the content-addressed path.
+    // All state-internal (never in a `*Output` schema, no codegen) and
+    // serde-defaulted; see [`crate::recipe_identity`] for the definitions.
+    /// The model's **identity** key: blake3 (hex) of the canonical
+    /// [`rocky_ir::ModelIr`] JSON — [`crate::recipe_identity::recipe_hash`].
+    /// The same canonical form [`ProvenanceRecord`] embeds. Distinct from
+    /// [`Self::skip_hash`] (the cosmetic-invariant *skip* key): recipe_hash
+    /// is whitespace-sensitive program identity, not a skip decision.
+    /// `None` for failed executions and for records written before v11.
+    #[serde(default)]
+    pub recipe_hash: Option<String>,
+    /// The model's **input** key (hex): a blake3 over the *observed* input
+    /// identities via [`crate::recipe_identity::compute_input_hash`]. Present
+    /// only when this run actually observed inputs (the skip gate's upstream
+    /// freshness signatures, or the content-addressed reuse spine). `None` on
+    /// the default run path, which observes no inputs — the declared inputs
+    /// already live inside [`Self::recipe_hash`], so a bare "no upstreams"
+    /// hash would add nothing and would falsely read as a strong claim.
+    #[serde(default)]
+    pub input_hash: Option<String>,
+    /// Strength of [`Self::input_hash`]: `"strong"` (every observed upstream
+    /// is a content hash) or `"heuristic"` (at least one is a freshness
+    /// signature — the *weak* label the design uses for mutable sources). See
+    /// [`crate::recipe_identity::ProofClass`]. `None` whenever
+    /// [`Self::input_hash`] is `None`.
+    #[serde(default)]
+    pub input_proof_class: Option<String>,
+    /// The **environment** key (hex): blake3 over
+    /// [`crate::recipe_identity::EnvIdentity`] (engine version + adapter /
+    /// dialect identity + execution config). Excludes hostname by
+    /// construction — machine identity is on [`RunRecord::hostname`], not
+    /// here. `None` for failed executions and pre-v11 records.
+    #[serde(default)]
+    pub env_hash: Option<String>,
+    /// The [`crate::recipe_identity::HASH_SCHEME`] tag (`"v1"`) in force when
+    /// the triple above was computed, so a future canonicalisation change is
+    /// an explicit new scheme rather than a silent history fork. `None` for
+    /// failed executions and pre-v11 records.
+    #[serde(default)]
+    pub hash_scheme: Option<String>,
 }
 
 /// A complete pipeline run record.
@@ -3876,6 +3933,11 @@ mod tests {
                 bytes_scanned: None,
                 bytes_written: None,
                 tenant: None,
+                recipe_hash: None,
+                input_hash: None,
+                input_proof_class: None,
+                env_hash: None,
+                hash_scheme: None,
             }],
         );
         store.record_run(&run).unwrap();
@@ -3917,6 +3979,11 @@ mod tests {
                     bytes_scanned: None,
                     bytes_written: None,
                     tenant: None,
+                    recipe_hash: None,
+                    input_hash: None,
+                    input_proof_class: None,
+                    env_hash: None,
+                    hash_scheme: None,
                 },
                 ModelExecution {
                     model_name: "customers".to_string(),
@@ -3931,6 +3998,11 @@ mod tests {
                     bytes_scanned: None,
                     bytes_written: None,
                     tenant: None,
+                    recipe_hash: None,
+                    input_hash: None,
+                    input_proof_class: None,
+                    env_hash: None,
+                    hash_scheme: None,
                 },
             ],
         );
@@ -3960,6 +4032,11 @@ mod tests {
                     bytes_scanned: None,
                     bytes_written: None,
                     tenant: None,
+                    recipe_hash: None,
+                    input_hash: None,
+                    input_proof_class: None,
+                    env_hash: None,
+                    hash_scheme: None,
                 }],
             );
             store.record_run(&run).unwrap();
@@ -4080,6 +4157,145 @@ mod tests {
         // The new attribution dimension defaults to None — a pre-tenant
         // record is treated as unattributed, never crashes the read.
         assert_eq!(exec.tenant, None);
+    }
+
+    /// v10 → v11 forward-compat: a `ModelExecution` blob written before the
+    /// recipe-identity triple existed (no `recipe_hash` / `input_hash` /
+    /// `input_proof_class` / `env_hash` / `hash_scheme` keys) must
+    /// forward-deserialize with all five defaulting to `None`.
+    #[test]
+    fn test_v10_model_execution_forward_deserializes_recipe_identity_none() {
+        let v10_blob = br#"{
+            "model_name": "orders",
+            "started_at": "2024-01-01T12:00:00Z",
+            "finished_at": "2024-01-01T12:00:02Z",
+            "duration_ms": 2000,
+            "rows_affected": 5000,
+            "status": "success",
+            "sql_hash": "legacy-sql-hash",
+            "skip_hash": "logic-key",
+            "upstream_freshness": null,
+            "bytes_scanned": 4096,
+            "bytes_written": 2048,
+            "tenant": "acme"
+        }"#;
+
+        let exec: ModelExecution = serde_json::from_slice(v10_blob)
+            .expect("pre-v11 ModelExecution must forward-deserialize");
+
+        // Prior fields preserved.
+        assert_eq!(exec.model_name, "orders");
+        assert_eq!(exec.tenant.as_deref(), Some("acme"));
+        // The recipe-identity triple defaults to None — a pre-v11 record is
+        // treated as identity-unknown, never crashes the read.
+        assert_eq!(exec.recipe_hash, None);
+        assert_eq!(exec.input_hash, None);
+        assert_eq!(exec.input_proof_class, None);
+        assert_eq!(exec.env_hash, None);
+        assert_eq!(exec.hash_scheme, None);
+    }
+
+    /// A v11 `ModelExecution` blob (carrying the triple) must back-read on a
+    /// binary that predates it: serde ignores the unknown keys, so a v10 reader
+    /// never breaks on a v11 row. Emulated by deserializing the full v11 shape
+    /// and confirming the round-trip is lossless.
+    #[test]
+    fn test_v11_model_execution_round_trips_recipe_identity() {
+        let exec = ModelExecution {
+            model_name: "fct_orders".to_string(),
+            started_at: "2024-01-01T12:00:00Z".parse().unwrap(),
+            finished_at: "2024-01-01T12:00:02Z".parse().unwrap(),
+            duration_ms: 2000,
+            rows_affected: Some(10),
+            status: "success".to_string(),
+            sql_hash: "sql".to_string(),
+            skip_hash: Some("logic-key".to_string()),
+            upstream_freshness: None,
+            bytes_scanned: None,
+            bytes_written: None,
+            tenant: None,
+            recipe_hash: Some("rh".to_string()),
+            input_hash: Some("ih".to_string()),
+            input_proof_class: Some("heuristic".to_string()),
+            env_hash: Some("eh".to_string()),
+            hash_scheme: Some("v1".to_string()),
+        };
+        let json = serde_json::to_string(&exec).unwrap();
+        let back: ModelExecution = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.recipe_hash.as_deref(), Some("rh"));
+        assert_eq!(back.input_hash.as_deref(), Some("ih"));
+        assert_eq!(back.input_proof_class.as_deref(), Some("heuristic"));
+        assert_eq!(back.env_hash.as_deref(), Some("eh"));
+        assert_eq!(back.hash_scheme.as_deref(), Some("v1"));
+    }
+
+    /// 🔴 Ledger-readability tripwire. The durable ledger's records
+    /// ([`ModelExecution`] carrying the recipe-identity triple, and
+    /// [`ProvenanceRecord`]) must stay byte-readable across releases: an
+    /// auditor reads these blobs back long after they were written. This pins
+    /// the exact serialized JSON of a fixed record of each type, so an
+    /// accidental serde change (a renamed field, a flipped attribute, a
+    /// reordered declaration) that would silently break an old reader fails
+    /// loudly here. A legitimate wire-format change must update these pins
+    /// *deliberately* and be paired with a schema-version bump — never re-pin to
+    /// make the test green. Run with `REGEN_LEDGER_GOLDEN=1` to reprint.
+    #[test]
+    fn ledger_record_serialization_pinned() {
+        let regen = std::env::var("REGEN_LEDGER_GOLDEN").is_ok_and(|v| !v.is_empty());
+        let ts: chrono::DateTime<chrono::Utc> = "2024-01-01T12:00:00Z".parse().unwrap();
+
+        let exec = ModelExecution {
+            model_name: "fct_orders".to_string(),
+            started_at: ts,
+            finished_at: ts,
+            duration_ms: 2000,
+            rows_affected: Some(10),
+            status: "success".to_string(),
+            sql_hash: "sql".to_string(),
+            skip_hash: Some("logic-key".to_string()),
+            upstream_freshness: None,
+            bytes_scanned: None,
+            bytes_written: None,
+            tenant: None,
+            recipe_hash: Some("recipe-abc".to_string()),
+            input_hash: Some("input-def".to_string()),
+            input_proof_class: Some("heuristic".to_string()),
+            env_hash: Some("env-ghi".to_string()),
+            hash_scheme: Some("v1".to_string()),
+        };
+        let exec_json = serde_json::to_string(&exec).unwrap();
+
+        let prov = ProvenanceRecord {
+            run_id: "run-1".to_string(),
+            model_name: "fct_orders".to_string(),
+            input_hash: "input-def".to_string(),
+            skip_hash: "logic-key".to_string(),
+            model_ir_canonical_json: r#"{"a":1}"#.to_string(),
+            upstreams: vec![crate::reuse::UpstreamIdentity::Watermark {
+                upstream_key: "cat.sch.src".to_string(),
+                max_ts: Some("2024-01-01T00:00:00Z".to_string()),
+                row_count: Some(42),
+            }],
+            output_blake3: vec!["out-hash".to_string()],
+            output_path: vec!["s3://b/p.parquet".to_string()],
+            proof_class: "heuristic".to_string(),
+            recorded_at: ts,
+        };
+        let prov_json = serde_json::to_string(&prov).unwrap();
+
+        if regen {
+            eprintln!("EXEC_GOLDEN = {exec_json}");
+            eprintln!("PROV_GOLDEN = {prov_json}");
+            return;
+        }
+
+        const EXEC_GOLDEN: &str = r#"{"model_name":"fct_orders","started_at":"2024-01-01T12:00:00Z","finished_at":"2024-01-01T12:00:00Z","duration_ms":2000,"rows_affected":10,"status":"success","sql_hash":"sql","skip_hash":"logic-key","upstream_freshness":null,"bytes_scanned":null,"bytes_written":null,"tenant":null,"recipe_hash":"recipe-abc","input_hash":"input-def","input_proof_class":"heuristic","env_hash":"env-ghi","hash_scheme":"v1"}"#;
+        const PROV_GOLDEN: &str = r#"{"run_id":"run-1","model_name":"fct_orders","input_hash":"input-def","skip_hash":"logic-key","model_ir_canonical_json":"{\"a\":1}","upstreams":[{"kind":"watermark","upstream_key":"cat.sch.src","max_ts":"2024-01-01T00:00:00Z","row_count":42}],"output_blake3":["out-hash"],"output_path":["s3://b/p.parquet"],"proof_class":"heuristic","recorded_at":"2024-01-01T12:00:00Z"}"#;
+        assert_eq!(exec_json, EXEC_GOLDEN, "ModelExecution wire format drifted");
+        assert_eq!(
+            prov_json, PROV_GOLDEN,
+            "ProvenanceRecord wire format drifted"
+        );
     }
 
     /// End-to-end variant of the forward-compat guard: write a v5 blob
@@ -6299,7 +6515,14 @@ mod tests {
         // The pinned format contract. Update DELIBERATELY: a table-set change
         // is an on-disk break that needs a `CURRENT_SCHEMA_VERSION` bump + a
         // migration path, not just an edit here.
-        const EXPECTED_VERSION: u32 = 10;
+        //
+        // v11 bumps the version for the recipe-identity triple added to the
+        // `ModelExecution` blob. The table set below is deliberately unchanged
+        // — v11 adds no tables, only serde-defaulted blob fields — so the
+        // forward-compat path is the existing default-on-missing behaviour
+        // (guarded by `test_v10_model_execution_forward_deserializes_recipe_identity_none`
+        // and the `open_with_policy_*` mismatch tests), not a new migration.
+        const EXPECTED_VERSION: u32 = 11;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",

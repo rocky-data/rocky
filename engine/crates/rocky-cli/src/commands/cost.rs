@@ -508,6 +508,11 @@ mod tests {
             bytes_scanned,
             bytes_written,
             tenant: tenant.map(str::to_string),
+            recipe_hash: None,
+            input_hash: None,
+            input_proof_class: None,
+            env_hash: None,
+            hash_scheme: None,
         }
     }
 
