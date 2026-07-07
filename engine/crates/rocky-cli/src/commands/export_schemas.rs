@@ -24,12 +24,13 @@ use crate::output::{
     ClearSchemaCacheOutput, ColumnLineageOutput, CompactApplyOutput, CompactDedupOutput,
     CompactOutput, CompareOutput, CompileOutput, ComplianceOutput, CostOutput, DagOutput,
     DagRunOutput, DiscoverOutput, DriftOutput, ErrorEnvelope, EstimateOutput, HistoryOutput,
-    HooksListOutput, HooksTestOutput, ImportDbtOutput, LineageDiffOutput, LineageOutput, LoadOutput,
-    MetaOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput, PolicyCheckOutput,
-    PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput, PreviewRowsOutput, ProfileOutput,
-    ProfileStorageOutput, PromotePlan, RecipeHistoryOutput, ReplayCheckOutput, ReplayExecuteOutput,
-    ReplayOutput, RetentionStatusOutput, RetentionSweepOutput, ReviewOutput, RunOutput, SeedOutput,
-    StateOutput, TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
+    HooksListOutput, HooksTestOutput, ImportDbtOutput, LineageDiffOutput, LineageOutput,
+    LoadOutput, MetaOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput,
+    PolicyCheckOutput, PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput,
+    PreviewRowsOutput, ProfileOutput, ProfileStorageOutput, PromotePlan, RecipeHistoryOutput,
+    ReplayCheckOutput, ReplayExecuteOutput, ReplayOutput, RetentionStatusOutput,
+    RetentionSweepOutput, ReviewOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput,
+    TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
