@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Feature-detection payload for `GET /api/v1/meta`.\n\nFingerprints the running engine + bound config so an embedder can pin against a build without version-sniffing. Every field is computed at request time — none are baked literals — so `state_schema_version`, `schemas_hash`, and `config_hash` track the live engine and the on-disk config even across a long-running sidecar.",
+  "properties": {
+    "capabilities": {
+      "description": "Feature/capability tokens the build advertises.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "config_hash": {
+      "description": "Fingerprint of the resolved `rocky.toml` (contents + path) this sidecar bound, recomputed per request. `null` when no config resolved.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "engine_version": {
+      "description": "Engine release (`CARGO_PKG_VERSION`).",
+      "type": "string"
+    },
+    "routes": {
+      "description": "The `/api/v1` routes this build serves.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "schemas_hash": {
+      "description": "Fingerprint of the exported JSON-schema set (the `schemas/*.schema.json` contract). Derived from the live registered schemas, so it moves on every codegen; embedders detect an output-shape change without version-sniffing.",
+      "type": "string"
+    },
+    "state_schema_version": {
+      "description": "Current state-store schema version, read from the engine's `current_schema_version()` getter at request time (never a literal).",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "capabilities",
+    "engine_version",
+    "routes",
+    "schemas_hash",
+    "state_schema_version"
+  ],
+  "title": "MetaOutput",
+  "type": "object"
+}

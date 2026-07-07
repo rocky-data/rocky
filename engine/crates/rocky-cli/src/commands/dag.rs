@@ -49,6 +49,43 @@ pub fn run_dag(
     json: bool,
     cache_ttl_override: Option<u64>,
 ) -> Result<()> {
+    let output = dag_output(
+        config_path,
+        state_path,
+        models_dir,
+        seeds_dir,
+        contracts_dir,
+        include_column_lineage,
+        cache_ttl_override,
+    )?;
+
+    if json {
+        print_json(&output)?;
+    } else {
+        print_dag_table(&output);
+    }
+    Ok(())
+}
+
+/// Side-effect-free core of `rocky dag`: load models + seeds, build the
+/// unified DAG, compute execution phases, and assemble the enriched
+/// [`DagOutput`]. Does no printing, so other surfaces (`rocky serve`'s
+/// `GET /api/v1/dag`) can serve the identical bytes `rocky dag --output json`
+/// emits.
+///
+/// `cache_ttl_override`: CLI `--cache-ttl` flag override for the
+/// `[cache.schemas] ttl_seconds` setting. Only relevant when
+/// `include_column_lineage` drives a compile.
+#[allow(clippy::too_many_arguments)]
+pub fn dag_output(
+    config_path: &Path,
+    state_path: &Path,
+    models_dir: &Path,
+    seeds_dir: Option<&Path>,
+    contracts_dir: Option<&Path>,
+    include_column_lineage: bool,
+    cache_ttl_override: Option<u64>,
+) -> Result<DagOutput> {
     let cfg = rocky_core::config::load_rocky_config(config_path)?;
     // Apply `--cache-ttl` once up-front; the column-lineage compile
     // below consumes the already-overridden `SchemaCacheConfig`.
@@ -87,7 +124,7 @@ pub fn run_dag(
         unified_dag::execution_phases(&dag).context("failed to compute execution phases")?;
 
     // Build the enriched output.
-    let output = build_dag_output(
+    build_dag_output(
         &dag,
         &phases,
         &models,
@@ -98,14 +135,7 @@ pub fn run_dag(
         &cfg,
         state_path,
         &schema_cache_cfg,
-    )?;
-
-    if json {
-        print_json(&output)?;
-    } else {
-        print_dag_table(&output);
-    }
-    Ok(())
+    )
 }
 
 /// Build the full `DagOutput` from the unified DAG plus model/seed metadata.

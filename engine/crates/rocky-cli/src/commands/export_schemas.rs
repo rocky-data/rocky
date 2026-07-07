@@ -23,13 +23,14 @@ use crate::output::{
     BranchOutput, BranchPromoteOutput, CatalogOutput, CiDiffOutput, CiOutput,
     ClearSchemaCacheOutput, ColumnLineageOutput, CompactApplyOutput, CompactDedupOutput,
     CompactOutput, CompareOutput, CompileOutput, ComplianceOutput, CostOutput, DagOutput,
-    DagRunOutput, DiscoverOutput, DriftOutput, EstimateOutput, HistoryOutput, HooksListOutput,
-    HooksTestOutput, ImportDbtOutput, LineageDiffOutput, LineageOutput, LoadOutput, MetricsOutput,
-    ModelHistoryOutput, OptimizeOutput, PlanOutput, PolicyCheckOutput, PreviewCostOutput,
-    PreviewCreateOutput, PreviewDiffOutput, PreviewRowsOutput, ProfileOutput, ProfileStorageOutput,
-    PromotePlan, RecipeHistoryOutput, ReplayCheckOutput, ReplayExecuteOutput, ReplayOutput,
-    RetentionStatusOutput, RetentionSweepOutput, ReviewOutput, RunOutput, SeedOutput, StateOutput,
-    TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
+    DagRunOutput, DiscoverOutput, DriftOutput, ErrorEnvelope, EstimateOutput, HistoryOutput,
+    HooksListOutput, HooksTestOutput, ImportDbtOutput, LineageDiffOutput, LineageOutput,
+    LoadOutput, MetaOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput,
+    PolicyCheckOutput, PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput,
+    PreviewRowsOutput, ProfileOutput, ProfileStorageOutput, PromotePlan, RecipeHistoryOutput,
+    ReplayCheckOutput, ReplayExecuteOutput, ReplayOutput, RetentionStatusOutput,
+    RetentionSweepOutput, ReviewOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput,
+    TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -58,6 +59,11 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<ClearSchemaCacheOutput>("state_clear_schema_cache"),
         entry::<DoctorOutput>("doctor"),
         entry::<CompileOutput>("compile"),
+        // `rocky serve` HTTP API surface (not CLI `--output json` commands,
+        // but exported through the same pipeline so embedders get generated
+        // Pydantic/TS bindings for the error body and the `/meta` payload).
+        entry::<ErrorEnvelope>("error_envelope"),
+        entry::<MetaOutput>("meta"),
         entry::<TestOutput>("test"),
         entry::<CiOutput>("ci"),
         entry::<CiDiffOutput>("ci_diff"),
@@ -151,6 +157,27 @@ pub fn export_schemas(output_dir: &Path) -> Result<()> {
 
     println!("\nExported {count} schemas to {}", output_dir.display());
     Ok(())
+}
+
+/// Stable fingerprint of the exported JSON-schema set.
+///
+/// Hashes every registered schema (name + canonical JSON) with blake3 so the
+/// digest moves whenever any `--output json` payload shape changes — i.e. on
+/// every codegen run. Derived from the in-process schema registry rather than
+/// the on-disk `schemas/*.schema.json` files, so it works in a released binary
+/// with no filesystem dependency yet stays in lockstep with the committed
+/// files (codegen-drift CI keeps the two equal). Backs `GET /api/v1/meta`'s
+/// `schemas_hash`.
+pub fn schemas_hash() -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (name, schema) in schemas() {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+        let bytes = serde_json::to_vec(&schema).expect("schema serialization is infallible");
+        hasher.update(&bytes);
+        hasher.update(b"\0");
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 #[cfg(test)]

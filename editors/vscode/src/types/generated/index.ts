@@ -46,6 +46,10 @@ export type {
 // Column lineage (per-column shape of `rocky lineage --column <col>`)
 export type { ColumnLineageOutput } from "./column_lineage";
 
+// serve HTTP API — structured error body + /meta feature-detection payload
+export type { ErrorEnvelope } from "./error_envelope";
+export type { MetaOutput } from "./meta";
+
 // Lineage (model-level shape)
 export type {
   LineageOutput,

@@ -434,6 +434,7 @@ fn render_html(info: &ProjectInfo) -> String {
     html.push_str(r#"<h2>API Endpoints</h2><div class="card"><ul class="endpoint-list">"#);
     let endpoints = [
         ("GET", "/api/v1/health", "Health check"),
+        ("GET", "/api/v1/meta", "Engine + config fingerprint"),
         ("GET", "/api/v1/models", "List all models"),
         ("GET", "/api/v1/models/{name}", "Model details"),
         ("GET", "/api/v1/models/{name}/lineage", "Model lineage"),
@@ -445,6 +446,7 @@ fn render_html(info: &ProjectInfo) -> String {
         ("POST", "/api/v1/compile", "Trigger recompile"),
         ("GET", "/api/v1/dag", "Full DAG"),
         ("GET", "/api/v1/dag/layers", "Execution layers"),
+        ("GET", "/api/v1/dag/status", "Latest DAG run status"),
     ];
     for (method, path, desc) in endpoints {
         let method_class = if method == "POST" {

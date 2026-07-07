@@ -1,3 +1,4 @@
+pub mod api;
 pub mod commands;
 pub mod deprecation;
 pub mod error_reporter;

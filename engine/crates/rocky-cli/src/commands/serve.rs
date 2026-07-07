@@ -55,5 +55,5 @@ pub async fn run_serve(
     // Wait for initial compilation
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    rocky_server::api::serve(state, rocky_server::api::ServeConfig { host, port }).await
+    crate::api::serve(state, crate::api::ServeConfig { host, port }).await
 }

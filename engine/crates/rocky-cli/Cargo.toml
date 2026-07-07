@@ -27,6 +27,7 @@ rocky-airbyte = { path = "../rocky-airbyte" }
 rocky-catalog-core = { path = "../rocky-catalog-core" }
 rocky-iceberg = { path = "../rocky-iceberg" }
 rocky-cache = { path = "../rocky-cache", features = ["valkey"] }
+axum = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 serde = { workspace = true }
@@ -58,6 +59,10 @@ async-trait = { workspace = true }
 async-trait = { workspace = true }
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
+# `rocky-cli/src/api.rs` (the `rocky serve` HTTP surface) round-trip tests
+# and the golden API-vs-CLI parity tests spin up the axum router and hit it
+# over loopback with a real HTTP client.
+reqwest = { workspace = true }
 
 [[bench]]
 name = "compile"

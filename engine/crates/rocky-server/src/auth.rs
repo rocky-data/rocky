@@ -20,11 +20,11 @@
 
 use std::sync::Arc;
 
-use axum::body::Body;
+use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::state::ServerState;
@@ -42,41 +42,62 @@ const AUTH_EXEMPT_PATHS: &[&str] = &["/api/v1/health"];
 /// the token byte-by-byte.
 ///
 /// When no token is configured (loopback-only deployments) the middleware
-/// is a no-op — but [`api::serve`][crate::api::serve] refuses to bind a
-/// non-loopback host without one, so the no-op path is safe.
+/// is a no-op — but `rocky serve` refuses to bind a non-loopback host
+/// without one, so the no-op path is safe.
+///
+/// A rejected request carries the same `{code, message, remediation_hint}`
+/// error envelope shape the `/api/v1` handlers use, with `code:"unauthorized"`
+/// — never an empty body.
 pub async fn require_bearer_token(
     State(state): State<Arc<ServerState>>,
     request: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Response {
     if AUTH_EXEMPT_PATHS.contains(&request.uri().path()) {
-        return Ok(next.run(request).await);
+        return next.run(request).await;
     }
 
     let Some(expected) = state.auth_token.as_deref() else {
-        // No token configured → loopback-only mode (see `api::serve`).
-        return Ok(next.run(request).await);
+        // No token configured → loopback-only mode.
+        return next.run(request).await;
     };
 
-    let header_value = request
+    let provided = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .and_then(|h| h.strip_prefix("Bearer "));
 
-    let provided = header_value
-        .strip_prefix("Bearer ")
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let Some(provided) = provided else {
+        return unauthorized_response();
+    };
 
     if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
-        return Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header(header::WWW_AUTHENTICATE, "Bearer")
-            .body(Body::empty())
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+        return unauthorized_response();
     }
 
-    Ok(next.run(request).await)
+    next.run(request).await
+}
+
+/// Build a `401` response carrying the structured `unauthorized` error
+/// envelope + a `WWW-Authenticate: Bearer` challenge.
+///
+/// The body mirrors `rocky_cli::output::ErrorEnvelope`'s shape by hand: the
+/// typed struct lives downstream in `rocky-cli` (the router's crate), so the
+/// middleware — which must reject before any handler runs — emits the same
+/// `{code, message, remediation_hint}` JSON directly.
+fn unauthorized_response() -> Response {
+    let body = serde_json::json!({
+        "code": "unauthorized",
+        "message": "missing or invalid bearer token",
+        "remediation_hint": "supply `Authorization: Bearer <token>`",
+    });
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))],
+        Json(body),
+    )
+        .into_response()
 }
 
 /// Constant-time byte comparison. Returns `true` only if both slices have
