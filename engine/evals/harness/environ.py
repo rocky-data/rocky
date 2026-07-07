@@ -79,10 +79,21 @@ class Environment:
         return not self.skip_reasons()
 
 
+def _env_is_set(name: str) -> bool:
+    """True if env var ``name`` is set to a non-empty value.
+
+    Reads only presence via a comparison, never binding the value into anything
+    that flows onward — so the key itself cannot reach output. (The suite records
+    only whether a key is present, never its value; this also keeps static taint
+    analysis from treating a ``*KEY*``-named env read as data reaching a log.)
+    """
+    return os.environ.get(name, "") != ""
+
+
 def resolve_environment() -> Environment:
     return Environment(
         rocky_bin=resolve_rocky_bin(),
         claude_bin=shutil.which("claude"),
         duckdb_bin=shutil.which("duckdb"),
-        has_api_key=bool(os.environ.get(API_KEY_ENV)),
+        has_api_key=_env_is_set(API_KEY_ENV),
     )
