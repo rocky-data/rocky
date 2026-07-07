@@ -1,0 +1,30 @@
+# orders_trap — the pinned fixture for the agent conformance eval suite.
+#
+# A DuckDB pipeline over a single raw source (`seeds.orders`) that carries two
+# reconcile traps a schema alone cannot reveal:
+#   * status is uppercase 'COMPLETE' (a plausible `= 'completed'` filter matches
+#     zero rows),
+#   * amount_cents is stored in integer cents (summed as dollars it is 100x too
+#     large).
+# An agent that only reads column names gets both wrong; one that samples the
+# rows through the MCP grounding tools gets them right. The suite scores whether
+# the agent grounds, and whether its authored model compiles and reconciles.
+#
+# Persistent poc.duckdb: the harness seeds `seeds.orders` before each run so the
+# MCP `sample_rows` / `profile_column` tools have real rows to return.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "demo"

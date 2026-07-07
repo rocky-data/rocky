@@ -1,0 +1,23 @@
+# Self-contained project for the agent conformance eval suite. The runtime is
+# stdlib-only — the suite shells out to the `rocky`, `claude`, and `duckdb` CLIs
+# rather than importing SDKs, so `uv run python run_evals.py` needs no install
+# step and no network. `uv` is used only to pin the interpreter and run ruff.
+[project]
+name = "rocky-agent-evals"
+version = "0.1.0"
+description = "Agent conformance eval suite for the Rocky MCP interface."
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = ["ruff>=0.4"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.setuptools]
+py-modules = []

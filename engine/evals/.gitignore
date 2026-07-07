@@ -1,0 +1,13 @@
+# Scorecard outputs are run artifacts (published per release, not committed here).
+results/
+# Fixture warehouses / state that a local run might leave behind.
+*.duckdb
+*.duckdb.wal
+.rocky-state.redb
+.rocky-state.redb.lock
+# Python + tooling caches.
+__pycache__/
+*.pyc
+.venv/
+.ruff_cache/
+uv.lock
