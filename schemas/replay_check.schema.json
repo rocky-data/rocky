@@ -1,0 +1,140 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ReplayCheckInputOutput": {
+      "description": "Resolvability of one declared upstream inside a [`ReplayCheckModelOutput`].",
+      "properties": {
+        "kind": {
+          "description": "`content` (a recorded blake3 in the artifact ledger) or `watermark` (a freshness signal over a mutable source).",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why the input does not resolve; `null` when resolvable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resolvable": {
+          "description": "Whether this input resolves from the ledger for a deterministic replay.",
+          "type": "boolean"
+        },
+        "upstream_key": {
+          "description": "Fully-qualified `catalog.schema.table` identity of the upstream.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "resolvable",
+        "upstream_key"
+      ],
+      "type": "object"
+    },
+    "ReplayCheckModelOutput": {
+      "description": "Per-model replayability verdict inside a [`ReplayCheckOutput`].",
+      "properties": {
+        "has_provenance": {
+          "description": "Whether a provenance record was found for this `(run, model)`.",
+          "type": "boolean"
+        },
+        "inputs": {
+          "description": "Per-input resolvability, one entry per declared upstream.",
+          "items": {
+            "$ref": "#/definitions/ReplayCheckInputOutput"
+          },
+          "type": "array"
+        },
+        "ir_parseable": {
+          "description": "Whether the embedded canonical `ModelIr` deserialized under the current engine. `false` both when there is no provenance and when a provenance record's IR failed to parse (an IR forward-compat break).",
+          "type": "boolean"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "nondeterministic": {
+          "description": "Static-scan non-determinism flag (via `rocky_sql::determinism`): the model's SQL contains a volatile construct (`now()`, `current_timestamp`, `random()`, an unresolved function, ...). Orthogonal to `verdict`.",
+          "type": "boolean"
+        },
+        "proof_class": {
+          "description": "Match-strength label carried on the provenance record (`strong` or `heuristic`); `null` when no provenance was found.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasons": {
+          "description": "Human-readable reasons the model is not replayable; empty when replayable.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "verdict": {
+          "description": "`replayable` or `non_replayable`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "has_provenance",
+        "inputs",
+        "ir_parseable",
+        "model_name",
+        "nondeterministic",
+        "reasons",
+        "verdict"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky replay --at <run_id> --check`.\n\nRead-only replayability audit: classifies every model in a recorded run as replayable or not, using only the state-store ledger — the model's [`rocky_core::state::ProvenanceRecord`] (which embeds the canonical `ModelIr`) and the content-addressed artifact rows. Nothing is executed and the working tree is never read: the recording is the source of truth.\n\nA model is `replayable` when its provenance record exists, its embedded IR parses under the current engine, and every declared input resolves from the ledger. The `nondeterministic` flag on each model is orthogonal to the verdict — a nondeterministic model is still replayable, but a future re-execution may legitimately diverge.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "model_count": {
+      "description": "Total number of models considered (after any `--model` filter).",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "models": {
+      "items": {
+        "$ref": "#/definitions/ReplayCheckModelOutput"
+      },
+      "type": "array"
+    },
+    "replayable": {
+      "description": "`true` iff every model in the run is replayable.",
+      "type": "boolean"
+    },
+    "replayable_count": {
+      "description": "Number of those models classified replayable.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "status": {
+      "description": "Recorded run status (`success`, `partial_failure`, ...).",
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "model_count",
+    "models",
+    "replayable",
+    "replayable_count",
+    "run_id",
+    "status",
+    "version"
+  ],
+  "title": "ReplayCheckOutput",
+  "type": "object"
+}

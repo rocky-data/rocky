@@ -5810,6 +5810,78 @@ pub struct ReplayModelOutput {
     pub bytes_written: Option<u64>,
 }
 
+/// JSON output for `rocky replay --at <run_id> --check`.
+///
+/// Read-only replayability audit: classifies every model in a recorded run
+/// as replayable or not, using only the state-store ledger — the model's
+/// [`rocky_core::state::ProvenanceRecord`] (which embeds the canonical
+/// `ModelIr`) and the content-addressed artifact rows. Nothing is executed
+/// and the working tree is never read: the recording is the source of truth.
+///
+/// A model is `replayable` when its provenance record exists, its embedded
+/// IR parses under the current engine, and every declared input resolves
+/// from the ledger. The `nondeterministic` flag on each model is orthogonal
+/// to the verdict — a nondeterministic model is still replayable, but a
+/// future re-execution may legitimately diverge.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReplayCheckOutput {
+    pub version: String,
+    pub command: String,
+    pub run_id: String,
+    /// Recorded run status (`success`, `partial_failure`, ...).
+    pub status: String,
+    /// `true` iff every model in the run is replayable.
+    pub replayable: bool,
+    /// Total number of models considered (after any `--model` filter).
+    pub model_count: usize,
+    /// Number of those models classified replayable.
+    pub replayable_count: usize,
+    pub models: Vec<ReplayCheckModelOutput>,
+}
+
+/// Per-model replayability verdict inside a [`ReplayCheckOutput`].
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ReplayCheckModelOutput {
+    pub model_name: String,
+    /// `replayable` or `non_replayable`.
+    pub verdict: String,
+    /// Human-readable reasons the model is not replayable; empty when
+    /// replayable.
+    pub reasons: Vec<String>,
+    /// Whether a provenance record was found for this `(run, model)`.
+    pub has_provenance: bool,
+    /// Whether the embedded canonical `ModelIr` deserialized under the
+    /// current engine. `false` both when there is no provenance and when a
+    /// provenance record's IR failed to parse (an IR forward-compat break).
+    pub ir_parseable: bool,
+    /// Static-scan non-determinism flag (via `rocky_sql::determinism`): the
+    /// model's SQL contains a volatile construct (`now()`, `current_timestamp`,
+    /// `random()`, an unresolved function, ...). Orthogonal to `verdict`.
+    pub nondeterministic: bool,
+    /// Match-strength label carried on the provenance record (`strong` or
+    /// `heuristic`); `null` when no provenance was found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof_class: Option<String>,
+    /// Per-input resolvability, one entry per declared upstream.
+    pub inputs: Vec<ReplayCheckInputOutput>,
+}
+
+/// Resolvability of one declared upstream inside a
+/// [`ReplayCheckModelOutput`].
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ReplayCheckInputOutput {
+    /// Fully-qualified `catalog.schema.table` identity of the upstream.
+    pub upstream_key: String,
+    /// `content` (a recorded blake3 in the artifact ledger) or `watermark`
+    /// (a freshness signal over a mutable source).
+    pub kind: String,
+    /// Whether this input resolves from the ledger for a deterministic replay.
+    pub resolvable: bool,
+    /// Why the input does not resolve; `null` when resolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// JSON output for `rocky trace <run_id|latest>`.
 ///
 /// Sibling to [`ReplayOutput`] but with offset-relative timings so

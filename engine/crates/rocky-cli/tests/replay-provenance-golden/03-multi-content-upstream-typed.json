@@ -1,0 +1,32 @@
+{
+  "run_id": "golden-run",
+  "model_name": "fct_order_lines",
+  "input_hash": "841c6dd941d962de8c3c4991f63139d73d5e6a1f3f3783797aed831f16ea42ca",
+  "skip_hash": "af2eb31b4c755fbaa5ab2c507ea3ec9a587e779cc84fb2eee4ddff1d1e1f5b58",
+  "model_ir_canonical_json": "{\"governance\":{\"auto_create_catalogs\":false,\"auto_create_schemas\":false,\"permissions_file\":null},\"lineage_edges\":[],\"materialization\":{\"partition_columns\":[],\"storage_prefix\":\"s3://bucket/tgt/raw/fct_order_lines\",\"strategy\":\"ContentAddressed\"},\"name\":\"fct_order_lines\",\"sources\":[{\"catalog\":\"tgt\",\"schema\":\"raw\",\"table\":\"orders\"},{\"catalog\":\"tgt\",\"schema\":\"raw\",\"table\":\"customers\"},{\"catalog\":\"tgt\",\"schema\":\"raw\",\"table\":\"products\"}],\"sql\":\"SELECT o.order_id, c.name, p.sku, o.total FROM tgt.raw.orders o JOIN tgt.raw.customers c ON o.customer_id = c.id JOIN tgt.raw.products p ON o.product_id = p.id\",\"target\":{\"catalog\":\"tgt\",\"schema\":\"raw\",\"table\":\"fct_order_lines\"},\"typed_columns\":[{\"data_type\":\"Int64\",\"name\":\"order_id\",\"nullable\":false},{\"data_type\":\"String\",\"name\":\"name\",\"nullable\":true},{\"data_type\":\"Float64\",\"name\":\"total\",\"nullable\":true}]}",
+  "upstreams": [
+    {
+      "kind": "content",
+      "upstream_key": "tgt.raw.orders",
+      "blake3_hash": "4444444444444444444444444444444444444444444444444444444444444444"
+    },
+    {
+      "kind": "content",
+      "upstream_key": "tgt.raw.customers",
+      "blake3_hash": "5555555555555555555555555555555555555555555555555555555555555555"
+    },
+    {
+      "kind": "content",
+      "upstream_key": "tgt.raw.products",
+      "blake3_hash": "6666666666666666666666666666666666666666666666666666666666666666"
+    }
+  ],
+  "output_blake3": [
+    "7777777777777777777777777777777777777777777777777777777777777777"
+  ],
+  "output_path": [
+    "s3://bucket/out/7777777777777777777777777777777777777777777777777777777777777777.parquet"
+  ],
+  "proof_class": "strong",
+  "recorded_at": "2026-01-01T00:00:00Z"
+}

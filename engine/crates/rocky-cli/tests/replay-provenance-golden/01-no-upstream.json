@@ -1,0 +1,16 @@
+{
+  "run_id": "golden-run",
+  "model_name": "seed_events",
+  "input_hash": "3311e41d0eb343dd7526acdaf41837c6b6fcb9afa9373a3dccbd52801e66d125",
+  "skip_hash": "1fe8c16a02ee240be7398175adc5f3fdd61b77177dd3e76c553a453e447ac8a2",
+  "model_ir_canonical_json": "{\"governance\":{\"auto_create_catalogs\":false,\"auto_create_schemas\":false,\"permissions_file\":null},\"lineage_edges\":[],\"materialization\":{\"partition_columns\":[],\"storage_prefix\":\"s3://bucket/tgt/raw/seed_events\",\"strategy\":\"ContentAddressed\"},\"name\":\"seed_events\",\"sql\":\"SELECT i AS id, i % 3 AS bucket FROM generate_series(1, 10) AS t(i)\",\"target\":{\"catalog\":\"tgt\",\"schema\":\"raw\",\"table\":\"seed_events\"},\"typed_columns\":[{\"data_type\":\"Int64\",\"name\":\"id\",\"nullable\":false},{\"data_type\":\"Int64\",\"name\":\"bucket\",\"nullable\":false}]}",
+  "upstreams": [],
+  "output_blake3": [
+    "1111111111111111111111111111111111111111111111111111111111111111"
+  ],
+  "output_path": [
+    "s3://bucket/out/1111111111111111111111111111111111111111111111111111111111111111.parquet"
+  ],
+  "proof_class": "strong",
+  "recorded_at": "2026-01-01T00:00:00Z"
+}

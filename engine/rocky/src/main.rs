@@ -1508,12 +1508,25 @@ enum Command {
     /// 03:15 UTC?" and as the reproducibility artefact for branch +
     /// replay. Re-execution with pinned inputs is a follow-up once the
     /// content-addressed write path arrives.
+    ///
+    /// With `--check`, runs a read-only replayability audit instead of the
+    /// inspection view: for each model it classifies whether the recording
+    /// alone is sufficient to re-execute it (provenance present, embedded IR
+    /// parses under the current engine, inputs resolvable from the ledger)
+    /// and flags static non-determinism. Nothing is executed.
     Replay {
-        /// Run id or the literal `latest`
-        target: String,
+        /// Run id or the literal `latest`. May also be given via `--at`.
+        target: Option<String>,
+        /// Run id or the literal `latest` (alternative to the positional
+        /// argument).
+        #[arg(long, value_name = "RUN_ID")]
+        at: Option<String>,
         /// Filter to a single model within the run
         #[arg(long)]
         model: Option<String>,
+        /// Run a read-only replayability audit instead of the inspection view.
+        #[arg(long)]
+        check: bool,
     },
 
     /// Render a completed run as a timeline.
@@ -3326,8 +3339,22 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 }
             }
         },
-        Command::Replay { target, model } => {
-            rocky_cli::commands::run_replay(&state_path, &target, model.as_deref(), json)
+        Command::Replay {
+            target,
+            at,
+            model,
+            check,
+        } => {
+            let run_ref = at.or(target).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provide a run id (positional or --at <RUN_ID>), or the literal 'latest'"
+                )
+            })?;
+            if check {
+                rocky_cli::commands::run_replay_check(&state_path, &run_ref, model.as_deref(), json)
+            } else {
+                rocky_cli::commands::run_replay(&state_path, &run_ref, model.as_deref(), json)
+            }
         }
         Command::Trace { target, model } => {
             rocky_cli::commands::run_trace(&state_path, &target, model.as_deref(), json)

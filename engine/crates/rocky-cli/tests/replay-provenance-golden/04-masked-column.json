@@ -1,0 +1,22 @@
+{
+  "run_id": "golden-run",
+  "model_name": "dim_customers",
+  "input_hash": "4ce3a0cacfb618e831eb74483cf8030a9b4411e8c6cd54ac2a695840553e5880",
+  "skip_hash": "ee4bc2513f3de6d0eded39a1347c5b4e554e7558ef9e193069410282c0e3a2df",
+  "model_ir_canonical_json": "{\"column_masks\":[{\"column\":\"email\",\"strategy\":\"hash\"}],\"governance\":{\"auto_create_catalogs\":false,\"auto_create_schemas\":false,\"permissions_file\":null},\"lineage_edges\":[],\"materialization\":{\"partition_columns\":[],\"storage_prefix\":\"s3://bucket/tgt/raw/dim_customers\",\"strategy\":\"ContentAddressed\"},\"name\":\"dim_customers\",\"sources\":[{\"catalog\":\"tgt\",\"schema\":\"raw\",\"table\":\"customers\"}],\"sql\":\"SELECT customer_id, name, email FROM tgt.raw.customers\",\"target\":{\"catalog\":\"tgt\",\"schema\":\"raw\",\"table\":\"dim_customers\"},\"typed_columns\":[{\"data_type\":\"Int64\",\"name\":\"customer_id\",\"nullable\":false},{\"data_type\":\"String\",\"name\":\"name\",\"nullable\":true},{\"data_type\":\"String\",\"name\":\"email\",\"nullable\":true}]}",
+  "upstreams": [
+    {
+      "kind": "content",
+      "upstream_key": "tgt.raw.customers",
+      "blake3_hash": "8888888888888888888888888888888888888888888888888888888888888888"
+    }
+  ],
+  "output_blake3": [
+    "9999999999999999999999999999999999999999999999999999999999999999"
+  ],
+  "output_path": [
+    "s3://bucket/out/9999999999999999999999999999999999999999999999999999999999999999.parquet"
+  ],
+  "proof_class": "strong",
+  "recorded_at": "2026-01-01T00:00:00Z"
+}
