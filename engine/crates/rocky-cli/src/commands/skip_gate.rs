@@ -504,6 +504,10 @@ impl<'a> SkipGate<'a> {
                 upstream_key: lname,
                 max_ts,
                 row_count,
+                // The plain-strategy skip gate captures freshness only; the
+                // consumer-side per-column baseline is content-addressed-path
+                // only (recorded by the content-addressed runner).
+                consumed_column_hashes: None,
             });
         }
         Some(sigs)

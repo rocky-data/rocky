@@ -233,7 +233,15 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   with it `None` and a v12 blob back-reads cleanly on a v11 binary (serde
 ///   ignores the extra key). No new tables, no in-place migration. Guarded by
 ///   `test_v11_model_execution_forward_deserializes_output_column_hashes_none`.
-const CURRENT_SCHEMA_VERSION: u32 = 12;
+/// - **v13** — adds `consumed_column_hashes` (the consumer-side per-column
+///   baseline; see [`ColumnHash`]) to the [`UpstreamSig`] blob carried on
+///   [`ModelExecution::upstream_freshness`]. Pure additive blob-field change,
+///   same shape as the v12 field: the new field is `#[serde(default)]`, so a
+///   v12 `UpstreamSig` forward-deserializes with it `None` and a v13 blob
+///   back-reads cleanly on a v12 binary (serde ignores the extra key). No new
+///   tables, no in-place migration. Guarded by
+///   `test_v12_upstream_sig_forward_deserializes_consumed_column_hashes_none`.
+const CURRENT_SCHEMA_VERSION: u32 = 13;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -1049,6 +1057,34 @@ pub struct UpstreamSig {
     /// the rowcount fallback is enabled. `None` otherwise.
     #[serde(default)]
     pub row_count: Option<u64>,
+
+    // --- Consumer-side column baseline (schema v13) ----------------------
+    /// The per-column content hashes this downstream **consumed** from this
+    /// upstream at its last successful build — the consumer-side baseline
+    /// (see [`ColumnHash`]). One entry per column in `consumed(D, U)` (the
+    /// columns the downstream provably reads from this upstream, per the
+    /// completeness guard), each carrying the upstream's producer output-column
+    /// hash ([`ModelExecution::output_column_hashes`]) as observed at build
+    /// time.
+    ///
+    /// This is **consumer-side and local**: it records what *this* model read
+    /// from *this* upstream, reconstructible from two stored snapshots plus the
+    /// current run — never a producer-now-vs-producer-prior inference. It
+    /// extends the freshness baseline this same `UpstreamSig` already stores
+    /// (`max_ts` / `row_count`) with column granularity, on the
+    /// content-addressed path only.
+    ///
+    /// `None` when the baseline was not captured: a pre-v13 record, a
+    /// non-content-addressed build, an upstream whose producer column hashes
+    /// were unavailable this build, or a downstream whose consumed-column set
+    /// could not be proven complete. An absent baseline can only ever force a
+    /// (safe) rebuild in the later skip gate, never a wrong skip. Captured
+    /// only; nothing consults it yet (the skip gate is a later phase).
+    /// State-internal — carries no codegen. Serde-defaulted so a pre-v13 blob
+    /// forward-deserializes with it `None`; guarded by
+    /// `test_v12_upstream_sig_forward_deserializes_consumed_column_hashes_none`.
+    #[serde(default)]
+    pub consumed_column_hashes: Option<Vec<ColumnHash>>,
 }
 
 /// A single output column's content hash, captured on a successful
@@ -4283,6 +4319,44 @@ mod tests {
         assert_eq!(exec.output_column_hashes, None);
     }
 
+    /// v12 → v13 forward-compat: an `UpstreamSig` blob written before
+    /// `consumed_column_hashes` existed (a full v12 freshness signature with no
+    /// `consumed_column_hashes` key) must forward-deserialize with the field
+    /// defaulting to `None`. Also asserts a v13 `UpstreamSig` carrying the new
+    /// field round-trips, so the consumer baseline survives a store→read cycle.
+    #[test]
+    fn test_v12_upstream_sig_forward_deserializes_consumed_column_hashes_none() {
+        let v12_blob = br#"{
+            "upstream_key": "cat.sch.orders",
+            "max_ts": "2024-01-01T00:00:00Z",
+            "row_count": 42
+        }"#;
+
+        let sig: UpstreamSig =
+            serde_json::from_slice(v12_blob).expect("pre-v13 UpstreamSig must forward-deserialize");
+
+        // Prior freshness fields preserved.
+        assert_eq!(sig.upstream_key, "cat.sch.orders");
+        assert_eq!(sig.row_count, Some(42));
+        // The new field defaults to None — a pre-v13 signature is treated as
+        // "no consumer column baseline recorded", never crashes the read.
+        assert_eq!(sig.consumed_column_hashes, None);
+
+        // A v13 signature carrying the consumer baseline round-trips.
+        let v13 = UpstreamSig {
+            upstream_key: "cat.sch.orders".to_string(),
+            max_ts: None,
+            row_count: None,
+            consumed_column_hashes: Some(vec![ColumnHash {
+                column: "id".to_string(),
+                hash: "col-hash".to_string(),
+            }]),
+        };
+        let json = serde_json::to_string(&v13).unwrap();
+        let back: UpstreamSig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v13);
+    }
+
     /// A v11 `ModelExecution` blob (carrying the triple) must back-read on a
     /// binary that predates it: serde ignores the unknown keys, so a v10 reader
     /// never breaks on a v11 row. Emulated by deserializing the full v11 shape
@@ -6616,14 +6690,14 @@ mod tests {
         // is an on-disk break that needs a `CURRENT_SCHEMA_VERSION` bump + a
         // migration path, not just an edit here.
         //
-        // v12 bumps the version for the `output_column_hashes` field added to
-        // the `ModelExecution` blob. The table set below is deliberately
-        // unchanged — v12 adds no tables, only a serde-defaulted blob field —
-        // so the forward-compat path is the existing default-on-missing
-        // behaviour (guarded by
-        // `test_v11_model_execution_forward_deserializes_output_column_hashes_none`
+        // v13 bumps the version for the `consumed_column_hashes` field added to
+        // the `UpstreamSig` blob (carried on `ModelExecution.upstream_freshness`).
+        // The table set below is deliberately unchanged — v13 adds no tables,
+        // only a serde-defaulted blob field — so the forward-compat path is the
+        // existing default-on-missing behaviour (guarded by
+        // `test_v12_upstream_sig_forward_deserializes_consumed_column_hashes_none`
         // and the `open_with_policy_*` mismatch tests), not a new migration.
-        const EXPECTED_VERSION: u32 = 12;
+        const EXPECTED_VERSION: u32 = 13;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
