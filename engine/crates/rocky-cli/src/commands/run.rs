@@ -4801,6 +4801,19 @@ pub(crate) async fn execute_models(
     let mut reuse_outputs: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
+    // Producer-side per-column output hashes for every content-addressed model
+    // built earlier in THIS run, keyed by target `catalog.schema.table` full
+    // name (as `reuse_outputs` is). A later content-addressed model reads this
+    // to record what its consumed columns hashed to at build time — the
+    // consumer-side per-column baseline (schema v13, record-only). Populated
+    // independently of `[reuse]` (the consumer baseline is content-addressed
+    // path, not reuse, scoped); empty and untouched when no content-addressed
+    // model produces column hashes.
+    let mut built_output_hashes: std::collections::HashMap<
+        String,
+        Vec<rocky_core::state::ColumnHash>,
+    > = std::collections::HashMap::new();
+
     // Static lookup built once when reuse is on: every lowercased identity a
     // model can be UNAMBIGUOUSLY *read by* in SQL → that model's target
     // `catalog.schema.table` full name. Lets the read-set resolver map a table
@@ -4817,6 +4830,19 @@ pub(crate) async fn execute_models(
     } else {
         Default::default()
     };
+
+    // The same read-by → target-full lookup, always built: the consumer-side
+    // per-column baseline is scoped to the content-addressed path, which runs
+    // with or without `[reuse]`, so it can't borrow the reuse-gated map above.
+    // Cheap (one entry per model name + identity) and only consulted when a
+    // content-addressed model records its baseline.
+    let baseline_target_by_model = build_reuse_target_by_model(
+        compile_result
+            .project
+            .models
+            .iter()
+            .map(|m| (m.config.name.as_str(), &m.config.target)),
+    );
 
     // Pre-create target schemas when the caller requested auto-create.
     // Mirrors the replication path's per-source loop (see the
@@ -5189,6 +5215,19 @@ pub(crate) async fn execute_models(
                 match summary {
                     Ok(summary) => {
                         let duration_ms = model_start.elapsed().as_millis() as u64;
+                        // Consumer-side per-column baseline (schema v13,
+                        // record-only). For each upstream this model provably
+                        // consumes, record the columns `consumed(D, U)` paired
+                        // with `U`'s producer output-column hashes as observed
+                        // at THIS build — what `D` read, not producer-now-vs-
+                        // prior (Fork 2). `None` when the consumed set isn't
+                        // provably complete (⇒ a safe rebuild in the later
+                        // gate). Nothing consults it yet.
+                        let consumed_column_baseline = compute_consumer_baseline(
+                            &model_ir.sql,
+                            &baseline_target_by_model,
+                            &built_output_hashes,
+                        );
                         output.materializations.push(MaterializationOutput {
                             asset_key,
                             rows_copied: Some(summary.num_rows as u64),
@@ -5225,7 +5264,27 @@ pub(crate) async fn execute_models(
                             // only; nothing consults it yet.
                             output_column_hashes: (!summary.output_column_hashes.is_empty())
                                 .then(|| summary.output_column_hashes.clone()),
+                            // The consumer-side per-column baseline computed
+                            // above; routed onto `ModelExecution.upstream_freshness`
+                            // by `to_run_record`.
+                            consumed_column_baseline,
                         });
+                        // Make this model's producer column hashes visible to
+                        // later content-addressed models that consume it, so a
+                        // downstream can record what it read from this upstream.
+                        // Recorded only when the build produced hashes: a
+                        // genuine unpartitioned build always does; a point-to
+                        // reuse carries the referenced run's recorded hashes
+                        // when present; a partitioned build produces none (the
+                        // per-file fold is deferred). An absent entry degrades a
+                        // downstream baseline to a safe rebuild. Keyed by target
+                        // full name as `reuse_outputs` is.
+                        if !summary.output_column_hashes.is_empty() {
+                            built_output_hashes.insert(
+                                target_table_full_name.clone(),
+                                summary.output_column_hashes.clone(),
+                            );
+                        }
                         // Per-model decision (reporting-only). A
                         // content_addressed model is never skip-eligible, so it
                         // is suppressed in the skip-gate loop above and owns its
@@ -5578,6 +5637,92 @@ where
         map.insert(name.to_lowercase(), target_full);
     }
     map
+}
+
+/// Compute the **consumer-side per-column baseline** for a content-addressed
+/// model `D` at build time: for every upstream `U` that `D` *provably* consumes,
+/// the columns `consumed(D, U)` paired with `U`'s producer output-column hashes
+/// as observed during this run.
+///
+/// This is the record-only half of T2's per-column skip substrate (schema v13).
+/// It is **consumer-side and local** (design Fork 2): it records what `D` read
+/// from each upstream *at this build*, reconstructible from the stored snapshot
+/// plus the current run — never a producer-now-vs-producer-prior inference.
+/// Nothing consults the result yet; the skip gate is a later phase.
+///
+/// Fails **closed** to `None` (no baseline ⇒ a safe rebuild in the later gate,
+/// never a wrong skip) whenever the consumed set can't be proven complete
+/// ([`rocky_sql::consumed_columns`] returns
+/// [`ForceBuild`](rocky_sql::consumed_columns::ConsumedColumns::ForceBuild)).
+///
+/// Arguments:
+/// - `sql` — `D`'s model SQL.
+/// - `target_by_model` — read-by identity (lowercased bare name or 3-part
+///   `catalog.schema.table`) → the producing model's target full name, from
+///   [`build_reuse_target_by_model`].
+/// - `built_output_hashes` — target full name → that upstream's producer
+///   output-column hashes recorded earlier in this run.
+///
+/// Each returned [`UpstreamSig`](rocky_core::state::UpstreamSig) carries only
+/// the column baseline (`max_ts` / `row_count` are `None` — freshness is the
+/// plain-strategy gate's concern, not this path). An upstream's
+/// `consumed_column_hashes` is:
+/// - `Some(hashes)` — the consumed columns resolved to a producer that recorded
+///   hashes this run and **every** consumed column matched (case-insensitively,
+///   since [`consumed_columns`](rocky_sql::consumed_columns) lowercases column
+///   names while the producer keeps the original Arrow field name);
+/// - `None` — the read didn't resolve to a project model (a raw source, or a
+///   catalog-ambiguous 2-part name absent from `target_by_model`), the upstream
+///   recorded no hashes this run (not built content-addressed, reused, or
+///   partitioned), or a consumed column had no matching producer hash. Recorded
+///   honestly so the later gate sees "consumed, but no column baseline ⇒ build".
+fn compute_consumer_baseline(
+    sql: &str,
+    target_by_model: &std::collections::HashMap<String, String>,
+    built_output_hashes: &std::collections::HashMap<String, Vec<rocky_core::state::ColumnHash>>,
+) -> Option<Vec<rocky_core::state::UpstreamSig>> {
+    use rocky_sql::consumed_columns::{ConsumedColumns, consumed_columns};
+
+    let ConsumedColumns::Complete(consumed) = consumed_columns(sql) else {
+        // Consumed set not provably complete ⇒ no baseline (fail closed).
+        return None;
+    };
+
+    let mut sigs = Vec::with_capacity(consumed.len());
+    for (source_key, cols) in &consumed {
+        let (upstream_key, consumed_column_hashes) = match target_by_model.get(source_key) {
+            Some(target_full) => {
+                // Filter the upstream's producer hashes to the consumed columns.
+                // Every consumed column must resolve to a producer hash, else
+                // this upstream can't back a column-level skip (fail closed to
+                // `None`). Case-insensitive: `cols` are lowercased,
+                // `ColumnHash.column` is the original Arrow field name.
+                let hashes = built_output_hashes.get(target_full).and_then(|producer| {
+                    let by_col: std::collections::HashMap<String, &rocky_core::state::ColumnHash> =
+                        producer
+                            .iter()
+                            .map(|ch| (ch.column.to_lowercase(), ch))
+                            .collect();
+                    let mut filtered = Vec::with_capacity(cols.len());
+                    for col in cols {
+                        filtered.push((*by_col.get(col)?).clone());
+                    }
+                    Some(filtered)
+                });
+                (target_full.clone(), hashes)
+            }
+            // Unresolved read (raw source / catalog-ambiguous): no column
+            // baseline for it, keyed by the name as written.
+            None => (source_key.clone(), None),
+        };
+        sigs.push(rocky_core::state::UpstreamSig {
+            upstream_key,
+            max_ts: None,
+            row_count: None,
+            consumed_column_hashes,
+        });
+    }
+    Some(sigs)
 }
 
 /// Resolve a content-addressed model's immediate upstreams to STRONG
@@ -6074,6 +6219,8 @@ async fn execute_one_plain_model(
         )),
         // Not the content-addressed write path — no in-process column bytes.
         output_column_hashes: None,
+        // Consumer baseline is content-addressed-path only.
+        consumed_column_baseline: None,
     })
 }
 
@@ -6507,6 +6654,8 @@ async fn run_one_partition(
             )),
             // Not the content-addressed write path — no in-process column bytes.
             output_column_hashes: None,
+            // Consumer baseline is content-addressed-path only.
+            consumed_column_baseline: None,
         }),
     }
 }
@@ -7416,6 +7565,8 @@ async fn process_table(
             )),
             // Not the content-addressed write path — no in-process column bytes.
             output_column_hashes: None,
+            // Consumer baseline is content-addressed-path only.
+            consumed_column_baseline: None,
         },
         drift_checked: true,
         drift_detected: drift_action,
@@ -12199,6 +12350,118 @@ merge_keys = ["id"]
             }
             other => panic!("expected a Content identity, got {other:?}"),
         }
+    }
+
+    // -- consumer-side per-column baseline (T2 P2, record-only) --------------
+    //
+    // These drive the PRODUCTION baseline computation
+    // (`compute_consumer_baseline`) over the PRODUCTION completeness guard
+    // (`rocky_sql::consumed_columns`) + the production resolver map
+    // (`build_reuse_target_by_model`), on real SQL — not a hand-faked consumed
+    // set — so the guard, the FROM→upstream resolution, and the
+    // case-insensitive producer-hash filter are all genuinely under test.
+
+    fn ch(column: &str, hash: &str) -> rocky_core::state::ColumnHash {
+        rocky_core::state::ColumnHash {
+            column: column.to_string(),
+            hash: hash.to_string(),
+        }
+    }
+
+    #[test]
+    fn consumer_baseline_records_only_consumed_columns_case_insensitively() {
+        // Upstream `u` produced three columns (ORIGINAL Arrow-field casing);
+        // the downstream projects `id`, filters on `name`, and never reads
+        // `email`. The baseline must carry `id` + `name` (consumed) and NOT
+        // `email`, matching case-insensitively (consumed_columns lowercases;
+        // the producer keeps original case) — the exact bug that would silently
+        // record an empty baseline and make the feature inert.
+        let t_u = target_cfg("cat", "sch", "u");
+        let target_by_model = build_reuse_target_by_model([("u", &t_u)]);
+
+        let mut built = std::collections::HashMap::new();
+        built.insert(
+            "cat.sch.u".to_string(),
+            vec![
+                ch("ID", "h_id"),
+                ch("Name", "h_name"),
+                ch("Email", "h_email"),
+            ],
+        );
+
+        let sigs = compute_consumer_baseline(
+            "SELECT id FROM u WHERE name = 'x'",
+            &target_by_model,
+            &built,
+        )
+        .expect("a provably-complete consumed set yields a baseline");
+
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].upstream_key, "cat.sch.u");
+        // Freshness fields are not this path's concern.
+        assert_eq!(sigs[0].max_ts, None);
+        assert_eq!(sigs[0].row_count, None);
+        let cols = sigs[0]
+            .consumed_column_hashes
+            .as_ref()
+            .expect("consumed columns resolved to producer hashes");
+        assert_eq!(
+            cols,
+            &vec![ch("ID", "h_id"), ch("Name", "h_name")],
+            "records the producer hashes for the consumed columns (id + name), \
+             excludes the never-read `email`, matched case-insensitively"
+        );
+    }
+
+    #[test]
+    fn consumer_baseline_fails_closed_on_incomplete_consumed_set() {
+        // A `SELECT *` can't enumerate consumed columns ⇒ the guard force-builds
+        // ⇒ no baseline (None), which forces a safe rebuild in the later gate.
+        let t_u = target_cfg("cat", "sch", "u");
+        let target_by_model = build_reuse_target_by_model([("u", &t_u)]);
+        let mut built = std::collections::HashMap::new();
+        built.insert("cat.sch.u".to_string(), vec![ch("id", "h_id")]);
+
+        assert!(
+            compute_consumer_baseline("SELECT * FROM u", &target_by_model, &built).is_none(),
+            "an un-enumerable consumed set must yield no baseline (fail closed)"
+        );
+    }
+
+    #[test]
+    fn consumer_baseline_none_for_upstream_without_producer_hashes() {
+        // The downstream provably consumes `u.id`, but `u` recorded no producer
+        // hashes this run (not built content-addressed, reused, or partitioned).
+        // The upstream is recorded with `consumed_column_hashes: None` — honest
+        // "consumed, but no column baseline ⇒ the later gate must build".
+        let t_u = target_cfg("cat", "sch", "u");
+        let target_by_model = build_reuse_target_by_model([("u", &t_u)]);
+        let built = std::collections::HashMap::new(); // u produced no hashes
+
+        let sigs = compute_consumer_baseline("SELECT id FROM u", &target_by_model, &built)
+            .expect("consumed set is complete even when the upstream has no hashes");
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].upstream_key, "cat.sch.u");
+        assert_eq!(sigs[0].consumed_column_hashes, None);
+    }
+
+    #[test]
+    fn consumer_baseline_none_when_a_consumed_column_is_missing_from_producer() {
+        // The downstream consumes `id` + `name`, but the producer recorded only
+        // `id` (a rename or a stale hash). Every consumed column must resolve or
+        // the upstream can't back a column skip — fail closed to `None`.
+        let t_u = target_cfg("cat", "sch", "u");
+        let target_by_model = build_reuse_target_by_model([("u", &t_u)]);
+        let mut built = std::collections::HashMap::new();
+        built.insert("cat.sch.u".to_string(), vec![ch("id", "h_id")]);
+
+        let sigs =
+            compute_consumer_baseline("SELECT id, name FROM u", &target_by_model, &built).unwrap();
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(
+            sigs[0].consumed_column_hashes, None,
+            "a consumed column absent from the producer's hashes ⇒ no baseline for that upstream"
+        );
     }
 
     /// Runtime regression: a first run of an incremental transformation

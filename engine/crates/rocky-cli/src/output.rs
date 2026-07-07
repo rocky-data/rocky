@@ -984,6 +984,21 @@ pub struct MaterializationOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub output_column_hashes: Option<Vec<rocky_core::state::ColumnHash>>,
+    /// State-internal consumer-side per-column baseline for this model, carried
+    /// so [`RunOutput::to_run_record`] can route it onto the persisted
+    /// [`rocky_core::state::ModelExecution::upstream_freshness`] as
+    /// [`UpstreamSig`](rocky_core::state::UpstreamSig) entries whose
+    /// `consumed_column_hashes` record what this model consumed from each
+    /// upstream at build time. Populated only by the content-addressed runner
+    /// on a genuine build whose consumed-column set is provably complete;
+    /// `None` everywhere else. Consumer-side and local (Fork 2), never
+    /// producer-now-vs-prior; captured only, nothing consults it yet.
+    ///
+    /// Never serialized and never part of the JSON schema (via `#[serde(skip)]`
+    /// and `#[schemars(skip)]`) — same pattern as [`Self::output_column_hashes`].
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub consumed_column_baseline: Option<Vec<rocky_core::state::UpstreamSig>>,
 }
 
 /// State-internal skip-gate result for one materialized model, carried on
@@ -4624,10 +4639,19 @@ impl RunOutput {
                 // `None` whenever the gate is off or the model was not
                 // skip-eligible — its absence simply forces a rebuild next run.
                 skip_hash: mat.skip_internal.as_ref().and_then(|s| s.skip_hash.clone()),
+                // The consumer-side upstream baseline. A skip-eligible plain
+                // model carries its freshness signatures via `skip_internal`; a
+                // content-addressed model carries the per-column consumer
+                // baseline via `consumed_column_baseline`. A model is at most
+                // one of the two, so `or_else` picks whichever is present (both
+                // land on `upstream_freshness` as `UpstreamSig` entries). The
+                // per-column baseline is captured only — the skip gate never
+                // reads a content-addressed model's `upstream_freshness`.
                 upstream_freshness: mat
                     .skip_internal
                     .as_ref()
-                    .map(|s| s.upstream_freshness.clone()),
+                    .map(|s| s.upstream_freshness.clone())
+                    .or_else(|| mat.consumed_column_baseline.clone()),
                 bytes_scanned: mat.bytes_scanned,
                 bytes_written: mat.bytes_written,
                 tenant: mat.tenant.clone(),
@@ -5051,6 +5075,7 @@ mod cost_finalize_tests {
             skip_internal: None,
             recipe_identity: None,
             output_column_hashes: None,
+            consumed_column_baseline: None,
         }
     }
 
@@ -5266,6 +5291,7 @@ mod run_record_tests {
             skip_internal: None,
             recipe_identity: None,
             output_column_hashes: None,
+            consumed_column_baseline: None,
         }
     }
 
@@ -5328,6 +5354,56 @@ mod run_record_tests {
         assert_eq!(
             customers.finished_at,
             customers_start + chrono::Duration::milliseconds(800)
+        );
+    }
+
+    /// The content-addressed consumer baseline (`consumed_column_baseline`)
+    /// must land on the persisted `ModelExecution.upstream_freshness` — the
+    /// consumer-side per-column baseline (schema v13). A content-addressed
+    /// model has no `skip_internal`, so the `or_else` route in `to_run_record`
+    /// is what carries it. Proves the baseline is durable end-to-end.
+    #[test]
+    fn to_run_record_lands_consumer_baseline_on_upstream_freshness() {
+        let mut out = RunOutput::new(String::new(), 1_000, 1);
+        out.tables_copied = 1;
+        let started = fixed_start();
+        let mut m = mat(&["cat", "sch", "d"], 100, Some("sqlh"), started);
+        // Content-addressed model: no skip_internal, only the consumer baseline.
+        assert!(m.skip_internal.is_none());
+        m.consumed_column_baseline = Some(vec![rocky_core::state::UpstreamSig {
+            upstream_key: "cat.sch.u".to_string(),
+            max_ts: None,
+            row_count: None,
+            consumed_column_hashes: Some(vec![rocky_core::state::ColumnHash {
+                column: "id".to_string(),
+                hash: "h_id".to_string(),
+            }]),
+        }]);
+        out.materializations.push(m);
+
+        let record = out.to_run_record(
+            "run-baseline-1",
+            started,
+            started + chrono::Duration::seconds(1),
+            "cfg".to_string(),
+            RunTrigger::Manual,
+            RunStatus::Success,
+            RunRecordAudit::test_sentinels(),
+        );
+
+        let d = &record.models_executed[0];
+        let sigs = d
+            .upstream_freshness
+            .as_ref()
+            .expect("consumer baseline routed onto upstream_freshness");
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].upstream_key, "cat.sch.u");
+        assert_eq!(
+            sigs[0].consumed_column_hashes,
+            Some(vec![rocky_core::state::ColumnHash {
+                column: "id".to_string(),
+                hash: "h_id".to_string(),
+            }])
         );
     }
 

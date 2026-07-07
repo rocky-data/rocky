@@ -877,6 +877,8 @@ pub async fn run_snapshot(
             )),
             // Not the content-addressed write path — no in-process column bytes.
             output_column_hashes: None,
+            // Consumer baseline is content-addressed-path only.
+            consumed_column_baseline: None,
         });
     } else {
         output.tables_failed = 1;
