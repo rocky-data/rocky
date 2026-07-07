@@ -609,6 +609,23 @@ mod tests {
     }
 
     #[test]
+    fn within_group_ordered_set_aggregate_consumed() {
+        // Ordered-set aggregates carry their ordering column in `WITHIN GROUP`,
+        // a distinct AST field from an inline aggregate `ORDER BY`. `latency`
+        // determines the aggregate's value, so it must be consumed — and the
+        // second `grp` column means the empty-consumed-set gate would NOT catch
+        // a miss here, so this pins the walk reaching `within_group`.
+        let map = complete_map(
+            "SELECT grp, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY latency) AS p \
+             FROM cat.sch.t GROUP BY grp",
+        );
+        assert_eq!(
+            map["cat.sch.t"],
+            BTreeSet::from(["grp".into(), "latency".into()])
+        );
+    }
+
+    #[test]
     fn self_join_merges_under_one_key() {
         // Both aliases resolve to the same upstream table, so their consumed
         // columns merge under one key — sound, because it is one upstream.
