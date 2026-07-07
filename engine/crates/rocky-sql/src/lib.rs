@@ -1,3 +1,4 @@
+pub mod consumed_columns;
 pub mod defer;
 pub mod determinism;
 pub mod dialect;
