@@ -32,6 +32,7 @@ pub mod optimize;
 pub mod plan_partition;
 pub mod preview;
 pub mod quarantine;
+pub mod recipe_identity;
 pub mod redacted;
 pub mod retention;
 pub mod retry;

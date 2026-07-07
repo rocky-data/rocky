@@ -5214,6 +5214,10 @@ pub(crate) async fn execute_models(
                             job_ids: vec![],
                             // content_addressed is never skip-eligible.
                             skip_internal: None,
+                            recipe_identity: Some(crate::output::recipe_identity_internal(
+                                &model_ir,
+                                warehouse.dialect().name(),
+                            )),
                         });
                         // Per-model decision (reporting-only). A
                         // content_addressed model is never skip-eligible, so it
@@ -6057,6 +6061,10 @@ async fn execute_one_plain_model(
         // when `--skip-unchanged` is enabled; `None` keeps default-off
         // behavior byte-identical.
         skip_internal: None,
+        recipe_identity: Some(crate::output::recipe_identity_internal(
+            &model_ir,
+            warehouse.dialect().name(),
+        )),
     })
 }
 
@@ -6482,6 +6490,12 @@ async fn run_one_partition(
             job_ids: job_ids_acc,
             // time_interval is excluded from the v1 skip gate.
             skip_internal: None,
+            // Recipe hash from the STATIC IR (window=None) so it is
+            // partition-invariant across a model's partitions.
+            recipe_identity: Some(crate::output::recipe_identity_internal(
+                &model.to_model_ir(),
+                warehouse.dialect().name(),
+            )),
         }),
     }
 }
@@ -7385,6 +7399,10 @@ async fn process_table(
             // Replication materializations are not gated by --skip-unchanged
             // in v1 (the gate covers transformation models).
             skip_internal: None,
+            recipe_identity: Some(crate::output::recipe_identity_internal(
+                &model_ir,
+                dialect.name(),
+            )),
         },
         drift_checked: true,
         drift_detected: drift_action,
@@ -11203,6 +11221,11 @@ merge_keys = ["id"]
                 bytes_scanned: None,
                 bytes_written: None,
                 tenant: None,
+                recipe_hash: None,
+                input_hash: None,
+                input_proof_class: None,
+                env_hash: None,
+                hash_scheme: None,
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),

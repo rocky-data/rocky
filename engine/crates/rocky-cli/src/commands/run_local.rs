@@ -871,6 +871,10 @@ pub async fn run_snapshot(
             tenant: None,
             job_ids: Vec::new(),
             skip_internal: None,
+            recipe_identity: Some(crate::output::recipe_identity_internal(
+                &model_ir,
+                dialect.name(),
+            )),
         });
     } else {
         output.tables_failed = 1;

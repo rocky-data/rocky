@@ -962,6 +962,17 @@ pub struct MaterializationOutput {
     #[serde(skip)]
     #[schemars(skip)]
     pub skip_internal: Option<ModelSkipState>,
+    /// State-internal recipe-identity slice (`recipe_hash` + `env_hash` +
+    /// scheme), co-located with the model so [`RunOutput::to_run_record`] can
+    /// stamp it onto the persisted `ModelExecution`. Computed at the per-model
+    /// execution site; `None` keeps default behavior byte-identical for any
+    /// path that has not (yet) been wired to compute it.
+    ///
+    /// Never serialized and never part of the JSON schema (via `#[serde(skip)]`
+    /// and `#[schemars(skip)]`) — same pattern as [`Self::skip_internal`].
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub recipe_identity: Option<RecipeIdentityInternal>,
 }
 
 /// State-internal skip-gate result for one materialized model, carried on
@@ -975,6 +986,111 @@ pub struct ModelSkipState {
     pub skip_hash: Option<String>,
     /// Per-upstream freshness signatures observed for this build.
     pub upstream_freshness: Vec<rocky_core::state::UpstreamSig>,
+}
+
+/// State-internal recipe-identity slice for one materialized model, carried on
+/// [`MaterializationOutput`] from the per-model execution site (where the typed
+/// IR and the adapter are both in scope) to `to_run_record`, which stamps it —
+/// together with the input side derived from [`ModelSkipState`] — onto the
+/// persisted [`rocky_core::state::ModelExecution`].
+///
+/// Holds only the two hashes that need per-model / adapter context:
+/// `recipe_hash` (the program identity, from the model's IR) and `env_hash`
+/// (engine + adapter/dialect). The input side is recomputed in
+/// `to_run_record` from the observed upstream signatures. Never serialized and
+/// never part of the JSON schema — mirrors the `skip_internal` pattern.
+#[derive(Debug, Clone)]
+pub struct RecipeIdentityInternal {
+    /// blake3 (hex) of the canonical `ModelIr` JSON —
+    /// [`rocky_core::recipe_identity::recipe_hash`].
+    pub recipe_hash: String,
+    /// blake3 (hex) of the run's [`rocky_core::recipe_identity::EnvIdentity`].
+    pub env_hash: String,
+    /// The [`rocky_core::recipe_identity::HASH_SCHEME`] tag in force.
+    pub hash_scheme: String,
+}
+
+/// Derive the persisted `(input_hash, input_proof_class)` for one materialized
+/// model from its observed upstream freshness signatures.
+///
+/// The input side of the recipe-identity triple is populated only when this
+/// run actually *observed* inputs — i.e. the `--skip-unchanged` gate ran and
+/// recorded per-upstream watermark/rowcount signatures on
+/// [`MaterializationOutput::skip_internal`]. Those observed signatures fold
+/// into an [`rocky_core::recipe_identity::UpstreamIdentity::Watermark`] set,
+/// yielding a `"heuristic"` (weak) input hash — honest about attesting
+/// freshness, not byte-identity.
+///
+/// Returns `(None, None)` on the default run path (no gate, no observed
+/// inputs), on a non-canonicalisable model (`skip_hash` absent), or when no
+/// upstream signatures were captured. A bare "no upstreams" hash is
+/// deliberately *not* fabricated: the declared inputs already live inside
+/// `recipe_hash`, so an empty-upstream input hash would add nothing and would
+/// misleadingly read as a strong claim.
+/// Compute the per-model recipe-identity carrier (`recipe_hash` + `env_hash` +
+/// scheme) at a model's execution site, where the typed IR and the warehouse
+/// adapter are both in scope.
+///
+/// `recipe_hash` is the program identity (canonical `ModelIr` JSON); `env_hash`
+/// folds the engine version and the `adapter_name` (the dialect identity, e.g.
+/// `WarehouseAdapter::dialect().name()`), never the hostname. The input side of
+/// the triple is derived later, in [`RunOutput::to_run_record`], from the
+/// observed upstream signatures — see [`derive_input_identity`].
+///
+/// For a `time_interval` model, pass the **static** IR (`window = None`, e.g.
+/// `model.to_model_ir()`) so the recipe hash is partition-invariant.
+pub(crate) fn recipe_identity_internal(
+    model_ir: &rocky_ir::ModelIr,
+    adapter_name: &str,
+) -> RecipeIdentityInternal {
+    let recipe_hash = rocky_core::recipe_identity::recipe_hash(model_ir)
+        .to_hex()
+        .to_string();
+    let env = rocky_core::recipe_identity::EnvIdentity {
+        engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        adapter: adapter_name.to_string(),
+        exec_config: std::collections::BTreeMap::new(),
+    };
+    let env_hash = rocky_core::recipe_identity::env_hash(&env)
+        .to_hex()
+        .to_string();
+    RecipeIdentityInternal {
+        recipe_hash,
+        env_hash,
+        hash_scheme: rocky_core::recipe_identity::HASH_SCHEME.to_string(),
+    }
+}
+
+fn derive_input_identity(mat: &MaterializationOutput) -> (Option<String>, Option<String>) {
+    let Some(skip) = mat.skip_internal.as_ref() else {
+        return (None, None);
+    };
+    let Some(skip_hash) = skip.skip_hash.as_deref() else {
+        return (None, None);
+    };
+    if skip.upstream_freshness.is_empty() {
+        return (None, None);
+    }
+    let upstreams: Vec<rocky_core::recipe_identity::UpstreamIdentity> = skip
+        .upstream_freshness
+        .iter()
+        .map(
+            |sig| rocky_core::recipe_identity::UpstreamIdentity::Watermark {
+                upstream_key: sig.upstream_key.clone(),
+                max_ts: sig.max_ts.map(|ts| ts.to_rfc3339()),
+                row_count: sig.row_count,
+            },
+        )
+        .collect();
+    let target_identity = mat.asset_key.join(".");
+    let input_hash =
+        rocky_core::recipe_identity::compute_input_hash(skip_hash, &target_identity, &upstreams)
+            .to_hex()
+            .to_string();
+    let proof_class = rocky_core::recipe_identity::proof_class_for(&upstreams)
+        .as_str()
+        .to_string();
+    (Some(input_hash), Some(proof_class))
 }
 
 /// The per-model build decision the engine made this run — what the
@@ -4354,6 +4470,7 @@ impl RunOutput {
                 .last()
                 .cloned()
                 .unwrap_or_else(|| "<unknown>".to_string());
+            let (input_hash, input_proof_class) = derive_input_identity(mat);
             models.push(rocky_core::state::ModelExecution {
                 model_name,
                 started_at: model_started,
@@ -4374,6 +4491,16 @@ impl RunOutput {
                 bytes_scanned: mat.bytes_scanned,
                 bytes_written: mat.bytes_written,
                 tenant: mat.tenant.clone(),
+                // Recipe identity. `recipe_hash` / `env_hash` / scheme come
+                // from the per-model carrier stamped at the execution site;
+                // the input side is derived here from the observed upstream
+                // freshness signatures (see `derive_input_identity`) — `None`
+                // on the default path, which observes no inputs.
+                recipe_hash: mat.recipe_identity.as_ref().map(|r| r.recipe_hash.clone()),
+                env_hash: mat.recipe_identity.as_ref().map(|r| r.env_hash.clone()),
+                hash_scheme: mat.recipe_identity.as_ref().map(|r| r.hash_scheme.clone()),
+                input_hash: input_hash.clone(),
+                input_proof_class,
             });
         }
 
@@ -4399,6 +4526,13 @@ impl RunOutput {
                 // Errors carry only the asset key, not the parsed schema
                 // components, so the tenant dimension is unavailable here.
                 tenant: None,
+                // A failed execution captured no recipe identity — consistent
+                // with its `None` skip_hash / empty sql_hash above.
+                recipe_hash: None,
+                input_hash: None,
+                input_proof_class: None,
+                env_hash: None,
+                hash_scheme: None,
             });
         }
 
@@ -4769,6 +4903,7 @@ mod cost_finalize_tests {
             tenant: None,
             job_ids: Vec::new(),
             skip_internal: None,
+            recipe_identity: None,
         }
     }
 
@@ -4982,6 +5117,7 @@ mod run_record_tests {
             tenant: None,
             job_ids: Vec::new(),
             skip_internal: None,
+            recipe_identity: None,
         }
     }
 

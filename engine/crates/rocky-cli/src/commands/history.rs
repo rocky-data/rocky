@@ -463,6 +463,11 @@ mod tests {
                 bytes_scanned: None,
                 bytes_written: None,
                 tenant: None,
+                recipe_hash: None,
+                input_hash: None,
+                input_proof_class: None,
+                env_hash: None,
+                hash_scheme: None,
             }],
             trigger: RunTrigger::Manual,
             config_hash: "cfg-hash".to_string(),
@@ -531,6 +536,11 @@ mod tests {
             bytes_scanned: None,
             bytes_written: None,
             tenant: None,
+            recipe_hash: None,
+            input_hash: None,
+            input_proof_class: None,
+            env_hash: None,
+            hash_scheme: None,
         }
     }
 
