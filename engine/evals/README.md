@@ -40,6 +40,11 @@ uv run python run_evals.py --scenario completed_revenue --model claude-opus-4-1 
 
 # Creds-free plumbing check (CI runs this on the no-secret path):
 uv run python run_evals.py --selftest
+
+# Structured-error contract check (needs only the `rocky` binary — no key, no
+# warehouse, no model): drives `rocky mcp` with bad input and asserts the
+# {code, message, remediation_hint} error envelope + hint quality.
+uv run python run_evals.py --error-contract
 ```
 
 `ROCKY_BIN` overrides binary discovery (otherwise: `engine/target/{release,debug}/rocky`,
@@ -73,6 +78,25 @@ from the agent's own claim of success:
 
 A scenario **passes** when all of its *required* checks pass; the reconcile bonus
 is recorded but never gates the pass.
+
+### The structured-error contract (`--error-contract`)
+
+A separate, **creds-free** check (needs only the `rocky` binary — no model key,
+no `claude`, no warehouse) asserts the MCP surface's *failure* paths, not just
+its success paths. It drives a real `rocky mcp` server over stdio with
+deliberately bad input and checks, with deterministic assertions, that every
+failing tool call returns a tool-result error (`isError: true`) carrying a
+`{code, message, remediation_hint, policy_rule?}` envelope in
+`structuredContent` — the machine-UX analog of Rocky's diagnostic codes — with a
+stable `code` and an *actionable* `remediation_hint` (e.g. an unknown dialect's
+hint must name the accepted set; a `model_not_found` hint must point at a
+discovery tool). It also pins the complementary shape: a genuine **compile
+error** is *not* an envelope — it is a successful call reporting
+`has_errors: true` with diagnostics that each carry a code and message.
+
+Unlike the live authoring scenarios (whose pass/fail is model-outcome variance),
+this contract is deterministic, so a failure is a real regression and **gates**
+the run. CI runs it on the no-secret path alongside `--selftest`.
 
 ### Why the agent gets no shell
 
@@ -126,6 +150,7 @@ engine/evals/
 │   ├── scoring.py               deterministic checks (pure fns)
 │   ├── scorecard.py             scorecard model + JSON/Markdown render
 │   ├── selftest.py              creds-free plumbing check
+│   ├── error_contract.py        creds-free structured-error contract check (rocky binary only)
 │   └── version.py               HARNESS_VERSION
 ├── fixtures/orders_trap/        the pinned DuckDB fixture (the reconcile trap)
 └── testdata/                    recorded transcript for --selftest

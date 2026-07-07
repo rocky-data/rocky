@@ -1076,6 +1076,97 @@ async fn compile_rejects_unknown_target_dialect() {
         Some(true),
         "unknown target_dialect must be an error"
     );
+    // The failure carries the structured envelope: a machine-matchable code, a
+    // message, and an actionable remediation_hint that names the accepted set.
+    let err = result
+        .structured_content
+        .expect("a failing tool call carries the structured error envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["message"].as_str().unwrap().contains("redshift"),
+        "message names the offending value: {err:?}"
+    );
+    let hint = err["remediation_hint"].as_str().unwrap();
+    assert!(
+        hint.contains("duckdb") && hint.contains("snowflake"),
+        "remediation_hint names the accepted dialects: {hint:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The structured-error contract, end-to-end over the wire: every failing tool
+/// call comes back as `is_error: true` with a `{code, message,
+/// remediation_hint}` envelope in `structured_content`. Drives one
+/// representative error class per code an offline call can reach, so the
+/// envelope shape is proven reachable through `rocky mcp` (not just unit-typed).
+#[tokio::test]
+async fn tool_failures_carry_structured_error_envelope() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // Assert a failing tool call carries the full envelope and return the
+    // parsed error object for further per-case assertions.
+    async fn expect_error(
+        client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        tool: &'static str,
+        args: serde_json::Value,
+    ) -> serde_json::Value {
+        let params = match args {
+            serde_json::Value::Null => CallToolRequestParams::new(tool),
+            other => {
+                CallToolRequestParams::new(tool).with_arguments(other.as_object().unwrap().clone())
+            }
+        };
+        let result = client
+            .call_tool(params)
+            .await
+            .unwrap_or_else(|e| panic!("{tool} call returns a result: {e}"));
+        assert_eq!(result.is_error, Some(true), "{tool} must be an error");
+        let err = result
+            .structured_content
+            .unwrap_or_else(|| panic!("{tool} error carries structured_content"));
+        for key in ["code", "message", "remediation_hint"] {
+            let v = err.get(key).and_then(|v| v.as_str());
+            assert!(
+                v.is_some_and(|s| !s.trim().is_empty()),
+                "{tool} envelope has a non-empty {key}: {err:?}"
+            );
+        }
+        // policy_rule is reserved for a future policy plane and absent today.
+        assert!(
+            err.get("policy_rule").is_none(),
+            "{tool} envelope omits policy_rule until the policy plane sets it: {err:?}"
+        );
+        err
+    }
+
+    // invalid_argument — unknown `list` kind (no compile, no warehouse).
+    let bad_kind = expect_error(&client, "list", serde_json::json!({ "kind": "frobnicate" })).await;
+    assert_eq!(bad_kind["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        bad_kind["remediation_hint"]
+            .as_str()
+            .unwrap()
+            .contains("models"),
+        "list hint names the accepted kinds: {bad_kind:?}"
+    );
+
+    // model_not_found — the project compiles (one model) but the name is absent.
+    let ghost = expect_error(
+        &client,
+        "dependents",
+        serde_json::json!({ "model": "ghost" }),
+    )
+    .await;
+    assert_eq!(ghost["code"], serde_json::json!("model_not_found"));
+    let ghost_hint = ghost["remediation_hint"].as_str().unwrap();
+    assert!(
+        ghost_hint.contains("list") || ghost_hint.contains("inspect_schema"),
+        "model_not_found hint points at a discovery tool: {ghost_hint:?}"
+    );
 
     client.cancel().await.unwrap();
 }

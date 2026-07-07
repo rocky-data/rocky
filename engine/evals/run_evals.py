@@ -6,6 +6,7 @@ Usage:
     uv run python run_evals.py --scenario completed_revenue
     uv run python run_evals.py --model claude-opus-4-1 --max-attempts 2
     uv run python run_evals.py --selftest      # creds-free: score a recorded transcript
+    uv run python run_evals.py --error-contract # rocky-binary only: assert the MCP error envelope
 
 The live suite is NOT creds-free — it drives a scripted Claude Code session and
 needs $ANTHROPIC_API_KEY (plus the `claude`, `rocky`, and `duckdb` CLIs). When
@@ -29,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from harness import error_contract as error_contract_mod
 from harness import selftest as selftest_mod
 from harness.driver import ClaudeCliDriver
 from harness.environ import resolve_environment
@@ -201,10 +203,19 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="creds-free plumbing check: score a recorded transcript, no model call",
     )
+    parser.add_argument(
+        "--error-contract",
+        action="store_true",
+        help="rocky-binary-only check: assert the structured MCP error envelope on bad input "
+        "(no model key, no warehouse)",
+    )
     args = parser.parse_args(argv)
 
     if args.selftest:
         return selftest_mod.run()
+
+    if args.error_contract:
+        return error_contract_mod.main()
 
     card = build_scorecard(args)
     json_path, md_path = write_outputs(card, args.output_dir)
