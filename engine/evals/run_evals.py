@@ -81,6 +81,7 @@ def run_scenario(
                 system_prompt=scenario.system_prompt,
                 model=model,
                 timeout_s=timeout_s,
+                disallowed_extra=scenario.disallowed_extra,
             )
             transcript = parse_transcript(agent.transcript_path)
             # Preserve the transcript for debugging / artifact upload before the

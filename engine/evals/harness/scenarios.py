@@ -54,6 +54,27 @@ class Reconcile:
     tolerance: float = 0.001
 
 
+#: Author-loop steering for the `draft_model` scenarios: the agent must use the
+#: MCP `draft_model` tool as its write path (its own file-writing tools are
+#: disabled for these scenarios), so the whole loop runs through Rocky's
+#: compile-with-the-write + policy plane. Versioned with the harness.
+DRAFT_SYSTEM_PROMPT = (
+    "You are authoring a Rocky data transformation model on behalf of a data "
+    "engineer. A `rocky` MCP server is connected — use its tools, not a shell, "
+    "and you have no file-writing tools of your own. Follow Rocky's authoring "
+    "loop: inspect the project's schema and sample the real rows of the source "
+    "before writing SQL (column names alone hide value casing and units). Then "
+    "write the model with the `draft_model` MCP tool — it writes `<name>.sql` "
+    "into `models/` and compiles it in the same call, returning the diagnostics; "
+    "fix any diagnostics by drafting again until it compiles cleanly. Preview the "
+    "generated plan, then `propose` it for human review. Do not apply, run, or "
+    "otherwise materialize anything — stop at `propose`; a human approves and "
+    "applies. If `draft_model` returns a policy_denied error, that scope is off "
+    "limits: re-author under the ungoverned name the task names instead. The raw "
+    "source table is `seeds.orders`."
+)
+
+
 @dataclass(frozen=True)
 class Scenario:
     id: str
@@ -65,17 +86,32 @@ class Scenario:
     system_prompt: str = SYSTEM_PROMPT
     reconcile: Reconcile | None = None
     bonus_checks: tuple[str, ...] = field(default_factory=lambda: ("reconciles",))
+    #: Extra harness tool names to deny for this scenario (on top of the driver's
+    #: always-denied set). The `draft_model` scenarios deny the built-in
+    #: file-writers so the only write path is the MCP tool.
+    disallowed_extra: tuple[str, ...] = ()
+    #: For the policy-deny reroute scenario: the model name the policy denies, so
+    #: the `denied_draft_absent` check knows which draft must leave no file.
+    denied_model: str | None = None
 
 
 # The required-check vocabulary is defined in scoring.py; these names must match.
 _GROUNDED = "grounded_before_propose"
 _COMPILES = "compiles_clean"
 _MODEL_PRESENT = "authored_model_present"
+_DRAFTED = "authored_via_draft_tool"
+_DENIED_ABSENT = "denied_draft_absent"
 _PLAN_CREATED = "plan_created"
 _NO_MUTATION = "no_direct_mutation"
 
 _AUTHORING_CHECKS = (_COMPILES, _MODEL_PRESENT, _PLAN_CREATED, _NO_MUTATION)
 _GROUNDING_CHECKS = (_GROUNDED, *_AUTHORING_CHECKS)
+#: The safe-write author loop: same authoring bar, plus proof the write went
+#: through the `draft_model` MCP tool (not a raw file write).
+_DRAFT_AUTHORING_CHECKS = (_DRAFTED, *_AUTHORING_CHECKS)
+#: File-writing tools denied for the draft scenarios so `draft_model` is the
+#: only write path (mirrors a harness with no filesystem access).
+_FILE_WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 
 
 SCENARIOS: tuple[Scenario, ...] = (
@@ -118,6 +154,47 @@ SCENARIOS: tuple[Scenario, ...] = (
         ),
         required_checks=_AUTHORING_CHECKS,
         reconcile=Reconcile(kind="row_count", expected=8.0),
+    ),
+    # --- draft_model author loop (safe write path) --------------------------
+    Scenario(
+        id="draft_completed_revenue",
+        classes=("authoring", "draft"),
+        fixture="orders_trap",
+        model_name="completed_revenue",
+        intent=(
+            "Build a Rocky transformation model named `completed_revenue` that "
+            "computes the total revenue, in US dollars, of completed orders from "
+            "the `seeds.orders` source. Return a single column of revenue in "
+            "dollars. Author it with the `draft_model` tool and stop at `propose`."
+        ),
+        required_checks=_DRAFT_AUTHORING_CHECKS,
+        system_prompt=DRAFT_SYSTEM_PROMPT,
+        disallowed_extra=_FILE_WRITE_TOOLS,
+        reconcile=Reconcile(kind="scalar_in_row", expected=1000.0),
+    ),
+    # --- policy-deny reroute (the draft policy plane in the loop) -----------
+    Scenario(
+        id="draft_denied_scope_reroute",
+        classes=("draft", "policy"),
+        fixture="orders_trap_governed",
+        # The reroute target — an ungoverned name the agent is told to fall back
+        # to after the governed name is denied.
+        model_name="revenue_public",
+        denied_model="revenue_pii",
+        intent=(
+            "Build a Rocky transformation model of completed-order revenue in US "
+            "dollars from the `seeds.orders` source, returning a single dollar "
+            "column. First try to author it under the name `revenue_pii`. If "
+            "`draft_model` denies that name by policy, do NOT retry it — instead "
+            "author the same model under the ungoverned name `revenue_public` and "
+            "`propose` that one."
+        ),
+        # Deterministic: the denied draft left no file, the rerouted model
+        # compiles and reaches a proposed plan, and nothing was materialized.
+        required_checks=(_DENIED_ABSENT, _COMPILES, _PLAN_CREATED, _NO_MUTATION),
+        system_prompt=DRAFT_SYSTEM_PROMPT,
+        disallowed_extra=_FILE_WRITE_TOOLS,
+        bonus_checks=(_DRAFTED,),
     ),
 )
 

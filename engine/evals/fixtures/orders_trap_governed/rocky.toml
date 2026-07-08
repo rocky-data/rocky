@@ -1,0 +1,36 @@
+# orders_trap_governed — the orders_trap fixture with an agent-policy plane.
+#
+# Identical dataset to `orders_trap` (same seed, same reconcile traps), plus a
+# `[policy]` block that DENIES an agent authoring (a propose-class action) into
+# any model named `*_pii`. It is the pinned fixture for the policy-deny reroute
+# scenario: an agent that drafts `revenue_pii` gets a structured `policy_denied`
+# with no file left on disk, and must re-author under an ungoverned name.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "poc"
+schema_template = "demo"
+
+[policy]
+version = 1
+default_agent_effect = "allow"
+
+# Deny an agent authoring any model whose name ends in `_pii`. `draft_model`
+# maps to the `propose` capability, so this fires at draft time — before the
+# draft is kept — and the deny rolls the write back.
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { models = ["*_pii"] }
+effect = "deny"

@@ -125,6 +125,22 @@ pub struct ProposeArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DraftModelArgs {
+    /// The model name. Becomes `models/<name>.sql` + a `models/<name>.toml`
+    /// sidecar. Must be a bare identifier — no path separators, no `..`, no
+    /// extension, not absolute. A name that would escape the models directory
+    /// is refused with an `invalid_argument` error.
+    pub name: String,
+    /// The model's SQL body, written verbatim to `models/<name>.sql`. Raw SQL is
+    /// first-class in Rocky — write real SQL grounded in the sampled data.
+    pub sql: String,
+    /// A plain-language statement of what the model is for, persisted to the
+    /// sidecar's `intent` field (surfaced by `catalog` and lineage). Ground it
+    /// in the intent you were given; it is the reviewer's context for the draft.
+    pub intent: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct BreakingChangeArgs {
     /// Git ref to compare the working tree against. Defaults to `"HEAD"`.
     #[serde(default = "default_base_ref")]
@@ -1666,6 +1682,247 @@ impl RockyMcpServer {
         }))
     }
 
+    /// Validate a draft model `name` and resolve its `models/<name>.sql` +
+    /// sidecar paths, refusing any name that could escape the models directory.
+    ///
+    /// Mirrors the import-dbt `safe_join_under` path guard (the traversal fix
+    /// that hardened untrusted `model-paths`): reject an absolute name or any
+    /// path-traversal component syntactically, and — when a target path already
+    /// exists — canonicalize it and confirm it stays under the models directory,
+    /// catching a pre-existing symlink that would redirect the write. A draft
+    /// name is a bare identifier, so a separator, `..`, or extension is refused.
+    fn resolve_draft_paths(&self, name: &str) -> Result<DraftPaths, Json<ToolError>> {
+        use std::path::Component;
+
+        let bad = |msg: String| {
+            ToolError::invalid_argument(
+                msg,
+                "Pass a bare model name — a single identifier like \"completed_revenue\" — so it \
+                 maps to exactly one models/<name>.sql draft under the project.",
+            )
+        };
+
+        let stem = name.trim();
+        if stem.is_empty() {
+            return Err(bad("model name is empty".to_string()));
+        }
+        // A draft name is a single path segment with no extension: reject
+        // separators, `..`, and `.` up front (syntactic, no filesystem access).
+        if stem.contains('/') || stem.contains('\\') || stem.contains('.') {
+            return Err(bad(format!(
+                "model name '{stem}' must be a bare identifier: no path separators, '..', or \
+                 extension (it becomes models/<name>.sql)"
+            )));
+        }
+        // Belt-and-braces: the name must be exactly one normal path component.
+        let mut comps = Path::new(stem).components();
+        if !matches!(comps.next(), Some(Component::Normal(_))) || comps.next().is_some() {
+            return Err(bad(format!(
+                "model name '{stem}' is not a single path segment"
+            )));
+        }
+
+        let sql_path = self.models_dir.join(format!("{stem}.sql"));
+        let sidecar_path = self.models_dir.join(format!("{stem}.toml"));
+
+        // Symlink defense-in-depth: if a target already exists, confirm it
+        // resolves under the (canonicalized) models directory before we write
+        // through it. A not-yet-existing path passed the syntactic check above.
+        for p in [&sql_path, &sidecar_path] {
+            if p.exists() {
+                let base = self.models_dir.canonicalize().map_err(|e| {
+                    bad(format!("failed to canonicalize the models directory: {e}"))
+                })?;
+                let canon = p
+                    .canonicalize()
+                    .map_err(|e| bad(format!("failed to canonicalize {}: {e}", p.display())))?;
+                if !canon.starts_with(&base) {
+                    return Err(bad(format!(
+                        "draft path {} resolves outside the models directory",
+                        p.display()
+                    )));
+                }
+            }
+        }
+
+        Ok(DraftPaths {
+            stem: stem.to_string(),
+            sql_path,
+            sidecar_path,
+        })
+    }
+
+    #[tool(
+        description = "Draft a Rocky transformation model into the project working tree and \
+         compile it in the SAME call — the safe write path for an agent. Writes the SQL to \
+         models/<name>.sql plus a sidecar carrying the intent, then compiles and returns the \
+         diagnostics, so you get the type-check WITH the write (no separate round-trip). It does \
+         NOT run, apply, or touch the warehouse; a draft is inert until you `propose` it and a \
+         human reviews it. Path-gated to the models directory (a name with separators/`..` is \
+         refused) and policy-aware: authoring into a governed scope returns a structured \
+         policy_denied / policy_review_required error, and a denied draft is not left on disk. \
+         Use this instead of raw file writes so your edits flow through compile feedback + policy."
+    )]
+    async fn draft_model(
+        &self,
+        params: Parameters<DraftModelArgs>,
+    ) -> ToolResult<DraftModelResult> {
+        let args = params.0;
+        let paths = self.resolve_draft_paths(&args.name)?;
+
+        // A cold project may not have a models/ directory yet.
+        std::fs::create_dir_all(&self.models_dir).map_err(|e| {
+            ToolError::internal(
+                format!("failed to create the models directory: {e}"),
+                "Ensure the project directory is writable so drafts can be written.",
+            )
+        })?;
+
+        // Snapshot prior on-disk state so a policy DENY (or a write failure) rolls
+        // back to leave NO new artifact — a draft the policy plane refuses must
+        // not linger on disk (mirrors the propose gate's deny → no plan written).
+        let prior_sql = std::fs::read(&paths.sql_path).ok();
+        let prior_sidecar = std::fs::read(&paths.sidecar_path).ok();
+        let rollback = || {
+            restore_or_remove(&paths.sql_path, prior_sql.as_deref());
+            restore_or_remove(&paths.sidecar_path, prior_sidecar.as_deref());
+        };
+
+        // Write the draft: the SQL body verbatim + a minimal sidecar that carries
+        // the intent. Target/strategy resolve from the project's conventions
+        // (rocky.toml pipeline + _defaults.toml), exactly as a hand-authored bare
+        // model — the draft tool never invents a target the agent didn't ask for.
+        if let Err(e) = std::fs::write(&paths.sql_path, ensure_trailing_newline(&args.sql)) {
+            rollback();
+            return Err(ToolError::internal(
+                format!(
+                    "failed to write draft SQL to {}: {e}",
+                    paths.sql_path.display()
+                ),
+                "Ensure the models directory is writable.",
+            ));
+        }
+        if let Err(e) = std::fs::write(
+            &paths.sidecar_path,
+            draft_sidecar(&paths.stem, args.intent.trim()),
+        ) {
+            rollback();
+            return Err(ToolError::internal(
+                format!(
+                    "failed to write draft sidecar to {}: {e}",
+                    paths.sidecar_path.display()
+                ),
+                "Ensure the models directory is writable.",
+            ));
+        }
+
+        // Compile immediately — the agent gets the type-check with the write.
+        // Scope the returned diagnostics to the drafted model (the whole project
+        // is still checked, so a fatal error anywhere surfaces).
+        let with_seed = self.seed_file().is_some();
+        let output = match commands::compile_output(
+            Some(&self.config_path),
+            &self.state_path(),
+            &self.models_dir,
+            None,
+            Some(&paths.stem),
+            false,
+            None,
+            with_seed,
+            None,
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                rollback();
+                return Err(ToolError::compile_failed(format!("{e:#}")));
+            }
+        };
+        let compiled = project_compile_result(&output);
+
+        // A draft is a `propose`-class authorship. Map the drafted model to the
+        // `propose` capability and consult the SAME agent-policy plane the
+        // propose/apply gates use (the shared `evaluate_apply_policy`) — so an
+        // agent authoring into a governed scope gets a structured verdict WITH
+        // the write, not later at apply. Absent a `[policy]` block this resolves
+        // to `NotConfigured` and behaviour is byte-identical to no policy plane.
+        let state_path = self.state_path();
+        let touched: std::collections::BTreeMap<String, rocky_core::config::PolicyCapability> =
+            std::iter::once((
+                paths.stem.clone(),
+                rocky_core::config::PolicyCapability::Propose,
+            ))
+            .collect();
+        // A draft has no plan; the decision is recorded against a draft-scoped id
+        // so the audit ledger stays honest about what it is.
+        let decision_id = format!("draft:{}", paths.stem);
+        let gate = rocky_cli::commands::evaluate_apply_policy(
+            &self.config_path,
+            &decision_id,
+            rocky_core::config::PolicyPrincipal::Agent,
+            &touched,
+            &self.models_dir,
+            &state_path,
+        );
+
+        match gate {
+            rocky_cli::commands::PolicyGate::NotConfigured
+            | rocky_cli::commands::PolicyGate::Allow => Ok(Json(DraftModelResult {
+                model: paths.stem.clone(),
+                sql_path: rel_display(&self.root, &paths.sql_path),
+                sidecar_path: rel_display(&self.root, &paths.sidecar_path),
+                has_errors: compiled.has_errors,
+                error_count: compiled.error_count,
+                warning_count: compiled.warning_count,
+                diagnostics: compiled.diagnostics,
+                next_steps: DRAFT_NEXT_STEPS.to_string(),
+            })),
+            rocky_cli::commands::PolicyGate::RequireReview {
+                model,
+                rule_id,
+                reason,
+            } => {
+                // Mirrors the propose gate's require_review: the draft is the
+                // reviewable artifact, so it PERSISTS; the structured signal
+                // routes the agent to human review before it takes the change
+                // further in this governed scope.
+                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                Err(ToolError::policy_review_required(
+                    format!(
+                        "policy requires human review before authoring in this scope: model \
+                         '{model}'{named} — {reason}. The draft was written to {} for a human to \
+                         review.",
+                        rel_display(&self.root, &paths.sql_path)
+                    ),
+                    "A human must review this draft before it goes further; do not plan, propose, \
+                     or apply it in this governed scope on your own."
+                        .to_string(),
+                    rule_id.map(|r| r.to_string()),
+                ))
+            }
+            rocky_cli::commands::PolicyGate::Deny {
+                model,
+                rule_id,
+                reason,
+            } => {
+                // A deny cannot be satisfied by review — roll the draft back so
+                // NO artifact lingers on disk (the decision is already in the
+                // ledger), consistent with the propose gate's deny semantics.
+                rollback();
+                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                Err(ToolError::policy_denied(
+                    format!(
+                        "policy denies authoring this model: '{model}'{named} — {reason}. A deny \
+                         cannot be satisfied by human review, so the draft was not kept."
+                    ),
+                    "Re-scope the draft — author it under a different, ungoverned name, or drop \
+                     it. A denied authorship cannot be applied even after review."
+                        .to_string(),
+                    rule_id.map(|r| r.to_string()),
+                ))
+            }
+        }
+    }
+
     #[tool(
         description = "Propose materializing the model(s) as an AI-AUTHORED plan. This does NOT \
          execute anything. It records a plan that a human must review and approve \
@@ -2610,6 +2867,99 @@ fn build_ai_run_plan(model: Option<String>, result: &CompilerResult) -> rocky_cl
     }
 }
 
+/// The authoring-loop reminder every successful `draft_model` response carries.
+/// A draft is written and compiled, never applied — this restates the flow so
+/// the agent never mistakes a written draft for a materialized change.
+const DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched the \
+     warehouse. Continue the authoring loop: fix any error diagnostics above and re-draft (or \
+     `compile`) until it is clean, `plan_preview` to read the SQL Rocky would run, then `propose` \
+     to record an AI-authored plan for a human to `rocky review <plan_id> --approve` and \
+     `rocky apply`. Never apply a draft directly.";
+
+/// The validated on-disk targets a draft writes to.
+struct DraftPaths {
+    /// The model name (bare file stem).
+    stem: String,
+    /// Absolute path of `models/<stem>.sql`.
+    sql_path: PathBuf,
+    /// Absolute path of `models/<stem>.toml`.
+    sidecar_path: PathBuf,
+}
+
+/// Restore `path` to its snapshotted `prior` bytes, or remove it when it had no
+/// prior content. The rollback primitive for a policy-denied (or failed) draft:
+/// a freshly written draft is removed entirely; a re-draft over an existing
+/// model is restored to the model's prior content, so a deny never corrupts nor
+/// leaves a new artifact.
+fn restore_or_remove(path: &Path, prior: Option<&[u8]>) {
+    match prior {
+        Some(bytes) => {
+            let _ = std::fs::write(path, bytes);
+        }
+        None => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Ensure the drafted SQL ends in exactly one trailing newline (POSIX text
+/// file), without disturbing a body that already does.
+fn ensure_trailing_newline(sql: &str) -> String {
+    let trimmed = sql.trim_end_matches('\n');
+    format!("{trimmed}\n")
+}
+
+/// Build the draft sidecar TOML: `name` (matching the file stem so the L001
+/// name lint stays quiet) plus the `intent`, both TOML-escaped. Target and
+/// strategy are intentionally omitted — they resolve from the project's
+/// conventions, keeping the draft tool from inventing routing the agent never
+/// asked for.
+fn draft_sidecar(stem: &str, intent: &str) -> String {
+    let header = "# Draft authored via the Rocky MCP `draft_model` tool. Target and strategy \
+                  resolve\n# from the project's conventions (rocky.toml pipeline + \
+                  _defaults.toml).\n";
+    if intent.is_empty() {
+        format!("{header}name = {}\n", toml_basic_string(stem))
+    } else {
+        format!(
+            "{header}name = {}\nintent = {}\n",
+            toml_basic_string(stem),
+            toml_basic_string(intent)
+        )
+    }
+}
+
+/// Render `s` as a TOML basic string (double-quoted, with the escapes TOML
+/// requires) so an arbitrary intent embeds safely in the sidecar.
+fn toml_basic_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Display `path` relative to the project `root` with forward slashes, falling
+/// back to the absolute path when it is not under the root.
+fn rel_display(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2708,6 +3058,60 @@ mod tests {
         let server = RockyMcpServer::new(PathBuf::from("/tmp/proj/rocky.toml"));
         assert_eq!(server.models_dir, PathBuf::from("/tmp/proj/models"));
         assert_eq!(server.root, PathBuf::from("/tmp/proj"));
+    }
+
+    #[test]
+    fn resolve_draft_paths_accepts_a_bare_name_and_refuses_traversal() {
+        let server = RockyMcpServer::new(PathBuf::from("/tmp/proj/rocky.toml"));
+        let Ok(ok) = server.resolve_draft_paths("completed_revenue") else {
+            panic!("a bare name should resolve");
+        };
+        assert_eq!(ok.stem, "completed_revenue");
+        assert_eq!(
+            ok.sql_path,
+            PathBuf::from("/tmp/proj/models/completed_revenue.sql")
+        );
+        assert_eq!(
+            ok.sidecar_path,
+            PathBuf::from("/tmp/proj/models/completed_revenue.toml")
+        );
+        for bad in [
+            "../evil",
+            "/etc/passwd",
+            "sub/model",
+            "..\\win",
+            "revenue.sql",
+            "..",
+            "",
+        ] {
+            assert!(
+                server.resolve_draft_paths(bad).is_err(),
+                "name '{bad}' must be refused as a path-escape / non-bare name"
+            );
+        }
+    }
+
+    #[test]
+    fn draft_sidecar_toml_escapes_the_intent() {
+        let sidecar = draft_sidecar("orders", "revenue for \"COMPLETE\" orders\nline two");
+        assert!(sidecar.contains("name = \"orders\""));
+        // Quotes and newlines in the intent are TOML-escaped so an arbitrary
+        // intent embeds as a valid TOML basic string.
+        assert!(sidecar.contains("intent = \"revenue for \\\"COMPLETE\\\" orders\\nline two\""));
+        // An empty intent omits the key entirely (still a valid sidecar).
+        let empty = draft_sidecar("orders", "");
+        assert!(empty.contains("name = \"orders\""));
+        assert!(
+            !empty.contains("intent ="),
+            "empty intent omits the intent key"
+        );
+    }
+
+    #[test]
+    fn ensure_trailing_newline_normalizes() {
+        assert_eq!(ensure_trailing_newline("SELECT 1"), "SELECT 1\n");
+        assert_eq!(ensure_trailing_newline("SELECT 1\n"), "SELECT 1\n");
+        assert_eq!(ensure_trailing_newline("SELECT 1\n\n"), "SELECT 1\n");
     }
 
     #[test]

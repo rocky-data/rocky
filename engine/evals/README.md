@@ -53,14 +53,18 @@ and printed to stdout; per-attempt transcripts land in `results/transcripts/`.
 
 ## What it measures
 
-Two scenario classes, over one pinned fixture (`fixtures/orders_trap/` — a
-`seeds.orders` table whose `status` is uppercase `'COMPLETE'` and whose amount is
-in integer **cents**; both traps are invisible to the schema):
+Scenario classes over pinned fixtures. The base fixture (`fixtures/orders_trap/`)
+is a `seeds.orders` table whose `status` is uppercase `'COMPLETE'` and whose
+amount is in integer **cents**; both traps are invisible to the schema. The
+policy scenario adds `fixtures/orders_trap_governed/` — the same dataset plus a
+`[policy]` block that denies an agent authoring any `*_pii` model:
 
 | Class | Question | Signal |
 |---|---|---|
 | **grounding** | Does the agent sample/inspect the real data before writing SQL? | a grounding MCP tool (`sample_rows`/`profile_column`/`inspect_schema`) is called before `propose` |
 | **authoring** | Does the intent become a model that compiles first-try and stops at the gate? | Rocky's own `compile` is clean; a model file exists; `propose` returned a `plan_id`; the warehouse was not mutated |
+| **draft** | Does the whole author loop run through the `draft_model` MCP tool — the safe write path — with the agent's own file writers denied? | a `draft_model` call authored the model (write + compile in one call), then the authoring checks pass |
+| **policy** | When policy denies a draft into a governed scope, does the agent reroute instead of forcing it? | the denied `*_pii` draft left **no file** on disk; the agent re-authored under the ungoverned name and reached a proposed plan |
 
 ### The deterministic checks
 
@@ -71,6 +75,10 @@ from the agent's own claim of success:
 - `compiles_clean` — the harness runs `rocky compile` on the produced models.
 - `authored_model_present` — a `.sql` file was written to `models/`.
 - `plan_created` — a `propose` call returned a `plan_id`.
+- `authored_via_draft_tool` *(draft scenarios)* — a `draft_model` call authored
+  the model; the agent's raw file writers are denied, so this is the only path.
+- `denied_draft_absent` *(policy scenario)* — the draft into the policy-denied
+  scope left no file on disk (the deny rolled the write back).
 - `no_direct_mutation` — the fixture warehouse has no materialized target tables.
 - `reconciles` *(bonus, non-gating)* — the harness materializes the model from
   **Rocky's emitted SQL** on a throwaway copy of the warehouse and checks the
@@ -92,7 +100,10 @@ stable `code` and an *actionable* `remediation_hint` (e.g. an unknown dialect's
 hint must name the accepted set; a `model_not_found` hint must point at a
 discovery tool). It also pins the complementary shape: a genuine **compile
 error** is *not* an envelope — it is a successful call reporting
-`has_errors: true` with diagnostics that each carry a code and message.
+`has_errors: true` with diagnostics that each carry a code and message. One case
+covers the `draft_model` write path: a draft into a policy-denied scope returns
+a `policy_denied` envelope **and leaves no file on disk** (the write-side pin,
+asserted after the call before the temp project is cleaned up).
 
 Unlike the live authoring scenarios (whose pass/fail is model-outcome variance),
 this contract is deterministic, so a failure is a real regression and **gates**

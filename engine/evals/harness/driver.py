@@ -54,6 +54,7 @@ class Driver(Protocol):
         system_prompt: str,
         model: str,
         timeout_s: int,
+        disallowed_extra: tuple[str, ...] = (),
     ) -> AgentRun: ...
 
 
@@ -95,6 +96,7 @@ class ClaudeCliDriver:
         system_prompt: str,
         model: str,
         timeout_s: int,
+        disallowed_extra: tuple[str, ...] = (),
     ) -> AgentRun:
         mcp_config = self._write_mcp_config(project_dir)
         config_dir = Path(tempfile.mkdtemp(prefix="rocky-eval-cfg-"))
@@ -111,6 +113,7 @@ class ClaudeCliDriver:
             str(mcp_config),
             "--disallowedTools",
             *_DISALLOWED_TOOLS,
+            *disallowed_extra,
             "--permission-mode",
             "bypassPermissions",
             "--output-format",

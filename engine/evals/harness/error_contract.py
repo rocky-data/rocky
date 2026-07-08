@@ -203,6 +203,37 @@ def _write_parse_error_project(project: Path) -> None:
     (project / "models" / "bad.toml").write_text(_model_sidecar("bad"))
 
 
+#: A `[policy]` block that denies an agent authoring (`propose`-class) into any
+#: scope — the deterministic lever for the `draft_model` policy-deny path.
+_DENY_PROPOSE_POLICY = """
+[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "deny"
+"""
+
+
+def _write_policy_denied_draft_project(project: Path) -> None:
+    """A project whose policy denies agent authorship, so `draft_model` must
+    return a structured ``policy_denied`` envelope AND leave no draft on disk.
+
+    A `_defaults.toml` supplies the target so the draft would otherwise compile —
+    the deny, not a compile failure, is what stops it. This pins the deny
+    ordering (write → compile → policy → rollback) end-to-end through the real
+    binary, creds-free.
+    """
+    (project / "models").mkdir(parents=True, exist_ok=True)
+    (project / "rocky.toml").write_text(_MINIMAL_CONFIG + _DENY_PROPOSE_POLICY)
+    (project / "models" / "_defaults.toml").write_text(
+        '[target]\ncatalog = "poc"\nschema = "demo"\n'
+    )
+
+
 # --------------------------------------------------------------------------
 # cases
 # --------------------------------------------------------------------------
@@ -222,6 +253,9 @@ class EnvelopeCase:
     hint_contains_all: tuple[str, ...] = ()
     #: Substrings the remediation_hint must contain at least one of.
     hint_contains_any: tuple[str, ...] = ()
+    #: Project-relative paths that must NOT exist after the call — the write-side
+    #: assertion (a policy-denied draft leaves no artifact on disk).
+    absent_after: tuple[str, ...] = ()
 
 
 ENVELOPE_CASES: tuple[EnvelopeCase, ...] = (
@@ -267,6 +301,21 @@ ENVELOPE_CASES: tuple[EnvelopeCase, ...] = (
         expected_code="compile_failed",
         hint_contains_all=("compile",),
     ),
+    EnvelopeCase(
+        id="policy_denied__draft_into_denied_scope",
+        setup=_write_policy_denied_draft_project,
+        tool="draft_model",
+        arguments={
+            "name": "revenue_draft",
+            "sql": "SELECT 1 AS id",
+            "intent": "a draft the policy denies",
+        },
+        expected_code="policy_denied",
+        # The hint must route the agent to a reroute, not a retry.
+        hint_contains_any=("Re-scope", "different"),
+        # THE PIN: the denied draft is rolled back — no file left on disk.
+        absent_after=("models/revenue_draft.sql", "models/revenue_draft.toml"),
+    ),
 )
 
 
@@ -292,6 +341,14 @@ def _check_envelope_case(rocky_bin: Path, case: EnvelopeCase) -> CaseResult:
             result = _mcp_call_tool(rocky_bin, project, case.tool, case.arguments)
         except RuntimeError as exc:
             return CaseResult(case.id, False, str(exc))
+
+        # Write-side assertion, checked before the temp project is cleaned up: a
+        # policy-denied draft must leave no artifact on disk.
+        leaked = [rel for rel in case.absent_after if (project / rel).exists()]
+        if leaked:
+            return CaseResult(
+                case.id, False, f"paths that must not exist were left behind: {leaked}"
+            )
 
     if result.get("isError") is not True:
         return CaseResult(case.id, False, f"expected isError=true, got {result.get('isError')!r}")
