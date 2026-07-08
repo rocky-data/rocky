@@ -6137,6 +6137,70 @@ pub struct ReviewOutput {
     pub message: Option<String>,
 }
 
+/// JSON output for `rocky review --queue` — the pending-review work queue.
+///
+/// Lists every `require_review` policy decision that has not yet been
+/// satisfied by a sign-off marker, ranked so the change most in need of a
+/// human floats to the top. The rank blends three signals: how much sits
+/// downstream of the model (blast radius), how disruptive the change class is
+/// (a breaking schema change outranks an additive one), and how long the
+/// escalation has waited (staleness). Each entry carries the exact
+/// `rocky review <plan_id> --approve` invocation that clears it — the queue
+/// is a triage view; the approval path is unchanged.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReviewQueueOutput {
+    pub version: String,
+    pub command: String,
+    /// Human-readable description of the ordering, e.g.
+    /// `"blast_radius × classification × staleness"`.
+    pub ranking: String,
+    /// Count of pending escalations in the queue.
+    pub total: u64,
+    /// The pending escalations, highest-priority first.
+    pub pending: Vec<ReviewQueueEntry>,
+}
+
+/// One pending `require_review` escalation inside [`ReviewQueueOutput`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReviewQueueEntry {
+    /// The plan whose approval clears this escalation.
+    pub plan_id: String,
+    /// Composite ledger key (`"{timestamp}|{plan_id}|{model}"`) — the stable
+    /// identity a governor drills into via `rocky audit --for`.
+    pub decision_ref: String,
+    /// RFC 3339 timestamp when the decision was recorded.
+    pub timestamp: String,
+    /// Who authored the change (`human` / `agent`).
+    pub principal: rocky_core::config::PolicyPrincipal,
+    /// The capability that was evaluated (its `schema_change.*` refinement is
+    /// the change class the ranking weighs).
+    pub capability: rocky_core::config::PolicyCapability,
+    /// The model the escalation is about.
+    pub model: String,
+    /// Index of the winning `[[policy.rules]]` entry, or `null` when the
+    /// escalation came from the default posture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<usize>,
+    /// Human-readable explanation of how `require_review` was reached.
+    pub reason: String,
+    /// Count of models that transitively consume this one — the blast radius
+    /// the ranking weighs. `null` when the model could not be located in the
+    /// compiled graph (e.g. it was removed), in which case the ranking treats
+    /// the blast radius as zero and this entry says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blast_radius: Option<u64>,
+    /// The change-class weight the ranking used (breaking > bare verb >
+    /// additive / value-only).
+    pub classification_weight: u32,
+    /// How long the escalation has waited, in whole seconds.
+    pub staleness_seconds: i64,
+    /// The composite priority score. Higher sorts first. Reported so a
+    /// consumer can re-rank or explain the ordering without recomputing it.
+    pub score: f64,
+    /// The exact command that clears this escalation.
+    pub approve_command: String,
+}
+
 /// JSON output for `rocky policy check`.
 ///
 /// Explain-mode only: reports the effect the agent policy plane *would*
@@ -6217,6 +6281,173 @@ pub struct AuditDecisionEntry {
     pub rule_id: Option<usize>,
     /// Human-readable explanation of how the effect was reached.
     pub reason: String,
+}
+
+// ---------------------------------------------------------------------------
+// `rocky audit --for` — the custody chain drill-down
+// ---------------------------------------------------------------------------
+
+/// What `rocky audit --for <selector>` resolved its selector to.
+///
+/// The selector is resolved in priority order: a 64-char hex string with a
+/// plan file on disk is a [`AuditSubjectKind::Plan`]; a string matching a
+/// `run_id` in the run ledger is a [`AuditSubjectKind::Run`]; anything else is
+/// treated as a [`AuditSubjectKind::Model`] name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditSubjectKind {
+    /// A model / table name — the primary custody-chain entry point.
+    Model,
+    /// A `run_id` from the run ledger.
+    Run,
+    /// A `plan_id` (64-char blake3 hex) with a plan file on disk.
+    Plan,
+}
+
+/// JSON output for `rocky audit --for <table|run|plan>` — the custody chain.
+///
+/// A one-query drill-down assembled link by link from the data Rocky already
+/// records: who proposed the change and what the policy plane decided
+/// ([`Self::decisions`]), what the plan changed ([`Self::plan`]), which runs
+/// materialized it ([`Self::runs`]), what a post-apply verification found
+/// ([`Self::verify_after`]), and what sits downstream in its blast radius
+/// ([`Self::blast_radius`]).
+///
+/// Every link fails closed the same way the estate brief does: a link whose
+/// signal is genuinely not recorded renders [`SectionAvailability::Unavailable`]
+/// with a note, never a fabricated or assumed value. Notably, post-apply
+/// verification outcomes are not persisted anywhere today, so
+/// [`Self::verify_after`] is always `unavailable`; and the run ledger is not
+/// keyed to policy decisions, so a `run` selector cannot join back to a
+/// decision. The blast radius is recomputed from the current compiled graph
+/// (a live query, not a stored snapshot).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuditForOutput {
+    pub version: String,
+    pub command: String,
+    /// The selector as supplied on the command line.
+    pub subject: String,
+    /// What the selector resolved to.
+    pub subject_kind: AuditSubjectKind,
+    /// Whether the selector matched anything at all (a decision, a run, a plan
+    /// file, or a model in the graph). `false` when nothing referenced it —
+    /// every link is then empty and says why.
+    pub resolved: bool,
+    /// Who proposed the change and what the policy plane decided — the
+    /// persisted decision ledger, scoped to this subject.
+    pub decisions: AuditChainDecisions,
+    /// What the governing plan changed (its embedded per-model change
+    /// classification).
+    pub plan: AuditChainPlan,
+    /// Runs that materialized the subject.
+    pub runs: AuditChainRuns,
+    /// What a post-apply verification found — not recorded today.
+    pub verify_after: AuditChainVerify,
+    /// What sits downstream of the subject — the CLL blast radius.
+    pub blast_radius: AuditChainBlastRadius,
+}
+
+/// Decision link of the custody chain: the policy-decision ledger scoped to
+/// the subject (by model for a model selector, by plan_id for a plan
+/// selector).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuditChainDecisions {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub total: u64,
+    /// The matching decisions, newest first.
+    pub entries: Vec<AuditDecisionEntry>,
+}
+
+/// Plan link of the custody chain: what the governing plan changed, read from
+/// the plan file's embedded change-classification.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuditChainPlan {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The plan that governed the subject (the newest one, for a model
+    /// selector). `null` when no plan file could be located.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// The plan's authoring principal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<rocky_core::config::PolicyPrincipal>,
+    /// The plan kind (`run` / `ai_authored` / …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Whether the base↔head change classification was available when the
+    /// plan was authored. `false` means every planned model was treated as a
+    /// breaking change (fail-closed), and `changes` reflects that.
+    pub diff_available: bool,
+    /// The per-model change classification the plan carried — the persisted
+    /// stand-in for the typed diff. The full field-level `diff_project_ir`
+    /// output is not persisted for run plans, only this classification is.
+    pub changes: Vec<AuditPlanChange>,
+}
+
+/// One model's change classification inside [`AuditChainPlan`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuditPlanChange {
+    pub model: String,
+    /// The change class the plan recorded for this model
+    /// (`schema_change.additive` / `schema_change.breaking` / `value_change`
+    /// / a bare verb).
+    pub capability: rocky_core::config::PolicyCapability,
+}
+
+/// Run link of the custody chain: runs that materialized the subject.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuditChainRuns {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub total: u64,
+    /// Matching runs, newest first.
+    pub runs: Vec<AuditRunEntry>,
+}
+
+/// One run inside [`AuditChainRuns`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuditRunEntry {
+    pub run_id: String,
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: String,
+    /// Best-effort caller identity recorded on the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggering_identity: Option<String>,
+}
+
+/// Verify-after link of the custody chain.
+///
+/// Post-apply verification outcomes are not persisted to the state store
+/// today, so this link is always [`SectionAvailability::Unavailable`] with a
+/// note — never a smoothed-over "verification passed".
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuditChainVerify {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Blast-radius link of the custody chain: the models that transitively
+/// consume the subject, recomputed from the current compiled graph.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuditChainBlastRadius {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The model the blast radius was computed for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Direct downstream consumers (one hop).
+    pub direct: Vec<String>,
+    /// All transitive downstream consumers (the full closure, sorted).
+    pub transitive: Vec<String>,
+    /// Size of the transitive closure.
+    pub total: u64,
 }
 
 // ---------------------------------------------------------------------------
