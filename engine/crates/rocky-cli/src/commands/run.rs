@@ -5053,7 +5053,49 @@ pub(crate) async fn execute_models(
         containment.seed_failed(compile_failed_models.iter().cloned());
     }
 
-    for layer in &compile_result.project.layers {
+    // When containment is on, execution follows layers recomputed over the FULL
+    // containment edge set (ref ∪ physical ∪ bare), so a physical/bare reader is
+    // scheduled strictly after its producer — closing the same-layer `--parallel`
+    // race where a reader and its (about-to-fail) producer co-scheduled and the
+    // reader built on stale output. When off, the original ref-only layers are
+    // used, byte-for-byte. Any model stuck in an augmented-graph cycle is
+    // contained up front (fail closed) and recorded as a single run error so the
+    // run reports non-success.
+    let augmented_plan = resilience
+        .contain_failures
+        .then(|| containment.augmented_layers());
+    if let Some(plan) = &augmented_plan
+        && !plan.cyclic.is_empty()
+    {
+        for model in &plan.cyclic {
+            containment.poison(model);
+            output.contained.push(crate::output::ContainedModelOutput {
+                model: model.clone(),
+                blocked_by: Vec::new(),
+                unblock_hint: "a physical/bare-name read forms a dependency cycle; \
+                                   declare dependencies via ref() and break the cycle"
+                    .to_string(),
+            });
+        }
+        output.tables_failed += 1;
+        output.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec!["<cycle>".to_string()],
+            error: format!(
+                "dependency cycle in the containment graph (physical/bare-name reads) — \
+                 withheld {} model(s): {}. Declare dependencies via ref() and remove the cycle.",
+                plan.cyclic.len(),
+                plan.cyclic.join(", "),
+            ),
+            failure_kind: crate::output::FailureKind::Unknown,
+            cooldown_seconds: None,
+        });
+    }
+    let execution_layers: &[Vec<String>] = match &augmented_plan {
+        Some(plan) => &plan.layers,
+        None => &compile_result.project.layers,
+    };
+
+    for layer in execution_layers {
         // Collect this layer's matched models (honouring the name filter),
         // tagged with their stable within-layer index so concurrent results
         // can be re-ordered to match serial output exactly.
@@ -10756,6 +10798,52 @@ merge_keys = ["id"]
         (output, result)
     }
 
+    /// Drive `execute_models` with containment on, a **concurrency-capable**
+    /// DuckDB adapter, and `--parallel N` — for exercising the intra-layer
+    /// concurrent path under containment.
+    async fn run_models_with_containment_parallel(
+        models_dir: &std::path::Path,
+        db_path: &std::path::Path,
+        parallel: u32,
+    ) -> (RunOutput, Result<()>) {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::open(db_path)
+            .expect("open duckdb")
+            .with_concurrent_for_test(true);
+        let opts = PartitionRunOptions {
+            parallel,
+            ..Default::default()
+        };
+        let mut output = RunOutput::new(String::new(), 0, parallel.max(1) as usize);
+        let resilience = rocky_core::config::ResilienceConfig {
+            contain_failures: true,
+            ..Default::default()
+        };
+        let result = super::execute_models(
+            models_dir,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &opts,
+            "test-run",
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            resilience,
+            true,
+        )
+        .await;
+        (output, result)
+    }
+
     /// Write the diamond/disjoint DAG the containment tests share:
     ///
     /// - `good_a` (layer 0) builds; `dep_of_good` (layer 1) reads it → builds.
@@ -11305,6 +11393,148 @@ merge_keys = ["id"]
         assert!(
             !table_exists(&verify, "rollup").await,
             "the contained downstream must not exist"
+        );
+    }
+
+    /// The `--parallel` same-layer race (headline): a physical reader with NO
+    /// `ref()` edge to its producer co-schedules with the producer in the same
+    /// ref-only layer, so under `--parallel 2` it builds on stale data while the
+    /// producer is still running, THEN the producer fails. Augmented re-layering
+    /// schedules the reader strictly after the producer, so it is contained.
+    /// Fails on the pre-re-layering HEAD; passes now.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn containment_contains_same_layer_physical_read_under_parallel() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("parrace.duckdb");
+
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db).expect("seed open");
+            seed.execute_statement("CREATE TABLE main.orders_current AS SELECT 999 AS id")
+                .await
+                .unwrap();
+        }
+        // `stage_orders` + `rollup` have NO ref deps ⇒ same ref-only layer 0.
+        // `disjoint` is a healthy unrelated model (so the run is a PartialFailure,
+        // and to show disjoint work still lands under the race).
+        write_model_with_target(
+            &models_dir,
+            "stage_orders",
+            "SELECT * FROM main.missing_source",
+            "main",
+            "orders_current",
+        );
+        write_model_with_target(
+            &models_dir,
+            "rollup",
+            "SELECT COUNT(*) AS n FROM main.orders_current",
+            "main",
+            "rollup",
+        );
+        write_model_with_target(&models_dir, "disjoint", "SELECT 7 AS x", "main", "disjoint");
+
+        let (out, result) = run_models_with_containment_parallel(&models_dir, &db, 2).await;
+        result.expect("containment returns Ok — the failure is recorded, not thrown");
+
+        let built: std::collections::BTreeSet<String> = out
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert!(
+            built.contains("disjoint"),
+            "the disjoint model still builds: {built:?}"
+        );
+        assert!(
+            !built.contains("rollup"),
+            "rollup must be contained under the same-layer --parallel race, not built on stale data"
+        );
+        let contained: Vec<&str> = out.contained.iter().map(|c| c.model.as_str()).collect();
+        assert!(
+            contained.contains(&"rollup"),
+            "rollup must be contained (augmented re-layering ordered it after the producer): {contained:?}"
+        );
+        assert!(matches!(
+            out.derive_run_status(),
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+        let verify = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+        assert!(
+            !table_exists(&verify, "rollup").await,
+            "the contained reader must not exist"
+        );
+    }
+
+    /// Earlier-layer residual (now closed): a physical reader placed in an
+    /// EARLIER ref-layer than its physically-read producer (via an unrelated
+    /// healthy dep chain) would build before the producer even runs. Augmented
+    /// re-layering orders it strictly after the producer, so the producer's
+    /// failure contains it. Fails on the pre-re-layering HEAD; passes now.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_reorders_earlier_layer_physical_reader() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("earlier.duckdb");
+
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db).expect("seed open");
+            seed.execute_statement("CREATE TABLE main.orders_current AS SELECT 999 AS id")
+                .await
+                .unwrap();
+        }
+        // Push the producer into ref-layer 2 via a healthy chain up0 → up1.
+        write_plain_model(&models_dir, "anchor", "SELECT 1 AS v");
+        write_plain_model(&models_dir, "up0", "SELECT 1 AS v");
+        write_plain_model(&models_dir, "up1", "SELECT v FROM up0");
+        write_model_with_target(
+            &models_dir,
+            "stage_orders",
+            "SELECT v FROM up1 CROSS JOIN main.missing_source",
+            "main",
+            "orders_current",
+        );
+        // `reader` sits in ref-layer 1 (via `anchor`), EARLIER than the
+        // producer's ref-layer 2; it physically reads the producer's target.
+        write_model_with_target(
+            &models_dir,
+            "reader",
+            "SELECT a.v FROM anchor a CROSS JOIN main.orders_current o",
+            "main",
+            "reader",
+        );
+
+        let (out, result) = run_models_with_containment(&models_dir, &db).await;
+        result.expect("containment returns Ok");
+
+        let built: std::collections::BTreeSet<String> = out
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert!(built.contains("anchor") && built.contains("up0") && built.contains("up1"));
+        assert!(
+            !built.contains("reader"),
+            "an earlier-ref-layer physical reader must be re-ordered after its producer and contained"
+        );
+        let contained: Vec<&str> = out.contained.iter().map(|c| c.model.as_str()).collect();
+        assert!(
+            contained.contains(&"reader"),
+            "reader must be contained: {contained:?}"
+        );
+        let verify = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+        assert!(
+            !table_exists(&verify, "reader").await,
+            "the contained reader must not exist"
         );
     }
 

@@ -268,6 +268,18 @@ pub(crate) struct ContainmentDecision {
     pub fail_closed: bool,
 }
 
+/// Execution layers over the augmented containment graph, plus any models that
+/// couldn't be ordered because a physical/bare edge formed a cycle.
+pub(crate) struct LayerPlan {
+    /// Topological execution layers (longest-path) over ref ∪ physical ∪ bare
+    /// edges. A reader is strictly later than every producer it reads.
+    pub layers: Vec<Vec<String>>,
+    /// Models in — or downstream of — an augmented-graph cycle. They can't be
+    /// safely ordered, so the caller contains them (fail closed). Empty in the
+    /// common acyclic case.
+    pub cyclic: Vec<String>,
+}
+
 impl ContainmentLedger {
     pub(crate) fn new() -> Self {
         Self {
@@ -380,6 +392,81 @@ impl ContainmentLedger {
             });
         }
         None
+    }
+
+    /// Compute execution layers over the **full containment edge set** (ref()
+    /// deps ∪ resolved physical/bare-read producer edges), so a reader is
+    /// scheduled strictly after every producer it reads by any edge kind — the
+    /// ordering guarantee that closes the same-layer `--parallel` race.
+    ///
+    /// Longest-path layering ([`rocky_ir::dag::execution_layers`]) places a node
+    /// one layer after its deepest dependency, so no two models in the same
+    /// layer share a containment edge; combined with the executor's per-layer
+    /// barrier, every prior failure is poisoned before the next layer is
+    /// evaluated.
+    ///
+    /// **Cycle → fail closed.** A physical/bare edge can introduce a dependency
+    /// cycle the ref-graph lacked. Rather than let the topological sort silently
+    /// drop the cyclic nodes, they are returned in [`LayerPlan::cyclic`] (the
+    /// stuck set — the cycle plus everything downstream of it) for the caller to
+    /// *contain*, and only the acyclic remainder is layered.
+    pub(crate) fn augmented_layers(&self) -> LayerPlan {
+        use rocky_ir::dag::{self, DagError, DagNode};
+
+        // Augmented graph: each model's dependencies are its full containment
+        // upstream set, restricted to known models.
+        let node = |name: &str, ups: &[String]| DagNode {
+            name: name.to_string(),
+            depends_on: ups
+                .iter()
+                .filter(|u| self.known.contains(*u))
+                .cloned()
+                .collect(),
+        };
+        let nodes: Vec<DagNode> = self
+            .known
+            .iter()
+            .map(|m| node(m, self.upstreams.get(m).map(Vec::as_slice).unwrap_or(&[])))
+            .collect();
+
+        match dag::execution_layers(&nodes) {
+            Ok(layers) => LayerPlan {
+                layers,
+                cyclic: Vec::new(),
+            },
+            // The stuck set (cycle + downstream) can't be ordered — fail closed:
+            // contain it, and layer only the acyclic remainder.
+            Err(DagError::CyclicDependency { nodes: stuck }) => {
+                let stuck_set: HashSet<&str> = stuck.iter().map(String::as_str).collect();
+                let acyclic: Vec<DagNode> = nodes
+                    .iter()
+                    .filter(|n| !stuck_set.contains(n.name.as_str()))
+                    .map(|n| DagNode {
+                        name: n.name.clone(),
+                        depends_on: n
+                            .depends_on
+                            .iter()
+                            .filter(|d| !stuck_set.contains(d.as_str()))
+                            .cloned()
+                            .collect(),
+                    })
+                    .collect();
+                let layers = dag::execution_layers(&acyclic).unwrap_or_default();
+                let mut cyclic = stuck;
+                cyclic.sort();
+                LayerPlan { layers, cyclic }
+            }
+            // `UnknownDependency` cannot arise (deps are filtered to known
+            // models), but fail closed if it somehow does: contain everything.
+            Err(_) => {
+                let mut cyclic: Vec<String> = self.known.iter().cloned().collect();
+                cyclic.sort();
+                LayerPlan {
+                    layers: Vec::new(),
+                    cyclic,
+                }
+            }
+        }
     }
 }
 
@@ -737,5 +824,94 @@ mod tests {
         assert!(unblock_hint(&["a".to_string()], false).contains("resolve upstream 'a'"));
         assert!(unblock_hint(&["a".to_string(), "b".to_string()], true).contains("cannot prove"));
         assert!(!unblock_hint(&[], true).is_empty());
+    }
+
+    fn layer_of(plan: &LayerPlan, model: &str) -> Option<usize> {
+        plan.layers
+            .iter()
+            .position(|l| l.iter().any(|m| m == model))
+    }
+
+    /// Augmented layering orders a physical/bare reader strictly after its
+    /// producer, even with NO `ref()` edge between them — the ordering fix for
+    /// the same-layer `--parallel` race.
+    #[test]
+    fn augmented_layers_order_physical_reader_after_producer() {
+        // `rollup` has no ref dep on `stage`; it only physically reads its
+        // target `main.orders_current`. Ref-only layering would co-schedule
+        // them; augmented layering must not.
+        let led = ledger(
+            &[
+                ("stage", &[], &[], true),
+                ("rollup", &[], &["main.orders_current"], true),
+            ],
+            &[
+                ("stage", "", "main", "orders_current"),
+                ("rollup", "", "main", "rollup"),
+            ],
+        );
+        let plan = led.augmented_layers();
+        assert!(plan.cyclic.is_empty());
+        let (ls, lr) = (
+            layer_of(&plan, "stage").unwrap(),
+            layer_of(&plan, "rollup").unwrap(),
+        );
+        assert!(
+            lr > ls,
+            "reader (layer {lr}) must be strictly after producer (layer {ls})"
+        );
+    }
+
+    /// Invariant: no two models in the same augmented layer share a containment
+    /// edge (longest-path layering guarantees this; the executor relies on it so
+    /// prior-layer poison is fully known before a layer dispatches).
+    #[test]
+    fn augmented_layers_no_same_layer_shared_edge() {
+        let led = ledger(
+            &[
+                ("a", &[], &[], true),
+                ("b", &["a"], &["a"], true),               // ref edge a→b
+                ("c", &[], &["main.a_out"], true),         // physical edge a→c
+                ("d", &["b"], &["b", "main.c_out"], true), // ref b→d, physical c→d
+            ],
+            &[("a", "", "main", "a_out"), ("c", "", "main", "c_out")],
+        );
+        let plan = led.augmented_layers();
+        assert!(plan.cyclic.is_empty());
+        // For every layer, no pair shares an edge (neither is the other's
+        // upstream over the augmented graph).
+        for layer in &plan.layers {
+            for i in 0..layer.len() {
+                for j in (i + 1)..layer.len() {
+                    let (x, y) = (&layer[i], &layer[j]);
+                    let x_ups = led.upstreams.get(x).cloned().unwrap_or_default();
+                    let y_ups = led.upstreams.get(y).cloned().unwrap_or_default();
+                    assert!(
+                        !x_ups.contains(y) && !y_ups.contains(x),
+                        "same-layer pair {x:?},{y:?} shares a containment edge"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A physical/bare edge that forms a cycle the ref-graph lacked → fail
+    /// closed: the stuck set is surfaced in `cyclic` (for the caller to
+    /// contain), not silently dropped or mis-ordered.
+    #[test]
+    fn augmented_layers_cycle_is_contained() {
+        // A refs B (edge B→A); B physically reads A's target `main.a` (edge
+        // A→B) ⇒ cycle A↔B.
+        let led = ledger(
+            &[("A", &["B"], &["b"], true), ("B", &[], &["main.a"], true)],
+            &[("A", "", "main", "a"), ("B", "", "main", "b")],
+        );
+        let plan = led.augmented_layers();
+        assert_eq!(plan.cyclic, vec!["A".to_string(), "B".to_string()]);
+        assert!(
+            plan.layers
+                .iter()
+                .all(|l| l.is_empty() || !l.contains(&"A".to_string()))
+        );
     }
 }
