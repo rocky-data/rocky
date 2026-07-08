@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.55.0] — 2026-07-08
+
+### Changed
+
+- **Floors on `rocky-sdk>=0.2.0`** to pick up the generated types for the engine-v1.57.0 output surface (replay, recipe history, agent policy, `brief`, and the `rocky serve` job/meta/error types), re-exported through `dagster_rocky.types`. (#1033–#1052)
+
+### Fixed
+
+- **Pruned-table handling for `prune_unchanged` runs.** A replication run that pruned an unchanged source table is now mapped to its asset/check status correctly instead of surfacing as a missing materialization. (#1025)
+
 ## [1.54.1] — 2026-07-02
 
 ### Fixed
