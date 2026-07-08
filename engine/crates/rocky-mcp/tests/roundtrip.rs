@@ -192,6 +192,162 @@ async fn propose_writes_ai_authored_plan() {
     client.cancel().await.unwrap();
 }
 
+/// Like [`write_project`] but appends a `[policy]` block so the `propose`
+/// agent-policy gate is exercised. The single `orders` model is unclassified
+/// and uncontracted, so an `{ any = true }` rule is the deterministic lever.
+fn write_project_with_policy(dir: &Path, db_path: &Path, policy: &str) {
+    write_project(dir, db_path);
+    let cfg_path = dir.join("rocky.toml");
+    let mut cfg = std::fs::read_to_string(&cfg_path).unwrap();
+    cfg.push('\n');
+    cfg.push_str(policy);
+    std::fs::write(&cfg_path, cfg).unwrap();
+}
+
+/// Whether `.rocky/plans` holds any persisted plan `*.json`.
+fn plan_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let plans_dir = dir.join(".rocky").join("plans");
+    let Ok(entries) = std::fs::read_dir(&plans_dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect()
+}
+
+/// The load-bearing policy-gate proof, creds-free and deterministic: a
+/// `[policy]` block that denies an agent apply makes `propose` return a
+/// parseable structured deny — `{code = "policy_denied", policy_rule, message,
+/// remediation_hint}` — naming the deciding rule. A deny does **not** persist
+/// the plan, and the decision is recorded in the audit ledger.
+#[tokio::test]
+async fn propose_denied_by_policy_returns_structured_error() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "deny"
+"#,
+    );
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("propose"))
+        .await
+        .expect("propose returns a result");
+
+    // Structured deny, over the wire: is_error + a parseable envelope.
+    assert_eq!(result.is_error, Some(true), "a denied propose is an error");
+    let err = result
+        .structured_content
+        .expect("a denied propose carries the structured error envelope");
+    assert_eq!(err["code"], serde_json::json!("policy_denied"));
+    assert_eq!(
+        err["policy_rule"],
+        serde_json::json!("0"),
+        "the envelope names the deciding rule: {err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("orders"),
+        "message names the denied model: {message}"
+    );
+    let hint = err["remediation_hint"].as_str().unwrap();
+    assert!(
+        hint.contains("branch") || hint.contains("Re-scope"),
+        "remediation_hint points at a reroute: {hint}"
+    );
+
+    // A deny must NOT persist the plan — the decision is reserved for a human.
+    assert!(
+        plan_files(dir.path()).is_empty(),
+        "a denied propose must not write a plan file"
+    );
+
+    // The decision IS recorded in the audit ledger (queryable via `rocky audit`).
+    client.cancel().await.unwrap();
+    let state_path = rocky_core::state::resolve_state_path(None, &dir.path().join("models")).path;
+    let store = rocky_core::state::StateStore::open(&state_path).expect("open ledger");
+    let decisions = store.list_policy_decisions().expect("list decisions");
+    assert!(
+        decisions
+            .iter()
+            .any(|d| d.model == "orders" && d.effect == rocky_core::config::PolicyEffect::Deny),
+        "the propose-time deny is recorded in the ledger: {decisions:?}"
+    );
+}
+
+/// A `require_review` verdict at propose time still **persists** the plan (it is
+/// headed to human review) and returns a structured `policy_review_required`
+/// signal naming the rule and the recorded plan_id, so the agent surfaces the
+/// review/apply path to the user instead of applying autonomously.
+#[tokio::test]
+async fn propose_require_review_persists_plan_and_signals() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "require_review"
+"#,
+    );
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("propose"))
+        .await
+        .expect("propose returns a result");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "require_review returns a structured signal the agent parses"
+    );
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("policy_review_required"));
+    assert_eq!(err["policy_rule"], serde_json::json!("0"));
+    let message = err["message"].as_str().unwrap();
+    let hint = err["remediation_hint"].as_str().unwrap();
+    assert!(
+        hint.contains("rocky review") && hint.contains("--approve"),
+        "remediation_hint points at the human review path: {hint}"
+    );
+
+    // require_review DOES persist the plan — it is on its way to a reviewer.
+    let plans = plan_files(dir.path());
+    assert_eq!(plans.len(), 1, "the plan was recorded for review");
+    let plan: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&plans[0]).unwrap()).unwrap();
+    assert_eq!(plan["kind"], serde_json::json!("ai_authored"));
+
+    // The recorded plan_id is surfaced to the agent so it can name it to the user.
+    let plan_id = plans[0].file_stem().unwrap().to_str().unwrap();
+    assert!(
+        message.contains(plan_id) || hint.contains(plan_id),
+        "the recorded plan_id is surfaced: message={message} hint={hint}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn sample_rows_returns_capped_rows_on_duckdb() {
     let dir = TempDir::new().unwrap();

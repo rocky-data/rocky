@@ -80,7 +80,7 @@ pub use ai::{
     SchemaBuckets, build_schema_context, run_ai, run_ai_explain, run_ai_sync, run_ai_test,
 };
 pub use ai_contract::run_ai_contract;
-pub use apply::{run_apply, run_apply_inline_for_run};
+pub use apply::{PolicyGate, evaluate_apply_policy, run_apply, run_apply_inline_for_run};
 pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
 pub use audit::run_audit;
 #[cfg(feature = "duckdb")]

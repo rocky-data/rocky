@@ -53,15 +53,24 @@ pub enum ToolErrorCode {
     WarehouseError,
     /// An AI / LLM operation failed (client initialization or request).
     AiError,
+    /// The agent policy plane refused the proposed mutation outright (a hard
+    /// `deny`). Human review cannot satisfy it — the agent should re-scope
+    /// (e.g. propose to a branch) rather than retry. `policy_rule` names the
+    /// deciding rule.
+    PolicyDenied,
+    /// The agent policy plane requires human review before the proposed
+    /// mutation can apply. The plan was recorded; a human must approve it
+    /// (`rocky review <plan_id> --approve`) before `rocky apply`. `policy_rule`
+    /// names the deciding rule when one matched.
+    PolicyReviewRequired,
     /// An unexpected internal failure. `message` carries the detail.
     Internal,
 }
 
 /// The structured error envelope returned by a failing tool call.
 ///
-/// `policy_rule` is reserved for the agent policy plane (a future deny /
-/// require-review decision names the rule that produced it); it is absent on
-/// every error today.
+/// `policy_rule` is set by the agent policy plane on a deny / require-review
+/// decision (it names the deciding rule); it is absent on every other error.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ToolError {
     /// Stable error class the caller can branch on.
@@ -71,8 +80,11 @@ pub struct ToolError {
     /// A concrete next action that recovers from this error — the point of the
     /// envelope. Never empty.
     pub remediation_hint: String,
-    /// The policy rule behind a deny / require-review decision. Reserved for the
-    /// agent policy plane; always absent today.
+    /// The policy rule behind a deny / require-review decision. Set by the
+    /// agent policy plane on [`ToolErrorCode::PolicyDenied`] /
+    /// [`ToolErrorCode::PolicyReviewRequired`] (the deciding rule's id, or
+    /// absent when the default posture decided it); absent on every other
+    /// error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_rule: Option<String>,
 }
@@ -155,6 +167,50 @@ impl ToolError {
             message,
             "Verify ANTHROPIC_API_KEY is set in the server environment and the model is reachable, \
              then retry.",
+        )
+    }
+
+    /// Build an envelope that carries the deciding policy rule. Used by the two
+    /// policy-plane constructors; the rule id (or `None` for a default-posture
+    /// decision) rides in `policy_rule` so an agent can branch on it.
+    fn wrap_policy(
+        code: ToolErrorCode,
+        message: impl Into<String>,
+        remediation_hint: impl Into<String>,
+        policy_rule: Option<String>,
+    ) -> Json<Self> {
+        Json(Self {
+            code,
+            message: message.into(),
+            remediation_hint: remediation_hint.into(),
+            policy_rule,
+        })
+    }
+
+    /// The agent policy plane denied the proposed mutation (`deny`). A deny
+    /// cannot be satisfied by human review; `hint` should point at a re-scope
+    /// path (propose to a branch, drop the denied model).
+    pub fn policy_denied(
+        message: impl Into<String>,
+        hint: impl Into<String>,
+        policy_rule: Option<String>,
+    ) -> Json<Self> {
+        Self::wrap_policy(ToolErrorCode::PolicyDenied, message, hint, policy_rule)
+    }
+
+    /// The agent policy plane requires human review before the proposed
+    /// mutation can apply (`require_review`). The plan is recorded; `hint`
+    /// should point at the human review/apply path.
+    pub fn policy_review_required(
+        message: impl Into<String>,
+        hint: impl Into<String>,
+        policy_rule: Option<String>,
+    ) -> Json<Self> {
+        Self::wrap_policy(
+            ToolErrorCode::PolicyReviewRequired,
+            message,
+            hint,
+            policy_rule,
         )
     }
 

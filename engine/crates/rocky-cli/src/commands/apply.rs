@@ -305,10 +305,14 @@ pub(crate) fn ai_plan_is_reviewed(root: &Path, plan_id: &str) -> bool {
 // agent-policy plane — apply/promote enforcement (seams 2 & 3)
 // ---------------------------------------------------------------------------
 
-/// The apply-time policy decision, aggregated most-restrictive across every
-/// model the plan touches.
+/// A resolved agent-policy decision, aggregated most-restrictive across every
+/// model a plan touches.
+///
+/// Produced by [`evaluate_apply_policy`] at each mutating enforcement point —
+/// `rocky apply`, promote, and the MCP `propose` gate — so all three share one
+/// per-model evaluation and one aggregation rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PolicyGate {
+pub enum PolicyGate {
     /// No `[policy]` block in the config — the evaluator was never
     /// constructed. The caller falls back to its pre-policy-plane behaviour
     /// (AiAuthored → require a review marker; Run/Promote → ungated), so
@@ -377,14 +381,20 @@ fn model_attributes(models_dir: &Path) -> BTreeMap<String, ModelAttributes> {
 /// Evaluate the agent-policy plane over a plan's touched `(model, capability)`
 /// set and aggregate the most-restrictive effect. Records one
 /// [`PolicyDecisionRecord`] per evaluation to the ledger (best-effort — an
-/// audit-write failure never fails the apply; the *gate* is the safety
+/// audit-write failure never fails the caller; the *gate* is the safety
 /// boundary, the ledger is the trail).
+///
+/// Shared by the mutating enforcement points — `rocky apply`, promote, and the
+/// MCP `propose` gate — so each evaluates the same per-model rules with the same
+/// aggregation and records to the same ledger. `plan_id` is the id the decision
+/// is recorded against (the propose gate passes a deterministic id it may not
+/// persist).
 ///
 /// `touched` maps each governed model to the capability that was reviewed at
 /// propose time (the embedded classification, or `schema_change.breaking` when
 /// the classification was unavailable / fail-closed). An empty map means the
 /// plan changes nothing → `Allow`.
-fn evaluate_apply_policy(
+pub fn evaluate_apply_policy(
     config_path: &Path,
     plan_id: &str,
     principal: PolicyPrincipal,
@@ -499,16 +509,7 @@ fn touched_models_for_run(
     plan: &PersistedPlan,
     run_plan: &RunPlan,
 ) -> BTreeMap<String, PolicyCapability> {
-    let caps = plan.embedded_capabilities();
-    if caps.diff_available {
-        caps.changed
-    } else {
-        run_plan
-            .models
-            .iter()
-            .map(|m| (m.clone(), PolicyCapability::SchemaChangeBreaking))
-            .collect()
-    }
+    plan.embedded_capabilities().touched(&run_plan.models)
 }
 
 /// The `(model, capability)` set the policy plane evaluates for a `Promote`
