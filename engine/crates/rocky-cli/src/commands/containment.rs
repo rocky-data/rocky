@@ -42,10 +42,32 @@
 //!
 //! The closure is evaluated layer-by-layer in topological order, poisoning every
 //! withheld model as it goes, so a one-hop upstream check is transitively
-//! complete. Residual boundary: a physical read of a producer that is *not*
-//! topologically earlier is a pre-existing undeclared-dependency ordering issue
-//! (the read sees prior-run data regardless of containment) — declare the
-//! dependency via `ref()`/model name.
+//! complete. When `contain_failures` is on, execution layers are recomputed over
+//! this full edge set ([`ContainmentLedger::augmented_layers`]) so a reader is
+//! scheduled strictly after every producer it reads — closing the same-layer
+//! `--parallel` race for *resolvable* reads.
+//!
+//! # Guarantee scope
+//!
+//! Failure containment is **guaranteed** for dependencies declared via `ref()`
+//! and for physical reads Rocky can statically resolve — 2-part `schema.table`,
+//! 3-part `catalog.schema.table`, quoted or unquoted. Those are folded into both
+//! the closure and the execution ordering, so a downstream of a failure is never
+//! built on its stale/missing output.
+//!
+//! Reads Rocky **cannot enumerate** — a model built on a CTE, sub-query, or set
+//! operation, anything `rocky_sql::lineage_complete::lineage_is_provably_complete`
+//! rejects (an "uncertain" model) — are handled on a **best-effort** basis
+//! *identical to a normal fail-fast run*. An uncertain model with a known failed
+//! upstream is contained (the fail-closed belt in [`ContainmentLedger::evaluate`]),
+//! but because its reads yield no ordering edge, under `--parallel` a same-layer
+//! uncertain reader of a failing producer can still materialize on stale data —
+//! **exactly as plain fail-fast does** in that case (verified by the
+//! `containment_matches_fail_fast_for_same_layer_uncertain_read` parity test).
+//! This is a documented boundary, not a regression: the achievable guarantee is
+//! *containment never materializes anything fail-fast wouldn't*. Chasing the
+//! absolute bar would mean containing every CTE model, which would false-fail
+//! healthy projects. **Declare the dependency with `ref()` for a hard guarantee.**
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 

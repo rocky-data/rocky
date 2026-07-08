@@ -11470,6 +11470,98 @@ merge_keys = ["id"]
         );
     }
 
+    /// Seed a stale `main.orders_current` and write the same-layer *uncertain*
+    /// (CTE) project: `stage_orders` produces `main.orders_current` and fails;
+    /// `rollup` reads it through a CTE, so its read set is unenumerable
+    /// (`lineage_is_provably_complete` is false) and no ordering edge is derived.
+    async fn setup_same_layer_uncertain_project(
+        models_dir: &std::path::Path,
+        db: &std::path::Path,
+    ) {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        {
+            let seed = DuckDbWarehouseAdapter::open(db).expect("seed open");
+            seed.execute_statement("CREATE TABLE main.orders_current AS SELECT 999 AS id")
+                .await
+                .unwrap();
+        }
+        write_model_with_target(
+            models_dir,
+            "stage_orders",
+            "SELECT * FROM main.missing_source",
+            "main",
+            "orders_current",
+        );
+        write_model_with_target(
+            models_dir,
+            "rollup",
+            "WITH x AS (SELECT id FROM main.orders_current) SELECT COUNT(*) AS n FROM x",
+            "main",
+            "rollup",
+        );
+    }
+
+    /// GUARANTEE-BOUNDARY parity (intentional, not a latent bug): for a read
+    /// Rocky cannot statically resolve — a CTE / anything `lineage_is_provably_
+    /// complete` rejects, i.e. an "uncertain" model — containment behaves
+    /// *identically* to a normal fail-fast run. Under `--parallel 2` a same-layer
+    /// uncertain reader of a failed producer materializes on stale data in BOTH
+    /// modes; that is a pre-existing property of parallel fail-fast, not a
+    /// containment regression.
+    ///
+    /// This test locks the achievable invariant — **containment never
+    /// materializes anything fail-fast wouldn't** (containment ⊆ fail-fast) — by
+    /// running the same project twice under `--parallel 2`, once with
+    /// `contain_failures = false` and once `= true`, and asserting identical
+    /// materialization sets. It will catch a future change that either
+    /// over-contains (would false-fail healthy CTE projects) or regresses below
+    /// fail-fast. Declaring the dependency via `ref()` lifts the read into the
+    /// resolved, guaranteed set (covered by the resolved-read tests above).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn containment_matches_fail_fast_for_same_layer_uncertain_read() {
+        let mat_set = |o: &RunOutput| -> std::collections::BTreeSet<String> {
+            o.materializations
+                .iter()
+                .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+                .collect()
+        };
+
+        // Fail-fast (contain_failures = false), concurrency-capable, --parallel 2.
+        let ff = tempfile::TempDir::new().expect("temp dir");
+        let ff_models = ff.path().join("models");
+        std::fs::create_dir(&ff_models).unwrap();
+        let ff_db = ff.path().join("ff.duckdb");
+        setup_same_layer_uncertain_project(&ff_models, &ff_db).await;
+        let (out_ff, _) = run_models_against_duckdb(&ff_models, &ff_db, true, 2).await;
+
+        // Containment (contain_failures = true), --parallel 2.
+        let ct = tempfile::TempDir::new().expect("temp dir");
+        let ct_models = ct.path().join("models");
+        std::fs::create_dir(&ct_models).unwrap();
+        let ct_db = ct.path().join("ct.duckdb");
+        setup_same_layer_uncertain_project(&ct_models, &ct_db).await;
+        let (out_ct, _) = run_models_with_containment_parallel(&ct_models, &ct_db, 2).await;
+
+        assert_eq!(
+            mat_set(&out_ff),
+            mat_set(&out_ct),
+            "containment must not materialize anything fail-fast wouldn't for a same-layer \
+             uncertain (CTE) read — the achievable containment ⊆ fail-fast invariant"
+        );
+        assert!(
+            mat_set(&out_ct).contains("rollup"),
+            "the unenumerable (CTE) reader builds in BOTH modes — the documented best-effort \
+             boundary (declare the dep via ref() for a hard guarantee)"
+        );
+        assert!(
+            out_ct.contained.is_empty(),
+            "a same-layer uncertain read is fail-fast parity, NOT over-contained: {:?}",
+            out_ct.contained
+        );
+    }
+
     /// Earlier-layer residual (now closed): a physical reader placed in an
     /// EARLIER ref-layer than its physically-read producer (via an unrelated
     /// healthy dep chain) would build before the producer even runs. Augmented
