@@ -18,6 +18,7 @@ mod compare;
 mod compile;
 mod completions;
 mod compliance;
+mod containment;
 mod cost;
 mod dag;
 mod discover;

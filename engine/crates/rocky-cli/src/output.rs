@@ -268,6 +268,13 @@ pub struct RunOutput {
     /// omitted) for a default run, which stays byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_decisions: Vec<ModelDecisionOutput>,
+    /// Models withheld this run because an upstream failed (or was itself
+    /// withheld) and `[resilience] contain_failures` continued the disjoint
+    /// subgraphs — the blast radius of the failures named in `errors[]`. Empty
+    /// (and omitted) for a run that did not withhold anything: the default
+    /// fail-fast run, and any successful run, record nothing here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contained: Vec<ContainedModelOutput>,
     pub check_results: Vec<TableCheckOutput>,
     /// Row-quarantine outcomes — one entry per table the quality
     /// pipeline quarantined. Empty for runs that did not use
@@ -1170,6 +1177,25 @@ pub struct ModelDecisionOutput {
     /// "not skip-eligible", "upstream data may have changed", "reused prior
     /// run's bytes (strong proof)").
     pub reason: String,
+}
+
+/// One model withheld from a run because an upstream failed (or was itself
+/// withheld) and failure-containment continued the disjoint subgraphs.
+///
+/// This is the blast radius of a failure — the run's `errors[]` name the root
+/// cause(s). A withheld model was **not built** this run: its target was left
+/// untouched (never rebuilt on a failed upstream's stale/missing output). This
+/// is model-graph containment, distinct from the quality pipeline's row-level
+/// `quarantine` surface.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ContainedModelOutput {
+    /// The withheld model's name (matches the model entry in the project DAG).
+    pub model: String,
+    /// The failed-or-withheld upstream(s) that reach this model — its direct
+    /// poisoned dependencies. The run's `errors[]` carry the root-cause detail.
+    pub blocked_by: Vec<String>,
+    /// Operator hint: resolve the named upstream failure(s), then re-run.
+    pub unblock_hint: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -4397,6 +4423,7 @@ impl RunOutput {
             shadow: false,
             materializations: vec![],
             model_decisions: vec![],
+            contained: vec![],
             check_results: vec![],
             quarantine: vec![],
             anomalies: vec![],

@@ -118,6 +118,10 @@ export interface RunOutput {
   check_results: TableCheckOutput[];
   command: string;
   /**
+   * Models withheld this run because an upstream failed (or was itself withheld) and `[resilience] contain_failures` continued the disjoint subgraphs — the blast radius of the failures named in `errors[]`. Empty (and omitted) for a run that did not withhold anything: the default fail-fast run, and any successful run, record nothing here.
+   */
+  contained?: ContainedModelOutput[];
+  /**
    * Aggregate cost attribution across every materialization in this run (per-model entries + run totals). `None` for DuckDB-only pipelines or when no materializations produced a cost number.
    */
   cost_summary?: RunCostSummary | null;
@@ -211,6 +215,26 @@ export interface BudgetBreachOutput {
 export interface TableCheckOutput {
   asset_key: string[];
   checks: CheckResult[];
+  [k: string]: unknown;
+}
+/**
+ * One model withheld from a run because an upstream failed (or was itself withheld) and failure-containment continued the disjoint subgraphs.
+ *
+ * This is the blast radius of a failure — the run's `errors[]` name the root cause(s). A withheld model was **not built** this run: its target was left untouched (never rebuilt on a failed upstream's stale/missing output). This is model-graph containment, distinct from the quality pipeline's row-level `quarantine` surface.
+ */
+export interface ContainedModelOutput {
+  /**
+   * The failed-or-withheld upstream(s) that reach this model — its direct poisoned dependencies. The run's `errors[]` carry the root-cause detail.
+   */
+  blocked_by: string[];
+  /**
+   * The withheld model's name (matches the model entry in the project DAG).
+   */
+  model: string;
+  /**
+   * Operator hint: resolve the named upstream failure(s), then re-run.
+   */
+  unblock_hint: string;
   [k: string]: unknown;
 }
 /**

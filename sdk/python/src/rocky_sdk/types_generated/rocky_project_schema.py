@@ -1164,6 +1164,12 @@ class ResilienceConfig(BaseModel):
     """
     Trip the run-loop breaker after this many *consecutive* transient model failures; once tripped, no further model is retried for the rest of the run (they still get their one attempt). Default: `3`. `0` disables the breaker.
     """
+    contain_failures: bool | None = False
+    """
+    Continue disjoint subgraphs when a model fails, instead of aborting the whole run at the first failure. Default `false` (fail-fast — the run stops at the first failing model, exactly as before this knob existed).
+
+    When `true`, a failed model and its downstream closure are *withheld* (never built on the failure's stale/missing output), while unrelated subtrees still materialize; the run reports `PartialFailure` with a containment manifest naming what failed and its blast radius. This changes no data semantics — everything withheld is already withheld by today's fail-fast run; it only *narrows* the withholding to the actual blast radius. The closure is conservative (computed from the resolved dependency graph, contain-more on any doubt).
+    """
     enabled: bool | None = True
     """
     Master switch for run-loop classified retry. Default `true`. When `false`, every model is attempted exactly once (no classification, no backoff) — the behaviour before this layer existed.
@@ -3575,6 +3581,7 @@ class RockyConfig(BaseModel):
         {
             "backoff_multiplier": 2.0,
             "circuit_breaker_threshold": 3,
+            "contain_failures": False,
             "enabled": True,
             "initial_backoff_ms": 500,
             "jitter": True,
