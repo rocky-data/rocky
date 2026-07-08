@@ -106,28 +106,36 @@ impl ProducerIndex {
         }
     }
 
-    /// Resolve one lowercased physical read identity to a produced target.
+    /// Resolve one physical read identity to a produced target.
+    ///
+    /// The identity is first canonicalized ([`canonicalize_identifier`]) so a
+    /// quoted read (`"main"."orders_current"`, `` `main`.`orders_current` ``,
+    /// mixed) matches the clean producer keys — the producer side is built from
+    /// structured `config.target` parts and carries no quotes. A read that
+    /// cannot be cleanly canonicalized (unbalanced quotes, an empty segment, or
+    /// a quoted segment with an embedded dot that can't be slotted into the
+    /// `schema.table` index) resolves to [`ReadResolution::Ambiguous`] so the
+    /// reader **fails closed**.
     ///
     /// Only 2-part (`schema.table`) and 3-part (`catalog.schema.table`) reads
-    /// are physical-target shapes. A bare (0-dot) read is either a model name
+    /// are physical-target shapes. A bare (1-part) read is either a model name
     /// (already a `ref()` edge, handled by the caller) or an external table; a
     /// read with more than three parts is out of range. Both resolve to
     /// [`ReadResolution::External`].
     fn resolve(&self, read: &str) -> ReadResolution {
-        let parts: Vec<&str> = read.split('.').collect();
+        let Some(parts) = canonicalize_identifier(read) else {
+            // Un-canonicalizable — cannot attribute the read; fail closed.
+            return ReadResolution::Ambiguous;
+        };
         let candidates: &[String] = match parts.as_slice() {
             [catalog, schema, table] => self
                 .by_full
-                .get(&(
-                    (*catalog).to_string(),
-                    (*schema).to_string(),
-                    (*table).to_string(),
-                ))
+                .get(&(catalog.clone(), schema.clone(), table.clone()))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
             [schema, table] => self
                 .by_schema_table
-                .get(&((*schema).to_string(), (*table).to_string()))
+                .get(&(schema.clone(), table.clone()))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
             _ => &[],
@@ -138,6 +146,65 @@ impl ProducerIndex {
             _ => ReadResolution::Ambiguous,
         }
     }
+}
+
+/// Split a possibly-quoted SQL table identifier into its lowercased, unquoted
+/// parts, or `None` when it can't be cleanly canonicalized.
+///
+/// The read identity arrives from the SQL lineage walk, where sqlparser renders
+/// an `ObjectName` back to a string **with** its original quote characters
+/// (`"main"."orders_current"`), while the producer index keys are the clean,
+/// structured `config.target` parts. Matching therefore requires stripping the
+/// quotes the same way for the read side. Quote styles recognized: double-quote
+/// `"…"` (DuckDB / Snowflake / Postgres), backtick `` `…` `` (BigQuery /
+/// Databricks), bracket `[…]` (T-SQL). Inside a quoted segment a `.` is a
+/// literal, not a separator; a doubled closing quote (`""`, ` `` `) is an
+/// escaped quote character.
+///
+/// Returns `None` — so the caller **fails closed** — on any identity that can't
+/// be unambiguously slotted into the `schema.table` index: unbalanced quotes, an
+/// empty segment (`a..b`, a trailing dot), or a segment that after unquoting
+/// still contains a `.` (a quoted identifier with an embedded dot). Doing string
+/// surgery here rather than a naive `replace('"', "")` is deliberate — the naive
+/// form would mis-split a quoted identifier that legitimately contains a dot.
+fn canonicalize_identifier(read: &str) -> Option<Vec<String>> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = read.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' | '`' | '[' => {
+                let close = if ch == '[' { ']' } else { ch };
+                loop {
+                    match chars.next() {
+                        // Unbalanced quote — cannot canonicalize.
+                        None => return None,
+                        Some(c) if c == close => {
+                            // A doubled closing quote (`""` / ` `` `) is an
+                            // escaped literal, not the end of the segment.
+                            // Brackets have no doubling convention.
+                            if close != ']' && chars.peek() == Some(&close) {
+                                chars.next();
+                                cur.push(close);
+                            } else {
+                                break;
+                            }
+                        }
+                        Some(c) => cur.push(c),
+                    }
+                }
+            }
+            '.' => parts.push(std::mem::take(&mut cur)),
+            c => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    // An empty segment or an embedded dot (from a quoted identifier) can't be
+    // slotted into the `schema.table` index — fail closed.
+    if parts.iter().any(|p| p.is_empty() || p.contains('.')) {
+        return None;
+    }
+    Some(parts.into_iter().map(|p| p.to_lowercase()).collect())
 }
 
 /// Conservative, fail-closed downstream-closure tracker for one run.
@@ -390,6 +457,111 @@ mod tests {
         );
         led.poison("other");
         assert!(led.evaluate("m").is_none(), "external read must build");
+    }
+
+    /// Quoted physical reads (double-quote, backtick, and mixed) resolve to the
+    /// producer just like the unquoted form and are contained.
+    #[test]
+    fn quoted_physical_reads_are_contained() {
+        for read in [
+            "\"marts\".\"orders_current\"",         // double-quoted
+            "`marts`.`orders_current`",             // backtick-quoted
+            "marts.\"orders_current\"",             // mixed
+            "\"cat\".\"marts\".\"orders_current\"", // 3-part quoted
+        ] {
+            let mut led = ledger(
+                &[
+                    ("stage", &[], &[], true),
+                    ("rollup", &["anchor"], &[read], true),
+                    ("anchor", &[], &[], true),
+                ],
+                &[("stage", "cat", "marts", "orders_current")],
+            );
+            led.poison("stage");
+            let dec = led
+                .evaluate("rollup")
+                .unwrap_or_else(|| panic!("quoted read {read:?} must be contained"));
+            assert!(
+                dec.blocked_by.contains(&"stage".to_string()),
+                "quoted read {read:?} must name the producer: {:?}",
+                dec.blocked_by
+            );
+        }
+    }
+
+    /// A quoted read of a genuinely EXTERNAL table (no producer) is external —
+    /// it builds (not over-contained).
+    #[test]
+    fn quoted_external_read_builds() {
+        let mut led = ledger(
+            &[("m", &[], &["\"raw\".\"external\""], true)],
+            &[("other", "", "marts", "orders_current")],
+        );
+        led.poison("other");
+        assert!(
+            led.evaluate("m").is_none(),
+            "quoted external read must build"
+        );
+    }
+
+    /// An un-canonicalizable read (unbalanced quote, or a quoted segment with an
+    /// embedded dot) fails closed once a failure has occurred.
+    #[test]
+    fn uncanonicalizable_read_fails_closed() {
+        for read in ["\"main\".\"orders", "\"weird.name\""] {
+            let mut led = ledger(
+                &[
+                    ("bad", &[], &[], true),
+                    ("reader", &["anchor"], &[read], true),
+                    ("anchor", &[], &[], true),
+                ],
+                &[("p", "", "marts", "orders")],
+            );
+            led.poison("bad");
+            let dec = led
+                .evaluate("reader")
+                .unwrap_or_else(|| panic!("un-canonicalizable read {read:?} must fail closed"));
+            assert!(
+                dec.fail_closed,
+                "read {read:?} must trip the fail-closed belt"
+            );
+        }
+    }
+
+    /// Canonicalization unit cases: quote styles, mixed, escapes, and the
+    /// fail-closed (`None`) cases.
+    #[test]
+    fn canonicalize_identifier_cases() {
+        let parts = |v: &[&str]| Some(v.iter().copied().map(String::from).collect::<Vec<_>>());
+        assert_eq!(
+            canonicalize_identifier("main.orders"),
+            parts(&["main", "orders"])
+        );
+        assert_eq!(
+            canonicalize_identifier("\"MAIN\".\"Orders\""),
+            parts(&["main", "orders"]),
+            "quotes stripped and lowercased"
+        );
+        assert_eq!(
+            canonicalize_identifier("`cat`.`marts`.`t`"),
+            parts(&["cat", "marts", "t"])
+        );
+        assert_eq!(
+            canonicalize_identifier("main.\"orders\""),
+            parts(&["main", "orders"]),
+            "mixed quoting"
+        );
+        // Doubled quote = escaped literal quote within the segment.
+        assert_eq!(canonicalize_identifier("\"a\"\"b\""), parts(&["a\"b"]));
+        // Fail-closed cases.
+        assert_eq!(
+            canonicalize_identifier("\"main\".\"orders"),
+            None,
+            "unbalanced"
+        );
+        assert_eq!(canonicalize_identifier("\"we.ird\""), None, "embedded dot");
+        assert_eq!(canonicalize_identifier("a..b"), None, "empty segment");
+        assert_eq!(canonicalize_identifier(".orders"), None, "leading dot");
     }
 
     /// (c) Fail-closed belt: an unenumerable read set (not provably complete) is

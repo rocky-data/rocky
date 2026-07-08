@@ -11168,6 +11168,70 @@ merge_keys = ["id"]
         );
     }
 
+    /// Quoted-identifier hardening: a physical read written with QUOTED
+    /// identifiers (`"main"."orders_current"`) must resolve to the producer just
+    /// like the unquoted form — otherwise the quote characters survive into the
+    /// read identity, miss the producer index, and the reader builds on stale
+    /// data. Fails on the pre-quote-aware closure; passes after canonicalization.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_contains_quoted_physical_read_of_failed_producer() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("quoted.duckdb");
+
+        // Pre-seed a STALE prior-run `main.orders_current`.
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db).expect("seed open");
+            seed.execute_statement("CREATE TABLE main.orders_current AS SELECT 999 AS id")
+                .await
+                .unwrap();
+        }
+        write_plain_model(&models_dir, "anchor", "SELECT 1 AS v");
+        write_model_with_target(
+            &models_dir,
+            "stage_orders",
+            "SELECT * FROM main.does_not_exist_xyz",
+            "main",
+            "orders_current",
+        );
+        // `rollup` reads the producer's target with QUOTED identifiers.
+        write_model_with_target(
+            &models_dir,
+            "rollup",
+            "SELECT a.v FROM anchor a CROSS JOIN \"main\".\"orders_current\" o",
+            "main",
+            "rollup",
+        );
+
+        let (out, result) = run_models_with_containment(&models_dir, &db).await;
+        result.expect("containment returns Ok — the failure is recorded, not thrown");
+
+        let built: std::collections::BTreeSet<String> = out
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert!(
+            !built.contains("rollup"),
+            "a QUOTED physical read of a failed producer's target must NOT build"
+        );
+        let contained: Vec<&str> = out.contained.iter().map(|c| c.model.as_str()).collect();
+        assert!(
+            contained.contains(&"rollup"),
+            "rollup (quoted physical read) must be contained: {contained:?}"
+        );
+        let verify = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+        assert!(
+            !table_exists(&verify, "rollup").await,
+            "the contained downstream must not exist"
+        );
+    }
+
     /// Finding 2 / fail-closed belt: a model whose read set is NOT provably
     /// complete (a CTE — the completeness gate rejects it) cannot be proven
     /// disjoint from a failure, so once any failure has occurred it must be
