@@ -6567,9 +6567,13 @@ mod tests {
     fn test_v13_opens_and_creates_policy_decisions_table() {
         // A store freshly opened under the current binary materializes the
         // `policy_decisions` table (part of the eager EXPECTED_TABLES set) and
-        // stamps itself at v14. Reads succeed against an empty ledger.
+        // stamps itself at the current schema version. The ledger has existed
+        // since v14. Reads succeed against an empty ledger.
         let (store, _dir) = temp_store();
-        assert_eq!(current_schema_version(), 14);
+        assert!(
+            current_schema_version() >= 14,
+            "policy_decisions ledger exists from schema v14 onward"
+        );
         let decisions = store.list_policy_decisions().unwrap();
         assert!(
             decisions.is_empty(),
