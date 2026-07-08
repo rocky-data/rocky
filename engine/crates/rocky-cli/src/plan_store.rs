@@ -218,6 +218,29 @@ impl PersistedPlan {
     }
 }
 
+impl EmbeddedCapabilities {
+    /// The `(model, capability)` set the policy plane evaluates for a plan
+    /// covering `planned_models`.
+    ///
+    /// - Diff available at propose time → the embedded per-changed-model
+    ///   classification (unchanged models are absent and are not gated).
+    /// - Diff unavailable (skipped, or a legacy plan with no embed) → **every**
+    ///   planned model, classified `schema_change.breaking` (fail closed).
+    ///
+    /// The apply-time enforcement and the propose-time MCP gate share this so
+    /// the two evaluate the identical touched set for the same plan.
+    pub fn touched(&self, planned_models: &[String]) -> BTreeMap<String, PolicyCapability> {
+        if self.diff_available {
+            self.changed.clone()
+        } else {
+            planned_models
+                .iter()
+                .map(|m| (m.clone(), PolicyCapability::SchemaChangeBreaking))
+                .collect()
+        }
+    }
+}
+
 /// Default `format_version` for `PersistedPlan` when the field is absent
 /// on disk — kept at `1` so plans written before C-5 (which had no
 /// `format_version` field) read cleanly. `Run` / `Replication` /
@@ -298,6 +321,46 @@ pub fn write_plan_governed<T: Serialize>(
     write_plan_inner(root, kind, payload, 1, principal, Some(caps_value))
 }
 
+/// Compute the `plan_id` a governed `Run` / `AiAuthored` plan will carry,
+/// **without persisting it**.
+///
+/// Identical inputs to [`write_plan_governed`] yield an identical id — both
+/// route the payload through [`payload_with_capabilities`] and hash it with
+/// [`compute_plan_id`]. This lets a caller obtain the stable id *before*
+/// deciding whether to write: the MCP `propose` policy gate references the id
+/// in its audit record (and a review message) even for a plan it ultimately
+/// refuses to persist.
+pub fn governed_plan_id<T: Serialize>(
+    kind: &PlanKind,
+    payload: &T,
+    capabilities: &EmbeddedCapabilities,
+) -> Result<String> {
+    let caps_value =
+        serde_json::to_value(capabilities).context("failed to serialize embedded capabilities")?;
+    let payload_value = payload_with_capabilities(payload, Some(caps_value))?;
+    Ok(compute_plan_id(kind, &payload_value))
+}
+
+/// Serialize a plan `payload` to a JSON value, injecting the embedded
+/// change-classification (capability-embed) under `policy_capabilities` when
+/// present so it becomes part of `blake3({kind, payload})`.
+///
+/// Shared by [`write_plan_inner`] and [`governed_plan_id`] so an id computed
+/// ahead of a write matches the id the write produces.
+fn payload_with_capabilities<T: Serialize>(
+    payload: &T,
+    capabilities: Option<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let mut payload_value =
+        serde_json::to_value(payload).context("failed to serialize plan payload to JSON value")?;
+    if let Some(caps) = capabilities
+        && let serde_json::Value::Object(ref mut map) = payload_value
+    {
+        map.insert(POLICY_CAPABILITIES_KEY.to_string(), caps);
+    }
+    Ok(payload_value)
+}
+
 /// Persist a typed-IR `Compact` / `Archive` plan
 /// (`format_version = 2`).
 ///
@@ -330,18 +393,11 @@ fn write_plan_inner<T: Serialize>(
     principal: PolicyPrincipal,
     capabilities: Option<serde_json::Value>,
 ) -> Result<String> {
-    let mut payload_value =
-        serde_json::to_value(payload).context("failed to serialize plan payload to JSON value")?;
-
-    // Embed the propose-time change-classification (capability-embed) INTO the payload so it
-    // is part of `blake3({kind, payload})` — the reviewed capability binds to
-    // the `plan_id`. Only meaningful for object payloads (run/ai_authored);
-    // typed-IR compact/archive payloads never carry it.
-    if let Some(caps) = capabilities
-        && let serde_json::Value::Object(ref mut map) = payload_value
-    {
-        map.insert(POLICY_CAPABILITIES_KEY.to_string(), caps);
-    }
+    // Embed the propose-time change-classification (capability-embed) INTO the
+    // payload so it is part of `blake3({kind, payload})` — the reviewed
+    // capability binds to the `plan_id`. Only meaningful for object payloads
+    // (run/ai_authored); typed-IR compact/archive payloads never carry it.
+    let payload_value = payload_with_capabilities(payload, capabilities)?;
 
     let plan_id = compute_plan_id(&kind, &payload_value);
 

@@ -1698,12 +1698,11 @@ impl RockyMcpServer {
 
         let run_plan = build_ai_run_plan(params.0.model.clone(), &result);
 
-        // policy seam 1 + capability-embed: the `propose` tool is the sole MCP writer of plans.
-        // Stamp the `agent` principal explicitly (an AiAuthored plan is
-        // agent-authored by construction) and embed the propose-time
-        // change-classification so `rocky apply` evaluates the plan against the
-        // exact capabilities that were reviewed. A creds-free / non-git project
-        // fails closed (every model classified breaking).
+        // The `propose` tool is the sole MCP writer of plans; it always authors
+        // an AI-authored plan and therefore always acts as the `agent`
+        // principal. Embed the propose-time change-classification so the
+        // reviewed capabilities bind to the plan_id (a creds-free / non-git
+        // project fails closed — every model classified breaking).
         let state_path = self.state_path();
         let capabilities = rocky_cli::commands::compute_embedded_capabilities(
             &self.config_path,
@@ -1711,21 +1710,101 @@ impl RockyMcpServer {
             "main",
             Some(&state_path),
         );
-        let plan_id = rocky_cli::plan_store::write_plan_governed(
-            &self.root,
-            rocky_cli::plan_store::PlanKind::AiAuthored,
+
+        // Consult the agent-policy plane before persisting — the same per-model
+        // evaluation `rocky apply` runs — so an over-eager agent receives a
+        // structured, parseable verdict at propose time instead of a plan a
+        // later apply silently refuses. Absent a `[policy]` block this resolves
+        // to `NotConfigured` and behaviour is byte-identical to before the plane.
+        let touched = capabilities.touched(&run_plan.models);
+        // The deterministic id the plan will carry if written — recorded in the
+        // audit ledger (and named in a review message) even when a deny refuses
+        // to persist the plan.
+        let plan_id = rocky_cli::plan_store::governed_plan_id(
+            &rocky_cli::plan_store::PlanKind::AiAuthored,
             &run_plan,
-            rocky_core::config::PolicyPrincipal::Agent,
-            capabilities,
+            &capabilities,
         )
         .map_err(|e| {
             ToolError::internal(
-                format!("failed to write AI-authored plan: {e:#}"),
-                "Ensure the project directory is writable so the plan store can persist the plan.",
+                format!("failed to compute plan id: {e:#}"),
+                "Retry the propose; if it persists, verify the project compiles cleanly.",
             )
         })?;
+        let gate = rocky_cli::commands::evaluate_apply_policy(
+            &self.config_path,
+            &plan_id,
+            rocky_core::config::PolicyPrincipal::Agent,
+            &touched,
+            &self.models_dir,
+            &state_path,
+        );
 
-        Ok(Json(ProposeResult { plan_id, models }))
+        let write_plan = || {
+            rocky_cli::plan_store::write_plan_governed(
+                &self.root,
+                rocky_cli::plan_store::PlanKind::AiAuthored,
+                &run_plan,
+                rocky_core::config::PolicyPrincipal::Agent,
+                capabilities,
+            )
+            .map_err(|e| {
+                ToolError::internal(
+                    format!("failed to write AI-authored plan: {e:#}"),
+                    "Ensure the project directory is writable so the plan store can persist the \
+                     plan.",
+                )
+            })
+        };
+
+        match gate {
+            rocky_cli::commands::PolicyGate::NotConfigured
+            | rocky_cli::commands::PolicyGate::Allow => {
+                let plan_id = write_plan()?;
+                Ok(Json(ProposeResult { plan_id, models }))
+            }
+            rocky_cli::commands::PolicyGate::RequireReview {
+                model,
+                rule_id,
+                reason,
+            } => {
+                // Headed to human review — persist the plan so a reviewer can
+                // approve it, then return a structured signal the agent parses.
+                let plan_id = write_plan()?;
+                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                Err(ToolError::policy_review_required(
+                    format!(
+                        "policy requires human review before this change can apply: \
+                         model '{model}'{named} — {reason}. The plan was recorded as {plan_id}."
+                    ),
+                    format!(
+                        "A human must run `rocky review {plan_id} --approve` then \
+                         `rocky apply {plan_id}`; never approve on the user's behalf."
+                    ),
+                    rule_id.map(|r| r.to_string()),
+                ))
+            }
+            rocky_cli::commands::PolicyGate::Deny {
+                model,
+                rule_id,
+                reason,
+            } => {
+                // A deny cannot be satisfied by review — do NOT persist the
+                // plan; the decision is already recorded in the audit ledger.
+                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                Err(ToolError::policy_denied(
+                    format!(
+                        "policy denies proposing this change: model '{model}'{named} — {reason}. \
+                         A deny cannot be satisfied by human review, so no plan was recorded."
+                    ),
+                    "Re-scope the change so it no longer touches the denied model — propose to a \
+                     branch, or drop that model from the change. A denied change cannot be applied \
+                     even after review."
+                        .to_string(),
+                    rule_id.map(|r| r.to_string()),
+                ))
+            }
+        }
     }
 
     /// Resolve the project's target warehouse adapter from `rocky.toml`.
