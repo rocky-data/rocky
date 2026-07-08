@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.34.0] — 2026-07-08
+
+### Added
+
+- **Generated TypeScript types for the engine-v1.57.0 output surface** — replay (`replay_check`, `replay_execute`), recipe history, agent policy (`policy_check`, `audit`), the governor's `brief`, and the `rocky serve` job/meta/error types. Additive; the LSP client and existing commands are unchanged. (#1033–#1052)
+
+### Fixed
+
+- **Pin `@types/vscode` to the `engines.vscode` floor** so `vsce package` succeeds during the release build. (#1015)
+
 ## [1.33.5] — 2026-07-02
 
 > 1.33.4 was tagged but never published — its release build failed at `vsce package`

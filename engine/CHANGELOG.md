@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.57.0] - 2026-07-08
+
+A large feature release: an enforcing **agent policy plane**, **recipe identity** on every execution, **replay** re-execution, sound **per-column content hashing**, an embedder-grade **engine API** with a job model, the **governor's brief**, and a standalone **recipe-manifest verifier**. All additive — absent the new opt-in config (`[policy]`, `[reuse] column_level`), behavior is unchanged.
+
+### Added
+
+- **Agent policy plane — "IAM for data agents."** A `[policy]` block declares `(principal, capability, scope) → effect` rules; the evaluator resolves them per-model with a deny-override, most-specific-wins (most-restrictive on incomparable), fail-closed classification. `rocky policy check` explains a verdict; enforcement wires into `apply`/`promote` (generalizing the AI-authored review gate) and the MCP `propose` tool, which returns a structured `{code, message, remediation_hint}` denial naming the rule. Every decision is recorded to a `POLICY_DECISIONS` ledger, queryable with `rocky audit`. A denied propose writes no plan; a legacy AI-authored plan still requires review. Absent `[policy]`, behavior is byte-identical to before. (#1043, #1048, #1050)
+- **Recipe identity on every execution.** Each materialization records the `(recipe_hash, input_hash, env_hash)` triple plus a versioned `hash_scheme`, with an honest `input_proof_class` (`strong` vs `heuristic`) so a freshness-derived input hash is never presented as a content claim. Surfaced on `history`/`trace`/`catalog` records and via `rocky history --recipe <hash>` — every execution of that exact program. (#1033, #1039)
+- **Replay re-execution.** `rocky replay --at <run> --check` classifies each recorded model as replayable or not from the ledger alone; `--execute --verify` re-runs a model (or, with no `--model`, the whole run in topological order, each downstream reading its *replayed* upstream) on an ephemeral engine and blake3-compares to the recording. Fail-safe verdicts; nothing materialized to production; nondeterministic models are flagged, not chased. (#1035, #1038, #1041)
+- **Per-column content hashing (T2).** A consumed-column completeness guard (fail-closed on `SELECT *`/CTEs/ambiguity), producer-side output-column hashes and a consumer-side baseline recorded on the content-addressed path, and a **sound content-addressed column-level skip gate** — a rebuilt upstream is skipped for a downstream only when the columns it consumes are byte-identical to its baseline. Default-OFF behind `[reuse] column_level`; every uncertainty fails closed to BUILD. (#1034, #1037, #1042, #1046)
+- **Engine API (`rocky serve --api`).** The `/api/v1` routes now serve canonical `*Output` bytes identical to the CLI's `--output json` (a golden parity test enforces it), with a `{code, message, remediation_hint}` error envelope, a computed `/meta` (engine + schema versions, capabilities), and a **job model** — `POST /api/v1/jobs/{run|plan|apply}` → `202`, `GET /jobs/{id}` with the canonical output embedded, one-mutating-job-at-a-time (`409 mutation_in_progress`), and persisted job status so a restarted sidecar reports honestly. (#1044, #1047)
+- **`rocky brief` — the governor's estate digest.** A typed digest composed template-first from the ledger (agent activity, escalations, runs, drift, freshness, quality, cost/budget), every line carrying ledger citations, fail-closed sections, markdown or JSON. (#1052)
+- **Recipe-manifest v0.1 spec + `rocky-verify`.** A vendor-neutral manifest schema (every field mapped to shipped recording code) and a dependency-light standalone verifier that validates a manifest and byte-checks recorded hashes offline — no engine required. (#1051)
+- **Agent interface hardening.** A structured `{code, message, remediation_hint, policy_rule?}` error contract across the MCP tools, and a versioned agent-conformance eval suite (`engine/evals/`) scoring an agent's grounding/authoring over the MCP surface. (#1036, #1032)
+- **Replication `prune_unchanged`.** Skip-unchanged source pruning on the replication path. (#1024)
+
+### Fixed
+
+- **`rocky plan` honors `merge` + `table_overrides` on replication.** The plan preview ignored per-table strategy and column overrides on the replication path. (#1023)
+
 ## [1.56.0] - 2026-07-02
 
 ### Added

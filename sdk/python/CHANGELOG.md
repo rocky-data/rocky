@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-08
+
+### Added
+
+- **Generated types for the engine-v1.57.0 output surface.** New Pydantic models track the CLI's new JSON outputs: replay (`replay_check`, `replay_execute`), recipe history (`recipe_history`), the agent-policy plane (`policy_check`, `audit`), the governor's `brief`, and the `rocky serve` API surface (`job_status`, `meta`, `error_envelope`). The recipe-identity triple (`recipe_hash`/`input_hash`/`input_proof_class`/`env_hash`/`hash_scheme`) now populates on the `history()` / `catalog()` result models. All additive — existing calls are unchanged; the new models are available to import. (#1033–#1052)
+
 ## [0.1.7] — 2026-07-02
 
 ### Added
