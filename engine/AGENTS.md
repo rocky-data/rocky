@@ -46,7 +46,8 @@ engine/                         # this directory, inside the rocky monorepo
 │   │   │   ├── catalog.rs      # Catalog/schema lifecycle management
 │   │   │   ├── checks.rs       # Inline data quality checks
 │   │   │   ├── contracts.rs    # Data contracts (required/protected columns)
-│   │   │   ├── dag.rs          # DAG resolution for model dependencies
+│   │   │   ├── unified_dag.rs  # Unified ELT DAG — one graph across all pipeline stages
+│   │   │   ├── dag_executor.rs # DAG-driven execution in dependency order (+ dag_status.rs live status)
 │   │   │   ├── models.rs       # SQL model loading (sidecar .sql + .toml)
 │   │   │   ├── hooks/          # Pipeline lifecycle hooks (commands, webhooks, templates, presets)
 │   │   │   ├── optimize.rs     # Cost model + materialization strategy recommendations
