@@ -14,6 +14,8 @@ Single repository for the Rocky data platform — a typed-program layer above th
 
 Each subproject has its own `AGENTS.md` with build commands, coding standards, and architecture details (its `CLAUDE.md` is a thin shim that imports the `AGENTS.md`). **Always read the subproject `AGENTS.md` before working inside it.**
 
+> **Adversarial / red-team code review** (e.g. Codex via `codex-plugin-cc`): read [`CODEX_REVIEW.md`](CODEX_REVIEW.md) before reviewing engine changes. It is the grounded correctness profile — Rocky's real compiler pipeline (surface → SQL string → single `ModelIr`, no HIR), the incremental-recompute surfaces, the enum-exhaustiveness rule, the nullability/3VL invariants, and the test-evidence bar.
+
 ## How they fit together
 
 ```
