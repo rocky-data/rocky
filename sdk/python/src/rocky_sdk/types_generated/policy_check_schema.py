@@ -8,7 +8,7 @@ from enum import StrEnum
 from pydantic import BaseModel, conint
 
 
-class PolicyCapability23(StrEnum):
+class PolicyCapability34(StrEnum):
     """
     Read model output / metadata. Always allowed.
     """
@@ -16,7 +16,7 @@ class PolicyCapability23(StrEnum):
     read = "read"
 
 
-class PolicyCapability24(StrEnum):
+class PolicyCapability35(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -24,7 +24,7 @@ class PolicyCapability24(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability25(StrEnum):
+class PolicyCapability36(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -32,7 +32,7 @@ class PolicyCapability25(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability26(StrEnum):
+class PolicyCapability37(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -40,7 +40,7 @@ class PolicyCapability26(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability27(StrEnum):
+class PolicyCapability38(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -48,7 +48,7 @@ class PolicyCapability27(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability28(StrEnum):
+class PolicyCapability39(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -56,7 +56,7 @@ class PolicyCapability28(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability29(StrEnum):
+class PolicyCapability40(StrEnum):
     """
     Retry a failed run.
     """
@@ -64,7 +64,7 @@ class PolicyCapability29(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability30(StrEnum):
+class PolicyCapability41(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -72,7 +72,7 @@ class PolicyCapability30(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability31(StrEnum):
+class PolicyCapability42(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -80,7 +80,7 @@ class PolicyCapability31(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability32(StrEnum):
+class PolicyCapability43(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -88,7 +88,7 @@ class PolicyCapability32(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability33(StrEnum):
+class PolicyCapability44(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -96,7 +96,7 @@ class PolicyCapability33(StrEnum):
     value_change = "value_change"
 
 
-class PolicyEffect7(StrEnum):
+class PolicyEffect10(StrEnum):
     """
     Permit the action outright.
     """
@@ -104,7 +104,7 @@ class PolicyEffect7(StrEnum):
     allow = "allow"
 
 
-class PolicyEffect8(StrEnum):
+class PolicyEffect11(StrEnum):
     """
     Permit only after human review. The safe default posture.
     """
@@ -112,7 +112,7 @@ class PolicyEffect8(StrEnum):
     require_review = "require_review"
 
 
-class PolicyEffect9(StrEnum):
+class PolicyEffect12(StrEnum):
     """
     Refuse the action. A hard override — no `allow` overturns it.
     """
@@ -147,7 +147,7 @@ class PolicyModelAttributes(BaseModel):
     """
 
 
-class PolicyPrincipal5(StrEnum):
+class PolicyPrincipal7(StrEnum):
     """
     A person.
     """
@@ -155,7 +155,7 @@ class PolicyPrincipal5(StrEnum):
     human = "human"
 
 
-class PolicyPrincipal6(StrEnum):
+class PolicyPrincipal8(StrEnum):
     """
     A non-human caller (AI agent / automation).
     """
@@ -171,23 +171,23 @@ class PolicyCheckOutput(BaseModel):
     """
 
     capability: (
-        PolicyCapability23
-        | PolicyCapability24
-        | PolicyCapability25
-        | PolicyCapability26
-        | PolicyCapability27
-        | PolicyCapability28
-        | PolicyCapability29
-        | PolicyCapability30
-        | PolicyCapability31
-        | PolicyCapability32
-        | PolicyCapability33
+        PolicyCapability34
+        | PolicyCapability35
+        | PolicyCapability36
+        | PolicyCapability37
+        | PolicyCapability38
+        | PolicyCapability39
+        | PolicyCapability40
+        | PolicyCapability41
+        | PolicyCapability42
+        | PolicyCapability43
+        | PolicyCapability44
     )
     """
     The capability that was checked.
     """
     command: str
-    effect: PolicyEffect7 | PolicyEffect8 | PolicyEffect9
+    effect: PolicyEffect10 | PolicyEffect11 | PolicyEffect12
     """
     Resolved effect: `allow`, `require_review`, or `deny`.
     """
@@ -203,7 +203,7 @@ class PolicyCheckOutput(BaseModel):
     """
     The compiled model attributes the matcher read.
     """
-    principal: PolicyPrincipal5 | PolicyPrincipal6
+    principal: PolicyPrincipal7 | PolicyPrincipal8
     """
     The principal that was checked (`human` / `agent`).
     """

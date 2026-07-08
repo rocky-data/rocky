@@ -133,7 +133,7 @@ class BriefSinceMode3(StrEnum):
     field_7d = "7d"
 
 
-class PolicyCapability12(StrEnum):
+class PolicyCapability23(StrEnum):
     """
     Read model output / metadata. Always allowed.
     """
@@ -141,7 +141,7 @@ class PolicyCapability12(StrEnum):
     read = "read"
 
 
-class PolicyCapability13(StrEnum):
+class PolicyCapability24(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -149,7 +149,7 @@ class PolicyCapability13(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability14(StrEnum):
+class PolicyCapability25(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -157,7 +157,7 @@ class PolicyCapability14(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability15(StrEnum):
+class PolicyCapability26(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -165,7 +165,7 @@ class PolicyCapability15(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability16(StrEnum):
+class PolicyCapability27(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -173,7 +173,7 @@ class PolicyCapability16(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability17(StrEnum):
+class PolicyCapability28(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -181,7 +181,7 @@ class PolicyCapability17(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability18(StrEnum):
+class PolicyCapability29(StrEnum):
     """
     Retry a failed run.
     """
@@ -189,7 +189,7 @@ class PolicyCapability18(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability19(StrEnum):
+class PolicyCapability30(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -197,7 +197,7 @@ class PolicyCapability19(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability20(StrEnum):
+class PolicyCapability31(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -205,7 +205,7 @@ class PolicyCapability20(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability21(StrEnum):
+class PolicyCapability32(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -213,7 +213,7 @@ class PolicyCapability21(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability22(StrEnum):
+class PolicyCapability33(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -221,7 +221,7 @@ class PolicyCapability22(StrEnum):
     value_change = "value_change"
 
 
-class PolicyEffect4(StrEnum):
+class PolicyEffect7(StrEnum):
     """
     Permit the action outright.
     """
@@ -229,7 +229,7 @@ class PolicyEffect4(StrEnum):
     allow = "allow"
 
 
-class PolicyEffect5(StrEnum):
+class PolicyEffect8(StrEnum):
     """
     Permit only after human review. The safe default posture.
     """
@@ -237,7 +237,7 @@ class PolicyEffect5(StrEnum):
     require_review = "require_review"
 
 
-class PolicyEffect6(StrEnum):
+class PolicyEffect9(StrEnum):
     """
     Refuse the action. A hard override — no `allow` overturns it.
     """
@@ -245,7 +245,7 @@ class PolicyEffect6(StrEnum):
     deny = "deny"
 
 
-class PolicyPrincipal3(StrEnum):
+class PolicyPrincipal5(StrEnum):
     """
     A person.
     """
@@ -253,7 +253,7 @@ class PolicyPrincipal3(StrEnum):
     human = "human"
 
 
-class PolicyPrincipal4(StrEnum):
+class PolicyPrincipal6(StrEnum):
     """
     A non-human caller (AI agent / automation).
     """
@@ -261,7 +261,7 @@ class PolicyPrincipal4(StrEnum):
     agent = "agent"
 
 
-class SectionAvailability1(StrEnum):
+class SectionAvailability4(StrEnum):
     """
     The query ran and the section carries data for the window.
     """
@@ -269,7 +269,7 @@ class SectionAvailability1(StrEnum):
     available = "available"
 
 
-class SectionAvailability2(StrEnum):
+class SectionAvailability5(StrEnum):
     """
     The query ran cleanly but nothing fell inside the window.
     """
@@ -277,7 +277,7 @@ class SectionAvailability2(StrEnum):
     no_data = "no_data"
 
 
-class SectionAvailability3(StrEnum):
+class SectionAvailability6(StrEnum):
     """
     The underlying signal is not recorded in the state store, so the section cannot be composed. Accompanied by a `note` explaining why.
     """
@@ -294,7 +294,7 @@ class BriefCostSection(BaseModel):
     """
     The billed-warehouse adapter cost was computed against, if resolvable from `rocky.toml`.
     """
-    availability: SectionAvailability1 | SectionAvailability2 | SectionAvailability3
+    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
     """
     Whether a brief section's underlying query succeeded and had data.
 
@@ -326,17 +326,17 @@ class BriefDecisionEntry(BaseModel):
     """
 
     capability: (
-        PolicyCapability12
-        | PolicyCapability13
-        | PolicyCapability14
-        | PolicyCapability15
-        | PolicyCapability16
-        | PolicyCapability17
-        | PolicyCapability18
-        | PolicyCapability19
-        | PolicyCapability20
-        | PolicyCapability21
-        | PolicyCapability22
+        PolicyCapability23
+        | PolicyCapability24
+        | PolicyCapability25
+        | PolicyCapability26
+        | PolicyCapability27
+        | PolicyCapability28
+        | PolicyCapability29
+        | PolicyCapability30
+        | PolicyCapability31
+        | PolicyCapability32
+        | PolicyCapability33
     )
     """
     The class of action a policy rule governs.
@@ -347,7 +347,7 @@ class BriefDecisionEntry(BaseModel):
     """
     Composite ledger key that uniquely identifies this decision.
     """
-    effect: PolicyEffect4 | PolicyEffect5 | PolicyEffect6
+    effect: PolicyEffect7 | PolicyEffect8 | PolicyEffect9
     """
     The verdict a policy rule (or the default posture) yields.
 
@@ -361,7 +361,7 @@ class BriefDecisionEntry(BaseModel):
     """
     The plan the decision governed.
     """
-    principal: PolicyPrincipal3 | PolicyPrincipal4
+    principal: PolicyPrincipal5 | PolicyPrincipal6
     """
     Who is attempting an action.
 
@@ -386,7 +386,7 @@ class BriefDriftSection(BaseModel):
     Drift section — schema drift recorded in the state store.
     """
 
-    availability: SectionAvailability1 | SectionAvailability2 | SectionAvailability3
+    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
     """
     Whether a brief section's underlying query succeeded and had data.
 
@@ -404,7 +404,7 @@ class BriefEscalationsSection(BaseModel):
     Escalations section — `require_review` decisions still awaiting a human.
     """
 
-    availability: SectionAvailability1 | SectionAvailability2 | SectionAvailability3
+    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
     """
     Whether a brief section's underlying query succeeded and had data.
 
@@ -427,7 +427,7 @@ class BriefFreshnessSection(BaseModel):
     Freshness / SLO section, derived from recorded quality snapshots.
     """
 
-    availability: SectionAvailability1 | SectionAvailability2 | SectionAvailability3
+    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
     """
     Whether a brief section's underlying query succeeded and had data.
 
@@ -447,7 +447,7 @@ class BriefPrincipalActivity(BaseModel):
 
     allow: conint(ge=0)
     deny: conint(ge=0)
-    principal: PolicyPrincipal3 | PolicyPrincipal4
+    principal: PolicyPrincipal5 | PolicyPrincipal6
     """
     Who is attempting an action.
 
@@ -462,7 +462,7 @@ class BriefQualitySection(BaseModel):
     Quality / check section, derived from recorded quality snapshots.
     """
 
-    availability: SectionAvailability1 | SectionAvailability2 | SectionAvailability3
+    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
     """
     Whether a brief section's underlying query succeeded and had data.
 
@@ -484,7 +484,7 @@ class BriefRunsSection(BaseModel):
     """
     Runs that did not fully succeed, newest first — the exception view. Each cites its `run_id`.
     """
-    availability: SectionAvailability1 | SectionAvailability2 | SectionAvailability3
+    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
     """
     Whether a brief section's underlying query succeeded and had data.
 
@@ -503,7 +503,7 @@ class BriefAgentActivitySection(BaseModel):
     """
 
     allow: conint(ge=0)
-    availability: SectionAvailability1 | SectionAvailability2 | SectionAvailability3
+    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
     """
     Whether a brief section's underlying query succeeded and had data.
 

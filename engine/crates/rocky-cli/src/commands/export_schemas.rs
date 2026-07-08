@@ -19,18 +19,19 @@ use serde::Serialize;
 use crate::commands::doctor::DoctorOutput;
 use crate::output::{
     AiContractOutput, AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ApplyOutput,
-    ApproveOutput, ArchiveApplyOutput, ArchiveOutput, AuditOutput, BranchDeleteOutput,
-    BranchListOutput, BranchOutput, BranchPromoteOutput, BriefOutput, CatalogOutput, CiDiffOutput,
-    CiOutput, ClearSchemaCacheOutput, ColumnLineageOutput, CompactApplyOutput, CompactDedupOutput,
-    CompactOutput, CompareOutput, CompileOutput, ComplianceOutput, CostOutput, DagOutput,
-    DagRunOutput, DiscoverOutput, DriftOutput, ErrorEnvelope, EstimateOutput, HistoryOutput,
-    HooksListOutput, HooksTestOutput, ImportDbtOutput, JobStatus, LineageDiffOutput, LineageOutput,
-    LoadOutput, MetaOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput,
-    PolicyCheckOutput, PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput,
-    PreviewRowsOutput, ProfileOutput, ProfileStorageOutput, PromotePlan, RecipeHistoryOutput,
-    ReplayCheckOutput, ReplayExecuteOutput, ReplayOutput, RetentionStatusOutput,
-    RetentionSweepOutput, ReviewOutput, RunOutput, SeedOutput, StateOutput, TestAdapterOutput,
-    TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
+    ApproveOutput, ArchiveApplyOutput, ArchiveOutput, AuditForOutput, AuditOutput,
+    BranchDeleteOutput, BranchListOutput, BranchOutput, BranchPromoteOutput, BriefOutput,
+    CatalogOutput, CiDiffOutput, CiOutput, ClearSchemaCacheOutput, ColumnLineageOutput,
+    CompactApplyOutput, CompactDedupOutput, CompactOutput, CompareOutput, CompileOutput,
+    ComplianceOutput, CostOutput, DagOutput, DagRunOutput, DiscoverOutput, DriftOutput,
+    ErrorEnvelope, EstimateOutput, HistoryOutput, HooksListOutput, HooksTestOutput,
+    ImportDbtOutput, JobStatus, LineageDiffOutput, LineageOutput, LoadOutput, MetaOutput,
+    MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput, PolicyCheckOutput,
+    PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput, PreviewRowsOutput, ProfileOutput,
+    ProfileStorageOutput, PromotePlan, RecipeHistoryOutput, ReplayCheckOutput, ReplayExecuteOutput,
+    ReplayOutput, RetentionStatusOutput, RetentionSweepOutput, ReviewOutput, ReviewQueueOutput,
+    RunOutput, SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TraceOutput,
+    ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -119,8 +120,10 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<RetentionStatusOutput>("retention_status"),
         entry::<RetentionSweepOutput>("state_retention_sweep"),
         entry::<ReviewOutput>("review"),
+        entry::<ReviewQueueOutput>("review_queue"),
         entry::<PolicyCheckOutput>("policy_check"),
         entry::<AuditOutput>("audit"),
+        entry::<AuditForOutput>("audit_for"),
         entry::<BriefOutput>("brief"),
         // Plan/apply spine (Cluster 3 B, Phase 2–3)
         entry::<ApplyOutput>("apply"),

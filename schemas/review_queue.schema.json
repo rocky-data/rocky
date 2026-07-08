@@ -1,0 +1,234 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "PolicyCapability": {
+      "description": "The class of action a policy rule governs.\n\n`read` is always allowed (short-circuit). The mutating verbs (`propose` … `quarantine`) name coarse operations; `schema_change.additive`, `schema_change.breaking`, and `value_change` are *refinements* of the apply/promote verbs — a rule naming a bare verb (`apply`/`promote`) matches those refinements too, but a rule naming a refinement matches only that exact refinement.",
+      "oneOf": [
+        {
+          "description": "Read model output / metadata. Always allowed.",
+          "enum": [
+            "read"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Draft a plan for later review.",
+          "enum": [
+            "propose"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Apply a plan against the warehouse.",
+          "enum": [
+            "apply"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Promote a branch / environment.",
+          "enum": [
+            "promote"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Backfill historical partitions.",
+          "enum": [
+            "backfill"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Garbage-collect / reclaim storage.",
+          "enum": [
+            "gc"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Retry a failed run.",
+          "enum": [
+            "retry"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Quarantine a partition / model.",
+          "enum": [
+            "quarantine"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "An additive schema change (refinement of apply/promote).",
+          "enum": [
+            "schema_change.additive"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A breaking schema change (refinement of apply/promote).",
+          "enum": [
+            "schema_change.breaking"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A value-only data change (refinement of apply/promote).",
+          "enum": [
+            "value_change"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyPrincipal": {
+      "description": "Who is attempting an action.\n\n`agent` is a non-human caller (an AI harness authoring, applying, or remediating). `human` is a person. In v0 the principal is supplied explicitly (`rocky policy check --principal …`); auto-detection is a later phase.",
+      "oneOf": [
+        {
+          "description": "A person.",
+          "enum": [
+            "human"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A non-human caller (AI agent / automation).",
+          "enum": [
+            "agent"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ReviewQueueEntry": {
+      "description": "One pending `require_review` escalation inside [`ReviewQueueOutput`].",
+      "properties": {
+        "approve_command": {
+          "description": "The exact command that clears this escalation.",
+          "type": "string"
+        },
+        "blast_radius": {
+          "description": "Count of models that transitively consume this one — the blast radius the ranking weighs. `null` when the model could not be located in the compiled graph (e.g. it was removed), in which case the ranking treats the blast radius as zero and this entry says so.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "capability": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PolicyCapability"
+            }
+          ],
+          "description": "The capability that was evaluated (its `schema_change.*` refinement is the change class the ranking weighs)."
+        },
+        "classification_weight": {
+          "description": "The change-class weight the ranking used (breaking > bare verb > additive / value-only).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "decision_ref": {
+          "description": "Composite ledger key (`\"{timestamp}|{plan_id}|{model}\"`) — the stable identity a governor drills into via `rocky audit --for`.",
+          "type": "string"
+        },
+        "model": {
+          "description": "The model the escalation is about.",
+          "type": "string"
+        },
+        "plan_id": {
+          "description": "The plan whose approval clears this escalation.",
+          "type": "string"
+        },
+        "principal": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PolicyPrincipal"
+            }
+          ],
+          "description": "Who authored the change (`human` / `agent`)."
+        },
+        "reason": {
+          "description": "Human-readable explanation of how `require_review` was reached.",
+          "type": "string"
+        },
+        "rule_id": {
+          "description": "Index of the winning `[[policy.rules]]` entry, or `null` when the escalation came from the default posture.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "score": {
+          "description": "The composite priority score. Higher sorts first. Reported so a consumer can re-rank or explain the ordering without recomputing it.",
+          "format": "double",
+          "type": "number"
+        },
+        "staleness_seconds": {
+          "description": "How long the escalation has waited, in whole seconds.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "timestamp": {
+          "description": "RFC 3339 timestamp when the decision was recorded.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "approve_command",
+        "capability",
+        "classification_weight",
+        "decision_ref",
+        "model",
+        "plan_id",
+        "principal",
+        "reason",
+        "score",
+        "staleness_seconds",
+        "timestamp"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky review --queue` — the pending-review work queue.\n\nLists every `require_review` policy decision that has not yet been satisfied by a sign-off marker, ranked so the change most in need of a human floats to the top. The rank blends three signals: how much sits downstream of the model (blast radius), how disruptive the change class is (a breaking schema change outranks an additive one), and how long the escalation has waited (staleness). Each entry carries the exact `rocky review <plan_id> --approve` invocation that clears it — the queue is a triage view; the approval path is unchanged.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "pending": {
+      "description": "The pending escalations, highest-priority first.",
+      "items": {
+        "$ref": "#/definitions/ReviewQueueEntry"
+      },
+      "type": "array"
+    },
+    "ranking": {
+      "description": "Human-readable description of the ordering, e.g. `\"blast_radius × classification × staleness\"`.",
+      "type": "string"
+    },
+    "total": {
+      "description": "Count of pending escalations in the queue.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "pending",
+    "ranking",
+    "total",
+    "version"
+  ],
+  "title": "ReviewQueueOutput",
+  "type": "object"
+}

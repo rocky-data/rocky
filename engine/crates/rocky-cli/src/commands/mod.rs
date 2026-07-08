@@ -84,7 +84,7 @@ pub use ai::{
 pub use ai_contract::run_ai_contract;
 pub use apply::{PolicyGate, evaluate_apply_policy, run_apply, run_apply_inline_for_run};
 pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
-pub use audit::run_audit;
+pub use audit::{run_audit, run_audit_for};
 #[cfg(feature = "duckdb")]
 pub use bench::run_bench;
 pub use branch::{
@@ -143,7 +143,7 @@ pub use profile_storage::run_profile_storage;
 pub use publish_ir::run_publish_ir;
 pub use replay::{run_replay, run_replay_check, run_replay_execute};
 pub use retention_status::run_retention_status;
-pub use review::run_review;
+pub use review::{run_review, run_review_queue};
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.
 pub use rocky_sql::transpile::Dialect;

@@ -1,0 +1,565 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AuditChainBlastRadius": {
+      "description": "Blast-radius link of the custody chain: the models that transitively consume the subject, recomputed from the current compiled graph.",
+      "properties": {
+        "availability": {
+          "$ref": "#/definitions/SectionAvailability"
+        },
+        "direct": {
+          "description": "Direct downstream consumers (one hop).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "model": {
+          "description": "The model the blast radius was computed for.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total": {
+          "description": "Size of the transitive closure.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "transitive": {
+          "description": "All transitive downstream consumers (the full closure, sorted).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "availability",
+        "direct",
+        "total",
+        "transitive"
+      ],
+      "type": "object"
+    },
+    "AuditChainDecisions": {
+      "description": "Decision link of the custody chain: the policy-decision ledger scoped to the subject (by model for a model selector, by plan_id for a plan selector).",
+      "properties": {
+        "availability": {
+          "$ref": "#/definitions/SectionAvailability"
+        },
+        "entries": {
+          "description": "The matching decisions, newest first.",
+          "items": {
+            "$ref": "#/definitions/AuditDecisionEntry"
+          },
+          "type": "array"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "availability",
+        "entries",
+        "total"
+      ],
+      "type": "object"
+    },
+    "AuditChainPlan": {
+      "description": "Plan link of the custody chain: what the governing plan changed, read from the plan file's embedded change-classification.",
+      "properties": {
+        "availability": {
+          "$ref": "#/definitions/SectionAvailability"
+        },
+        "changes": {
+          "description": "The per-model change classification the plan carried — the persisted stand-in for the typed diff. The full field-level `diff_project_ir` output is not persisted for run plans, only this classification is.",
+          "items": {
+            "$ref": "#/definitions/AuditPlanChange"
+          },
+          "type": "array"
+        },
+        "diff_available": {
+          "description": "Whether the base↔head change classification was available when the plan was authored. `false` means every planned model was treated as a breaking change (fail-closed), and `changes` reflects that.",
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "The plan kind (`run` / `ai_authored` / …).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan_id": {
+          "description": "The plan that governed the subject (the newest one, for a model selector). `null` when no plan file could be located.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "principal": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PolicyPrincipal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The plan's authoring principal."
+        }
+      },
+      "required": [
+        "availability",
+        "changes",
+        "diff_available"
+      ],
+      "type": "object"
+    },
+    "AuditChainRuns": {
+      "description": "Run link of the custody chain: runs that materialized the subject.",
+      "properties": {
+        "availability": {
+          "$ref": "#/definitions/SectionAvailability"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runs": {
+          "description": "Matching runs, newest first.",
+          "items": {
+            "$ref": "#/definitions/AuditRunEntry"
+          },
+          "type": "array"
+        },
+        "total": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "availability",
+        "runs",
+        "total"
+      ],
+      "type": "object"
+    },
+    "AuditChainVerify": {
+      "description": "Verify-after link of the custody chain.\n\nPost-apply verification outcomes are not persisted to the state store today, so this link is always [`SectionAvailability::Unavailable`] with a note — never a smoothed-over \"verification passed\".",
+      "properties": {
+        "availability": {
+          "$ref": "#/definitions/SectionAvailability"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "availability"
+      ],
+      "type": "object"
+    },
+    "AuditDecisionEntry": {
+      "description": "One recorded policy decision in the [`AuditOutput`] ledger.",
+      "properties": {
+        "capability": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PolicyCapability"
+            }
+          ],
+          "description": "The capability that was evaluated."
+        },
+        "effect": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PolicyEffect"
+            }
+          ],
+          "description": "The resolved verdict (`allow` / `require_review` / `deny`)."
+        },
+        "model": {
+          "description": "The model the decision was about.",
+          "type": "string"
+        },
+        "plan_id": {
+          "description": "The plan the decision governed.",
+          "type": "string"
+        },
+        "principal": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PolicyPrincipal"
+            }
+          ],
+          "description": "Who was acting (`human` / `agent`)."
+        },
+        "reason": {
+          "description": "Human-readable explanation of how the effect was reached.",
+          "type": "string"
+        },
+        "rule_id": {
+          "description": "Index of the winning `[[policy.rules]]` entry, or `null` for the default posture.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "timestamp": {
+          "description": "RFC 3339 timestamp when the decision was recorded.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "capability",
+        "effect",
+        "model",
+        "plan_id",
+        "principal",
+        "reason",
+        "timestamp"
+      ],
+      "type": "object"
+    },
+    "AuditPlanChange": {
+      "description": "One model's change classification inside [`AuditChainPlan`].",
+      "properties": {
+        "capability": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PolicyCapability"
+            }
+          ],
+          "description": "The change class the plan recorded for this model (`schema_change.additive` / `schema_change.breaking` / `value_change` / a bare verb)."
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "capability",
+        "model"
+      ],
+      "type": "object"
+    },
+    "AuditRunEntry": {
+      "description": "One run inside [`AuditChainRuns`].",
+      "properties": {
+        "finished_at": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "triggering_identity": {
+          "description": "Best-effort caller identity recorded on the run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "finished_at",
+        "run_id",
+        "started_at",
+        "status"
+      ],
+      "type": "object"
+    },
+    "AuditSubjectKind": {
+      "description": "What `rocky audit --for <selector>` resolved its selector to.\n\nThe selector is resolved in priority order: a 64-char hex string with a plan file on disk is a [`AuditSubjectKind::Plan`]; a string matching a `run_id` in the run ledger is a [`AuditSubjectKind::Run`]; anything else is treated as a [`AuditSubjectKind::Model`] name.",
+      "oneOf": [
+        {
+          "description": "A model / table name — the primary custody-chain entry point.",
+          "enum": [
+            "model"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A `run_id` from the run ledger.",
+          "enum": [
+            "run"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A `plan_id` (64-char blake3 hex) with a plan file on disk.",
+          "enum": [
+            "plan"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyCapability": {
+      "description": "The class of action a policy rule governs.\n\n`read` is always allowed (short-circuit). The mutating verbs (`propose` … `quarantine`) name coarse operations; `schema_change.additive`, `schema_change.breaking`, and `value_change` are *refinements* of the apply/promote verbs — a rule naming a bare verb (`apply`/`promote`) matches those refinements too, but a rule naming a refinement matches only that exact refinement.",
+      "oneOf": [
+        {
+          "description": "Read model output / metadata. Always allowed.",
+          "enum": [
+            "read"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Draft a plan for later review.",
+          "enum": [
+            "propose"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Apply a plan against the warehouse.",
+          "enum": [
+            "apply"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Promote a branch / environment.",
+          "enum": [
+            "promote"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Backfill historical partitions.",
+          "enum": [
+            "backfill"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Garbage-collect / reclaim storage.",
+          "enum": [
+            "gc"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Retry a failed run.",
+          "enum": [
+            "retry"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Quarantine a partition / model.",
+          "enum": [
+            "quarantine"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "An additive schema change (refinement of apply/promote).",
+          "enum": [
+            "schema_change.additive"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A breaking schema change (refinement of apply/promote).",
+          "enum": [
+            "schema_change.breaking"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A value-only data change (refinement of apply/promote).",
+          "enum": [
+            "value_change"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyEffect": {
+      "description": "The verdict a policy rule (or the default posture) yields.\n\nOrdered by restrictiveness for incomparable-rule tie-breaking: `Deny` is a hard override (handled separately), and among non-deny verdicts `RequireReview` is more restrictive than `Allow`.",
+      "oneOf": [
+        {
+          "description": "Permit the action outright.",
+          "enum": [
+            "allow"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Permit only after human review. The safe default posture.",
+          "enum": [
+            "require_review"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Refuse the action. A hard override — no `allow` overturns it.",
+          "enum": [
+            "deny"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyPrincipal": {
+      "description": "Who is attempting an action.\n\n`agent` is a non-human caller (an AI harness authoring, applying, or remediating). `human` is a person. In v0 the principal is supplied explicitly (`rocky policy check --principal …`); auto-detection is a later phase.",
+      "oneOf": [
+        {
+          "description": "A person.",
+          "enum": [
+            "human"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A non-human caller (AI agent / automation).",
+          "enum": [
+            "agent"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SectionAvailability": {
+      "description": "Whether a brief section's underlying query succeeded and had data.\n\nThe digest is composed section-by-section from independent typed queries over the state store and the decision ledger. Each section fails closed: a query that returns nothing renders as [`SectionAvailability::NoData`], and a source that is not wired into the state store at all renders as [`SectionAvailability::Unavailable`] with a note — never as a smoothed-over \"all clear\". A brief that claims more than the ledger holds poisons the whole surface, so the marker is machine-readable, not prose.",
+      "oneOf": [
+        {
+          "description": "The query ran and the section carries data for the window.",
+          "enum": [
+            "available"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The query ran cleanly but nothing fell inside the window.",
+          "enum": [
+            "no_data"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The underlying signal is not recorded in the state store, so the section cannot be composed. Accompanied by a `note` explaining why.",
+          "enum": [
+            "unavailable"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "JSON output for `rocky audit --for <table|run|plan>` — the custody chain.\n\nA one-query drill-down assembled link by link from the data Rocky already records: who proposed the change and what the policy plane decided ([`Self::decisions`]), what the plan changed ([`Self::plan`]), which runs materialized it ([`Self::runs`]), what a post-apply verification found ([`Self::verify_after`]), and what sits downstream in its blast radius ([`Self::blast_radius`]).\n\nEvery link fails closed the same way the estate brief does: a link whose signal is genuinely not recorded renders [`SectionAvailability::Unavailable`] with a note, never a fabricated or assumed value. Notably, post-apply verification outcomes are not persisted anywhere today, so [`Self::verify_after`] is always `unavailable`; and the run ledger is not keyed to policy decisions, so a `run` selector cannot join back to a decision. The blast radius is recomputed from the current compiled graph (a live query, not a stored snapshot).",
+  "properties": {
+    "blast_radius": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AuditChainBlastRadius"
+        }
+      ],
+      "description": "What sits downstream of the subject — the CLL blast radius."
+    },
+    "command": {
+      "type": "string"
+    },
+    "decisions": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AuditChainDecisions"
+        }
+      ],
+      "description": "Who proposed the change and what the policy plane decided — the persisted decision ledger, scoped to this subject."
+    },
+    "plan": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AuditChainPlan"
+        }
+      ],
+      "description": "What the governing plan changed (its embedded per-model change classification)."
+    },
+    "resolved": {
+      "description": "Whether the selector matched anything at all (a decision, a run, a plan file, or a model in the graph). `false` when nothing referenced it — every link is then empty and says why.",
+      "type": "boolean"
+    },
+    "runs": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AuditChainRuns"
+        }
+      ],
+      "description": "Runs that materialized the subject."
+    },
+    "subject": {
+      "description": "The selector as supplied on the command line.",
+      "type": "string"
+    },
+    "subject_kind": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AuditSubjectKind"
+        }
+      ],
+      "description": "What the selector resolved to."
+    },
+    "verify_after": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AuditChainVerify"
+        }
+      ],
+      "description": "What a post-apply verification found — not recorded today."
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "blast_radius",
+    "command",
+    "decisions",
+    "plan",
+    "resolved",
+    "runs",
+    "subject",
+    "subject_kind",
+    "verify_after",
+    "version"
+  ],
+  "title": "AuditForOutput",
+  "type": "object"
+}

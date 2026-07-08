@@ -397,16 +397,21 @@ enum Command {
         plan_id: String,
     },
 
-    /// Review an AI-authored plan before it can be applied.
+    /// Review an AI-authored plan before it can be applied, or list the queue.
     ///
     /// AI agents can author plans, but a bare `rocky apply` refuses to execute
-    /// an AI-authored plan until a human has reviewed it. `rocky review`
-    /// compiles the working-tree models, diffs them against `--base`, and
-    /// reports the breaking-change findings. With `--approve` it records a
-    /// sign-off marker that unblocks `rocky apply <plan-id>`.
+    /// an AI-authored plan until a human has reviewed it. `rocky review
+    /// <plan-id>` compiles the working-tree models, diffs them against
+    /// `--base`, and reports the breaking-change findings. With `--approve` it
+    /// records a sign-off marker that unblocks `rocky apply <plan-id>`.
+    ///
+    /// `rocky review --queue` lists every pending `require_review` escalation,
+    /// ranked by blast radius × change class × staleness, each with the exact
+    /// `rocky review <plan-id> --approve` command that clears it.
     Review {
-        /// AI-authored plan identifier (64-char blake3 hex) to review.
-        plan_id: String,
+        /// Plan identifier (64-char blake3 hex) to review. Omitted with
+        /// `--queue`.
+        plan_id: Option<String>,
         /// Git ref to diff the working-tree models against.
         #[arg(long, default_value = "HEAD")]
         base: String,
@@ -414,6 +419,12 @@ enum Command {
         /// unblocks `rocky apply`. Without this flag the review is a dry run.
         #[arg(long)]
         approve: bool,
+        /// List the pending-review queue instead of reviewing a single plan.
+        #[arg(long)]
+        queue: bool,
+        /// Models directory used to rank the queue by downstream blast radius.
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
     },
 
     /// Agent-authority policy plane (explain-mode in v0).
@@ -426,12 +437,28 @@ enum Command {
         subcommand: PolicySubcommand,
     },
 
-    /// Show the agent-policy decision ledger
+    /// Show the agent-policy decision ledger, or a subject's custody chain.
     ///
-    /// Lists every policy decision recorded at a mutating enforcement seam
-    /// (`rocky apply` / promote), oldest first. Reads are never recorded, so
-    /// this is the audit trail of governed mutations the policy plane evaluated.
-    Audit,
+    /// Bare `rocky audit` lists every policy decision recorded at a mutating
+    /// enforcement seam (`rocky apply` / promote), oldest first. Reads are
+    /// never recorded, so this is the audit trail of governed mutations the
+    /// policy plane evaluated.
+    ///
+    /// `rocky audit --for <table|run|plan>` drills into the custody chain for a
+    /// single subject: who proposed the change and what policy decided, what
+    /// the plan changed, which runs materialized it, what verification found,
+    /// and what sits downstream in its blast radius — the alert → full-chain
+    /// path in one command. A link whose signal is not recorded says so rather
+    /// than fabricating a value.
+    Audit {
+        /// Drill into the custody chain for a single subject — a model/table
+        /// name, a `run_id`, or a `plan_id`.
+        #[arg(long = "for")]
+        for_subject: Option<String>,
+        /// Models directory used to compute the downstream blast radius.
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
+    },
 
     /// The governor's estate digest — what happened and what needs you.
     ///
@@ -2585,7 +2612,21 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             plan_id,
             base,
             approve,
-        } => rocky_cli::commands::run_review(&cli.config, &plan_id, &base, approve, json).await,
+            queue,
+            models,
+        } => {
+            if queue {
+                rocky_cli::commands::run_review_queue(&cli.config, &state_path, &models, json)
+            } else {
+                let Some(plan_id) = plan_id else {
+                    anyhow::bail!(
+                        "`rocky review` needs a <plan-id> to review, or `--queue` to list the \
+                         pending-review queue"
+                    );
+                };
+                rocky_cli::commands::run_review(&cli.config, &plan_id, &base, approve, json).await
+            }
+        }
         Command::Policy { subcommand } => match subcommand {
             PolicySubcommand::Check {
                 principal,
@@ -2601,7 +2642,19 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 json,
             ),
         },
-        Command::Audit => rocky_cli::commands::run_audit(&state_path, json),
+        Command::Audit {
+            for_subject,
+            models,
+        } => match for_subject {
+            Some(selector) => rocky_cli::commands::run_audit_for(
+                &cli.config,
+                &state_path,
+                &models,
+                &selector,
+                json,
+            ),
+            None => rocky_cli::commands::run_audit(&state_path, json),
+        },
         Command::Brief { since } => {
             rocky_cli::commands::run_brief(&state_path, &cli.config, since.into(), json)
         }

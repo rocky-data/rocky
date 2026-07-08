@@ -853,7 +853,7 @@ class PolicyCapability(StrEnum):
     read = "read"
 
 
-class PolicyCapability36(StrEnum):
+class PolicyCapability59(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -861,7 +861,7 @@ class PolicyCapability36(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability37(StrEnum):
+class PolicyCapability60(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -869,7 +869,7 @@ class PolicyCapability37(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability38(StrEnum):
+class PolicyCapability61(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -877,7 +877,7 @@ class PolicyCapability38(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability39(StrEnum):
+class PolicyCapability62(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -885,7 +885,7 @@ class PolicyCapability39(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability40(StrEnum):
+class PolicyCapability63(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -893,7 +893,7 @@ class PolicyCapability40(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability41(StrEnum):
+class PolicyCapability64(StrEnum):
     """
     Retry a failed run.
     """
@@ -901,7 +901,7 @@ class PolicyCapability41(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability42(StrEnum):
+class PolicyCapability65(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -909,7 +909,7 @@ class PolicyCapability42(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability43(StrEnum):
+class PolicyCapability66(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -917,7 +917,7 @@ class PolicyCapability43(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability44(StrEnum):
+class PolicyCapability67(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -925,7 +925,7 @@ class PolicyCapability44(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability45(StrEnum):
+class PolicyCapability68(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -933,7 +933,7 @@ class PolicyCapability45(StrEnum):
     value_change = "value_change"
 
 
-class PolicyEffect10(StrEnum):
+class PolicyEffect13(StrEnum):
     """
     Permit the action outright.
     """
@@ -941,7 +941,7 @@ class PolicyEffect10(StrEnum):
     allow = "allow"
 
 
-class PolicyEffect11(StrEnum):
+class PolicyEffect14(StrEnum):
     """
     Permit only after human review. The safe default posture.
     """
@@ -949,7 +949,7 @@ class PolicyEffect11(StrEnum):
     require_review = "require_review"
 
 
-class PolicyEffect12(StrEnum):
+class PolicyEffect15(StrEnum):
     """
     Refuse the action. A hard override — no `allow` overturns it.
     """
@@ -965,7 +965,7 @@ class PolicyPrincipal(StrEnum):
     human = "human"
 
 
-class PolicyPrincipal9(StrEnum):
+class PolicyPrincipal14(StrEnum):
     """
     A non-human caller (AI agent / automation).
     """
@@ -2043,16 +2043,16 @@ class PolicyRule(BaseModel):
     )
     capability: (
         PolicyCapability
-        | PolicyCapability36
-        | PolicyCapability37
-        | PolicyCapability38
-        | PolicyCapability39
-        | PolicyCapability40
-        | PolicyCapability41
-        | PolicyCapability42
-        | PolicyCapability43
-        | PolicyCapability44
-        | PolicyCapability45
+        | PolicyCapability59
+        | PolicyCapability60
+        | PolicyCapability61
+        | PolicyCapability62
+        | PolicyCapability63
+        | PolicyCapability64
+        | PolicyCapability65
+        | PolicyCapability66
+        | PolicyCapability67
+        | PolicyCapability68
     )
     """
     Which capability this rule governs.
@@ -2061,11 +2061,11 @@ class PolicyRule(BaseModel):
     """
     Optional v1 conditional refinements. **Parsed and ignored in v0** — captured as opaque JSON so a config authored for v1 still loads.
     """
-    effect: PolicyEffect10 | PolicyEffect11 | PolicyEffect12
+    effect: PolicyEffect13 | PolicyEffect14 | PolicyEffect15
     """
     The verdict when this rule matches.
     """
-    principal: PolicyPrincipal | PolicyPrincipal9
+    principal: PolicyPrincipal | PolicyPrincipal14
     """
     Who this rule applies to.
     """
@@ -2866,7 +2866,7 @@ class PolicyConfig(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
     )
-    default_agent_effect: PolicyEffect10 | PolicyEffect11 | PolicyEffect12 | None = (
+    default_agent_effect: PolicyEffect13 | PolicyEffect14 | PolicyEffect15 | None = (
         "require_review"
     )
     """

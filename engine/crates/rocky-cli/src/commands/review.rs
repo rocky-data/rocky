@@ -20,15 +20,21 @@
 //! emitted output therefore always lists the full classified delta so the
 //! approval is informed.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use rocky_core::breaking_change::{self, BreakingFinding};
+use rocky_core::config::{PolicyCapability, PolicyEffect};
+use rocky_core::state::{PolicyDecisionRecord, StateStore};
 use serde::{Deserialize, Serialize};
 
-use crate::commands::apply::review_marker_path;
-use crate::output::{ApproverIdentity, ReviewOutput, RunPlan, print_json};
+use crate::commands::apply::{ai_plan_is_reviewed, review_marker_path};
+use crate::commands::audit::{blast_radius_of, compile_project};
+use crate::output::{
+    ApproverIdentity, ReviewOutput, ReviewQueueEntry, ReviewQueueOutput, RunPlan, print_json,
+};
 use crate::plan_store::{PlanKind, read_plan};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -320,6 +326,223 @@ fn write_review_marker(root: &Path, plan_id: &str, marker: &ReviewMarker) -> Res
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// `rocky review --queue` — the pending-review work queue
+// ---------------------------------------------------------------------------
+
+/// Upper bound on decision history scanned when building the queue.
+const MAX_HISTORY_SCAN: usize = 10_000;
+
+/// Human-readable description of the queue ordering.
+const QUEUE_RANKING: &str = "blast_radius × classification × staleness";
+
+/// Execute `rocky review --queue`.
+///
+/// Lists every `require_review` policy decision not yet cleared by a sign-off
+/// marker, ranked so the change most in need of a human floats to the top. The
+/// approval path is unchanged: each entry names the `rocky review <plan_id>
+/// --approve` command that clears it.
+pub fn run_review_queue(
+    config_path: &Path,
+    state_path: &Path,
+    models_dir: &Path,
+    output_json: bool,
+) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    run_review_queue_in(&cwd, config_path, state_path, models_dir, output_json)
+}
+
+/// Inner implementation — takes an explicit `root` (for the marker check) so
+/// tests can drive it without touching the process cwd.
+pub(crate) fn run_review_queue_in(
+    root: &Path,
+    config_path: &Path,
+    state_path: &Path,
+    models_dir: &Path,
+    output_json: bool,
+) -> Result<()> {
+    let decisions: Vec<PolicyDecisionRecord> = if state_path.exists() {
+        let store = StateStore::open_read_only(state_path)
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+        store
+            .list_policy_decisions()
+            .context("failed to read the policy-decision ledger")?
+    } else {
+        Vec::new()
+    };
+
+    let pending = build_queue(
+        root,
+        config_path,
+        state_path,
+        models_dir,
+        &decisions,
+        Utc::now(),
+    );
+
+    let output = ReviewQueueOutput {
+        version: VERSION.to_string(),
+        command: "review".to_string(),
+        ranking: QUEUE_RANKING.to_string(),
+        total: pending.len() as u64,
+        pending,
+    };
+
+    if output_json {
+        print_json(&output)?;
+    } else {
+        render_queue_text(&output);
+    }
+    Ok(())
+}
+
+/// Assemble the ranked queue from the decision ledger. Factored out so the
+/// ranking is unit-testable without a state store.
+fn build_queue(
+    root: &Path,
+    config_path: &Path,
+    state_path: &Path,
+    models_dir: &Path,
+    decisions: &[PolicyDecisionRecord],
+    now: DateTime<Utc>,
+) -> Vec<ReviewQueueEntry> {
+    let outstanding = select_outstanding(decisions, |plan_id| ai_plan_is_reviewed(root, plan_id));
+    if outstanding.is_empty() {
+        return Vec::new();
+    }
+
+    // One compile serves every model's blast radius. A compile failure leaves
+    // every blast radius unknown (weight-and-staleness-only ranking) rather
+    // than failing the whole queue.
+    let compiled = compile_project(config_path, state_path, models_dir).ok();
+
+    let mut entries: Vec<ReviewQueueEntry> = outstanding
+        .into_iter()
+        .map(|d| {
+            let blast_radius = compiled
+                .as_ref()
+                .and_then(|r| blast_radius_of(r, &d.model))
+                .map(|(_, transitive)| transitive.len() as u64);
+            let classification_weight = classification_weight(d.capability);
+            let staleness_seconds = (now - d.timestamp).num_seconds().max(0);
+            let score = queue_score(blast_radius, classification_weight, staleness_seconds);
+            ReviewQueueEntry {
+                plan_id: d.plan_id.clone(),
+                decision_ref: format!("{}|{}|{}", d.timestamp.to_rfc3339(), d.plan_id, d.model),
+                timestamp: d.timestamp.to_rfc3339(),
+                principal: d.principal,
+                capability: d.capability,
+                model: d.model.clone(),
+                rule_id: d.rule_id,
+                reason: d.reason.clone(),
+                blast_radius,
+                classification_weight,
+                staleness_seconds,
+                score,
+                approve_command: format!("rocky review {} --approve", d.plan_id),
+            }
+        })
+        .collect();
+
+    // Highest score first; deterministic tie-break on plan_id then model.
+    entries.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.plan_id.cmp(&b.plan_id))
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    entries
+}
+
+/// The pending escalations to surface: the latest `require_review` decision
+/// per `(plan_id, model)` whose plan has not yet been signed off.
+///
+/// A re-evaluated plan appends a fresh ledger row each time, so the queue
+/// keeps only the newest row per `(plan_id, model)` — current state, not
+/// history — and drops any whose plan already carries a review marker
+/// (`is_reviewed`). Pure over the ledger + the marker predicate so the
+/// dedup/filter logic is testable without a state store.
+fn select_outstanding(
+    decisions: &[PolicyDecisionRecord],
+    is_reviewed: impl Fn(&str) -> bool,
+) -> Vec<&PolicyDecisionRecord> {
+    let mut latest: BTreeMap<(&str, &str), &PolicyDecisionRecord> = BTreeMap::new();
+    for d in decisions
+        .iter()
+        .take(MAX_HISTORY_SCAN)
+        .filter(|d| d.effect == PolicyEffect::RequireReview)
+    {
+        latest
+            .entry((d.plan_id.as_str(), d.model.as_str()))
+            .and_modify(|cur| {
+                if d.timestamp > cur.timestamp {
+                    *cur = d;
+                }
+            })
+            .or_insert(d);
+    }
+    latest
+        .into_values()
+        .filter(|d| !is_reviewed(&d.plan_id))
+        .collect()
+}
+
+/// Composite priority score: `(blast + 1) × classification_weight ×
+/// (1 + staleness_hours)`. Higher sorts first. An unknown blast radius
+/// (compile failed / model removed) contributes as zero so the entry still
+/// ranks on class and age rather than dropping out.
+fn queue_score(
+    blast_radius: Option<u64>,
+    classification_weight: u32,
+    staleness_seconds: i64,
+) -> f64 {
+    let staleness_factor = 1.0 + (staleness_seconds.max(0) as f64 / 3600.0);
+    (blast_radius.unwrap_or(0) + 1) as f64 * f64::from(classification_weight) * staleness_factor
+}
+
+/// Change-class weight for the ranking: a breaking schema change outranks a
+/// bare mutating verb, which outranks an additive / value-only change.
+fn classification_weight(capability: PolicyCapability) -> u32 {
+    match capability {
+        PolicyCapability::SchemaChangeBreaking => 3,
+        PolicyCapability::Apply | PolicyCapability::Promote | PolicyCapability::Backfill => 2,
+        _ => 1,
+    }
+}
+
+/// Render the queue as a concise human-readable list.
+fn render_queue_text(out: &ReviewQueueOutput) {
+    if out.pending.is_empty() {
+        println!("review queue: no escalations awaiting review");
+        return;
+    }
+    println!(
+        "review queue: {} escalation(s) awaiting review (ranked by {})",
+        out.total, out.ranking
+    );
+    for (i, e) in out.pending.iter().enumerate() {
+        let blast = e
+            .blast_radius
+            .map(|b| format!("{b} downstream"))
+            .unwrap_or_else(|| "blast radius unknown".to_string());
+        let principal = serde_json::to_value(e.principal)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        println!(
+            "  {}. {} ({}) — {}, waited {}s [score {:.1}]",
+            i + 1,
+            e.model,
+            principal,
+            blast,
+            e.staleness_seconds,
+            e.score,
+        );
+        println!("     {}", e.reason);
+        println!("     approve: {}", e.approve_command);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +639,111 @@ mod tests {
     fn message_handles_skipped_gate() {
         let msg = build_message(false, 0, &None, "deadbeef");
         assert!(msg.contains("gate skipped"), "skipped-gate msg: {msg}");
+    }
+
+    // ---------- review queue ----------
+
+    use chrono::TimeZone;
+    use rocky_core::config::PolicyPrincipal;
+
+    fn qd(
+        secs: u32,
+        plan_id: &str,
+        model: &str,
+        effect: PolicyEffect,
+        cap: PolicyCapability,
+    ) -> PolicyDecisionRecord {
+        PolicyDecisionRecord {
+            timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
+            plan_id: plan_id.to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: cap,
+            model: model.to_string(),
+            effect,
+            rule_id: None,
+            reason: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn classification_weight_orders_breaking_over_verb_over_additive() {
+        assert!(
+            classification_weight(PolicyCapability::SchemaChangeBreaking)
+                > classification_weight(PolicyCapability::Apply)
+        );
+        assert!(
+            classification_weight(PolicyCapability::Apply)
+                > classification_weight(PolicyCapability::SchemaChangeAdditive)
+        );
+        assert_eq!(
+            classification_weight(PolicyCapability::ValueChange),
+            classification_weight(PolicyCapability::SchemaChangeAdditive)
+        );
+    }
+
+    #[test]
+    fn queue_score_rewards_blast_class_and_staleness() {
+        // More blast radius ranks higher, all else equal.
+        assert!(queue_score(Some(5), 1, 0) > queue_score(Some(0), 1, 0));
+        // A more disruptive change class ranks higher.
+        assert!(queue_score(Some(0), 3, 0) > queue_score(Some(0), 1, 0));
+        // A staler escalation ranks higher.
+        assert!(queue_score(Some(0), 1, 7200) > queue_score(Some(0), 1, 0));
+        // An unknown blast radius contributes as zero, not as a drop-out.
+        assert_eq!(queue_score(None, 2, 0), queue_score(Some(0), 2, 0));
+    }
+
+    #[test]
+    fn select_outstanding_filters_effect_and_reviewed_and_dedupes() {
+        let decisions = vec![
+            // require_review, plan A / model x — two rows, newest wins.
+            qd(
+                1,
+                "planA",
+                "x",
+                PolicyEffect::RequireReview,
+                PolicyCapability::SchemaChangeAdditive,
+            ),
+            qd(
+                9,
+                "planA",
+                "x",
+                PolicyEffect::RequireReview,
+                PolicyCapability::SchemaChangeBreaking,
+            ),
+            // require_review on an already-reviewed plan — dropped.
+            qd(
+                2,
+                "planReviewed",
+                "y",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+            // not a require_review — never in the queue.
+            qd(
+                3,
+                "planC",
+                "z",
+                PolicyEffect::Deny,
+                PolicyCapability::SchemaChangeBreaking,
+            ),
+            qd(
+                4,
+                "planD",
+                "w",
+                PolicyEffect::Allow,
+                PolicyCapability::SchemaChangeAdditive,
+            ),
+        ];
+
+        let out = select_outstanding(&decisions, |plan_id| plan_id == "planReviewed");
+
+        // Only planA/x survives: deny + allow excluded, planReviewed filtered.
+        assert_eq!(out.len(), 1);
+        let d = out[0];
+        assert_eq!(d.plan_id, "planA");
+        assert_eq!(d.model, "x");
+        // The newest of the two planA/x rows wins (the breaking one at secs=9).
+        assert_eq!(d.capability, PolicyCapability::SchemaChangeBreaking);
     }
 }
