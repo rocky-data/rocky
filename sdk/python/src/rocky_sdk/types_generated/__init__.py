@@ -166,6 +166,27 @@ from .compare_schema import CompareOutput, TableCompareResult
 # Cost command (historical per-run cost attribution)
 from .cost_schema import CostOutput, PerModelCostHistorical
 
+# Brief command (the governor's estate digest)
+from .brief_schema import (
+    BriefAgentActivitySection,
+    BriefBudgetStatus,
+    BriefCostSection,
+    BriefDecisionEntry,
+    BriefDriftEntry,
+    BriefDriftSection,
+    BriefEscalationsSection,
+    BriefFailedModel,
+    BriefFreshnessEntry,
+    BriefFreshnessSection,
+    BriefOutput,
+    BriefPrincipalActivity,
+    BriefQualityEntry,
+    BriefQualitySection,
+    BriefRunCost,
+    BriefRunEntry,
+    BriefRunsSection,
+)
+
 # Compact command — canonical source for NamedStatement (also used by archive)
 from .compact_schema import CompactOutput, NamedStatement
 
@@ -404,6 +425,24 @@ __all__ = [
     # cost
     "CostOutput",
     "PerModelCostHistorical",
+    # brief
+    "BriefOutput",
+    "BriefAgentActivitySection",
+    "BriefPrincipalActivity",
+    "BriefDecisionEntry",
+    "BriefEscalationsSection",
+    "BriefRunsSection",
+    "BriefRunEntry",
+    "BriefFailedModel",
+    "BriefDriftSection",
+    "BriefDriftEntry",
+    "BriefFreshnessSection",
+    "BriefFreshnessEntry",
+    "BriefQualitySection",
+    "BriefQualityEntry",
+    "BriefCostSection",
+    "BriefRunCost",
+    "BriefBudgetStatus",
     # compact (canonical source for NamedStatement)
     "CompactOutput",
     "NamedStatement",

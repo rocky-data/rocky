@@ -188,6 +188,33 @@ fn resolve_cli_principal(
 enum OutputFormat {
     Json,
     Table,
+    /// Markdown. Only `rocky brief` renders a distinct Markdown document; on
+    /// every other command it is treated as the non-JSON (`table`) format.
+    Md,
+}
+
+/// `--since` window for `rocky brief`.
+#[derive(Clone, Copy, clap::ValueEnum, PartialEq, Eq, Debug)]
+enum BriefSinceArg {
+    /// Everything since the previous `--since last` digest (the stored
+    /// cursor). Advances the cursor on success.
+    Last,
+    /// A rolling 24-hour window ending now.
+    #[value(name = "24h")]
+    Hours24,
+    /// A rolling 7-day window ending now.
+    #[value(name = "7d")]
+    Days7,
+}
+
+impl From<BriefSinceArg> for rocky_cli::commands::BriefSince {
+    fn from(arg: BriefSinceArg) -> Self {
+        match arg {
+            BriefSinceArg::Last => rocky_cli::commands::BriefSince::Last,
+            BriefSinceArg::Hours24 => rocky_cli::commands::BriefSince::Hours24,
+            BriefSinceArg::Days7 => rocky_cli::commands::BriefSince::Days7,
+        }
+    }
 }
 
 /// Resolve the effective output format from the (optional) `--output` flag.
@@ -405,6 +432,24 @@ enum Command {
     /// (`rocky apply` / promote), oldest first. Reads are never recorded, so
     /// this is the audit trail of governed mutations the policy plane evaluated.
     Audit,
+
+    /// The governor's estate digest — what happened and what needs you.
+    ///
+    /// A typed projection of the state store and the policy-decision ledger
+    /// over a window: decisions awaiting review (ranked), agent activity by
+    /// principal, runs, drift, freshness, quality, and cost. Composed
+    /// template-first from typed queries — every line cites a `run_id`,
+    /// `plan_id`, or `decision_ref`, and a section whose signal is not
+    /// recorded fails closed to `unavailable` rather than a false all-clear.
+    ///
+    /// `--output json` is the machine surface; the default (or `--output md`)
+    /// renders a Slack/email-ready Markdown digest a webhook hook can post.
+    Brief {
+        /// Window: `last` (since the previous `--since last` digest — the
+        /// stored cursor, which this advances), `24h`, or `7d`.
+        #[arg(long, value_enum, default_value_t = BriefSinceArg::Last)]
+        since: BriefSinceArg,
+    },
 
     /// Validate config without connecting to any APIs
     Validate,
@@ -2557,6 +2602,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             ),
         },
         Command::Audit => rocky_cli::commands::run_audit(&state_path, json),
+        Command::Brief { since } => {
+            rocky_cli::commands::run_brief(&state_path, &cli.config, since.into(), json)
+        }
         Command::Validate => rocky_cli::commands::validate(&cli.config, json),
         Command::Discover {
             pipeline,
@@ -3849,6 +3897,20 @@ mod tests {
     #[test]
     fn resolve_output_default_pipe_is_json() {
         assert_eq!(resolve_output(None, false), OutputFormat::Json);
+    }
+
+    /// An explicit `--output md` (used by `rocky brief`) passes through
+    /// unchanged and is not the JSON format.
+    #[test]
+    fn resolve_output_explicit_md_passes_through() {
+        assert_eq!(
+            resolve_output(Some(OutputFormat::Md), true),
+            OutputFormat::Md
+        );
+        assert!(!matches!(
+            resolve_output(Some(OutputFormat::Md), false),
+            OutputFormat::Json
+        ));
     }
 
     /// Serialises every env-mutating test in this module so concurrent

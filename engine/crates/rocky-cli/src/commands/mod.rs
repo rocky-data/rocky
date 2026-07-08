@@ -7,6 +7,7 @@ mod audit;
 #[cfg(feature = "duckdb")]
 pub mod bench;
 mod branch;
+mod brief;
 mod catalog;
 #[cfg(feature = "duckdb")]
 mod ci;
@@ -89,6 +90,7 @@ pub use branch::{
     run_branch_approve, run_branch_compare, run_branch_create, run_branch_delete, run_branch_list,
     run_branch_promote, run_branch_promote_from_plan, run_branch_show,
 };
+pub use brief::{BriefSince, run_brief};
 pub use catalog::{
     CatalogFormat, compute_catalog_output, default_out_dir as catalog_default_out_dir, run_catalog,
 };
