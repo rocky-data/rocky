@@ -23,6 +23,15 @@ pub struct ServerState {
     pub compile_result: RwLock<Option<CompileResult>>,
     /// Latest DAG execution status, exposed at `GET /api/v1/dag/status`.
     pub dag_status: DagStatusStore,
+    /// App-level single-mutating-job guard for the HTTP job model. A second
+    /// `run`/`apply` submission while one holds it is rejected with
+    /// `409 mutation_in_progress`. In-memory only — does not survive a restart
+    /// (the redb advisory lock is the correctness backstop).
+    pub mutation_permit: crate::jobs::MutationPermit,
+    /// Fast in-memory cache of job records fronting the durable `jobs` state
+    /// table, serving `GET /api/v1/jobs/{id}` without touching redb on the hot
+    /// path. Repopulated lazily from redb after a restart.
+    pub jobs: crate::jobs::JobRegistry,
     /// Bearer token required by the HTTP API auth middleware. `None`
     /// means "no auth"; in that mode [`crate::api::serve`] refuses to
     /// bind a non-loopback host. See [`crate::auth::require_bearer_token`].
@@ -64,6 +73,8 @@ impl ServerState {
             config_path,
             compile_result: RwLock::new(None),
             dag_status: DagStatusStore::new(),
+            mutation_permit: crate::jobs::MutationPermit::new(),
+            jobs: crate::jobs::JobRegistry::new(),
             auth_token,
             allowed_origins,
             schema_cache_throttle: SchemaCacheThrottle::new(),

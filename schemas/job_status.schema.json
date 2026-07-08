@@ -1,0 +1,130 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "JobKind": {
+      "description": "The kind of long-running operation a job wraps.",
+      "oneOf": [
+        {
+          "description": "`rocky run` — materializes tables. Takes the mutation permit.",
+          "enum": [
+            "run"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`rocky plan` — previews and persists a plan. Non-mutating; no permit.",
+          "enum": [
+            "plan"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`rocky apply` — executes a persisted plan. Takes the mutation permit.",
+          "enum": [
+            "apply"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "JobState": {
+      "description": "Lifecycle state of a job.",
+      "oneOf": [
+        {
+          "description": "Accepted, not yet started.",
+          "enum": [
+            "queued"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The underlying `rocky <kind>` subprocess is executing.",
+          "enum": [
+            "running"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The subprocess exited 0.",
+          "enum": [
+            "succeeded"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The subprocess exited non-zero, or could not be launched.",
+          "enum": [
+            "failed"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "Status of a `rocky serve` long-running job (`GET /api/v1/jobs/{id}`).\n\nThe presentation type over `rocky-core`'s `PersistedJob`: it carries the same lifecycle facts with typed [`JobKind`]/[`JobState`] enums for embedder ergonomics, and — once the job is terminal — the canonical `RunOutput` / `PlanOutput` / `ApplyOutput` the underlying subprocess emitted, embedded **verbatim** in [`result`](Self::result). An embedder switches on [`kind`](Self::kind) to know which schema `result` conforms to (the same `run` / `plan` / `apply` schemas the CLI exports).",
+  "properties": {
+    "error": {
+      "description": "Failure detail when [`state`](Self::state) is [`JobState::Failed`], else `null`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "finished_at": {
+      "description": "When the job reached a terminal state (RFC 3339), or `null` if not yet.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "job_id": {
+      "description": "Opaque job identifier (as returned by `POST /api/v1/jobs/{kind}`).",
+      "type": "string"
+    },
+    "kind": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/JobKind"
+        }
+      ],
+      "description": "Which operation the job wraps."
+    },
+    "principal": {
+      "description": "The advisory, spoofable `X-Rocky-Principal` recorded for audit, or `null`. Never an authorization input under the single-shared-secret auth ceiling.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "result": {
+      "description": "The canonical output of the underlying `rocky <kind>` command, embedded verbatim once the job is terminal (`null` while queued/running). Its shape is the `run` / `plan` / `apply` schema selected by [`kind`](Self::kind)."
+    },
+    "started_at": {
+      "description": "When execution started (RFC 3339), or `null` if not yet.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "state": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/JobState"
+        }
+      ],
+      "description": "Current lifecycle state."
+    },
+    "submitted_at": {
+      "description": "When the job was submitted (RFC 3339).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "job_id",
+    "kind",
+    "state",
+    "submitted_at"
+  ],
+  "title": "JobStatus",
+  "type": "object"
+}

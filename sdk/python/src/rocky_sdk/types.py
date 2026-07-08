@@ -1114,6 +1114,7 @@ from .types_generated import (  # noqa: E402, F401
     FailedSourceOutput,
     FreshnessConfigOutput,
     HistoryOutput,
+    JobStatus,
     LineageColumnChange,
     LineageColumnDef,
     LineageDiffOutput,

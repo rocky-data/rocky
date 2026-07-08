@@ -24,6 +24,7 @@
 pub mod auth;
 pub mod dag_viz;
 pub mod dashboard;
+pub mod jobs;
 pub mod lsp;
 pub(crate) mod schema_cache_throttle;
 pub mod state;

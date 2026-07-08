@@ -48,6 +48,7 @@ export type { ColumnLineageOutput } from "./column_lineage";
 
 // serve HTTP API — structured error body + /meta feature-detection payload
 export type { ErrorEnvelope } from "./error_envelope";
+export type { JobStatus } from "./job_status";
 export type { MetaOutput } from "./meta";
 
 // Lineage (model-level shape)
