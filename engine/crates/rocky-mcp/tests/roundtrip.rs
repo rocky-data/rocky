@@ -83,6 +83,7 @@ async fn tools_list_returns_expected_set() {
             "compile",
             "dependents",
             "draft_contract",
+            "draft_model",
             "drift_preview",
             "explain_model",
             "generate_tests",
@@ -343,6 +344,272 @@ effect = "require_review"
     assert!(
         message.contains(plan_id) || hint.contains(plan_id),
         "the recorded plan_id is surfaced: message={message} hint={hint}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// Write a `models/_defaults.toml` supplying the target catalog/schema, so a
+/// drafted `<name>.sql` + intent-only sidecar resolves its target from project
+/// conventions (matching the real fixture convention) and compiles.
+fn write_target_defaults(dir: &Path) {
+    std::fs::write(
+        dir.join("models").join("_defaults.toml"),
+        "[target]\ncatalog = \"warehouse\"\nschema = \"out\"\n",
+    )
+    .unwrap();
+}
+
+fn draft_args(name: &str, sql: &str, intent: &str) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::json!({ "name": name, "sql": sql, "intent": intent })
+        .as_object()
+        .unwrap()
+        .clone()
+}
+
+/// The happy path: `draft_model` writes the SQL + a sidecar carrying the intent,
+/// compiles in the same call, returns the diagnostics, and reminds the flow.
+#[tokio::test]
+async fn draft_model_writes_compiles_and_reminds_flow() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    write_target_defaults(dir.path());
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "daily_revenue",
+                "SELECT 1 AS id, 100 AS revenue",
+                "Daily revenue rollup for the demo",
+            )),
+        )
+        .await
+        .expect("draft_model call");
+
+    assert_ne!(result.is_error, Some(true), "a valid draft is not an error");
+    let sc = result.structured_content.expect("structured content");
+    assert_eq!(sc["model"], serde_json::json!("daily_revenue"));
+    assert_eq!(sc["has_errors"], serde_json::json!(false));
+    assert_eq!(
+        sc["sql_path"],
+        serde_json::json!("models/daily_revenue.sql")
+    );
+    assert!(
+        sc["diagnostics"].is_array(),
+        "diagnostics returned with the write"
+    );
+    let next = sc["next_steps"].as_str().expect("next_steps");
+    assert!(
+        next.contains("propose") && next.contains("review") && next.contains("Never apply"),
+        "the response reminds the compile -> plan -> propose -> review flow: {next}"
+    );
+
+    // The draft landed on disk: SQL body + a sidecar carrying the intent.
+    let sql = dir.path().join("models").join("daily_revenue.sql");
+    let sidecar = dir.path().join("models").join("daily_revenue.toml");
+    assert!(sql.is_file(), "draft SQL written");
+    assert!(sidecar.is_file(), "sidecar written");
+    let sidecar_text = std::fs::read_to_string(&sidecar).unwrap();
+    assert!(
+        sidecar_text.contains("Daily revenue rollup for the demo"),
+        "sidecar carries the intent: {sidecar_text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The path guard: a name that would escape the models directory is refused with
+/// a structured `invalid_argument` envelope and writes nothing.
+#[tokio::test]
+async fn draft_model_refuses_path_escaping_name() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    for bad in [
+        "../evil",
+        "/etc/passwd",
+        "sub/model",
+        "..\\win",
+        "revenue.sql",
+    ] {
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                    bad,
+                    "SELECT 1 AS id",
+                    "x",
+                )),
+            )
+            .await
+            .expect("draft_model call");
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "path-escaping name '{bad}' must be refused"
+        );
+        let err = result.structured_content.expect("envelope");
+        assert_eq!(
+            err["code"],
+            serde_json::json!("invalid_argument"),
+            "name '{bad}'"
+        );
+    }
+
+    // Nothing was written for any refused name — the models dir still holds only
+    // the fixture's `orders` model, and no `evil` file escaped anywhere.
+    let mut sql_files: Vec<String> = std::fs::read_dir(dir.path().join("models"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".sql"))
+        .collect();
+    sql_files.sort();
+    assert_eq!(
+        sql_files,
+        vec!["orders.sql".to_string()],
+        "no draft written for a refused name"
+    );
+    assert!(
+        !dir.path().parent().unwrap().join("evil.sql").exists(),
+        "no file escaped the models directory"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// THE PIN: a policy-DENIED draft returns the structured `policy_denied`
+/// envelope AND leaves no file on disk — the deny rolls the write back, exactly
+/// as the propose gate's deny writes no plan. The decision is still recorded in
+/// the audit ledger.
+#[tokio::test]
+async fn draft_model_denied_by_policy_leaves_no_file() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "deny"
+"#,
+    );
+    write_target_defaults(dir.path());
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "shadow",
+                "SELECT 1 AS id",
+                "a draft the policy denies",
+            )),
+        )
+        .await
+        .expect("draft_model returns a result");
+
+    // Structured deny over the wire.
+    assert_eq!(result.is_error, Some(true), "a denied draft is an error");
+    let err = result
+        .structured_content
+        .expect("a denied draft carries the structured error envelope");
+    assert_eq!(err["code"], serde_json::json!("policy_denied"));
+    assert_eq!(
+        err["policy_rule"],
+        serde_json::json!("0"),
+        "the envelope names the deciding rule: {err:?}"
+    );
+    let hint = err["remediation_hint"].as_str().unwrap();
+    assert!(
+        hint.contains("Re-scope") || hint.contains("different"),
+        "remediation_hint points at a reroute: {hint}"
+    );
+
+    // THE PIN: a denied draft leaves NO file on disk.
+    assert!(
+        !dir.path().join("models").join("shadow.sql").exists(),
+        "a denied draft must not leave the .sql on disk"
+    );
+    assert!(
+        !dir.path().join("models").join("shadow.toml").exists(),
+        "a denied draft must not leave the sidecar on disk"
+    );
+
+    // The decision IS recorded in the audit ledger (the trail survives the
+    // rollback), mirroring the propose gate's deny.
+    client.cancel().await.unwrap();
+    let state_path = rocky_core::state::resolve_state_path(None, &dir.path().join("models")).path;
+    let store = rocky_core::state::StateStore::open(&state_path).expect("open ledger");
+    let decisions = store.list_policy_decisions().expect("list decisions");
+    assert!(
+        decisions
+            .iter()
+            .any(|d| d.model == "shadow" && d.effect == rocky_core::config::PolicyEffect::Deny),
+        "the denied draft is recorded in the ledger: {decisions:?}"
+    );
+}
+
+/// A `require_review` verdict PERSISTS the draft (it is the reviewable artifact,
+/// mirroring the propose gate) and returns a structured `policy_review_required`
+/// signal that routes the agent to human review.
+#[tokio::test]
+async fn draft_model_require_review_keeps_file_and_signals() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "require_review"
+"#,
+    );
+    write_target_defaults(dir.path());
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "reviewed",
+                "SELECT 1 AS id",
+                "a draft that needs review",
+            )),
+        )
+        .await
+        .expect("draft_model returns a result");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "require_review returns a structured signal the agent parses"
+    );
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("policy_review_required"));
+    assert_eq!(err["policy_rule"], serde_json::json!("0"));
+
+    // require_review KEEPS the draft — it is on its way to a human reviewer.
+    assert!(
+        dir.path().join("models").join("reviewed.sql").is_file(),
+        "a require_review draft persists as the reviewable artifact"
+    );
+    assert!(
+        dir.path().join("models").join("reviewed.toml").is_file(),
+        "the sidecar persists too"
     );
 
     client.cancel().await.unwrap();

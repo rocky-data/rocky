@@ -25,6 +25,8 @@ GROUNDING_TOOLS = frozenset(
     }
 )
 PROPOSE_TOOL = "mcp__rocky__propose"
+#: The safe MCP write path — writes a draft model + compiles it in one call.
+DRAFT_TOOL = "mcp__rocky__draft_model"
 #: Built-in harness tools that write model files (authoring signal).
 FILE_WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 
@@ -60,6 +62,24 @@ class ParsedTranscript:
 
     def grounding_calls(self) -> list[ToolCall]:
         return [c for c in self.tool_calls if c.name in GROUNDING_TOOLS]
+
+    def draft_calls(self) -> list[ToolCall]:
+        return self.calls_named(DRAFT_TOOL)
+
+    def drafted_names(self) -> list[str]:
+        """The `name` argument of every ``draft_model`` call, in order."""
+        return [str(c.input.get("name", "")) for c in self.draft_calls()]
+
+    def draft_succeeded_for(self, name: str) -> bool:
+        """True if a ``draft_model`` call for ``name`` returned a non-error result
+        (the write + compile was accepted, not policy-denied)."""
+        for call in self.draft_calls():
+            if str(call.input.get("name", "")) != name:
+                continue
+            result = self.tool_results.get(call.tool_use_id)
+            if result and not result.is_error:
+                return True
+        return False
 
     def first_index(self, name: str) -> int | None:
         for call in self.tool_calls:

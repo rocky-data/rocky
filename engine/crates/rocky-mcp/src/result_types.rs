@@ -325,6 +325,37 @@ pub struct ProposeResult {
     pub models: Vec<String>,
 }
 
+/// `draft_model` result — the draft was written to the working tree and
+/// compiled in the same call, so the agent gets the type-check with the write.
+///
+/// A draft is never applied and never touches the warehouse: it is the safe
+/// write path that channels an agent's file edits through Rocky's compile
+/// feedback and policy plane. Continue the flow the `next_steps` reminder names.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DraftModelResult {
+    /// The drafted model's name (its file stem under `models/`).
+    pub model: String,
+    /// Repo-relative path the SQL body was written to (`models/<name>.sql`).
+    pub sql_path: String,
+    /// Repo-relative path of the sidecar that carries the intent
+    /// (`models/<name>.toml`).
+    pub sidecar_path: String,
+    /// Whether the immediate compile produced any error-severity diagnostics.
+    pub has_errors: bool,
+    /// Count of error-severity diagnostics.
+    pub error_count: usize,
+    /// Count of warning-severity diagnostics.
+    pub warning_count: usize,
+    /// The immediate compile's diagnostics, scoped to the drafted model — the
+    /// type-check the agent gets with the write. Read the code/span/suggestion
+    /// and fix against them, then re-draft or `compile`.
+    pub diagnostics: Vec<DiagnosticLite>,
+    /// The authoring-loop reminder: a draft is not applied. It restates the flow
+    /// (`compile` → `plan_preview` → `propose` → human review → apply) so the
+    /// agent never mistakes a written draft for a materialized change.
+    pub next_steps: String,
+}
+
 /// One column on a `catalog` asset.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct CatalogColumnLite {
