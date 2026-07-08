@@ -15,17 +15,20 @@
 //!   closed: a link whose signal is genuinely not recorded renders
 //!   `unavailable` with a note rather than a fabricated value.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Duration, Utc};
 use rocky_compiler::compile::{self, CompilerConfig};
+use rocky_core::config::PolicyEffect;
 use rocky_core::state::{PolicyDecisionRecord, RunRecord, StateStore};
 
 use crate::output::{
     AuditChainBlastRadius, AuditChainDecisions, AuditChainPlan, AuditChainRuns, AuditChainVerify,
     AuditDecisionEntry, AuditForOutput, AuditOutput, AuditPlanChange, AuditRunEntry,
-    AuditSubjectKind, SectionAvailability, print_json,
+    AuditScorecardOutput, AuditSubjectKind, ScorecardDimension, ScorecardGroup,
+    ScorecardUnavailableMetric, SectionAvailability, print_json,
 };
 use crate::plan_store::read_plan;
 
@@ -718,6 +721,298 @@ fn status_line(availability: &SectionAvailability, note: &Option<String>) -> Str
     }
 }
 
+// ---------------------------------------------------------------------------
+// `rocky audit --scorecard` — the decisions-by-group trust scorecard
+// ---------------------------------------------------------------------------
+
+/// Execute `rocky audit --scorecard --by <dimension> [--window <span>]`.
+///
+/// Aggregates the persisted policy-decision ledger into a decisions-by-group
+/// trust scorecard: per group (principal / rule / scope) the acceptance,
+/// denial, and escalation rates over a `--window`. Reads only.
+///
+/// Fails closed like the estate brief: a ledger that cannot be read renders the
+/// whole scorecard `unavailable` with a note (exit 0) rather than propagating a
+/// hard error, and metrics the ledger does not persist are declared
+/// `unavailable` rather than fabricated. A malformed `--window`, by contrast,
+/// is a usage error and is surfaced as one.
+pub fn run_audit_scorecard(
+    state_path: &Path,
+    by: ScorecardDimension,
+    window: Option<&str>,
+    output_json: bool,
+) -> Result<()> {
+    let now = Utc::now();
+    let window_label = window.unwrap_or("all").to_string();
+    let window_start = parse_window(window, now)?;
+
+    let output = match load_decisions_for_scorecard(state_path) {
+        Ok(decisions) => build_scorecard(by, &window_label, window_start, &decisions),
+        Err(err) => AuditScorecardOutput {
+            version: VERSION.to_string(),
+            command: "audit".to_string(),
+            by,
+            window: window_label,
+            window_start: window_start.map(|t| t.to_rfc3339()),
+            availability: SectionAvailability::Unavailable,
+            note: Some(format!(
+                "the policy-decision ledger could not be read, so no scorecard could be \
+                 composed: {err}"
+            )),
+            total_decisions: 0,
+            groups: Vec::new(),
+            unavailable_metrics: scorecard_unavailable_metrics(),
+        },
+    };
+
+    if output_json {
+        print_json(&output)?;
+    } else {
+        render_scorecard_text(&output);
+    }
+    Ok(())
+}
+
+/// Read the decision ledger for a scorecard. An absent state file is not an
+/// error — it yields an empty ledger (renders as `no_data`). An open/read
+/// failure is surfaced so the caller can fail the section closed.
+fn load_decisions_for_scorecard(state_path: &Path) -> Result<Vec<PolicyDecisionRecord>> {
+    if !state_path.exists() {
+        return Ok(Vec::new());
+    }
+    let store = StateStore::open_read_only(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    store
+        .list_policy_decisions()
+        .context("failed to read the policy-decision ledger")
+}
+
+/// Parse the `--window` flag into an inclusive lower bound.
+///
+/// `None` and `all` mean all-time (no bound). Otherwise the value is a
+/// `<N><unit>` duration with `unit` in `{d, h}` (days / hours), e.g. `30d` or
+/// `24h`. A malformed value is a usage error, not a fail-closed section.
+fn parse_window(window: Option<&str>, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
+    let Some(raw) = window else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("all") {
+        return Ok(None);
+    }
+
+    let malformed = || {
+        format!("invalid --window '{raw}': expected 'all' or a '<N>d' / '<N>h' duration (e.g. 30d)")
+    };
+
+    // Guard the byte slice below against a non-ASCII last char splitting a
+    // UTF-8 boundary; a duration is always ASCII.
+    if !raw.is_ascii() || raw.len() < 2 {
+        bail!(malformed());
+    }
+    let (magnitude, unit) = raw.split_at(raw.len() - 1);
+    let n: i64 = match magnitude.parse::<i64>() {
+        Ok(n) if n >= 0 => n,
+        _ => bail!(malformed()),
+    };
+
+    match unit {
+        "d" | "D" => Ok(Some(now - Duration::days(n))),
+        "h" | "H" => Ok(Some(now - Duration::hours(n))),
+        _ => bail!(malformed()),
+    }
+}
+
+/// The ledger key that cites a single decision (`timestamp|plan_id|model`) —
+/// the same composite the brief and review queue use.
+fn scorecard_decision_ref(d: &PolicyDecisionRecord) -> String {
+    format!("{}|{}|{}", d.timestamp.to_rfc3339(), d.plan_id, d.model)
+}
+
+/// The group label for a decision under a grouping dimension.
+///
+/// `Scope` groups by the concrete `model` the decision was about — the ledger
+/// records the matched model, not the rule's scope predicates, so the model is
+/// the honest stand-in for "scope."
+fn scorecard_group_key(by: ScorecardDimension, d: &PolicyDecisionRecord) -> String {
+    match by {
+        ScorecardDimension::Principal => serde_plain(&d.principal),
+        ScorecardDimension::Rule => d
+            .rule_id
+            .map(|r| format!("rule {r}"))
+            .unwrap_or_else(|| "default posture".to_string()),
+        ScorecardDimension::Scope => d.model.clone(),
+    }
+}
+
+/// Running per-group counts while aggregating the ledger.
+#[derive(Default)]
+struct GroupAccumulator {
+    allow: u64,
+    require_review: u64,
+    deny: u64,
+    /// Citations backing the counts, in insertion order (newest first, since
+    /// the ledger is sorted newest-first before aggregation).
+    decision_refs: Vec<String>,
+}
+
+impl GroupAccumulator {
+    fn record(&mut self, d: &PolicyDecisionRecord) {
+        match d.effect {
+            PolicyEffect::Allow => self.allow += 1,
+            PolicyEffect::RequireReview => self.require_review += 1,
+            PolicyEffect::Deny => self.deny += 1,
+        }
+        self.decision_refs.push(scorecard_decision_ref(d));
+    }
+
+    fn into_group(self, key: String) -> ScorecardGroup {
+        let total = self.allow + self.require_review + self.deny;
+        let rate = |n: u64| {
+            if total == 0 {
+                0.0
+            } else {
+                n as f64 / total as f64
+            }
+        };
+        ScorecardGroup {
+            key,
+            total,
+            allow: self.allow,
+            require_review: self.require_review,
+            deny: self.deny,
+            acceptance_rate: rate(self.allow),
+            denial_rate: rate(self.deny),
+            review_rate: rate(self.require_review),
+            decision_refs: self.decision_refs,
+        }
+    }
+}
+
+/// Compose the scorecard from a decision ledger. Pure over its inputs so the
+/// aggregation is unit-testable without a state store.
+fn build_scorecard(
+    by: ScorecardDimension,
+    window_label: &str,
+    window_start: Option<DateTime<Utc>>,
+    decisions: &[PolicyDecisionRecord],
+) -> AuditScorecardOutput {
+    // Window filter, then newest-first so each group's citations lead with the
+    // most recent decision. The whole ledger is aggregated (no scan cap): the
+    // store already materialized every row, and truncating would bias the
+    // rates — a scorecard must summarize exactly what is persisted.
+    let mut windowed: Vec<&PolicyDecisionRecord> = decisions
+        .iter()
+        .filter(|d| window_start.is_none_or(|lo| d.timestamp >= lo))
+        .collect();
+    windowed.sort_by_key(|d| std::cmp::Reverse(d.timestamp));
+
+    let total_decisions = windowed.len() as u64;
+
+    let mut accumulators: BTreeMap<String, GroupAccumulator> = BTreeMap::new();
+    for d in &windowed {
+        accumulators
+            .entry(scorecard_group_key(by, d))
+            .or_default()
+            .record(d);
+    }
+
+    let mut groups: Vec<ScorecardGroup> = accumulators
+        .into_iter()
+        .map(|(key, acc)| acc.into_group(key))
+        .collect();
+    // Busiest group first; deterministic tie-break on the label.
+    groups.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.key.cmp(&b.key)));
+
+    let (availability, note) = if total_decisions == 0 {
+        (
+            SectionAvailability::NoData,
+            Some("no policy decisions fall in the window".to_string()),
+        )
+    } else {
+        (SectionAvailability::Available, None)
+    };
+
+    AuditScorecardOutput {
+        version: VERSION.to_string(),
+        command: "audit".to_string(),
+        by,
+        window: window_label.to_string(),
+        window_start: window_start.map(|t| t.to_rfc3339()),
+        availability,
+        note,
+        total_decisions,
+        groups,
+        unavailable_metrics: scorecard_unavailable_metrics(),
+    }
+}
+
+/// The scorecard metrics the ledger does not persist, each rendered
+/// `unavailable` with the reason. Declared once — never faked into a number.
+fn scorecard_unavailable_metrics() -> Vec<ScorecardUnavailableMetric> {
+    vec![
+        ScorecardUnavailableMetric {
+            metric: "verify_after_pass_rate".to_string(),
+            availability: SectionAvailability::Unavailable,
+            note: "post-apply verification outcomes are not persisted to the state store, so a \
+                   verify-after pass rate cannot be computed"
+                .to_string(),
+        },
+        ScorecardUnavailableMetric {
+            metric: "reverts".to_string(),
+            availability: SectionAvailability::Unavailable,
+            note: "reverts / rollbacks of an applied change are not recorded to the ledger, so a \
+                   revert count cannot be computed"
+                .to_string(),
+        },
+        ScorecardUnavailableMetric {
+            metric: "escalation_latency".to_string(),
+            availability: SectionAvailability::Unavailable,
+            note: "the resolution of a require_review escalation is not recorded to the ledger \
+                   (an approval leaves only an on-disk plan marker, a denial records nothing), so \
+                   escalation latency cannot be computed"
+                .to_string(),
+        },
+    ]
+}
+
+/// Render the scorecard as a concise human-readable report.
+fn render_scorecard_text(out: &AuditScorecardOutput) {
+    let by = serde_plain(&out.by);
+    println!("policy scorecard by {by} ({} window)", out.window);
+
+    match out.availability {
+        SectionAvailability::Available => {
+            println!(
+                "  {} decision(s) across {} group(s)",
+                out.total_decisions,
+                out.groups.len()
+            );
+            for g in &out.groups {
+                println!(
+                    "  {}: {} decision(s) — accept {:.1}% / review {:.1}% / deny {:.1}% \
+                     [allow {}, review {}, deny {}]",
+                    g.key,
+                    g.total,
+                    g.acceptance_rate * 100.0,
+                    g.review_rate * 100.0,
+                    g.denial_rate * 100.0,
+                    g.allow,
+                    g.require_review,
+                    g.deny,
+                );
+            }
+        }
+        _ => println!("  {}", status_line(&out.availability, &out.note)),
+    }
+
+    // The honesty footer: what the ledger cannot support, stated plainly.
+    println!("\nnot recorded — uncomputable from the persisted ledger:");
+    for m in &out.unavailable_metrics {
+        println!("  {} — {}", m.metric, m.note);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -849,5 +1144,254 @@ mod tests {
         );
         assert_eq!(link.availability, SectionAvailability::NoData);
         assert_eq!(link.total, 0);
+    }
+
+    // ---------- scorecard ----------
+
+    /// Full-control decision builder: principal, rule, effect, model, and a
+    /// second offset in a fixed day so timestamps order deterministically.
+    fn sc_decision(
+        secs: u32,
+        plan_id: &str,
+        model: &str,
+        principal: PolicyPrincipal,
+        rule_id: Option<usize>,
+        effect: PolicyEffect,
+    ) -> PolicyDecisionRecord {
+        PolicyDecisionRecord {
+            timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
+            plan_id: plan_id.to_string(),
+            principal,
+            capability: PolicyCapability::Apply,
+            model: model.to_string(),
+            effect,
+            rule_id,
+            reason: "test".to_string(),
+        }
+    }
+
+    /// The seed used by the hand-computed-truth tests below. Ten decisions:
+    ///
+    /// agent: 3 allow, 2 require_review, 2 deny  (7 total)
+    /// human: 3 allow                            (3 total)
+    ///
+    /// by rule: rule 0 → 4 (agent), rule 1 → 3 (agent), default posture →
+    /// 3 (human, rule_id None).
+    fn seed() -> Vec<PolicyDecisionRecord> {
+        use PolicyEffect::{Allow, Deny, RequireReview};
+        use PolicyPrincipal::{Agent, Human};
+        vec![
+            sc_decision(1, "p1", "bronze_a", Agent, Some(0), Allow),
+            sc_decision(2, "p1", "bronze_b", Agent, Some(0), Allow),
+            sc_decision(3, "p2", "silver_a", Agent, Some(0), RequireReview),
+            sc_decision(4, "p2", "silver_b", Agent, Some(0), Deny),
+            sc_decision(5, "p3", "bronze_a", Agent, Some(1), Allow),
+            sc_decision(6, "p3", "silver_a", Agent, Some(1), RequireReview),
+            sc_decision(7, "p3", "gold_a", Agent, Some(1), Deny),
+            sc_decision(8, "p4", "bronze_a", Human, None, Allow),
+            sc_decision(9, "p4", "silver_a", Human, None, Allow),
+            sc_decision(10, "p5", "gold_a", Human, None, Allow),
+        ]
+    }
+
+    fn group<'a>(out: &'a AuditScorecardOutput, key: &str) -> &'a ScorecardGroup {
+        out.groups
+            .iter()
+            .find(|g| g.key == key)
+            .unwrap_or_else(|| panic!("group '{key}' not found in {:?}", out.groups))
+    }
+
+    #[test]
+    fn scorecard_by_principal_matches_hand_computed_truth() {
+        let out = build_scorecard(ScorecardDimension::Principal, "all", None, &seed());
+        assert_eq!(out.availability, SectionAvailability::Available);
+        assert_eq!(out.total_decisions, 10);
+        assert_eq!(out.groups.len(), 2);
+
+        let agent = group(&out, "agent");
+        assert_eq!(
+            (agent.total, agent.allow, agent.require_review, agent.deny),
+            (7, 3, 2, 2)
+        );
+        assert!((agent.acceptance_rate - 3.0 / 7.0).abs() < 1e-9);
+        assert!((agent.denial_rate - 2.0 / 7.0).abs() < 1e-9);
+        assert!((agent.review_rate - 2.0 / 7.0).abs() < 1e-9);
+        // The three rates partition the group.
+        assert!((agent.acceptance_rate + agent.review_rate + agent.denial_rate - 1.0).abs() < 1e-9);
+
+        let human = group(&out, "human");
+        assert_eq!(
+            (human.total, human.allow, human.require_review, human.deny),
+            (3, 3, 0, 0)
+        );
+        assert!((human.acceptance_rate - 1.0).abs() < 1e-9);
+        assert_eq!(human.denial_rate, 0.0);
+    }
+
+    #[test]
+    fn scorecard_by_rule_groups_by_rule_id_and_default_posture() {
+        let out = build_scorecard(ScorecardDimension::Rule, "all", None, &seed());
+        assert_eq!(out.groups.len(), 3);
+
+        let r0 = group(&out, "rule 0");
+        assert_eq!(
+            (r0.total, r0.allow, r0.require_review, r0.deny),
+            (4, 2, 1, 1)
+        );
+
+        let r1 = group(&out, "rule 1");
+        assert_eq!(
+            (r1.total, r1.allow, r1.require_review, r1.deny),
+            (3, 1, 1, 1)
+        );
+
+        // rule_id None renders as the default posture, not a fabricated index.
+        let default = group(&out, "default posture");
+        assert_eq!((default.total, default.allow), (3, 3));
+    }
+
+    #[test]
+    fn scorecard_by_scope_groups_by_model() {
+        let out = build_scorecard(ScorecardDimension::Scope, "all", None, &seed());
+        // bronze_a = secs 1, 5, 8 → 3 rows, all allow.
+        let bronze_a = group(&out, "bronze_a");
+        assert_eq!((bronze_a.total, bronze_a.allow), (3, 3));
+        // silver_a = secs 3 (review), 6 (review), 9 (allow) → 3 rows.
+        let silver_a = group(&out, "silver_a");
+        assert_eq!(
+            (silver_a.total, silver_a.allow, silver_a.require_review),
+            (3, 1, 2)
+        );
+        // gold_a = secs 7 (deny), 10 (allow).
+        let gold_a = group(&out, "gold_a");
+        assert_eq!((gold_a.total, gold_a.allow, gold_a.deny), (2, 1, 1));
+    }
+
+    #[test]
+    fn scorecard_groups_ranked_by_total_desc() {
+        let out = build_scorecard(ScorecardDimension::Principal, "all", None, &seed());
+        // agent (7) outranks human (3).
+        assert_eq!(out.groups[0].key, "agent");
+        assert_eq!(out.groups[1].key, "human");
+    }
+
+    #[test]
+    fn scorecard_decision_refs_are_complete_and_newest_first() {
+        let out = build_scorecard(ScorecardDimension::Principal, "all", None, &seed());
+        let agent = group(&out, "agent");
+        // One ref per decision — a governor can recount from these.
+        assert_eq!(agent.decision_refs.len() as u64, agent.total);
+        // Newest first: the agent's newest decision is at secs=7 (p3/gold_a).
+        assert!(agent.decision_refs[0].contains("|p3|gold_a"));
+        // Every ref is a full ledger key (timestamp|plan_id|model).
+        for r in &agent.decision_refs {
+            assert_eq!(r.matches('|').count(), 2, "ref not a full ledger key: {r}");
+        }
+    }
+
+    #[test]
+    fn scorecard_window_excludes_out_of_window_decisions() {
+        // A lower bound at secs=5 keeps only decisions 5..=10 (6 rows).
+        let lo = Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, 5).unwrap();
+        let out = build_scorecard(
+            ScorecardDimension::Principal,
+            "5s-cutoff",
+            Some(lo),
+            &seed(),
+        );
+        assert_eq!(out.total_decisions, 6);
+        // agent within window: secs 5 (allow), 6 (review), 7 (deny) → 3.
+        let agent = group(&out, "agent");
+        assert_eq!(
+            (agent.total, agent.allow, agent.require_review, agent.deny),
+            (3, 1, 1, 1)
+        );
+        // human within window: secs 8, 9, 10 → 3 allow.
+        assert_eq!(group(&out, "human").total, 3);
+    }
+
+    #[test]
+    fn scorecard_empty_ledger_is_no_data_not_unavailable() {
+        let out = build_scorecard(ScorecardDimension::Principal, "all", None, &[]);
+        assert_eq!(out.availability, SectionAvailability::NoData);
+        assert_eq!(out.total_decisions, 0);
+        assert!(out.groups.is_empty());
+        // The honesty footer is present even with no data.
+        assert_eq!(out.unavailable_metrics.len(), 3);
+    }
+
+    #[test]
+    fn scorecard_unavailable_metrics_are_the_three_unpersisted_and_all_unavailable() {
+        let out = build_scorecard(ScorecardDimension::Principal, "all", None, &seed());
+        let names: Vec<&str> = out
+            .unavailable_metrics
+            .iter()
+            .map(|m| m.metric.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["verify_after_pass_rate", "reverts", "escalation_latency"]
+        );
+        // None is faked into a number — all render unavailable with a reason.
+        for m in &out.unavailable_metrics {
+            assert_eq!(m.availability, SectionAvailability::Unavailable);
+            assert!(!m.note.is_empty());
+        }
+    }
+
+    #[test]
+    fn parse_window_accepts_all_and_durations_and_rejects_garbage() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 8, 12, 0, 0).unwrap();
+        assert_eq!(parse_window(None, now).unwrap(), None);
+        assert_eq!(parse_window(Some("all"), now).unwrap(), None);
+        assert_eq!(parse_window(Some("ALL"), now).unwrap(), None);
+        assert_eq!(
+            parse_window(Some("30d"), now).unwrap(),
+            Some(now - Duration::days(30))
+        );
+        assert_eq!(
+            parse_window(Some("24h"), now).unwrap(),
+            Some(now - Duration::hours(24))
+        );
+        // Malformed values are usage errors, not silently-defaulted windows.
+        assert!(parse_window(Some("30"), now).is_err());
+        assert!(parse_window(Some("d"), now).is_err());
+        assert!(parse_window(Some("30w"), now).is_err());
+        assert!(parse_window(Some("-5d"), now).is_err());
+        assert!(parse_window(Some("thirtyd"), now).is_err());
+    }
+
+    #[test]
+    fn scorecard_group_key_maps_each_dimension() {
+        let d = sc_decision(
+            1,
+            "p1",
+            "fct_orders",
+            PolicyPrincipal::Agent,
+            Some(3),
+            PolicyEffect::Deny,
+        );
+        assert_eq!(
+            scorecard_group_key(ScorecardDimension::Principal, &d),
+            "agent"
+        );
+        assert_eq!(scorecard_group_key(ScorecardDimension::Rule, &d), "rule 3");
+        assert_eq!(
+            scorecard_group_key(ScorecardDimension::Scope, &d),
+            "fct_orders"
+        );
+        // A default-posture decision (rule_id None) never fabricates an index.
+        let dd = sc_decision(
+            2,
+            "p1",
+            "m",
+            PolicyPrincipal::Human,
+            None,
+            PolicyEffect::Allow,
+        );
+        assert_eq!(
+            scorecard_group_key(ScorecardDimension::Rule, &dd),
+            "default posture"
+        );
     }
 }
