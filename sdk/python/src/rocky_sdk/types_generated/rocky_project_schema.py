@@ -1200,6 +1200,12 @@ class ReuseConfig(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
     )
+    column_level: bool | None = False
+    """
+    Opt-in **column-level skip** for content-addressed models. When `true`, an unpartitioned content-addressed model whose logic, environment, and every provably-consumed upstream column are unchanged since its last successful build is **skipped** — its SQL does not run and no new commit is written; the prior output stays authoritative. Skipping on a value change to a consumed column is precisely the silent-staleness bug this gate is built to avoid, so the decision is fail-closed: any unproven input (a non-deterministic model, a changed recipe/env, an un-enumerable consumed set, a missing or moved column hash) forces a build.
+
+    **Default-OFF.** `false` (the default) keeps `rocky run` byte- and cost-identical: no column-level comparison runs and no model is skipped on this basis. Independent of [`Self::enabled`] (byte-level point-to reuse) — the two are orthogonal opt-ins on the content-addressed path. Experimental; off the content-addressed path the feature does not apply.
+    """
     enabled: bool | None = False
     """
     Master switch for auditable reuse: populates the input-match spine and arms the point-to decision. `false` (default) ⇒ the spine is never written, no per-model hashing cost is paid, and no model reuses.
@@ -3523,7 +3529,9 @@ class RockyConfig(BaseModel):
 
     Unset (the default) preserves per-adapter semantics: each adapter still honours its own `retry.max_retries_per_run` independently. That's the backward-compatible path and stays the right choice when adapters have wildly different rate limits.
     """
-    reuse: ReuseConfig | None = Field({"enabled": False}, validate_default=True)
+    reuse: ReuseConfig | None = Field(
+        {"column_level": False, "enabled": False}, validate_default=True
+    )
     """
     Opt-in auditable reuse. Default-OFF: an absent `[reuse]` block keeps `rocky run` byte- and cost-identical (no per-model hashing, no extra state write). When enabled, an eligible content-addressed model whose inputs match a prior strong run may **point-to** that run's parquet (zero-copy) instead of re-executing its SQL — fail-closed to BUILD on any doubt. See [`ReuseConfig`].
     """

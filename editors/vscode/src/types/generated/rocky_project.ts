@@ -1885,6 +1885,12 @@ export interface RunRetryConfig {
  */
 export interface ReuseConfig {
   /**
+   * Opt-in **column-level skip** for content-addressed models. When `true`, an unpartitioned content-addressed model whose logic, environment, and every provably-consumed upstream column are unchanged since its last successful build is **skipped** — its SQL does not run and no new commit is written; the prior output stays authoritative. Skipping on a value change to a consumed column is precisely the silent-staleness bug this gate is built to avoid, so the decision is fail-closed: any unproven input (a non-deterministic model, a changed recipe/env, an un-enumerable consumed set, a missing or moved column hash) forces a build.
+   *
+   * **Default-OFF.** `false` (the default) keeps `rocky run` byte- and cost-identical: no column-level comparison runs and no model is skipped on this basis. Independent of [`Self::enabled`] (byte-level point-to reuse) — the two are orthogonal opt-ins on the content-addressed path. Experimental; off the content-addressed path the feature does not apply.
+   */
+  column_level?: boolean;
+  /**
    * Master switch for auditable reuse: populates the input-match spine and arms the point-to decision. `false` (default) ⇒ the spine is never written, no per-model hashing cost is paid, and no model reuses.
    */
   enabled?: boolean;

@@ -119,6 +119,8 @@ pub async fn run_transformation(
             &super::run::DeferOptions::default(),
             skip_gate,
             rocky_cfg.reuse.enabled,
+            // Content-addressed column-level skip (its own `[reuse]` sub-key).
+            rocky_cfg.reuse.column_level,
             run_vars,
         )
         .await;

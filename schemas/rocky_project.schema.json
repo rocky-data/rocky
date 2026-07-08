@@ -3068,6 +3068,11 @@
       "additionalProperties": false,
       "description": "`[reuse]` — opt-in auditable reuse for content-addressed models.\n\nWhen `enabled = true`, a successful run records, per model, an input-match index entry and an offline-verifiable provenance record (the model's logic key, upstream input identities, output blake3(s), and proof class). That spine is the *input* side; on a later run, an eligible model whose recomputed `input_hash` hits the index for a prior **strong** run may **point-to** that run's already-written parquet — a zero-copy commit that skips the SQL — provided every clause of the runner's fail-closed reuse decision holds. Any doubt builds.\n\n**Default-OFF.** `enabled = false` (the default) keeps `rocky run` byte- *and* cost-identical to before the spine existed: no extra normalize+hash work, no extra state write, no reuse decision. The point-to path is strong (byte-identical) only on the content-addressed/UniForm write path; experimental, opt-in.",
       "properties": {
+        "column_level": {
+          "default": false,
+          "description": "Opt-in **column-level skip** for content-addressed models. When `true`, an unpartitioned content-addressed model whose logic, environment, and every provably-consumed upstream column are unchanged since its last successful build is **skipped** — its SQL does not run and no new commit is written; the prior output stays authoritative. Skipping on a value change to a consumed column is precisely the silent-staleness bug this gate is built to avoid, so the decision is fail-closed: any unproven input (a non-deterministic model, a changed recipe/env, an un-enumerable consumed set, a missing or moved column hash) forces a build.\n\n**Default-OFF.** `false` (the default) keeps `rocky run` byte- and cost-identical: no column-level comparison runs and no model is skipped on this basis. Independent of [`Self::enabled`] (byte-level point-to reuse) — the two are orthogonal opt-ins on the content-addressed path. Experimental; off the content-addressed path the feature does not apply.",
+          "type": "boolean"
+        },
         "enabled": {
           "default": false,
           "description": "Master switch for auditable reuse: populates the input-match spine and arms the point-to decision. `false` (default) ⇒ the spine is never written, no per-model hashing cost is paid, and no model reuses.",
@@ -4191,6 +4196,7 @@
         }
       ],
       "default": {
+        "column_level": false,
         "enabled": false
       },
       "description": "Opt-in auditable reuse. Default-OFF: an absent `[reuse]` block keeps `rocky run` byte- and cost-identical (no per-model hashing, no extra state write). When enabled, an eligible content-addressed model whose inputs match a prior strong run may **point-to** that run's parquet (zero-copy) instead of re-executing its SQL — fail-closed to BUILD on any doubt. See [`ReuseConfig`]."
