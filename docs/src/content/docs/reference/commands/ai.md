@@ -373,13 +373,13 @@ The server is **stateless**: every tool call resolves the project from the confi
 - Warehouse-touching tools hit **your own warehouse** with the credentials in your `rocky.toml`.
 - The draft generators call the Anthropic API using **your own `ANTHROPIC_API_KEY`** from the server environment. Without the key set, those tools return a null/empty draft and a `message` explaining why.
 
-What leaves your machine is bounded: warehouse queries go to your warehouse; the generators send your model's SQL and schema to **your own** Anthropic key, and for `draft_contract` only aggregate column counts (row / null / distinct), **never raw cell values**.
+What leaves your machine is bounded: warehouse queries go to your warehouse; the generators send your model's SQL and schema to **your own** Anthropic key, and for `ai_contract` only aggregate column counts (row / null / distinct), **never raw cell values**.
 
 ### Safety model: read-only and propose-only
 
 The server **never materializes anything**. Materialization stays human-gated:
 
-- The generators (`draft_contract`, `generate_tests`, `explain_model`) return **drafts** and mutate nothing; you save them to disk and run `compile` / `test` yourself.
+- The generators (`ai_contract`, `ai_test`, `explain_model`) return **drafts** and mutate nothing; hand them to the `draft_contract` / `draft_check` write tools, or save them to disk and run `compile` / `test` yourself.
 - `governance_preview` and `drift_preview` are **read-only** previews.
 - The `propose` tool only writes an **AI-authored plan**; a human runs `rocky review <plan_id> --approve` then `rocky apply <plan_id>`. The server never approves on the user's behalf.
 
@@ -406,16 +406,26 @@ The server **never materializes anything**. Materialization stays human-gated:
 | `governance_preview` | DRY-RUN of the classification / masking / retention actions a `rocky run` would reconcile. Computed offline; no warehouse I/O. |
 | `drift_preview` | Source-vs-target schema drift between two warehouse tables. Hits your warehouse. |
 
-**Draft generators** (mutate nothing; require `ANTHROPIC_API_KEY`):
+**LLM generators** (mutate nothing; require `ANTHROPIC_API_KEY`; named for the `rocky ai-*` verbs):
 
 | Tool | What it does |
 |---|---|
-| `draft_contract` | Draft a `.contract.toml` from a model's aggregate per-column profile, compile-verified against its inferred schema. Sends only aggregate statistics — never raw cell values. |
-| `generate_tests` | Draft SQL test assertions (not-null, grain uniqueness, ranges, referential integrity) for a model. |
+| `ai_contract` | Draft a `.contract.toml` from a model's aggregate per-column profile, compile-verified against its inferred schema. Sends only aggregate statistics — never raw cell values. |
+| `ai_test` | Draft SQL test assertions (not-null, grain uniqueness, ranges, referential integrity) for a model. |
 | `explain_model` | Draft an intent description for a model from its SQL and schema. |
 | `suggest_freshness_block` | Draft a `[freshness]` TOML block for a model with temporal columns. |
 
-**Propose** (the one write: a plan, not a materialization; no Anthropic key required):
+**Write path** (write into `models/`, compile in the same call, policy-gated; no Anthropic key required):
+
+| Tool | What it does |
+|---|---|
+| `draft_model` | Write `models/<name>.sql` + sidecar and compile it. |
+| `draft_contract` | Write `models/<model>.contract.toml` (your `spec`) and compile-validate it against the model's schema. |
+| `draft_check` | Merge declarative `[[tests]]` checks (your `spec`) into the model's sidecar and compile. |
+
+A `draft_*` call made without its content `spec` returns an actionable error pointing at the matching `ai_*` generator.
+
+**Propose** (the one plan write: not a materialization; no Anthropic key required):
 
 | Tool | What it does |
 |---|---|

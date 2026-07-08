@@ -78,15 +78,17 @@ async fn tools_list_returns_expected_set() {
     assert_eq!(
         names,
         vec![
+            "ai_contract",
+            "ai_test",
             "breaking_change",
             "catalog",
             "compile",
             "dependents",
+            "draft_check",
             "draft_contract",
             "draft_model",
             "drift_preview",
             "explain_model",
-            "generate_tests",
             "governance_preview",
             "history",
             "inspect_schema",
@@ -615,6 +617,269 @@ effect = "require_review"
     client.cancel().await.unwrap();
 }
 
+// --- draft_contract / draft_check (agent-authored write path) ---------------
+
+/// The happy path: `draft_contract` writes the agent's `.contract.toml` next to
+/// the model, compiles it against the model's inferred schema in the same call,
+/// and reminds the flow. The `orders` fixture is `SELECT 1 AS id, 'COMPLETE' AS
+/// status`, so a contract over `id`/`status` compiles clean.
+#[tokio::test]
+async fn draft_contract_writes_and_compiles() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let spec = "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n\n\
+                [[columns]]\nname = \"status\"\ntype = \"String\"\nnullable = true\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_contract").with_arguments(args))
+        .await
+        .expect("draft_contract call");
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a valid contract is not an error"
+    );
+    let sc = result.structured_content.expect("structured content");
+    assert_eq!(sc["model"], serde_json::json!("orders"));
+    assert_eq!(sc["has_errors"], serde_json::json!(false));
+    assert_eq!(
+        sc["contract_path"],
+        serde_json::json!("models/orders.contract.toml")
+    );
+    assert!(sc["diagnostics"].is_array());
+
+    // The contract landed on disk where compile auto-discovers it.
+    let contract = dir.path().join("models").join("orders.contract.toml");
+    assert!(contract.is_file(), "contract written to the sibling path");
+    assert!(
+        std::fs::read_to_string(&contract)
+            .unwrap()
+            .contains("status"),
+        "the agent's contract body was written verbatim"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// A `draft_contract` call with no `spec` is a mis-dispatch to the generator: it
+/// returns a structured `invalid_argument` error whose hint names `ai_contract`,
+/// and writes nothing.
+#[tokio::test]
+async fn draft_contract_without_spec_redirects_to_ai_contract() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let args = serde_json::json!({ "model": "orders" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_contract").with_arguments(args))
+        .await
+        .expect("draft_contract call");
+
+    assert_eq!(result.is_error, Some(true), "a no-spec call is an error");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["remediation_hint"]
+            .as_str()
+            .unwrap()
+            .contains("ai_contract"),
+        "the redirect points at ai_contract: {err:?}"
+    );
+    assert!(
+        !dir.path()
+            .join("models")
+            .join("orders.contract.toml")
+            .exists(),
+        "a redirected call writes nothing"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// THE PIN: a policy-DENIED `draft_contract` returns the structured
+/// `policy_denied` envelope AND leaves no contract on disk — the deny rolls the
+/// write back, exactly as `draft_model`'s deny.
+#[tokio::test]
+async fn draft_contract_denied_by_policy_leaves_no_file() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "deny"
+"#,
+    );
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let spec = "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = false\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_contract").with_arguments(args))
+        .await
+        .expect("draft_contract returns a result");
+
+    assert_eq!(result.is_error, Some(true), "a denied contract is an error");
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("policy_denied"));
+    assert_eq!(err["policy_rule"], serde_json::json!("0"));
+    assert!(
+        !dir.path()
+            .join("models")
+            .join("orders.contract.toml")
+            .exists(),
+        "a denied contract must not leave a file on disk"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The happy path: `draft_check` merges the agent's `[[tests]]` block into the
+/// model's sidecar, compiles, and reminds the flow. The prior sidecar's
+/// `name = "orders"` survives the merge.
+#[tokio::test]
+async fn draft_check_writes_and_compiles() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_ne!(result.is_error, Some(true), "a valid check is not an error");
+    let sc = result.structured_content.expect("structured content");
+    assert_eq!(sc["model"], serde_json::json!("orders"));
+    assert_eq!(sc["has_errors"], serde_json::json!(false));
+    assert_eq!(sc["sidecar_path"], serde_json::json!("models/orders.toml"));
+
+    let sidecar = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert!(
+        sidecar.contains("[[tests]]") && sidecar.contains("not_null"),
+        "the check was merged into the sidecar: {sidecar}"
+    );
+    assert!(
+        sidecar.contains("name = \"orders\""),
+        "the prior sidecar content survives the merge: {sidecar}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// A `draft_check` call with no `spec` is a mis-dispatch to the generator: it
+/// returns a structured `invalid_argument` error whose hint names `ai_test`.
+#[tokio::test]
+async fn draft_check_without_spec_redirects_to_ai_test() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let args = serde_json::json!({ "model": "orders" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_eq!(result.is_error, Some(true), "a no-spec call is an error");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["remediation_hint"]
+            .as_str()
+            .unwrap()
+            .contains("ai_test"),
+        "the redirect points at ai_test: {err:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// THE PIN for the merge case: a policy-DENIED `draft_check` returns the
+/// structured `policy_denied` envelope AND restores the model's PRIOR sidecar —
+/// the check rolls back without deleting the model's `name`/intent.
+#[tokio::test]
+async fn draft_check_denied_by_policy_restores_prior_sidecar() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "deny"
+"#,
+    );
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check returns a result");
+
+    assert_eq!(result.is_error, Some(true), "a denied check is an error");
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("policy_denied"));
+
+    // The PRIOR sidecar is restored byte-for-byte — the check left nothing, and
+    // the model's own name/target were not corrupted by the rolled-back merge.
+    let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_eq!(
+        after, before,
+        "a denied check restores the prior sidecar exactly"
+    );
+    assert!(
+        !after.contains("[[tests]]"),
+        "no check lingered after the deny: {after}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn sample_rows_returns_capped_rows_on_duckdb() {
     let dir = TempDir::new().unwrap();
@@ -866,8 +1131,8 @@ async fn authoring_trajectories_orchestrate_tools_and_stop_at_the_gate() {
     let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
     let client = connect(server).await;
 
-    // find_untested_models — catalog -> generate_tests/draft_contract -> propose,
-    // stopping at the review/apply gate.
+    // find_untested_models — catalog -> ai_test/ai_contract -> draft_check/
+    // draft_contract -> propose, stopping at the review/apply gate.
     let untested = client
         .get_prompt(GetPromptRequestParams::new("find_untested_models"))
         .await
@@ -875,7 +1140,9 @@ async fn authoring_trajectories_orchestrate_tools_and_stop_at_the_gate() {
     let haystack = prompt_text(&untested);
     for anchor in [
         "catalog",
-        "generate_tests",
+        "ai_test",
+        "draft_check",
+        "ai_contract",
         "draft_contract",
         "propose",
         "review",
@@ -891,7 +1158,7 @@ async fn authoring_trajectories_orchestrate_tools_and_stop_at_the_gate() {
         "find_untested_models must carry the reconcile discipline"
     );
 
-    // add_tests_to_pks — inspect_schema -> profile_column -> generate_tests ->
+    // add_tests_to_pks — inspect_schema -> profile_column -> draft_check ->
     // propose. The optional `model` arg scopes the trajectory text.
     let pk_args = serde_json::json!({ "model": "orders" })
         .as_object()
@@ -906,7 +1173,7 @@ async fn authoring_trajectories_orchestrate_tools_and_stop_at_the_gate() {
         "orders", // the scoped model name threads into the text
         "inspect_schema",
         "profile_column",
-        "generate_tests",
+        "draft_check",
         "propose",
         "review",
         "apply",
@@ -1618,11 +1885,11 @@ async fn generator_tools_degrade_without_api_key() {
         .unwrap()
         .clone();
 
-    // draft_contract: contract_toml null, message names the env var.
+    // ai_contract: contract_toml null, message names the env var.
     let dc = client
-        .call_tool(CallToolRequestParams::new("draft_contract").with_arguments(args.clone()))
+        .call_tool(CallToolRequestParams::new("ai_contract").with_arguments(args.clone()))
         .await
-        .expect("draft_contract call");
+        .expect("ai_contract call");
     assert_ne!(dc.is_error, Some(true), "missing key is a no-op, not error");
     let sc = dc.structured_content.expect("structured content");
     assert!(
@@ -1634,14 +1901,14 @@ async fn generator_tools_degrade_without_api_key() {
             .as_str()
             .unwrap()
             .contains(rocky_ai::client::AI_API_KEY_ENV),
-        "draft_contract message should name the env var; got {sc:?}"
+        "ai_contract message should name the env var; got {sc:?}"
     );
 
-    // generate_tests: assertions empty, message names the env var.
+    // ai_test: assertions empty, message names the env var.
     let gt = client
-        .call_tool(CallToolRequestParams::new("generate_tests").with_arguments(args.clone()))
+        .call_tool(CallToolRequestParams::new("ai_test").with_arguments(args.clone()))
         .await
-        .expect("generate_tests call");
+        .expect("ai_test call");
     assert_ne!(gt.is_error, Some(true));
     let sc = gt.structured_content.expect("structured content");
     assert!(

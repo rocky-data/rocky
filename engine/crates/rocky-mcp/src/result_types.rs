@@ -356,6 +356,68 @@ pub struct DraftModelResult {
     pub next_steps: String,
 }
 
+/// `draft_contract` result — an agent-authored `.contract.toml` written to the
+/// working tree and compile-validated in the same call.
+///
+/// The write-path sibling of `draft_model`: the agent supplies the contract, the
+/// tool writes it next to the model (`models/<model>.contract.toml`), compiles
+/// so the contract is validated against the model's inferred schema (a column
+/// the model doesn't produce surfaces as a `W010` diagnostic here), and gates the
+/// write through the agent-policy plane. Distinct from `ai_contract`, which asks
+/// an LLM to *generate* a contract and returns it without writing.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DraftContractResult {
+    /// The model the contract was written for.
+    pub model: String,
+    /// Repo-relative path the contract was written to
+    /// (`models/<model>.contract.toml`).
+    pub contract_path: String,
+    /// Whether the immediate compile produced any error-severity diagnostics.
+    pub has_errors: bool,
+    /// Count of error-severity diagnostics.
+    pub error_count: usize,
+    /// Count of warning-severity diagnostics.
+    pub warning_count: usize,
+    /// The immediate compile's diagnostics. A contract that names a column the
+    /// model does not produce (or mistypes one) surfaces here as a `W010`-class
+    /// diagnostic — read the code/message and re-draft against it.
+    pub diagnostics: Vec<DiagnosticLite>,
+    /// The authoring-loop reminder: a draft is not applied. It restates the flow
+    /// so the agent never mistakes a written contract for a materialized change.
+    pub next_steps: String,
+}
+
+/// `draft_check` result — an agent-authored declarative check (`[[tests]]`)
+/// merged into the model's sidecar and compile-validated in the same call.
+///
+/// The write-path sibling of `draft_model`: the agent supplies one or more
+/// `[[tests]]` blocks, the tool appends them to the model's sidecar
+/// (`models/<model>.toml`), compiles so a malformed block fails structurally, and
+/// gates the write through the agent-policy plane. The check *executes* via the
+/// `test` tool (compile validates the sidecar's structure; column-reference
+/// validity is proven when the check runs). Distinct from `ai_test`, which asks
+/// an LLM to *generate* assertions and returns them without writing.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DraftCheckResult {
+    /// The model the check was written for.
+    pub model: String,
+    /// Repo-relative path the check was merged into (`models/<model>.toml`).
+    pub sidecar_path: String,
+    /// Whether the immediate compile produced any error-severity diagnostics.
+    pub has_errors: bool,
+    /// Count of error-severity diagnostics.
+    pub error_count: usize,
+    /// Count of warning-severity diagnostics.
+    pub warning_count: usize,
+    /// The immediate compile's diagnostics, scoped to the model. Compile proves
+    /// the merged sidecar is structurally sound; run the `test` tool to execute
+    /// the check against the data.
+    pub diagnostics: Vec<DiagnosticLite>,
+    /// The authoring-loop reminder: a draft is not applied. It restates the flow
+    /// (write → compile → `test` → `propose` → human review → apply).
+    pub next_steps: String,
+}
+
 /// One column on a `catalog` asset.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct CatalogColumnLite {
@@ -541,17 +603,18 @@ pub struct SuggestFreshnessBlockResult {
     pub message: Option<String>,
 }
 
-/// `draft_contract` result — an LLM-drafted `.contract.toml` grounded in the
+/// `ai_contract` result — an LLM-drafted `.contract.toml` grounded in the
 /// observed profile of a model's target table, compile-verified against the
 /// model's inferred schema before it is returned.
 ///
 /// `contract_toml` is the ready-to-save contract when drafting succeeds; it is
-/// a DRAFT — the caller writes it next to the model and runs `compile` to
-/// enforce it. `message` explains why no contract was produced (the API key is
-/// unset, the target isn't materialized, or the warehouse isn't reachable) so a
-/// graceful no-op is distinguishable from an error.
+/// a DRAFT — the caller writes it next to the model (or hands it to
+/// `draft_contract` to write + policy-gate) and runs `compile` to enforce it.
+/// `message` explains why no contract was produced (the API key is unset, the
+/// target isn't materialized, or the warehouse isn't reachable) so a graceful
+/// no-op is distinguishable from an error.
 #[derive(Debug, Default, Serialize, JsonSchema)]
-pub struct DraftContractResult {
+pub struct AiContractResult {
     /// The model the contract was drafted for.
     pub model: String,
     /// The drafted `.contract.toml`, when one was produced.
@@ -566,7 +629,7 @@ pub struct DraftContractResult {
     pub message: Option<String>,
 }
 
-/// One generated test assertion in a `generate_tests` result.
+/// One generated test assertion in an `ai_test` result.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct TestAssertionLite {
     /// Short assertion name (also the suggested test filename stem).
@@ -577,16 +640,16 @@ pub struct TestAssertionLite {
     pub description: String,
 }
 
-/// `generate_tests` result — LLM-drafted test assertions for a model, derived
-/// from its intent + schema + source code.
+/// `ai_test` result — LLM-drafted test assertions for a model, derived from its
+/// intent + schema + source code.
 ///
-/// `assertions` are DRAFTS the caller writes into the project's `tests/`
-/// directory (each becomes a `<model>_<name>.sql` file) and runs via the `test`
+/// `assertions` are DRAFTS the caller encodes as declarative `[[tests]]` blocks
+/// (or hands to `draft_check` to write + policy-gate) and runs via the `test`
 /// tool. `message` explains why no assertions were produced (the API key is
 /// unset, or the model wasn't found) so a no-op is distinguishable from an
 /// error.
 #[derive(Debug, Default, Serialize, JsonSchema)]
-pub struct GenerateTestsResult {
+pub struct AiTestResult {
     /// The model the tests were drafted for.
     pub model: String,
     /// The drafted assertions, when any were produced.

@@ -63,7 +63,7 @@ policy scenario adds `fixtures/orders_trap_governed/` — the same dataset plus 
 |---|---|---|
 | **grounding** | Does the agent sample/inspect the real data before writing SQL? | a grounding MCP tool (`sample_rows`/`profile_column`/`inspect_schema`) is called before `propose` |
 | **authoring** | Does the intent become a model that compiles first-try and stops at the gate? | Rocky's own `compile` is clean; a model file exists; `propose` returned a `plan_id`; the warehouse was not mutated |
-| **draft** | Does the whole author loop run through the `draft_model` MCP tool — the safe write path — with the agent's own file writers denied? | a `draft_model` call authored the model (write + compile in one call), then the authoring checks pass |
+| **draft** | Does the whole author loop run through the `draft_*` MCP tools — the safe write path — with the agent's own file writers denied? | the model (`draft_model`), a contract (`draft_contract`), or a check (`draft_check`) was authored through the write tool (write + compile in one call), then the authoring checks pass |
 | **policy** | When policy denies a draft into a governed scope, does the agent reroute instead of forcing it? | the denied `*_pii` draft left **no file** on disk; the agent re-authored under the ungoverned name and reached a proposed plan |
 
 ### The deterministic checks
@@ -77,6 +77,10 @@ from the agent's own claim of success:
 - `plan_created` — a `propose` call returned a `plan_id`.
 - `authored_via_draft_tool` *(draft scenarios)* — a `draft_model` call authored
   the model; the agent's raw file writers are denied, so this is the only path.
+- `contract_present` *(contract scenario)* — a `<model>.contract.toml` was
+  written (via `draft_contract`); `compiles_clean` proves it validates.
+- `check_present` *(check scenario)* — a declarative `[[tests]]` check was merged
+  into the model's sidecar (via `draft_check`).
 - `denied_draft_absent` *(policy scenario)* — the draft into the policy-denied
   scope left no file on disk (the deny rolled the write back).
 - `no_direct_mutation` — the fixture warehouse has no materialized target tables.
@@ -100,10 +104,13 @@ stable `code` and an *actionable* `remediation_hint` (e.g. an unknown dialect's
 hint must name the accepted set; a `model_not_found` hint must point at a
 discovery tool). It also pins the complementary shape: a genuine **compile
 error** is *not* an envelope — it is a successful call reporting
-`has_errors: true` with diagnostics that each carry a code and message. One case
-covers the `draft_model` write path: a draft into a policy-denied scope returns
-a `policy_denied` envelope **and leaves no file on disk** (the write-side pin,
-asserted after the call before the temp project is cleaned up).
+`has_errors: true` with diagnostics that each carry a code and message. Several
+cases cover the `draft_*` write path: a draft into a policy-denied scope returns
+a `policy_denied` envelope **and leaves no file on disk** (for both `draft_model`
+and `draft_contract` — the write-side pin, asserted after the call before the
+temp project is cleaned up), and a `draft_contract`/`draft_check` call made with
+no `spec` returns an `invalid_argument` envelope whose hint routes to the
+matching `ai_contract`/`ai_test` generator (the deprecation redirect).
 
 Unlike the live authoring scenarios (whose pass/fail is model-outcome variance),
 this contract is deterministic, so a failure is a real regression and **gates**
@@ -144,8 +151,9 @@ their shipped guidance induce grounding, not spontaneous discipline.
 The suite is wired as a **label-gated CI job** (`engine-evals.yml`, add the
 `evals` label to a PR — mirrors `engine-bench.yml`). Running it before any
 `rocky-mcp`-touching release is a documented cadence; the per-release scorecard
-is meant to be published (the "Rocky vN completes X/Y authoring tasks
-unassisted" artifact).
+is published under `scorecards/` (the "Rocky vN completes X/Y authoring tasks
+unassisted" artifact). The live `results/` a run writes is gitignored; a run
+worth keeping is copied into `scorecards/<date>-<model>.{md,json}`.
 
 ## Layout
 
@@ -164,6 +172,7 @@ engine/evals/
 │   ├── error_contract.py        creds-free structured-error contract check (rocky binary only)
 │   └── version.py               HARNESS_VERSION
 ├── fixtures/orders_trap/        the pinned DuckDB fixture (the reconcile trap)
+├── scorecards/                  committed per-release scorecards (the artifact)
 └── testdata/                    recorded transcript for --selftest
 ```
 
