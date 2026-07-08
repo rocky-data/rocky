@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.34.1] — 2026-07-08
+
+### Added
+
+- **Generated TypeScript types for the engine-v1.58.0 output surface** — the audit trust scorecard (`audit_scorecard`) and the custody drill-down + review queue (`audit_for`, `review_queue`), plus two additive `run` output fields: a `contained[]` withheld-model list (model-failure containment) and an `attempts[]` retry trail (classified retry). Additive; the LSP client and existing commands are unchanged. (#1055, #1056, #1057, #1058)
+
 ## [1.34.0] — 2026-07-08
 
 ### Added
