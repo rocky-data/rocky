@@ -8,74 +8,226 @@
 //! # Naming (not row-quarantine)
 //!
 //! This is a different axis from the quality pipeline's *row*-quarantine
-//! (`rocky_core::quarantine`, `QuarantineMode::{Split,Tag,Drop}`,
-//! `__valid`/`__quarantine` tables), which splits bad *rows* out of one table.
+//! (`rocky_core::quarantine`), which splits bad *rows* out of one table.
 //! Containment operates on the *model graph*: it withholds whole downstream
 //! *models* when an upstream fails. The vocabulary here is deliberately
 //! distinct — `Contained` / "blocked by" — so a reader never confuses a
 //! withheld model with a quarantined row.
 //!
-//! # Soundness
+//! # Soundness — the closure must be complete, not just the declared graph
 //!
-//! The closure is the soundness surface. The invariant: **a downstream of a
-//! failed model must never build on stale or missing input.** So the ledger is
-//! *conservative* — it withholds a model whenever any of its resolved upstreams
-//! is failed-or-withheld, contain-more on any doubt.
+//! The invariant is absolute: **a downstream of a failed model must never build
+//! on that failure's stale or missing output.** So the closure is *conservative
+//! and fail-closed*, and it does **not** trust the declared dependency graph
+//! (`dag_nodes`) as complete or authoritative. Two escape hatches make a naive
+//! `dag_nodes`-only closure unsound, and both are closed here:
 //!
-//! Two facts make a direct-upstream check transitively complete:
+//! 1. **Physical-table reads.** A raw-SQL model can read a producer's *target
+//!    table by physical name* (`marts.orders_current`) instead of by model name
+//!    (`ref(stage_orders)`). That read produces no `dag_nodes` edge, so a
+//!    `dag_nodes`-only closure would let the model build on the failed
+//!    producer's stale output. We therefore resolve every physical `FROM`/`JOIN`
+//!    read against the set of **produced targets** ([`ProducerIndex`]) and add
+//!    an implicit containment edge when a read matches a produced target — so a
+//!    model reading a failed model's output, by `ref()` *or* by physical name,
+//!    is withheld. A read that resolves to no produced target is a genuinely
+//!    external table this run does not produce, so a run failure cannot make it
+//!    stale — no edge, build allowed.
+//! 2. **Unprovable read sets.** If a model's reads cannot be fully enumerated
+//!    (`rocky_sql::lineage_complete::lineage_is_provably_complete` is `false` —
+//!    CTEs, sub-queries, set operations, unparseable SQL) or a physical read is
+//!    ambiguous (matches producers in more than one catalog), we cannot *prove*
+//!    the model is disjoint from the failure set. Such a model **fails closed**:
+//!    once any failure has occurred it is contained, never built.
 //!
-//! - The edge set is the *resolved* dependency graph
-//!   ([`rocky_ir::dag::DagNode::depends_on`] — explicit `depends_on` **merged
-//!   with** the SQL-`ref()`-derived deps the executor's layering was built
-//!   from). Using the executor's own edges means a model that lands in a later
-//!   layer *because of* an edge is contained by that same edge — no
-//!   SQL-only dependency slips through un-contained.
-//! - The caller evaluates models in topological order (layer by layer), marking
-//!   every withheld model into the poison set as it goes. So by the time a model
-//!   is considered, every ancestor that failed or was withheld is already in the
-//!   poison set, and `blocked_by` (a one-hop check against the poison set) sees
-//!   it.
+//! The closure is evaluated layer-by-layer in topological order, poisoning every
+//! withheld model as it goes, so a one-hop upstream check is transitively
+//! complete. Residual boundary: a physical read of a producer that is *not*
+//! topologically earlier is a pre-existing undeclared-dependency ordering issue
+//! (the read sees prior-run data regardless of containment) — declare the
+//! dependency via `ref()`/model name.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-use rocky_ir::dag::DagNode;
-
-/// Conservative downstream-closure tracker for one run.
+/// Index of every model's produced target, for resolving a physical `FROM` /
+/// `JOIN` read back to the model that produces that table.
 ///
-/// Holds the resolved dependency edges (owned, cloned once from the project's
-/// `dag_nodes`) plus the *poison set*: the union of failed models and models
-/// withheld because an upstream was poisoned. A model is withheld iff any of
-/// its resolved upstreams is in the poison set.
+/// Two lookups mirror how a physical read can be written:
+/// - `by_full` — an explicit 3-part `catalog.schema.table` read matches a
+///   producer's full target exactly.
+/// - `by_schema_table` — a 2-part `schema.table` read omits the catalog; it
+///   matches producers on `(schema, table)`. If more than one producer (in
+///   different catalogs) shares that `(schema, table)`, the read is *ambiguous*.
+///
+/// All keys are lowercased. A model appears once per lookup.
+pub(crate) struct ProducerIndex {
+    by_full: HashMap<(String, String, String), Vec<String>>,
+    by_schema_table: HashMap<(String, String), Vec<String>>,
+}
+
+/// How a single physical read resolves against the produced targets.
+enum ReadResolution {
+    /// Resolves to exactly one produced target — add a containment edge.
+    Edge(String),
+    /// Matches more than one produced target (multi-catalog `schema.table`) —
+    /// cannot be attributed, so the reader fails closed.
+    Ambiguous,
+    /// Matches no produced target — a genuinely external table this run does
+    /// not produce, which a run failure cannot make stale.
+    External,
+}
+
+impl ProducerIndex {
+    /// Build from `(model_name, catalog, schema, table)` tuples.
+    pub(crate) fn build<'a, I>(models: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
+    {
+        let mut by_full: HashMap<(String, String, String), Vec<String>> = HashMap::new();
+        let mut by_schema_table: HashMap<(String, String), Vec<String>> = HashMap::new();
+        for (name, catalog, schema, table) in models {
+            let (c, s, t) = (
+                catalog.to_lowercase(),
+                schema.to_lowercase(),
+                table.to_lowercase(),
+            );
+            by_full
+                .entry((c, s.clone(), t.clone()))
+                .or_default()
+                .push(name.to_string());
+            by_schema_table
+                .entry((s, t))
+                .or_default()
+                .push(name.to_string());
+        }
+        Self {
+            by_full,
+            by_schema_table,
+        }
+    }
+
+    /// Resolve one lowercased physical read identity to a produced target.
+    ///
+    /// Only 2-part (`schema.table`) and 3-part (`catalog.schema.table`) reads
+    /// are physical-target shapes. A bare (0-dot) read is either a model name
+    /// (already a `ref()` edge, handled by the caller) or an external table; a
+    /// read with more than three parts is out of range. Both resolve to
+    /// [`ReadResolution::External`].
+    fn resolve(&self, read: &str) -> ReadResolution {
+        let parts: Vec<&str> = read.split('.').collect();
+        let candidates: &[String] = match parts.as_slice() {
+            [catalog, schema, table] => self
+                .by_full
+                .get(&(
+                    (*catalog).to_string(),
+                    (*schema).to_string(),
+                    (*table).to_string(),
+                ))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            [schema, table] => self
+                .by_schema_table
+                .get(&((*schema).to_string(), (*table).to_string()))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            _ => &[],
+        };
+        match candidates {
+            [] => ReadResolution::External,
+            [one] => ReadResolution::Edge(one.clone()),
+            _ => ReadResolution::Ambiguous,
+        }
+    }
+}
+
+/// Conservative, fail-closed downstream-closure tracker for one run.
+///
+/// Holds, per model, its full containment-upstream set (`ref()` deps ∪ resolved
+/// physical-target edges) plus an `uncertain` flag for models whose disjointness
+/// from the failure set cannot be proven; and the *poison set* — the union of
+/// failed and withheld models.
 pub(crate) struct ContainmentLedger {
-    /// `model name → its resolved upstream model names` (explicit + SQL-derived,
-    /// the same edges the execution layering used).
-    deps: HashMap<String, Vec<String>>,
-    /// Failed ∪ withheld model names. A model whose upstream is in here is
-    /// withheld; the model itself is then added, extending the closure.
+    /// `model name → its containment upstreams` (ref-deps ∪ physical edges).
+    upstreams: HashMap<String, Vec<String>>,
+    /// Models whose read set could not be proven complete / unambiguous — they
+    /// fail closed once any failure has occurred.
+    uncertain: HashSet<String>,
+    /// Every model the ledger was told about (run-set coverage). A model queried
+    /// but never added is treated as uncertain (fail closed).
+    known: HashSet<String>,
+    /// Failed ∪ withheld model names.
     poison: BTreeSet<String>,
 }
 
+/// The verdict for one model: whether to withhold it, and why.
+pub(crate) struct ContainmentDecision {
+    /// The poisoned models that make it unsafe to build — a proven upstream
+    /// block names those upstreams; a fail-closed block names the current
+    /// failure set.
+    pub blocked_by: Vec<String>,
+    /// `true` when contained by the conservative belt (unprovable disjointness),
+    /// not by a proven poisoned upstream.
+    pub fail_closed: bool,
+}
+
 impl ContainmentLedger {
-    /// Build a ledger from the project's resolved DAG nodes.
-    ///
-    /// The edges are cloned into an owned map so the ledger carries no borrow
-    /// of the compile result — the run loop mutates `output` and other state
-    /// alongside it without lifetime entanglement. The clone is one small pass
-    /// over the node list, paid once per run.
-    pub(crate) fn from_dag_nodes(nodes: &[DagNode]) -> Self {
-        let deps = nodes
-            .iter()
-            .map(|n| (n.name.clone(), n.depends_on.clone()))
-            .collect();
+    pub(crate) fn new() -> Self {
         Self {
-            deps,
+            upstreams: HashMap::new(),
+            uncertain: HashSet::new(),
+            known: HashSet::new(),
             poison: BTreeSet::new(),
         }
     }
 
-    /// Seed the poison set with already-known failed models (e.g. models that
-    /// failed to compile and were excluded from execution). Their downstreams
-    /// will be withheld just like a runtime failure's.
+    /// Register one model with its `ref()` deps, its enumerated physical reads,
+    /// whether that read set is provably complete, and the producer index.
+    ///
+    /// Computes the model's full containment-upstream set (ref-deps ∪ physical
+    /// edges to produced targets) and marks it `uncertain` when the read set is
+    /// not provably complete or any physical read is ambiguous.
+    pub(crate) fn add_model(
+        &mut self,
+        name: &str,
+        ref_deps: &[String],
+        model_names: &HashSet<String>,
+        reads: &[String],
+        reads_complete: bool,
+        producers: &ProducerIndex,
+    ) {
+        self.known.insert(name.to_string());
+        let mut ups: BTreeSet<String> = ref_deps.iter().cloned().collect();
+        // A read set we cannot fully enumerate cannot prove disjointness.
+        let mut uncertain = !reads_complete;
+        for read in reads {
+            // A bare model-name read is already a `ref()` edge (in `ref_deps`).
+            if model_names.contains(read) {
+                continue;
+            }
+            match producers.resolve(read) {
+                // A physical read of another model's produced target.
+                ReadResolution::Edge(producer) if producer != name => {
+                    ups.insert(producer);
+                }
+                // A model reading its own target (e.g. incremental self-ref) is
+                // not a cross-model edge.
+                ReadResolution::Edge(_) => {}
+                // Cannot attribute the read to a single producer — fail closed.
+                ReadResolution::Ambiguous => uncertain = true,
+                // Genuinely external — a run failure cannot make it stale.
+                ReadResolution::External => {}
+            }
+        }
+        self.upstreams
+            .insert(name.to_string(), ups.into_iter().collect());
+        if uncertain {
+            self.uncertain.insert(name.to_string());
+        }
+    }
+
+    /// Seed the poison set with already-known failed models (e.g. compile
+    /// failures excluded from execution). Their downstreams are withheld like a
+    /// runtime failure's.
     pub(crate) fn seed_failed<I>(&mut self, models: I)
     where
         I: IntoIterator<Item = String>,
@@ -83,37 +235,67 @@ impl ContainmentLedger {
         self.poison.extend(models);
     }
 
-    /// The poisoned upstreams that reach `model` — its *direct* failed-or-
-    /// withheld dependencies. Empty ⇒ the model is safe to build. Non-empty ⇒
-    /// the model must be withheld; the returned names are the operator's
-    /// "blocked by" list (the run's `errors[]` name the root cause).
-    ///
-    /// Sorted + de-duplicated for deterministic output.
-    pub(crate) fn blocked_by(&self, model: &str) -> Vec<String> {
-        let Some(deps) = self.deps.get(model) else {
-            return Vec::new();
-        };
-        let mut blockers: Vec<String> = deps
-            .iter()
-            .filter(|u| self.poison.contains(*u))
-            .cloned()
-            .collect();
-        blockers.sort();
-        blockers.dedup();
-        blockers
-    }
-
     /// Add a model to the poison set — a failed cause *or* a withheld
-    /// downstream. Either way its own descendants must be withheld, so both
-    /// extend the closure identically.
+    /// downstream. Either way its descendants must be withheld, so both extend
+    /// the closure identically.
     pub(crate) fn poison(&mut self, model: &str) {
         self.poison.insert(model.to_string());
     }
+
+    /// Decide whether `model` must be withheld this run.
+    ///
+    /// - Any containment upstream (ref or physical) is poisoned ⇒ contained,
+    ///   naming those upstreams (`fail_closed = false`).
+    /// - Otherwise, if a failure has occurred (`poison` non-empty) and the model
+    ///   is *uncertain* — unprovable read set, an ambiguous read, or unknown to
+    ///   the ledger — ⇒ contained by the fail-closed belt, naming the current
+    ///   failure set (`fail_closed = true`).
+    /// - Otherwise ⇒ `None` (safe to build).
+    pub(crate) fn evaluate(&self, model: &str) -> Option<ContainmentDecision> {
+        let mut blockers: Vec<String> = self
+            .upstreams
+            .get(model)
+            .map(|ups| {
+                ups.iter()
+                    .filter(|u| self.poison.contains(*u))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !blockers.is_empty() {
+            blockers.sort();
+            blockers.dedup();
+            return Some(ContainmentDecision {
+                blocked_by: blockers,
+                fail_closed: false,
+            });
+        }
+        let failure_occurred = !self.poison.is_empty();
+        let is_uncertain = self.uncertain.contains(model) || !self.known.contains(model);
+        if failure_occurred && is_uncertain {
+            return Some(ContainmentDecision {
+                blocked_by: self.poison.iter().cloned().collect(),
+                fail_closed: true,
+            });
+        }
+        None
+    }
 }
 
-/// A human-readable hint telling the operator how to clear a withheld model:
-/// resolve the named upstream failure(s), then re-run.
-pub(crate) fn unblock_hint(blocked_by: &[String]) -> String {
+/// A human-readable hint telling the operator how to clear a withheld model.
+pub(crate) fn unblock_hint(blocked_by: &[String], fail_closed: bool) -> String {
+    if fail_closed {
+        return match blocked_by {
+            [] => "contained conservatively while a failure is unresolved; \
+                   declare dependencies via ref()/model name and re-run"
+                .to_string(),
+            many => format!(
+                "contained conservatively: cannot prove this model is independent of the \
+                 failure(s) {}; declare dependencies via ref()/model name and re-run",
+                many.join(", ")
+            ),
+        };
+    }
     match blocked_by {
         [] => "re-run once the upstream failure is resolved".to_string(),
         [one] => format!("resolve upstream '{one}', then re-run"),
@@ -125,144 +307,185 @@ pub(crate) fn unblock_hint(blocked_by: &[String]) -> String {
 mod tests {
     use super::*;
 
-    fn node(name: &str, deps: &[&str]) -> DagNode {
-        DagNode {
-            name: name.to_string(),
-            depends_on: deps.iter().copied().map(String::from).collect(),
+    /// Build a ledger from `(name, ref_deps, sql_reads, reads_complete)` tuples
+    /// plus producer `(name, catalog, schema, table)` tuples, driving the same
+    /// path `execute_models` uses.
+    fn ledger(
+        models: &[(&str, &[&str], &[&str], bool)],
+        producers: &[(&str, &str, &str, &str)],
+    ) -> ContainmentLedger {
+        let index = ProducerIndex::build(producers.iter().copied());
+        let names: HashSet<String> = models.iter().map(|(n, ..)| n.to_string()).collect();
+        let mut led = ContainmentLedger::new();
+        for (name, deps, reads, complete) in models {
+            let deps: Vec<String> = deps.iter().copied().map(String::from).collect();
+            let reads: Vec<String> = reads.iter().map(|s| s.to_lowercase()).collect();
+            led.add_model(name, &deps, &names, &reads, *complete, &index);
         }
+        led
     }
 
-    /// Drive the ledger over a topologically-ordered model list exactly as the
-    /// run loop does: a model with a poisoned upstream is withheld (and itself
-    /// poisoned); an already-failed model is seeded; everything else builds.
-    /// Returns `(built, withheld)` model-name sets.
-    fn simulate(
-        nodes: &[DagNode],
-        topo_order: &[&str],
-        failed: &[&str],
-    ) -> (Vec<String>, Vec<String>) {
-        let mut ledger = ContainmentLedger::from_dag_nodes(nodes);
-        let failed_set: BTreeSet<&str> = failed.iter().copied().collect();
-        let mut built = Vec::new();
-        let mut withheld = Vec::new();
-        for &name in topo_order {
-            // A model that is itself the failure: mark failed, don't build.
-            if failed_set.contains(name) {
-                ledger.poison(name);
-                continue;
-            }
-            let blockers = ledger.blocked_by(name);
-            if blockers.is_empty() {
-                built.push(name.to_string());
-            } else {
-                ledger.poison(name);
-                withheld.push(name.to_string());
-            }
-        }
-        (built, withheld)
-    }
-
-    /// (a) Disjoint subtrees still run. Graph: A→B and C→D are two independent
-    /// chains. A fails ⇒ B is withheld, but C and D (disjoint) still build.
+    /// (a) Disjoint subtrees still run; the ref-declared downstream of a failure
+    /// is contained.
     #[test]
-    fn disjoint_subtree_still_builds() {
-        let nodes = [
-            node("A", &[]),
-            node("B", &["A"]),
-            node("C", &[]),
-            node("D", &["C"]),
-        ];
-        let (built, withheld) = simulate(&nodes, &["A", "C", "B", "D"], &["A"]);
-        assert_eq!(built, vec!["C", "D"], "the disjoint C→D subtree must build");
-        assert_eq!(withheld, vec!["B"], "only A's downstream is withheld");
-    }
-
-    /// (b) The full downstream closure of a failure is contained. Chain
-    /// A→B→C→D; A fails ⇒ B, C, and D are ALL withheld (transitive closure),
-    /// even though only B depends on A directly — C is withheld because B is
-    /// poisoned, D because C is.
-    #[test]
-    fn full_downstream_closure_is_contained() {
-        let nodes = [
-            node("A", &[]),
-            node("B", &["A"]),
-            node("C", &["B"]),
-            node("D", &["C"]),
-        ];
-        let (built, withheld) = simulate(&nodes, &["A", "B", "C", "D"], &["A"]);
-        assert!(built.is_empty(), "nothing survives A's failure in a chain");
-        assert_eq!(
-            withheld,
-            vec!["B", "C", "D"],
-            "the whole closure is withheld"
+    fn disjoint_subtree_builds_ref_downstream_contained() {
+        let mut led = ledger(
+            &[
+                ("A", &[], &[], true),
+                ("B", &["A"], &["a"], true),
+                ("C", &[], &[], true),
+                ("D", &["C"], &["c"], true),
+            ],
+            &[],
         );
+        led.poison("A");
+        assert!(led.evaluate("B").is_some(), "B depends on failed A");
+        assert!(led.evaluate("C").is_none(), "C is disjoint");
+        assert!(led.evaluate("D").is_none(), "D is disjoint");
     }
 
-    /// (c) A diamond: A→{B,C}→D. A fails ⇒ B, C, and their shared join D are
-    /// all withheld. D is blocked by BOTH B and C (both poisoned).
+    /// (b) Physical-table read of a failed producer's TARGET is contained even
+    /// with no `ref()` edge — the Finding-1 unit-level guard.
     #[test]
-    fn diamond_closure_and_multi_blocker() {
-        let nodes = [
-            node("A", &[]),
-            node("B", &["A"]),
-            node("C", &["A"]),
-            node("D", &["B", "C"]),
-        ];
-        let mut ledger = ContainmentLedger::from_dag_nodes(&nodes);
-        ledger.poison("A"); // A failed
-        assert_eq!(ledger.blocked_by("B"), vec!["A"]);
-        ledger.poison("B");
-        assert_eq!(ledger.blocked_by("C"), vec!["A"]);
-        ledger.poison("C");
-        // D is reachable from A through two paths — both blockers surface.
-        assert_eq!(ledger.blocked_by("D"), vec!["B", "C"]);
-    }
-
-    /// A model whose upstreams are all healthy is never withheld.
-    #[test]
-    fn healthy_model_is_not_blocked() {
-        let nodes = [node("A", &[]), node("B", &["A"])];
-        let mut ledger = ContainmentLedger::from_dag_nodes(&nodes);
-        ledger.poison("A");
-        // B depends on A (poisoned) → blocked.
-        assert!(!ledger.blocked_by("B").is_empty());
-        // But a fresh sibling with no poisoned deps is clear.
-        assert!(ledger.blocked_by("A").is_empty());
-    }
-
-    /// A compile-failed model seeded up front withholds its runtime downstream
-    /// exactly like a runtime failure would — a compile error is a failure too.
-    #[test]
-    fn seeded_compile_failure_contains_downstream() {
-        let nodes = [node("bad", &[]), node("dep", &["bad"])];
-        let mut ledger = ContainmentLedger::from_dag_nodes(&nodes);
-        ledger.seed_failed(["bad".to_string()]);
-        assert_eq!(ledger.blocked_by("dep"), vec!["bad"]);
-    }
-
-    /// A poisoned *partitioned* cause blocks only its descendants, not a
-    /// disjoint sibling — the model-level rule the partition path relies on
-    /// (any failed partition poisons the whole model's downstream).
-    #[test]
-    fn partitioned_cause_blocks_only_descendants() {
-        let nodes = [
-            node("events", &[]), // partitioned model, one partition failed
-            node("rollup", &["events"]),
-            node("unrelated", &[]),
-        ];
-        let mut ledger = ContainmentLedger::from_dag_nodes(&nodes);
-        ledger.poison("events");
-        assert_eq!(ledger.blocked_by("rollup"), vec!["events"]);
+    fn physical_target_read_is_contained() {
+        // `stage` produces `marts.orders_current`; `rollup` reads it by physical
+        // name (2-part) with no ref edge to `stage`.
+        let mut led = ledger(
+            &[
+                ("stage", &[], &["main.raw"], true),
+                (
+                    "rollup",
+                    &["anchor"],
+                    &["anchor", "marts.orders_current"],
+                    true,
+                ),
+                ("anchor", &[], &[], true),
+            ],
+            &[
+                ("stage", "", "marts", "orders_current"),
+                ("rollup", "", "marts", "rollup"),
+                ("anchor", "", "main", "anchor"),
+            ],
+        );
+        led.poison("stage");
+        let dec = led.evaluate("rollup").expect("rollup must be contained");
         assert!(
-            ledger.blocked_by("unrelated").is_empty(),
-            "a disjoint model must be unaffected by a partition failure elsewhere"
+            !dec.fail_closed,
+            "contained by a proven physical edge, not the belt"
         );
+        assert!(
+            dec.blocked_by.contains(&"stage".to_string()),
+            "the physical edge must name the producer: {:?}",
+            dec.blocked_by
+        );
+    }
+
+    /// A physical read that matches NO produced target is external — never
+    /// contained (a run failure can't make an external table stale).
+    #[test]
+    fn external_physical_read_is_not_contained() {
+        let mut led = ledger(
+            &[("m", &[], &["raw_db.orders"], true)],
+            &[("other", "", "marts", "orders_current")],
+        );
+        led.poison("other");
+        assert!(led.evaluate("m").is_none(), "external read must build");
+    }
+
+    /// (c) Fail-closed belt: an unenumerable read set (not provably complete) is
+    /// contained once any failure has occurred, never built — Finding-2 /
+    /// invariant-1 guard.
+    #[test]
+    fn unprovable_reads_fail_closed() {
+        let mut led = ledger(
+            &[
+                ("bad", &[], &[], true),
+                ("mystery", &["anchor"], &[], false), // reads NOT provably complete
+                ("anchor", &[], &[], true),
+            ],
+            &[],
+        );
+        // No failure yet ⇒ even an uncertain model may build.
+        assert!(led.evaluate("mystery").is_none(), "no failure ⇒ build");
+        led.poison("bad");
+        let dec = led
+            .evaluate("mystery")
+            .expect("uncertain ⇒ fail closed after a failure");
+        assert!(dec.fail_closed, "contained by the fail-closed belt");
+    }
+
+    /// An ambiguous physical read (matches producers in two catalogs) fails
+    /// closed once a failure has occurred.
+    #[test]
+    fn ambiguous_physical_read_fails_closed() {
+        let mut led = ledger(
+            &[
+                ("bad", &[], &[], true),
+                ("reader", &["anchor"], &["marts.orders"], true),
+                ("anchor", &[], &[], true),
+            ],
+            &[
+                ("p1", "cat_a", "marts", "orders"),
+                ("p2", "cat_b", "marts", "orders"),
+            ],
+        );
+        led.poison("bad");
+        let dec = led
+            .evaluate("reader")
+            .expect("ambiguous read ⇒ fail closed");
+        assert!(dec.fail_closed);
+    }
+
+    /// A model unknown to the ledger fails closed once a failure has occurred —
+    /// the coverage guarantee (Finding 2: never trust the map as total).
+    #[test]
+    fn unknown_model_fails_closed() {
+        let mut led = ledger(&[("known", &[], &[], true)], &[]);
+        // No poison ⇒ an unknown model is not spuriously contained.
+        assert!(led.evaluate("ghost").is_none());
+        led.poison("something");
+        let dec = led
+            .evaluate("ghost")
+            .expect("unknown model ⇒ fail closed after a failure");
+        assert!(
+            dec.fail_closed,
+            "a model absent from the edge map must fail closed"
+        );
+    }
+
+    /// The full downstream closure of a failure is contained transitively when
+    /// evaluated in topological order (poisoning as we go).
+    #[test]
+    fn full_closure_contained_in_topo_order() {
+        let mut led = ledger(
+            &[
+                ("A", &[], &[], true),
+                ("B", &["A"], &["a"], true),
+                ("C", &["B"], &["b"], true),
+            ],
+            &[],
+        );
+        led.poison("A");
+        assert!(led.evaluate("B").is_some());
+        led.poison("B"); // withheld B poisons its own downstream
+        assert!(led.evaluate("C").is_some());
+    }
+
+    /// A compile-failed model seeded up front contains its downstream.
+    #[test]
+    fn seeded_failure_contains_downstream() {
+        let mut led = ledger(
+            &[("bad", &[], &[], true), ("dep", &["bad"], &["bad"], true)],
+            &[],
+        );
+        led.seed_failed(["bad".to_string()]);
+        assert!(led.evaluate("dep").is_some());
     }
 
     #[test]
     fn unblock_hint_wording() {
-        assert!(unblock_hint(&["a".to_string()]).contains("resolve upstream 'a'"));
-        assert!(unblock_hint(&["a".to_string(), "b".to_string()]).contains("a, b"));
-        assert!(!unblock_hint(&[]).is_empty());
+        assert!(unblock_hint(&["a".to_string()], false).contains("resolve upstream 'a'"));
+        assert!(unblock_hint(&["a".to_string(), "b".to_string()], true).contains("cannot prove"));
+        assert!(!unblock_hint(&[], true).is_empty());
     }
 }
