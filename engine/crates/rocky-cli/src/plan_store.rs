@@ -129,7 +129,7 @@ pub struct PersistedPlan {
     /// `format_version = 1`.
     #[serde(default = "default_format_version")]
     pub format_version: u32,
-    /// The principal that authored this plan (F3 agent-policy plane).
+    /// The principal that authored this plan (agent-policy plane).
     ///
     /// Rides **outside** the `plan_id` digest (like `created_at` /
     /// `format_version`) — the authoring identity must not perturb the hash,
@@ -158,13 +158,13 @@ pub struct PersistedPlan {
 }
 
 /// The reserved payload key under which the propose-time change-classification
-/// is embedded (D3). Kept out of every typed plan struct — it is injected into
+/// is embedded (capability-embed). Kept out of every typed plan struct — it is injected into
 /// the serialized payload `Value` at write time and read back as an
 /// [`EmbeddedCapabilities`] at apply time.
 const POLICY_CAPABILITIES_KEY: &str = "policy_capabilities";
 
 /// The propose-time change-classification embedded in a governed plan's
-/// payload (D3). Part of `blake3({kind, payload})`, so the reviewed capability
+/// payload (capability-embed). Part of `blake3({kind, payload})`, so the reviewed capability
 /// decision binds to the `plan_id`.
 ///
 /// Apply reads this back and never recomputes from a live diff. **Fail-closed
@@ -200,7 +200,7 @@ fn default_principal_for_kind(kind: &PlanKind) -> PolicyPrincipal {
 
 impl PersistedPlan {
     /// The authoring principal, resolving an absent stamp by kind (see
-    /// [`default_principal_for_kind`]). This is the value the F3 policy plane
+    /// [`default_principal_for_kind`]). This is the value the policy plane
     /// evaluates — the *authoring* identity binds, so a plan authored by an
     /// agent still evaluates as `agent` regardless of who runs `apply`.
     pub fn resolved_principal(&self) -> PolicyPrincipal {
@@ -208,7 +208,7 @@ impl PersistedPlan {
             .unwrap_or_else(|| default_principal_for_kind(&self.kind))
     }
 
-    /// The propose-time change-classification embedded in the payload (D3).
+    /// The propose-time change-classification embedded in the payload (capability-embed).
     /// Fail-closed: a plan with no embed yields `diff_available = false`.
     pub fn embedded_capabilities(&self) -> EmbeddedCapabilities {
         self.payload
@@ -280,7 +280,7 @@ pub fn write_plan<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Res
 
 /// Persist a governed `Run` / `AiAuthored` plan (`format_version = 1`) with an
 /// explicit authoring `principal` and an embedded propose-time
-/// change-classification (D3).
+/// change-classification (capability-embed).
 ///
 /// The `capabilities` value is injected into the payload under
 /// `policy_capabilities` **before** the `plan_id` is computed, so the reviewed
@@ -333,7 +333,7 @@ fn write_plan_inner<T: Serialize>(
     let mut payload_value =
         serde_json::to_value(payload).context("failed to serialize plan payload to JSON value")?;
 
-    // Embed the propose-time change-classification (D3) INTO the payload so it
+    // Embed the propose-time change-classification (capability-embed) INTO the payload so it
     // is part of `blake3({kind, payload})` — the reviewed capability binds to
     // the `plan_id`. Only meaningful for object payloads (run/ai_authored);
     // typed-IR compact/archive payloads never carry it.
@@ -684,7 +684,7 @@ mod tests {
         );
     }
 
-    // ---------- F3 principal + embedded-capability (D3 / seam 1) ----------
+    // ---------- agent-policy principal + embedded-capability (capability-embed / seam 1) ----------
 
     /// 🔴 The load-bearing safety invariant: a legacy `ai_authored` plan file
     /// with NO `principal` field must resolve to `agent`, never `human` —
@@ -697,7 +697,7 @@ mod tests {
         std::fs::create_dir_all(&plans_dir)?;
         let payload = serde_json::json!({"models": ["db.s.t"]});
         let plan_id = compute_plan_id(&PlanKind::AiAuthored, &payload);
-        // A pre-F3 plan file: kind = ai_authored, NO principal key at all.
+        // A pre-policy-plane plan file: kind = ai_authored, NO principal key at all.
         let legacy = serde_json::json!({
             "plan_id": plan_id,
             "kind": "ai_authored",

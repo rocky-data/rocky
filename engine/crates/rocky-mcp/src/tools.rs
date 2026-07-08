@@ -1698,7 +1698,7 @@ impl RockyMcpServer {
 
         let run_plan = build_ai_run_plan(params.0.model.clone(), &result);
 
-        // F3 seam 1 + D3: the `propose` tool is the sole MCP writer of plans.
+        // policy seam 1 + capability-embed: the `propose` tool is the sole MCP writer of plans.
         // Stamp the `agent` principal explicitly (an AiAuthored plan is
         // agent-authored by construction) and embed the propose-time
         // change-classification so `rocky apply` evaluates the plan against the

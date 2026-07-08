@@ -127,7 +127,7 @@ struct Cli {
     #[arg(long, global = true)]
     cache_ttl: Option<u64>,
 
-    /// Authoring principal for the F3 agent-policy plane (`human` | `agent`).
+    /// Authoring principal for the agent-policy plane (`human` | `agent`).
     ///
     /// Stamped onto plans created by `rocky plan` so a later `rocky apply`
     /// evaluates them against the identity that authored them. The CLI surface

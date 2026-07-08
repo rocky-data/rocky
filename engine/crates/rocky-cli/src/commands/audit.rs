@@ -2,7 +2,7 @@
 //!
 //! Reads the [`POLICY_DECISIONS`](rocky_core::state) table and renders every
 //! recorded policy decision (oldest first) as text (default) or JSON. Each row
-//! is one evaluation the F3 policy plane made at a mutating enforcement seam
+//! is one evaluation the policy plane made at a mutating enforcement seam
 //! (`rocky apply` / promote) — reads are never recorded, so this is the trail
 //! of *governed mutations*, not inspection.
 

@@ -142,7 +142,7 @@ async fn run_apply_run_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize run plan payload")?;
 
-    // F3 seam 2: an agent-authored `Run` plan (`rocky plan --principal agent`,
+    // policy seam 2: an agent-authored `Run` plan (`rocky plan --principal agent`,
     // or `ROCKY_PRINCIPAL=agent`) is gated exactly like an AiAuthored plan when
     // a `[policy]` block is configured. Absent `[policy]` this is a no-op —
     // `Run` was never gated — so behaviour is byte-identical to today. A
@@ -302,7 +302,7 @@ pub(crate) fn ai_plan_is_reviewed(root: &Path, plan_id: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// F3 agent-policy plane — apply/promote enforcement (seams 2 & 3)
+// agent-policy plane — apply/promote enforcement (seams 2 & 3)
 // ---------------------------------------------------------------------------
 
 /// The apply-time policy decision, aggregated most-restrictive across every
@@ -310,7 +310,7 @@ pub(crate) fn ai_plan_is_reviewed(root: &Path, plan_id: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PolicyGate {
     /// No `[policy]` block in the config — the evaluator was never
-    /// constructed. The caller falls back to its pre-F3 behaviour
+    /// constructed. The caller falls back to its pre-policy-plane behaviour
     /// (AiAuthored → require a review marker; Run/Promote → ungated), so
     /// absent-`[policy]` behaviour is byte-identical to today.
     NotConfigured,
@@ -398,7 +398,7 @@ fn evaluate_apply_policy(
             None => return PolicyGate::NotConfigured,
         },
         // A missing or malformed config leaves the policy plane unconfigured —
-        // the caller keeps its pre-F3 gate. (The run path re-loads and surfaces
+        // the caller keeps its pre-policy-plane gate. (The run path re-loads and surfaces
         // any real config error itself.)
         Err(_) => return PolicyGate::NotConfigured,
     };
@@ -566,7 +566,7 @@ fn compile_target_to_name(models_dir: &Path) -> BTreeMap<String, String> {
 /// controls whether `require_review` demands the review marker (it always does
 /// for run-shaped plans; kept explicit for the promote mirror).
 ///
-/// The `NotConfigured` arm is handled by the caller (it needs the pre-F3
+/// The `NotConfigured` arm is handled by the caller (it needs the pre-policy-plane
 /// fallback), so this function is only called for a configured plane.
 fn apply_policy_gate(root: &Path, plan_id: &str, gate: PolicyGate) -> Result<()> {
     match gate {
@@ -635,11 +635,11 @@ async fn run_apply_ai_authored_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize ai_authored plan payload")?;
 
-    // F3 seam 2: rule-driven refusal. When a `[policy]` block is configured,
+    // policy seam 2: rule-driven refusal. When a `[policy]` block is configured,
     // the per-model policy evaluation (over the authoring principal and the
     // embedded, reviewed capability classification) supersedes the fixed
     // AiAuthored gate. Absent a `[policy]` block the evaluator is never
-    // constructed and the pre-F3 marker gate remains — byte-identical to today.
+    // constructed and the pre-policy-plane marker gate remains — byte-identical to today.
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
     let touched = touched_models_for_run(&plan, &run_plan);
     let gate = evaluate_apply_policy(
@@ -1080,7 +1080,7 @@ async fn run_apply_promote_plan(
     let promote_plan: PromotePlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize promote plan payload")?;
 
-    // F3 seam 3: mirror the apply-time policy enforcement on the promote path.
+    // policy seam 3: mirror the apply-time policy enforcement on the promote path.
     // Absent `[policy]` this is a no-op (promote was never gated). A
     // human-authored promote resolves to `allow`; an agent-authored promote is
     // gated per changed model under the `promote` verb.
@@ -1366,7 +1366,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // F3 agent-policy enforcement (seams 2 & 3)
+    // agent-policy enforcement (seams 2 & 3)
     // ---------------------------------------------------------------------
 
     /// Config with an adapter + pipeline and an EMPTY `[policy]` block (no
@@ -1402,7 +1402,7 @@ auto_create_schemas = true
 "#;
 
     /// Rewrite a just-written plan file to look like a *legacy* plan: strip the
-    /// `principal` field (as if written before F3). The `plan_id` is unchanged
+    /// `principal` field (as if written before the policy plane). The `plan_id` is unchanged
     /// because `principal` rides outside the hash, so the integrity check still
     /// passes on read.
     fn strip_principal_from_plan(root: &Path, plan_id: &str) -> anyhow::Result<()> {
@@ -1453,7 +1453,7 @@ auto_create_schemas = true
     }
 
     /// Byte-identical fallback: with NO `[policy]` block, an AI-authored plan
-    /// without a marker is refused with the pre-F3 message (the hardcoded gate
+    /// without a marker is refused with the pre-policy-plane message (the hardcoded gate
     /// remains the sole gate — the evaluator is never constructed).
     #[tokio::test]
     async fn no_policy_block_ai_authored_requires_marker() -> anyhow::Result<()> {
@@ -1474,7 +1474,7 @@ auto_create_schemas = true
         let msg = err.to_string();
         assert!(
             msg.contains("not been reviewed") && msg.contains("rocky review"),
-            "must be the pre-F3 marker message, got: {msg}"
+            "must be the pre-policy-plane marker message, got: {msg}"
         );
         Ok(())
     }

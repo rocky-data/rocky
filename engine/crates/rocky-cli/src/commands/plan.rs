@@ -34,7 +34,7 @@ pub struct PlanRunOptions {
     pub governance_override: Option<GovernanceOverride>,
     pub models_dir: Option<PathBuf>,
     pub partition_opts: PartitionRunOptions,
-    /// Resolved authoring principal (F3 agent-policy plane). `None` ⇒ `human`
+    /// Resolved authoring principal (agent-policy plane). `None` ⇒ `human`
     /// (the CLI-surface default). Stamped onto the persisted plan so a later
     /// `rocky apply` evaluates the plan against the identity that authored it.
     pub principal: Option<PolicyPrincipal>,
@@ -347,7 +347,7 @@ pub async fn plan(
         output.has_budget_errors = has_errors;
     }
 
-    // --- Semantic breaking-change verdict (D3 — decision-support) --------
+    // --- Semantic breaking-change verdict (capability-embed — decision-support) --------
     //
     // REPORTING ONLY. Computed AFTER the budget check and BEFORE plan
     // persistence so the classifier's findings live on `output` but never
@@ -929,7 +929,7 @@ fn build_and_persist_run_plan(
 
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
 
-    // F3 seam 1 + D3: stamp the authoring principal and embed the propose-time
+    // policy seam 1 + capability-embed: stamp the authoring principal and embed the propose-time
     // change-classification into the plan payload, so a later `rocky apply`
     // evaluates the plan against the identity that authored it and the exact
     // capabilities that were reviewed.
@@ -943,7 +943,7 @@ fn build_and_persist_run_plan(
     Ok(Some((run_plan, plan_id, persisted_at)))
 }
 
-/// Compute the propose-time change-classification (D3) to embed in a governed
+/// Compute the propose-time change-classification (capability-embed) to embed in a governed
 /// plan's payload.
 ///
 /// Diffs the compiled working tree (`head`) against the project at `base_ref`
@@ -2670,7 +2670,7 @@ table = "m"
     }
 
     // ------------------------------------------------------------------
-    // Semantic verdict (D3 — decision-support)
+    // Semantic verdict (capability-embed — decision-support)
     // ------------------------------------------------------------------
 
     /// The caveat constant must plainly state that the classifier diffs
