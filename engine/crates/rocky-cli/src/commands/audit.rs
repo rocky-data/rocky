@@ -791,7 +791,10 @@ fn load_decisions_for_scorecard(state_path: &Path) -> Result<Vec<PolicyDecisionR
 ///
 /// `None` and `all` mean all-time (no bound). Otherwise the value is a
 /// `<N><unit>` duration with `unit` in `{d, h}` (days / hours), e.g. `30d` or
-/// `24h`. A malformed value is a usage error, not a fail-closed section.
+/// `24h`. A malformed *or out-of-range* value is a usage error, not a
+/// fail-closed section and never a panic — an absurd magnitude (`100000000d`)
+/// bails with the same clean error as a syntactic one, never overflowing the
+/// `TimeDelta` / `DateTime` subtraction.
 fn parse_window(window: Option<&str>, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
     let Some(raw) = window else {
         return Ok(None);
@@ -816,10 +819,22 @@ fn parse_window(window: Option<&str>, now: DateTime<Utc>) -> Result<Option<DateT
         _ => bail!(malformed()),
     };
 
-    match unit {
-        "d" | "D" => Ok(Some(now - Duration::days(n))),
-        "h" | "H" => Ok(Some(now - Duration::hours(n))),
+    // Build the span with the checked constructors: `Duration::days` /
+    // `Duration::hours` panic on `TimeDelta` overflow, and subtracting an
+    // over-large span from `now` panics on `DateTime` underflow. An
+    // i64-parseable but absurd magnitude must degrade to the usage error, not
+    // crash.
+    let span = match unit {
+        "d" | "D" => Duration::try_days(n),
+        "h" | "H" => Duration::try_hours(n),
         _ => bail!(malformed()),
+    };
+    let Some(span) = span else {
+        bail!(malformed());
+    };
+    match now.checked_sub_signed(span) {
+        Some(lower_bound) => Ok(Some(lower_bound)),
+        None => bail!(malformed()),
     }
 }
 
@@ -1359,6 +1374,14 @@ mod tests {
         assert!(parse_window(Some("30w"), now).is_err());
         assert!(parse_window(Some("-5d"), now).is_err());
         assert!(parse_window(Some("thirtyd"), now).is_err());
+        // i64-parseable but out-of-range magnitudes must degrade to the usage
+        // error, never panic on TimeDelta / DateTime overflow (a fat-fingered
+        // extra-zeros window like 100000000d ≈ 273k years).
+        assert!(parse_window(Some("100000000d"), now).is_err());
+        assert!(parse_window(Some("200000000000d"), now).is_err());
+        assert!(parse_window(Some("100000000000h"), now).is_err());
+        // An i64-overflowing magnitude was already rejected at the parse step.
+        assert!(parse_window(Some("9999999999999999999999d"), now).is_err());
     }
 
     #[test]
