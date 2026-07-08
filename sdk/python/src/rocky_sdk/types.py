@@ -374,6 +374,33 @@ class MetricsSnapshot(BaseModel):
     query_duration_max_ms: int
 
 
+class ContainedModel(BaseModel):
+    """A model Rocky withheld this run because an upstream failed.
+
+    Emitted only under ``[resilience] contain_failures``: when a model (or one
+    of its upstreams) fails, the engine continues the disjoint subgraphs and
+    records every withheld model here — the blast radius of the failures named
+    in :attr:`RunResult.errors`. A withheld model was **not built**; its target
+    was left untouched. Empty (and omitted from the wire) for a default
+    fail-fast run and for any successful run.
+
+    Hand-written to match the wire field names emitted by the engine's
+    ``ContainedModelOutput``. It is not re-exported from the generated barrel,
+    so it lives here alongside the other hand-written run-output models. Kept in
+    sync with the generated schema by the ``contained[]`` parse test in
+    ``tests/test_types.py``.
+    """
+
+    #: The withheld model's name (matches the model entry in the project DAG).
+    model: str
+    #: The failed-or-withheld upstream(s) that reach this model — its direct
+    #: poisoned dependencies. The run's :attr:`RunResult.errors` carry the
+    #: root-cause detail.
+    blocked_by: list[str] = Field(default_factory=list)
+    #: Operator hint: resolve the named upstream failure(s), then re-run.
+    unblock_hint: str = ""
+
+
 class RunResult(BaseModel):
     version: str
     command: str
@@ -384,6 +411,16 @@ class RunResult(BaseModel):
     materializations: list[MaterializationInfo]
     check_results: list[TableCheckResult]
     errors: list[TableError] = []
+    #: Models withheld this run because an upstream failed (or was itself
+    #: withheld) and ``[resilience] contain_failures`` continued the disjoint
+    #: subgraphs — the blast radius of the failures in :attr:`errors`. Empty
+    #: (and omitted on the wire) for a default fail-fast run and for any
+    #: successful run. Without this field declared, Pydantic's default
+    #: ``extra="ignore"`` would silently drop the wire value (the runtime
+    #: ``RunResult`` is the hand-written dispatch target, not the generated
+    #: ``RunOutput``), so a consumer mapping it — e.g. dagster-rocky surfacing
+    #: the containment blast radius — would never see anything.
+    contained: list[ContainedModel] = Field(default_factory=list)
     #: Tables filtered out before execution because they don't exist in
     #: the source warehouse. Empty when nothing was excluded. The CLI
     #: skips serializing this field when empty, so it remains backwards
