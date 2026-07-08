@@ -459,6 +459,10 @@ export interface RockyConfig {
    */
   portability?: PortabilityConfig;
   /**
+   * `[resilience]` — the run loop's classified-retry policy. Governs whether a model whose materialization fails *transiently* is re-run, with a conservative bounded budget and capped backoff. On by default (a transient failure is retried), but every knob is small and explicit; see [`ResilienceConfig`]. Permanent / Unknown failures never retry.
+   */
+  resilience?: ResilienceConfig;
+  /**
    * Run-level retry budget shared across every adapter for this run.
    *
    * When set, `rocky run` builds a single [`crate::retry_budget::RetryBudget`] from [`RunRetryConfig::max_retries_per_run`] and passes it to every connector via `with_retry_budget(...)`. One bad table that burns through retries on adapter A then has less budget available for adapter B's retries — the protection §P2.7 added within a single adapter now extends across the whole run.
@@ -1866,6 +1870,51 @@ export interface PortabilityConfig {
    * Target dialect for the portability lint. When unset, no lint runs (matches the wave-1 "flag opt-in" behavior). The CLI flag overrides this if both are present.
    */
   target_dialect?: Dialect | null;
+}
+/**
+ * `[resilience]` — the run loop's classified-retry policy.
+ *
+ * This is a **distinct layer** from the per-adapter `[adapter.*.retry]` (which retries individual statements inside a connector) and from the run-level `[retry]` budget ([`RunRetryConfig`], which caps connector retries). `[resilience]` governs whether the run loop re-runs a whole *model* whose materialization failed, classifying the failure via [`crate::failure_class::FailureClass`] and retrying only a *proven* transient one.
+ *
+ * # Not default-OFF, but conservative
+ *
+ * Unlike the skip / reuse gates, this layer is **on by default** — a model that fails transiently today *will* be retried once this ships. The lever that keeps that safe is [`Self::transient_max_retries`] (default `2`): a small, bounded budget with capped exponential backoff. Set `transient_max_retries = 0` (or `enabled = false`) to restore the prior single-attempt behaviour, e.g. in CI where a fast-fail is preferred.
+ *
+ * Permanent and Unknown failures are **never** retried regardless of these settings — that is a property of the classifier, not of this config.
+ */
+export interface ResilienceConfig {
+  /**
+   * Multiplier applied to the backoff after each retry.
+   */
+  backoff_multiplier?: number;
+  /**
+   * Trip the run-loop breaker after this many *consecutive* transient model failures; once tripped, no further model is retried for the rest of the run (they still get their one attempt). Default: `3`. `0` disables the breaker.
+   */
+  circuit_breaker_threshold?: number;
+  /**
+   * Master switch for run-loop classified retry. Default `true`. When `false`, every model is attempted exactly once (no classification, no backoff) — the behaviour before this layer existed.
+   */
+  enabled?: boolean;
+  /**
+   * Initial backoff (ms) before the first retry.
+   */
+  initial_backoff_ms?: number;
+  /**
+   * Add ±25 % jitter so concurrent runs don't retry in lockstep.
+   */
+  jitter?: boolean;
+  /**
+   * Maximum backoff (ms) — caps the exponential growth.
+   */
+  max_backoff_ms?: number;
+  /**
+   * Optional ceiling on the *total* number of retries across all models in one run — a global budget separate from the per-adapter one. Default `Some(8)`: a conservative cap so one flaky layer can't spin the whole run. `None` removes the ceiling (per-model `transient_max_retries` is then the only bound); `Some(0)` forbids all retries.
+   */
+  max_retries_per_run?: number | null;
+  /**
+   * Maximum re-runs of a model that failed with a *transient* class. Conservative default: `2` (so at most three attempts total). `0` disables retry while leaving the classifier active for observability.
+   */
+  transient_max_retries?: number;
 }
 /**
  * Top-level retry configuration applied across every adapter for this run. See [`RockyConfig::retry`] for the cross-adapter semantics this unlocks.

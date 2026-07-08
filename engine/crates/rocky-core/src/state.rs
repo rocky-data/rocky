@@ -275,7 +275,14 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   change: v14 databases auto-create the empty table on next open and stamp
 ///   themselves as v15. No blob migration needed; existing tables are
 ///   untouched. Empty until a `rocky serve` sidecar submits a job.
-const CURRENT_SCHEMA_VERSION: u32 = 15;
+/// - **v16** — adds the [`ModelExecution::attempts`] classified-retry trail.
+///   A pure serde-additive *field* change, not a table change: the redb table
+///   set is unchanged (`EXPECTED_TABLES` is untouched). A v15 blob (which lacks
+///   the field) forward-deserializes with the trail empty, guarded by
+///   `test_v15_model_execution_forward_deserializes_attempts_empty`. The bump
+///   exists so the on-disk version tracks the record-shape addition and the
+///   `[state] on_schema_mismatch` handling engages as usual; no blob walk.
+const CURRENT_SCHEMA_VERSION: u32 = 16;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -1146,6 +1153,50 @@ pub struct ColumnHash {
     pub hash: String,
 }
 
+/// One attempt at materializing a model, recorded when the run loop's
+/// classified-retry layer is active.
+///
+/// A model that succeeds on the first try records a single attempt; a model
+/// that failed transiently and was re-run records one entry per attempt, the
+/// last of which is the outcome that stuck. The trail is **execution
+/// metadata** — it lives on [`ModelExecution`] alongside the identity hashes,
+/// never inside them, so a retried-then-succeeded execution stays
+/// byte-indistinguishable downstream from a first-try success (same
+/// `recipe_hash` / `input_hash` / output hash).
+///
+/// Reused verbatim on `MaterializationOutput.attempts` (the run-JSON surface),
+/// so it derives `JsonSchema`; that is the one attempt type on both the wire
+/// and the state record.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct AttemptRecord {
+    /// 1-based attempt index. Attempt 1 is the first try; 2+ are retries.
+    pub attempt: u32,
+    /// `"success"` or `"failed"`.
+    pub outcome: String,
+    /// The run-loop [`FailureClass`](crate::failure_class::FailureClass) label
+    /// (`"transient"` / `"permanent"` / `"unknown"`) for a failed attempt;
+    /// `None` on a successful attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    /// The transient sub-kind label (`"network"`, `"timeout"`, …) when the
+    /// failure was transient; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transient_kind: Option<String>,
+    /// The failure message (truncated), for a failed attempt; `None` on
+    /// success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Milliseconds slept as backoff *after* this attempt before the next
+    /// retry. `None` on the final (kept) attempt and on any attempt that was
+    /// not followed by a retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_ms: Option<u64>,
+    /// Wall-clock duration of this attempt, in milliseconds.
+    pub duration_ms: u64,
+}
+
 /// Execution record for a single model within a run.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelExecution {
@@ -1269,6 +1320,28 @@ pub struct ModelExecution {
     /// `test_v11_model_execution_forward_deserializes_output_column_hashes_none`.
     #[serde(default)]
     pub output_column_hashes: Option<Vec<ColumnHash>>,
+
+    // --- Attempt history (schema v16) ------------------------------------
+    /// The classified-retry attempt trail for this execution: one
+    /// [`AttemptRecord`] per try. Empty for records written before v16, for
+    /// executions the retry layer never touched, and (by construction) for a
+    /// single-attempt success where the trail carries no extra signal — the
+    /// producer only stamps a trail once a retry actually occurred.
+    ///
+    /// **Execution metadata, never identity.** This field rides *alongside*
+    /// `recipe_hash` / `input_hash` / `output_column_hashes`, never inside
+    /// them, exactly like the governance audit trail rides outside `plan_id`.
+    /// A model that failed once then succeeded records its retries here while
+    /// producing byte-identical identity hashes to a clean first-try run, so
+    /// replay, the column-skip gate, and `rocky-verify` are all unaffected.
+    ///
+    /// Serde-defaulted (and omitted when empty) so a pre-v16 blob
+    /// forward-deserializes with it empty AND a no-retry record's ledger bytes
+    /// stay byte-identical to before v16 — the common case carries no trail.
+    /// Guarded by `test_v15_model_execution_forward_deserializes_attempts_empty`
+    /// and the `ledger_record_serialization_pinned` golden.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<AttemptRecord>,
 }
 
 /// A complete pipeline run record.
@@ -4282,6 +4355,7 @@ mod tests {
                 env_hash: None,
                 hash_scheme: None,
                 output_column_hashes: None,
+                attempts: Vec::new(),
             }],
         );
         store.record_run(&run).unwrap();
@@ -4329,6 +4403,7 @@ mod tests {
                     env_hash: None,
                     hash_scheme: None,
                     output_column_hashes: None,
+                    attempts: Vec::new(),
                 },
                 ModelExecution {
                     model_name: "customers".to_string(),
@@ -4349,6 +4424,7 @@ mod tests {
                     env_hash: None,
                     hash_scheme: None,
                     output_column_hashes: None,
+                    attempts: Vec::new(),
                 },
             ],
         );
@@ -4384,6 +4460,7 @@ mod tests {
                     env_hash: None,
                     hash_scheme: None,
                     output_column_hashes: None,
+                    attempts: Vec::new(),
                 }],
             );
             store.record_run(&run).unwrap();
@@ -4580,6 +4657,72 @@ mod tests {
         assert_eq!(exec.output_column_hashes, None);
     }
 
+    /// v15 → v16 forward-compat: a `ModelExecution` blob written before the
+    /// classified-retry `attempts` field existed (a full v15 record with no
+    /// `attempts` key) must forward-deserialize with the trail defaulting to
+    /// empty — never crash the read. Also asserts a v16 record carrying a trail
+    /// round-trips, so the attempt history survives a store→read cycle.
+    #[test]
+    fn test_v15_model_execution_forward_deserializes_attempts_empty() {
+        let v15_blob = br#"{
+            "model_name": "orders",
+            "started_at": "2024-01-01T12:00:00Z",
+            "finished_at": "2024-01-01T12:00:02Z",
+            "duration_ms": 2000,
+            "rows_affected": 5000,
+            "status": "success",
+            "sql_hash": "legacy-sql-hash",
+            "skip_hash": "logic-key",
+            "upstream_freshness": null,
+            "bytes_scanned": 4096,
+            "bytes_written": 2048,
+            "tenant": "acme",
+            "recipe_hash": "rh",
+            "input_hash": "ih",
+            "input_proof_class": "heuristic",
+            "env_hash": "eh",
+            "hash_scheme": "v1",
+            "output_column_hashes": null
+        }"#;
+
+        let exec: ModelExecution = serde_json::from_slice(v15_blob)
+            .expect("pre-v16 ModelExecution must forward-deserialize");
+
+        // Prior fields preserved; the new trail defaults to empty.
+        assert_eq!(exec.model_name, "orders");
+        assert_eq!(exec.recipe_hash.as_deref(), Some("rh"));
+        assert!(
+            exec.attempts.is_empty(),
+            "a pre-v16 record reads back with no attempt trail"
+        );
+
+        // A v16 record carrying a trail round-trips losslessly.
+        let mut with_trail = exec;
+        with_trail.attempts = vec![
+            AttemptRecord {
+                attempt: 1,
+                outcome: "failed".to_string(),
+                failure_class: Some("transient".to_string()),
+                transient_kind: Some("rate_limit".to_string()),
+                error: Some("429".to_string()),
+                backoff_ms: Some(500),
+                duration_ms: 12,
+            },
+            AttemptRecord {
+                attempt: 2,
+                outcome: "success".to_string(),
+                failure_class: None,
+                transient_kind: None,
+                error: None,
+                backoff_ms: None,
+                duration_ms: 20,
+            },
+        ];
+        let json = serde_json::to_string(&with_trail).unwrap();
+        let back: ModelExecution = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.attempts, with_trail.attempts);
+    }
+
     /// v12 → v13 forward-compat: an `UpstreamSig` blob written before
     /// `consumed_column_hashes` existed (a full v12 freshness signature with no
     /// `consumed_column_hashes` key) must forward-deserialize with the field
@@ -4646,6 +4789,7 @@ mod tests {
                 column: "id".to_string(),
                 hash: "col-hash".to_string(),
             }]),
+            attempts: Vec::new(),
         };
         let json = serde_json::to_string(&exec).unwrap();
         let back: ModelExecution = serde_json::from_str(&json).unwrap();
@@ -4697,6 +4841,7 @@ mod tests {
             env_hash: Some("env-ghi".to_string()),
             hash_scheme: Some("v1".to_string()),
             output_column_hashes: None,
+            attempts: Vec::new(),
         };
         let exec_json = serde_json::to_string(&exec).unwrap();
 
@@ -7056,7 +7201,13 @@ mod tests {
         // v15 adds the `jobs` table for the `rocky serve` HTTP job model. Same
         // additive shape: a v14 database auto-creates the empty `jobs` table on
         // next open and stamps itself v15, guarded by the same mismatch tests.
-        const EXPECTED_VERSION: u32 = 15;
+        //
+        // v16 adds `ModelExecution.attempts` (the classified-retry trail). That
+        // is a serde-additive *field* on a blob — the redb table set does NOT
+        // change, so EXPECTED_TABLES below is untouched; only the version moves.
+        // A v15 blob forward-deserializes with the trail empty (guarded by
+        // `test_v15_model_execution_forward_deserializes_attempts_empty`).
+        const EXPECTED_VERSION: u32 = 16;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",

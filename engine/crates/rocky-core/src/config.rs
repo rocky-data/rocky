@@ -878,6 +878,120 @@ fn default_jitter() -> bool {
     true
 }
 
+/// `[resilience]` — the run loop's classified-retry policy.
+///
+/// This is a **distinct layer** from the per-adapter `[adapter.*.retry]`
+/// (which retries individual statements inside a connector) and from the
+/// run-level `[retry]` budget ([`RunRetryConfig`], which caps connector
+/// retries). `[resilience]` governs whether the run loop re-runs a whole
+/// *model* whose materialization failed, classifying the failure via
+/// [`crate::failure_class::FailureClass`] and retrying only a *proven*
+/// transient one.
+///
+/// # Not default-OFF, but conservative
+///
+/// Unlike the skip / reuse gates, this layer is **on by default** — a model
+/// that fails transiently today *will* be retried once this ships. The lever
+/// that keeps that safe is [`Self::transient_max_retries`] (default `2`): a
+/// small, bounded budget with capped exponential backoff. Set
+/// `transient_max_retries = 0` (or `enabled = false`) to restore the prior
+/// single-attempt behaviour, e.g. in CI where a fast-fail is preferred.
+///
+/// Permanent and Unknown failures are **never** retried regardless of these
+/// settings — that is a property of the classifier, not of this config.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResilienceConfig {
+    /// Master switch for run-loop classified retry. Default `true`. When
+    /// `false`, every model is attempted exactly once (no classification, no
+    /// backoff) — the behaviour before this layer existed.
+    #[serde(default = "default_resilience_enabled")]
+    pub enabled: bool,
+    /// Maximum re-runs of a model that failed with a *transient* class.
+    /// Conservative default: `2` (so at most three attempts total). `0`
+    /// disables retry while leaving the classifier active for observability.
+    #[serde(default = "default_transient_max_retries")]
+    pub transient_max_retries: u32,
+    /// Initial backoff (ms) before the first retry.
+    #[serde(default = "default_resilience_initial_backoff_ms")]
+    pub initial_backoff_ms: u64,
+    /// Maximum backoff (ms) — caps the exponential growth.
+    #[serde(default = "default_resilience_max_backoff_ms")]
+    pub max_backoff_ms: u64,
+    /// Multiplier applied to the backoff after each retry.
+    #[serde(default = "default_backoff_multiplier")]
+    pub backoff_multiplier: f64,
+    /// Add ±25 % jitter so concurrent runs don't retry in lockstep.
+    #[serde(default = "default_jitter")]
+    pub jitter: bool,
+    /// Trip the run-loop breaker after this many *consecutive* transient
+    /// model failures; once tripped, no further model is retried for the rest
+    /// of the run (they still get their one attempt). Default: `3`. `0`
+    /// disables the breaker.
+    #[serde(default = "default_resilience_breaker_threshold")]
+    pub circuit_breaker_threshold: u32,
+    /// Optional ceiling on the *total* number of retries across all models in
+    /// one run — a global budget separate from the per-adapter one. Default
+    /// `Some(8)`: a conservative cap so one flaky layer can't spin the whole
+    /// run. `None` removes the ceiling (per-model `transient_max_retries` is
+    /// then the only bound); `Some(0)` forbids all retries.
+    #[serde(default = "default_resilience_max_retries_per_run")]
+    pub max_retries_per_run: Option<u32>,
+}
+
+impl ResilienceConfig {
+    /// Project this policy's backoff knobs onto a [`RetryConfig`] so the run
+    /// loop can reuse the shared [`crate::retry::compute_backoff`] helper —
+    /// one backoff implementation across adapters and the run loop.
+    #[must_use]
+    pub fn backoff_config(&self) -> RetryConfig {
+        RetryConfig {
+            max_retries: self.transient_max_retries,
+            initial_backoff_ms: self.initial_backoff_ms,
+            max_backoff_ms: self.max_backoff_ms,
+            backoff_multiplier: self.backoff_multiplier,
+            jitter: self.jitter,
+            circuit_breaker_threshold: self.circuit_breaker_threshold,
+            circuit_breaker_recovery_timeout_secs: None,
+            max_retries_per_run: self.max_retries_per_run,
+        }
+    }
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_resilience_enabled(),
+            transient_max_retries: default_transient_max_retries(),
+            initial_backoff_ms: default_resilience_initial_backoff_ms(),
+            max_backoff_ms: default_resilience_max_backoff_ms(),
+            backoff_multiplier: default_backoff_multiplier(),
+            jitter: default_jitter(),
+            circuit_breaker_threshold: default_resilience_breaker_threshold(),
+            max_retries_per_run: default_resilience_max_retries_per_run(),
+        }
+    }
+}
+
+fn default_resilience_enabled() -> bool {
+    true
+}
+fn default_transient_max_retries() -> u32 {
+    2
+}
+fn default_resilience_initial_backoff_ms() -> u64 {
+    500
+}
+fn default_resilience_max_backoff_ms() -> u64 {
+    30_000
+}
+fn default_resilience_breaker_threshold() -> u32 {
+    3
+}
+fn default_resilience_max_retries_per_run() -> Option<u32> {
+    Some(8)
+}
+
 /// Schema pattern configuration from TOML, converted to [`SchemaPattern`] at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -2376,6 +2490,14 @@ pub struct RockyConfig {
     /// [`PolicyConfig`] and [`crate::policy`] for the evaluator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyConfig>,
+
+    /// `[resilience]` — the run loop's classified-retry policy. Governs
+    /// whether a model whose materialization fails *transiently* is re-run,
+    /// with a conservative bounded budget and capped backoff. On by default
+    /// (a transient failure is retried), but every knob is small and explicit;
+    /// see [`ResilienceConfig`]. Permanent / Unknown failures never retry.
+    #[serde(default)]
+    pub resilience: ResilienceConfig,
 }
 
 /// `[run]` — opt-in tuning for the model-skip gate.

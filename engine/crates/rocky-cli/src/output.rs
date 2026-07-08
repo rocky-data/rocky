@@ -949,6 +949,16 @@ pub struct MaterializationOutput {
     /// (Databricks, Snowflake).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub job_ids: Vec<String>,
+    /// The classified-retry attempt trail for this materialization: one
+    /// [`AttemptRecord`](rocky_core::state::AttemptRecord) per try. Empty
+    /// (and omitted from JSON) for a clean first-try success — the run loop
+    /// only stamps a trail once a retry actually happened, so a non-retried
+    /// build's output stays byte-identical to before this layer shipped.
+    /// [`RunOutput::to_run_record`] copies this verbatim onto the persisted
+    /// `ModelExecution.attempts` — one attempt type on both the wire and the
+    /// state record.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub attempts: Vec<rocky_core::state::AttemptRecord>,
     /// State-internal skip-gate outputs, co-located with the model they
     /// describe so [`RunOutput::to_run_record`] can copy them onto the
     /// persisted `ModelExecution` without a second name-keyed map. Stamped
@@ -4669,6 +4679,11 @@ impl RunOutput {
                 // content-addressed runner on a genuine unpartitioned build;
                 // `None` on every other path (carried straight through).
                 output_column_hashes: mat.output_column_hashes.clone(),
+                // Classified-retry attempt trail (schema v16). Execution
+                // metadata — carried alongside the identity hashes above,
+                // never inside them, so a retried-then-succeeded build stays
+                // byte-indistinguishable downstream from a first-try success.
+                attempts: mat.attempts.clone(),
             });
         }
 
@@ -4703,6 +4718,11 @@ impl RunOutput {
                 hash_scheme: None,
                 // A failed execution recorded no output columns.
                 output_column_hashes: None,
+                // A run-level error entry (no per-model materialization)
+                // carries no attempt trail; the failing model's own attempts,
+                // when the retry layer produced them, ride on its
+                // `MaterializationOutput` instead.
+                attempts: Vec::new(),
             });
         }
 
@@ -5055,6 +5075,7 @@ mod cost_finalize_tests {
     fn mat(asset_key: &[&str], duration_ms: u64) -> MaterializationOutput {
         MaterializationOutput {
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
+            attempts: Vec::new(),
             rows_copied: None,
             duration_ms,
             started_at: Utc::now(),
@@ -5271,6 +5292,7 @@ mod run_record_tests {
     ) -> MaterializationOutput {
         MaterializationOutput {
             asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
+            attempts: Vec::new(),
             rows_copied: Some(42),
             duration_ms,
             started_at,
@@ -5359,6 +5381,96 @@ mod run_record_tests {
 
     /// The content-addressed consumer baseline (`consumed_column_baseline`)
     /// must land on the persisted `ModelExecution.upstream_freshness` — the
+    /// 🔴 The load-bearing identity invariant for classified retry, at the
+    /// state-write boundary: an execution that carries an attempt trail
+    /// produces byte-identical *identity* to one that doesn't — attempt history
+    /// rides on `ModelExecution.attempts` alongside the identity fields, never
+    /// inside them.
+    #[test]
+    fn to_run_record_keeps_attempt_trail_out_of_identity() {
+        use rocky_core::state::AttemptRecord;
+
+        let started = fixed_start();
+        let identity = RecipeIdentityInternal {
+            recipe_hash: "recipe-abc".to_string(),
+            env_hash: "env-def".to_string(),
+            hash_scheme: "v1".to_string(),
+        };
+        let out_cols = Some(vec![rocky_core::state::ColumnHash {
+            column: "amount".to_string(),
+            hash: "out-hash".to_string(),
+        }]);
+
+        // Two materializations identical in every identity-bearing field; one
+        // recovered after a transient retry (so it carries a trail), the other
+        // a clean first try (empty trail).
+        let build_mat = |attempts: Vec<AttemptRecord>| {
+            let mut m = mat(&["s", "orders"], 1_000, Some("sql-xyz"), started);
+            m.recipe_identity = Some(identity.clone());
+            m.output_column_hashes = out_cols.clone();
+            m.attempts = attempts;
+            m
+        };
+        let clean = build_mat(Vec::new());
+        let retried = build_mat(vec![
+            AttemptRecord {
+                attempt: 1,
+                outcome: "failed".to_string(),
+                failure_class: Some("transient".to_string()),
+                transient_kind: Some("server_busy".to_string()),
+                error: Some("lock".to_string()),
+                backoff_ms: Some(0),
+                duration_ms: 3,
+            },
+            AttemptRecord {
+                attempt: 2,
+                outcome: "success".to_string(),
+                failure_class: None,
+                transient_kind: None,
+                error: None,
+                backoff_ms: None,
+                duration_ms: 5,
+            },
+        ]);
+
+        let to_exec = |m: MaterializationOutput| {
+            let mut out = RunOutput::new(String::new(), 1_000, 1);
+            out.tables_copied = 1;
+            out.materializations.push(m);
+            out.to_run_record(
+                "run-id",
+                started,
+                started + chrono::Duration::seconds(1),
+                "cfg".to_string(),
+                RunTrigger::Manual,
+                RunStatus::Success,
+                RunRecordAudit::test_sentinels(),
+            )
+            .models_executed
+            .remove(0)
+        };
+        let clean_exec = to_exec(clean);
+        let retried_exec = to_exec(retried);
+
+        // Identity fields byte-identical across the two.
+        assert_eq!(clean_exec.recipe_hash, retried_exec.recipe_hash);
+        assert_eq!(clean_exec.input_hash, retried_exec.input_hash);
+        assert_eq!(clean_exec.env_hash, retried_exec.env_hash);
+        assert_eq!(clean_exec.hash_scheme, retried_exec.hash_scheme);
+        assert_eq!(clean_exec.sql_hash, retried_exec.sql_hash);
+        assert_eq!(
+            clean_exec.output_column_hashes,
+            retried_exec.output_column_hashes
+        );
+        // Only the attempt trail differs — and it is faithfully carried through.
+        assert!(clean_exec.attempts.is_empty());
+        assert_eq!(retried_exec.attempts.len(), 2);
+        assert_eq!(
+            retried_exec.attempts[0].failure_class.as_deref(),
+            Some("transient")
+        );
+    }
+
     /// consumer-side per-column baseline (schema v13). A content-addressed
     /// model has no `skip_internal`, so the `or_else` route in `to_run_record`
     /// is what carries it. Proves the baseline is durable end-to-end.

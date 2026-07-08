@@ -14,6 +14,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use tokio::task::spawn_blocking;
 
+use rocky_core::failure_class::{FailureClass, TransientKind};
 use rocky_core::traits::{
     AdapterError, AdapterResult, ExplainResult, QueryResult, SqlDialect, WarehouseAdapter,
 };
@@ -146,6 +147,10 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         .map_err(|e| join_error(&e))?
     }
 
+    fn classify_failure(&self, err: &AdapterError) -> FailureClass {
+        classify_duckdb_failure(err)
+    }
+
     async fn fetch_arrow_batch(&self, sql: &str) -> AdapterResult<RecordBatch> {
         // `duckdb 1.10503` pins workspace `arrow 58`, so `query_arrow`
         // returns batches directly type-compatible with the trait's
@@ -275,9 +280,95 @@ fn join_error(e: &tokio::task::JoinError) -> AdapterError {
     AdapterError::msg(format!("duckdb blocking task failed: {e}"))
 }
 
+/// Classify a DuckDB adapter error for the run loop's classified-retry layer.
+///
+/// DuckDB runs in-process, so almost every failure is a *deterministic* SQL or
+/// logic error that re-running would reproduce verbatim — those are
+/// [`FailureClass::Permanent`] and must not be retried. The one genuinely
+/// transient class is file-lock / write-conflict contention when several
+/// processes (or writers) share one database file: those clear on their own,
+/// so they are [`FailureClass::Transient`]. This never returns `Unknown`: an
+/// in-process error the phrase-set doesn't recognise is treated as permanent,
+/// which fails closed (no retry) — the safe direction.
+#[must_use]
+pub fn classify_duckdb_failure(err: &AdapterError) -> FailureClass {
+    // Match on the rendered message (uppercased) — DuckDB surfaces contention
+    // as opaque `duckdb::Error` variants whose text is the reliable signal.
+    let msg = err.to_string().to_uppercase();
+    let is_lock_contention = msg.contains("COULD NOT SET LOCK ON FILE")
+        || msg.contains("CONFLICTING LOCK")
+        || msg.contains("DATABASE IS LOCKED")
+        || msg.contains("COULD NOT OBTAIN A LOCK")
+        // Optimistic-concurrency write conflicts under concurrent writers.
+        || msg.contains("WRITE-WRITE CONFLICT")
+        || msg.contains("CONFLICT ON TUPLE")
+        || msg.contains("TRANSACTIONCONTEXT ERROR");
+    if is_lock_contention {
+        FailureClass::Transient(TransientKind::ServerBusy)
+    } else {
+        FailureClass::Permanent
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_lock_contention_is_transient() {
+        for phrase in [
+            "IO Error: Could not set lock on file \"poc.duckdb\": Resource temporarily unavailable",
+            "database is locked",
+            "Conflicting lock is held",
+            "TransactionContext Error: Write-write conflict on tuple",
+        ] {
+            let err = AdapterError::msg(phrase.to_string());
+            assert_eq!(
+                classify_duckdb_failure(&err),
+                FailureClass::Transient(TransientKind::ServerBusy),
+                "phrase should classify transient: {phrase}"
+            );
+            assert!(classify_duckdb_failure(&err).is_retryable());
+        }
+    }
+
+    #[test]
+    fn classify_sql_and_logic_errors_are_permanent_never_retried() {
+        for phrase in [
+            "Catalog Error: Table with name orders does not exist!",
+            "Binder Error: Referenced column \"missing\" not found",
+            "Parser Error: syntax error at or near \"SELCT\"",
+            "Conversion Error: Could not convert string 'x' to INT32",
+            "Constraint Error: NOT NULL constraint failed",
+        ] {
+            let err = AdapterError::msg(phrase.to_string());
+            let class = classify_duckdb_failure(&err);
+            assert_eq!(
+                class,
+                FailureClass::Permanent,
+                "phrase should classify permanent: {phrase}"
+            );
+            // The dangerous direction — a permanent error must never retry.
+            assert!(!class.is_retryable(), "must not retry: {phrase}");
+        }
+    }
+
+    #[test]
+    fn duckdb_classify_never_returns_unknown() {
+        // In-process: an unrecognised error is deterministic ⇒ permanent, not
+        // unknown, so it still fails closed to no-retry.
+        let err = AdapterError::msg("some entirely novel duckdb message".to_string());
+        assert_eq!(classify_duckdb_failure(&err), FailureClass::Permanent);
+    }
+
+    #[test]
+    fn adapter_trait_method_delegates_to_classifier() {
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        let transient = AdapterError::msg("Could not set lock on file".to_string());
+        assert!(adapter.classify_failure(&transient).is_retryable());
+        let permanent = AdapterError::msg("Catalog Error: no such table".to_string());
+        assert!(!adapter.classify_failure(&permanent).is_retryable());
+    }
 
     #[tokio::test]
     async fn test_adapter_execute_statement() {

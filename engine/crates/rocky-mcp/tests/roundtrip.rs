@@ -994,6 +994,7 @@ fn seed_run_history(models_dir: &Path) {
             env_hash: None,
             hash_scheme: None,
             output_column_hashes: None,
+            attempts: Vec::new(),
         }],
         trigger: RunTrigger::Manual,
         config_hash: "cfg".to_string(),

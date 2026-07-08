@@ -333,6 +333,10 @@ export interface ExecutionSummary {
 export interface MaterializationOutput {
   asset_key: string[];
   /**
+   * The classified-retry attempt trail for this materialization: one [`AttemptRecord`](rocky_core::state::AttemptRecord) per try. Empty (and omitted from JSON) for a clean first-try success — the run loop only stamps a trail once a retry actually happened, so a non-retried build's output stays byte-identical to before this layer shipped. [`RunOutput::to_run_record`] copies this verbatim onto the persisted `ModelExecution.attempts` — one attempt type on both the wire and the state record.
+   */
+  attempts?: AttemptRecord[];
+  /**
    * Adapter-reported bytes figure used for cost accounting, summed across all statements executed for this materialization. This is the *billing-relevant* number per adapter, not literal scan volume — so anyone comparing this to a warehouse console should know which column lines up.
    *
    * - **BigQuery:** `statistics.query.totalBytesBilled` (with the 10 MB per-query minimum already applied) — matches the BigQuery console's "Bytes billed" field, **not** "Bytes processed". Fed straight into [`rocky_core::cost::compute_observed_cost_usd`] to produce `cost_usd`. - **Databricks:** when populated, byte count from the statement-execution manifest (`total_byte_count`); `None` today until the manifest plumbing lands. - **Snowflake:** `None` — deferred by design (QUERY_HISTORY round-trip cost; Snowflake cost is duration × DBU, not bytes-driven). - **DuckDB:** `None` — no billed-bytes concept.
@@ -367,6 +371,44 @@ export interface MaterializationOutput {
    * Tenant this materialization is attributed to, taken from the discover-time schema-pattern `{tenant}` component. Present only for replication pipelines whose schema pattern declares a `{tenant}` placeholder; transformation / `time_interval` models and non-tenant patterns leave it `None`. Carried onto the persisted `rocky_core::state::ModelExecution` by [`RunOutput::to_run_record`] so `rocky cost --by tenant` can roll per-model cost up to a tenant dimension. Omitted from JSON when `None` so non-tenant outputs stay byte-identical.
    */
   tenant?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * One attempt at materializing a model, recorded when the run loop's classified-retry layer is active.
+ *
+ * A model that succeeds on the first try records a single attempt; a model that failed transiently and was re-run records one entry per attempt, the last of which is the outcome that stuck. The trail is **execution metadata** — it lives on [`ModelExecution`] alongside the identity hashes, never inside them, so a retried-then-succeeded execution stays byte-indistinguishable downstream from a first-try success (same `recipe_hash` / `input_hash` / output hash).
+ *
+ * Reused verbatim on `MaterializationOutput.attempts` (the run-JSON surface), so it derives `JsonSchema`; that is the one attempt type on both the wire and the state record.
+ */
+export interface AttemptRecord {
+  /**
+   * 1-based attempt index. Attempt 1 is the first try; 2+ are retries.
+   */
+  attempt: number;
+  /**
+   * Milliseconds slept as backoff *after* this attempt before the next retry. `None` on the final (kept) attempt and on any attempt that was not followed by a retry.
+   */
+  backoff_ms?: number | null;
+  /**
+   * Wall-clock duration of this attempt, in milliseconds.
+   */
+  duration_ms: number;
+  /**
+   * The failure message (truncated), for a failed attempt; `None` on success.
+   */
+  error?: string | null;
+  /**
+   * The run-loop [`FailureClass`](crate::failure_class::FailureClass) label (`"transient"` / `"permanent"` / `"unknown"`) for a failed attempt; `None` on a successful attempt.
+   */
+  failure_class?: string | null;
+  /**
+   * `"success"` or `"failed"`.
+   */
+  outcome: string;
+  /**
+   * The transient sub-kind label (`"network"`, `"timeout"`, …) when the failure was transient; `None` otherwise.
+   */
+  transient_kind?: string | null;
   [k: string]: unknown;
 }
 export interface MaterializationMetadata {

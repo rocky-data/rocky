@@ -1140,6 +1140,56 @@ class RequiredColumn(BaseModel):
     """
 
 
+class ResilienceConfig(BaseModel):
+    """
+    `[resilience]` — the run loop's classified-retry policy.
+
+    This is a **distinct layer** from the per-adapter `[adapter.*.retry]` (which retries individual statements inside a connector) and from the run-level `[retry]` budget ([`RunRetryConfig`], which caps connector retries). `[resilience]` governs whether the run loop re-runs a whole *model* whose materialization failed, classifying the failure via [`crate::failure_class::FailureClass`] and retrying only a *proven* transient one.
+
+    # Not default-OFF, but conservative
+
+    Unlike the skip / reuse gates, this layer is **on by default** — a model that fails transiently today *will* be retried once this ships. The lever that keeps that safe is [`Self::transient_max_retries`] (default `2`): a small, bounded budget with capped exponential backoff. Set `transient_max_retries = 0` (or `enabled = false`) to restore the prior single-attempt behaviour, e.g. in CI where a fast-fail is preferred.
+
+    Permanent and Unknown failures are **never** retried regardless of these settings — that is a property of the classifier, not of this config.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    backoff_multiplier: float | None = 2.0
+    """
+    Multiplier applied to the backoff after each retry.
+    """
+    circuit_breaker_threshold: conint(ge=0) | None = 3
+    """
+    Trip the run-loop breaker after this many *consecutive* transient model failures; once tripped, no further model is retried for the rest of the run (they still get their one attempt). Default: `3`. `0` disables the breaker.
+    """
+    enabled: bool | None = True
+    """
+    Master switch for run-loop classified retry. Default `true`. When `false`, every model is attempted exactly once (no classification, no backoff) — the behaviour before this layer existed.
+    """
+    initial_backoff_ms: conint(ge=0) | None = 500
+    """
+    Initial backoff (ms) before the first retry.
+    """
+    jitter: bool | None = True
+    """
+    Add ±25 % jitter so concurrent runs don't retry in lockstep.
+    """
+    max_backoff_ms: conint(ge=0) | None = 30000
+    """
+    Maximum backoff (ms) — caps the exponential growth.
+    """
+    max_retries_per_run: conint(ge=0) | None = 8
+    """
+    Optional ceiling on the *total* number of retries across all models in one run — a global budget separate from the per-adapter one. Default `Some(8)`: a conservative cap so one flaky layer can't spin the whole run. `None` removes the ceiling (per-model `transient_max_retries` is then the only bound); `Some(0)` forbids all retries.
+    """
+    transient_max_retries: conint(ge=0) | None = 2
+    """
+    Maximum re-runs of a model that failed with a *transient* class. Conservative default: `2` (so at most three attempts total). `0` disables retry while leaving the classifier active for observability.
+    """
+
+
 class RetryConfig(BaseModel):
     """
     Retry policy for transient warehouse errors (HTTP 429/503, rate limits, timeouts).
@@ -3520,6 +3570,22 @@ class RockyConfig(BaseModel):
     )
     """
     Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`].
+    """
+    resilience: ResilienceConfig | None = Field(
+        {
+            "backoff_multiplier": 2.0,
+            "circuit_breaker_threshold": 3,
+            "enabled": True,
+            "initial_backoff_ms": 500,
+            "jitter": True,
+            "max_backoff_ms": 30000,
+            "max_retries_per_run": 8,
+            "transient_max_retries": 2,
+        },
+        validate_default=True,
+    )
+    """
+    `[resilience]` — the run loop's classified-retry policy. Governs whether a model whose materialization fails *transiently* is re-run, with a conservative bounded budget and capped backoff. On by default (a transient failure is retried), but every knob is small and explicit; see [`ResilienceConfig`]. Permanent / Unknown failures never retry.
     """
     retry: RunRetryConfig | None = None
     """

@@ -13,7 +13,9 @@ use std::time::Duration;
 use reqwest::{Client, RequestBuilder};
 use rocky_core::circuit_breaker::{CircuitBreaker, TransitionOutcome};
 use rocky_core::config::RetryConfig;
+use rocky_core::failure_class::{FailureClass, TransientKind};
 use rocky_core::retry::compute_backoff;
+use rocky_core::traits::AdapterError;
 use rocky_observe::events::{
     ErrorClass, PipelineEvent, global_event_bus, record_span_event, set_current_span_error,
 };
@@ -679,7 +681,7 @@ fn check_terminal(response: StatementResponse) -> Result<StatementResponse, Conn
 }
 
 /// Classifies whether a connector error is transient and worth retrying.
-fn is_transient(err: &ConnectorError) -> bool {
+pub(crate) fn is_transient(err: &ConnectorError) -> bool {
     match err {
         // 401 is transient-on-first-retry — the connector drops the auth
         // cache before retrying, so a stale cached JWT replays as a fresh
@@ -708,7 +710,7 @@ fn is_transient(err: &ConnectorError) -> bool {
 
 /// Maps `ConnectorError` to the structured [`ErrorClass`] surfaced on
 /// retry `PipelineEvent`s (§P2.8).
-fn classify_error(err: &ConnectorError) -> ErrorClass {
+pub(crate) fn classify_error(err: &ConnectorError) -> ErrorClass {
     match err {
         ConnectorError::ApiError { status: 401, .. } => ErrorClass::Auth,
         ConnectorError::ApiError { status: 429, .. } => ErrorClass::RateLimit,
@@ -734,9 +736,125 @@ fn classify_error(err: &ConnectorError) -> ErrorClass {
     }
 }
 
+/// Map an [`ErrorClass`] to a run-loop [`TransientKind`] (only meaningful for
+/// the transient branch; non-transient variants map to `Other` defensively).
+fn transient_kind_of(class: ErrorClass) -> TransientKind {
+    match class {
+        ErrorClass::Timeout => TransientKind::Timeout,
+        ErrorClass::RateLimit => TransientKind::RateLimit,
+        ErrorClass::Auth => TransientKind::Auth,
+        ErrorClass::Transient => TransientKind::Network,
+        ErrorClass::Config | ErrorClass::Permanent => TransientKind::Other,
+    }
+}
+
+/// Classify a Snowflake [`AdapterError`] for the run loop's classified-retry
+/// layer, reusing the connector's own [`is_transient`] judgement so the run
+/// loop and the connector agree by construction.
+///
+/// Downcasts to a [`ConnectorError`]: transient ⇒ [`FailureClass::Transient`]
+/// (kind from [`classify_error`]); not transient ⇒ [`FailureClass::Permanent`];
+/// not a [`ConnectorError`] ⇒ [`FailureClass::Unknown`] (fail closed).
+#[must_use]
+pub(crate) fn classify_connector_failure(err: &AdapterError) -> FailureClass {
+    let Some(connector_err) = err.inner().downcast_ref::<ConnectorError>() else {
+        return FailureClass::Unknown;
+    };
+    if is_transient(connector_err) {
+        FailureClass::Transient(transient_kind_of(classify_error(connector_err)))
+    } else {
+        FailureClass::Permanent
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The run-loop classifier hoists the connector's own `is_transient`
+    /// judgement: 429 / 503 / throttle become `Transient`, a rejected
+    /// statement or 400 becomes `Permanent`, and a permanent error is never
+    /// marked retryable (the dangerous direction).
+    #[test]
+    fn classify_connector_failure_maps_transient_and_permanent() {
+        let transient_cases = [
+            (
+                ConnectorError::ApiError {
+                    status: 503,
+                    body: "unavailable".to_string(),
+                },
+                TransientKind::Network,
+            ),
+            (
+                ConnectorError::ApiError {
+                    status: 429,
+                    body: "rate limited".to_string(),
+                },
+                TransientKind::RateLimit,
+            ),
+            (
+                ConnectorError::StatementFailed {
+                    handle: "s1".to_string(),
+                    message: "000630: Statement throttled".to_string(),
+                },
+                TransientKind::Network,
+            ),
+        ];
+        for (err, kind) in transient_cases {
+            let msg = err.to_string();
+            let class = classify_connector_failure(&AdapterError::new(err));
+            assert_eq!(
+                class,
+                FailureClass::Transient(kind),
+                "should be transient: {msg}"
+            );
+            assert!(class.is_retryable());
+        }
+
+        let permanent_cases = [
+            ConnectorError::StatementFailed {
+                handle: "s2".to_string(),
+                message: "002003: Object 'ORDERS' does not exist".to_string(),
+            },
+            ConnectorError::ApiError {
+                status: 400,
+                body: "bad request".to_string(),
+            },
+        ];
+        for err in permanent_cases {
+            let msg = err.to_string();
+            let class = classify_connector_failure(&AdapterError::new(err));
+            assert_eq!(class, FailureClass::Permanent, "should be permanent: {msg}");
+            assert!(!class.is_retryable(), "must not retry: {msg}");
+        }
+    }
+
+    /// A non-`ConnectorError` boxed error fails closed to `Unknown`.
+    #[test]
+    fn classify_non_connector_error_is_unknown() {
+        let err = AdapterError::msg("some unrelated boxed error");
+        assert_eq!(classify_connector_failure(&err), FailureClass::Unknown);
+    }
+
+    /// A survived 401 maps to the `Auth` kind and a 403 to `Permanent`; both
+    /// are terminal at the run loop (a survived permission failure is never
+    /// re-run).
+    #[test]
+    fn survived_auth_and_permission_are_not_run_retryable() {
+        let auth = classify_connector_failure(&AdapterError::new(ConnectorError::ApiError {
+            status: 401,
+            body: "expired".to_string(),
+        }));
+        assert_eq!(auth, FailureClass::Transient(TransientKind::Auth));
+        assert!(!auth.is_run_retryable());
+
+        let forbidden = classify_connector_failure(&AdapterError::new(ConnectorError::ApiError {
+            status: 403,
+            body: "forbidden".to_string(),
+        }));
+        assert_eq!(forbidden, FailureClass::Permanent);
+        assert!(!forbidden.is_run_retryable());
+    }
 
     #[test]
     fn test_count_statements_single() {
