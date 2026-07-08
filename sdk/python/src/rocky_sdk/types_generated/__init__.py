@@ -63,6 +63,7 @@ from .column_lineage_schema import ColumnLineageOutput
 
 # serve HTTP API — structured error body + /meta feature-detection payload
 from .error_envelope_schema import ErrorEnvelope
+from .job_status_schema import JobStatus
 from .meta_schema import MetaOutput
 
 # DAG command — unified pipeline DAG with enriched orchestration metadata
@@ -325,6 +326,7 @@ __all__ = [
     "ColumnLineageOutput",
     # serve HTTP API
     "ErrorEnvelope",
+    "JobStatus",
     "MetaOutput",
     # dag
     "DagEdgeOutput",

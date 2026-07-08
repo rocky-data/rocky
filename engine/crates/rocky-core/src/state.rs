@@ -169,6 +169,12 @@ const DISCOVER_SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("d
 /// schema-version-qualified by `state_sync`, so a v14 ledger never mixes with
 /// another schema version's.
 const POLICY_DECISIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("policy_decisions");
+/// Long-running-job records for the `rocky serve` HTTP job model
+/// (`POST /api/v1/jobs/{run|plan|apply}`). Keyed by `job_id`; the value is a
+/// serialized [`PersistedJob`]. Persisting job status here (rather than
+/// in-memory only) is what lets a killed-and-restarted sidecar report honest
+/// status for jobs it launched instead of a blank slate.
+const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -262,7 +268,14 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   untouched. Empty until a project with a `[policy]` block applies an
 ///   agent-authored plan, so pre-existing state resumes unchanged. Guarded by
 ///   `test_v13_opens_and_creates_policy_decisions_table`.
-const CURRENT_SCHEMA_VERSION: u32 = 14;
+/// - **v15** — adds the [`JOBS`] table for the `rocky serve` HTTP job model
+///   (`POST /api/v1/jobs/{run|plan|apply}`). Each row is a serialized
+///   [`PersistedJob`] keyed by `job_id`, letting a killed-and-restarted sidecar
+///   report honest status for the jobs it launched. Pure additive schema
+///   change: v14 databases auto-create the empty table on next open and stamp
+///   themselves as v15. No blob migration needed; existing tables are
+///   untouched. Empty until a `rocky serve` sidecar submits a job.
+const CURRENT_SCHEMA_VERSION: u32 = 15;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -654,6 +667,7 @@ impl StateStore {
             let _table = txn.open_table(INPUT_PROVENANCE)?;
             let _table = txn.open_table(DISCOVER_SNAPSHOTS)?;
             let _table = txn.open_table(POLICY_DECISIONS)?;
+            let _table = txn.open_table(JOBS)?;
         }
         txn.commit()?;
         Ok(InitOutcome::Ready)
@@ -1465,6 +1479,97 @@ pub struct RunProgress {
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub total_tables: usize,
     pub tables: Vec<TableProgress>,
+}
+
+// ---------------------------------------------------------------------------
+// State store: HTTP job records (`rocky serve` job model)
+// ---------------------------------------------------------------------------
+
+/// A persisted `rocky serve` long-running-job record.
+///
+/// The durable half of the HTTP job model (`POST /api/v1/jobs/{run|plan|apply}`,
+/// `GET /api/v1/jobs/{id}`): written to the [`JOBS`] table so a
+/// killed-and-restarted sidecar reports honest status for jobs it launched
+/// rather than a blank slate (the in-memory registry that fronts it does not
+/// survive a restart). The presentation type — `rocky-cli`'s `JobStatus` — is
+/// built from this record at the API boundary; the two are kept separate so
+/// this crate stays free of the `JsonSchema`/HTTP surface.
+///
+/// `state` and `kind` are stored as plain strings (not enums) for the same
+/// forward-compatibility reason the [`RunRecord`] audit fields are
+/// `#[serde(default)]`: a newer sidecar can introduce a state without a
+/// blob-format break, and every field defaults so a partially-written record
+/// still deserializes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PersistedJob {
+    /// Opaque job identifier returned by `POST /api/v1/jobs/{kind}`.
+    pub job_id: String,
+    /// Job kind: `"run"`, `"plan"`, or `"apply"`.
+    #[serde(default)]
+    pub kind: String,
+    /// Lifecycle state: `"queued"`, `"running"`, `"succeeded"`, or `"failed"`.
+    #[serde(default)]
+    pub state: String,
+    /// When the job was submitted (RFC 3339).
+    #[serde(default)]
+    pub submitted_at: String,
+    /// When execution started (RFC 3339), if it has.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    /// When the job reached a terminal state (RFC 3339), if it has.
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    /// Advisory, spoofable `X-Rocky-Principal` recorded for audit (never an
+    /// authorization input under the single-shared-secret auth ceiling).
+    #[serde(default)]
+    pub principal: Option<String>,
+    /// Failure detail when `state == "failed"`.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// The canonical `RunOutput` / `PlanOutput` / `ApplyOutput` the underlying
+    /// `rocky <kind>` subprocess emitted, embedded verbatim, once terminal.
+    #[serde(default)]
+    pub result: Option<serde_json::Value>,
+}
+
+impl StateStore {
+    /// Insert or replace a job record (keyed by `job_id`).
+    ///
+    /// A brief open-write-close: the caller opens the store, writes, and drops
+    /// it, so the server never holds a long-lived write handle across a job's
+    /// subprocess (which is itself the writer for `run`/`apply`).
+    pub fn record_job(&self, job: &PersistedJob) -> Result<(), StateError> {
+        let bytes = serde_json::to_vec(job)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(JOBS)?;
+            table.insert(job.job_id.as_str(), bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Fetch a job record by `job_id`.
+    pub fn get_job(&self, job_id: &str) -> Result<Option<PersistedJob>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(JOBS)?;
+        match table.get(job_id)? {
+            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all persisted job records (unordered).
+    pub fn list_jobs(&self) -> Result<Vec<PersistedJob>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(JOBS)?;
+        let mut jobs = Vec::new();
+        for entry in table.iter()? {
+            let (_, value) = entry?;
+            jobs.push(serde_json::from_slice(value.value())?);
+        }
+        Ok(jobs)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6862,7 +6967,11 @@ mod tests {
         // next open and stamps itself v14; the forward-compat path is the
         // existing version-mismatch handling (guarded by the `open_with_policy_*`
         // tests), not a blob migration.
-        const EXPECTED_VERSION: u32 = 14;
+        //
+        // v15 adds the `jobs` table for the `rocky serve` HTTP job model. Same
+        // additive shape: a v14 database auto-creates the empty `jobs` table on
+        // next open and stamps itself v15, guarded by the same mismatch tests.
+        const EXPECTED_VERSION: u32 = 15;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
@@ -6872,6 +6981,7 @@ mod tests {
             "idempotency_keys",
             "input_index",
             "input_provenance",
+            "jobs",
             "loaded_files",
             "metadata",
             "output_artifacts",
@@ -6911,6 +7021,72 @@ mod tests {
              update EXPECTED_TABLES (and bump CURRENT_SCHEMA_VERSION + add the migration) in \
              the same PR."
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // JOBS table (v14 — `rocky serve` HTTP job model)
+    // -----------------------------------------------------------------------
+
+    fn sample_job(id: &str, state: &str) -> PersistedJob {
+        PersistedJob {
+            job_id: id.to_string(),
+            kind: "run".to_string(),
+            state: state.to_string(),
+            submitted_at: "2026-07-07T00:00:00Z".to_string(),
+            started_at: Some("2026-07-07T00:00:01Z".to_string()),
+            finished_at: None,
+            principal: Some("ci@example.com".to_string()),
+            error: None,
+            result: None,
+        }
+    }
+
+    /// A recorded job round-trips through the store, a terminal update replaces
+    /// the prior record, and `list_jobs` sees every row.
+    #[test]
+    fn job_record_roundtrips_and_updates() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(&path).unwrap();
+
+        assert!(store.get_job("job-1").unwrap().is_none());
+        store.record_job(&sample_job("job-1", "running")).unwrap();
+
+        let got = store.get_job("job-1").unwrap().expect("job present");
+        assert_eq!(got.state, "running");
+        assert_eq!(got.kind, "run");
+
+        // Terminal update replaces the running record under the same key.
+        let mut done = sample_job("job-1", "succeeded");
+        done.finished_at = Some("2026-07-07T00:00:05Z".to_string());
+        done.result = Some(serde_json::json!({ "version": "1", "command": "run" }));
+        store.record_job(&done).unwrap();
+
+        let got = store.get_job("job-1").unwrap().unwrap();
+        assert_eq!(got.state, "succeeded");
+        assert_eq!(got.result.unwrap()["command"], "run");
+
+        store.record_job(&sample_job("job-2", "failed")).unwrap();
+        let mut ids: Vec<String> = store
+            .list_jobs()
+            .unwrap()
+            .into_iter()
+            .map(|j| j.job_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["job-1".to_string(), "job-2".to_string()]);
+    }
+
+    /// A minimal blob (only `job_id`) forward-deserializes with every other
+    /// field defaulted — the additive-field contract for the record.
+    #[test]
+    fn persisted_job_forward_deserializes_with_defaults() {
+        let job: PersistedJob = serde_json::from_str(r#"{"job_id":"j"}"#).unwrap();
+        assert_eq!(job.job_id, "j");
+        assert_eq!(job.state, "");
+        assert_eq!(job.kind, "");
+        assert!(job.result.is_none());
+        assert!(job.principal.is_none());
     }
 
     // -----------------------------------------------------------------------

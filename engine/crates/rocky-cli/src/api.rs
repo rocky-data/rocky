@@ -17,6 +17,10 @@
 //! GET  /api/v1/dag/layers                       → execution layers (dashboard-only)
 //! GET  /api/v1/dag/status                       → latest DAG run status (server-only)
 //! POST /api/v1/compile                          → trigger recompilation
+//! POST /api/v1/jobs/run                         → submit a run job    → 202 {job_id}
+//! POST /api/v1/jobs/plan                        → submit a plan job   → 202 {job_id}
+//! POST /api/v1/jobs/apply                       → submit an apply job → 202 {job_id}
+//! GET  /api/v1/jobs/:id                          → job status (+ embedded result when done)
 //! ```
 //!
 //! ## Contract (`/api/v1`)
@@ -43,15 +47,17 @@
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use rocky_core::state::PersistedJob;
 use rocky_server::auth::{build_cors_layer, require_bearer_token};
 use rocky_server::dashboard;
 use rocky_server::state::ServerState;
@@ -61,8 +67,8 @@ use crate::commands::{
     metrics_output, model_history_output, schemas_hash,
 };
 use crate::output::{
-    ColumnLineageOutput, CompileOutput, DagOutput, ErrorEnvelope, HistoryOutput, LineageOutput,
-    MetaOutput, MetricsOutput, ModelHistoryOutput,
+    ColumnLineageOutput, CompileOutput, DagOutput, ErrorEnvelope, HistoryOutput, JobKind, JobState,
+    JobStatus, LineageOutput, MetaOutput, MetricsOutput, ModelHistoryOutput,
 };
 
 /// Bind config for [`serve`].
@@ -109,6 +115,10 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/dag", get(full_dag))
         .route("/api/v1/dag/layers", get(dag_layers))
         .route("/api/v1/dag/status", get(dag_status))
+        .route("/api/v1/jobs/run", post(submit_run))
+        .route("/api/v1/jobs/plan", post(submit_plan))
+        .route("/api/v1/jobs/apply", post(submit_apply))
+        .route("/api/v1/jobs/{id}", get(get_job))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_token,
@@ -196,6 +206,7 @@ impl ApiError {
                 code: code.to_string(),
                 message: message.into(),
                 remediation_hint: hint.map(str::to_string),
+                running_job_id: None,
             },
         }
     }
@@ -233,6 +244,36 @@ impl ApiError {
             format!("model '{name}' not found"),
             Some("check the model name against GET /api/v1/models"),
         )
+    }
+
+    /// `404` — no job with this id (neither in-memory nor persisted).
+    fn job_not_found(id: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            format!("job '{id}' not found"),
+            Some("use the job_id returned by POST /api/v1/jobs/{run|plan|apply}"),
+        )
+    }
+
+    /// `409` — a `run`/`apply` job already holds the single-mutating-job permit.
+    /// Carries the holder's `job_id` in `running_job_id` so the embedder can
+    /// poll it. Distinct from `503 engine_busy` (redb lock contention), which is
+    /// the cross-process backstop, not this app-level guard.
+    fn mutation_in_progress(running_job_id: &str) -> Self {
+        let mut err = Self::new(
+            StatusCode::CONFLICT,
+            "mutation_in_progress",
+            "another run/apply job is already in progress on this project",
+            Some("wait for the running job to finish (poll GET /api/v1/jobs/{id}), then resubmit"),
+        );
+        err.envelope.running_job_id = Some(running_job_id.to_string());
+        err
+    }
+
+    /// `400` — the request body could not be parsed.
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "bad_request", message, None)
     }
 
     /// `500` — an unexpected internal error.
@@ -299,6 +340,10 @@ fn api_v1_routes() -> Vec<String> {
         "GET /api/v1/dag",
         "GET /api/v1/dag/layers",
         "GET /api/v1/dag/status",
+        "POST /api/v1/jobs/run",
+        "POST /api/v1/jobs/plan",
+        "POST /api/v1/jobs/apply",
+        "GET /api/v1/jobs/{id}",
     ]
     .into_iter()
     .map(String::from)
@@ -318,6 +363,7 @@ fn capabilities() -> Vec<String> {
         "metrics",
         "meta",
         "error_envelope",
+        "jobs",
     ]
     .into_iter()
     .map(String::from)
@@ -603,6 +649,335 @@ async fn dag_status(
     match state.dag_status.get().await {
         Some(status) => Ok(Json(serde_json::json!(status))),
         None => Err(ApiError::engine_not_ready()),
+    }
+}
+
+// --- Job model (POST /api/v1/jobs/{run|plan|apply}, GET /api/v1/jobs/{id}) ---
+
+/// Optional JSON body for a job submission. Every field is optional; an empty
+/// body runs the verb with its defaults (all pipelines, no filter). Unknown
+/// fields are ignored so an embedder on a newer client stays forward-compatible.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct JobRequest {
+    /// `--filter <component=value>` for `run`/`plan`.
+    filter: Option<String>,
+    /// `--pipeline <name>` for `run`/`plan`.
+    pipeline: Option<String>,
+    /// `--model <name>` for `run`/`plan` (single-model execution).
+    model: Option<String>,
+    /// The positional `<plan_id>` for `apply`.
+    plan_id: Option<String>,
+}
+
+/// Mint an opaque, collision-resistant job id for this sidecar.
+fn new_job_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&nanos.to_le_bytes());
+    hasher.update(&seq.to_le_bytes());
+    hasher.update(&std::process::id().to_le_bytes());
+    format!("job_{}", &hasher.finalize().to_hex()[..24])
+}
+
+/// The persisted string form of a lifecycle state.
+fn job_state_str(state: JobState) -> &'static str {
+    match state {
+        JobState::Queued => "queued",
+        JobState::Running => "running",
+        JobState::Succeeded => "succeeded",
+        JobState::Failed => "failed",
+    }
+}
+
+/// Build the API presentation type from the durable record. Unknown persisted
+/// `kind`/`state` strings (only reachable from a malformed record) fall back to
+/// safe defaults rather than failing the read.
+fn job_status_from(job: PersistedJob) -> JobStatus {
+    JobStatus {
+        kind: JobKind::parse(&job.kind).unwrap_or(JobKind::Run),
+        state: JobState::parse(&job.state).unwrap_or(JobState::Failed),
+        job_id: job.job_id,
+        submitted_at: job.submitted_at,
+        started_at: job.started_at,
+        finished_at: job.finished_at,
+        principal: job.principal,
+        error: job.error,
+        result: job.result,
+    }
+}
+
+/// Read and validate the advisory `X-Rocky-Principal` header.
+///
+/// Spoofable by construction under the single-shared-secret auth ceiling, so it
+/// is recorded for audit only — never an authorization input. Validated against
+/// the engine's principal charset (`^[a-zA-Z0-9_ \-.@]+$`); a malformed value is
+/// a `400`, an absent one is `None`.
+fn principal_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(raw) = headers.get("x-rocky-principal") else {
+        return Ok(None);
+    };
+    let value = raw
+        .to_str()
+        .map_err(|_| ApiError::bad_request("X-Rocky-Principal must be valid ASCII"))?;
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let valid = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '-' | '.' | '@'));
+    if !valid {
+        return Err(ApiError::bad_request(
+            "X-Rocky-Principal contains characters outside ^[a-zA-Z0-9_ \\-.@]+$",
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
+/// Persist a job record (brief open-write-close on the blocking pool).
+async fn persist_job(state_path: std::path::PathBuf, job: PersistedJob) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let store = rocky_core::state::StateStore::open(&state_path)?;
+        store.record_job(&job)?;
+        Ok(())
+    })
+    .await?
+}
+
+/// `POST /api/v1/jobs/run` — submit a run job (mutating; takes the permit).
+async fn submit_run(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Run, state, &headers, &body).await
+}
+
+/// `POST /api/v1/jobs/plan` — submit a plan job (non-mutating; no permit).
+async fn submit_plan(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Plan, state, &headers, &body).await
+}
+
+/// `POST /api/v1/jobs/apply` — submit an apply job (mutating; takes the permit).
+async fn submit_apply(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Apply, state, &headers, &body).await
+}
+
+/// Shared submission path for all three job kinds.
+///
+/// Returns `202 {job_id}` after (1) taking the mutation permit for `run`/`apply`
+/// — a second attempt while one is held is a `409 mutation_in_progress` — and
+/// (2) persisting the `running` record **before** spawning the subprocess, so a
+/// crash immediately after submission still reports honest status on restart.
+/// The actual `rocky <kind>` runs as a subprocess in a background task so the
+/// server never holds a long-lived write handle.
+async fn submit_job(
+    kind: JobKind,
+    state: Arc<ServerState>,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<Response, ApiError> {
+    let request: JobRequest = if body.is_empty() {
+        JobRequest::default()
+    } else {
+        serde_json::from_slice(body)
+            .map_err(|e| ApiError::bad_request(format!("invalid job request body: {e}")))?
+    };
+    let principal = principal_from_headers(headers)?;
+    let job_id = new_job_id();
+
+    // Layer 1: the app-level single-mutating-job guard. `plan` never takes it.
+    // A second `run`/`apply` while one is held returns the holder's id as a
+    // `409 mutation_in_progress` rather than colliding on the redb flock.
+    let permit = if kind.mutates() {
+        match state.mutation_permit.try_acquire(&job_id) {
+            Ok(guard) => Some(guard),
+            Err(running_job_id) => return Err(ApiError::mutation_in_progress(&running_job_id)),
+        }
+    } else {
+        None
+    };
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let record = PersistedJob {
+        job_id: job_id.clone(),
+        kind: kind.verb().to_string(),
+        state: job_state_str(JobState::Running).to_string(),
+        submitted_at: now.clone(),
+        started_at: Some(now),
+        finished_at: None,
+        principal,
+        error: None,
+        result: None,
+    };
+
+    let state_path = state_path_for(&state);
+    let config_path = state.config_path.clone();
+
+    // Register + persist the `running` record BEFORE spawning the subprocess and
+    // BEFORE returning 202, so a crash immediately after submission still reports
+    // honest status on restart (the durability done-criterion). Persistence is
+    // best-effort under lock contention — the in-memory registry is authoritative
+    // for the live session, and embedders reconcile via /runs.
+    state.jobs.upsert(record.clone()).await;
+    if let Err(e) = persist_job(state_path.clone(), record.clone()).await {
+        tracing::warn!(error = %e, job_id = %job_id,
+            "could not persist initial job record; in-memory only until it settles");
+    }
+
+    // Background task: run the subprocess, then record the terminal state. The
+    // permit is moved in and released when the task ends.
+    let task_state = state.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let (final_state, result, error) =
+            execute_job_subprocess(kind, config_path, state_path.clone(), request).await;
+
+        let mut done = record;
+        done.state = job_state_str(final_state).to_string();
+        done.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        done.result = result;
+        done.error = error;
+        task_state.jobs.upsert(done.clone()).await;
+        if let Err(e) = persist_job(state_path, done.clone()).await {
+            tracing::warn!(error = %e, job_id = %done.job_id,
+                "could not persist terminal job record; /runs is the reconcile surface");
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        PrettyJson(serde_json::json!({ "job_id": job_id })),
+    )
+        .into_response())
+}
+
+/// Spawn `rocky <kind> --output json` as a subprocess and collect its outcome.
+///
+/// Runs as a subprocess (matching the SDK's pattern) so the server never holds
+/// a long-lived redb write handle for the job's duration. The subprocess
+/// acquires the state flock for the run; the server's own reads/writes stay
+/// brief. The verbatim stdout JSON becomes the embedded `result`.
+async fn execute_job_subprocess(
+    kind: JobKind,
+    config_path: Option<std::path::PathBuf>,
+    state_path: std::path::PathBuf,
+    request: JobRequest,
+) -> (JobState, Option<serde_json::Value>, Option<String>) {
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                JobState::Failed,
+                None,
+                Some(format!("could not resolve the rocky binary: {e}")),
+            );
+        }
+    };
+
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("--output").arg("json");
+    if let Some(config) = &config_path {
+        cmd.arg("--config").arg(config);
+    }
+    cmd.arg("--state-path").arg(&state_path);
+    cmd.arg(kind.verb());
+    match kind {
+        JobKind::Run | JobKind::Plan => {
+            if let Some(filter) = &request.filter {
+                cmd.arg("--filter").arg(filter);
+            }
+            if let Some(pipeline) = &request.pipeline {
+                cmd.arg("--pipeline").arg(pipeline);
+            }
+            if let Some(model) = &request.model {
+                cmd.arg("--model").arg(model);
+            }
+        }
+        JobKind::Apply => {
+            if let Some(plan_id) = &request.plan_id {
+                cmd.arg(plan_id);
+            }
+        }
+    }
+
+    let output = match cmd.output().await {
+        Ok(output) => output,
+        Err(e) => {
+            return (
+                JobState::Failed,
+                None,
+                Some(format!("failed to spawn `rocky {}`: {e}", kind.verb())),
+            );
+        }
+    };
+
+    // The canonical output is emitted on stdout; embed it verbatim when parseable.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
+
+    if output.status.success() {
+        (JobState::Succeeded, result, None)
+    } else {
+        // Surface the last few stderr lines (the actionable tail) as the error.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let lines: Vec<&str> = stderr.lines().collect();
+        let tail = lines[lines.len().saturating_sub(10)..].join("\n");
+        let msg = if tail.trim().is_empty() {
+            format!("`rocky {}` exited with {}", kind.verb(), output.status)
+        } else {
+            tail
+        };
+        (JobState::Failed, result, Some(msg))
+    }
+}
+
+/// `GET /api/v1/jobs/{id}` — job status, with the embedded canonical result once
+/// terminal.
+///
+/// Reads the in-memory registry first; on a miss (e.g. after a sidecar restart)
+/// it falls back to the durable `jobs` state table, so a job launched before a
+/// crash still reports its last-persisted status instead of a spurious `404`.
+async fn get_job(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+) -> Result<PrettyJson<JobStatus>, ApiError> {
+    if let Some(record) = state.jobs.get(&id).await {
+        return Ok(PrettyJson(job_status_from(record)));
+    }
+
+    let state_path = state_path_for(&state);
+    if !state_path.exists() {
+        return Err(ApiError::job_not_found(&id));
+    }
+
+    let lookup_id = id.clone();
+    let record = tokio::task::spawn_blocking(move || {
+        let store = rocky_core::state::StateStore::open_read_only(&state_path)?;
+        store.get_job(&lookup_id)
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_state_err(anyhow::Error::from(e)))?;
+
+    match record {
+        Some(record) => {
+            // Warm the cache so subsequent reads are hot.
+            state.jobs.upsert(record.clone()).await;
+            Ok(PrettyJson(job_status_from(record)))
+        }
+        None => Err(ApiError::job_not_found(&id)),
     }
 }
 
@@ -1045,5 +1420,133 @@ mod tests {
         // Timeout = serve is happily running. An immediate Ok/Err would mean
         // the loopback check fired; that would be the bug.
         assert!(early.is_err(), "serve exited too quickly: {early:?}");
+    }
+
+    // --- Job model (POST /api/v1/jobs/*, GET /api/v1/jobs/{id}) ---
+    //
+    // The full happy path (a real `rocky plan` subprocess emitting a PlanOutput)
+    // is proven by the live reachability transcript, not here: in a cargo test
+    // `std::env::current_exe()` is the test harness, not the `rocky` binary, so
+    // these tests exercise every deterministic API-layer guarantee that returns
+    // *before* the subprocess spawns (the 409 permit guard, principal
+    // validation, 404) plus the durable-restart read, which needs no subprocess.
+
+    /// A second `run`/`apply` submission while the permit is held is a
+    /// `409 mutation_in_progress` carrying the holder's `job_id` — never a redb
+    /// collision, never a queue.
+    #[tokio::test]
+    async fn job_second_mutation_returns_409_with_running_job_id() {
+        let state = test_state();
+        // Simulate a run/apply already in flight by holding the permit.
+        let held = state
+            .mutation_permit
+            .try_acquire("job_incumbent")
+            .expect("permit is free");
+        let base = spawn_router(state).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/apply"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "mutation_in_progress");
+        assert_eq!(body.running_job_id.as_deref(), Some("job_incumbent"));
+
+        drop(held);
+    }
+
+    /// The permit-relevant contract for each kind: `run`/`apply` mutate (take
+    /// the permit), `plan` does not (so a submitted plan is never blocked by a
+    /// held permit). Asserted directly to avoid spawning the test harness as a
+    /// bogus `rocky` subprocess.
+    #[test]
+    fn job_kind_mutation_and_verb_semantics() {
+        assert!(JobKind::Run.mutates());
+        assert!(JobKind::Apply.mutates());
+        assert!(!JobKind::Plan.mutates());
+        assert_eq!(JobKind::Run.verb(), "run");
+        assert_eq!(JobKind::Plan.verb(), "plan");
+        assert_eq!(JobKind::Apply.verb(), "apply");
+    }
+
+    /// An unknown job id is a structured `404 job_not_found`.
+    #[tokio::test]
+    async fn job_get_unknown_returns_404() {
+        let base = spawn_router(test_state()).await;
+        let resp = reqwest::get(format!("{base}/api/v1/jobs/does_not_exist"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "job_not_found");
+    }
+
+    /// A malformed `X-Rocky-Principal` is rejected before any work starts.
+    #[tokio::test]
+    async fn job_invalid_principal_returns_400() {
+        let base = spawn_router(test_state()).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/plan"))
+            .header("X-Rocky-Principal", "bad/slash")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "bad_request");
+    }
+
+    /// The durability done-criterion: a job persisted as `running` (as if the
+    /// sidecar was killed mid-job, before the terminal write) is reported with
+    /// honest status by a **freshly restarted** server — an empty in-memory
+    /// registry falls back to the durable `jobs` state table — not a spurious
+    /// `404`/`succeeded`.
+    #[tokio::test]
+    async fn job_status_survives_restart_via_persisted_record() {
+        use rocky_core::state::{PersistedJob, StateStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+
+        // A job that was "running" when the (previous) sidecar died.
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_job(&PersistedJob {
+                    job_id: "job_inflight".to_string(),
+                    kind: "run".to_string(),
+                    state: "running".to_string(),
+                    submitted_at: "2026-07-07T00:00:00Z".to_string(),
+                    started_at: Some("2026-07-07T00:00:00Z".to_string()),
+                    finished_at: None,
+                    principal: None,
+                    error: None,
+                    result: None,
+                })
+                .unwrap();
+        }
+
+        // A brand-new server (empty in-memory registry) — the "restart".
+        let state = ServerState::new(models_dir, None, None);
+        let base = spawn_router(state).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/jobs/job_inflight"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: JobStatus = resp.json().await.unwrap();
+        assert_eq!(body.job_id, "job_inflight");
+        assert!(
+            matches!(body.state, JobState::Running),
+            "a killed-mid-job record must report honest `running` status after restart, got {:?}",
+            body.state
+        );
+        assert!(body.result.is_none());
     }
 }

@@ -7229,7 +7229,9 @@ impl PreviewCostOutput {
 ///
 /// Stable codes emitted today: `engine_not_ready` (no compile available
 /// yet), `engine_busy` (state locked by a running job — retryable),
-/// `model_not_found`, `unauthorized`, `internal_error`.
+/// `model_not_found`, `job_not_found`, `mutation_in_progress` (a `run`/`apply`
+/// job already holds the mutation permit — carries [`running_job_id`](Self::running_job_id)),
+/// `bad_request`, `unauthorized`, `internal_error`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorEnvelope {
     /// Stable machine token, e.g. `"model_not_found"`.
@@ -7238,6 +7240,12 @@ pub struct ErrorEnvelope {
     pub message: String,
     /// Actionable next step, or `null` when none applies.
     pub remediation_hint: Option<String>,
+    /// The `job_id` of the run/apply job currently holding the mutation permit,
+    /// on a `409 mutation_in_progress` (and, when known, on a
+    /// `503 engine_busy`). Omitted for every other error. Additive,
+    /// serde-defaulted — embedders that predate it simply never see it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_job_id: Option<String>,
 }
 
 /// Feature-detection payload for `GET /api/v1/meta`.
@@ -7266,6 +7274,107 @@ pub struct MetaOutput {
     pub capabilities: Vec<String>,
     /// The `/api/v1` routes this build serves.
     pub routes: Vec<String>,
+}
+
+/// The kind of long-running operation a job wraps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum JobKind {
+    /// `rocky run` — materializes tables. Takes the mutation permit.
+    Run,
+    /// `rocky plan` — previews and persists a plan. Non-mutating; no permit.
+    Plan,
+    /// `rocky apply` — executes a persisted plan. Takes the mutation permit.
+    Apply,
+}
+
+impl JobKind {
+    /// The `rocky` subcommand this kind spawns.
+    pub fn verb(self) -> &'static str {
+        match self {
+            JobKind::Run => "run",
+            JobKind::Plan => "plan",
+            JobKind::Apply => "apply",
+        }
+    }
+
+    /// Whether this kind mutates warehouse state (and so takes the permit).
+    /// `plan` previews only.
+    pub fn mutates(self) -> bool {
+        matches!(self, JobKind::Run | JobKind::Apply)
+    }
+
+    /// Parse the persisted string form; unknown values map to `None`.
+    pub fn parse(s: &str) -> Option<JobKind> {
+        match s {
+            "run" => Some(JobKind::Run),
+            "plan" => Some(JobKind::Plan),
+            "apply" => Some(JobKind::Apply),
+            _ => None,
+        }
+    }
+}
+
+/// Lifecycle state of a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum JobState {
+    /// Accepted, not yet started.
+    Queued,
+    /// The underlying `rocky <kind>` subprocess is executing.
+    Running,
+    /// The subprocess exited 0.
+    Succeeded,
+    /// The subprocess exited non-zero, or could not be launched.
+    Failed,
+}
+
+impl JobState {
+    /// Parse the persisted string form; unknown values map to `None`.
+    pub fn parse(s: &str) -> Option<JobState> {
+        match s {
+            "queued" => Some(JobState::Queued),
+            "running" => Some(JobState::Running),
+            "succeeded" => Some(JobState::Succeeded),
+            "failed" => Some(JobState::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Status of a `rocky serve` long-running job (`GET /api/v1/jobs/{id}`).
+///
+/// The presentation type over `rocky-core`'s `PersistedJob`: it carries the
+/// same lifecycle facts with typed [`JobKind`]/[`JobState`] enums for embedder
+/// ergonomics, and — once the job is terminal — the canonical
+/// `RunOutput` / `PlanOutput` / `ApplyOutput` the underlying subprocess emitted,
+/// embedded **verbatim** in [`result`](Self::result). An embedder switches on
+/// [`kind`](Self::kind) to know which schema `result` conforms to (the same
+/// `run` / `plan` / `apply` schemas the CLI exports).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct JobStatus {
+    /// Opaque job identifier (as returned by `POST /api/v1/jobs/{kind}`).
+    pub job_id: String,
+    /// Which operation the job wraps.
+    pub kind: JobKind,
+    /// Current lifecycle state.
+    pub state: JobState,
+    /// When the job was submitted (RFC 3339).
+    pub submitted_at: String,
+    /// When execution started (RFC 3339), or `null` if not yet.
+    pub started_at: Option<String>,
+    /// When the job reached a terminal state (RFC 3339), or `null` if not yet.
+    pub finished_at: Option<String>,
+    /// The advisory, spoofable `X-Rocky-Principal` recorded for audit, or `null`.
+    /// Never an authorization input under the single-shared-secret auth ceiling.
+    pub principal: Option<String>,
+    /// Failure detail when [`state`](Self::state) is [`JobState::Failed`], else `null`.
+    pub error: Option<String>,
+    /// The canonical output of the underlying `rocky <kind>` command, embedded
+    /// verbatim once the job is terminal (`null` while queued/running). Its
+    /// shape is the `run` / `plan` / `apply` schema selected by
+    /// [`kind`](Self::kind).
+    pub result: Option<serde_json::Value>,
 }
 
 #[cfg(test)]

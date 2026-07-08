@@ -24,7 +24,7 @@ use crate::output::{
     ClearSchemaCacheOutput, ColumnLineageOutput, CompactApplyOutput, CompactDedupOutput,
     CompactOutput, CompareOutput, CompileOutput, ComplianceOutput, CostOutput, DagOutput,
     DagRunOutput, DiscoverOutput, DriftOutput, ErrorEnvelope, EstimateOutput, HistoryOutput,
-    HooksListOutput, HooksTestOutput, ImportDbtOutput, LineageDiffOutput, LineageOutput,
+    HooksListOutput, HooksTestOutput, ImportDbtOutput, JobStatus, LineageDiffOutput, LineageOutput,
     LoadOutput, MetaOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput, PlanOutput,
     PolicyCheckOutput, PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput,
     PreviewRowsOutput, ProfileOutput, ProfileStorageOutput, PromotePlan, RecipeHistoryOutput,
@@ -64,6 +64,7 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         // Pydantic/TS bindings for the error body and the `/meta` payload).
         entry::<ErrorEnvelope>("error_envelope"),
         entry::<MetaOutput>("meta"),
+        entry::<JobStatus>("job_status"),
         entry::<TestOutput>("test"),
         entry::<CiOutput>("ci"),
         entry::<CiDiffOutput>("ci_diff"),

@@ -12,7 +12,7 @@ class ErrorEnvelope(BaseModel):
 
     Every non-2xx `/api/v1` response carries this envelope: the HTTP status line carries the error *class* (`400`/`401`/`404`/`409`/`500`/`503`) and the body carries a stable machine token plus a human message and an optional actionable hint. Embedders switch on [`code`](Self::code) and surface [`message`](Self::message) / [`remediation_hint`](Self::remediation_hint) to operators.
 
-    Stable codes emitted today: `engine_not_ready` (no compile available yet), `engine_busy` (state locked by a running job — retryable), `model_not_found`, `unauthorized`, `internal_error`.
+    Stable codes emitted today: `engine_not_ready` (no compile available yet), `engine_busy` (state locked by a running job — retryable), `model_not_found`, `job_not_found`, `mutation_in_progress` (a `run`/`apply` job already holds the mutation permit — carries [`running_job_id`](Self::running_job_id)), `bad_request`, `unauthorized`, `internal_error`.
     """
 
     code: str
@@ -26,4 +26,8 @@ class ErrorEnvelope(BaseModel):
     remediation_hint: str | None = None
     """
     Actionable next step, or `null` when none applies.
+    """
+    running_job_id: str | None = None
+    """
+    The `job_id` of the run/apply job currently holding the mutation permit, on a `409 mutation_in_progress` (and, when known, on a `503 engine_busy`). Omitted for every other error. Additive, serde-defaulted — embedders that predate it simply never see it.
     """
