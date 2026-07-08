@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-08
+
+### Added
+
+- **Generated types for the engine-v1.58.0 output surface.** New Pydantic models track the CLI's new JSON outputs: the audit trust scorecard (`audit_scorecard`) and the custody drill-down + review queue (`audit_for`, `review_queue`). The `run` output gains two additive fields — a `contained[]` list of withheld models (model-failure containment) and an `attempts[]` retry trail per execution (classified retry). All additive — existing calls are unchanged and the new models are available to import. (#1055, #1056, #1057, #1058)
+
 ## [0.2.0] — 2026-07-08
 
 ### Added
