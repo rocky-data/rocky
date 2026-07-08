@@ -11232,6 +11232,82 @@ merge_keys = ["id"]
         );
     }
 
+    /// Bare unqualified read hardening: a model reading a failed producer's
+    /// target by BARE table name (`FROM orders_current`, resolved via the
+    /// default schema) — where the producer's model name differs from its table
+    /// name — must be contained. Fails on the pre-fix closure (a 1-part read was
+    /// treated as external); passes once bare reads resolve against producer
+    /// target-table names.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_contains_bare_read_of_failed_producer_table() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("bare.duckdb");
+
+        // Pre-seed a STALE prior-run `main.orders_current`.
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db).expect("seed open");
+            seed.execute_statement("CREATE TABLE main.orders_current AS SELECT 999 AS id")
+                .await
+                .unwrap();
+        }
+        write_plain_model(&models_dir, "anchor", "SELECT 1 AS v");
+        // Producer MODEL name (`stage_orders`) differs from its TABLE
+        // (`orders_current`), so a bare `orders_current` read is not a model
+        // name — it only resolves via the producer's target table.
+        write_model_with_target(
+            &models_dir,
+            "stage_orders",
+            "SELECT * FROM main.does_not_exist_xyz",
+            "main",
+            "orders_current",
+        );
+        // `rollup` reads the producer's target by BARE name (default schema).
+        write_model_with_target(
+            &models_dir,
+            "rollup",
+            "SELECT a.v FROM anchor a CROSS JOIN orders_current o",
+            "main",
+            "rollup",
+        );
+
+        let (out, result) = run_models_with_containment(&models_dir, &db).await;
+        result.expect("containment returns Ok — the failure is recorded, not thrown");
+
+        let built: std::collections::BTreeSet<String> = out
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert!(
+            !built.contains("rollup"),
+            "a BARE read of a failed producer's target table must NOT build"
+        );
+        let contained: Vec<&str> = out.contained.iter().map(|c| c.model.as_str()).collect();
+        assert!(
+            contained.contains(&"rollup"),
+            "rollup (bare read) must be contained: {contained:?}"
+        );
+        assert!(
+            out.contained
+                .iter()
+                .find(|c| c.model == "rollup")
+                .is_some_and(|c| c.blocked_by.iter().any(|b| b == "stage_orders")),
+            "rollup's blocker must name the producer via the bare-table edge: {:?}",
+            out.contained
+        );
+        let verify = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+        assert!(
+            !table_exists(&verify, "rollup").await,
+            "the contained downstream must not exist"
+        );
+    }
+
     /// Finding 2 / fail-closed belt: a model whose read set is NOT provably
     /// complete (a CTE — the completeness gate rejects it) cannot be proven
     /// disjoint from a failure, so once any failure has occurred it must be

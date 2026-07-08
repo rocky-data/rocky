@@ -52,25 +52,39 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 /// Index of every model's produced target, for resolving a physical `FROM` /
 /// `JOIN` read back to the model that produces that table.
 ///
-/// Two lookups mirror how a physical read can be written:
+/// Three lookups mirror how a physical read can be written:
 /// - `by_full` — an explicit 3-part `catalog.schema.table` read matches a
 ///   producer's full target exactly.
 /// - `by_schema_table` — a 2-part `schema.table` read omits the catalog; it
-///   matches producers on `(schema, table)`. If more than one producer (in
-///   different catalogs) shares that `(schema, table)`, the read is *ambiguous*.
+///   matches producers on `(schema, table)`. More than one producer (across
+///   catalogs) sharing that `(schema, table)` is *ambiguous* → fail closed.
+/// - `by_table` — a bare 1-part read (`orders_current`) resolved via the
+///   session default schema. We do NOT model per-dialect `search_path`
+///   precisely (getting it wrong is the unsound direction); instead a bare read
+///   colliding with a producer's target table **in any schema** is treated as a
+///   *candidate* edge to each such producer, so the reader is contained iff at
+///   least one candidate producer is poisoned. This over-contains only when a
+///   bare read literally matches a failed producer's output table — the
+///   acceptable direction; a bare read matching no producer table is external.
 ///
 /// All keys are lowercased. A model appears once per lookup.
 pub(crate) struct ProducerIndex {
     by_full: HashMap<(String, String, String), Vec<String>>,
     by_schema_table: HashMap<(String, String), Vec<String>>,
+    by_table: HashMap<String, Vec<String>>,
 }
 
 /// How a single physical read resolves against the produced targets.
 enum ReadResolution {
-    /// Resolves to exactly one produced target — add a containment edge.
-    Edge(String),
-    /// Matches more than one produced target (multi-catalog `schema.table`) —
-    /// cannot be attributed, so the reader fails closed.
+    /// Resolves to one or more candidate producers — each is added as a
+    /// containment edge, so the reader is blocked iff at least one is poisoned.
+    /// Exactly one candidate for an unambiguous 2/3-part read; possibly several
+    /// for a bare 1-part read that collides with a producer target table across
+    /// schemas.
+    Edges(Vec<String>),
+    /// A qualified (2/3-part) read matching more than one produced target
+    /// (multi-catalog collision), or an un-canonicalizable identity — cannot be
+    /// attributed, so the reader fails closed.
     Ambiguous,
     /// Matches no produced target — a genuinely external table this run does
     /// not produce, which a run failure cannot make stale.
@@ -85,6 +99,7 @@ impl ProducerIndex {
     {
         let mut by_full: HashMap<(String, String, String), Vec<String>> = HashMap::new();
         let mut by_schema_table: HashMap<(String, String), Vec<String>> = HashMap::new();
+        let mut by_table: HashMap<String, Vec<String>> = HashMap::new();
         for (name, catalog, schema, table) in models {
             let (c, s, t) = (
                 catalog.to_lowercase(),
@@ -96,13 +111,15 @@ impl ProducerIndex {
                 .or_default()
                 .push(name.to_string());
             by_schema_table
-                .entry((s, t))
+                .entry((s, t.clone()))
                 .or_default()
                 .push(name.to_string());
+            by_table.entry(t).or_default().push(name.to_string());
         }
         Self {
             by_full,
             by_schema_table,
+            by_table,
         }
     }
 
@@ -117,33 +134,47 @@ impl ProducerIndex {
     /// `schema.table` index) resolves to [`ReadResolution::Ambiguous`] so the
     /// reader **fails closed**.
     ///
-    /// Only 2-part (`schema.table`) and 3-part (`catalog.schema.table`) reads
-    /// are physical-target shapes. A bare (1-part) read is either a model name
-    /// (already a `ref()` edge, handled by the caller) or an external table; a
-    /// read with more than three parts is out of range. Both resolve to
-    /// [`ReadResolution::External`].
+    /// A bare (1-part) read is resolved against producer target-table names
+    /// (`by_table`): a caller-known model name is skipped upstream (it is a
+    /// `ref()` edge), so a bare read that reaches here and matches a producer's
+    /// target table is a candidate edge to that producer. A qualified read
+    /// (2/3-part) resolves uniquely or is [`ReadResolution::Ambiguous`]; a read
+    /// with more than three parts is out of range → [`ReadResolution::External`].
     fn resolve(&self, read: &str) -> ReadResolution {
         let Some(parts) = canonicalize_identifier(read) else {
             // Un-canonicalizable — cannot attribute the read; fail closed.
             return ReadResolution::Ambiguous;
         };
-        let candidates: &[String] = match parts.as_slice() {
-            [catalog, schema, table] => self
-                .by_full
-                .get(&(catalog.clone(), schema.clone(), table.clone()))
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-            [schema, table] => self
-                .by_schema_table
-                .get(&(schema.clone(), table.clone()))
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-            _ => &[],
-        };
-        match candidates {
-            [] => ReadResolution::External,
-            [one] => ReadResolution::Edge(one.clone()),
-            _ => ReadResolution::Ambiguous,
+        match parts.as_slice() {
+            // Qualified reads must resolve to exactly one producer; a collision
+            // (duplicate exact target, or multi-catalog `schema.table`) can't be
+            // attributed, so it fails closed.
+            [catalog, schema, table] => Self::qualified(self.by_full.get(&(
+                catalog.clone(),
+                schema.clone(),
+                table.clone(),
+            ))),
+            [schema, table] => {
+                Self::qualified(self.by_schema_table.get(&(schema.clone(), table.clone())))
+            }
+            // Bare read: every producer whose target table matches is a
+            // candidate — contain iff at least one is poisoned. No match ⇒
+            // genuinely external ⇒ build (no over-containment).
+            [table] => match self.by_table.get(table) {
+                None => ReadResolution::External,
+                Some(candidates) => ReadResolution::Edges(candidates.clone()),
+            },
+            _ => ReadResolution::External,
+        }
+    }
+
+    /// Resolve a qualified (2/3-part) read: exactly one producer ⇒ an edge; a
+    /// collision ⇒ ambiguous (fail closed); none ⇒ external.
+    fn qualified(candidates: Option<&Vec<String>>) -> ReadResolution {
+        match candidates.map(Vec::as_slice) {
+            None | Some([]) => ReadResolution::External,
+            Some([one]) => ReadResolution::Edges(vec![one.clone()]),
+            Some(_) => ReadResolution::Ambiguous,
         }
     }
 }
@@ -272,14 +303,17 @@ impl ContainmentLedger {
                 continue;
             }
             match producers.resolve(read) {
-                // A physical read of another model's produced target.
-                ReadResolution::Edge(producer) if producer != name => {
-                    ups.insert(producer);
+                // A physical read of one-or-more producers' target(s). Each is a
+                // candidate edge (self-reads excluded); the model is blocked iff
+                // at least one candidate is poisoned.
+                ReadResolution::Edges(producers) => {
+                    for producer in producers {
+                        if producer != name {
+                            ups.insert(producer);
+                        }
+                    }
                 }
-                // A model reading its own target (e.g. incremental self-ref) is
-                // not a cross-model edge.
-                ReadResolution::Edge(_) => {}
-                // Cannot attribute the read to a single producer — fail closed.
+                // Cannot attribute the read to a bounded producer set — fail closed.
                 ReadResolution::Ambiguous => uncertain = true,
                 // Genuinely external — a run failure cannot make it stale.
                 ReadResolution::External => {}
@@ -457,6 +491,50 @@ mod tests {
         );
         led.poison("other");
         assert!(led.evaluate("m").is_none(), "external read must build");
+    }
+
+    /// A bare (1-part) read of a producer's target table (default-schema
+    /// resolution) is contained when that producer is poisoned — via `by_table`,
+    /// even though the producer's model name differs from its table name.
+    #[test]
+    fn bare_read_of_producer_table_is_contained() {
+        let mut led = ledger(
+            &[
+                ("stage", &[], &[], true),
+                ("rollup", &["anchor"], &["orders_current"], true),
+                ("anchor", &[], &[], true),
+            ],
+            &[("stage", "", "main", "orders_current")],
+        );
+        led.poison("stage");
+        let dec = led
+            .evaluate("rollup")
+            .expect("bare read of a failed producer's table ⇒ contained");
+        assert!(
+            !dec.fail_closed,
+            "resolved via a producer edge, not the belt"
+        );
+        assert!(dec.blocked_by.contains(&"stage".to_string()));
+    }
+
+    /// A bare read of a genuine external table (no producer has that table name)
+    /// builds — even when an unrelated failure has occurred. The bare-read
+    /// resolution must not over-contain every bare read whenever a run fails.
+    #[test]
+    fn bare_read_of_external_table_builds() {
+        let mut led = ledger(
+            &[
+                ("bad", &[], &[], true),
+                ("reader", &["anchor"], &["some_external"], true),
+                ("anchor", &[], &[], true),
+            ],
+            &[("stage", "", "main", "orders_current")], // no producer targets `some_external`
+        );
+        led.poison("bad");
+        assert!(
+            led.evaluate("reader").is_none(),
+            "a bare external read must build even under an unrelated failure"
+        );
     }
 
     /// Quoted physical reads (double-quote, backtick, and mixed) resolve to the
