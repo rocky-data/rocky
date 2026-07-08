@@ -1,11 +1,13 @@
 ---
 title: MCP Authoring
-description: "How rocky mcp exposes Rocky as a local, bring-your-own-key authoring substrate for an AI agent: typed tools, read-only previews, draft-only generators, and a human approval gate"
+description: "How rocky mcp exposes Rocky as a local, bring-your-own-key authoring substrate for an AI agent: typed tools, read-only previews, LLM generators, policy-gated write tools, and a human approval gate"
 sidebar:
   order: 9.4
 ---
 
 `rocky mcp` runs Rocky as a [Model Context Protocol](https://modelcontextprotocol.io) server: a set of typed tools that an MCP-capable agent (Claude Desktop, an IDE assistant, your own client) can call to author and evolve Rocky models against your real warehouse. It is the substrate that lets an agent do the inspect → sample → write SQL → compile → plan → propose loop with the same compiler and warehouse Rocky already uses, and stop at a human approval gate.
+
+For the loop itself — how an agent authors, checks, and proposes a change, and the gates that keep it honest — start with [Operating Rocky with Agents](/concepts/operating-rocky-with-agents/). This page is the tool-by-tool reference behind it.
 
 For the CLI-level `rocky ai` / `ai-sync` / `ai-explain` / `ai-test` commands (a separate, non-MCP surface), see [AI Commands](/reference/commands/ai/).
 
@@ -21,7 +23,7 @@ The agent is whatever client you connect; the model is whatever your key points 
 
 ## The tool families
 
-The tools fall into four families. The first two never call an LLM; the third does (under your key); the fourth orchestrates the others.
+The tools fall into five families. The verify/ground and preview families never call an LLM; the generators do (under your key); the write-path tools mutate the project tree behind the compiler and the policy plane; and the trajectories orchestrate the rest.
 
 ### Verify and ground (read-only, no LLM)
 
@@ -50,15 +52,28 @@ Both are strictly read-only. They let an agent (or you) see the governed and dri
 
 ### Generators (draft-only, your key)
 
-These call an LLM under your `ANTHROPIC_API_KEY` and **return drafts**. They never write to disk, never apply, and never touch the warehouse beyond the aggregate read they need to ground the draft.
+These call an LLM under your `ANTHROPIC_API_KEY` and **return drafts**. They never write to disk, never apply, and never touch the warehouse beyond the aggregate read they need to ground the draft. Their names carry the `ai_` prefix, mirroring the `rocky ai-*` CLI verbs.
 
 | Tool | What it drafts |
 |---|---|
-| `draft_contract` | A `.contract.toml` for a model, grounded in the **aggregate per-column profile** of its target table. |
-| `generate_tests` | SQL assertions (not-null, grain uniqueness, value-range) for a model. |
+| `ai_contract` | A `.contract.toml` for a model, grounded in the **aggregate per-column profile** of its target table. |
+| `ai_test` | SQL assertions (not-null, grain uniqueness, value-range) for a model. |
 | `explain_model` | A natural-language intent description for a model's SQL. |
+| `suggest_freshness_block` | A `[freshness]` block for a model with temporal columns. |
 
-The output is a proposal for a human (or the calling agent) to review and write, not an applied change. With no key set, each returns an empty result rather than failing, so the rest of the surface stays usable.
+The output is a proposal to review and write, not an applied change — hand it to the matching write-path tool below, or write it yourself. With no key set, each returns an empty result rather than failing, so the rest of the surface stays usable.
+
+### Write path (draft tools)
+
+These are the safe way for an agent to change the project. Each writes into the project's `models/` directory, **compiles in the same call** so you get the type-check with the write, and is gated by the [agent policy plane](#the-agent-policy-plane) — never the warehouse, never an applied change. They carry the `draft_` prefix.
+
+| Tool | What it writes |
+|---|---|
+| `draft_model` | `models/<name>.sql` + a sidecar carrying the intent. |
+| `draft_contract` | `models/<model>.contract.toml`, compile-validated against the model's inferred schema (a column the model doesn't produce comes back as a `W010` diagnostic). |
+| `draft_check` | one or more declarative `[[tests]]` blocks merged into the model's sidecar; run the `test` tool to execute them. |
+
+The split is deliberate: the `ai_*` generators *propose* content with an LLM; the `draft_*` tools *write* content (yours or a generator's) through the compiler and the policy plane. A `draft_*` call made without its content argument returns a structured error pointing you at the matching `ai_*` generator, so the two are never confused. The write tools don't grant new power — an agent in a coding harness can already write files — they channel that writing through immediate compile feedback and policy visibility, and they work in harnesses with no filesystem access.
 
 ### Prompt trajectories (orchestration, stop at the gate)
 
@@ -67,8 +82,8 @@ MCP *prompts* are pre-written multi-step trajectories that chain the tools above
 | Prompt | What it walks |
 |---|---|
 | `build_model` | inspect_schema → sample_rows → profile_column → compile → plan preview → propose. Stops at the human approval gate. |
-| `find_untested_models` | compile → identify untested models → `generate_tests` / `draft_contract` → propose. Stops at the gate. |
-| `add_tests_to_pks` | inspect_schema → identify key columns → `generate_tests` for uniqueness + not-null → propose. |
+| `find_untested_models` | compile → identify untested models → `ai_test` / `ai_contract` → `draft_check` / `draft_contract` → propose. Stops at the gate. |
+| `add_tests_to_pks` | inspect_schema → identify key columns → `draft_check` (uniqueness + not-null) → propose. |
 | `summarize_project` | A read-only project tour; proposes nothing — points at `find_untested_models` / `build_model` for next steps. |
 | `fix_failing_test` | Investigates a failing test and proposes a fix to review. |
 
@@ -89,11 +104,25 @@ A bare `rocky apply <plan_id>` on an unapproved AI-authored plan is rejected. Th
 
 The result is that no LLM output reaches the warehouse without two independent checks: the **compiler** (every proposed model is type-checked and contract-validated, exactly as in the [AI and Intent](/concepts/ai-intent/) compile-verify loop) and a **human** (every AI-authored plan needs an explicit `--approve`).
 
+## The agent policy plane
+
+The write-path tools are the first place a governed project can say *no* to an agent, before anything is even proposed. If your `rocky.toml` declares a `[policy]` block, every `draft_*` call is evaluated against it as a `propose`-class action for the model it touches:
+
+- **Allowed** (or no policy declared) — the draft is written and compiled, as above.
+- **Requires review** — the draft is written (it is the reviewable artifact) and the tool returns a `policy_review_required` error naming the rule, so the agent routes it to a human instead of taking it further.
+- **Denied** — the tool returns a `policy_denied` error and **the draft is rolled back**: a freshly written file is removed, and a re-draft over an existing model restores the model's prior content. A deny leaves nothing on disk. Every decision — allow, review, deny — is recorded in the audit ledger regardless.
+
+This is the same evaluator that gates `apply`, `promote`, and `propose`, so an agent authoring into a governed scope gets the verdict *with the write* rather than three steps later. See [Cross-team contracts](/concepts/cross-team-contracts/) for how `[policy]` rules are written.
+
+## Structured errors
+
+Every failing tool call comes back as a tool-result error whose content is a stable envelope — `{ code, message, remediation_hint, policy_rule? }` — not a prose blob. `code` is a machine-matchable class (`invalid_argument`, `model_not_found`, `compile_failed`, `policy_denied`, `policy_review_required`, …); `remediation_hint` is a concrete next action; `policy_rule` names the deciding rule on a policy verdict. It is the tool-layer analog of Rocky's diagnostic codes: an agent branches on the `code` and acts on the `remediation_hint` without scraping text. A clean compile that reports error *diagnostics* is **not** an error envelope — it is a successful result with `has_errors: true`, so "the tool failed" and "the code has a problem" stay distinguishable.
+
 ## Egress discipline
 
 The grounding and generator tools are deliberately constrained in what leaves your environment:
 
-- **`draft_contract` sends aggregate statistics only.** It profiles the target table and hands the LLM **counts and aggregate column statistics**, never raw cell values. The contract is drafted from the *shape* of the data (null rates, distinct counts, ranges), not its contents.
+- **`ai_contract` sends aggregate statistics only.** It profiles the target table and hands the LLM **counts and aggregate column statistics**, never raw cell values. The contract is drafted from the *shape* of the data (null rates, distinct counts, ranges), not its contents.
 - **`governance_preview` and `drift_preview` are read-only** and never call an LLM at all.
 - **The verify/ground tools never call an LLM** either. `sample_rows` and `profile_column` read your warehouse to inform the *agent*; whether any of that reaches an LLM is governed by the client you connect and the prompts you run, under your key.
 

@@ -7,4 +7,4 @@ frontier-model change, or a real regression, and the version pin is what lets a
 reader tell them apart.
 """
 
-HARNESS_VERSION = "0.3.0"
+HARNESS_VERSION = "0.4.0"

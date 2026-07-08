@@ -234,6 +234,15 @@ def _write_policy_denied_draft_project(project: Path) -> None:
     )
 
 
+def _write_policy_denied_contract_project(project: Path) -> None:
+    """A valid project (with the `orders` model) whose policy denies agent
+    authorship, so `draft_contract` for an existing model must return
+    ``policy_denied`` AND roll the contract back — no `.contract.toml` on disk.
+    """
+    _write_valid_project(project)
+    (project / "rocky.toml").write_text(_MINIMAL_CONFIG + _DENY_PROPOSE_POLICY)
+
+
 # --------------------------------------------------------------------------
 # cases
 # --------------------------------------------------------------------------
@@ -315,6 +324,40 @@ ENVELOPE_CASES: tuple[EnvelopeCase, ...] = (
         hint_contains_any=("Re-scope", "different"),
         # THE PIN: the denied draft is rolled back — no file left on disk.
         absent_after=("models/revenue_draft.sql", "models/revenue_draft.toml"),
+    ),
+    # A `draft_contract` call with no `spec` is a mis-dispatch to the generator:
+    # the redirect must point at `ai_contract` in one hop.
+    EnvelopeCase(
+        id="invalid_argument__draft_contract_no_spec_redirects",
+        setup=_write_valid_project,
+        tool="draft_contract",
+        arguments={"model": "orders"},
+        expected_code="invalid_argument",
+        hint_contains_all=("ai_contract",),
+        absent_after=("models/orders.contract.toml",),
+    ),
+    # A `draft_check` call with no `spec` redirects to `ai_test`.
+    EnvelopeCase(
+        id="invalid_argument__draft_check_no_spec_redirects",
+        setup=_write_valid_project,
+        tool="draft_check",
+        arguments={"model": "orders"},
+        expected_code="invalid_argument",
+        hint_contains_all=("ai_test",),
+    ),
+    # A policy-denied `draft_contract` for an existing model rolls back — no
+    # `.contract.toml` left on disk (the write-path deny mirrors `draft_model`).
+    EnvelopeCase(
+        id="policy_denied__draft_contract_denied_scope",
+        setup=_write_policy_denied_contract_project,
+        tool="draft_contract",
+        arguments={
+            "model": "orders",
+            "spec": '[[columns]]\nname = "id"\ntype = "Int64"\nnullable = true\n',
+        },
+        expected_code="policy_denied",
+        hint_contains_any=("Re-scope", "different"),
+        absent_after=("models/orders.contract.toml",),
     ),
 )
 

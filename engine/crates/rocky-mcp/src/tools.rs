@@ -199,7 +199,7 @@ pub struct SuggestFreshnessBlockArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct DraftContractArgs {
+pub struct AiContractArgs {
     /// The model to draft a `.contract.toml` for. Its target table must be
     /// materialized in the warehouse (run the model first) — the contract is
     /// grounded in the table's observed per-column profile.
@@ -207,9 +207,41 @@ pub struct DraftContractArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct GenerateTestsArgs {
+pub struct AiTestArgs {
     /// The model to draft test assertions for, from its intent + schema + SQL.
     pub model: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DraftContractArgs {
+    /// The model to write a contract for. Its `.sql` (or `.rocky`) source must
+    /// already exist under `models/` — the contract is written to the sibling
+    /// `models/<model>.contract.toml` that compile auto-discovers.
+    pub model: String,
+    /// The contract's `.contract.toml` body you authored, written verbatim.
+    /// Compile validates it against the model's inferred schema in the same call
+    /// (a column the model doesn't produce comes back as a `W010` diagnostic).
+    /// When omitted, the call is treated as a mis-dispatch to the generator and
+    /// returns an actionable error pointing at the `ai_contract` tool.
+    #[serde(default)]
+    pub spec: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DraftCheckArgs {
+    /// The model to write a check for. Its `.sql` (or `.rocky`) source must
+    /// already exist under `models/`; the check is merged into the model's
+    /// sidecar (`models/<model>.toml`).
+    pub model: String,
+    /// One or more declarative `[[tests]]` blocks you authored, appended to the
+    /// model's sidecar verbatim. Each block is a Rocky data-quality check
+    /// (`not_null`, `unique`, `accepted_values`, `relationships`, `expression`,
+    /// range, …). Compile proves the merged sidecar is structurally sound; the
+    /// check executes via the `test` tool. When omitted, the call is treated as
+    /// a mis-dispatch to the generator and returns an actionable error pointing
+    /// at the `ai_test` tool.
+    #[serde(default)]
+    pub spec: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -995,26 +1027,26 @@ impl RockyMcpServer {
     // or applies anything.
 
     #[tool(
-        description = "Draft a `.contract.toml` for a model from the aggregate per-column \
-         profile of its target table (the `rocky ai-contract` generator). An LLM proposes \
+        description = "GENERATE a `.contract.toml` for a model from the aggregate per-column \
+         profile of its target table with an LLM (the `rocky ai-contract` generator). Proposes \
          required/protected columns and per-column types; the draft is compile-verified against \
          the model's inferred schema before it is returned. Returns the contract TOML as a DRAFT \
-         — save it next to the model and run `compile` to enforce it; it mutates nothing. The \
-         model's target table must be materialized. Egress: only aggregate STATISTICS \
-         (row/null/distinct counts) are sent to the LLM — no raw cell values. Requires \
-         ANTHROPIC_API_KEY in the server environment — without it (or when the target isn't \
-         reachable), `contract_toml` is null and `message` explains why."
+         — hand it to `draft_contract` to write + policy-gate it, or save it next to the model and \
+         run `compile`; it mutates nothing itself. The model's target table must be materialized. \
+         Egress: only aggregate STATISTICS (row/null/distinct counts) are sent to the LLM — no raw \
+         cell values. Requires ANTHROPIC_API_KEY in the server environment — without it (or when \
+         the target isn't reachable), `contract_toml` is null and `message` explains why."
     )]
-    async fn draft_contract(
+    async fn ai_contract(
         &self,
-        params: Parameters<DraftContractArgs>,
-    ) -> ToolResult<DraftContractResult> {
+        params: Parameters<AiContractArgs>,
+    ) -> ToolResult<AiContractResult> {
         let model_name = params.0.model;
 
         let client = match self.make_ai_client() {
             Ok(Some(c)) => c,
             Ok(None) => {
-                return Ok(Json(DraftContractResult {
+                return Ok(Json(AiContractResult {
                     model: model_name,
                     message: Some(format!(
                         "{} not set in the server environment",
@@ -1045,7 +1077,7 @@ impl RockyMcpServer {
         {
             Ok(p) => p,
             Err(e) => {
-                return Ok(Json(DraftContractResult {
+                return Ok(Json(AiContractResult {
                     model: model_name,
                     message: Some(format!("could not profile the target table: {e:#}")),
                     ..Default::default()
@@ -1057,7 +1089,7 @@ impl RockyMcpServer {
             .await
             .map_err(|e| ToolError::ai_error(format!("contract draft failed: {e}")))?;
 
-        Ok(Json(DraftContractResult {
+        Ok(Json(AiContractResult {
             model: model_name,
             contract_toml: Some(drafted.toml),
             attempts: Some(drafted.attempts),
@@ -1066,24 +1098,21 @@ impl RockyMcpServer {
     }
 
     #[tool(
-        description = "Draft test assertions for a model from its intent, schema, and SQL (the \
-         `rocky ai-test` generator). An LLM proposes SQL assertions that each return 0 rows when \
-         the invariant holds (not-null, grain uniqueness, value ranges, referential integrity). \
-         Returns the assertions as DRAFTS — write each into the project's `tests/` directory \
-         (`<model>_<name>.sql`) and run them via the `test` tool; it mutates nothing. Requires \
-         ANTHROPIC_API_KEY in the server environment — without it, `assertions` is empty and \
-         `message` explains why."
+        description = "GENERATE test assertions for a model from its intent, schema, and SQL with \
+         an LLM (the `rocky ai-test` generator). Proposes SQL assertions that each return 0 rows \
+         when the invariant holds (not-null, grain uniqueness, value ranges, referential \
+         integrity). Returns the assertions as DRAFTS — encode them as declarative `[[tests]]` \
+         checks (or hand them to `draft_check` to write + policy-gate) and run them via the `test` \
+         tool; it mutates nothing itself. Requires ANTHROPIC_API_KEY in the server environment — \
+         without it, `assertions` is empty and `message` explains why."
     )]
-    async fn generate_tests(
-        &self,
-        params: Parameters<GenerateTestsArgs>,
-    ) -> ToolResult<GenerateTestsResult> {
+    async fn ai_test(&self, params: Parameters<AiTestArgs>) -> ToolResult<AiTestResult> {
         let model_name = params.0.model;
 
         let client = match self.make_ai_client() {
             Ok(Some(c)) => c,
             Ok(None) => {
-                return Ok(Json(GenerateTestsResult {
+                return Ok(Json(AiTestResult {
                     model: model_name,
                     message: Some(format!(
                         "{} not set in the server environment",
@@ -1109,7 +1138,7 @@ impl RockyMcpServer {
             })
             .collect();
 
-        Ok(Json(GenerateTestsResult {
+        Ok(Json(AiTestResult {
             model: model_name,
             assertions,
             message: None,
@@ -1185,7 +1214,7 @@ impl RockyMcpServer {
 
     /// Compile the project and resolve `model_name` to its loaded
     /// [`Model`](rocky_core::models::Model). The generators that read source +
-    /// intent (`generate_tests`, `explain_model`) need both the compile result
+    /// intent (`ai_test`, `explain_model`) need both the compile result
     /// and the owned model.
     fn compile_and_find_model(
         &self,
@@ -1205,7 +1234,7 @@ impl RockyMcpServer {
     }
 
     /// Profile each column of a model's target table into a
-    /// [`TableProfile`](rocky_ai::contract::TableProfile) for `draft_contract`.
+    /// [`TableProfile`](rocky_ai::contract::TableProfile) for `ai_contract`.
     ///
     /// Reuses the grounding path (`prepare_table_query` + `query_grounding`), so
     /// it works on any configured warehouse, not just DuckDB.
@@ -1724,11 +1753,12 @@ impl RockyMcpServer {
 
         let sql_path = self.models_dir.join(format!("{stem}.sql"));
         let sidecar_path = self.models_dir.join(format!("{stem}.toml"));
+        let contract_path = self.models_dir.join(format!("{stem}.contract.toml"));
 
         // Symlink defense-in-depth: if a target already exists, confirm it
         // resolves under the (canonicalized) models directory before we write
         // through it. A not-yet-existing path passed the syntactic check above.
-        for p in [&sql_path, &sidecar_path] {
+        for p in [&sql_path, &sidecar_path, &contract_path] {
             if p.exists() {
                 let base = self.models_dir.canonicalize().map_err(|e| {
                     bad(format!("failed to canonicalize the models directory: {e}"))
@@ -1749,7 +1779,63 @@ impl RockyMcpServer {
             stem: stem.to_string(),
             sql_path,
             sidecar_path,
+            contract_path,
         })
+    }
+
+    /// Whether the model `stem` already has a source file under `models/`
+    /// (`.sql` or `.rocky`). The write-path contract/check tools refuse to write
+    /// a sidecar artifact for a model that does not exist — author the model
+    /// first with `draft_model`.
+    fn model_source_exists(&self, stem: &str) -> bool {
+        self.models_dir.join(format!("{stem}.sql")).exists()
+            || self.models_dir.join(format!("{stem}.rocky")).exists()
+    }
+
+    /// Consult the agent-policy plane for a `propose`-class authorship of `stem`,
+    /// scoped to a stable `decision_id`. Mirrors the gate `draft_model` and the
+    /// `propose` tool share (`evaluate_apply_policy`) so a write into a governed
+    /// scope gets a structured verdict WITH the write. Absent a `[policy]` block
+    /// this resolves to `NotConfigured` and behaviour is unchanged.
+    fn evaluate_draft_policy(
+        &self,
+        stem: &str,
+        decision_id: &str,
+    ) -> rocky_cli::commands::PolicyGate {
+        let touched: std::collections::BTreeMap<String, rocky_core::config::PolicyCapability> =
+            std::iter::once((
+                stem.to_string(),
+                rocky_core::config::PolicyCapability::Propose,
+            ))
+            .collect();
+        rocky_cli::commands::evaluate_apply_policy(
+            &self.config_path,
+            decision_id,
+            rocky_core::config::PolicyPrincipal::Agent,
+            &touched,
+            &self.models_dir,
+            &self.state_path(),
+        )
+    }
+
+    /// Compile the project scoped to `stem` and reduce it to the lite
+    /// [`CompileResult`] the draft tools return inline. Shared by `draft_model`,
+    /// `draft_contract`, and `draft_check` — the "compile with the write" step.
+    fn compile_drafted(&self, stem: &str) -> Result<CompileResult, Json<ToolError>> {
+        let with_seed = self.seed_file().is_some();
+        let output = commands::compile_output(
+            Some(&self.config_path),
+            &self.state_path(),
+            &self.models_dir,
+            None,
+            Some(stem),
+            false,
+            None,
+            with_seed,
+            None,
+        )
+        .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
+        Ok(project_compile_result(&output))
     }
 
     #[tool(
@@ -1916,6 +2002,250 @@ impl RockyMcpServer {
                     ),
                     "Re-scope the draft — author it under a different, ungoverned name, or drop \
                      it. A denied authorship cannot be applied even after review."
+                        .to_string(),
+                    rule_id.map(|r| r.to_string()),
+                ))
+            }
+        }
+    }
+
+    #[tool(
+        description = "Write an agent-authored data CONTRACT for an existing model into the \
+         project working tree and compile-validate it in the SAME call — the safe write path for \
+         a contract. Writes your `spec` verbatim to models/<model>.contract.toml (the sibling \
+         compile auto-discovers), then compiles so the contract is checked against the model's \
+         inferred schema and returns the diagnostics (a column the model doesn't produce comes \
+         back as a `W010` diagnostic). It does NOT run, apply, or touch the warehouse. Path-gated \
+         to the models directory and policy-aware: authoring into a governed scope returns a \
+         structured policy_denied / policy_review_required error, and a denied draft leaves no \
+         file. Omit `spec` and this returns an error pointing you at `ai_contract`, the LLM \
+         generator that drafts a contract for you to pass here."
+    )]
+    async fn draft_contract(
+        &self,
+        params: Parameters<DraftContractArgs>,
+    ) -> ToolResult<DraftContractResult> {
+        let args = params.0;
+        // Redirect a mis-dispatch: a call with no `spec` is someone expecting the
+        // old generator. Point them at `ai_contract` in a single, actionable hop.
+        let Some(spec) = args.spec else {
+            return Err(ToolError::invalid_argument(
+                "draft_contract writes an agent-authored contract; its `spec` (the \
+                 `.contract.toml` body) is required and was not provided",
+                "This is the write path: pass `spec` with the contract you authored and it is \
+                 written + compile-validated + policy-gated. To GENERATE a contract from the \
+                 target table's profile with an LLM, call the `ai_contract` tool instead.",
+            ));
+        };
+        let paths = self.resolve_draft_paths(&args.model)?;
+        if !self.model_source_exists(&paths.stem) {
+            return Err(ToolError::model_not_found(&paths.stem));
+        }
+
+        // Snapshot so a policy DENY (or a write/compile failure) rolls back to
+        // leave NO new artifact — mirrors `draft_model` and the propose gate.
+        let prior = std::fs::read(&paths.contract_path).ok();
+        let rollback = || restore_or_remove(&paths.contract_path, prior.as_deref());
+
+        if let Err(e) = std::fs::write(&paths.contract_path, ensure_trailing_newline(&spec)) {
+            rollback();
+            return Err(ToolError::internal(
+                format!(
+                    "failed to write draft contract to {}: {e}",
+                    paths.contract_path.display()
+                ),
+                "Ensure the models directory is writable.",
+            ));
+        }
+
+        // Compile with the write — the contract is validated against the model's
+        // inferred schema. A hard compile failure rolls the draft back.
+        let compiled = match self.compile_drafted(&paths.stem) {
+            Ok(c) => c,
+            Err(e) => {
+                rollback();
+                return Err(e);
+            }
+        };
+
+        let decision_id = format!("draft-contract:{}", paths.stem);
+        match self.evaluate_draft_policy(&paths.stem, &decision_id) {
+            rocky_cli::commands::PolicyGate::NotConfigured
+            | rocky_cli::commands::PolicyGate::Allow => Ok(Json(DraftContractResult {
+                model: paths.stem.clone(),
+                contract_path: rel_display(&self.root, &paths.contract_path),
+                has_errors: compiled.has_errors,
+                error_count: compiled.error_count,
+                warning_count: compiled.warning_count,
+                diagnostics: compiled.diagnostics,
+                next_steps: DRAFT_CONTRACT_NEXT_STEPS.to_string(),
+            })),
+            rocky_cli::commands::PolicyGate::RequireReview {
+                model,
+                rule_id,
+                reason,
+            } => {
+                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                Err(ToolError::policy_review_required(
+                    format!(
+                        "policy requires human review before authoring a contract in this scope: \
+                         model '{model}'{named} — {reason}. The contract was written to {} for a \
+                         human to review.",
+                        rel_display(&self.root, &paths.contract_path)
+                    ),
+                    "A human must review this contract before it goes further; do not plan, \
+                     propose, or apply it in this governed scope on your own."
+                        .to_string(),
+                    rule_id.map(|r| r.to_string()),
+                ))
+            }
+            rocky_cli::commands::PolicyGate::Deny {
+                model,
+                rule_id,
+                reason,
+            } => {
+                rollback();
+                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                Err(ToolError::policy_denied(
+                    format!(
+                        "policy denies authoring a contract for this model: '{model}'{named} — \
+                         {reason}. A deny cannot be satisfied by human review, so the contract was \
+                         not kept."
+                    ),
+                    "Re-scope — write the contract for a different, ungoverned model, or drop it. \
+                     A denied authorship cannot be applied even after review."
+                        .to_string(),
+                    rule_id.map(|r| r.to_string()),
+                ))
+            }
+        }
+    }
+
+    #[tool(
+        description = "Write an agent-authored data-quality CHECK for an existing model into the \
+         project working tree and compile-validate it in the SAME call — the safe write path for \
+         a check. Appends your `spec` (one or more declarative `[[tests]]` blocks — not_null, \
+         unique, accepted_values, relationships, expression, range, …) to the model's sidecar \
+         (models/<model>.toml), then compiles so a malformed block fails structurally and returns \
+         the diagnostics. The check EXECUTES via the `test` tool (compile proves structure; the \
+         data-level assertion runs under `test`). It does NOT run, apply, or touch the warehouse. \
+         Path-gated to the models directory and policy-aware: a governed scope returns a \
+         structured policy_denied / policy_review_required error, and a denied draft restores the \
+         prior sidecar. Omit `spec` and this returns an error pointing you at `ai_test`, the LLM \
+         generator that drafts assertions for you to pass here."
+    )]
+    async fn draft_check(
+        &self,
+        params: Parameters<DraftCheckArgs>,
+    ) -> ToolResult<DraftCheckResult> {
+        let args = params.0;
+        let Some(spec) = args.spec else {
+            return Err(ToolError::invalid_argument(
+                "draft_check writes an agent-authored check; its `spec` (one or more `[[tests]]` \
+                 blocks) is required and was not provided",
+                "This is the write path: pass `spec` with the `[[tests]]` check you authored and \
+                 it is written + compile-validated + policy-gated. To GENERATE assertions from a \
+                 model's intent and schema with an LLM, call the `ai_test` tool instead.",
+            ));
+        };
+        // Guard against a spec that would attach to the sidecar's last table
+        // (e.g. `[target]`) and corrupt it — a check is a `[[tests]]` block.
+        if !spec.contains("[[tests]]") {
+            return Err(ToolError::invalid_argument(
+                "draft_check `spec` must contain one or more `[[tests]]` blocks",
+                "Author the check as a declarative `[[tests]]` block, e.g.\n[[tests]]\ntype = \
+                 \"not_null\"\ncolumn = \"id\"\nThen pass it as `spec`.",
+            ));
+        }
+        let paths = self.resolve_draft_paths(&args.model)?;
+        if !self.model_source_exists(&paths.stem) {
+            return Err(ToolError::model_not_found(&paths.stem));
+        }
+
+        // Snapshot the sidecar so a DENY restores the model's PRIOR sidecar (the
+        // name/intent draft_model wrote), never deletes it — the check is what
+        // rolls back, not the model. A model with no sidecar yet snapshots None.
+        let prior = std::fs::read(&paths.sidecar_path).ok();
+        let rollback = || restore_or_remove(&paths.sidecar_path, prior.as_deref());
+
+        // Merge: append the `[[tests]]` block(s) to the existing sidecar, or seed
+        // a minimal sidecar (`name = "<stem>"`) when the model is a bare `.sql`.
+        let merged = match &prior {
+            Some(bytes) => {
+                let prior_text = String::from_utf8_lossy(bytes);
+                format!(
+                    "{}\n\n{}",
+                    prior_text.trim_end(),
+                    spec.trim_start_matches('\n')
+                )
+            }
+            None => format!("name = {}\n\n{}", toml_basic_string(&paths.stem), spec),
+        };
+        if let Err(e) = std::fs::write(&paths.sidecar_path, ensure_trailing_newline(&merged)) {
+            rollback();
+            return Err(ToolError::internal(
+                format!(
+                    "failed to write draft check to {}: {e}",
+                    paths.sidecar_path.display()
+                ),
+                "Ensure the models directory is writable.",
+            ));
+        }
+
+        let compiled = match self.compile_drafted(&paths.stem) {
+            Ok(c) => c,
+            Err(e) => {
+                rollback();
+                return Err(e);
+            }
+        };
+
+        let decision_id = format!("draft-check:{}", paths.stem);
+        match self.evaluate_draft_policy(&paths.stem, &decision_id) {
+            rocky_cli::commands::PolicyGate::NotConfigured
+            | rocky_cli::commands::PolicyGate::Allow => Ok(Json(DraftCheckResult {
+                model: paths.stem.clone(),
+                sidecar_path: rel_display(&self.root, &paths.sidecar_path),
+                has_errors: compiled.has_errors,
+                error_count: compiled.error_count,
+                warning_count: compiled.warning_count,
+                diagnostics: compiled.diagnostics,
+                next_steps: DRAFT_CHECK_NEXT_STEPS.to_string(),
+            })),
+            rocky_cli::commands::PolicyGate::RequireReview {
+                model,
+                rule_id,
+                reason,
+            } => {
+                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                Err(ToolError::policy_review_required(
+                    format!(
+                        "policy requires human review before authoring a check in this scope: \
+                         model '{model}'{named} — {reason}. The check was written to {} for a \
+                         human to review.",
+                        rel_display(&self.root, &paths.sidecar_path)
+                    ),
+                    "A human must review this check before it goes further; do not plan, propose, \
+                     or apply it in this governed scope on your own."
+                        .to_string(),
+                    rule_id.map(|r| r.to_string()),
+                ))
+            }
+            rocky_cli::commands::PolicyGate::Deny {
+                model,
+                rule_id,
+                reason,
+            } => {
+                rollback();
+                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                Err(ToolError::policy_denied(
+                    format!(
+                        "policy denies authoring a check for this model: '{model}'{named} — \
+                         {reason}. A deny cannot be satisfied by human review, so the check was \
+                         not kept (the model's prior sidecar is restored)."
+                    ),
+                    "Re-scope — write the check for a different, ungoverned model, or drop it. A \
+                     denied authorship cannot be applied even after review."
                         .to_string(),
                     rule_id.map(|r| r.to_string()),
                 ))
@@ -2212,8 +2542,8 @@ impl RockyMcpServer {
     #[prompt(
         name = "find_untested_models",
         description = "Find models with no declarative tests and draft tests for them: catalog \
-         -> identify untested models -> generate_tests / draft_contract -> propose. Stops at the \
-         human approval gate."
+         -> identify untested models -> ai_test / ai_contract -> draft_check / draft_contract -> \
+         propose. Stops at the human approval gate."
     )]
     async fn find_untested_models(
         &self,
@@ -2240,13 +2570,16 @@ impl RockyMcpServer {
                  values, and profile_column on any key, status, or amount column to learn its null \
                  rate, distinct count, and domain. The schema says a column exists; only the data \
                  tells you whether it is unique, non-null, or bounded.\n\
-                 3. generate_tests — draft SQL assertions (not-null, grain uniqueness, value \
-                 ranges, referential integrity) from what you observed. For invariants better \
-                 expressed as required/protected columns, draft_contract instead. Both return \
-                 DRAFTS — write each assertion into the project's tests/ directory and the \
-                 contract next to its model.\n\
-                 4. compile — type-check after writing, and run the new tests via the `test` tool. \
-                 Fix against any diagnostic and re-run until clean.\n\
+                 3. Draft the checks. For a data-quality assertion (not-null, grain uniqueness, \
+                 value ranges, referential integrity), call ai_test to have an LLM draft it from \
+                 what you observed, then write it with draft_check — it appends the `[[tests]]` \
+                 block to the model and compiles in the same call. For invariants better expressed \
+                 as required/protected columns, call ai_contract to draft the contract, then write \
+                 it with draft_contract. Both write tools compile-validate and policy-gate the \
+                 write; you can also author the check/contract yourself and pass it straight to \
+                 the write tool.\n\
+                 4. compile — the write tools already type-check; run the new checks via the \
+                 `test` tool. Fix against any diagnostic and re-run until clean.\n\
                  5. propose — generate the plan that records the new tests/contracts. It is an \
                  AI-authored plan with a plan_id.\n\n\
                  RECONCILE DISCIPLINE: a test that asserts the wrong invariant passes and is still \
@@ -2271,7 +2604,7 @@ impl RockyMcpServer {
     #[prompt(
         name = "add_tests_to_pks",
         description = "Add uniqueness + not-null tests to a model's primary-key / unique columns: \
-         inspect_schema -> identify key columns -> generate_tests for uniqueness + not-null -> \
+         inspect_schema -> identify key columns -> ai_test / author the checks -> draft_check -> \
          propose. Stops at the human approval gate."
     )]
     async fn add_tests_to_pks(
@@ -2302,11 +2635,12 @@ impl RockyMcpServer {
                      unique (distinct count == row count) and non-null before you assert it. A \
                      column named `id` that has duplicates or nulls is not a key, and a test that \
                      claims it is will fail on the next run — find that out now, from the data.\n\
-                     3. generate_tests — draft a uniqueness assertion and a not-null assertion for \
-                     each confirmed key column (each returns 0 rows when the invariant holds). \
-                     These are DRAFTS — write each into the project's tests/ directory as \
-                     `<model>_<name>.sql`.\n\
-                     4. compile, then run the new tests via the `test` tool. Loop until clean.\n\
+                     3. Draft a uniqueness check and a not-null check for each confirmed key \
+                     column (each `[[tests]]` block passes when the invariant holds). Author them \
+                     directly, or call ai_test to draft them, then write them with draft_check — \
+                     it merges the `[[tests]]` blocks into the model and compiles in the same \
+                     call, policy-gated.\n\
+                     4. run the new checks via the `test` tool. Loop until clean.\n\
                      5. propose — generate the plan recording the new tests. It is an AI-authored \
                      plan with a plan_id.\n\n\
                      RECONCILE DISCIPLINE: only assert uniqueness/not-null on columns the profile \
@@ -2538,12 +2872,12 @@ fn commands_adapter_registry(
     rocky_cli::registry::AdapterRegistry::from_config(cfg)
 }
 
-/// Build the per-column **statistics** query for `draft_contract`'s profiler.
+/// Build the per-column **statistics** query for `ai_contract`'s profiler.
 ///
 /// Aggregate counts only — `COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`.
 /// Deliberately selects no `MIN`/`MAX` and issues no domain query, so no raw
 /// cell value can reach the LLM prompt (the egress contract the MCP
-/// `draft_contract` tool upholds — see `profile_table_columns`). `table_ref`
+/// `ai_contract` tool upholds — see `profile_table_columns`). `table_ref`
 /// and `col` are already validated by the caller.
 fn column_stats_sql(table_ref: &str, col: &str) -> String {
     format!(
@@ -2876,6 +3210,22 @@ const DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or 
      to record an AI-authored plan for a human to `rocky review <plan_id> --approve` and \
      `rocky apply`. Never apply a draft directly.";
 
+/// The authoring-loop reminder every successful `draft_contract` response
+/// carries. The contract is written and compile-validated, never applied.
+const DRAFT_CONTRACT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched \
+     the warehouse. The contract is written and compile-validated against the model's schema \
+     (read any `W010`-class diagnostic above and re-draft to fix a column mismatch). When it is \
+     clean, `propose` to record an AI-authored plan for a human to `rocky review <plan_id> \
+     --approve` and `rocky apply`. Never apply a draft directly.";
+
+/// The authoring-loop reminder every successful `draft_check` response carries.
+/// The check is written and structurally compiled, then executed via `test`.
+const DRAFT_CHECK_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched the \
+     warehouse. The check is merged into the model's sidecar and the project compiles; run the \
+     `test` tool to EXECUTE the check against the data and confirm it passes. When it is clean, \
+     `propose` to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
+     and `rocky apply`. Never apply a draft directly.";
+
 /// The validated on-disk targets a draft writes to.
 struct DraftPaths {
     /// The model name (bare file stem).
@@ -2884,6 +3234,8 @@ struct DraftPaths {
     sql_path: PathBuf,
     /// Absolute path of `models/<stem>.toml`.
     sidecar_path: PathBuf,
+    /// Absolute path of `models/<stem>.contract.toml`.
+    contract_path: PathBuf,
 }
 
 /// Restore `path` to its snapshotted `prior` bytes, or remove it when it had no
@@ -3024,7 +3376,7 @@ mod tests {
         );
     }
 
-    /// Egress contract: the `draft_contract` profiler issues STATISTICS only —
+    /// Egress contract: the `ai_contract` profiler issues STATISTICS only —
     /// it must never select raw cell values (`MIN`/`MAX`) nor a domain sample,
     /// matching the default of the `rocky ai-contract` generator it wraps.
     #[test]
