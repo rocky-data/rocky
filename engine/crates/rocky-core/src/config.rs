@@ -937,6 +937,20 @@ pub struct ResilienceConfig {
     /// then the only bound); `Some(0)` forbids all retries.
     #[serde(default = "default_resilience_max_retries_per_run")]
     pub max_retries_per_run: Option<u32>,
+    /// Continue disjoint subgraphs when a model fails, instead of aborting the
+    /// whole run at the first failure. Default `false` (fail-fast — the run
+    /// stops at the first failing model, exactly as before this knob existed).
+    ///
+    /// When `true`, a failed model and its downstream closure are *withheld*
+    /// (never built on the failure's stale/missing output), while unrelated
+    /// subtrees still materialize; the run reports `PartialFailure` with a
+    /// containment manifest naming what failed and its blast radius. This
+    /// changes no data semantics — everything withheld is already withheld by
+    /// today's fail-fast run; it only *narrows* the withholding to the actual
+    /// blast radius. The closure is conservative (computed from the resolved
+    /// dependency graph, contain-more on any doubt).
+    #[serde(default = "default_contain_failures")]
+    pub contain_failures: bool,
 }
 
 impl ResilienceConfig {
@@ -969,6 +983,7 @@ impl Default for ResilienceConfig {
             jitter: default_jitter(),
             circuit_breaker_threshold: default_resilience_breaker_threshold(),
             max_retries_per_run: default_resilience_max_retries_per_run(),
+            contain_failures: default_contain_failures(),
         }
     }
 }
@@ -990,6 +1005,9 @@ fn default_resilience_breaker_threshold() -> u32 {
 }
 fn default_resilience_max_retries_per_run() -> Option<u32> {
     Some(8)
+}
+fn default_contain_failures() -> bool {
+    false
 }
 
 /// Schema pattern configuration from TOML, converted to [`SchemaPattern`] at runtime.

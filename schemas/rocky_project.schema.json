@@ -3015,6 +3015,11 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "contain_failures": {
+          "default": false,
+          "description": "Continue disjoint subgraphs when a model fails, instead of aborting the whole run at the first failure. Default `false` (fail-fast — the run stops at the first failing model, exactly as before this knob existed).\n\nWhen `true`, a failed model and its downstream closure are *withheld* (never built on the failure's stale/missing output), while unrelated subtrees still materialize; the run reports `PartialFailure` with a containment manifest naming what failed and its blast radius. This changes no data semantics — everything withheld is already withheld by today's fail-fast run; it only *narrows* the withholding to the actual blast radius. The closure is conservative (computed from the resolved dependency graph, contain-more on any doubt).",
+          "type": "boolean"
+        },
         "enabled": {
           "default": true,
           "description": "Master switch for run-loop classified retry. Default `true`. When `false`, every model is attempted exactly once (no classification, no backoff) — the behaviour before this layer existed.",
@@ -4247,6 +4252,7 @@
       "default": {
         "backoff_multiplier": 2.0,
         "circuit_breaker_threshold": 3,
+        "contain_failures": false,
         "enabled": true,
         "initial_backoff_ms": 500,
         "jitter": true,

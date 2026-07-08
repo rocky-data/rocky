@@ -148,6 +148,25 @@ The dispatched adapter classifies its own failures:
 
 ---
 
+## Failure containment across the model graph
+
+By default a transformation run **fails fast**: the first model that fails stops the run, and models not yet built are skipped. Opt into *containment* to continue disjoint work instead:
+
+```toml
+[resilience]
+contain_failures = true   # default: false
+```
+
+With containment on, a failed model and its **downstream closure** are withheld while unrelated subtrees still materialize. The run reports `PartialFailure`, listing the withheld models on `RunOutput.contained[*]` (each naming what blocked it, with an unblock hint) and the failure causes on `RunOutput.errors[*]`. For a partitioned (`time_interval`) model, a failed partition withholds the model's downstream while its healthy partitions still land.
+
+**Guarantee scope.** Containment is *guaranteed* for dependencies declared via `ref()` and for physical reads Rocky can statically resolve — `schema.table`, `catalog.schema.table`, quoted or unquoted. Those are folded into both the withholding closure and the execution ordering, so a downstream of a failure is never built on its stale or missing output, and under `--parallel` a reader is scheduled strictly after every producer it reads.
+
+Reads Rocky **cannot enumerate** — a model built on a CTE, sub-query, or set operation — are handled on a **best-effort** basis identical to a normal fail-fast run. Such a model is still contained when it has a *known* failed upstream, but because its reads can't be resolved into an ordering edge, under `--parallel` a same-layer reader of a failing producer can materialize on stale data — exactly as a fail-fast run does in that case. This is a documented boundary, not a regression: containment never materializes anything a fail-fast run wouldn't. **Declare the dependency with `ref()` for a hard containment guarantee.**
+
+Default is off; the fail-fast behavior described in the sections above is unchanged unless you set `contain_failures = true`.
+
+---
+
 ## 6. State store failures
 
 **Definition.** Rocky's embedded state store (redb at `<models>/.rocky-state.redb` by default) holds watermarks, run history, branch state, and partition progress. Failures here either prevent a run from starting (lock contention, corruption) or quietly degrade an incremental run to an unintended full refresh (missing watermark).

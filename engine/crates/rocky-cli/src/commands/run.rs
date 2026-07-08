@@ -211,20 +211,30 @@ pub(crate) fn run_status_exit_result(output: &RunOutput, run_id: &str) -> Result
 /// `RunOutput::new` default of `success`). A clean run still derives
 /// `Success`; a copy-only failure behaves exactly as before.
 fn merge_replication_compile_and_copy_errors(output: &mut RunOutput, table_errors: &[TableError]) {
-    output
-        .errors
-        .retain(|e| e.failure_kind == crate::output::FailureKind::CompileError);
-    // Count distinct compile-failed models from the retained entries rather
-    // than inferring from `tables_failed`: the compile path records one
-    // `errors` entry per diagnostic but bumps `tables_failed` once per model,
-    // so count distinct asset_keys, not raw entries.
-    let compile_failed_count = output
+    // Retain `execute_models`' own records: compile failures (`CompileError`)
+    // and, when `[resilience] contain_failures` is on, contained-cause runtime
+    // failures (`Unknown` — the anyhow-erased bucket `record_contained_cause`
+    // uses). Copy failures arrive separately in `table_errors` and are appended
+    // below, so widening the retain never double-counts them. Byte-identical on
+    // the default fail-fast path: `execute_models` returns `Err` there, so no
+    // `Unknown` entry is ever present on `output.errors` before this merge.
+    output.errors.retain(|e| {
+        matches!(
+            e.failure_kind,
+            crate::output::FailureKind::CompileError | crate::output::FailureKind::Unknown
+        )
+    });
+    // Count distinct failed models from the retained entries rather than
+    // inferring from `tables_failed`: the compile path records one `errors`
+    // entry per diagnostic but bumps `tables_failed` once per model, so count
+    // distinct asset_keys, not raw entries.
+    let recorded_failed_count = output
         .errors
         .iter()
         .map(|e| e.asset_key.as_slice())
         .collect::<std::collections::BTreeSet<_>>()
         .len();
-    output.tables_failed = compile_failed_count + table_errors.len();
+    output.tables_failed = recorded_failed_count + table_errors.len();
     output
         .errors
         .extend(table_errors.iter().map(|e| TableErrorOutput {
@@ -4614,6 +4624,31 @@ fn apply_defer_rewrite(
     Ok(())
 }
 
+/// Record a model's runtime failure as a *contained cause*: bump the failure
+/// tally, push an `errors[]` entry keyed by the model, and poison the model in
+/// the containment ledger so its downstream closure is withheld.
+///
+/// Used only on the `[resilience] contain_failures` path — the fail-fast
+/// default returns `Err` from `execute_models` instead of continuing. The
+/// `errors[]` entry carries [`crate::output::FailureKind::Unknown`], the enum's
+/// own bucket for an `anyhow`-erased runtime error reaching this layer; the
+/// replication-path error merge retains it alongside compile failures.
+fn record_contained_cause(
+    output: &mut RunOutput,
+    containment: &mut super::containment::ContainmentLedger,
+    model_name: &str,
+    err: &anyhow::Error,
+) {
+    output.tables_failed += 1;
+    output.errors.push(crate::output::TableErrorOutput {
+        asset_key: vec![model_name.to_string()],
+        error: format!("{err:#}"),
+        failure_kind: crate::output::FailureKind::Unknown,
+        cooldown_seconds: None,
+    });
+    containment.poison(model_name);
+}
+
 #[tracing::instrument(skip_all, name = "execute_models")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_models(
@@ -4946,7 +4981,121 @@ pub(crate) async fn execute_models(
     // model exactly as before (no extra state reads / warehouse queries).
     let mut gate = super::skip_gate::SkipGate::new(skip_gate, &compile_result.project);
 
-    for layer in &compile_result.project.layers {
+    // Failure-containment ledger (opt-in via `[resilience] contain_failures`).
+    // Tracks the downstream closure of every failed / withheld model so a
+    // disjoint subgraph can continue while a failure's blast radius is withheld.
+    // The closure does NOT trust the declared graph (`dag_nodes`) as complete:
+    // it also folds physical-target reads (a raw-SQL model reading a producer's
+    // table by physical name, not by `ref()`) into the closure, and fails closed
+    // on any model whose reads can't be proven disjoint from the failure set —
+    // see `commands::containment`. Seeded with the compile-failed models
+    // excluded above (a compile error is a failure; its downstream is withheld).
+    //
+    // Built only when `contain_failures` is on (extracting each model's reads
+    // has a cost); when off the ledger stays empty and unconsulted, and the run
+    // keeps its historical fail-fast-at-first-failure behaviour byte-for-byte.
+    let mut containment = super::containment::ContainmentLedger::new();
+    if resilience.contain_failures {
+        let producers = super::containment::ProducerIndex::build(
+            compile_result.project.models.iter().map(|m| {
+                (
+                    m.config.name.as_str(),
+                    m.config.target.catalog.as_str(),
+                    m.config.target.schema.as_str(),
+                    m.config.target.table.as_str(),
+                )
+            }),
+        );
+        let model_names: std::collections::HashSet<String> = compile_result
+            .project
+            .models
+            .iter()
+            .map(|m| m.config.name.clone())
+            .collect();
+        let dep_by_model: std::collections::HashMap<&str, &[String]> = compile_result
+            .project
+            .dag_nodes
+            .iter()
+            .map(|n| (n.name.as_str(), n.depends_on.as_slice()))
+            .collect();
+        for model in &compile_result.project.models {
+            let name = model.config.name.as_str();
+            let ref_deps = dep_by_model.get(name).copied().unwrap_or(&[]);
+            // Enumerate physical reads only when the read set is provably
+            // complete; otherwise the model fails closed (`reads_complete =
+            // false`), so it is withheld once a failure has occurred.
+            let (reads, reads_complete): (Vec<String>, bool) =
+                if rocky_sql::lineage_complete::lineage_is_provably_complete(&model.sql) {
+                    match rocky_sql::lineage::extract_lineage(&model.sql) {
+                        Ok(l) => (
+                            l.source_tables
+                                .iter()
+                                .map(|t| t.name.to_lowercase())
+                                .collect(),
+                            true,
+                        ),
+                        // Provably-complete said yes but extraction failed — fail
+                        // closed rather than trust an empty read set.
+                        Err(_) => (Vec::new(), false),
+                    }
+                } else {
+                    (Vec::new(), false)
+                };
+            containment.add_model(
+                name,
+                ref_deps,
+                &model_names,
+                &reads,
+                reads_complete,
+                &producers,
+            );
+        }
+        containment.seed_failed(compile_failed_models.iter().cloned());
+    }
+
+    // When containment is on, execution follows layers recomputed over the FULL
+    // containment edge set (ref ∪ physical ∪ bare), so a physical/bare reader is
+    // scheduled strictly after its producer — closing the same-layer `--parallel`
+    // race where a reader and its (about-to-fail) producer co-scheduled and the
+    // reader built on stale output. When off, the original ref-only layers are
+    // used, byte-for-byte. Any model stuck in an augmented-graph cycle is
+    // contained up front (fail closed) and recorded as a single run error so the
+    // run reports non-success.
+    let augmented_plan = resilience
+        .contain_failures
+        .then(|| containment.augmented_layers());
+    if let Some(plan) = &augmented_plan
+        && !plan.cyclic.is_empty()
+    {
+        for model in &plan.cyclic {
+            containment.poison(model);
+            output.contained.push(crate::output::ContainedModelOutput {
+                model: model.clone(),
+                blocked_by: Vec::new(),
+                unblock_hint: "a physical/bare-name read forms a dependency cycle; \
+                                   declare dependencies via ref() and break the cycle"
+                    .to_string(),
+            });
+        }
+        output.tables_failed += 1;
+        output.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec!["<cycle>".to_string()],
+            error: format!(
+                "dependency cycle in the containment graph (physical/bare-name reads) — \
+                 withheld {} model(s): {}. Declare dependencies via ref() and remove the cycle.",
+                plan.cyclic.len(),
+                plan.cyclic.join(", "),
+            ),
+            failure_kind: crate::output::FailureKind::Unknown,
+            cooldown_seconds: None,
+        });
+    }
+    let execution_layers: &[Vec<String>] = match &augmented_plan {
+        Some(plan) => &plan.layers,
+        None => &compile_result.project.layers,
+    };
+
+    for layer in execution_layers {
         // Collect this layer's matched models (honouring the name filter),
         // tagged with their stable within-layer index so concurrent results
         // can be re-ordered to match serial output exactly.
@@ -4962,6 +5111,51 @@ pub(crate) async fn execute_models(
             .enumerate()
             .map(|(idx, (name, model))| (idx, name, model))
             .collect();
+
+        // ---- failure containment (opt-in) ------------------------------
+        // Before the skip gate and any build, withhold every model in this
+        // layer that `evaluate` deems unsafe: a proven poisoned upstream (ref OR
+        // physical-target read), or — fail closed — a model whose reads can't be
+        // proven disjoint from the failure set once any failure has occurred.
+        // Layers are topologically ordered and every withheld model is poisoned
+        // as we go, so a one-hop check is transitively complete. A withheld
+        // model is never adjudicated by the skip gate and never built (it would
+        // read a failure's stale/missing output) — it is recorded on
+        // `output.contained` and poisons its own downstream. Identity no-op when
+        // `contain_failures` is off, keeping the default fail-fast path
+        // byte-identical.
+        let matched: Vec<(usize, &String, &rocky_core::models::Model)> =
+            if resilience.contain_failures {
+                let mut buildable = Vec::with_capacity(matched.len());
+                for (_, name, model) in matched {
+                    match containment.evaluate(name) {
+                        None => {
+                            let dense_idx = buildable.len();
+                            buildable.push((dense_idx, name, model));
+                        }
+                        Some(decision) => {
+                            containment.poison(name);
+                            info!(
+                                model = name.as_str(),
+                                blocked_by = decision.blocked_by.join(",").as_str(),
+                                fail_closed = decision.fail_closed,
+                                "containment: withholding model (not built this run)"
+                            );
+                            output.contained.push(crate::output::ContainedModelOutput {
+                                model: name.to_string(),
+                                unblock_hint: super::containment::unblock_hint(
+                                    &decision.blocked_by,
+                                    decision.fail_closed,
+                                ),
+                                blocked_by: decision.blocked_by,
+                            });
+                        }
+                    }
+                }
+                buildable
+            } else {
+                matched
+            };
 
         // ---- skip gate (B2 ∧ B3) --------------------------------------
         // Evaluate the gate over this layer's matched set BEFORE dispatch, so
@@ -5163,7 +5357,24 @@ pub(crate) async fn execute_models(
                         models_executed += 1;
                     }
                     Err(e) => {
-                        if first_error.is_none() {
+                        // Containment: record + poison EVERY failure in the
+                        // layer (two models in one layer can have disjoint
+                        // downstream closures — poisoning only the first would
+                        // leave the second's downstream un-contained). Fail-fast
+                        // default keeps the historical first-error-only path.
+                        if resilience.contain_failures {
+                            if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
+                                let _ = reg
+                                    .fire(&HookContext::model_error(
+                                        run_id,
+                                        pipe,
+                                        name,
+                                        &format!("{e:#}"),
+                                    ))
+                                    .await;
+                            }
+                            record_contained_cause(output, &mut containment, name, &e);
+                        } else if first_error.is_none() {
                             if let (Some(reg), Some(pipe)) = (hook_registry, pipeline_name) {
                                 let _ = reg
                                     .fire(&HookContext::model_error(
@@ -5180,6 +5391,9 @@ pub(crate) async fn execute_models(
                 }
             }
 
+            // Fail-fast default: surface the first failure and stop before any
+            // dependent layer. Under containment `first_error` stays `None` (each
+            // failure was recorded + poisoned above), so the run continues.
             if let Some(e) = first_error {
                 return Err(e);
             }
@@ -5577,6 +5791,12 @@ pub(crate) async fn execute_models(
                                 ))
                                 .await;
                         }
+                        // Containment: record + poison this content-addressed
+                        // model and continue disjoint work; fail-fast otherwise.
+                        if resilience.contain_failures {
+                            record_contained_cause(output, &mut containment, model_name, &e);
+                            continue;
+                        }
                         return Err(e);
                     }
                 }
@@ -5609,7 +5829,19 @@ pub(crate) async fn execute_models(
                         ))
                         .await;
                 }
-                time_interval_res?;
+                // Containment: a partitioned model whose run reported any failed
+                // partition has already materialized its healthy partitions (and
+                // marked only the failed one `Failed` in per-partition state).
+                // Record the cause (its error names the failing partition) and
+                // poison the model so downstream consumers of the incomplete
+                // table are withheld, then continue. Fail-fast otherwise.
+                if let Err(e) = time_interval_res {
+                    if resilience.contain_failures {
+                        record_contained_cause(output, &mut containment, model_name, &e);
+                        continue;
+                    }
+                    return Err(e);
+                }
                 // Per-model decision (reporting-only). time_interval is never
                 // skip-eligible, so it is suppressed in the skip-gate loop above
                 // and owns its `Build` entry here. Gated on the skip gate being
@@ -5702,15 +5934,25 @@ pub(crate) async fn execute_models(
                             ))
                             .await;
                     }
-                    return Err(e);
+                    // Containment: record + poison this model and continue
+                    // disjoint work; fail-fast (return) otherwise.
+                    if resilience.contain_failures {
+                        record_contained_cause(output, &mut containment, model_name, &e);
+                    } else {
+                        return Err(e);
+                    }
                 }
             }
         }
     }
 
-    // Flush the auditable-reuse spine in one transaction at end-of-run, only
-    // on the success path (a failed run returns early above and discards the
-    // accumulator — only fully-successful builds are indexed).
+    // Flush the auditable-reuse spine in one transaction at end-of-run. The
+    // accumulator only ever gains an entry from a *successfully-built*
+    // content-addressed model (the push lives in the build's `Ok` arm), so it
+    // is sound to flush even when this run also contained a failure: a
+    // fail-fast run returns before here (empty accumulator), and a
+    // containment run reaches here having indexed only its genuine successes —
+    // a withheld model never built and never pushed a spine entry.
     // Best-effort: a write failure logs and continues, mirroring the
     // `record_artifact` posture — the run itself is already durable.
     if reuse_enabled
@@ -8518,6 +8760,7 @@ mod tests {
             shadow: false,
             materializations: vec![],
             model_decisions: vec![],
+            contained: vec![],
             check_results: vec![],
             quarantine: vec![],
             anomalies: vec![],
@@ -10125,6 +10368,45 @@ merge_keys = ["id"]
         ));
     }
 
+    /// On the replication path with `[resilience] contain_failures = true`,
+    /// `execute_models` records a contained-cause runtime failure (`Unknown`
+    /// kind) on `output.errors` and returns `Ok`. The merge must retain that
+    /// entry — the pre-fix `retain(CompileError)` would have silently dropped
+    /// it, flipping a real failure back toward `Success` — and count it exactly
+    /// once alongside any copy failures (no double-count).
+    #[test]
+    fn merge_preserves_contained_cause_runtime_error() {
+        let mut out = RunOutput::new(String::new(), 0, 1);
+        // A disjoint model materialized (progress) → PartialFailure, not Failure.
+        out.tables_copied = 1;
+        out.tables_failed = 1;
+        out.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec!["bad".to_string()],
+            error: "model 'bad' failed: warehouse rejected SQL".to_string(),
+            failure_kind: crate::output::FailureKind::Unknown,
+            cooldown_seconds: None,
+        });
+        // No copy failures on this run — the containment cause is the only one.
+        let no_copy_errors: Vec<TableError> = Vec::new();
+
+        super::merge_replication_compile_and_copy_errors(&mut out, &no_copy_errors);
+
+        assert_eq!(
+            out.tables_failed, 1,
+            "the contained-cause failure is counted once, not dropped"
+        );
+        assert_eq!(
+            out.errors.len(),
+            1,
+            "the Unknown-kind runtime failure survives the merge: {:?}",
+            out.errors
+        );
+        assert!(matches!(
+            out.status,
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+    }
+
     /// End-to-end: a model declaring a `[[surrogate_key]]` block materializes a
     /// table that carries the injected, dialect-resolved hash column.
     #[cfg(feature = "duckdb")]
@@ -10435,6 +10717,975 @@ merge_keys = ["id"]
         )
         .await;
         (output, result)
+    }
+
+    /// Drive `execute_models` serially (DuckDB) with `[resilience]
+    /// contain_failures = true` — the failure-containment path under test.
+    async fn run_models_with_containment(
+        models_dir: &std::path::Path,
+        db_path: &std::path::Path,
+    ) -> (RunOutput, Result<()>) {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::open(db_path).expect("open duckdb");
+        let opts = PartitionRunOptions::default();
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let resilience = rocky_core::config::ResilienceConfig {
+            contain_failures: true,
+            ..Default::default()
+        };
+        let result = super::execute_models(
+            models_dir,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &opts,
+            "test-run",
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            resilience,
+            true,
+        )
+        .await;
+        (output, result)
+    }
+
+    /// Like [`run_models_with_containment`] but with caller-supplied partition
+    /// options (for driving a `time_interval` model across a partition window)
+    /// and `auto_create_schemas = true` (the fixtures target a fresh schema).
+    async fn run_models_with_containment_opts(
+        models_dir: &std::path::Path,
+        db_path: &std::path::Path,
+        opts: &PartitionRunOptions,
+    ) -> (RunOutput, Result<()>) {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::open(db_path).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let resilience = rocky_core::config::ResilienceConfig {
+            contain_failures: true,
+            ..Default::default()
+        };
+        let result = super::execute_models(
+            models_dir,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            opts,
+            "test-run",
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            true, // auto_create_schemas — the fixtures target `marts`
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            resilience,
+            true,
+        )
+        .await;
+        (output, result)
+    }
+
+    /// Drive `execute_models` with containment on, a **concurrency-capable**
+    /// DuckDB adapter, and `--parallel N` — for exercising the intra-layer
+    /// concurrent path under containment.
+    async fn run_models_with_containment_parallel(
+        models_dir: &std::path::Path,
+        db_path: &std::path::Path,
+        parallel: u32,
+    ) -> (RunOutput, Result<()>) {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let adapter = DuckDbWarehouseAdapter::open(db_path)
+            .expect("open duckdb")
+            .with_concurrent_for_test(true);
+        let opts = PartitionRunOptions {
+            parallel,
+            ..Default::default()
+        };
+        let mut output = RunOutput::new(String::new(), 0, parallel.max(1) as usize);
+        let resilience = rocky_core::config::ResilienceConfig {
+            contain_failures: true,
+            ..Default::default()
+        };
+        let result = super::execute_models(
+            models_dir,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &opts,
+            "test-run",
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            false,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            resilience,
+            true,
+        )
+        .await;
+        (output, result)
+    }
+
+    /// Write the diamond/disjoint DAG the containment tests share:
+    ///
+    /// - `good_a` (layer 0) builds; `dep_of_good` (layer 1) reads it → builds.
+    /// - `bad` (layer 0) fails at runtime (missing table); `dep_of_bad`
+    ///   (layer 1) reads `bad` via a bare SQL `ref()` with **no `depends_on`
+    ///   in its toml** → must be contained, proving the closure sources its
+    ///   edges from the resolved `dag_nodes`, not `config.depends_on`.
+    /// - `disjoint` (layer 0) shares no lineage with the failure → builds.
+    fn write_containment_dag(models_dir: &std::path::Path) {
+        write_plain_model(models_dir, "good_a", "SELECT 1 AS v");
+        write_plain_model(models_dir, "bad", "SELECT * FROM main.does_not_exist_xyz");
+        write_plain_model(models_dir, "disjoint", "SELECT 42 AS x");
+        write_plain_model(models_dir, "dep_of_bad", "SELECT * FROM bad");
+        write_plain_model(models_dir, "dep_of_good", "SELECT v FROM good_a");
+    }
+
+    /// Does `main.<name>` exist in the warehouse? Used by the containment test
+    /// to assert a contained model was never materialized.
+    async fn table_exists(
+        warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+        name: &str,
+    ) -> bool {
+        warehouse
+            .execute_query(&format!(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'main' AND table_name = '{name}'"
+            ))
+            .await
+            .ok()
+            .and_then(|r| r.rows.first()?.first()?.as_str().map(|s| s != "0"))
+            .unwrap_or(false)
+    }
+
+    /// Reachability guard for failure containment (`contain_failures = true`):
+    /// a runtime failure withholds only its downstream closure while disjoint
+    /// subgraphs still materialize, and the manifest names the blast radius.
+    ///
+    /// This is the run-path wiring proof — `execute_models` returns `Ok(())`
+    /// (failures recorded, not thrown), the healthy models materialize, the
+    /// failed model is on `errors[]`, and its SQL-`ref()`-only downstream is on
+    /// `contained[]` with `bad` as the blocker.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_continues_disjoint_subtree_on_failure() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_containment_dag(&models_dir);
+
+        let db = tmp.path().join("contain.duckdb");
+        let (out, result) = run_models_with_containment(&models_dir, &db).await;
+
+        // Containment returns Ok — failures are recorded on `output`, not thrown.
+        result.expect("containment path returns Ok(()); failures are recorded, not thrown");
+
+        let built: std::collections::BTreeSet<String> = out
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        // (a) Disjoint + healthy-upstream subtrees still build.
+        assert!(
+            built.contains("good_a"),
+            "healthy layer-0 model builds: {built:?}"
+        );
+        assert!(
+            built.contains("disjoint"),
+            "disjoint subtree builds: {built:?}"
+        );
+        assert!(
+            built.contains("dep_of_good"),
+            "downstream of a healthy model builds: {built:?}"
+        );
+
+        // (b) The failure is recorded as a cause, not built.
+        assert!(
+            !built.contains("bad"),
+            "the failing model must not be materialized"
+        );
+        assert_eq!(out.tables_failed, 1, "exactly one model failed");
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.asset_key.iter().any(|k| k == "bad")),
+            "errors[] must name the failed model: {:?}",
+            out.errors
+        );
+
+        // (c) The downstream closure of the failure is contained — and the
+        // blocker is the SQL-`ref()`-only edge to `bad` (dep_of_bad declared no
+        // `depends_on`), proving the closure reads `dag_nodes`, not config.
+        assert!(
+            !built.contains("dep_of_bad"),
+            "the failure's downstream must not build"
+        );
+        let contained: Vec<&str> = out.contained.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(
+            contained,
+            vec!["dep_of_bad"],
+            "dep_of_bad must be the sole contained model: {contained:?}"
+        );
+        assert_eq!(
+            out.contained[0].blocked_by,
+            vec!["bad".to_string()],
+            "the SQL-ref-only edge to `bad` must be the blocker (sourced from dag_nodes)"
+        );
+
+        // (d) Soundness at the warehouse: the contained model was never built
+        // on the failed upstream's missing output.
+        let verify = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+        assert!(
+            !table_exists(&verify, "dep_of_bad").await,
+            "contained model must not exist in the warehouse"
+        );
+        assert!(
+            !table_exists(&verify, "bad").await,
+            "the failed model must not have materialized"
+        );
+        assert!(
+            table_exists(&verify, "dep_of_good").await,
+            "the healthy downstream must exist"
+        );
+    }
+
+    /// Default posture (`contain_failures = false`) is byte-identical fail-fast:
+    /// `execute_models` returns `Err` at the first failure and withholds
+    /// nothing on `contained[]`. This is the §7.6 default-OFF regression guard.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_off_is_fail_fast() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_containment_dag(&models_dir);
+
+        let db = tmp.path().join("failfast.duckdb");
+        // `run_models_against_duckdb` uses `ResilienceConfig::default()`
+        // (contain_failures = false) — the default path.
+        let (out, result) = run_models_against_duckdb(&models_dir, &db, false, 1).await;
+
+        result.expect_err("default fail-fast: execute_models returns Err at the first failure");
+        assert!(
+            out.contained.is_empty(),
+            "the default path must never contain anything: {:?}",
+            out.contained
+        );
+    }
+
+    /// Partition-level containment: a `time_interval` model with one poisoned
+    /// partition still materializes its healthy partitions, is recorded as a
+    /// cause (its error naming the failing partition), and withholds a
+    /// downstream consumer of the now-incomplete target table.
+    ///
+    /// Guards the distinct `time_interval` catch-site in `execute_models` (the
+    /// `Err`-from-`execute_time_interval_model` branch), which the plain-model
+    /// containment test does not exercise.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_isolates_failing_partition() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("partition.duckdb");
+
+        // Seed a raw source: two clean rows on 2026-04-04, one un-castable row
+        // ('BAD') on 2026-04-05 — so the 04-05 partition fails while 04-04 is
+        // healthy. Drop the connection before `execute_models` reopens the file.
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db).expect("seed open");
+            seed.execute_statement("CREATE SCHEMA IF NOT EXISTS raw__orders")
+                .await
+                .unwrap();
+            seed.execute_statement(
+                "CREATE TABLE raw__orders.orders \
+                 (order_at TIMESTAMP, customer_id INTEGER, amount VARCHAR)",
+            )
+            .await
+            .unwrap();
+            seed.execute_statement(
+                "INSERT INTO raw__orders.orders VALUES \
+                 (TIMESTAMP '2026-04-04 09:00:00', 1, '10'), \
+                 (TIMESTAMP '2026-04-04 10:00:00', 2, '20'), \
+                 (TIMESTAMP '2026-04-05 09:00:00', 1, 'BAD')",
+            )
+            .await
+            .unwrap();
+        }
+
+        // `events`: a time_interval model whose SELECT casts `amount` to INT —
+        // the 04-05 window's 'BAD' row makes that partition fail.
+        std::fs::write(
+            models_dir.join("events.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date, customer_id, \
+             CAST(amount AS INTEGER) AS amt FROM raw__orders.orders \
+             WHERE order_at >= @start_date AND order_at < @end_date\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("events.toml"),
+            "depends_on = []\n\n\
+             [[sources]]\ncatalog = \"\"\nschema = \"raw__orders\"\ntable = \"orders\"\n\n\
+             [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+             granularity = \"day\"\nfirst_partition = \"2026-04-04\"\nlookback = 0\n\n\
+             [target]\ncatalog = \"\"\nschema = \"marts\"\ntable = \"events\"\n",
+        )
+        .unwrap();
+        // `rollup`: a downstream reading `events` by model name (SQL-ref edge).
+        std::fs::write(
+            models_dir.join("rollup.sql"),
+            "SELECT SUM(amt) AS total FROM events\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("rollup.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"marts\"\ntable = \"rollup\"\n",
+        )
+        .unwrap();
+
+        // Run BOTH partitions.
+        let opts = PartitionRunOptions {
+            from: Some("2026-04-04".into()),
+            to: Some("2026-04-05".into()),
+            ..Default::default()
+        };
+        let (out, result) = run_models_with_containment_opts(&models_dir, &db, &opts).await;
+
+        result.expect("containment returns Ok — the partition failure is recorded, not thrown");
+
+        // (a) The healthy partition materialized.
+        let events_parts: Vec<&str> = out
+            .materializations
+            .iter()
+            .filter(|m| m.asset_key.last().map(String::as_str) == Some("events"))
+            .filter_map(|m| m.partition.as_ref().map(|p| p.key.as_str()))
+            .collect();
+        assert_eq!(
+            events_parts,
+            vec!["2026-04-04"],
+            "only the healthy partition materializes: {events_parts:?}"
+        );
+        let summary = out
+            .partition_summaries
+            .iter()
+            .find(|s| s.model == "events")
+            .expect("events partition summary");
+        assert_eq!(summary.partitions_succeeded, 1);
+        assert_eq!(summary.partitions_failed, 1);
+
+        // (b) `events` is a cause, and the error names the failing partition.
+        assert_eq!(out.tables_failed, 1);
+        assert!(
+            out.errors.iter().any(
+                |e| e.asset_key.iter().any(|k| k == "events") && e.error.contains("2026-04-05")
+            ),
+            "errors[] must name the failing partition: {:?}",
+            out.errors
+        );
+
+        // (c) The downstream consumer of the incomplete table is contained.
+        let contained: Vec<&str> = out.contained.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(
+            contained,
+            vec!["rollup"],
+            "rollup must be contained: {contained:?}"
+        );
+        assert_eq!(out.contained[0].blocked_by, vec!["events".to_string()]);
+
+        // (d) Soundness at the warehouse: healthy rows landed, rollup absent.
+        let verify = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+        let events_rows = verify
+            .execute_query("SELECT COUNT(*) FROM marts.events")
+            .await
+            .ok()
+            .and_then(|r| r.rows.first()?.first()?.as_str().map(str::to_string))
+            .unwrap_or_default();
+        assert_eq!(
+            events_rows, "2",
+            "only the two healthy-partition rows landed"
+        );
+        let rollup_exists = verify
+            .execute_query(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'marts' AND table_name = 'rollup'",
+            )
+            .await
+            .ok()
+            .and_then(|r| r.rows.first()?.first()?.as_str().map(|s| s != "0"))
+            .unwrap_or(false);
+        assert!(
+            !rollup_exists,
+            "the contained downstream must not exist in `marts`"
+        );
+    }
+
+    /// Write a `full_refresh` model with an explicit `(schema, table)` target.
+    fn write_model_with_target(
+        dir: &std::path::Path,
+        name: &str,
+        sql: &str,
+        schema: &str,
+        table: &str,
+    ) {
+        std::fs::write(dir.join(format!("{name}.sql")), format!("{sql}\n"))
+            .expect("write model sql");
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"{schema}\"\ntable = \"{table}\"\n"
+            ),
+        )
+        .expect("write model toml");
+    }
+
+    /// Finding 1 (physical-table read escapes containment). A raw-SQL model
+    /// that reads a failed producer's target **by physical name** (not by model
+    /// name), layered after the producer via an unrelated healthy dependency,
+    /// must be contained — it would otherwise build on the producer's stale
+    /// (un-refreshed) output.
+    ///
+    /// Fails on the pre-fix HEAD (the closure consulted only `dag_nodes`, so the
+    /// physical read had no edge and `rollup` built on stale data); passes once
+    /// physical-target reads are folded into the closure.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_contains_physical_target_read_of_failed_producer() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("physical.duckdb");
+
+        // Pre-seed a STALE prior-run `main.orders_current` so the downstream can
+        // build on it (proving the stale-read hazard, not just a missing table).
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db).expect("seed open");
+            seed.execute_statement("CREATE TABLE main.orders_current AS SELECT 999 AS id")
+                .await
+                .unwrap();
+        }
+
+        // Layer 0: `anchor` healthy; `stage_orders` produces `main.orders_current`
+        // but FAILS (missing source), so the stale table is never refreshed.
+        write_plain_model(&models_dir, "anchor", "SELECT 1 AS v");
+        write_model_with_target(
+            &models_dir,
+            "stage_orders",
+            "SELECT * FROM main.does_not_exist_xyz",
+            "main",
+            "orders_current",
+        );
+        // Layer 1 (via the healthy `anchor` ref): `rollup` reads the producer's
+        // target BY PHYSICAL NAME (`main.orders_current`), not `ref(stage_orders)`.
+        write_model_with_target(
+            &models_dir,
+            "rollup",
+            "SELECT a.v FROM anchor a CROSS JOIN main.orders_current o",
+            "main",
+            "rollup",
+        );
+
+        let (out, result) = run_models_with_containment(&models_dir, &db).await;
+        result.expect("containment returns Ok — the failure is recorded, not thrown");
+
+        let built: std::collections::BTreeSet<String> = out
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert!(
+            built.contains("anchor"),
+            "the healthy anchor builds: {built:?}"
+        );
+        assert!(
+            !built.contains("stage_orders"),
+            "the failed producer must not materialize"
+        );
+        // The core assertion: `rollup` must be CONTAINED, not built on stale data.
+        assert!(
+            !built.contains("rollup"),
+            "rollup read a failed producer's target by physical name — it must NOT build"
+        );
+        let contained: Vec<&str> = out.contained.iter().map(|c| c.model.as_str()).collect();
+        assert!(
+            contained.contains(&"rollup"),
+            "rollup must be contained (physical-target read of the failed producer): {contained:?}"
+        );
+        assert!(
+            out.contained
+                .iter()
+                .find(|c| c.model == "rollup")
+                .is_some_and(|c| c.blocked_by.iter().any(|b| b == "stage_orders")),
+            "rollup's blocker must name the failed producer via the physical edge: {:?}",
+            out.contained
+        );
+
+        // Soundness at the warehouse: rollup's target was never created.
+        let verify = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+        assert!(
+            !table_exists(&verify, "rollup").await,
+            "the contained downstream must not exist"
+        );
+    }
+
+    /// Quoted-identifier hardening: a physical read written with QUOTED
+    /// identifiers (`"main"."orders_current"`) must resolve to the producer just
+    /// like the unquoted form — otherwise the quote characters survive into the
+    /// read identity, miss the producer index, and the reader builds on stale
+    /// data. Fails on the pre-quote-aware closure; passes after canonicalization.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_contains_quoted_physical_read_of_failed_producer() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("quoted.duckdb");
+
+        // Pre-seed a STALE prior-run `main.orders_current`.
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db).expect("seed open");
+            seed.execute_statement("CREATE TABLE main.orders_current AS SELECT 999 AS id")
+                .await
+                .unwrap();
+        }
+        write_plain_model(&models_dir, "anchor", "SELECT 1 AS v");
+        write_model_with_target(
+            &models_dir,
+            "stage_orders",
+            "SELECT * FROM main.does_not_exist_xyz",
+            "main",
+            "orders_current",
+        );
+        // `rollup` reads the producer's target with QUOTED identifiers.
+        write_model_with_target(
+            &models_dir,
+            "rollup",
+            "SELECT a.v FROM anchor a CROSS JOIN \"main\".\"orders_current\" o",
+            "main",
+            "rollup",
+        );
+
+        let (out, result) = run_models_with_containment(&models_dir, &db).await;
+        result.expect("containment returns Ok — the failure is recorded, not thrown");
+
+        let built: std::collections::BTreeSet<String> = out
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert!(
+            !built.contains("rollup"),
+            "a QUOTED physical read of a failed producer's target must NOT build"
+        );
+        let contained: Vec<&str> = out.contained.iter().map(|c| c.model.as_str()).collect();
+        assert!(
+            contained.contains(&"rollup"),
+            "rollup (quoted physical read) must be contained: {contained:?}"
+        );
+        let verify = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+        assert!(
+            !table_exists(&verify, "rollup").await,
+            "the contained downstream must not exist"
+        );
+    }
+
+    /// Bare unqualified read hardening: a model reading a failed producer's
+    /// target by BARE table name (`FROM orders_current`, resolved via the
+    /// default schema) — where the producer's model name differs from its table
+    /// name — must be contained. Fails on the pre-fix closure (a 1-part read was
+    /// treated as external); passes once bare reads resolve against producer
+    /// target-table names.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_contains_bare_read_of_failed_producer_table() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("bare.duckdb");
+
+        // Pre-seed a STALE prior-run `main.orders_current`.
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db).expect("seed open");
+            seed.execute_statement("CREATE TABLE main.orders_current AS SELECT 999 AS id")
+                .await
+                .unwrap();
+        }
+        write_plain_model(&models_dir, "anchor", "SELECT 1 AS v");
+        // Producer MODEL name (`stage_orders`) differs from its TABLE
+        // (`orders_current`), so a bare `orders_current` read is not a model
+        // name — it only resolves via the producer's target table.
+        write_model_with_target(
+            &models_dir,
+            "stage_orders",
+            "SELECT * FROM main.does_not_exist_xyz",
+            "main",
+            "orders_current",
+        );
+        // `rollup` reads the producer's target by BARE name (default schema).
+        write_model_with_target(
+            &models_dir,
+            "rollup",
+            "SELECT a.v FROM anchor a CROSS JOIN orders_current o",
+            "main",
+            "rollup",
+        );
+
+        let (out, result) = run_models_with_containment(&models_dir, &db).await;
+        result.expect("containment returns Ok — the failure is recorded, not thrown");
+
+        let built: std::collections::BTreeSet<String> = out
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert!(
+            !built.contains("rollup"),
+            "a BARE read of a failed producer's target table must NOT build"
+        );
+        let contained: Vec<&str> = out.contained.iter().map(|c| c.model.as_str()).collect();
+        assert!(
+            contained.contains(&"rollup"),
+            "rollup (bare read) must be contained: {contained:?}"
+        );
+        assert!(
+            out.contained
+                .iter()
+                .find(|c| c.model == "rollup")
+                .is_some_and(|c| c.blocked_by.iter().any(|b| b == "stage_orders")),
+            "rollup's blocker must name the producer via the bare-table edge: {:?}",
+            out.contained
+        );
+        let verify = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+        assert!(
+            !table_exists(&verify, "rollup").await,
+            "the contained downstream must not exist"
+        );
+    }
+
+    /// The `--parallel` same-layer race (headline): a physical reader with NO
+    /// `ref()` edge to its producer co-schedules with the producer in the same
+    /// ref-only layer, so under `--parallel 2` it builds on stale data while the
+    /// producer is still running, THEN the producer fails. Augmented re-layering
+    /// schedules the reader strictly after the producer, so it is contained.
+    /// Fails on the pre-re-layering HEAD; passes now.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn containment_contains_same_layer_physical_read_under_parallel() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("parrace.duckdb");
+
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db).expect("seed open");
+            seed.execute_statement("CREATE TABLE main.orders_current AS SELECT 999 AS id")
+                .await
+                .unwrap();
+        }
+        // `stage_orders` + `rollup` have NO ref deps ⇒ same ref-only layer 0.
+        // `disjoint` is a healthy unrelated model (so the run is a PartialFailure,
+        // and to show disjoint work still lands under the race).
+        write_model_with_target(
+            &models_dir,
+            "stage_orders",
+            "SELECT * FROM main.missing_source",
+            "main",
+            "orders_current",
+        );
+        write_model_with_target(
+            &models_dir,
+            "rollup",
+            "SELECT COUNT(*) AS n FROM main.orders_current",
+            "main",
+            "rollup",
+        );
+        write_model_with_target(&models_dir, "disjoint", "SELECT 7 AS x", "main", "disjoint");
+
+        let (out, result) = run_models_with_containment_parallel(&models_dir, &db, 2).await;
+        result.expect("containment returns Ok — the failure is recorded, not thrown");
+
+        let built: std::collections::BTreeSet<String> = out
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert!(
+            built.contains("disjoint"),
+            "the disjoint model still builds: {built:?}"
+        );
+        assert!(
+            !built.contains("rollup"),
+            "rollup must be contained under the same-layer --parallel race, not built on stale data"
+        );
+        let contained: Vec<&str> = out.contained.iter().map(|c| c.model.as_str()).collect();
+        assert!(
+            contained.contains(&"rollup"),
+            "rollup must be contained (augmented re-layering ordered it after the producer): {contained:?}"
+        );
+        assert!(matches!(
+            out.derive_run_status(),
+            rocky_core::state::RunStatus::PartialFailure
+        ));
+        let verify = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+        assert!(
+            !table_exists(&verify, "rollup").await,
+            "the contained reader must not exist"
+        );
+    }
+
+    /// Seed a stale `main.orders_current` and write the same-layer *uncertain*
+    /// (CTE) project: `stage_orders` produces `main.orders_current` and fails;
+    /// `rollup` reads it through a CTE, so its read set is unenumerable
+    /// (`lineage_is_provably_complete` is false) and no ordering edge is derived.
+    async fn setup_same_layer_uncertain_project(
+        models_dir: &std::path::Path,
+        db: &std::path::Path,
+    ) {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        {
+            let seed = DuckDbWarehouseAdapter::open(db).expect("seed open");
+            seed.execute_statement("CREATE TABLE main.orders_current AS SELECT 999 AS id")
+                .await
+                .unwrap();
+        }
+        write_model_with_target(
+            models_dir,
+            "stage_orders",
+            "SELECT * FROM main.missing_source",
+            "main",
+            "orders_current",
+        );
+        write_model_with_target(
+            models_dir,
+            "rollup",
+            "WITH x AS (SELECT id FROM main.orders_current) SELECT COUNT(*) AS n FROM x",
+            "main",
+            "rollup",
+        );
+    }
+
+    /// GUARANTEE-BOUNDARY parity (intentional, not a latent bug): for a read
+    /// Rocky cannot statically resolve — a CTE / anything `lineage_is_provably_
+    /// complete` rejects, i.e. an "uncertain" model — containment behaves
+    /// *identically* to a normal fail-fast run. Under `--parallel 2` a same-layer
+    /// uncertain reader of a failed producer materializes on stale data in BOTH
+    /// modes; that is a pre-existing property of parallel fail-fast, not a
+    /// containment regression.
+    ///
+    /// This test locks the achievable invariant — **containment never
+    /// materializes anything fail-fast wouldn't** (containment ⊆ fail-fast) — by
+    /// running the same project twice under `--parallel 2`, once with
+    /// `contain_failures = false` and once `= true`, and asserting identical
+    /// materialization sets. It will catch a future change that either
+    /// over-contains (would false-fail healthy CTE projects) or regresses below
+    /// fail-fast. Declaring the dependency via `ref()` lifts the read into the
+    /// resolved, guaranteed set (covered by the resolved-read tests above).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn containment_matches_fail_fast_for_same_layer_uncertain_read() {
+        let mat_set = |o: &RunOutput| -> std::collections::BTreeSet<String> {
+            o.materializations
+                .iter()
+                .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+                .collect()
+        };
+
+        // Fail-fast (contain_failures = false), concurrency-capable, --parallel 2.
+        let ff = tempfile::TempDir::new().expect("temp dir");
+        let ff_models = ff.path().join("models");
+        std::fs::create_dir(&ff_models).unwrap();
+        let ff_db = ff.path().join("ff.duckdb");
+        setup_same_layer_uncertain_project(&ff_models, &ff_db).await;
+        let (out_ff, _) = run_models_against_duckdb(&ff_models, &ff_db, true, 2).await;
+
+        // Containment (contain_failures = true), --parallel 2.
+        let ct = tempfile::TempDir::new().expect("temp dir");
+        let ct_models = ct.path().join("models");
+        std::fs::create_dir(&ct_models).unwrap();
+        let ct_db = ct.path().join("ct.duckdb");
+        setup_same_layer_uncertain_project(&ct_models, &ct_db).await;
+        let (out_ct, _) = run_models_with_containment_parallel(&ct_models, &ct_db, 2).await;
+
+        assert_eq!(
+            mat_set(&out_ff),
+            mat_set(&out_ct),
+            "containment must not materialize anything fail-fast wouldn't for a same-layer \
+             uncertain (CTE) read — the achievable containment ⊆ fail-fast invariant"
+        );
+        assert!(
+            mat_set(&out_ct).contains("rollup"),
+            "the unenumerable (CTE) reader builds in BOTH modes — the documented best-effort \
+             boundary (declare the dep via ref() for a hard guarantee)"
+        );
+        assert!(
+            out_ct.contained.is_empty(),
+            "a same-layer uncertain read is fail-fast parity, NOT over-contained: {:?}",
+            out_ct.contained
+        );
+    }
+
+    /// Earlier-layer residual (now closed): a physical reader placed in an
+    /// EARLIER ref-layer than its physically-read producer (via an unrelated
+    /// healthy dep chain) would build before the producer even runs. Augmented
+    /// re-layering orders it strictly after the producer, so the producer's
+    /// failure contains it. Fails on the pre-re-layering HEAD; passes now.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_reorders_earlier_layer_physical_reader() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("earlier.duckdb");
+
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db).expect("seed open");
+            seed.execute_statement("CREATE TABLE main.orders_current AS SELECT 999 AS id")
+                .await
+                .unwrap();
+        }
+        // Push the producer into ref-layer 2 via a healthy chain up0 → up1.
+        write_plain_model(&models_dir, "anchor", "SELECT 1 AS v");
+        write_plain_model(&models_dir, "up0", "SELECT 1 AS v");
+        write_plain_model(&models_dir, "up1", "SELECT v FROM up0");
+        write_model_with_target(
+            &models_dir,
+            "stage_orders",
+            "SELECT v FROM up1 CROSS JOIN main.missing_source",
+            "main",
+            "orders_current",
+        );
+        // `reader` sits in ref-layer 1 (via `anchor`), EARLIER than the
+        // producer's ref-layer 2; it physically reads the producer's target.
+        write_model_with_target(
+            &models_dir,
+            "reader",
+            "SELECT a.v FROM anchor a CROSS JOIN main.orders_current o",
+            "main",
+            "reader",
+        );
+
+        let (out, result) = run_models_with_containment(&models_dir, &db).await;
+        result.expect("containment returns Ok");
+
+        let built: std::collections::BTreeSet<String> = out
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert!(built.contains("anchor") && built.contains("up0") && built.contains("up1"));
+        assert!(
+            !built.contains("reader"),
+            "an earlier-ref-layer physical reader must be re-ordered after its producer and contained"
+        );
+        let contained: Vec<&str> = out.contained.iter().map(|c| c.model.as_str()).collect();
+        assert!(
+            contained.contains(&"reader"),
+            "reader must be contained: {contained:?}"
+        );
+        let verify = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+        assert!(
+            !table_exists(&verify, "reader").await,
+            "the contained reader must not exist"
+        );
+    }
+
+    /// Finding 2 / fail-closed belt: a model whose read set is NOT provably
+    /// complete (a CTE — the completeness gate rejects it) cannot be proven
+    /// disjoint from a failure, so once any failure has occurred it must be
+    /// contained, never built.
+    ///
+    /// Fails on the pre-fix HEAD (the closure consulted only `dag_nodes` deps,
+    /// so the unenumerable model built); passes once unanalyzable reads
+    /// fail closed.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_fails_closed_on_unenumerable_reads() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        let db = tmp.path().join("failclosed.duckdb");
+
+        // Layer 0: `anchor` healthy; `bad` fails at runtime.
+        write_plain_model(&models_dir, "anchor", "SELECT 1 AS v");
+        write_plain_model(&models_dir, "bad", "SELECT * FROM main.does_not_exist_xyz");
+        // Layer 1 (explicit `depends_on = ["anchor"]`, so `bad`'s layer-0 failure
+        // is known when this is evaluated): `mystery` uses a CTE, so its read set
+        // is not provably complete — the closure cannot prove it is disjoint from
+        // `bad`, so it must fail closed once `bad` has failed.
+        std::fs::write(
+            models_dir.join("mystery.sql"),
+            "WITH x AS (SELECT v FROM anchor) SELECT v FROM x\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models_dir.join("mystery.toml"),
+            "depends_on = [\"anchor\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"mystery\"\n",
+        )
+        .unwrap();
+
+        let (out, result) = run_models_with_containment(&models_dir, &db).await;
+        result.expect("containment returns Ok — the failure is recorded, not thrown");
+
+        let built: std::collections::BTreeSet<String> = out
+            .materializations
+            .iter()
+            .map(|m| m.asset_key.last().cloned().unwrap_or_default())
+            .collect();
+        assert!(
+            built.contains("anchor"),
+            "the healthy anchor builds: {built:?}"
+        );
+        assert!(
+            !built.contains("mystery"),
+            "an unenumerable-read model must fail closed once a failure occurred: {built:?}"
+        );
+        let contained: Vec<&str> = out.contained.iter().map(|c| c.model.as_str()).collect();
+        assert!(
+            contained.contains(&"mystery"),
+            "mystery must be contained (fail-closed on unprovable disjointness): {contained:?}"
+        );
     }
 
     /// End-to-end run-path coverage for `--var`: a model whose SQL references
