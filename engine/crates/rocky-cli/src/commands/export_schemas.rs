@@ -20,8 +20,8 @@ use crate::commands::doctor::DoctorOutput;
 use crate::output::{
     AiContractOutput, AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ApplyOutput,
     ApproveOutput, ArchiveApplyOutput, ArchiveOutput, AuditOutput, BranchDeleteOutput,
-    BranchListOutput, BranchOutput, BranchPromoteOutput, CatalogOutput, CiDiffOutput, CiOutput,
-    ClearSchemaCacheOutput, ColumnLineageOutput, CompactApplyOutput, CompactDedupOutput,
+    BranchListOutput, BranchOutput, BranchPromoteOutput, BriefOutput, CatalogOutput, CiDiffOutput,
+    CiOutput, ClearSchemaCacheOutput, ColumnLineageOutput, CompactApplyOutput, CompactDedupOutput,
     CompactOutput, CompareOutput, CompileOutput, ComplianceOutput, CostOutput, DagOutput,
     DagRunOutput, DiscoverOutput, DriftOutput, ErrorEnvelope, EstimateOutput, HistoryOutput,
     HooksListOutput, HooksTestOutput, ImportDbtOutput, JobStatus, LineageDiffOutput, LineageOutput,
@@ -121,6 +121,7 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<ReviewOutput>("review"),
         entry::<PolicyCheckOutput>("policy_check"),
         entry::<AuditOutput>("audit"),
+        entry::<BriefOutput>("brief"),
         // Plan/apply spine (Cluster 3 B, Phase 2–3)
         entry::<ApplyOutput>("apply"),
         entry::<PromotePlan>("plan_promote"),

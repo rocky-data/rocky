@@ -6107,6 +6107,305 @@ pub struct AuditDecisionEntry {
     pub reason: String,
 }
 
+// ---------------------------------------------------------------------------
+// `rocky brief` — the governor's estate digest
+// ---------------------------------------------------------------------------
+
+/// Whether a brief section's underlying query succeeded and had data.
+///
+/// The digest is composed section-by-section from independent typed queries
+/// over the state store and the decision ledger. Each section fails closed:
+/// a query that returns nothing renders as [`SectionAvailability::NoData`],
+/// and a source that is not wired into the state store at all renders as
+/// [`SectionAvailability::Unavailable`] with a note — never as a
+/// smoothed-over "all clear". A brief that claims more than the ledger holds
+/// poisons the whole surface, so the marker is machine-readable, not prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SectionAvailability {
+    /// The query ran and the section carries data for the window.
+    Available,
+    /// The query ran cleanly but nothing fell inside the window.
+    NoData,
+    /// The underlying signal is not recorded in the state store, so the
+    /// section cannot be composed. Accompanied by a `note` explaining why.
+    Unavailable,
+}
+
+/// How the digest window was resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BriefSinceMode {
+    /// Everything recorded since the previous `--since last` digest (the
+    /// stored cursor). Advances the cursor on success.
+    Last,
+    /// A rolling 24-hour window ending now. Does not touch the cursor.
+    #[serde(rename = "24h")]
+    Hours24,
+    /// A rolling 7-day window ending now. Does not touch the cursor.
+    #[serde(rename = "7d")]
+    Days7,
+}
+
+/// JSON output for `rocky brief` — the governor's estate digest.
+///
+/// A typed projection of the state store and the policy-decision ledger over
+/// a time window: agent activity by principal, runs, drift, freshness,
+/// quality, cost, and the ranked queue of decisions still awaiting a human.
+/// It is composed template-first from typed queries — there is no narration
+/// layer — and every line item carries a ledger citation (`run_id`,
+/// `plan_id`, or the composite `decision_ref`) so a claim can be
+/// independently checked against `rocky audit` / `rocky replay`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefOutput {
+    pub version: String,
+    pub command: String,
+    /// RFC 3339 wall clock when the digest was generated (the window's upper
+    /// bound).
+    pub generated_at: String,
+    /// How the window was resolved.
+    pub since_mode: BriefSinceMode,
+    /// RFC 3339 lower bound of the window. `null` only for a first-ever
+    /// `--since last` with no stored cursor — the digest then spans all of
+    /// recorded history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_timestamp: Option<String>,
+    /// Agent- and human-authored policy decisions in the window, grouped by
+    /// principal and effect.
+    pub agent_activity: BriefAgentActivitySection,
+    /// Decisions that resolved to `require_review` and still need a human,
+    /// ranked.
+    pub escalations: BriefEscalationsSection,
+    /// Pipeline runs in the window, with the ones needing attention listed.
+    pub runs: BriefRunsSection,
+    /// Schema drift observed in the window.
+    pub drift: BriefDriftSection,
+    /// Freshness / SLO status in the window.
+    pub freshness: BriefFreshnessSection,
+    /// Data-quality status in the window.
+    pub quality: BriefQualitySection,
+    /// Cost and budget burn across the window's runs.
+    pub cost: BriefCostSection,
+}
+
+/// Agent-activity section — the policy-decision ledger rolled up by principal.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefAgentActivitySection {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub total: u64,
+    pub allow: u64,
+    pub require_review: u64,
+    pub deny: u64,
+    /// One roll-up per acting principal (`human` / `agent`).
+    pub by_principal: Vec<BriefPrincipalActivity>,
+    /// Every decision in the window, newest first, each fully cited.
+    pub decisions: Vec<BriefDecisionEntry>,
+}
+
+/// Per-principal decision counts inside [`BriefAgentActivitySection`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefPrincipalActivity {
+    pub principal: rocky_core::config::PolicyPrincipal,
+    pub total: u64,
+    pub allow: u64,
+    pub require_review: u64,
+    pub deny: u64,
+}
+
+/// One recorded policy decision, cited for the digest.
+///
+/// `decision_ref` is the composite ledger key
+/// (`"{timestamp}|{plan_id}|{model}"`) — the stable identity a governor drills
+/// into via `rocky audit`. `plan_id` and `rule_id` are the other two
+/// citations: which plan the decision governed and which `[[policy.rules]]`
+/// entry won.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BriefDecisionEntry {
+    /// RFC 3339 timestamp when the decision was recorded.
+    pub timestamp: String,
+    /// Composite ledger key that uniquely identifies this decision.
+    pub decision_ref: String,
+    /// The plan the decision governed.
+    pub plan_id: String,
+    pub principal: rocky_core::config::PolicyPrincipal,
+    pub capability: rocky_core::config::PolicyCapability,
+    /// The model the decision was about.
+    pub model: String,
+    pub effect: rocky_core::config::PolicyEffect,
+    /// Index of the winning `[[policy.rules]]` entry, or `null` for the
+    /// default posture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<usize>,
+    /// Human-readable explanation of how the effect was reached.
+    pub reason: String,
+}
+
+/// Escalations section — `require_review` decisions still awaiting a human.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefEscalationsSection {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub total: u64,
+    /// How the queue is ordered. `"recency"` in v0; blast-radius ranking
+    /// (CLL × classification × staleness) is a later phase.
+    pub ranking: String,
+    /// The pending decisions, ranked, each fully cited.
+    pub pending: Vec<BriefDecisionEntry>,
+}
+
+/// Runs section — the run ledger rolled up by status.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefRunsSection {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub total: u64,
+    pub succeeded: u64,
+    pub partial_failure: u64,
+    pub failed: u64,
+    /// Runs that did not fully succeed, newest first — the exception view.
+    /// Each cites its `run_id`.
+    pub attention: Vec<BriefRunEntry>,
+}
+
+/// A single run needing attention inside [`BriefRunsSection`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefRunEntry {
+    /// The run's identifier — the citation to drill in via `rocky replay`.
+    pub run_id: String,
+    pub status: String,
+    pub trigger: String,
+    pub started_at: String,
+    pub finished_at: String,
+    /// Models within the run that did not report `success`.
+    pub failed_models: Vec<BriefFailedModel>,
+}
+
+/// A non-successful model execution inside a [`BriefRunEntry`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefFailedModel {
+    pub model_name: String,
+    pub status: String,
+}
+
+/// Drift section — schema drift recorded in the state store.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefDriftSection {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Drift events in the window, newest first.
+    pub events: Vec<BriefDriftEntry>,
+}
+
+/// A single schema-drift observation inside [`BriefDriftSection`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefDriftEntry {
+    pub timestamp: String,
+    /// The DAG graph hash the change was observed against — the citation for
+    /// this drift snapshot.
+    pub graph_hash: String,
+    /// Human-readable description of the change.
+    pub change: String,
+}
+
+/// Freshness / SLO section, derived from recorded quality snapshots.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefFreshnessSection {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Per-model freshness lag, worst first. Each cites its `run_id`.
+    pub models: Vec<BriefFreshnessEntry>,
+}
+
+/// A single model's freshness reading inside [`BriefFreshnessSection`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefFreshnessEntry {
+    pub model_name: String,
+    pub run_id: String,
+    pub freshness_lag_seconds: u64,
+    pub observed_at: String,
+}
+
+/// Quality / check section, derived from recorded quality snapshots.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefQualitySection {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Per-model quality readings, newest first. Each cites its `run_id`.
+    pub models: Vec<BriefQualityEntry>,
+}
+
+/// A single model's quality reading inside [`BriefQualitySection`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefQualityEntry {
+    pub model_name: String,
+    pub run_id: String,
+    pub observed_at: String,
+    pub row_count: u64,
+    /// The highest per-column null rate observed for the model, if any
+    /// columns were profiled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_null_rate: Option<f64>,
+}
+
+/// Cost section — per-run cost re-derived over the window, plus budget burn.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefCostSection {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The billed-warehouse adapter cost was computed against, if resolvable
+    /// from `rocky.toml`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adapter_type: Option<String>,
+    pub run_count: u64,
+    /// Summed observed cost across the window. `null` when no run produced
+    /// enough data to compute a cost (e.g. DuckDB, which has no billing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    pub total_duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes_scanned: Option<u64>,
+    /// Per-run cost in the window, priciest first. Each cites its `run_id`.
+    pub per_run: Vec<BriefRunCost>,
+    /// Budget-burn status against the configured per-run `[budget] max_usd`,
+    /// when one is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BriefBudgetStatus>,
+}
+
+/// Per-run cost inside [`BriefCostSection`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefRunCost {
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_scanned: Option<u64>,
+}
+
+/// Budget-burn status against the configured per-run ceiling.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefBudgetStatus {
+    /// The configured `[budget] max_usd` per-run ceiling.
+    pub max_usd_per_run: f64,
+    /// How many runs in the window exceeded the ceiling.
+    pub runs_over_budget: u64,
+    /// The priciest run in the window (its citation), when a cost was
+    /// computed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worst_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worst_run_cost_usd: Option<f64>,
+}
+
 /// JSON output for `rocky replay <run_id|latest>`.
 ///
 /// Inspection-only surface over the state store's [`RunRecord`]: shows every

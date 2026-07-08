@@ -262,3 +262,27 @@ export type {
   PreviewModelCostDelta,
 } from "./preview_cost";
 export type { PreviewRowsOutput } from "./preview_rows";
+
+// Brief — the governor's estate digest (runs, decisions, drift, freshness,
+// quality, cost; every line cites a run_id / plan_id / decision_ref)
+export type {
+  BriefAgentActivitySection,
+  BriefBudgetStatus,
+  BriefCostSection,
+  BriefDecisionEntry,
+  BriefDriftEntry,
+  BriefDriftSection,
+  BriefEscalationsSection,
+  BriefFailedModel,
+  BriefFreshnessEntry,
+  BriefFreshnessSection,
+  BriefOutput,
+  BriefPrincipalActivity,
+  BriefQualityEntry,
+  BriefQualitySection,
+  BriefRunCost,
+  BriefRunEntry,
+  BriefRunsSection,
+  BriefSinceMode,
+  SectionAvailability,
+} from "./brief";

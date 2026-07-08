@@ -2222,11 +2222,55 @@ impl StateStore {
         txn.commit()?;
         Ok(())
     }
+
+    /// Read the timestamp of the most recent `--since last` estate digest.
+    ///
+    /// Backs the `rocky brief --since last` cursor: the "everything up to
+    /// here has already been briefed" watermark. `None` when no digest has
+    /// ever been taken (the very first `--since last` therefore reports the
+    /// full history). Returns `Err` only when a stored value is present but
+    /// unparseable as RFC3339 — a genuine corruption signal, not a
+    /// missing-key signal.
+    ///
+    /// Stored in the existing [`METADATA`] table under a dedicated key, so it
+    /// adds no table and moves no schema version.
+    pub fn get_last_brief_at(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(METADATA)?;
+        let Some(value) = table.get(LAST_BRIEF_AT_KEY)? else {
+            return Ok(None);
+        };
+        let parsed = chrono::DateTime::parse_from_rfc3339(value.value())
+            .map_err(|e| StateError::VersionParse(format!("last_brief_at: {e}")))?
+            .with_timezone(&chrono::Utc);
+        Ok(Some(parsed))
+    }
+
+    /// Advance the `last_brief_at` digest cursor to `at`, serialised as
+    /// RFC3339.
+    ///
+    /// Called after a `rocky brief --since last` successfully renders, so the
+    /// next `--since last` digest starts where this one ended. Relative
+    /// windows (`--since 24h` / `--since 7d`) never touch the cursor.
+    pub fn set_last_brief_at(&self, at: chrono::DateTime<chrono::Utc>) -> Result<(), StateError> {
+        let formatted = at.to_rfc3339();
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(METADATA)?;
+            table.insert(LAST_BRIEF_AT_KEY, formatted.as_str())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
 }
 
 /// Metadata key for the timestamp of the most recent end-of-run
 /// auto-sweep (see [`StateStore::get_last_retention_sweep_at`]).
 const LAST_RETENTION_SWEEP_AT_KEY: &str = "last_retention_sweep_at";
+
+/// Metadata key for the `rocky brief --since last` digest cursor (see
+/// [`StateStore::get_last_brief_at`]).
+const LAST_BRIEF_AT_KEY: &str = "last_brief_at";
 
 // ---------------------------------------------------------------------------
 // Idempotency-key persistence (see `crate::idempotency`)
@@ -6499,6 +6543,43 @@ mod tests {
         }
         let store = StateStore::open(&path).unwrap();
         assert_eq!(store.get_last_retention_sweep_at().unwrap(), Some(stamped));
+    }
+
+    #[test]
+    fn last_brief_at_absent_returns_none() {
+        // Fresh state store has never taken a `--since last` digest.
+        let (store, _dir) = temp_store();
+        assert!(store.get_last_brief_at().unwrap().is_none());
+    }
+
+    #[test]
+    fn last_brief_at_round_trips_and_overwrites() {
+        // The digest cursor round-trips and advances monotonically as
+        // successive `--since last` briefs are taken.
+        let (store, _dir) = temp_store();
+        let first = chrono::DateTime::parse_from_rfc3339("2026-07-07T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let second = chrono::DateTime::parse_from_rfc3339("2026-07-07T18:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store.set_last_brief_at(first).unwrap();
+        assert_eq!(store.get_last_brief_at().unwrap(), Some(first));
+        store.set_last_brief_at(second).unwrap();
+        assert_eq!(store.get_last_brief_at().unwrap(), Some(second));
+    }
+
+    #[test]
+    fn last_brief_at_is_independent_of_retention_cursor() {
+        // The two metadata cursors never alias — advancing one leaves the
+        // other untouched.
+        let (store, _dir) = temp_store();
+        let brief = chrono::DateTime::parse_from_rfc3339("2026-07-07T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store.set_last_brief_at(brief).unwrap();
+        assert_eq!(store.get_last_brief_at().unwrap(), Some(brief));
+        assert!(store.get_last_retention_sweep_at().unwrap().is_none());
     }
 
     // -----------------------------------------------------------------------
