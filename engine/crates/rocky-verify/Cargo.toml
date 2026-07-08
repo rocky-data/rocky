@@ -1,0 +1,24 @@
+[package]
+name = "rocky-verify"
+version = "0.1.0"
+description = "Standalone offline verifier for rocky-manifest v0.1 attestations (no producing engine required)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Deliberately dependency-light and free of any `rocky-*` engine crate: the
+# whole point is to verify a manifest offline with no producing tool installed.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+boon = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,73 @@
+name: manifest-conformance
+
+# Drift tripwire between the rocky-manifest spec and the engine that produces
+# manifests. Builds the engine + the standalone rocky-verify, produces a
+# manifest from live engine output (the recipe-provenance POC), and proves
+# rocky-verify validates it against the published v0.1 schema offline — and
+# that a tampered manifest fails. Path-filtered tightly so it only runs when a
+# surface that could break the spec/implementation contract changes.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/crates/rocky-verify/**'
+      - 'engine/crates/rocky-core/src/recipe_identity.rs'
+      - 'engine/crates/rocky-cli/src/commands/history.rs'
+      - 'examples/audit-sample/**'
+      - 'examples/playground/pocs/04-governance/10-recipe-provenance/**'
+      - 'scripts/manifest-conformance.sh'
+      - '.github/workflows/manifest-conformance.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'engine/crates/rocky-verify/**'
+      - 'engine/crates/rocky-core/src/recipe_identity.rs'
+      - 'engine/crates/rocky-cli/src/commands/history.rs'
+      - 'examples/audit-sample/**'
+      - 'examples/playground/pocs/04-governance/10-recipe-provenance/**'
+      - 'scripts/manifest-conformance.sh'
+      - '.github/workflows/manifest-conformance.yml'
+
+# CI only reads the repo; restrict the token to the minimum (CodeQL ql-for-actions).
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 4
+  CARGO_NET_RETRY: '10'
+  CARGO_HTTP_MULTIPLEXING: 'false'
+
+jobs:
+  conformance:
+    name: Live manifest conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          workspaces: engine
+      - name: Free disk space and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
+      - run: sudo apt-get update && sudo apt-get install -y cmake
+      - name: Build rocky + rocky-verify
+        working-directory: engine
+        run: cargo build --release --bin rocky --bin rocky-verify
+      # The recipe-provenance POC shells out to the standalone `duckdb` CLI to
+      # seed data. Pin 1.5.3 to match the engine's bundled DuckDB.
+      - name: Install DuckDB CLI
+        run: |
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.3/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
+          sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/duckdb
+          duckdb --version
+      - name: Run manifest conformance
+        run: bash scripts/manifest-conformance.sh

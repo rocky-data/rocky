@@ -22,6 +22,7 @@ members = [
     "crates/rocky-observe",
     "crates/rocky-cli",
     "crates/rocky-mcp",
+    "crates/rocky-verify",
     "crates/rocky-wasm",
     "rocky",
     "rocky-lsp",
@@ -150,6 +151,10 @@ sha2 = "0.11"
 
 # Content-addressed hashing (row-level dedup calibration)
 blake3 = "1"
+
+# JSON Schema validation for the standalone rocky-manifest verifier. Pure-Rust,
+# dependency-light, draft 2020-12 — used only by rocky-verify.
+boon = "0.6"
 
 # MD5 — used by the Fivetran object-store cache backend to compare
 # locally-computed digests against S3 ETags (single-part ETags = MD5)
