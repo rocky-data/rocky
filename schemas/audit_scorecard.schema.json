@@ -1,0 +1,225 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ScorecardDimension": {
+      "description": "The dimension a scorecard groups policy decisions by.\n\nEach maps to a field the ledger persists on every decision: `principal` groups by who acted (`agent` / `human`), `rule` by the winning `[[policy.rules]]` index, and `scope` by the concrete model the decision was about (the ledger records the matched model, not the rule's scope predicates).",
+      "oneOf": [
+        {
+          "description": "Group by who acted (`agent` / `human`).",
+          "enum": [
+            "principal"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Group by the winning `[[policy.rules]]` index (or the default posture).",
+          "enum": [
+            "rule"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Group by the concrete model the decision was about.",
+          "enum": [
+            "scope"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ScorecardGroup": {
+      "description": "One group's decision aggregate in an [`AuditScorecardOutput`].\n\nEvery rate is a ratio over [`Self::total`] and is independently recomputable from [`Self::decision_refs`], which lists the exact ledger keys (`timestamp|plan_id|model`) that composed the group — so the aggregate summarizes citable rows, never an unverifiable number.",
+      "properties": {
+        "acceptance_rate": {
+          "description": "`allow / total` — the proposal acceptance rate.",
+          "format": "double",
+          "type": "number"
+        },
+        "allow": {
+          "description": "Decisions the plane allowed outright.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "decision_refs": {
+          "description": "The ledger keys that composed this group (`timestamp|plan_id|model`), newest first — the citations backing every count above.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "denial_rate": {
+          "description": "`deny / total` — the denial rate.",
+          "format": "double",
+          "type": "number"
+        },
+        "deny": {
+          "description": "Decisions the plane denied.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "key": {
+          "description": "The group label: a principal (`agent` / `human`), a rule (`rule 3` / `default posture`), or a model/scope name — per the scorecard's `by`.",
+          "type": "string"
+        },
+        "require_review": {
+          "description": "Decisions the plane escalated to human review.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "review_rate": {
+          "description": "`require_review / total` — the escalation rate.",
+          "format": "double",
+          "type": "number"
+        },
+        "total": {
+          "description": "Decisions in this group within the window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "acceptance_rate",
+        "allow",
+        "decision_refs",
+        "denial_rate",
+        "deny",
+        "key",
+        "require_review",
+        "review_rate",
+        "total"
+      ],
+      "type": "object"
+    },
+    "ScorecardUnavailableMetric": {
+      "description": "A metric the scorecard cannot compute because the ledger does not persist its inputs.\n\nDeclared explicitly (not silently omitted) so the honesty is machine-readable: a consumer sees the metric name, that it is `unavailable`, and exactly why.",
+      "properties": {
+        "availability": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SectionAvailability"
+            }
+          ],
+          "description": "Always [`SectionAvailability::Unavailable`]."
+        },
+        "metric": {
+          "description": "The metric identifier (`verify_after_pass_rate`, `reverts`, `escalation_latency`).",
+          "type": "string"
+        },
+        "note": {
+          "description": "Why the metric cannot be derived from the persisted ledger.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "availability",
+        "metric",
+        "note"
+      ],
+      "type": "object"
+    },
+    "SectionAvailability": {
+      "description": "Whether a brief section's underlying query succeeded and had data.\n\nThe digest is composed section-by-section from independent typed queries over the state store and the decision ledger. Each section fails closed: a query that returns nothing renders as [`SectionAvailability::NoData`], and a source that is not wired into the state store at all renders as [`SectionAvailability::Unavailable`] with a note — never as a smoothed-over \"all clear\". A brief that claims more than the ledger holds poisons the whole surface, so the marker is machine-readable, not prose.",
+      "oneOf": [
+        {
+          "description": "The query ran and the section carries data for the window.",
+          "enum": [
+            "available"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The query ran cleanly but nothing fell inside the window.",
+          "enum": [
+            "no_data"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The underlying signal is not recorded in the state store, so the section cannot be composed. Accompanied by a `note` explaining why.",
+          "enum": [
+            "unavailable"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "JSON output for `rocky audit --scorecard` — a trust-calibration digest.\n\nA decisions-by-group aggregation over the persisted policy-decision ledger, windowed by `--window`. It is the evidence base for widening or tightening autonomy, and it informs human judgment only — nothing here is wired to any automatic policy change.\n\nOnly metrics the ledger actually persists are computed. The ledger records one row per policy *evaluation* — `(principal, capability, model, effect, rule_id)` — and nothing about what happened *after* the decision. So verify-after outcomes, reverts, and escalation-resolution latency are not derivable; they are declared, once, in [`Self::unavailable_metrics`] as `unavailable` with the reason, never faked into a number. A ledger read failure renders the whole scorecard `unavailable` rather than a smoothed-over zero.",
+  "properties": {
+    "availability": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/SectionAvailability"
+        }
+      ],
+      "description": "Whether the scorecard could be composed at all: `unavailable` when the ledger could not be read (fail-closed), `no_data` when no decision falls in the window, `available` otherwise."
+    },
+    "by": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ScorecardDimension"
+        }
+      ],
+      "description": "The grouping dimension (`--by`)."
+    },
+    "command": {
+      "type": "string"
+    },
+    "groups": {
+      "description": "One row per group, ranked by decision count descending.",
+      "items": {
+        "$ref": "#/definitions/ScorecardGroup"
+      },
+      "type": "array"
+    },
+    "note": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "total_decisions": {
+      "description": "Total decisions in the window, across all groups.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "unavailable_metrics": {
+      "description": "Metrics the ledger does not persist, declared plainly rather than computed. Each is `unavailable` with the reason it cannot be derived.",
+      "items": {
+        "$ref": "#/definitions/ScorecardUnavailableMetric"
+      },
+      "type": "array"
+    },
+    "version": {
+      "type": "string"
+    },
+    "window": {
+      "description": "The window as requested (`all`, `30d`, `24h`, …).",
+      "type": "string"
+    },
+    "window_start": {
+      "description": "Lower bound of the window (RFC 3339), or `null` for all-time.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "availability",
+    "by",
+    "command",
+    "groups",
+    "total_decisions",
+    "unavailable_metrics",
+    "version",
+    "window"
+  ],
+  "title": "AuditScorecardOutput",
+  "type": "object"
+}

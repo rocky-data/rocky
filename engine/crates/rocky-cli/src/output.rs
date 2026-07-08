@@ -6478,6 +6478,116 @@ pub struct AuditChainBlastRadius {
 }
 
 // ---------------------------------------------------------------------------
+// `rocky audit --scorecard` — the decisions-by-group trust scorecard
+// ---------------------------------------------------------------------------
+
+/// The dimension a scorecard groups policy decisions by.
+///
+/// Each maps to a field the ledger persists on every decision: `principal`
+/// groups by who acted (`agent` / `human`), `rule` by the winning
+/// `[[policy.rules]]` index, and `scope` by the concrete model the decision was
+/// about (the ledger records the matched model, not the rule's scope
+/// predicates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScorecardDimension {
+    /// Group by who acted (`agent` / `human`).
+    Principal,
+    /// Group by the winning `[[policy.rules]]` index (or the default posture).
+    Rule,
+    /// Group by the concrete model the decision was about.
+    Scope,
+}
+
+/// JSON output for `rocky audit --scorecard` — a trust-calibration digest.
+///
+/// A decisions-by-group aggregation over the persisted policy-decision ledger,
+/// windowed by `--window`. It is the evidence base for widening or tightening
+/// autonomy, and it informs human judgment only — nothing here is wired to any
+/// automatic policy change.
+///
+/// Only metrics the ledger actually persists are computed. The ledger records
+/// one row per policy *evaluation* — `(principal, capability, model, effect,
+/// rule_id)` — and nothing about what happened *after* the decision. So
+/// verify-after outcomes, reverts, and escalation-resolution latency are not
+/// derivable; they are declared, once, in [`Self::unavailable_metrics`] as
+/// `unavailable` with the reason, never faked into a number. A ledger read
+/// failure renders the whole scorecard `unavailable` rather than a
+/// smoothed-over zero.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuditScorecardOutput {
+    pub version: String,
+    pub command: String,
+    /// The grouping dimension (`--by`).
+    pub by: ScorecardDimension,
+    /// The window as requested (`all`, `30d`, `24h`, …).
+    pub window: String,
+    /// Lower bound of the window (RFC 3339), or `null` for all-time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_start: Option<String>,
+    /// Whether the scorecard could be composed at all: `unavailable` when the
+    /// ledger could not be read (fail-closed), `no_data` when no decision falls
+    /// in the window, `available` otherwise.
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Total decisions in the window, across all groups.
+    pub total_decisions: u64,
+    /// One row per group, ranked by decision count descending.
+    pub groups: Vec<ScorecardGroup>,
+    /// Metrics the ledger does not persist, declared plainly rather than
+    /// computed. Each is `unavailable` with the reason it cannot be derived.
+    pub unavailable_metrics: Vec<ScorecardUnavailableMetric>,
+}
+
+/// One group's decision aggregate in an [`AuditScorecardOutput`].
+///
+/// Every rate is a ratio over [`Self::total`] and is independently
+/// recomputable from [`Self::decision_refs`], which lists the exact ledger keys
+/// (`timestamp|plan_id|model`) that composed the group — so the aggregate
+/// summarizes citable rows, never an unverifiable number.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ScorecardGroup {
+    /// The group label: a principal (`agent` / `human`), a rule (`rule 3` /
+    /// `default posture`), or a model/scope name — per the scorecard's `by`.
+    pub key: String,
+    /// Decisions in this group within the window.
+    pub total: u64,
+    /// Decisions the plane allowed outright.
+    pub allow: u64,
+    /// Decisions the plane escalated to human review.
+    pub require_review: u64,
+    /// Decisions the plane denied.
+    pub deny: u64,
+    /// `allow / total` — the proposal acceptance rate.
+    pub acceptance_rate: f64,
+    /// `deny / total` — the denial rate.
+    pub denial_rate: f64,
+    /// `require_review / total` — the escalation rate.
+    pub review_rate: f64,
+    /// The ledger keys that composed this group (`timestamp|plan_id|model`),
+    /// newest first — the citations backing every count above.
+    pub decision_refs: Vec<String>,
+}
+
+/// A metric the scorecard cannot compute because the ledger does not persist
+/// its inputs.
+///
+/// Declared explicitly (not silently omitted) so the honesty is
+/// machine-readable: a consumer sees the metric name, that it is `unavailable`,
+/// and exactly why.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ScorecardUnavailableMetric {
+    /// The metric identifier (`verify_after_pass_rate`, `reverts`,
+    /// `escalation_latency`).
+    pub metric: String,
+    /// Always [`SectionAvailability::Unavailable`].
+    pub availability: SectionAvailability,
+    /// Why the metric cannot be derived from the persisted ledger.
+    pub note: String,
+}
+
+// ---------------------------------------------------------------------------
 // `rocky brief` — the governor's estate digest
 // ---------------------------------------------------------------------------
 

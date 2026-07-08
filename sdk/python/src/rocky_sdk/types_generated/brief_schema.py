@@ -261,7 +261,7 @@ class PolicyPrincipal6(StrEnum):
     agent = "agent"
 
 
-class SectionAvailability4(StrEnum):
+class SectionAvailability7(StrEnum):
     """
     The query ran and the section carries data for the window.
     """
@@ -269,7 +269,7 @@ class SectionAvailability4(StrEnum):
     available = "available"
 
 
-class SectionAvailability5(StrEnum):
+class SectionAvailability8(StrEnum):
     """
     The query ran cleanly but nothing fell inside the window.
     """
@@ -277,7 +277,7 @@ class SectionAvailability5(StrEnum):
     no_data = "no_data"
 
 
-class SectionAvailability6(StrEnum):
+class SectionAvailability9(StrEnum):
     """
     The underlying signal is not recorded in the state store, so the section cannot be composed. Accompanied by a `note` explaining why.
     """
@@ -294,7 +294,7 @@ class BriefCostSection(BaseModel):
     """
     The billed-warehouse adapter cost was computed against, if resolvable from `rocky.toml`.
     """
-    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
+    availability: SectionAvailability7 | SectionAvailability8 | SectionAvailability9
     """
     Whether a brief section's underlying query succeeded and had data.
 
@@ -386,7 +386,7 @@ class BriefDriftSection(BaseModel):
     Drift section — schema drift recorded in the state store.
     """
 
-    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
+    availability: SectionAvailability7 | SectionAvailability8 | SectionAvailability9
     """
     Whether a brief section's underlying query succeeded and had data.
 
@@ -404,7 +404,7 @@ class BriefEscalationsSection(BaseModel):
     Escalations section — `require_review` decisions still awaiting a human.
     """
 
-    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
+    availability: SectionAvailability7 | SectionAvailability8 | SectionAvailability9
     """
     Whether a brief section's underlying query succeeded and had data.
 
@@ -427,7 +427,7 @@ class BriefFreshnessSection(BaseModel):
     Freshness / SLO section, derived from recorded quality snapshots.
     """
 
-    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
+    availability: SectionAvailability7 | SectionAvailability8 | SectionAvailability9
     """
     Whether a brief section's underlying query succeeded and had data.
 
@@ -462,7 +462,7 @@ class BriefQualitySection(BaseModel):
     Quality / check section, derived from recorded quality snapshots.
     """
 
-    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
+    availability: SectionAvailability7 | SectionAvailability8 | SectionAvailability9
     """
     Whether a brief section's underlying query succeeded and had data.
 
@@ -484,7 +484,7 @@ class BriefRunsSection(BaseModel):
     """
     Runs that did not fully succeed, newest first — the exception view. Each cites its `run_id`.
     """
-    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
+    availability: SectionAvailability7 | SectionAvailability8 | SectionAvailability9
     """
     Whether a brief section's underlying query succeeded and had data.
 
@@ -503,7 +503,7 @@ class BriefAgentActivitySection(BaseModel):
     """
 
     allow: conint(ge=0)
-    availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
+    availability: SectionAvailability7 | SectionAvailability8 | SectionAvailability9
     """
     Whether a brief section's underlying query succeeded and had data.
 

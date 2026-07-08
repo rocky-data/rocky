@@ -85,7 +85,7 @@ pub use ai::{
 pub use ai_contract::run_ai_contract;
 pub use apply::{PolicyGate, evaluate_apply_policy, run_apply, run_apply_inline_for_run};
 pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
-pub use audit::{run_audit, run_audit_for};
+pub use audit::{run_audit, run_audit_for, run_audit_scorecard};
 #[cfg(feature = "duckdb")]
 pub use bench::run_bench;
 pub use branch::{

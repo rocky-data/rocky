@@ -217,6 +217,29 @@ impl From<BriefSinceArg> for rocky_cli::commands::BriefSince {
     }
 }
 
+/// The `--by` grouping dimension for `rocky audit --scorecard`. Maps to
+/// [`rocky_cli::output::ScorecardDimension`], kept here so `clap::ValueEnum`
+/// does not need to leak into the output crate.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ScorecardByArg {
+    /// Group by who acted (`agent` / `human`).
+    Principal,
+    /// Group by the winning policy rule (or the default posture).
+    Rule,
+    /// Group by the model the decision was about.
+    Scope,
+}
+
+impl From<ScorecardByArg> for rocky_cli::output::ScorecardDimension {
+    fn from(arg: ScorecardByArg) -> Self {
+        match arg {
+            ScorecardByArg::Principal => rocky_cli::output::ScorecardDimension::Principal,
+            ScorecardByArg::Rule => rocky_cli::output::ScorecardDimension::Rule,
+            ScorecardByArg::Scope => rocky_cli::output::ScorecardDimension::Scope,
+        }
+    }
+}
+
 /// Resolve the effective output format from the (optional) `--output` flag.
 ///
 /// Precedence: an explicit `--output json|table` always wins. When the flag is
@@ -455,6 +478,17 @@ enum Command {
         /// name, a `run_id`, or a `plan_id`.
         #[arg(long = "for")]
         for_subject: Option<String>,
+        /// Aggregate the decision ledger into a trust scorecard (acceptance /
+        /// denial / escalation rates by group) instead of listing decisions.
+        #[arg(long, conflicts_with = "for_subject")]
+        scorecard: bool,
+        /// Scorecard grouping dimension. Only meaningful with `--scorecard`.
+        #[arg(long = "by", value_enum, default_value_t = ScorecardByArg::Principal, requires = "scorecard")]
+        by: ScorecardByArg,
+        /// Scorecard window: `all` (default), or a `<N>d` / `<N>h` duration
+        /// like `30d`. Only meaningful with `--scorecard`.
+        #[arg(long, requires = "scorecard")]
+        window: Option<String>,
         /// Models directory used to compute the downstream blast radius.
         #[arg(long, default_value = "models")]
         models: PathBuf,
@@ -2644,17 +2678,31 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         },
         Command::Audit {
             for_subject,
+            scorecard,
+            by,
+            window,
             models,
-        } => match for_subject {
-            Some(selector) => rocky_cli::commands::run_audit_for(
-                &cli.config,
-                &state_path,
-                &models,
-                &selector,
-                json,
-            ),
-            None => rocky_cli::commands::run_audit(&state_path, json),
-        },
+        } => {
+            if scorecard {
+                rocky_cli::commands::run_audit_scorecard(
+                    &state_path,
+                    by.into(),
+                    window.as_deref(),
+                    json,
+                )
+            } else {
+                match for_subject {
+                    Some(selector) => rocky_cli::commands::run_audit_for(
+                        &cli.config,
+                        &state_path,
+                        &models,
+                        &selector,
+                        json,
+                    ),
+                    None => rocky_cli::commands::run_audit(&state_path, json),
+                }
+            }
+        }
         Command::Brief { since } => {
             rocky_cli::commands::run_brief(&state_path, &cli.config, since.into(), json)
         }
