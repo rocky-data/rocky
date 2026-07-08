@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Model-failure containment surfaces as Dagster asset observations.** When a `rocky run` withholds models because an upstream failed (the `contained[]` blast radius, emitted under `[resilience] contain_failures`), each withheld model now gets a `dg.AssetObservation` carrying the containment reason (`rocky/contained`, `rocky/blocked_by`, `rocky/unblock_hint`), and its declared checks report that reason instead of the generic "table not materialized" placeholder. A contained model is deliberately left unmaterialized — the inverse of the empty-output signalling pattern — so a same-run downstream correctly cascade-skips and the blast radius stays visible; it is never given a fake-green zero-row result, even with `satisfy_empty_outputs=True`. Buffered/streaming execution modes only. Requires a `rocky-sdk` version that surfaces `RunResult.contained`.
+
 ## [1.55.0] — 2026-07-08
 
 ### Changed

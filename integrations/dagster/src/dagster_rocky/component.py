@@ -31,6 +31,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import dagster as dg
@@ -77,6 +78,7 @@ from .sensor import rocky_source_sensor
 from .translator import RockyDagsterTranslator, strip_tenant_component
 from .types import (
     CompileResult,
+    ContainedModel,
     DagResult,
     Diagnostic,
     DiscoverResult,
@@ -161,7 +163,7 @@ def _engine_schema_mismatch_failure(command: str, exc: ValidationError) -> dg.Fa
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Iterable, Iterator, Mapping
     from collections.abc import Set as AbstractSet
 
 #: Metadata key stamped on the zero-row ``MaterializeResult`` that the
@@ -2929,8 +2931,16 @@ def _emit_results(
     * :class:`dg.AssetCheckResult` — one per declared Rocky check, plus one
       ``row_count_anomaly`` (severity WARN) per Rocky-detected anomaly.
     * :class:`dg.AssetObservation` — one per drift action (ALTER COLUMN,
-      DROP+RECREATE, etc.). Drift is a structural change, not pass/fail,
-      so observation is the right primitive.
+      DROP+RECREATE, etc.), plus one per model withheld by failure containment
+      (``RunResult.contained`` — a model not built because an upstream failed
+      under ``[resilience] contain_failures``). Both are structural signals,
+      not pass/fail, so observation is the right primitive. A contained model
+      is deliberately left *unmaterialized* (the inverse of the empty-output
+      pass) so a same-run downstream cascade-skips and the blast radius stays
+      visible; the observation carries the ``rocky/blocked_by`` /
+      ``rocky/unblock_hint`` reason. This wiring is buffered/streaming only —
+      Pipes mode does not reach ``_emit_results``, and its wire cannot tell a
+      contained model apart from an absent one.
 
     When ``satisfy_empty_outputs`` is set, a final pass emits a zero-row
     :class:`dg.MaterializeResult` (marked
@@ -3082,6 +3092,52 @@ def _emit_results(
             yielded_checks.add(spec_key)
             yield anomaly_result
 
+    # Model-failure containment → AssetObservation. A model in ``contained``
+    # was withheld this run because an upstream failed (or was itself withheld)
+    # and ``[resilience] contain_failures`` continued the disjoint subgraphs —
+    # the blast radius of the failures in ``errors``. This is the deliberate
+    # INVERSE of the empty-output emission below: a contained model was NOT
+    # built, so we must NOT stamp a (fake-green) MaterializeResult on it. Left
+    # unmaterialized, a same-run downstream that depends on it correctly
+    # cascade-skips (``can_subset`` does not prune unyielded deps) — the blast
+    # radius stays visible instead of being masked. We surface the *reason*
+    # (blocked_by / unblock_hint) as an ``AssetObservation`` — the same
+    # non-materializing primitive used for drift — so the containment shows up
+    # on the asset timeline. ``contained.model`` is a single model name, so it
+    # resolves through the same string resolver as drift/anomaly. The resolved
+    # keys are collected so the guards below can (1) exclude them from the
+    # empty-output pass and (2) enrich their declared checks' placeholders.
+    #
+    # This only covers the buffered/streaming ``_emit_results`` path. Pipes mode
+    # (``execution_mode="pipes"``) never reaches here — it emits over the Pipes
+    # wire, which reports only what the engine copied and so cannot tell a
+    # contained model apart from an absent one (the same constraint
+    # ``_validate_satisfy_empty_outputs`` cites). dag_mode is a separate emission
+    # path. Neither is wired for containment.
+    contained_by_key: dict[dg.AssetKey, ContainedModel] = {}
+    for run_result in results:
+        for contained in run_result.contained:
+            asset_key = selected_resolver(contained.model)
+            if asset_key is None:
+                continue
+            if asset_key in contained_by_key:
+                # Same model withheld across two results in this op — keep the
+                # first, mirroring the first-wins dedup on materializations.
+                continue
+            contained_by_key[asset_key] = contained
+            yield dg.AssetObservation(
+                asset_key=asset_key,
+                description=(
+                    f"Withheld by failure containment — blocked by "
+                    f"{', '.join(contained.blocked_by) or 'an upstream failure'}"
+                ),
+                metadata={
+                    "rocky/contained": dg.MetadataValue.bool(True),
+                    "rocky/blocked_by": dg.MetadataValue.text(", ".join(contained.blocked_by)),
+                    "rocky/unblock_hint": dg.MetadataValue.text(contained.unblock_hint),
+                },
+            )
+
     # Empty-output satisfaction (opt-in). For a subset / partition run, emit
     # a zero-row MaterializeResult for every selected key that was neither
     # copied nor errored, so a same-run downstream depending on it isn't
@@ -3125,7 +3181,12 @@ def _emit_results(
             )
         else:
             errored_keys = {remap(err.asset_key) for r in results for err in r.errors}
-            empty_keys = selected_keys - materialized_keys - errored_keys
+            # Subtract contained keys too: a withheld model must stay
+            # unmaterialized so the downstream cascade-skips, exactly as an
+            # errored key does. Without this, the empty-output pass would stamp
+            # a fake-green zero-row MaterializeResult on it and mask the blast
+            # radius — the same invariant enforced for errored keys.
+            empty_keys = selected_keys - materialized_keys - errored_keys - set(contained_by_key)
             yield from _empty_output_results(empty_keys, pruned_keys)
     elif pruned_keys:
         # Pruning produced skipped tables but there is no empty-output pass to
@@ -3145,6 +3206,7 @@ def _emit_results(
         yielded_checks=yielded_checks,
         materialized_keys=materialized_keys,
         pruned_keys=pruned_keys,
+        contained_by_key=contained_by_key,
     )
 
 
@@ -3246,6 +3308,7 @@ def _emit_placeholder_checks(
     yielded_checks: set[tuple[dg.AssetKey, str]],
     materialized_keys: set[dg.AssetKey],
     pruned_keys: AbstractSet[dg.AssetKey] = frozenset(),
+    contained_by_key: Mapping[dg.AssetKey, ContainedModel] = MappingProxyType({}),
 ) -> Iterator[dg.AssetCheckResult]:
     """Emit placeholders for declared checks Rocky did not produce.
 
@@ -3257,11 +3320,35 @@ def _emit_placeholder_checks(
     ``passed=True`` with a "not re-checked" status rather than the WARN /
     ``passed=False`` placeholder an unmaterialized table would otherwise get —
     so pruning doesn't overwrite a passing check with a spurious failure.
+
+    A check on a model in ``contained_by_key`` was withheld by failure
+    containment (its upstream failed). It is unmaterialized, so it would
+    otherwise get the generic "table not materialized" WARN placeholder — which
+    says nothing about *why*. Instead it reports the containment reason
+    (``blocked_by`` / ``unblock_hint``) so the check surfaces the blast-radius
+    cause, mirroring the pruned-table special-case above. Still ``passed=False``
+    / WARN — the model was not built and the check did not run; the hard error
+    lives on the root-cause asset in ``errors``.
     """
     for cs in check_specs:
         if cs.asset_key not in selected_keys:
             continue
         if (cs.asset_key, cs.name) in yielded_checks:
+            continue
+
+        contained = contained_by_key.get(cs.asset_key)
+        if contained is not None:
+            blocked = ", ".join(contained.blocked_by) or "an upstream failure"
+            status = f"not checked: model withheld by failure containment (blocked by {blocked})"
+            if contained.unblock_hint:
+                status = f"{status} — {contained.unblock_hint}"
+            yield dg.AssetCheckResult(
+                asset_key=cs.asset_key,
+                check_name=cs.name,
+                passed=False,
+                severity=dg.AssetCheckSeverity.WARN,
+                metadata={"status": dg.MetadataValue.text(status)},
+            )
             continue
 
         if cs.asset_key in pruned_keys:
