@@ -10,6 +10,7 @@ mod catalog;
 #[cfg(feature = "duckdb")]
 mod ci;
 mod ci_diff;
+mod column_skip;
 mod compact;
 mod compare;
 mod compile;
