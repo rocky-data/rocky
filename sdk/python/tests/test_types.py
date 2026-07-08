@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from rocky_sdk import CiResult, CompileResult, DiscoverResult, TestResult, parse_rocky_output
@@ -130,6 +132,81 @@ def test_run_result_threads_check_severity_through_table_checks():
         }
     )
     assert result.check_results[0].checks[0].severity == "warning"
+
+
+def test_run_result_threads_containment_blast_radius():
+    # Shadow-drift regression: `contained[]` is present on the *generated*
+    # `RunOutput`, but `parse_rocky_output` dispatches `run` to the hand-written
+    # `RunResult`. Without the field declared there, Pydantic's default
+    # `extra="ignore"` silently drops the wire value, so a consumer surfacing the
+    # containment blast radius (dagster-rocky) never sees it. This is the same
+    # class of drift the `CheckResult.severity` test above pins.
+    payload = json.dumps(
+        {
+            "version": "1.0.0",
+            "command": "run",
+            "filter": "all",
+            "duration_ms": 42,
+            "tables_copied": 1,
+            "tables_failed": 1,
+            "materializations": [],
+            "check_results": [],
+            "errors": [
+                {"asset_key": ["stg_orders"], "error": "boom", "failure_kind": "query-rejected"}
+            ],
+            "contained": [
+                {
+                    "model": "fct_orders",
+                    "blocked_by": ["stg_orders"],
+                    "unblock_hint": "resolve the stg_orders failure, then re-run",
+                },
+                {
+                    "model": "mart_revenue",
+                    "blocked_by": ["fct_orders"],
+                    "unblock_hint": "resolve the stg_orders failure, then re-run",
+                },
+            ],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+    result = parse_rocky_output(payload)
+    assert isinstance(result, RunResult)
+    assert [c.model for c in result.contained] == ["fct_orders", "mart_revenue"]
+    assert result.contained[0].blocked_by == ["stg_orders"]
+    assert result.contained[1].blocked_by == ["fct_orders"]
+    assert "re-run" in result.contained[0].unblock_hint
+
+
+def test_run_result_containment_defaults_empty_when_omitted():
+    # A default fail-fast / successful run omits `contained` on the wire; it must
+    # surface as an empty list, not raise.
+    payload = json.dumps(
+        {
+            "version": "1.0.0",
+            "command": "run",
+            "filter": "all",
+            "duration_ms": 1,
+            "tables_copied": 0,
+            "materializations": [],
+            "check_results": [],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+    result = parse_rocky_output(payload)
+    assert isinstance(result, RunResult)
+    assert result.contained == []
 
 
 def test_parse_rocky_output_rejects_non_object():

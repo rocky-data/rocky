@@ -41,6 +41,7 @@ def _run_result(
     errors: list[dict] | None = None,
     tables_failed: int | None = None,
     excluded_tables: list[dict] | None = None,
+    contained: list[dict] | None = None,
 ) -> RunResult:
     mats = materializations or []
     errs = errors or []
@@ -59,6 +60,7 @@ def _run_result(
             "check_results": [],
             "errors": errs,
             "excluded_tables": excluded_tables or [],
+            "contained": contained or [],
             "permissions": {
                 "grants_added": 0,
                 "grants_revoked": 0,
@@ -68,6 +70,10 @@ def _run_result(
             "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
         }
     )
+
+
+def _contained(model: str, blocked_by: list[str], hint: str = "resolve upstream, re-run") -> dict:
+    return {"model": model, "blocked_by": blocked_by, "unblock_hint": hint}
 
 
 def _mat(name: str, rows: int = 10) -> dict:
@@ -569,3 +575,157 @@ def test_prune_without_satisfy_empty_outputs_warns(caplog):
             )
         )
     assert any("prune_unchanged skipped" in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# Model-failure containment — a withheld model surfaces as an AssetObservation,
+# stays UNMATERIALIZED (the inverse of empty-output), and enriches its checks.
+# --------------------------------------------------------------------------- #
+
+
+def test_contained_model_emits_observation_and_is_not_fake_greened():
+    """A model withheld by failure containment yields an ``AssetObservation``
+    carrying the reason (blocked_by / unblock_hint) and is NOT stamped with an
+    empty MaterializeResult even with ``satisfy_empty_outputs=True`` — the blast
+    radius must stay visible, the deliberate inverse of empty-output. A
+    genuinely-absent sibling still IS satisfied, proving the guard is targeted."""
+    a_raw, b_raw, c_raw = (dg.AssetKey([x]) for x in ("a_raw", "b_raw", "c_raw"))
+    mapping = {("a_raw",): a_raw, ("b_raw",): b_raw, ("c_raw",): c_raw}
+    # a_raw copied; b_raw genuinely absent; c_raw withheld because `root` failed.
+    run_result = _run_result(
+        materializations=[_mat("a_raw")],
+        errors=[{"asset_key": ["root"], "error": "boom", "failure_kind": "query-rejected"}],
+        contained=[_contained("c_raw", ["root"], "fix root, then re-run")],
+    )
+
+    events = list(
+        _emit_results(
+            results=[run_result],
+            check_specs=[],
+            selected_keys={a_raw, b_raw, c_raw},
+            rocky_key_to_dagster_key=mapping,
+            satisfy_empty_outputs=True,
+        )
+    )
+
+    obs = [e for e in events if isinstance(e, dg.AssetObservation) and e.asset_key == c_raw]
+    assert len(obs) == 1
+    md = obs[0].metadata
+    assert md["rocky/contained"].value is True
+    assert md["rocky/blocked_by"].value == "root"
+    assert md["rocky/unblock_hint"].value == "fix root, then re-run"
+
+    # Guard 1: c_raw (contained) is NOT fake-greened; b_raw (absent) IS.
+    empty_keys = {
+        e.asset_key
+        for e in events
+        if isinstance(e, dg.MaterializeResult) and e.metadata.get(EMPTY_FOR_PARTITION_METADATA_KEY)
+    }
+    assert c_raw not in empty_keys
+    assert b_raw in empty_keys
+    # And no real materialization for c_raw either — it stays unmaterialized.
+    real = {
+        e.asset_key
+        for e in events
+        if isinstance(e, dg.MaterializeResult)
+        and not e.metadata.get(EMPTY_FOR_PARTITION_METADATA_KEY)
+    }
+    assert real == {a_raw}
+
+
+def test_contained_model_placeholder_check_reports_containment_reason():
+    """Guard 2: a declared check on a contained model reports the containment
+    reason (blocked_by + unblock_hint) instead of the generic "table not
+    materialized" WARN placeholder an unmaterialized table would otherwise get."""
+    c_raw = dg.AssetKey(["c_raw"])
+    mapping = {("c_raw",): c_raw}
+    run_result = _run_result(
+        errors=[{"asset_key": ["root"], "error": "boom", "failure_kind": "query-rejected"}],
+        contained=[_contained("c_raw", ["root"], "fix root, then re-run")],
+    )
+
+    events = list(
+        _emit_results(
+            results=[run_result],
+            check_specs=[dg.AssetCheckSpec(name="row_count", asset=c_raw)],
+            selected_keys={c_raw},
+            rocky_key_to_dagster_key=mapping,
+            satisfy_empty_outputs=True,
+        )
+    )
+
+    checks = [e for e in events if isinstance(e, dg.AssetCheckResult)]
+    assert len(checks) == 1
+    assert checks[0].asset_key == c_raw
+    assert checks[0].check_name == "row_count"
+    assert checks[0].passed is False
+    assert checks[0].severity == dg.AssetCheckSeverity.WARN
+    status = checks[0].metadata["status"].value
+    assert "failure containment" in status
+    assert "root" in status  # the blocked_by upstream is named
+    assert "fix root, then re-run" in status  # the unblock hint is appended
+    assert "table not materialized" not in status  # NOT the generic placeholder
+
+
+def test_contained_upstream_cascade_skips_downstream_even_with_flag():
+    """The discriminating end-to-end case, driven through ``dg.materialize``:
+    with ``satisfy_empty_outputs=True`` a contained upstream is left
+    unmaterialized (only observed), so a same-run downstream that depends on it
+    still cascade-skips. This proves both that an ``AssetObservation`` does NOT
+    satisfy a ``can_subset`` output and that Guard 1 holds — were the contained
+    key fake-greened, the downstream ``c`` would RUN instead of skip."""
+    a_raw, b_raw, c_raw = (dg.AssetKey([x]) for x in ("a_raw", "b_raw", "c_raw"))
+    mapping = {("a_raw",): a_raw, ("b_raw",): b_raw, ("c_raw",): c_raw}
+    run_result = _run_result(
+        materializations=[_mat("a_raw"), _mat("b_raw")],
+        errors=[{"asset_key": ["root"], "error": "boom", "failure_kind": "query-rejected"}],
+        contained=[_contained("c_raw", ["root"], "fix root, then re-run")],
+    )
+
+    @dg.multi_asset(
+        specs=[dg.AssetSpec("a_raw"), dg.AssetSpec("b_raw"), dg.AssetSpec("c_raw")],
+        can_subset=True,
+        name="up",
+    )
+    def up(context):
+        yield from _emit_results(
+            results=[run_result],
+            check_specs=[],
+            selected_keys=set(context.selected_asset_keys),
+            rocky_key_to_dagster_key=mapping,
+            satisfy_empty_outputs=True,
+        )
+
+    @dg.multi_asset(
+        specs=[
+            dg.AssetSpec("a", deps=["a_raw"]),
+            dg.AssetSpec("b", deps=["b_raw"]),
+            dg.AssetSpec("c", deps=["c_raw"]),
+        ],
+        can_subset=True,
+        name="down",
+    )
+    def down(context):
+        for k in context.selected_asset_keys:
+            yield dg.MaterializeResult(asset_key=k)
+
+    result = dg.materialize([up, down], raise_on_error=False)
+    assert result.success  # up succeeds; the run still reports SUCCESS
+
+    mats = list(result.get_asset_materialization_events())
+    keys = {e.asset_key.to_user_string() for e in mats}
+    # up copied a_raw/b_raw; c_raw is contained → NOT materialized (no empty stamp).
+    assert {"a_raw", "b_raw"} <= keys
+    assert "c_raw" not in keys
+    # down depends on the withheld c_raw, so it cascade-skips (produces nothing).
+    assert keys & {"a", "b", "c"} == set()
+
+    # The containment observation was recorded against c_raw.
+    obs = [e for e in result.all_events if e.event_type_value == "ASSET_OBSERVATION"]
+    contained_obs = [
+        e
+        for e in obs
+        if "rocky/contained" in (e.event_specific_data.asset_observation.metadata or {})
+    ]
+    assert len(contained_obs) == 1
+    assert contained_obs[0].event_specific_data.asset_observation.asset_key == c_raw
