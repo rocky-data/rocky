@@ -1,0 +1,9 @@
+name = "fct_orders"
+
+[target]
+catalog = "poc"
+schema = "gold"
+table = "fct_orders"
+
+[tags]
+layer = "gold"

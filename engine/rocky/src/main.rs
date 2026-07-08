@@ -127,8 +127,61 @@ struct Cli {
     #[arg(long, global = true)]
     cache_ttl: Option<u64>,
 
+    /// Authoring principal for the F3 agent-policy plane (`human` | `agent`).
+    ///
+    /// Stamped onto plans created by `rocky plan` so a later `rocky apply`
+    /// evaluates them against the identity that authored them. The CLI surface
+    /// default is `human`; a harness driving `rocky` announces itself with
+    /// `--principal agent` (or `ROCKY_PRINCIPAL=agent`). An explicit
+    /// `--principal` always wins and is the only way to lower an env-raised
+    /// floor (a downgrade warns). Absent `[policy]`, this flag has no effect.
+    #[arg(long, global = true, value_enum)]
+    principal: Option<PolicyPrincipalArg>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Resolve the effective CLI authoring principal per the frozen §3 precedence.
+///
+/// The CLI surface floor is `human`. `ROCKY_PRINCIPAL` may *raise* to `agent`
+/// but never silently lower it; an explicit `--principal` always wins and is
+/// the only way to lower below an env-raised floor (a downgrade warns on
+/// stderr). Invalid `ROCKY_PRINCIPAL` values are a hard error (fail-closed),
+/// not a silent fallback.
+fn resolve_cli_principal(
+    flag: Option<PolicyPrincipalArg>,
+) -> Result<rocky_core::config::PolicyPrincipal> {
+    use rocky_core::config::PolicyPrincipal;
+
+    // The env floor: `ROCKY_PRINCIPAL` can only raise restrictiveness (→ agent).
+    let env_agent = match std::env::var("ROCKY_PRINCIPAL") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "agent" => Some(true),
+            "human" => Some(false),
+            other => {
+                anyhow::bail!("invalid ROCKY_PRINCIPAL='{other}': expected 'human' or 'agent'")
+            }
+        },
+        Err(_) => None,
+    };
+
+    if let Some(flag) = flag {
+        let resolved: PolicyPrincipal = flag.into();
+        // Warn when an explicit flag lowers an env-raised agent floor.
+        if resolved == PolicyPrincipal::Human && env_agent == Some(true) {
+            eprintln!(
+                "warning: --principal human overrides ROCKY_PRINCIPAL=agent — \
+                 the agent policy floor is lowered for this invocation"
+            );
+        }
+        return Ok(resolved);
+    }
+
+    Ok(match env_agent {
+        Some(true) => PolicyPrincipal::Agent,
+        _ => PolicyPrincipal::Human,
+    })
 }
 
 #[derive(Clone, clap::ValueEnum, PartialEq, Eq, Debug)]
@@ -345,6 +398,13 @@ enum Command {
         #[command(subcommand)]
         subcommand: PolicySubcommand,
     },
+
+    /// Show the agent-policy decision ledger
+    ///
+    /// Lists every policy decision recorded at a mutating enforcement seam
+    /// (`rocky apply` / promote), oldest first. Reads are never recorded, so
+    /// this is the audit trail of governed mutations the policy plane evaluated.
+    Audit,
 
     /// Validate config without connecting to any APIs
     Validate,
@@ -2496,6 +2556,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 json,
             ),
         },
+        Command::Audit => rocky_cli::commands::run_audit(&state_path, json),
         Command::Validate => rocky_cli::commands::validate(&cli.config, json),
         Command::Discover {
             pipeline,
@@ -2585,6 +2646,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     governance_override: gov_override,
                     models_dir,
                     partition_opts,
+                    principal: Some(resolve_cli_principal(cli.principal)?),
                 };
                 rocky_cli::commands::plan(
                     &cli.config,

@@ -171,6 +171,33 @@ pub enum BreakingChange {
     SqlBodyChanged { model: String },
 }
 
+impl BreakingChange {
+    /// The model this change is about, as the externally-visible target name
+    /// the diff pairs on (`target.full_name()`). Every variant carries a
+    /// `model` field; this returns it uniformly so callers can group findings
+    /// by model without matching each variant.
+    pub fn model(&self) -> &str {
+        match self {
+            BreakingChange::ModelRemoved { model }
+            | BreakingChange::ModelAdded { model }
+            | BreakingChange::ColumnDropped { model, .. }
+            | BreakingChange::ColumnAdded { model, .. }
+            | BreakingChange::ColumnTypeChanged { model, .. }
+            | BreakingChange::ColumnNullabilityChanged { model, .. }
+            | BreakingChange::ColumnReordered { model, .. }
+            | BreakingChange::MaterializationStrategyChanged { model, .. }
+            | BreakingChange::MaterializationKeyChanged { model, .. }
+            | BreakingChange::ReplicationColumnsChanged { model, .. }
+            | BreakingChange::PartitionByChanged { model, .. }
+            | BreakingChange::TargetRenamed { model, .. }
+            | BreakingChange::SourceChanged { model, .. }
+            | BreakingChange::ColumnMaskChanged { model, .. }
+            | BreakingChange::LakehouseFormatChanged { model, .. }
+            | BreakingChange::SqlBodyChanged { model } => model,
+        }
+    }
+}
+
 /// A classified finding produced by [`diff_project_ir`].
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BreakingFinding {

@@ -156,6 +156,19 @@ const INPUT_PROVENANCE: TableDefinition<&str, &[u8]> = TableDefinition::new("inp
 /// rewritten each `discover` run when `report_new_sources` is set, so the next
 /// run can diff "sources present now but absent before" into `new_sources`.
 const DISCOVER_SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("discover_snapshots");
+/// Append-only agent-policy decision ledger.
+///
+/// Key format: `"{timestamp_rfc3339}|{plan_id}|{model}"`. Value: serialized
+/// [`PolicyDecisionRecord`]. One row per policy *evaluation* at a mutating
+/// enforcement seam (`rocky apply` / promote) — reads are never recorded
+/// (they short-circuit before evaluation). Queried by `rocky audit`.
+///
+/// Mirrors [`OUTPUT_ARTIFACTS`]: replicates across backends by default (it is
+/// intentionally NOT in [`LOCAL_ONLY_TABLE_NAMES`]) so the audit trail is
+/// global ground truth, not machine-local scratch. Remote keys are
+/// schema-version-qualified by `state_sync`, so a v14 ledger never mixes with
+/// another schema version's.
+const POLICY_DECISIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("policy_decisions");
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -241,7 +254,15 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   back-reads cleanly on a v12 binary (serde ignores the extra key). No new
 ///   tables, no in-place migration. Guarded by
 ///   `test_v12_upstream_sig_forward_deserializes_consumed_column_hashes_none`.
-const CURRENT_SCHEMA_VERSION: u32 = 13;
+/// - **v14** — adds the [`POLICY_DECISIONS`] table for the agent-policy
+///   decision ledger (agent-authority enforcement at `rocky apply` / promote).
+///   Pure additive schema change, same shape as the v7 [`OUTPUT_ARTIFACTS`]
+///   add: v13 databases auto-create the empty table on next open and stamp
+///   themselves as v14. No blob migration needed; existing tables are
+///   untouched. Empty until a project with a `[policy]` block applies an
+///   agent-authored plan, so pre-existing state resumes unchanged. Guarded by
+///   `test_v13_opens_and_creates_policy_decisions_table`.
+const CURRENT_SCHEMA_VERSION: u32 = 14;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -632,6 +653,7 @@ impl StateStore {
             let _table = txn.open_table(INPUT_INDEX)?;
             let _table = txn.open_table(INPUT_PROVENANCE)?;
             let _table = txn.open_table(DISCOVER_SNAPSHOTS)?;
+            let _table = txn.open_table(POLICY_DECISIONS)?;
         }
         txn.commit()?;
         Ok(InitOutcome::Ready)
@@ -2523,6 +2545,49 @@ impl StateStore {
     }
 
     // -----------------------------------------------------------------------
+    // Agent-policy decision ledger (POLICY_DECISIONS)
+    // -----------------------------------------------------------------------
+
+    /// Append a policy decision to the ledger.
+    ///
+    /// Called once per policy *evaluation* at a mutating enforcement seam
+    /// (`rocky apply` / promote), for both `allow` and gate (`require_review`
+    /// / `deny`) outcomes. Reads are never recorded — they short-circuit
+    /// before evaluation. Idempotent for an identical `(timestamp, plan_id,
+    /// model)` triple (re-recording overwrites the same row).
+    pub fn record_policy_decision(
+        &self,
+        decision: &PolicyDecisionRecord,
+    ) -> Result<(), StateError> {
+        let key = policy_decision_key(&decision.timestamp, &decision.plan_id, &decision.model);
+        let bytes = serde_json::to_vec(decision)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(POLICY_DECISIONS)?;
+            table.insert(key.as_str(), bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Return every recorded policy decision, oldest first.
+    ///
+    /// Keys are `"{timestamp_rfc3339}|{plan_id}|{model}"`, which sort
+    /// chronologically, so a forward table scan yields decisions in the order
+    /// they were recorded. Backs `rocky audit`.
+    pub fn list_policy_decisions(&self) -> Result<Vec<PolicyDecisionRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(POLICY_DECISIONS)?;
+        let mut results = Vec::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let record: PolicyDecisionRecord = serde_json::from_slice(value.value())?;
+            results.push(record);
+        }
+        Ok(results)
+    }
+
+    // -----------------------------------------------------------------------
     // Input-match index + provenance (auditable-reuse spine — dormant)
     // -----------------------------------------------------------------------
 
@@ -2984,6 +3049,21 @@ fn provenance_key(run_id: &str, model_name: &str) -> String {
     format!("{run_id}|{model_name}")
 }
 
+/// Builds the key for the [`POLICY_DECISIONS`] table.
+///
+/// Composition: `"{timestamp_rfc3339}|{plan_id}|{model}"`. The RFC 3339
+/// timestamp prefix sorts chronologically under redb's lexicographic key
+/// order, so a forward scan replays decisions oldest-first; `plan_id` +
+/// `model` disambiguate multiple decisions recorded within the same
+/// timestamp tick.
+fn policy_decision_key(
+    timestamp: &chrono::DateTime<chrono::Utc>,
+    plan_id: &str,
+    model: &str,
+) -> String {
+    format!("{}|{plan_id}|{model}", timestamp.to_rfc3339())
+}
+
 /// One row in the content-addressed write ledger ([`OUTPUT_ARTIFACTS`]).
 ///
 /// Recorded once per `WriteResult` from
@@ -3023,6 +3103,38 @@ pub struct ArtifactRecord {
     /// same as the write's Delta `modification_time_millis` (that's in
     /// the log); close enough for retention sweep windows.
     pub written_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One row in the agent-policy decision ledger ([`POLICY_DECISIONS`]).
+///
+/// Recorded once per policy *evaluation* at a mutating enforcement seam
+/// (`rocky apply` / promote). The `effect` is the resolved verdict for the
+/// evaluated `model`; `rule_id` is the winning `[[policy.rules]]` index (or
+/// `None` for the default posture / short-circuit). Adding fields later is
+/// forward-compatible via `#[serde(default)]` — the same additive pattern the
+/// artifact and run ledgers use.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PolicyDecisionRecord {
+    /// Wall clock when the decision was recorded.
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// The plan the decision governed (`plan_id`).
+    pub plan_id: String,
+    /// Who was acting (`human` / `agent`).
+    pub principal: crate::config::PolicyPrincipal,
+    /// The capability that was evaluated (the model's change-classification
+    /// refinement of `apply` / `promote`, or the bare verb).
+    pub capability: crate::config::PolicyCapability,
+    /// The model the decision was about — the concrete scope that matched.
+    pub model: String,
+    /// The resolved verdict.
+    pub effect: crate::config::PolicyEffect,
+    /// Index of the winning `[[policy.rules]]` entry, or `None` for the
+    /// default posture / short-circuit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<usize>,
+    /// Human-readable explanation of how the effect was reached.
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// One row in the input-match index ([`INPUT_INDEX`]).
@@ -6307,6 +6419,60 @@ mod tests {
     }
 
     #[test]
+    fn policy_decision_round_trip_and_ordering() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        let (store, _dir) = temp_store();
+        // Two decisions with distinct timestamps → forward scan is oldest-first.
+        let earlier = PolicyDecisionRecord {
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            plan_id: "plan_a".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::SchemaChangeAdditive,
+            model: "raw_events".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: Some(1),
+            reason: "allow by rule 1".to_string(),
+        };
+        let later = PolicyDecisionRecord {
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T11:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            plan_id: "plan_b".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "fct_orders".to_string(),
+            effect: PolicyEffect::Deny,
+            rule_id: Some(0),
+            reason: "denied by rule 0 (deny overrides)".to_string(),
+        };
+        // Insert out of order; the ledger must return them chronologically.
+        store.record_policy_decision(&later).unwrap();
+        store.record_policy_decision(&earlier).unwrap();
+
+        let all = store.list_policy_decisions().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0], earlier, "oldest decision first");
+        assert_eq!(all[1], later);
+    }
+
+    #[test]
+    fn test_v13_opens_and_creates_policy_decisions_table() {
+        // A store freshly opened under the current binary materializes the
+        // `policy_decisions` table (part of the eager EXPECTED_TABLES set) and
+        // stamps itself at v14. Reads succeed against an empty ledger.
+        let (store, _dir) = temp_store();
+        assert_eq!(current_schema_version(), 14);
+        let decisions = store.list_policy_decisions().unwrap();
+        assert!(
+            decisions.is_empty(),
+            "a fresh store has an empty policy-decision ledger"
+        );
+    }
+
+    #[test]
     fn artifact_round_trip_by_hash() {
         // Record one artifact, look it up by its blake3 hash.
         let (store, _dir) = temp_store();
@@ -6690,14 +6856,13 @@ mod tests {
         // is an on-disk break that needs a `CURRENT_SCHEMA_VERSION` bump + a
         // migration path, not just an edit here.
         //
-        // v13 bumps the version for the `consumed_column_hashes` field added to
-        // the `UpstreamSig` blob (carried on `ModelExecution.upstream_freshness`).
-        // The table set below is deliberately unchanged — v13 adds no tables,
-        // only a serde-defaulted blob field — so the forward-compat path is the
-        // existing default-on-missing behaviour (guarded by
-        // `test_v12_upstream_sig_forward_deserializes_consumed_column_hashes_none`
-        // and the `open_with_policy_*` mismatch tests), not a new migration.
-        const EXPECTED_VERSION: u32 = 13;
+        // v14 adds the `policy_decisions` table for the agent-policy decision
+        // ledger — a pure additive table add, the same shape as the v7
+        // `output_artifacts` add. A v13 database auto-creates the empty table on
+        // next open and stamps itself v14; the forward-compat path is the
+        // existing version-mismatch handling (guarded by the `open_with_policy_*`
+        // tests), not a blob migration.
+        const EXPECTED_VERSION: u32 = 14;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
@@ -6711,6 +6876,7 @@ mod tests {
             "metadata",
             "output_artifacts",
             "partitions",
+            "policy_decisions",
             "quality_history",
             "run_history",
             "run_progress",

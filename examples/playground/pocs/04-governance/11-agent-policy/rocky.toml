@@ -1,0 +1,59 @@
+# Agent-policy plane — ENFORCED at apply time.
+#
+# Three tiny models plus a `[policy]` block that gates what an agent-authored
+# plan may do. Unlike the explain-only `policy-gallery`, this POC drives the
+# real enforcement seam: `rocky apply` consults the policy plane and refuses a
+# denied change before touching the warehouse.
+#
+#   fct_orders   — contracted (sibling .contract.toml), layer=gold  -> DENY apply
+#   dim_customer — layer=silver, column `email` classified pii
+#   raw_events   — layer=bronze, no classifications                 -> ALLOW additive
+#
+# `rocky plan` resolves a replication pipeline to reach its discovery gate, then
+# builds a run plan from `models/`. The pipeline below discovers `raw__`-prefixed
+# sources (there are none in a fresh DuckDB — discovery is empty), so the plan
+# is a pure transformation run plan over the three models.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.gallery]
+strategy = "full_refresh"
+
+[pipeline.gallery.source.discovery]
+adapter = "default"
+
+[pipeline.gallery.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.gallery.target]
+catalog_template = "poc"
+schema_template = "staging__{source}"
+
+[pipeline.gallery.target.governance]
+auto_create_schemas = true
+
+[policy]
+version = 1
+# The dial's factory position: an agent mutation with no matching rule meets a
+# human. Adopting `[policy]` with only this line reproduces today's behaviour.
+default_agent_effect = "require_review"
+
+# A contracted model is a cross-team boundary — an agent may never apply a
+# change to it. A hard deny that no allow overturns and no review satisfies.
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { contracted = true }
+effect = "deny"
+
+# An agent may make additive schema changes to a bronze, non-PII model
+# autonomously — this is the dial turned up for a low-risk surface.
+[[policy.rules]]
+principal = "agent"
+capability = "schema_change.additive"
+scope = { layer = "bronze", exclude_classifications = ["pii"] }
+effect = "allow"

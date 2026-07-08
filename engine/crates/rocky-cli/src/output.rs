@@ -6071,6 +6071,42 @@ pub struct PolicyModelAttributes {
     pub downstreams: u64,
 }
 
+/// JSON output for `rocky audit` — the agent-policy decision ledger.
+///
+/// Lists every policy decision recorded at a mutating enforcement seam
+/// (`rocky apply` / promote), oldest first. Reads are never recorded, so this
+/// is exclusively the trail of *governed mutations* the plane evaluated.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuditOutput {
+    pub version: String,
+    pub command: String,
+    /// Every recorded policy decision, oldest first.
+    pub decisions: Vec<AuditDecisionEntry>,
+}
+
+/// One recorded policy decision in the [`AuditOutput`] ledger.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuditDecisionEntry {
+    /// RFC 3339 timestamp when the decision was recorded.
+    pub timestamp: String,
+    /// The plan the decision governed.
+    pub plan_id: String,
+    /// Who was acting (`human` / `agent`).
+    pub principal: rocky_core::config::PolicyPrincipal,
+    /// The capability that was evaluated.
+    pub capability: rocky_core::config::PolicyCapability,
+    /// The model the decision was about.
+    pub model: String,
+    /// The resolved verdict (`allow` / `require_review` / `deny`).
+    pub effect: rocky_core::config::PolicyEffect,
+    /// Index of the winning `[[policy.rules]]` entry, or `null` for the
+    /// default posture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<usize>,
+    /// Human-readable explanation of how the effect was reached.
+    pub reason: String,
+}
+
 /// JSON output for `rocky replay <run_id|latest>`.
 ///
 /// Inspection-only surface over the state store's [`RunRecord`]: shows every

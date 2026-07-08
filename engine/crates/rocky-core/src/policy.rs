@@ -28,9 +28,70 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::breaking_change::{BreakingChange, BreakingFinding};
 use crate::config::{
     PolicyCapability, PolicyConfig, PolicyEffect, PolicyPrincipal, PolicyScope, glob_match,
 };
+
+/// Classify one model's change into the capability that governs its apply,
+/// per the frozen fail-closed §2.4 rules.
+///
+/// - Every finding is a bare `ColumnAdded` / `ModelAdded` ⇒
+///   [`PolicyCapability::SchemaChangeAdditive`].
+/// - The *only* change is `SqlBodyChanged` (alone) ⇒
+///   [`PolicyCapability::ValueChange`].
+/// - **Everything else — including an empty finding set — ⇒
+///   [`PolicyCapability::SchemaChangeBreaking`]** (fail closed). A widening
+///   `ColumnTypeChanged`, a `ColumnMaskChanged`, a mixed additive+body change,
+///   or "no findings for this model" all resolve up to breaking: if we cannot
+///   *prove* a change is additive-or-cosmetic, we treat it as breaking.
+///
+/// Callers pass the findings that belong to a **single** model (already
+/// grouped). An empty slice classifies as breaking — the caller is expected
+/// to only classify models it knows were changed; the empty case is the
+/// belt-and-braces fail-closed floor.
+pub fn classify_model_findings(findings: &[&BreakingFinding]) -> PolicyCapability {
+    if findings.is_empty() {
+        return PolicyCapability::SchemaChangeBreaking;
+    }
+    let all_additive = findings.iter().all(|f| {
+        matches!(
+            f.change,
+            BreakingChange::ColumnAdded { .. } | BreakingChange::ModelAdded { .. }
+        )
+    });
+    if all_additive {
+        return PolicyCapability::SchemaChangeAdditive;
+    }
+    let only_body = findings
+        .iter()
+        .all(|f| matches!(f.change, BreakingChange::SqlBodyChanged { .. }));
+    if only_body {
+        return PolicyCapability::ValueChange;
+    }
+    PolicyCapability::SchemaChangeBreaking
+}
+
+/// Group a flat findings list by model (`change.model()`) and classify each
+/// changed model into its governing capability. Only models that carry at
+/// least one finding appear in the result — unchanged models are absent (they
+/// are not schema changes and are not gated). Keyed by `target.full_name()`;
+/// callers that key on the logical model name must remap.
+pub fn classify_findings_by_model(
+    findings: &[BreakingFinding],
+) -> BTreeMap<String, PolicyCapability> {
+    let mut by_model: BTreeMap<String, Vec<&BreakingFinding>> = BTreeMap::new();
+    for finding in findings {
+        by_model
+            .entry(finding.change.model().to_string())
+            .or_default()
+            .push(finding);
+    }
+    by_model
+        .into_iter()
+        .map(|(model, group)| (model, classify_model_findings(&group)))
+        .collect()
+}
 
 /// The compiled attributes of one model that the policy matcher reads.
 ///
@@ -150,6 +211,15 @@ fn scope_constraints(scope: &PolicyScope, attrs: &ModelAttributes) -> Option<BTr
     }
     // `max_downstreams` is parse-only in v0: neither required nor counted.
     Some(set)
+}
+
+/// Restrictiveness rank for aggregating per-model effects into a single
+/// plan-level effect: `deny` (2) > `require_review` (1) > `allow` (0). The
+/// plan-level enforcement decision (see the CLI apply path) is the
+/// most-restrictive effect across every evaluated model, so a single
+/// protected model cannot be diluted by bundling it with permissive ones.
+pub fn effect_rank(effect: PolicyEffect) -> u8 {
+    restrictiveness(effect)
 }
 
 /// Restrictiveness rank among non-deny effects — higher wins ties between
@@ -654,6 +724,136 @@ mod tests {
         let d = evaluate(&p, PolicyPrincipal::Agent, PolicyCapability::Apply, &attrs);
         assert_eq!(d.matched_rule, None);
         assert_eq!(d.effect, PolicyEffect::RequireReview);
+    }
+
+    // ---------- change classification (§2.4, fail-closed) ----------
+
+    use crate::breaking_change::{BreakingChange, BreakingFinding, BreakingSeverity};
+
+    fn finding(change: BreakingChange, severity: BreakingSeverity) -> BreakingFinding {
+        BreakingFinding { change, severity }
+    }
+
+    #[test]
+    fn classify_all_additive_is_additive() {
+        let f1 = finding(
+            BreakingChange::ColumnAdded {
+                model: "db.s.t".to_string(),
+                column: "c".to_string(),
+                data_type: "String".to_string(),
+                nullable: true,
+            },
+            BreakingSeverity::Info,
+        );
+        let f2 = finding(
+            BreakingChange::ModelAdded {
+                model: "db.s.t".to_string(),
+            },
+            BreakingSeverity::Info,
+        );
+        assert_eq!(
+            classify_model_findings(&[&f1, &f2]),
+            PolicyCapability::SchemaChangeAdditive
+        );
+    }
+
+    #[test]
+    fn classify_only_sql_body_is_value_change() {
+        let f = finding(
+            BreakingChange::SqlBodyChanged {
+                model: "db.s.t".to_string(),
+            },
+            BreakingSeverity::Info,
+        );
+        assert_eq!(
+            classify_model_findings(&[&f]),
+            PolicyCapability::ValueChange
+        );
+    }
+
+    #[test]
+    fn classify_widening_type_change_fails_closed_to_breaking() {
+        // Int64 -> String scores Info (not narrowing) but is NOT additive.
+        let f = finding(
+            BreakingChange::ColumnTypeChanged {
+                model: "db.s.t".to_string(),
+                column: "c".to_string(),
+                old_type: "Int64".to_string(),
+                new_type: "String".to_string(),
+                narrowing: false,
+            },
+            BreakingSeverity::Info,
+        );
+        assert_eq!(
+            classify_model_findings(&[&f]),
+            PolicyCapability::SchemaChangeBreaking
+        );
+    }
+
+    #[test]
+    fn classify_additive_plus_body_is_breaking() {
+        let add = finding(
+            BreakingChange::ColumnAdded {
+                model: "db.s.t".to_string(),
+                column: "c".to_string(),
+                data_type: "String".to_string(),
+                nullable: true,
+            },
+            BreakingSeverity::Info,
+        );
+        let body = finding(
+            BreakingChange::SqlBodyChanged {
+                model: "db.s.t".to_string(),
+            },
+            BreakingSeverity::Info,
+        );
+        assert_eq!(
+            classify_model_findings(&[&add, &body]),
+            PolicyCapability::SchemaChangeBreaking
+        );
+    }
+
+    #[test]
+    fn classify_empty_findings_fails_closed_to_breaking() {
+        assert_eq!(
+            classify_model_findings(&[]),
+            PolicyCapability::SchemaChangeBreaking
+        );
+    }
+
+    #[test]
+    fn classify_by_model_groups_and_classifies() {
+        let findings = vec![
+            finding(
+                BreakingChange::ModelAdded {
+                    model: "db.s.bronze".to_string(),
+                },
+                BreakingSeverity::Info,
+            ),
+            finding(
+                BreakingChange::ColumnDropped {
+                    model: "db.s.gold".to_string(),
+                    column: "id".to_string(),
+                    data_type: "Int64".to_string(),
+                },
+                BreakingSeverity::Breaking,
+            ),
+        ];
+        let by = classify_findings_by_model(&findings);
+        assert_eq!(
+            by.get("db.s.bronze"),
+            Some(&PolicyCapability::SchemaChangeAdditive)
+        );
+        assert_eq!(
+            by.get("db.s.gold"),
+            Some(&PolicyCapability::SchemaChangeBreaking)
+        );
+    }
+
+    #[test]
+    fn effect_rank_orders_deny_over_review_over_allow() {
+        assert!(effect_rank(PolicyEffect::Deny) > effect_rank(PolicyEffect::RequireReview));
+        assert!(effect_rank(PolicyEffect::RequireReview) > effect_rank(PolicyEffect::Allow));
     }
 
     #[test]
