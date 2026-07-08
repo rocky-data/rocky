@@ -190,6 +190,78 @@ pub fn generate_show_delta_retention_sql(
     ))
 }
 
+/// Vendor-neutral namespace prefix for every recipe-manifest `TBLPROPERTIES`
+/// key Rocky writes into a table's warehouse-side metadata.
+///
+/// Each manifest field travels as `recipe_manifest.<field-path>` (e.g.
+/// `recipe_manifest.program_hash`, `recipe_manifest.producer.version`). The
+/// prefix is deliberately **not** a vendor brand like `rocky.` — vendor
+/// identity belongs in the manifest's `producer` field, not in the key, so the
+/// key doesn't read as "lock-in via metadata". The shared namespace lets a
+/// reader glob these keys and distinguish them both from `delta.*` reserved
+/// properties and from arbitrary user tags.
+pub const RECIPE_MANIFEST_TBLPROP_PREFIX: &str = "recipe_manifest.";
+
+/// Generates `ALTER TABLE <catalog>.<schema>.<table> SET TBLPROPERTIES (...)`
+/// for an arbitrary set of validated key-value pairs.
+///
+/// This is the general-purpose `TBLPROPERTIES` writer that backs the
+/// recipe-manifest metadata carrier (keys under
+/// [`RECIPE_MANIFEST_TBLPROP_PREFIX`]). It mirrors
+/// [`generate_set_table_tags_sql`] — the clause syntax `('k' = 'v', ...)` is
+/// identical between `SET TAGS` and `SET TBLPROPERTIES` — but emits the
+/// property keyword instead.
+///
+/// This is issued as a **post-create** statement, deliberately separate from
+/// the CREATE DDL. The recipe-identity triple it carries is the BLAKE3 of the
+/// model's canonical IR; folding it into the CREATE's inline `TBLPROPERTIES`
+/// (which the IR's `format_options.table_properties` feeds) would make the
+/// identity self-referential. Writing it after the table exists keeps the
+/// hash-input surface untouched and the write hash-neutral by construction.
+///
+/// Returns `Ok(None)` when `properties` is empty, so callers skip the
+/// statement rather than emit a syntactically-empty `SET TBLPROPERTIES ()`.
+///
+/// Identifiers and every key/value are validated against Rocky's SQL
+/// allowlist (`rocky-sql/validation.rs`) before interpolation — never
+/// `format!` on unvalidated input.
+pub fn generate_set_tblproperties_sql(
+    catalog: &str,
+    schema: &str,
+    table: &str,
+    properties: &BTreeMap<String, String>,
+) -> Result<Option<String>, CatalogError> {
+    validation::validate_identifier(catalog)?;
+    validation::validate_identifier(schema)?;
+    validation::validate_identifier(table)?;
+    if properties.is_empty() {
+        return Ok(None);
+    }
+    let clause = format_tags(properties)?;
+    Ok(Some(format!(
+        "ALTER TABLE {catalog}.{schema}.{table} SET TBLPROPERTIES ({clause})"
+    )))
+}
+
+/// Generates `SHOW TBLPROPERTIES <catalog>.<schema>.<table>` (the full,
+/// unfiltered property set).
+///
+/// Unlike [`generate_show_delta_retention_sql`], which scopes the probe to the
+/// two Delta retention keys, this returns every property so the caller can
+/// glob the [`RECIPE_MANIFEST_TBLPROP_PREFIX`] keys back out — the read-back
+/// half of the recipe-manifest carrier round-trip. Identifiers are validated
+/// before interpolation.
+pub fn generate_show_all_tblproperties_sql(
+    catalog: &str,
+    schema: &str,
+    table: &str,
+) -> Result<String, CatalogError> {
+    validation::validate_identifier(catalog)?;
+    validation::validate_identifier(schema)?;
+    validation::validate_identifier(table)?;
+    Ok(format!("SHOW TBLPROPERTIES {catalog}.{schema}.{table}"))
+}
+
 /// Generates `SHOW SCHEMAS IN <catalog>`.
 pub fn generate_show_schemas_sql(catalog: &str) -> Result<String, CatalogError> {
     validation::validate_identifier(catalog)?;
@@ -421,6 +493,76 @@ mod tests {
         assert!(generate_show_delta_retention_sql("db; DROP", "s", "t").is_err());
         assert!(generate_show_delta_retention_sql("db", "s ace", "t").is_err());
         assert!(generate_show_delta_retention_sql("db", "s", "t' --").is_err());
+    }
+
+    #[test]
+    fn test_set_tblproperties_emits_sorted_pairs() {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "recipe_manifest.program_hash".to_string(),
+            "2148e619b51421f51cfb3fac423145fe245bbe409b74f31c22d703ab07453036".to_string(),
+        );
+        props.insert("recipe_manifest.hash_scheme".to_string(), "v1".to_string());
+        props.insert(
+            "recipe_manifest.manifest_version".to_string(),
+            "0.1".to_string(),
+        );
+        let sql = generate_set_tblproperties_sql("wh", "silver", "orders", &props)
+            .unwrap()
+            .expect("non-empty properties yield a statement");
+        // BTreeMap guarantees the pairs are key-sorted, so the exact string is
+        // deterministic across runs.
+        assert_eq!(
+            sql,
+            "ALTER TABLE wh.silver.orders SET TBLPROPERTIES \
+('recipe_manifest.hash_scheme' = 'v1', \
+'recipe_manifest.manifest_version' = '0.1', \
+'recipe_manifest.program_hash' = '2148e619b51421f51cfb3fac423145fe245bbe409b74f31c22d703ab07453036')"
+        );
+    }
+
+    #[test]
+    fn test_set_tblproperties_empty_is_none() {
+        let props = BTreeMap::new();
+        assert!(
+            generate_set_tblproperties_sql("wh", "s", "t", &props)
+                .unwrap()
+                .is_none(),
+            "empty properties skip the statement rather than emit SET TBLPROPERTIES ()"
+        );
+    }
+
+    #[test]
+    fn test_set_tblproperties_rejects_bad_identifier() {
+        let mut props = BTreeMap::new();
+        props.insert("recipe_manifest.hash_scheme".to_string(), "v1".to_string());
+        assert!(generate_set_tblproperties_sql("db; DROP", "s", "t", &props).is_err());
+        assert!(generate_set_tblproperties_sql("db", "s ace", "t", &props).is_err());
+        assert!(generate_set_tblproperties_sql("db", "s", "t' --", &props).is_err());
+    }
+
+    #[test]
+    fn test_set_tblproperties_rejects_injection_in_value() {
+        // A value carrying a quote/semicolon must be rejected before it
+        // reaches the interpolated SQL, exactly like SET TAGS.
+        let mut props = BTreeMap::new();
+        props.insert(
+            "recipe_manifest.subject.model".to_string(),
+            "evil'; DROP TABLE--".to_string(),
+        );
+        assert!(generate_set_tblproperties_sql("wh", "s", "t", &props).is_err());
+    }
+
+    #[test]
+    fn test_show_all_tblproperties() {
+        let sql = generate_show_all_tblproperties_sql("wh", "silver", "orders").unwrap();
+        assert_eq!(sql, "SHOW TBLPROPERTIES wh.silver.orders");
+    }
+
+    #[test]
+    fn test_show_all_tblproperties_rejects_bad_identifier() {
+        assert!(generate_show_all_tblproperties_sql("db; DROP", "s", "t").is_err());
+        assert!(generate_show_all_tblproperties_sql("db", "s ace", "t").is_err());
     }
 
     #[test]
