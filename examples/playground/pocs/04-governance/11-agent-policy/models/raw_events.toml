@@ -1,0 +1,9 @@
+name = "raw_events"
+
+[target]
+catalog = "poc"
+schema = "bronze"
+table = "raw_events"
+
+[tags]
+layer = "bronze"

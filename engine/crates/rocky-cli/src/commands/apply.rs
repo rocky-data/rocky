@@ -33,11 +33,14 @@
 //! `commands::run::run` with `models_dir = None`, `run_all = false`, and
 //! no model filter so the engine's existing replication arm executes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::schema::SchemaPattern;
+use rocky_core::state::{PolicyDecisionRecord, StateStore};
 use tracing::warn;
 
 use crate::commands::parse_filter;
@@ -45,7 +48,7 @@ use crate::output::{
     AuditEvent, AuditEventKind, BranchPromoteOutput, PromotePlan, ReplicationConnectorSnapshot,
     ReplicationPlan, RunPlan,
 };
-use crate::plan_store::{PlanKind, read_plan};
+use crate::plan_store::{PersistedPlan, PlanKind, read_plan};
 
 use super::archive::run_archive_apply_in;
 use super::compact::run_compact_apply_in;
@@ -99,7 +102,9 @@ pub(crate) async fn run_apply_in(
         PlanKind::Replication => {
             run_apply_replication_plan(root, config_path, plan_id, state_path, output_json).await
         }
-        PlanKind::Promote => run_apply_promote_plan(root, config_path, plan_id, output_json).await,
+        PlanKind::Promote => {
+            run_apply_promote_plan(root, config_path, plan_id, state_path, output_json).await
+        }
         PlanKind::AiAuthored => {
             run_apply_ai_authored_plan(root, config_path, plan_id, state_path, output_json).await
         }
@@ -136,6 +141,23 @@ async fn run_apply_run_plan(
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize run plan payload")?;
+
+    // policy seam 2: an agent-authored `Run` plan (`rocky plan --principal agent`,
+    // or `ROCKY_PRINCIPAL=agent`) is gated exactly like an AiAuthored plan when
+    // a `[policy]` block is configured. Absent `[policy]` this is a no-op —
+    // `Run` was never gated — so behaviour is byte-identical to today. A
+    // human-authored plan resolves to `allow` (humans are never gated in v0).
+    let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
+    let touched = touched_models_for_run(&plan, &run_plan);
+    let gate = evaluate_apply_policy(
+        config_path,
+        plan_id,
+        plan.resolved_principal(),
+        &touched,
+        models_dir,
+        state_path,
+    );
+    apply_policy_gate(root, plan_id, gate)?;
 
     execute_run_plan(config_path, plan_id, run_plan, state_path, output_json).await
 }
@@ -279,6 +301,308 @@ pub(crate) fn ai_plan_is_reviewed(root: &Path, plan_id: &str) -> bool {
     review_marker_path(root, plan_id).exists()
 }
 
+// ---------------------------------------------------------------------------
+// agent-policy plane — apply/promote enforcement (seams 2 & 3)
+// ---------------------------------------------------------------------------
+
+/// The apply-time policy decision, aggregated most-restrictive across every
+/// model the plan touches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PolicyGate {
+    /// No `[policy]` block in the config — the evaluator was never
+    /// constructed. The caller falls back to its pre-policy-plane behaviour
+    /// (AiAuthored → require a review marker; Run/Promote → ungated), so
+    /// absent-`[policy]` behaviour is byte-identical to today.
+    NotConfigured,
+    /// Every touched model resolved to `allow`. Proceed without a marker.
+    Allow,
+    /// The most-restrictive effect is `require_review`. A human review marker
+    /// (`rocky review <plan> --approve`) satisfies it.
+    RequireReview {
+        model: String,
+        rule_id: Option<usize>,
+        reason: String,
+    },
+    /// The most-restrictive effect is `deny` — a hard refusal that cannot be
+    /// satisfied interactively (no marker unblocks it; that is the point).
+    Deny {
+        model: String,
+        rule_id: Option<usize>,
+        reason: String,
+    },
+}
+
+/// Build the apply-time [`ModelAttributes`] for every compiled model under
+/// `models_dir`, mirroring `rocky policy check`: `classifications` is the
+/// distinct column-classification set, `layer` is the `layer` tag, and
+/// `contracted` is the presence of a sibling `.contract.toml`.
+fn model_attributes(models_dir: &Path) -> BTreeMap<String, ModelAttributes> {
+    use rocky_compiler::compile::{self, CompilerConfig};
+
+    let config = CompilerConfig {
+        models_dir: models_dir.to_path_buf(),
+        ..Default::default()
+    };
+    let Ok(result) = compile::compile(&config) else {
+        return BTreeMap::new();
+    };
+
+    let mut out = BTreeMap::new();
+    for model in &result.project.models {
+        let name = model.config.name.clone();
+        let classifications = model.config.classification.values().cloned().collect();
+        let layer = model.config.tags.get("layer").cloned();
+        let contracted = model.contract_path.is_some();
+        let downstreams = result
+            .project
+            .models
+            .iter()
+            .filter(|m| m.config.depends_on.iter().any(|d| d == &name))
+            .count() as u64;
+        out.insert(
+            name.clone(),
+            ModelAttributes {
+                name,
+                tags: model.config.tags.clone(),
+                classifications,
+                layer,
+                contracted,
+                downstreams,
+            },
+        );
+    }
+    out
+}
+
+/// Evaluate the agent-policy plane over a plan's touched `(model, capability)`
+/// set and aggregate the most-restrictive effect. Records one
+/// [`PolicyDecisionRecord`] per evaluation to the ledger (best-effort — an
+/// audit-write failure never fails the apply; the *gate* is the safety
+/// boundary, the ledger is the trail).
+///
+/// `touched` maps each governed model to the capability that was reviewed at
+/// propose time (the embedded classification, or `schema_change.breaking` when
+/// the classification was unavailable / fail-closed). An empty map means the
+/// plan changes nothing → `Allow`.
+fn evaluate_apply_policy(
+    config_path: &Path,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    state_path: &Path,
+) -> PolicyGate {
+    let policy = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(cfg) => match cfg.policy {
+            Some(p) => p,
+            None => return PolicyGate::NotConfigured,
+        },
+        // A missing or malformed config leaves the policy plane unconfigured —
+        // the caller keeps its pre-policy-plane gate. (The run path re-loads and surfaces
+        // any real config error itself.)
+        Err(_) => return PolicyGate::NotConfigured,
+    };
+
+    if touched.is_empty() {
+        return PolicyGate::Allow;
+    }
+
+    let attrs_map = model_attributes(models_dir);
+    // Best-effort ledger handle. A failure to open state (e.g. a locked or
+    // forward-incompatible store) must not fail the apply — the decision is
+    // computed regardless; only the audit write is skipped.
+    let ledger = StateStore::open(state_path).ok();
+
+    let mut worst: Option<PolicyGate> = None;
+    for (model, capability) in touched {
+        let owned;
+        let attrs = match attrs_map.get(model) {
+            Some(a) => a,
+            None => {
+                // Model not in the compiled project (e.g. removed on the head
+                // side): evaluate against a bare-named model so it still meets
+                // the default posture rather than silently escaping.
+                owned = ModelAttributes {
+                    name: model.clone(),
+                    ..Default::default()
+                };
+                &owned
+            }
+        };
+
+        let decision = policy::evaluate(&policy, principal, *capability, attrs);
+
+        if let Some(store) = &ledger {
+            let record = PolicyDecisionRecord {
+                timestamp: chrono::Utc::now(),
+                plan_id: plan_id.to_string(),
+                principal,
+                capability: *capability,
+                model: model.clone(),
+                effect: decision.effect,
+                rule_id: decision.matched_rule,
+                reason: decision.reason.clone(),
+            };
+            if let Err(e) = store.record_policy_decision(&record) {
+                warn!(
+                    target: "rocky::policy",
+                    error = %e,
+                    "failed to record policy decision to the ledger (continuing)"
+                );
+            }
+        }
+
+        let gate = match decision.effect {
+            PolicyEffect::Allow => PolicyGate::Allow,
+            PolicyEffect::RequireReview => PolicyGate::RequireReview {
+                model: model.clone(),
+                rule_id: decision.matched_rule,
+                reason: decision.reason,
+            },
+            PolicyEffect::Deny => PolicyGate::Deny {
+                model: model.clone(),
+                rule_id: decision.matched_rule,
+                reason: decision.reason,
+            },
+        };
+        // Keep the most-restrictive gate: deny > require_review > allow.
+        if worst
+            .as_ref()
+            .map(|w| gate_rank(&gate) > gate_rank(w))
+            .unwrap_or(true)
+        {
+            worst = Some(gate);
+        }
+    }
+
+    worst.unwrap_or(PolicyGate::Allow)
+}
+
+/// Restrictiveness rank for aggregating per-model [`PolicyGate`]s.
+fn gate_rank(gate: &PolicyGate) -> u8 {
+    match gate {
+        PolicyGate::NotConfigured => 0,
+        PolicyGate::Allow => policy::effect_rank(PolicyEffect::Allow),
+        PolicyGate::RequireReview { .. } => policy::effect_rank(PolicyEffect::RequireReview),
+        PolicyGate::Deny { .. } => policy::effect_rank(PolicyEffect::Deny),
+    }
+}
+
+/// The `(model, capability)` set the policy plane evaluates for a run-shaped
+/// plan (`Run` / `AiAuthored`).
+///
+/// - Diff available at propose time → the embedded per-changed-model
+///   classification. Unchanged models are absent and are not gated.
+/// - Diff unavailable (skipped, or a legacy plan with no embed) → **every**
+///   planned model, classified `schema_change.breaking` (fail closed).
+fn touched_models_for_run(
+    plan: &PersistedPlan,
+    run_plan: &RunPlan,
+) -> BTreeMap<String, PolicyCapability> {
+    let caps = plan.embedded_capabilities();
+    if caps.diff_available {
+        caps.changed
+    } else {
+        run_plan
+            .models
+            .iter()
+            .map(|m| (m.clone(), PolicyCapability::SchemaChangeBreaking))
+            .collect()
+    }
+}
+
+/// The `(model, capability)` set the policy plane evaluates for a `Promote`
+/// plan: every model the branch changed (from the plan's captured
+/// breaking-change findings), gated under the bare `promote` verb.
+///
+/// The `promote` verb — not a `schema_change.*` refinement — is used so a
+/// `deny agent promote {…}` rule governs promotions while an `apply`-scoped
+/// rule does not accidentally fire on a promote (the refinements are shared
+/// between the two verbs). An empty result (no captured findings) means the
+/// promote changes nothing the plane needs to gate.
+fn touched_models_for_promote(
+    promote: &PromotePlan,
+    models_dir: &Path,
+) -> BTreeMap<String, PolicyCapability> {
+    let Some(findings) = promote.breaking_changes.as_ref().filter(|f| !f.is_empty()) else {
+        return BTreeMap::new();
+    };
+    let changed_targets: BTreeSet<String> = findings
+        .iter()
+        .map(|f| f.change.model().to_string())
+        .collect();
+    let target_to_name = compile_target_to_name(models_dir);
+    changed_targets
+        .into_iter()
+        .filter_map(|t| {
+            target_to_name
+                .get(&t)
+                .map(|n| (n.clone(), PolicyCapability::Promote))
+        })
+        .collect()
+}
+
+/// Compile `models_dir` and map each model's `target.full_name()` to its
+/// logical name (`config.name`). Used to translate breaking-change findings
+/// (keyed by target) into the model names the policy scope matches on.
+fn compile_target_to_name(models_dir: &Path) -> BTreeMap<String, String> {
+    use rocky_compiler::compile::{self, CompilerConfig};
+    let config = CompilerConfig {
+        models_dir: models_dir.to_path_buf(),
+        ..Default::default()
+    };
+    let Ok(result) = compile::compile(&config) else {
+        return BTreeMap::new();
+    };
+    let ir = super::ci_diff::project_ir_from_compile(&result);
+    ir.models
+        .iter()
+        .map(|m| (m.target.full_name(), m.name.to_string()))
+        .collect()
+}
+
+/// Apply a resolved [`PolicyGate`] to a run-shaped plan, returning `Ok(true)`
+/// when the plan may proceed and `Err(..)` when it is blocked. `require_marker`
+/// controls whether `require_review` demands the review marker (it always does
+/// for run-shaped plans; kept explicit for the promote mirror).
+///
+/// The `NotConfigured` arm is handled by the caller (it needs the pre-policy-plane
+/// fallback), so this function is only called for a configured plane.
+fn apply_policy_gate(root: &Path, plan_id: &str, gate: PolicyGate) -> Result<()> {
+    match gate {
+        PolicyGate::NotConfigured | PolicyGate::Allow => Ok(()),
+        PolicyGate::RequireReview {
+            model,
+            rule_id,
+            reason,
+        } => {
+            if ai_plan_is_reviewed(root, plan_id) {
+                Ok(())
+            } else {
+                let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                bail!(
+                    "policy requires human review for plan '{plan_id}': model '{model}'{rule} \
+                     resolved to require_review — {reason}. \
+                     Review and approve it with `rocky review {plan_id} --approve`, \
+                     then re-run `rocky apply {plan_id}`."
+                )
+            }
+        }
+        PolicyGate::Deny {
+            model,
+            rule_id,
+            reason,
+        } => {
+            let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+            bail!(
+                "policy DENIES plan '{plan_id}': model '{model}'{rule} — {reason}. \
+                 A deny cannot be satisfied by review; this mutation is reserved for a human. \
+                 Re-scope the change (e.g. propose to a branch) or have a human apply it."
+            )
+        }
+    }
+}
+
 /// Apply a `PlanKind::AiAuthored` plan.
 ///
 /// AI-authored plans carry a `RunPlan` payload identical in shape to a plain
@@ -308,17 +632,37 @@ async fn run_apply_ai_authored_plan(
         );
     }
 
-    if !ai_plan_is_reviewed(root, plan_id) {
-        bail!(
-            "AI-authored plan '{plan_id}' has not been reviewed and approved. \
-             An AI agent authored this change, so it cannot be applied directly. \
-             Review the breaking-change report and approve it first with \
-             `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
-        );
-    }
-
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize ai_authored plan payload")?;
+
+    // policy seam 2: rule-driven refusal. When a `[policy]` block is configured,
+    // the per-model policy evaluation (over the authoring principal and the
+    // embedded, reviewed capability classification) supersedes the fixed
+    // AiAuthored gate. Absent a `[policy]` block the evaluator is never
+    // constructed and the pre-policy-plane marker gate remains — byte-identical to today.
+    let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
+    let touched = touched_models_for_run(&plan, &run_plan);
+    let gate = evaluate_apply_policy(
+        config_path,
+        plan_id,
+        plan.resolved_principal(),
+        &touched,
+        models_dir,
+        state_path,
+    );
+    match gate {
+        PolicyGate::NotConfigured => {
+            if !ai_plan_is_reviewed(root, plan_id) {
+                bail!(
+                    "AI-authored plan '{plan_id}' has not been reviewed and approved. \
+                     An AI agent authored this change, so it cannot be applied directly. \
+                     Review the breaking-change report and approve it first with \
+                     `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
+                );
+            }
+        }
+        gate => apply_policy_gate(root, plan_id, gate)?,
+    }
 
     execute_run_plan(config_path, plan_id, run_plan, state_path, output_json).await
 }
@@ -717,6 +1061,7 @@ async fn run_apply_promote_plan(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
+    state_path: &Path,
     output_json: bool,
 ) -> Result<()> {
     use crate::output::print_json;
@@ -734,6 +1079,22 @@ async fn run_apply_promote_plan(
 
     let promote_plan: PromotePlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize promote plan payload")?;
+
+    // policy seam 3: mirror the apply-time policy enforcement on the promote path.
+    // Absent `[policy]` this is a no-op (promote was never gated). A
+    // human-authored promote resolves to `allow`; an agent-authored promote is
+    // gated per changed model under the `promote` verb.
+    let promote_models_dir = Path::new("models");
+    let touched = touched_models_for_promote(&promote_plan, promote_models_dir);
+    let gate = evaluate_apply_policy(
+        config_path,
+        plan_id,
+        plan.resolved_principal(),
+        &touched,
+        promote_models_dir,
+        state_path,
+    );
+    apply_policy_gate(root, plan_id, gate)?;
 
     // Build actor identity for apply-time audit events.
     let actor = crate::commands::branch::approver_identity_pub().unwrap_or_else(|_| {
@@ -1001,6 +1362,282 @@ mod tests {
             msg.contains("not been reviewed"),
             "refusal must explain the plan is unreviewed, got: {msg}"
         );
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // agent-policy enforcement (seams 2 & 3)
+    // ---------------------------------------------------------------------
+
+    /// Config with an adapter + pipeline and an EMPTY `[policy]` block (no
+    /// rules, factory `default_agent_effect`).
+    const EMPTY_POLICY_TOML: &str = r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+[policy]
+version = 1
+"#;
+
+    /// Config with an adapter + pipeline and NO `[policy]` block.
+    const NO_POLICY_TOML: &str = r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+"#;
+
+    /// Rewrite a just-written plan file to look like a *legacy* plan: strip the
+    /// `principal` field (as if written before the policy plane). The `plan_id` is unchanged
+    /// because `principal` rides outside the hash, so the integrity check still
+    /// passes on read.
+    fn strip_principal_from_plan(root: &Path, plan_id: &str) -> anyhow::Result<()> {
+        let path = root
+            .join(".rocky")
+            .join("plans")
+            .join(format!("{plan_id}.json"));
+        let raw = std::fs::read_to_string(&path)?;
+        let mut v: serde_json::Value = serde_json::from_str(&raw)?;
+        v.as_object_mut().unwrap().remove("principal");
+        std::fs::write(&path, serde_json::to_vec_pretty(&v)?)?;
+        Ok(())
+    }
+
+    /// 🔴 THE load-bearing regression: a legacy `ai_authored` plan file with NO
+    /// `principal` field, under an EMPTY `[policy]` block, must STILL require
+    /// review — it must NOT apply unreviewed. This proves the kind-aware
+    /// principal default (`ai_authored` ⟹ agent) is load-bearing: were it to
+    /// resolve to `human`, the policy would `allow` and the plan would apply
+    /// unreviewed.
+    #[tokio::test]
+    async fn legacy_ai_authored_with_empty_policy_still_requires_review() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("rocky.toml"), EMPTY_POLICY_TOML)?;
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &minimal_run_plan())?;
+        strip_principal_from_plan(dir.path(), &plan_id)?;
+
+        let state = dir.path().join("state.redb");
+        let err = super::run_apply_ai_authored_plan(
+            dir.path(),
+            &dir.path().join("rocky.toml"),
+            &plan_id,
+            &state,
+            true,
+        )
+        .await
+        .expect_err("a legacy ai_authored plan under an empty [policy] must NOT apply unreviewed");
+        let msg = err.to_string();
+        // Must be refused via the POLICY path (`require_review` from the empty
+        // block's default_agent_effect), NOT merely the legacy marker path —
+        // this is what proves the kind-aware `ai_authored ⟹ agent` default is
+        // load-bearing (a `human` default would `allow` and apply unreviewed).
+        assert!(
+            msg.contains("policy requires human review"),
+            "must be refused by the policy plane (not just the marker gate), got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// Byte-identical fallback: with NO `[policy]` block, an AI-authored plan
+    /// without a marker is refused with the pre-policy-plane message (the hardcoded gate
+    /// remains the sole gate — the evaluator is never constructed).
+    #[tokio::test]
+    async fn no_policy_block_ai_authored_requires_marker() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("rocky.toml"), NO_POLICY_TOML)?;
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &minimal_run_plan())?;
+
+        let state = dir.path().join("state.redb");
+        let err = super::run_apply_ai_authored_plan(
+            dir.path(),
+            &dir.path().join("rocky.toml"),
+            &plan_id,
+            &state,
+            true,
+        )
+        .await
+        .expect_err("no [policy] block still gates ai_authored on the marker");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not been reviewed") && msg.contains("rocky review"),
+            "must be the pre-policy-plane marker message, got: {msg}"
+        );
+        Ok(())
+    }
+
+    fn write_config(dir: &Path, policy_rules: &str) -> anyhow::Result<std::path::PathBuf> {
+        let toml = format!(
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+[policy]
+version = 1
+default_agent_effect = "require_review"
+{policy_rules}
+"#
+        );
+        let path = dir.join("rocky.toml");
+        std::fs::write(&path, toml)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn evaluate_apply_policy_denies_agent_on_any_deny_rule() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "deny"
+"#,
+        )?;
+        let mut touched = BTreeMap::new();
+        touched.insert("m".to_string(), PolicyCapability::SchemaChangeBreaking);
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &touched,
+            &dir.path().join("models"),
+            &dir.path().join("state.redb"),
+        );
+        assert!(matches!(gate, PolicyGate::Deny { .. }), "got {gate:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn evaluate_apply_policy_allows_human_even_with_deny_rule() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "deny"
+"#,
+        )?;
+        let mut touched = BTreeMap::new();
+        touched.insert("m".to_string(), PolicyCapability::SchemaChangeBreaking);
+        // A human principal is never gated in v0 — the agent deny does not apply.
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Human,
+            &touched,
+            &dir.path().join("models"),
+            &dir.path().join("state.redb"),
+        );
+        assert_eq!(gate, PolicyGate::Allow);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluate_apply_policy_not_configured_without_block() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("rocky.toml"), NO_POLICY_TOML)?;
+        let mut touched = BTreeMap::new();
+        touched.insert("m".to_string(), PolicyCapability::SchemaChangeBreaking);
+        let gate = super::evaluate_apply_policy(
+            &dir.path().join("rocky.toml"),
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &touched,
+            &dir.path().join("models"),
+            &dir.path().join("state.redb"),
+        );
+        assert_eq!(gate, PolicyGate::NotConfigured);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluate_apply_policy_empty_touched_allows() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(dir.path(), "")?;
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &BTreeMap::new(),
+            &dir.path().join("models"),
+            &dir.path().join("state.redb"),
+        );
+        assert_eq!(
+            gate,
+            PolicyGate::Allow,
+            "no changed models ⇒ nothing to gate"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn touched_models_for_run_fail_closed_without_embed() {
+        // A plan with no embedded classification (legacy / diff skipped) marks
+        // every planned model breaking.
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &minimal_run_plan()).unwrap();
+        let plan = read_plan(dir.path(), &plan_id).unwrap();
+        let run_plan: RunPlan = serde_json::from_value(plan.payload.clone()).unwrap();
+        let touched = super::touched_models_for_run(&plan, &run_plan);
+        assert_eq!(
+            touched.get("schema.orders"),
+            Some(&PolicyCapability::SchemaChangeBreaking)
+        );
+    }
+
+    #[test]
+    fn apply_policy_gate_deny_and_review_and_allow() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Deny cannot be satisfied — always errors.
+        let deny = PolicyGate::Deny {
+            model: "m".to_string(),
+            rule_id: Some(0),
+            reason: "denied by rule 0".to_string(),
+        };
+        assert!(super::apply_policy_gate(dir.path(), "p", deny).is_err());
+
+        // RequireReview without a marker errors; with a marker it passes.
+        let review = || PolicyGate::RequireReview {
+            model: "m".to_string(),
+            rule_id: None,
+            reason: "default".to_string(),
+        };
+        assert!(super::apply_policy_gate(dir.path(), "p", review()).is_err());
+        let marker = super::review_marker_path(dir.path(), "p");
+        std::fs::create_dir_all(marker.parent().unwrap())?;
+        std::fs::write(&marker, b"{}")?;
+        assert!(super::apply_policy_gate(dir.path(), "p", review()).is_ok());
+
+        // Allow and NotConfigured always pass.
+        assert!(super::apply_policy_gate(dir.path(), "p", PolicyGate::Allow).is_ok());
+        assert!(super::apply_policy_gate(dir.path(), "p", PolicyGate::NotConfigured).is_ok());
         Ok(())
     }
 

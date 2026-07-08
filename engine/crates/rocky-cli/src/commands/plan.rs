@@ -3,14 +3,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::Utc;
 
-use rocky_core::config::{GovernanceOverride, resolve_table_override};
+use rocky_core::config::{GovernanceOverride, PolicyPrincipal, resolve_table_override};
 use rocky_core::source::DiscoveredConnector;
 use rocky_core::sql_gen;
 use rocky_core::traits::SqlDialect;
 use rocky_ir::*;
 
 use crate::output::*;
-use crate::plan_store::{PlanKind, write_plan};
+use crate::plan_store::{EmbeddedCapabilities, PlanKind, write_plan, write_plan_governed};
 use crate::registry;
 
 use super::run::PartitionRunOptions;
@@ -34,6 +34,10 @@ pub struct PlanRunOptions {
     pub governance_override: Option<GovernanceOverride>,
     pub models_dir: Option<PathBuf>,
     pub partition_opts: PartitionRunOptions,
+    /// Resolved authoring principal (agent-policy plane). `None` ⇒ `human`
+    /// (the CLI-surface default). Stamped onto the persisted plan so a later
+    /// `rocky apply` evaluates the plan against the identity that authored it.
+    pub principal: Option<PolicyPrincipal>,
 }
 
 /// Execute `rocky plan` — dry-run SQL generation plus optional run-plan blueprint.
@@ -343,7 +347,7 @@ pub async fn plan(
         output.has_budget_errors = has_errors;
     }
 
-    // --- Semantic breaking-change verdict (D3 — decision-support) --------
+    // --- Semantic breaking-change verdict (capability-embed — decision-support) --------
     //
     // REPORTING ONLY. Computed AFTER the budget check and BEFORE plan
     // persistence so the classifier's findings live on `output` but never
@@ -379,11 +383,14 @@ pub async fn plan(
     let mut run_plan_persisted = false;
     if blueprint_models_dir.exists() {
         match build_and_persist_run_plan(
+            config_path,
             &blueprint_models_dir,
             filter,
             pipeline_name,
             env,
             run_options,
+            base_ref,
+            state_path,
         ) {
             Ok(Some((run_plan, plan_id, persisted_at))) => {
                 output.plan_id = Some(plan_id);
@@ -844,12 +851,16 @@ pub fn plan_preview_output(
 /// Captures the full `rocky run` flag surface from `run_options` so apply-time
 /// replay is intent-preserving. `--missing` / `--resume-latest` are persisted
 /// as booleans; the actual state-store lookup happens at apply time.
+#[allow(clippy::too_many_arguments)]
 fn build_and_persist_run_plan(
+    config_path: &Path,
     models_dir: &Path,
     filter: Option<&str>,
     pipeline: Option<&str>,
     env: Option<&str>,
     run_options: &PlanRunOptions,
+    base_ref: &str,
+    state_path: &Path,
 ) -> Result<Option<(RunPlan, String, chrono::DateTime<Utc>)>> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
@@ -917,10 +928,101 @@ fn build_and_persist_run_plan(
     };
 
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    let plan_id = write_plan(&cwd, PlanKind::Run, &run_plan).context("failed to write run plan")?;
+
+    // policy seam 1 + capability-embed: stamp the authoring principal and embed the propose-time
+    // change-classification into the plan payload, so a later `rocky apply`
+    // evaluates the plan against the identity that authored it and the exact
+    // capabilities that were reviewed.
+    let principal = run_options.principal.unwrap_or(PolicyPrincipal::Human);
+    let capabilities =
+        compute_embedded_capabilities(config_path, models_dir, base_ref, Some(state_path));
+    let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
+        .context("failed to write run plan")?;
 
     let persisted_at = Utc::now();
     Ok(Some((run_plan, plan_id, persisted_at)))
+}
+
+/// Compute the propose-time change-classification (capability-embed) to embed in a governed
+/// plan's payload.
+///
+/// Diffs the compiled working tree (`head`) against the project at `base_ref`
+/// using the exact compile + classifier path `rocky review` / `rocky ci-diff`
+/// use, groups findings by model, and classifies each *changed* model per the
+/// fail-closed §2.4 rules. Keyed by the logical model name so apply can look up
+/// each planned model directly.
+///
+/// **Fail-closed:** if either side fails to compile (no git base, base ref
+/// missing at that path, working tree broken) the result is
+/// `diff_available = false` with an empty map — the apply-time enforcement then
+/// treats every planned model as a breaking change.
+pub fn compute_embedded_capabilities(
+    config_path: &Path,
+    models_dir: &Path,
+    base_ref: &str,
+    state_path: Option<&Path>,
+) -> EmbeddedCapabilities {
+    use rocky_compiler::compile::{self, CompilerConfig};
+
+    if !models_dir.is_dir() {
+        return EmbeddedCapabilities::default(); // fail-closed
+    }
+
+    // Seed both compiles with cached source schemas so types are real (mirrors
+    // `rocky review`). Degrade to empty on any failure — a poorer classification
+    // only ever fails *closed* (more models look breaking), never open.
+    let source_schemas = match (
+        state_path,
+        rocky_core::config::load_rocky_config(config_path),
+    ) {
+        (Some(sp), Ok(cfg)) => {
+            let schema_cfg = cfg.cache.schemas.with_ttl_override(None);
+            crate::source_schemas::load_cached_source_schemas(&schema_cfg, sp)
+        }
+        _ => std::collections::HashMap::new(),
+    };
+
+    let head = {
+        let config = CompilerConfig {
+            models_dir: models_dir.to_path_buf(),
+            source_schemas: source_schemas.clone(),
+            ..Default::default()
+        };
+        match compile::compile(&config) {
+            Ok(r) => r,
+            Err(_) => return EmbeddedCapabilities::default(),
+        }
+    };
+    let base = match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
+        Ok(r) => r,
+        Err(_) => return EmbeddedCapabilities::default(),
+    };
+
+    let base_ir = super::ci_diff::project_ir_from_compile(&base);
+    let head_ir = super::ci_diff::project_ir_from_compile(&head);
+    let findings = rocky_core::breaking_change::diff_project_ir(&base_ir, &head_ir);
+    let by_target = rocky_core::policy::classify_findings_by_model(&findings);
+
+    // Findings key on `target.full_name()`; remap to the logical model name
+    // (`ModelIr.name == config.name`) so the map lines up with `RunPlan.models`
+    // and the apply-time `ModelAttributes.name`.
+    let target_to_name: std::collections::HashMap<String, String> = head_ir
+        .models
+        .iter()
+        .map(|m| (m.target.full_name(), m.name.to_string()))
+        .collect();
+
+    let mut changed = std::collections::BTreeMap::new();
+    for (target, cap) in by_target {
+        if let Some(name) = target_to_name.get(&target) {
+            changed.insert(name.clone(), cap);
+        }
+    }
+
+    EmbeddedCapabilities {
+        diff_available: true,
+        changed,
+    }
 }
 
 /// Build a canonical, sorted source-state snapshot from the discovered
@@ -2568,7 +2670,7 @@ table = "m"
     }
 
     // ------------------------------------------------------------------
-    // Semantic verdict (D3 — decision-support)
+    // Semantic verdict (capability-embed — decision-support)
     // ------------------------------------------------------------------
 
     /// The caveat constant must plainly state that the classifier diffs

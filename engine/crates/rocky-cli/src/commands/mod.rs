@@ -3,6 +3,7 @@ mod ai;
 mod ai_contract;
 pub mod apply;
 mod archive;
+mod audit;
 #[cfg(feature = "duckdb")]
 pub mod bench;
 mod branch;
@@ -81,6 +82,7 @@ pub use ai::{
 pub use ai_contract::run_ai_contract;
 pub use apply::{run_apply, run_apply_inline_for_run};
 pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
+pub use audit::run_audit;
 #[cfg(feature = "duckdb")]
 pub use bench::run_bench;
 pub use branch::{
@@ -124,7 +126,8 @@ pub use lsp::run_lsp;
 pub use metrics::{metrics_output, run_metrics};
 pub use optimize::{optimize_output, run_optimize};
 pub use plan::{
-    PlanRunOptions, plan, plan_preview_output, plan_promote, populate_governance_actions,
+    PlanRunOptions, compute_embedded_capabilities, plan, plan_preview_output, plan_promote,
+    populate_governance_actions,
 };
 pub use playground::{run_playground, run_playground_with_template};
 pub use policy::run_policy_check;

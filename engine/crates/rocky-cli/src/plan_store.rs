@@ -44,10 +44,12 @@
 //! The `format_version` field is **not** included in the `plan_id`
 //! digest. The digest is computed over `{kind, payload}` only.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use rocky_core::config::{PolicyCapability, PolicyPrincipal};
 use serde::{Deserialize, Serialize};
 
 /// The kind of plan — used to guard cross-apply mismatches.
@@ -127,12 +129,93 @@ pub struct PersistedPlan {
     /// `format_version = 1`.
     #[serde(default = "default_format_version")]
     pub format_version: u32,
+    /// The principal that authored this plan (agent-policy plane).
+    ///
+    /// Rides **outside** the `plan_id` digest (like `created_at` /
+    /// `format_version`) — the authoring identity must not perturb the hash,
+    /// while the reviewed capability classification (in `payload`) must bind
+    /// to it. Stamped at plan-creation.
+    ///
+    /// **Absent on legacy plans** (written before the field existed). An
+    /// absent value does NOT default to `human`: it resolves *by kind* via
+    /// [`PersistedPlan::resolved_principal`] — an `ai_authored` plan with no
+    /// stamp resolves to `agent` (never `human`, which would let a legacy
+    /// AI plan apply unreviewed once the hardcoded gate becomes rule-driven);
+    /// any other kind resolves to `human`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<PolicyPrincipal>,
     /// Raw plan body, opaque to plan_store. For `format_version = 2`
     /// (compact/archive) this is the typed-IR shape
     /// ([`rocky_ir::CompactPlanIr`] / [`rocky_ir::ArchivePlanIr`]). For
     /// `format_version = 1` (run/replication/promote) this is the
     /// per-kind plan struct serialized to JSON.
+    ///
+    /// For governed run/ai_authored plans the payload additionally carries a
+    /// `policy_capabilities` object (the propose-time change-classification —
+    /// see [`EmbeddedCapabilities`]) so the reviewed capability binds to the
+    /// `plan_id`.
     pub payload: serde_json::Value,
+}
+
+/// The reserved payload key under which the propose-time change-classification
+/// is embedded (capability-embed). Kept out of every typed plan struct — it is injected into
+/// the serialized payload `Value` at write time and read back as an
+/// [`EmbeddedCapabilities`] at apply time.
+const POLICY_CAPABILITIES_KEY: &str = "policy_capabilities";
+
+/// The propose-time change-classification embedded in a governed plan's
+/// payload (capability-embed). Part of `blake3({kind, payload})`, so the reviewed capability
+/// decision binds to the `plan_id`.
+///
+/// Apply reads this back and never recomputes from a live diff. **Fail-closed
+/// default:** an absent embed (a legacy plan, or a plan whose base↔head diff
+/// was skipped) deserializes to `diff_available = false` with an empty
+/// `changed` map, which the enforcement path treats as "classify every planned
+/// model as breaking".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddedCapabilities {
+    /// Whether the base↔head classification diff was available at
+    /// plan-creation. `false` ⇒ apply fails closed (every planned model is
+    /// treated as `schema_change.breaking`).
+    #[serde(default)]
+    pub diff_available: bool,
+    /// Per-changed-model capability, keyed by the logical model name (matching
+    /// `RunPlan.models` and the apply-time `ModelAttributes.name`). Only models
+    /// the diff found a change on appear here; unchanged models are absent and
+    /// are not gated.
+    #[serde(default)]
+    pub changed: BTreeMap<String, PolicyCapability>,
+}
+
+/// The principal an absent stamp resolves to, **by kind** (never a blanket
+/// `human`): an `ai_authored` plan is agent-authored by construction
+/// (`AiAuthored ⊂ agent`), so a legacy AI plan with no stamp is `agent`; any
+/// other kind is `human`.
+fn default_principal_for_kind(kind: &PlanKind) -> PolicyPrincipal {
+    match kind {
+        PlanKind::AiAuthored => PolicyPrincipal::Agent,
+        _ => PolicyPrincipal::Human,
+    }
+}
+
+impl PersistedPlan {
+    /// The authoring principal, resolving an absent stamp by kind (see
+    /// [`default_principal_for_kind`]). This is the value the policy plane
+    /// evaluates — the *authoring* identity binds, so a plan authored by an
+    /// agent still evaluates as `agent` regardless of who runs `apply`.
+    pub fn resolved_principal(&self) -> PolicyPrincipal {
+        self.principal
+            .unwrap_or_else(|| default_principal_for_kind(&self.kind))
+    }
+
+    /// The propose-time change-classification embedded in the payload (capability-embed).
+    /// Fail-closed: a plan with no embed yields `diff_available = false`.
+    pub fn embedded_capabilities(&self) -> EmbeddedCapabilities {
+        self.payload
+            .get(POLICY_CAPABILITIES_KEY)
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    }
 }
 
 /// Default `format_version` for `PersistedPlan` when the field is absent
@@ -191,7 +274,28 @@ fn plans_dir(root: &Path) -> Result<std::path::PathBuf> {
 /// fabricate a v1 plan on disk and assert the apply path errors
 /// cleanly.
 pub fn write_plan<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Result<String> {
-    write_plan_inner(root, kind, payload, 1)
+    let principal = default_principal_for_kind(&kind);
+    write_plan_inner(root, kind, payload, 1, principal, None)
+}
+
+/// Persist a governed `Run` / `AiAuthored` plan (`format_version = 1`) with an
+/// explicit authoring `principal` and an embedded propose-time
+/// change-classification (capability-embed).
+///
+/// The `capabilities` value is injected into the payload under
+/// `policy_capabilities` **before** the `plan_id` is computed, so the reviewed
+/// capability decision is part of `blake3({kind, payload})`. The `principal`
+/// rides outside the hash. Used by `rocky plan` and the MCP `propose` tool.
+pub fn write_plan_governed<T: Serialize>(
+    root: &Path,
+    kind: PlanKind,
+    payload: &T,
+    principal: PolicyPrincipal,
+    capabilities: EmbeddedCapabilities,
+) -> Result<String> {
+    let caps_value =
+        serde_json::to_value(capabilities).context("failed to serialize embedded capabilities")?;
+    write_plan_inner(root, kind, payload, 1, principal, Some(caps_value))
 }
 
 /// Persist a typed-IR `Compact` / `Archive` plan
@@ -209,7 +313,8 @@ pub fn write_plan_v2<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> 
         matches!(kind, PlanKind::Compact | PlanKind::Archive),
         "v2 plan-store format is defined only for compact and archive; got {kind}"
     );
-    write_plan_inner(root, kind, payload, 2)
+    let principal = default_principal_for_kind(&kind);
+    write_plan_inner(root, kind, payload, 2, principal, None)
 }
 
 /// Internal writer shared by [`write_plan`] and [`write_plan_v2`].
@@ -222,9 +327,21 @@ fn write_plan_inner<T: Serialize>(
     kind: PlanKind,
     payload: &T,
     format_version: u32,
+    principal: PolicyPrincipal,
+    capabilities: Option<serde_json::Value>,
 ) -> Result<String> {
-    let payload_value =
+    let mut payload_value =
         serde_json::to_value(payload).context("failed to serialize plan payload to JSON value")?;
+
+    // Embed the propose-time change-classification (capability-embed) INTO the payload so it
+    // is part of `blake3({kind, payload})` — the reviewed capability binds to
+    // the `plan_id`. Only meaningful for object payloads (run/ai_authored);
+    // typed-IR compact/archive payloads never carry it.
+    if let Some(caps) = capabilities
+        && let serde_json::Value::Object(ref mut map) = payload_value
+    {
+        map.insert(POLICY_CAPABILITIES_KEY.to_string(), caps);
+    }
 
     let plan_id = compute_plan_id(&kind, &payload_value);
 
@@ -233,6 +350,7 @@ fn write_plan_inner<T: Serialize>(
         kind,
         created_at: Utc::now(),
         format_version,
+        principal: Some(principal),
         payload: payload_value,
     };
 
@@ -564,6 +682,147 @@ mod tests {
             msg.contains("not found"),
             "error should mention 'not found', got: {msg}"
         );
+    }
+
+    // ---------- agent-policy principal + embedded-capability (capability-embed / seam 1) ----------
+
+    /// 🔴 The load-bearing safety invariant: a legacy `ai_authored` plan file
+    /// with NO `principal` field must resolve to `agent`, never `human` —
+    /// otherwise a legacy AI plan would evaluate as a human and apply
+    /// unreviewed once the hardcoded gate becomes rule-driven.
+    #[test]
+    fn legacy_ai_authored_plan_with_no_principal_resolves_to_agent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let plans_dir = dir.path().join(".rocky").join("plans");
+        std::fs::create_dir_all(&plans_dir)?;
+        let payload = serde_json::json!({"models": ["db.s.t"]});
+        let plan_id = compute_plan_id(&PlanKind::AiAuthored, &payload);
+        // A pre-policy-plane plan file: kind = ai_authored, NO principal key at all.
+        let legacy = serde_json::json!({
+            "plan_id": plan_id,
+            "kind": "ai_authored",
+            "created_at": "2026-05-15T12:34:56Z",
+            "payload": payload,
+        });
+        std::fs::write(
+            plans_dir.join(format!("{plan_id}.json")),
+            serde_json::to_vec_pretty(&legacy)?,
+        )?;
+
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert!(
+            plan.principal.is_none(),
+            "legacy file has no stamped principal"
+        );
+        assert_eq!(
+            plan.resolved_principal(),
+            PolicyPrincipal::Agent,
+            "an unstamped ai_authored plan MUST resolve to agent, never human"
+        );
+        Ok(())
+    }
+
+    /// A legacy non-AI plan (e.g. a `run` plan) with no principal resolves to
+    /// `human` — humans are never gated in v0, so this is the safe default for
+    /// the plan kinds that predate agent authorship.
+    #[test]
+    fn legacy_run_plan_with_no_principal_resolves_to_human() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let plans_dir = dir.path().join(".rocky").join("plans");
+        std::fs::create_dir_all(&plans_dir)?;
+        let payload = serde_json::json!({"models": ["db.s.t"]});
+        let plan_id = compute_plan_id(&PlanKind::Run, &payload);
+        let legacy = serde_json::json!({
+            "plan_id": plan_id,
+            "kind": "run",
+            "created_at": "2026-05-15T12:34:56Z",
+            "payload": payload,
+        });
+        std::fs::write(
+            plans_dir.join(format!("{plan_id}.json")),
+            serde_json::to_vec_pretty(&legacy)?,
+        )?;
+
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(plan.resolved_principal(), PolicyPrincipal::Human);
+        Ok(())
+    }
+
+    /// `write_plan` stamps the kind-derived principal explicitly: an
+    /// `ai_authored` plan is stamped `agent`, a `run` plan `human`.
+    #[test]
+    fn write_plan_stamps_kind_derived_principal() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = DummyPayload {
+            model: "db.s.t",
+            statement_count: 1,
+        };
+        let ai_id = write_plan(dir.path(), PlanKind::AiAuthored, &payload)?;
+        let run_id = write_plan(dir.path(), PlanKind::Run, &payload)?;
+        assert_eq!(
+            read_plan(dir.path(), &ai_id)?.principal,
+            Some(PolicyPrincipal::Agent)
+        );
+        assert_eq!(
+            read_plan(dir.path(), &run_id)?.principal,
+            Some(PolicyPrincipal::Human)
+        );
+        Ok(())
+    }
+
+    /// A governed write embeds the capability classification in the payload
+    /// (so it rides inside `plan_id`), stamps the given principal outside the
+    /// hash, and round-trips back through `embedded_capabilities`.
+    #[test]
+    fn write_plan_governed_embeds_capabilities_in_plan_id() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = serde_json::json!({"models": ["bronze_events"]});
+
+        let mut caps = EmbeddedCapabilities {
+            diff_available: true,
+            ..Default::default()
+        };
+        caps.changed.insert(
+            "bronze_events".to_string(),
+            PolicyCapability::SchemaChangeAdditive,
+        );
+
+        let governed_id = write_plan_governed(
+            dir.path(),
+            PlanKind::AiAuthored,
+            &payload,
+            PolicyPrincipal::Agent,
+            caps.clone(),
+        )?;
+        // The same payload written UNgoverned hashes differently — the embedded
+        // capability is part of the reviewed artifact's id.
+        let plain_id = write_plan(dir.path(), PlanKind::AiAuthored, &payload)?;
+        assert_ne!(
+            governed_id, plain_id,
+            "embedding capabilities must change the plan_id"
+        );
+
+        let plan = read_plan(dir.path(), &governed_id)?;
+        assert_eq!(plan.principal, Some(PolicyPrincipal::Agent));
+        assert_eq!(plan.embedded_capabilities(), caps);
+        Ok(())
+    }
+
+    /// A plan with no embed yields the fail-closed default:
+    /// `diff_available = false`, empty `changed`.
+    #[test]
+    fn embedded_capabilities_absent_fails_closed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = DummyPayload {
+            model: "db.s.t",
+            statement_count: 1,
+        };
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &payload)?;
+        let plan = read_plan(dir.path(), &plan_id)?;
+        let caps = plan.embedded_capabilities();
+        assert!(!caps.diff_available, "no embed ⇒ fail closed");
+        assert!(caps.changed.is_empty());
+        Ok(())
     }
 
     #[test]

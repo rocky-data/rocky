@@ -1697,10 +1697,26 @@ impl RockyMcpServer {
         }
 
         let run_plan = build_ai_run_plan(params.0.model.clone(), &result);
-        let plan_id = rocky_cli::plan_store::write_plan(
+
+        // policy seam 1 + capability-embed: the `propose` tool is the sole MCP writer of plans.
+        // Stamp the `agent` principal explicitly (an AiAuthored plan is
+        // agent-authored by construction) and embed the propose-time
+        // change-classification so `rocky apply` evaluates the plan against the
+        // exact capabilities that were reviewed. A creds-free / non-git project
+        // fails closed (every model classified breaking).
+        let state_path = self.state_path();
+        let capabilities = rocky_cli::commands::compute_embedded_capabilities(
+            &self.config_path,
+            &self.models_dir,
+            "main",
+            Some(&state_path),
+        );
+        let plan_id = rocky_cli::plan_store::write_plan_governed(
             &self.root,
             rocky_cli::plan_store::PlanKind::AiAuthored,
             &run_plan,
+            rocky_core::config::PolicyPrincipal::Agent,
+            capabilities,
         )
         .map_err(|e| {
             ToolError::internal(

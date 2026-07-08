@@ -81,16 +81,29 @@ pub(crate) async fn run_review_in(
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read plan '{plan_id}' for review"))?;
 
-    if plan.kind != PlanKind::AiAuthored {
+    // `rocky review` writes the human sign-off marker that satisfies a
+    // `require_review` policy effect. It applies to AI-authored plans and to
+    // agent-authored `Run` plans (`rocky plan --principal agent`) — both carry
+    // the identical `RunPlan` payload shape. Human-authored plans are never
+    // gated, so reviewing one is a no-op the guard rejects rather than
+    // silently writing a marker that means nothing.
+    let reviewable = plan.kind == PlanKind::AiAuthored
+        || (plan.kind == PlanKind::Run
+            && plan.resolved_principal() == rocky_core::config::PolicyPrincipal::Agent);
+    if !reviewable {
         bail!(
-            "plan '{plan_id}' is a {} plan, not an ai_authored plan. \
-             `rocky review` only applies to AI-authored plans.",
+            "plan '{plan_id}' is a {} plan authored by {}; `rocky review` only applies to \
+             AI-authored plans or agent-authored run plans.",
             plan.kind,
+            serde_json::to_value(plan.resolved_principal())
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "human".to_string()),
         );
     }
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
-        .context("failed to deserialize ai_authored plan payload")?;
+        .context("failed to deserialize plan payload")?;
 
     let models_dir = run_plan.models_dir.as_deref().unwrap_or("models");
 

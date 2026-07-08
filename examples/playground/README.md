@@ -38,7 +38,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**85 of 97 POCs run with no external credentials.** See each POC's README for prerequisites.
+**86 of 98 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -118,7 +118,7 @@ AI-powered model generation, intent extraction, schema sync, test generation, sc
 | [05-schema-grounded-validation](pocs/03-ai/05-schema-grounded-validation) | **Trust arc 5** — `ValidationContext` schema grounding + compile-verify retry loop |
 | [06-mcp-grounding](pocs/03-ai/06-mcp-grounding) | `rocky mcp` server — a schema-only model compiles but reconciles wrong; sampling the data via the MCP tools fixes it (creds-free `run.sh`) |
 
-### 04 — Governance (10 POCs · Databricks / DuckDB)
+### 04 — Governance (11 POCs · Databricks / DuckDB)
 
 Unity Catalog grants, schema patterns, workspace isolation, tagging, classification + masking, retention, auto-create schemas.
 

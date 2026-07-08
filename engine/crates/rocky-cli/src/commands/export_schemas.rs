@@ -19,8 +19,8 @@ use serde::Serialize;
 use crate::commands::doctor::DoctorOutput;
 use crate::output::{
     AiContractOutput, AiExplainOutput, AiGenerateOutput, AiSyncOutput, AiTestOutput, ApplyOutput,
-    ApproveOutput, ArchiveApplyOutput, ArchiveOutput, BranchDeleteOutput, BranchListOutput,
-    BranchOutput, BranchPromoteOutput, CatalogOutput, CiDiffOutput, CiOutput,
+    ApproveOutput, ArchiveApplyOutput, ArchiveOutput, AuditOutput, BranchDeleteOutput,
+    BranchListOutput, BranchOutput, BranchPromoteOutput, CatalogOutput, CiDiffOutput, CiOutput,
     ClearSchemaCacheOutput, ColumnLineageOutput, CompactApplyOutput, CompactDedupOutput,
     CompactOutput, CompareOutput, CompileOutput, ComplianceOutput, CostOutput, DagOutput,
     DagRunOutput, DiscoverOutput, DriftOutput, ErrorEnvelope, EstimateOutput, HistoryOutput,
@@ -119,6 +119,7 @@ fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<RetentionSweepOutput>("state_retention_sweep"),
         entry::<ReviewOutput>("review"),
         entry::<PolicyCheckOutput>("policy_check"),
+        entry::<AuditOutput>("audit"),
         // Plan/apply spine (Cluster 3 B, Phase 2–3)
         entry::<ApplyOutput>("apply"),
         entry::<PromotePlan>("plan_promote"),
