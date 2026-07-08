@@ -1280,6 +1280,8 @@ pub async fn run(
             // orthogonal to the point-to switch above and to `--no-reuse`.
             rocky_cfg.reuse.column_level,
             run_vars,
+            rocky_cfg.resilience.clone(),
+            super::resilience::retry_policy_allows(&rocky_cfg),
         )
         .await;
 
@@ -3754,6 +3756,8 @@ pub async fn run(
                     // sub-key, orthogonal to the point-to switch and `--no-reuse`.
                     rocky_cfg.reuse.column_level,
                     run_vars,
+                    rocky_cfg.resilience.clone(),
+                    super::resilience::retry_policy_allows(&rocky_cfg),
                 )
                 .await?;
                 Ok(())
@@ -4664,8 +4668,34 @@ pub(crate) async fn execute_models(
     // Empty for the call sites that don't expose `--var` (watch / dag / local
     // / tests).
     run_vars: &rocky_core::run_vars::RunVars,
+    // `[resilience]` — the run loop's classified-retry policy. Governs whether a
+    // model whose materialization fails *transiently* is re-run (bounded budget,
+    // capped backoff). On by default; a Permanent / Unknown failure never
+    // retries. Passed by value (cheap `Clone`) so call sites don't juggle a
+    // borrow of the `RockyConfig`.
+    resilience: rocky_core::config::ResilienceConfig,
+    // Whether the agent-policy plane permits the `retry` capability for this
+    // run (allow-by-default; only an explicit `capability = "retry"` policy rule
+    // gates it). Resolved once by the caller from `[policy]`.
+    retry_policy_allows: bool,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
+
+    // Build the run-scoped classified-retry plan once. The budget + breaker
+    // carry interior atomics, so their caps are observed across the whole run
+    // (serial or intra-layer concurrent). `circuit_breaker_threshold = 0`
+    // disables the breaker.
+    let retry_budget =
+        rocky_core::retry_budget::RetryBudget::from_config(resilience.max_retries_per_run);
+    let retry_breaker = (resilience.circuit_breaker_threshold > 0).then(|| {
+        rocky_core::circuit_breaker::CircuitBreaker::new(resilience.circuit_breaker_threshold)
+    });
+    let resilience_plan = super::resilience::ResiliencePlan {
+        cfg: &resilience,
+        policy_allows_retry: retry_policy_allows,
+        budget: &retry_budget,
+        breaker: retry_breaker.as_ref(),
+    };
 
     // Load the persisted schema cache directly from the live
     // `StateStore` — no round-trip through
@@ -5062,19 +5092,31 @@ pub(crate) async fn execute_models(
             let matched_ref = &matched;
             let mut layer_results: Vec<(usize, &String, Result<MaterializationOutput>)> =
                 futures::stream::iter(0..matched.len())
-                    .map(|idx| async move {
-                        let (_, name, model) = matched_ref[idx];
-                        let model_start = Instant::now();
-                        let r = execute_one_plain_model(
-                            model,
-                            warehouse,
-                            dialect,
-                            name,
-                            model_start,
-                            exec_ctx,
-                        )
-                        .await;
-                        (idx, name, r)
+                    .map(|idx| {
+                        let plan = &resilience_plan;
+                        async move {
+                            let (_, name, model) = matched_ref[idx];
+                            // Classified retry wraps each attempt: a fresh
+                            // timing clock per try, transient-only re-run,
+                            // attempt trail stamped onto the output.
+                            let r = super::resilience::run_model_with_retry(
+                                plan,
+                                warehouse,
+                                name,
+                                || {
+                                    execute_one_plain_model(
+                                        model,
+                                        warehouse,
+                                        dialect,
+                                        name,
+                                        Instant::now(),
+                                        exec_ctx,
+                                    )
+                                },
+                            )
+                            .await;
+                            (idx, name, r)
+                        }
                     })
                     .buffer_unordered(concurrency)
                     .collect()
@@ -5303,6 +5345,7 @@ pub(crate) async fn execute_models(
                         );
                         output.materializations.push(MaterializationOutput {
                             asset_key,
+                            attempts: Vec::new(),
                             rows_copied: Some(summary.num_rows as u64),
                             duration_ms,
                             started_at: model_started_at,
@@ -5597,14 +5640,26 @@ pub(crate) async fn execute_models(
 
             // Plain single-statement strategy: delegate to the shared
             // helper so the serial and intra-layer concurrent paths produce
-            // identical output by construction.
-            match execute_one_plain_model(
-                model,
+            // identical output by construction. Wrapped in classified retry:
+            // a transient failure re-runs the model (bounded), recording an
+            // attempt trail on the output. Each attempt takes a fresh timing
+            // clock inside the retry helper; the loop's `model_start` binding is
+            // still consumed by the sibling content-addressed / time_interval
+            // branches above.
+            match super::resilience::run_model_with_retry(
+                &resilience_plan,
                 warehouse,
-                dialect,
                 model_name,
-                model_start,
-                exec_ctx,
+                || {
+                    execute_one_plain_model(
+                        model,
+                        warehouse,
+                        dialect,
+                        model_name,
+                        Instant::now(),
+                        exec_ctx,
+                    )
+                },
             )
             .await
             {
@@ -6371,6 +6426,7 @@ async fn execute_one_plain_model(
     ];
     Ok(MaterializationOutput {
         asset_key,
+        attempts: Vec::new(),
         rows_copied: None,
         duration_ms: model_duration_ms,
         started_at: model_started_at,
@@ -6802,6 +6858,7 @@ async fn run_one_partition(
         partition_key: key.clone(),
         outcome: Ok(MaterializationOutput {
             asset_key: asset_key.to_vec(),
+            attempts: Vec::new(),
             rows_copied: None,
             duration_ms: record.duration_ms,
             started_at: partition_started_at,
@@ -7713,6 +7770,7 @@ async fn process_table(
     Ok(TableOutcome::Materialized(Box::new(TableResult {
         materialization: MaterializationOutput {
             asset_key: asset_key.clone(),
+            attempts: Vec::new(),
             rows_copied: None,
             duration_ms: table_duration,
             started_at: table_started_at,
@@ -10372,6 +10430,8 @@ merge_keys = ["id"]
             false,
             false,
             &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            true,
         )
         .await;
         (output, result)
@@ -10441,6 +10501,8 @@ merge_keys = ["id"]
             false,
             false,
             &run_vars,
+            rocky_core::config::ResilienceConfig::default(),
+            true,
         )
         .await
         .expect("run with --var should succeed");
@@ -10543,6 +10605,8 @@ merge_keys = ["id"]
             false,
             false,
             &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            true,
         )
         .await
         .expect("deferred run must succeed");
@@ -10660,6 +10724,8 @@ merge_keys = ["id"]
             false,
             false,
             &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            true,
         )
         .await;
 
@@ -10938,6 +11004,8 @@ merge_keys = ["id"]
                 false,
                 false,
                 &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig::default(),
+                true,
             )
             .await
             .expect("backfill run must succeed on serial DuckDB under --parallel");
@@ -11059,6 +11127,8 @@ merge_keys = ["id"]
             false,
             false,
             &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            true,
         )
         .await
         .expect("gate run must succeed");
@@ -11578,6 +11648,7 @@ merge_keys = ["id"]
                 env_hash: None,
                 hash_scheme: None,
                 output_column_hashes: None,
+                attempts: Vec::new(),
             }],
             trigger: rocky_core::state::RunTrigger::Manual,
             config_hash: "cfg".to_string(),
@@ -12026,6 +12097,8 @@ merge_keys = ["id"]
                 false,
                 false,
                 &rocky_core::run_vars::RunVars::new(),
+                rocky_core::config::ResilienceConfig::default(),
+                true,
             )
             .await
             .unwrap();
@@ -12728,6 +12801,7 @@ merge_keys = ["id"]
             // fct's own OUTPUT hashes — propagated on a skip so a later
             // content-addressed consumer sees fct's current output == its prior.
             output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
+            attempts: Vec::new(),
         };
         let run = rocky_core::state::RunRecord {
             run_id: "run-1".to_string(),
@@ -12923,6 +12997,237 @@ table = "fct_events"
             count_target(&adapter).await,
             source_rows * 2,
             "second run reuses the existing table and appends through the INSERT path"
+        );
+    }
+
+    /// End-to-end reachability + the load-bearing identity invariant for
+    /// classified retry.
+    ///
+    /// Drives the REAL `execute_one_plain_model` runtime path through the
+    /// run-loop retry helper against in-memory DuckDB, with a fault-injecting
+    /// adapter that fails the model's first materialization statement with a
+    /// *transient* error (a DuckDB lock message) then delegates.
+    ///
+    /// Proves two things:
+    /// 1. **Reachability** — a flaky run that used to fail now completes, and
+    ///    the recovered `MaterializationOutput` carries an attempt trail
+    ///    (one failed attempt + the successful retry).
+    /// 2. **🔴 Identity invariant** — the retried-then-succeeded build produces
+    ///    a byte-identical recipe identity (`recipe_hash` / `env_hash` /
+    ///    `hash_scheme`) and byte-identical materialized data to a clean
+    ///    first-try build. Attempt history is execution metadata; it never
+    ///    leaks into the identity a downstream `history --recipe` / replay /
+    ///    verify reads.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn flaky_transient_run_recovers_with_trail_and_identical_identity() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Instant;
+
+        use async_trait::async_trait;
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::{
+            AdapterError, AdapterResult, ExecutionStats, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::adapter::{DuckDbWarehouseAdapter, classify_duckdb_failure};
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        // A fault-injecting adapter: the first `fail_next` calls to
+        // `execute_statement_with_stats` return a transient DuckDB lock error;
+        // every other call (and every other method) delegates to real DuckDB.
+        struct FlakyDuckDb<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+            fail_next: AtomicU32,
+        }
+        #[async_trait]
+        impl WarehouseAdapter for FlakyDuckDb<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+            async fn execute_statement_with_stats(
+                &self,
+                sql: &str,
+            ) -> AdapterResult<ExecutionStats> {
+                if self.fail_next.load(Ordering::SeqCst) > 0 {
+                    self.fail_next.fetch_sub(1, Ordering::SeqCst);
+                    // A transient DuckDB message → classified `Transient`.
+                    return Err(AdapterError::msg(
+                        "IO Error: Could not set lock on file \"poc.duckdb\"",
+                    ));
+                }
+                self.inner.execute_statement_with_stats(sql).await
+            }
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                self.inner.describe_table(table).await
+            }
+            fn classify_failure(
+                &self,
+                err: &AdapterError,
+            ) -> rocky_core::failure_class::FailureClass {
+                classify_duckdb_failure(err)
+            }
+        }
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, region VARCHAR)",
+            "INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        ] {
+            inner.execute_statement(ddl).await.unwrap();
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("fct.toml"),
+            "name = \"fct\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"tgt\"\ntable = \"fct\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct.sql"),
+            "SELECT id, region FROM src.events",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("fct.sql"),
+            &dir.path().join("fct.toml"),
+            None,
+        )
+        .expect("load model");
+
+        let dialect = DuckDbSqlDialect;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+
+        // Conservative resilience config with zero backoff so the test is fast;
+        // one injected transient failure is within the default `2` budget.
+        let cfg = rocky_core::config::ResilienceConfig {
+            initial_backoff_ms: 0,
+            jitter: false,
+            ..Default::default()
+        };
+        let budget = rocky_core::retry_budget::RetryBudget::from_config(cfg.max_retries_per_run);
+        let plan = crate::commands::resilience::ResiliencePlan {
+            cfg: &cfg,
+            policy_allows_retry: true,
+            budget: &budget,
+            breaker: None,
+        };
+
+        async fn dump(adapter: &DuckDbWarehouseAdapter) -> Vec<Vec<serde_json::Value>> {
+            adapter
+                .execute_query("SELECT id, region FROM tgt.fct ORDER BY id")
+                .await
+                .expect("dump target")
+                .rows
+        }
+
+        // --- Clean first-try build (no injected failures). ---
+        let clean_adapter = FlakyDuckDb {
+            inner: &inner,
+            fail_next: AtomicU32::new(0),
+        };
+        let mat_clean =
+            crate::commands::resilience::run_model_with_retry(&plan, &clean_adapter, "fct", || {
+                super::execute_one_plain_model(
+                    &model,
+                    &clean_adapter as &dyn WarehouseAdapter,
+                    &dialect as &dyn SqlDialect,
+                    "fct",
+                    Instant::now(),
+                    exec_ctx,
+                )
+            })
+            .await
+            .expect("clean build succeeds");
+        assert!(
+            mat_clean.attempts.is_empty(),
+            "a clean first-try success carries no attempt trail"
+        );
+        let clean_rows = dump(&inner).await;
+
+        // Reset the target so the flaky build re-materializes from scratch.
+        inner.execute_statement("DROP TABLE tgt.fct").await.unwrap();
+
+        // --- Flaky build: first materialization statement fails transiently. ---
+        let flaky_adapter = FlakyDuckDb {
+            inner: &inner,
+            fail_next: AtomicU32::new(1),
+        };
+        let mat_flaky =
+            crate::commands::resilience::run_model_with_retry(&plan, &flaky_adapter, "fct", || {
+                super::execute_one_plain_model(
+                    &model,
+                    &flaky_adapter as &dyn WarehouseAdapter,
+                    &dialect as &dyn SqlDialect,
+                    "fct",
+                    Instant::now(),
+                    exec_ctx,
+                )
+            })
+            .await
+            .expect("flaky build recovers after a transient failure");
+
+        // (1) Reachability: recovered, with an honest attempt trail.
+        assert_eq!(
+            mat_flaky.attempts.len(),
+            2,
+            "one failed attempt + the successful retry"
+        );
+        assert_eq!(mat_flaky.attempts[0].outcome, "failed");
+        assert_eq!(
+            mat_flaky.attempts[0].failure_class.as_deref(),
+            Some("transient")
+        );
+        assert_eq!(
+            mat_flaky.attempts[0].transient_kind.as_deref(),
+            Some("server_busy")
+        );
+        assert_eq!(mat_flaky.attempts[1].outcome, "success");
+        let flaky_rows = dump(&inner).await;
+
+        // (2) 🔴 Identity invariant: recipe identity + materialized data are
+        // byte-identical to the clean build; only the attempt trail differs.
+        let id_clean = mat_clean
+            .recipe_identity
+            .as_ref()
+            .expect("clean recipe identity");
+        let id_flaky = mat_flaky
+            .recipe_identity
+            .as_ref()
+            .expect("flaky recipe identity");
+        assert_eq!(
+            id_clean.recipe_hash, id_flaky.recipe_hash,
+            "recipe_hash must be identical — retry never touches program identity"
+        );
+        assert_eq!(id_clean.env_hash, id_flaky.env_hash, "env_hash identical");
+        assert_eq!(
+            id_clean.hash_scheme, id_flaky.hash_scheme,
+            "hash scheme identical"
+        );
+        assert_eq!(
+            mat_clean.metadata.sql_hash, mat_flaky.metadata.sql_hash,
+            "sql fingerprint identical"
+        );
+        assert_eq!(
+            clean_rows, flaky_rows,
+            "the retried-then-succeeded build materializes byte-identical data"
         );
     }
 }

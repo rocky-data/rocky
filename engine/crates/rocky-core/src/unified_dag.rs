@@ -937,6 +937,7 @@ mod tests {
             run: Default::default(),
             reuse: Default::default(),
             policy: None,
+            resilience: Default::default(),
         }
     }
 

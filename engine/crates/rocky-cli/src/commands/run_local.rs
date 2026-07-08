@@ -122,6 +122,8 @@ pub async fn run_transformation(
             // Content-addressed column-level skip (its own `[reuse]` sub-key).
             rocky_cfg.reuse.column_level,
             run_vars,
+            rocky_cfg.resilience.clone(),
+            super::resilience::retry_policy_allows(rocky_cfg),
         )
         .await;
 
@@ -846,6 +848,7 @@ pub async fn run_snapshot(
     if tables_failed == 0 {
         output.tables_copied = 1;
         output.materializations.push(MaterializationOutput {
+            attempts: Vec::new(),
             asset_key: vec![
                 pipeline.target.catalog.clone(),
                 pipeline.target.schema.clone(),

@@ -33,6 +33,63 @@
       ],
       "type": "object"
     },
+    "AttemptRecord": {
+      "description": "One attempt at materializing a model, recorded when the run loop's classified-retry layer is active.\n\nA model that succeeds on the first try records a single attempt; a model that failed transiently and was re-run records one entry per attempt, the last of which is the outcome that stuck. The trail is **execution metadata** — it lives on [`ModelExecution`] alongside the identity hashes, never inside them, so a retried-then-succeeded execution stays byte-indistinguishable downstream from a first-try success (same `recipe_hash` / `input_hash` / output hash).\n\nReused verbatim on `MaterializationOutput.attempts` (the run-JSON surface), so it derives `JsonSchema`; that is the one attempt type on both the wire and the state record.",
+      "properties": {
+        "attempt": {
+          "description": "1-based attempt index. Attempt 1 is the first try; 2+ are retries.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "backoff_ms": {
+          "description": "Milliseconds slept as backoff *after* this attempt before the next retry. `None` on the final (kept) attempt and on any attempt that was not followed by a retry.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "duration_ms": {
+          "description": "Wall-clock duration of this attempt, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "error": {
+          "description": "The failure message (truncated), for a failed attempt; `None` on success.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "failure_class": {
+          "description": "The run-loop [`FailureClass`](crate::failure_class::FailureClass) label (`\"transient\"` / `\"permanent\"` / `\"unknown\"`) for a failed attempt; `None` on a successful attempt.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outcome": {
+          "description": "`\"success\"` or `\"failed\"`.",
+          "type": "string"
+        },
+        "transient_kind": {
+          "description": "The transient sub-kind label (`\"network\"`, `\"timeout\"`, …) when the failure was transient; `None` otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "attempt",
+        "duration_ms",
+        "outcome"
+      ],
+      "type": "object"
+    },
     "BudgetBreachOutput": {
       "description": "One budget breach surfaced on [`RunOutput::budget_breaches`].\n\nKept as a CLI-side struct (rather than re-using [`rocky_core::config::BudgetBreach`]) so the JSON schema lives alongside the other `rocky run` output types. The fields mirror `BudgetBreach` one-to-one.",
       "properties": {
@@ -491,6 +548,13 @@
         "asset_key": {
           "items": {
             "type": "string"
+          },
+          "type": "array"
+        },
+        "attempts": {
+          "description": "The classified-retry attempt trail for this materialization: one [`AttemptRecord`](rocky_core::state::AttemptRecord) per try. Empty (and omitted from JSON) for a clean first-try success — the run loop only stamps a trail once a retry actually happened, so a non-retried build's output stays byte-identical to before this layer shipped. [`RunOutput::to_run_record`] copies this verbatim onto the persisted `ModelExecution.attempts` — one attempt type on both the wire and the state record.",
+          "items": {
+            "$ref": "#/definitions/AttemptRecord"
           },
           "type": "array"
         },

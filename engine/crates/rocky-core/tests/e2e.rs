@@ -476,6 +476,7 @@ fn test_run_history_flow() {
                 env_hash: None,
                 hash_scheme: None,
                 output_column_hashes: None,
+                attempts: Vec::new(),
             },
             ModelExecution {
                 model_name: "customers".to_string(),
@@ -496,6 +497,7 @@ fn test_run_history_flow() {
                 env_hash: None,
                 hash_scheme: None,
                 output_column_hashes: None,
+                attempts: Vec::new(),
             },
         ],
         trigger: RunTrigger::Manual,

@@ -9,6 +9,7 @@ use tokio::time::Instant;
 use tracing::{Instrument, Span, debug, field, info_span, warn};
 
 use rocky_core::config::RetryConfig;
+use rocky_core::failure_class::{FailureClass, TransientKind};
 use rocky_core::retry::compute_backoff;
 use rocky_core::retry_budget::RetryBudget;
 use rocky_core::traits::{
@@ -899,6 +900,10 @@ impl WarehouseAdapter for BigQueryAdapter {
             .map_err(AdapterError::new)
     }
 
+    fn classify_failure(&self, err: &AdapterError) -> FailureClass {
+        classify_bigquery_failure(err)
+    }
+
     async fn execute_statement_with_stats(&self, sql: &str) -> AdapterResult<ExecutionStats> {
         let mut response = self.run_query(sql).await.map_err(AdapterError::new)?;
 
@@ -1649,7 +1654,7 @@ struct ErrorProto {
 ///   on retry.
 /// - A poll-loop [`BigQueryError::Timeout`] — the job already ran to the
 ///   deadline; re-submitting it is a fresh statement's concern.
-fn is_transient(err: &BigQueryError) -> bool {
+pub(crate) fn is_transient(err: &BigQueryError) -> bool {
     match err {
         BigQueryError::ApiError { status, .. } => {
             // `status` is the reqwest `StatusCode` `Display` form, e.g.
@@ -1668,6 +1673,40 @@ fn is_transient(err: &BigQueryError) -> bool {
         | BigQueryError::RetryBudgetExhausted { .. }
         | BigQueryError::StorageRead(_) => false,
     }
+}
+
+/// Classify a BigQuery [`AdapterError`] for the run loop's classified-retry
+/// layer, reusing the connector's own [`is_transient`] judgement so the run
+/// loop and the connector agree by construction.
+///
+/// Downcasts to a [`BigQueryError`]: transient ⇒ [`FailureClass::Transient`]
+/// with a kind read from the HTTP shape; not transient (a job/type error, auth,
+/// budget exhaustion) ⇒ [`FailureClass::Permanent`]; not a [`BigQueryError`] ⇒
+/// [`FailureClass::Unknown`] (fail closed).
+#[must_use]
+pub(crate) fn classify_bigquery_failure(err: &AdapterError) -> FailureClass {
+    let Some(bq_err) = err.inner().downcast_ref::<BigQueryError>() else {
+        return FailureClass::Unknown;
+    };
+    if !is_transient(bq_err) {
+        return FailureClass::Permanent;
+    }
+    let kind = match bq_err {
+        BigQueryError::ApiError { status, .. } => {
+            let code = status
+                .split_whitespace()
+                .next()
+                .and_then(|c| c.parse::<u16>().ok());
+            match code {
+                Some(429) => TransientKind::RateLimit,
+                _ => TransientKind::Network,
+            }
+        }
+        BigQueryError::Http(e) if e.is_timeout() => TransientKind::Timeout,
+        BigQueryError::Http(_) => TransientKind::Network,
+        _ => TransientKind::Other,
+    };
+    FailureClass::Transient(kind)
 }
 
 /// Top-level `statistics` block on a BigQuery job response. Only the
@@ -2123,5 +2162,43 @@ mod tests {
         assert!(!is_transient(&BigQueryError::RetryBudgetExhausted {
             limit: 1
         }));
+    }
+
+    /// The run-loop classifier hoists `is_transient`: a 429 becomes a
+    /// rate-limited Transient, a 5xx a network Transient, a job/type error
+    /// Permanent, and a non-`BigQueryError` boxed error `Unknown`. A permanent
+    /// error is never marked retryable (the dangerous direction).
+    #[test]
+    fn classify_bigquery_failure_maps_three_ways() {
+        let rate_limited = classify_bigquery_failure(&AdapterError::new(BigQueryError::ApiError {
+            status: "429 Too Many Requests".into(),
+            message: "slow down".into(),
+        }));
+        assert_eq!(
+            rate_limited,
+            FailureClass::Transient(TransientKind::RateLimit)
+        );
+
+        let unavailable = classify_bigquery_failure(&AdapterError::new(BigQueryError::ApiError {
+            status: "503 Service Unavailable".into(),
+            message: "x".into(),
+        }));
+        assert_eq!(unavailable, FailureClass::Transient(TransientKind::Network));
+
+        let job_err = classify_bigquery_failure(&AdapterError::new(BigQueryError::JobError {
+            reason: "invalidQuery".into(),
+            message: "bad column".into(),
+        }));
+        assert_eq!(job_err, FailureClass::Permanent);
+        assert!(!job_err.is_retryable());
+
+        let budget =
+            classify_bigquery_failure(&AdapterError::new(BigQueryError::RetryBudgetExhausted {
+                limit: 1,
+            }));
+        assert_eq!(budget, FailureClass::Permanent);
+
+        let unknown = classify_bigquery_failure(&AdapterError::msg("not a bigquery error"));
+        assert_eq!(unknown, FailureClass::Unknown);
     }
 }

@@ -334,6 +334,25 @@ pub trait WarehouseAdapter: Send + Sync {
             .map(|()| ExecutionStats::default())
     }
 
+    /// Classify an error this adapter returned into a run-loop
+    /// [`FailureClass`](crate::failure_class::FailureClass).
+    ///
+    /// The run loop calls this to decide whether a failed model is worth
+    /// re-running: only [`FailureClass::Transient`] is retried;
+    /// [`FailureClass::Permanent`] and [`FailureClass::Unknown`] fail closed.
+    ///
+    /// The default is [`FailureClass::Unknown`] — an adapter that has not
+    /// opted in never has its failures retried. Adapters override this to map
+    /// their own error taxonomy (the same retryable set their connector-level
+    /// retry loop already uses) onto the shared vocabulary.
+    ///
+    /// [`FailureClass::Transient`]: crate::failure_class::FailureClass::Transient
+    /// [`FailureClass::Permanent`]: crate::failure_class::FailureClass::Permanent
+    /// [`FailureClass::Unknown`]: crate::failure_class::FailureClass::Unknown
+    fn classify_failure(&self, _err: &AdapterError) -> crate::failure_class::FailureClass {
+        crate::failure_class::FailureClass::Unknown
+    }
+
     /// Execute a SQL query and return rows.
     async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult>;
 

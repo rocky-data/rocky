@@ -1076,6 +1076,7 @@ mod tests {
             env_hash: None,
             hash_scheme: None,
             output_column_hashes: None,
+            attempts: Vec::new(),
         }
     }
 

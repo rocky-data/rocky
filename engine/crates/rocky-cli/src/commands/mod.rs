@@ -51,6 +51,7 @@ mod profile;
 mod profile_storage;
 mod publish_ir;
 mod replay;
+mod resilience;
 mod retention_status;
 mod reuse_decision;
 mod review;

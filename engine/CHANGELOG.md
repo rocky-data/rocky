@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Classified retry at the run loop (`[resilience]`).** A model whose materialization fails is now classified — via each adapter's own retryable judgement, hoisted into a unified `FailureClass { Transient(kind), Permanent, Unknown }` — and a *proven* transient failure is re-run within a small bounded budget with capped exponential backoff. Every retry is recorded as an attempt trail on the execution record and surfaced in the run's JSON output. **Behavior change:** this is on by default, so a transient failure that fails a run today (a warehouse warming up, a 429, a connection reset, a lock conflict) will now be retried instead. The default budget is deliberately small (`transient_max_retries = 2`); set `transient_max_retries = 0` or `enabled = false` under `[resilience]` to restore the prior single-attempt behavior (e.g. in CI where a fast-fail is preferred). **Permanent** failures (a rejected statement, a type/contract error) and **Unknown** failures (an error the adapter doesn't recognise) are never retried — fail closed. Retry is allow-by-default under the agent-policy plane; only an explicit `capability = "retry"` rule gates it. State schema bumps to v16 (additive `attempts` field on the execution record; pre-v16 records read back with an empty trail).
+
 ## [1.57.0] - 2026-07-08
 
 A large feature release: an enforcing **agent policy plane**, **recipe identity** on every execution, **replay** re-execution, sound **per-column content hashing**, an embedder-grade **engine API** with a job model, the **governor's brief**, and a standalone **recipe-manifest verifier**. All additive — absent the new opt-in config (`[policy]`, `[reuse] column_level`), behavior is unchanged.

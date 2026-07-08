@@ -1,4 +1,6 @@
 use rocky_core::circuit_breaker::{CircuitBreaker, TransitionOutcome};
+use rocky_core::failure_class::{FailureClass, TransientKind};
+use rocky_core::traits::AdapterError;
 use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
@@ -1163,7 +1165,7 @@ fn check_terminal_state(response: StatementResponse) -> Result<StatementResponse
 /// - Network connection or timeout errors
 /// - Databricks-specific: warehouse starting, rate limits, temporary unavailability
 /// - Statement execution timeouts (may succeed on retry with a warmed-up warehouse)
-fn is_transient(err: &ConnectorError) -> bool {
+pub(crate) fn is_transient(err: &ConnectorError) -> bool {
     match err {
         // 401 and 403 are transient-on-first-retry — the connector drops
         // the OAuth cache before retrying, so a server-expired token is
@@ -1201,7 +1203,7 @@ fn is_transient(err: &ConnectorError) -> bool {
 /// `PipelineEvent` — §P2.8. Feeds the event-bus emission from the retry
 /// loop so downstream observers (metrics, Dagster) can distinguish
 /// transient from terminal without string-matching.
-fn classify_error(err: &ConnectorError) -> ErrorClass {
+pub(crate) fn classify_error(err: &ConnectorError) -> ErrorClass {
     match err {
         ConnectorError::ApiError { status: 401, .. } => ErrorClass::Auth,
         ConnectorError::ApiError { status: 429, .. } => ErrorClass::RateLimit,
@@ -1228,6 +1230,59 @@ fn classify_error(err: &ConnectorError) -> ErrorClass {
         | ConnectorError::UnexpectedState { .. }
         | ConnectorError::NoArrowChunks { .. }
         | ConnectorError::Arrow(_) => ErrorClass::Permanent,
+    }
+}
+
+/// Map an [`ErrorClass`] to a run-loop [`TransientKind`]. Only meaningful for
+/// the transient branch; the non-transient variants map to `Other`
+/// defensively (they never co-occur with `is_transient` returning `true`).
+fn transient_kind_of(class: ErrorClass) -> TransientKind {
+    match class {
+        ErrorClass::Timeout => TransientKind::Timeout,
+        ErrorClass::RateLimit => TransientKind::RateLimit,
+        ErrorClass::Auth => TransientKind::Auth,
+        ErrorClass::Transient => TransientKind::Network,
+        ErrorClass::Config | ErrorClass::Permanent => TransientKind::Other,
+    }
+}
+
+/// Classify a Databricks [`AdapterError`] for the run loop's classified-retry
+/// layer, reusing the connector's own [`is_transient`] judgement (the exact
+/// predicate its per-statement retry loop uses) so the run loop and the
+/// connector agree by construction.
+///
+/// - The error downcasts to a [`ConnectorError`] and `is_transient` ⇒
+///   [`FailureClass::Transient`] with a kind from [`classify_error`].
+/// - It downcasts but is not transient ⇒ [`FailureClass::Permanent`].
+/// - It is not a [`ConnectorError`] at all (some other boxed error) ⇒
+///   [`FailureClass::Unknown`] — fail closed, never retried.
+#[must_use]
+pub(crate) fn classify_connector_failure(err: &AdapterError) -> FailureClass {
+    let Some(connector_err) = err.inner().downcast_ref::<ConnectorError>() else {
+        return FailureClass::Unknown;
+    };
+    // An auth / permission status (401 Unauthorized, 403 Forbidden) is
+    // `is_transient` *only* so the connector's own retry loop drops the OAuth
+    // cache and re-mints a token once. A 401/403 that SURVIVES that retry and
+    // reaches the run loop is a genuine bad-credentials / permission-denied,
+    // so it must map to the `Auth` kind — which the run loop treats as
+    // terminal (`FailureClass::is_run_retryable`). Guard this ahead of the
+    // generic path because `classify_error` maps 403 to `Permanent` (a valid
+    // ErrorClass), which would otherwise surface as a run-retryable
+    // `Transient(Other)`.
+    if matches!(
+        connector_err,
+        ConnectorError::ApiError {
+            status: 401 | 403,
+            ..
+        }
+    ) {
+        return FailureClass::Transient(TransientKind::Auth);
+    }
+    if is_transient(connector_err) {
+        FailureClass::Transient(transient_kind_of(classify_error(connector_err)))
+    } else {
+        FailureClass::Permanent
     }
 }
 
@@ -1326,6 +1381,107 @@ fn poll_delay(attempt: usize) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The run-loop classifier hoists the connector's own `is_transient`
+    /// judgement: retryable API/statement errors become `Transient` with the
+    /// right kind, deterministic rejections become `Permanent`, and — the
+    /// dangerous direction — a permanent error is never marked retryable.
+    #[test]
+    fn classify_connector_failure_maps_transient_and_permanent() {
+        // 503 / 429 / timeout / warehouse-warming are transient.
+        let transient_cases = [
+            (
+                ConnectorError::ApiError {
+                    status: 503,
+                    body: "unavailable".to_string(),
+                },
+                TransientKind::Network,
+            ),
+            (
+                ConnectorError::ApiError {
+                    status: 429,
+                    body: "slow down".to_string(),
+                },
+                TransientKind::RateLimit,
+            ),
+            (
+                ConnectorError::Timeout {
+                    id: "s1".to_string(),
+                    seconds: 30,
+                },
+                TransientKind::Timeout,
+            ),
+            (
+                ConnectorError::StatementFailed {
+                    id: "s2".to_string(),
+                    message: "WAREHOUSE IS STARTING".to_string(),
+                },
+                TransientKind::Network,
+            ),
+        ];
+        for (err, kind) in transient_cases {
+            let msg = err.to_string();
+            let class = classify_connector_failure(&AdapterError::new(err));
+            assert_eq!(
+                class,
+                FailureClass::Transient(kind),
+                "should be transient: {msg}"
+            );
+            assert!(class.is_retryable());
+        }
+
+        // A rejected statement (bad SQL) and a 400 are permanent — never retry.
+        let permanent_cases = [
+            ConnectorError::StatementFailed {
+                id: "s3".to_string(),
+                message: "TABLE_OR_VIEW_NOT_FOUND".to_string(),
+            },
+            ConnectorError::ApiError {
+                status: 400,
+                body: "bad request".to_string(),
+            },
+        ];
+        for err in permanent_cases {
+            let msg = err.to_string();
+            let class = classify_connector_failure(&AdapterError::new(err));
+            assert_eq!(class, FailureClass::Permanent, "should be permanent: {msg}");
+            assert!(!class.is_retryable(), "must not retry: {msg}");
+        }
+    }
+
+    /// A boxed error that is *not* a `ConnectorError` fails closed to
+    /// `Unknown` — never retried.
+    #[test]
+    fn classify_non_connector_error_is_unknown() {
+        let err = AdapterError::msg("some unrelated boxed error");
+        assert_eq!(classify_connector_failure(&err), FailureClass::Unknown);
+        assert!(!classify_connector_failure(&err).is_retryable());
+    }
+
+    /// A 401/403 that survived the connector's own token-refresh retry maps to
+    /// the `Auth` kind, which the run loop treats as terminal — a survived
+    /// permission denial is never re-run. (403 in particular would otherwise
+    /// surface as a run-retryable `Transient(Other)` since `classify_error`
+    /// maps it to `Permanent`.)
+    #[test]
+    fn survived_auth_status_is_not_run_retryable() {
+        for status in [401u16, 403] {
+            let err = AdapterError::new(ConnectorError::ApiError {
+                status,
+                body: "denied".to_string(),
+            });
+            let class = classify_connector_failure(&err);
+            assert_eq!(
+                class,
+                FailureClass::Transient(TransientKind::Auth),
+                "{status} should classify as auth-kind"
+            );
+            assert!(
+                !class.is_run_retryable(),
+                "{status} must not be retried at the run loop"
+            );
+        }
+    }
 
     #[test]
     fn test_warehouse_id_from_http_path() {

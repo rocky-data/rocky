@@ -2999,6 +2999,67 @@
       ],
       "type": "object"
     },
+    "ResilienceConfig": {
+      "additionalProperties": false,
+      "description": "`[resilience]` — the run loop's classified-retry policy.\n\nThis is a **distinct layer** from the per-adapter `[adapter.*.retry]` (which retries individual statements inside a connector) and from the run-level `[retry]` budget ([`RunRetryConfig`], which caps connector retries). `[resilience]` governs whether the run loop re-runs a whole *model* whose materialization failed, classifying the failure via [`crate::failure_class::FailureClass`] and retrying only a *proven* transient one.\n\n# Not default-OFF, but conservative\n\nUnlike the skip / reuse gates, this layer is **on by default** — a model that fails transiently today *will* be retried once this ships. The lever that keeps that safe is [`Self::transient_max_retries`] (default `2`): a small, bounded budget with capped exponential backoff. Set `transient_max_retries = 0` (or `enabled = false`) to restore the prior single-attempt behaviour, e.g. in CI where a fast-fail is preferred.\n\nPermanent and Unknown failures are **never** retried regardless of these settings — that is a property of the classifier, not of this config.",
+      "properties": {
+        "backoff_multiplier": {
+          "default": 2.0,
+          "description": "Multiplier applied to the backoff after each retry.",
+          "format": "double",
+          "type": "number"
+        },
+        "circuit_breaker_threshold": {
+          "default": 3,
+          "description": "Trip the run-loop breaker after this many *consecutive* transient model failures; once tripped, no further model is retried for the rest of the run (they still get their one attempt). Default: `3`. `0` disables the breaker.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Master switch for run-loop classified retry. Default `true`. When `false`, every model is attempted exactly once (no classification, no backoff) — the behaviour before this layer existed.",
+          "type": "boolean"
+        },
+        "initial_backoff_ms": {
+          "default": 500,
+          "description": "Initial backoff (ms) before the first retry.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "jitter": {
+          "default": true,
+          "description": "Add ±25 % jitter so concurrent runs don't retry in lockstep.",
+          "type": "boolean"
+        },
+        "max_backoff_ms": {
+          "default": 30000,
+          "description": "Maximum backoff (ms) — caps the exponential growth.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_retries_per_run": {
+          "default": 8,
+          "description": "Optional ceiling on the *total* number of retries across all models in one run — a global budget separate from the per-adapter one. Default `Some(8)`: a conservative cap so one flaky layer can't spin the whole run. `None` removes the ceiling (per-model `transient_max_retries` is then the only bound); `Some(0)` forbids all retries.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "transient_max_retries": {
+          "default": 2,
+          "description": "Maximum re-runs of a model that failed with a *transient* class. Conservative default: `2` (so at most three attempts total). `0` disables retry while leaving the classifier active for observability.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "RetryConfig": {
       "additionalProperties": false,
       "description": "Retry policy for transient warehouse errors (HTTP 429/503, rate limits, timeouts).\n\nRocky retries transient errors with exponential backoff and optional jitter to prevent thundering herd across concurrent runs.",
@@ -4177,6 +4238,24 @@
         "target_dialect": null
       },
       "description": "Dialect-portability lint configuration. Consumed by `rocky compile` to drive P001 (and, when wired, future) diagnostics. The CLI's `--target-dialect` flag, when set, takes precedence over [`PortabilityConfig::target_dialect`]."
+    },
+    "resilience": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ResilienceConfig"
+        }
+      ],
+      "default": {
+        "backoff_multiplier": 2.0,
+        "circuit_breaker_threshold": 3,
+        "enabled": true,
+        "initial_backoff_ms": 500,
+        "jitter": true,
+        "max_backoff_ms": 30000,
+        "max_retries_per_run": 8,
+        "transient_max_retries": 2
+      },
+      "description": "`[resilience]` — the run loop's classified-retry policy. Governs whether a model whose materialization fails *transiently* is re-run, with a conservative bounded budget and capped backoff. On by default (a transient failure is retried), but every knob is small and explicit; see [`ResilienceConfig`]. Permanent / Unknown failures never retry."
     },
     "retry": {
       "anyOf": [

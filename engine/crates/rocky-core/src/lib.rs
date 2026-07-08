@@ -18,6 +18,7 @@ pub mod dag_status;
 pub mod dedup_analysis;
 pub mod docs;
 pub mod drift;
+pub mod failure_class;
 pub mod hooks;
 pub mod idempotency;
 pub mod imports;

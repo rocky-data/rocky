@@ -142,6 +142,10 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
             .map_err(AdapterError::new)
     }
 
+    fn classify_failure(&self, err: &AdapterError) -> rocky_core::failure_class::FailureClass {
+        crate::connector::classify_connector_failure(err)
+    }
+
     async fn execute_statement_with_stats(&self, sql: &str) -> AdapterResult<ExecutionStats> {
         // `total_byte_count` from the Databricks manifest is the
         // byte count Databricks natively reports for a statement —

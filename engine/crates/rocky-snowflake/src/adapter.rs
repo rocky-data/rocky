@@ -70,6 +70,10 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
             .map_err(AdapterError::new)
     }
 
+    fn classify_failure(&self, err: &AdapterError) -> rocky_core::failure_class::FailureClass {
+        crate::connector::classify_connector_failure(err)
+    }
+
     // `execute_statement_with_stats` intentionally NOT overridden.
     //
     // Snowflake does not return `bytes_scanned` in the immediate SQL API
