@@ -1,0 +1,18 @@
+{
+  "manifest_version": "0.1",
+  "hash_scheme": "v1",
+  "producer": {
+    "name": "rocky",
+    "version": "1.56.0"
+  },
+  "subject": {
+    "model": "orders_clean",
+    "run_id": "run-20260708-015241-256",
+    "produced_at": "2026-07-08T01:52:41.274162Z",
+    "status": "success"
+  },
+  "program_hash": "2148e619b51421f51cfb3fac423145fe245bbe409b74f31c22d703ab07453036",
+  "inputs_hash": "75ee2a328c52b2361aec2c1649cfd774e14ebbeb3f7e0bd99805e8e42c21b9c6",
+  "inputs_proof_class": "heuristic",
+  "env_hash": "bbf2c2045328f738683a6336df5fa61b5f00076aeaed7c495c04f9d6991d92bd"
+}

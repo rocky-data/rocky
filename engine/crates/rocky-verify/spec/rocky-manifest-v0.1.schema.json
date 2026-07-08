@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rocky-data.dev/spec/rocky-manifest-v0.1.schema.json",
+  "title": "rocky-manifest v0.1",
+  "description": "DRAFT / experimental. An offline-verifiable attestation of which program, over which inputs, in which environment produced a table version. A manifest is the recipe-identity attestation (program_hash, inputs_hash, env_hash, hash_scheme, inputs_proof_class) plus carrier metadata (producer, subject) and, on a content-addressed write path, optional output artifact byte-hashes. Field names are deliberately vendor-neutral so the format is not tied to any one producer.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_version",
+    "hash_scheme",
+    "producer",
+    "subject",
+    "program_hash",
+    "env_hash"
+  ],
+  "properties": {
+    "manifest_version": {
+      "description": "The rocky-manifest spec version this document conforms to.",
+      "const": "0.1"
+    },
+    "hash_scheme": {
+      "description": "The producer's hash-scheme tag that names the canonicalisation-and-hashing algorithm family in force when the identity hashes were computed. A future canonicalisation change is an explicit new scheme value rather than a silent history fork. The only scheme defined at v0.1 is \"v1\".",
+      "type": "string",
+      "minLength": 1
+    },
+    "producer": {
+      "description": "Who produced this attestation. Vendor-neutral: a consumer reads name and version rather than assuming a specific tool.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {
+          "description": "The producing tool's name, e.g. \"rocky\".",
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "description": "The producing tool's version string, e.g. a semver like \"1.56.0\".",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "subject": {
+      "description": "What this manifest attests: the produced table version and its provenance linkage.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model"],
+      "properties": {
+        "model": {
+          "description": "The model / target name whose production this manifest attests.",
+          "type": "string",
+          "minLength": 1
+        },
+        "run_id": {
+          "description": "The producer's run identifier this production belonged to, for cross-referencing the producer's own run ledger. Optional.",
+          "type": "string",
+          "minLength": 1
+        },
+        "produced_at": {
+          "description": "When the production ran, RFC 3339 / ISO 8601. Optional.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "status": {
+          "description": "The recorded execution status, e.g. \"success\". Optional.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "program_hash": {
+      "description": "The program-identity key: a lowercase-hex BLAKE3 (32 bytes) over the canonical typed representation of the exact program that ran. Two whitespace-different but logically-distinct programs have different program hashes; it is the stable identity of the program, not a skip decision.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "inputs_hash": {
+      "description": "The input-match key: a lowercase-hex BLAKE3 over the run's observed input identities. Present only when the production actually observed its inputs. Absent when no inputs were observed, in which case the declared inputs are already folded into program_hash. When present, inputs_proof_class MUST also be present.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "inputs_proof_class": {
+      "description": "The strength of inputs_hash. \"strong\": every observed upstream identity is a content hash, so the input side is byte-verifiable offline. \"heuristic\": at least one upstream was attested by a freshness signal (a watermark or row count) rather than a content hash, which attests freshness, not byte-identity. A heuristic input must never be read as a content claim. Present if and only if inputs_hash is present.",
+      "type": "string",
+      "enum": ["strong", "heuristic"]
+    },
+    "env_hash": {
+      "description": "The environment key: a lowercase-hex BLAKE3 over the environment semantics (producing-tool version and adapter / dialect identity). Excludes machine identity (hostname) by construction, so two productions on different hosts in the same logical environment share an env_hash.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "output_hashes": {
+      "description": "Byte-hashes of the produced output artifact file(s), one entry per content-addressed file. Present only on a content-addressed write path; absent for a general run that records provenance without hash-naming its output bytes. When present, each hash is byte-verifiable offline: hash the artifact and confirm equality, no producing tool required.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["hash"],
+        "properties": {
+          "hash": {
+            "description": "Lowercase-hex BLAKE3 (32 bytes) of the artifact file's bytes.",
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "path": {
+            "description": "Location of the artifact bytes (a filesystem path or object-store URI), so a verifier can find the file to hash. Optional; a content-addressed file is commonly named by its own hash, so the path may be recoverable from hash alone.",
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  },
+  "dependentRequired": {
+    "inputs_hash": ["inputs_proof_class"],
+    "inputs_proof_class": ["inputs_hash"]
+  }
+}

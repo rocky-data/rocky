@@ -1,0 +1,23 @@
+{
+  "manifest_version": "0.1",
+  "hash_scheme": "v1",
+  "producer": {
+    "name": "rocky",
+    "version": "1.56.0"
+  },
+  "subject": {
+    "model": "fct_revenue",
+    "run_id": "run_2026-05-30T11-04-22Z_8f1a",
+    "status": "success"
+  },
+  "program_hash": "2148e619b51421f51cfb3fac423145fe245bbe409b74f31c22d703ab07453036",
+  "inputs_hash": "75ee2a328c52b2361aec2c1649cfd774e14ebbeb3f7e0bd99805e8e42c21b9c6",
+  "inputs_proof_class": "strong",
+  "env_hash": "bbf2c2045328f738683a6336df5fa61b5f00076aeaed7c495c04f9d6991d92bd",
+  "output_hashes": [
+    {
+      "hash": "736713a2611f762af09ee4445c09157bcfdbf6e07145dd8edf2cfd203d8d5bfa",
+      "path": "736713a2611f762af09ee4445c09157bcfdbf6e07145dd8edf2cfd203d8d5bf0.parquet"
+    }
+  ]
+}
