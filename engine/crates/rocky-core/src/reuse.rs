@@ -63,9 +63,12 @@
 //! index it backs (see [`crate::state::StateStore`]) is *populated* on a
 //! successful run and *read back* by the runner's fail-closed reuse decision,
 //! which acts on a match by pointing-to a prior run's parquet. Population —
-//! and therefore reuse — is gated behind the opt-in `[reuse]` config
-//! ([`crate::config::ReuseConfig`]); with it off the default run path is byte-
-//! and cost-identical to before this module existed.
+//! and therefore point-to reuse — is gated behind `[reuse] enabled`
+//! (default-OFF, [`crate::config::ReuseConfig::enabled`]); with it off this
+//! module's input-hash spine is never built, so the run path pays none of its
+//! normalize+hash cost. (Column-level skip is a separate, orthogonal knob —
+//! [`crate::config::ReuseConfig::column_level`], default-ON — that lives in the
+//! `column_skip` module and engages only on the content-addressed path.)
 
 pub use crate::recipe_identity::{
     ProofClass, UpstreamIdentity, compute_input_hash, proof_class_for, resolve_content_upstreams,

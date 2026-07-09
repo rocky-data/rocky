@@ -1,4 +1,4 @@
-//! The opt-in content-addressed **column-level skip** decision.
+//! The content-addressed **column-level skip** decision.
 //!
 //! This is the *sound* half of the per-column skip substrate: "an upstream was
 //! rebuilt, but the specific columns this downstream actually consumes did NOT
@@ -31,7 +31,7 @@
 //! A wrong skip is **silent production staleness** — the worst failure a
 //! transformation engine can have. So, like the plain gate, this decision is:
 //!
-//! - **default-OFF** (behind `[reuse] column_level = false`);
+//! - **default-ON** (set `[reuse] column_level = false` to disable);
 //! - **fail-safe** — *every* missing, partial, or mismatched input resolves to
 //!   **build**. There is exactly one code path that yields [`ColumnSkipVerdict::Skip`],
 //!   and it requires every clause below to hold;

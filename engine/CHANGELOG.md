@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Content-addressed column-level skip is now on by default (`[reuse] column_level`).** An unpartitioned content-addressed model whose logic, environment, and every provably-consumed upstream column are unchanged since its last successful build is now **skipped** by default — its SQL does not run and no new commit is written; the prior output stays authoritative. The decision is fail-closed: any unproven input (a non-deterministic model, a changed recipe/env, an un-enumerable consumed set, a missing or moved column hash, or an ambiguous producer-column key) forces a build. This affects **only** the content-addressed materialization path and is inert on the common non-content-addressed run. Set `column_level = false` under `[reuse]` to restore the always-build behavior. The default was flipped after a live S3/UniForm verification of the skip-on-unchanged / build-on-changed decision on a real content-addressed table.
+
 ## [1.60.0] - 2026-07-09
 
 ### Added
