@@ -166,6 +166,64 @@ impl<'a> CatalogManager<'a> {
         Ok(parse_delta_retention_rows(&result.rows))
     }
 
+    /// Writes a recipe-manifest attestation into a table's Delta
+    /// `TBLPROPERTIES` via a single post-create `ALTER TABLE ... SET
+    /// TBLPROPERTIES`.
+    ///
+    /// `properties` carries the pre-built `recipe_manifest.*` keys (see
+    /// [`rocky_core::catalog::RECIPE_MANIFEST_TBLPROP_PREFIX`]). The write is
+    /// deliberately separate from the CREATE DDL so it never perturbs the IR
+    /// the recipe hash is computed over. An empty map is a no-op.
+    ///
+    /// Backs
+    /// [`GovernanceAdapter::write_recipe_manifest`](rocky_core::traits::GovernanceAdapter::write_recipe_manifest)
+    /// on Databricks. Delta accepts arbitrary custom property keys; managed
+    /// Iceberg rejects engine-managed writes
+    /// (`MANAGED_ICEBERG_OPERATION_NOT_SUPPORTED`), so this carrier is a Delta
+    /// path — the snapshot-summary carrier is the documented Iceberg fallback.
+    pub async fn set_recipe_manifest_properties(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        properties: &BTreeMap<String, String>,
+    ) -> Result<(), CatalogManagerError> {
+        let Some(sql) =
+            catalog_sql::generate_set_tblproperties_sql(catalog, schema, table, properties)?
+        else {
+            return Ok(());
+        };
+        debug!(
+            catalog,
+            schema, table, "writing recipe-manifest TBLPROPERTIES"
+        );
+        self.connector.execute_statement(&sql).await?;
+        Ok(())
+    }
+
+    /// Reads back the `recipe_manifest.*` `TBLPROPERTIES` a prior
+    /// [`Self::set_recipe_manifest_properties`] wrote.
+    ///
+    /// Issues `SHOW TBLPROPERTIES <cat>.<schema>.<table>` and keeps only the
+    /// keys under [`rocky_core::catalog::RECIPE_MANIFEST_TBLPROP_PREFIX`] — the
+    /// read-back half of the offline-verification round-trip. Returns an empty
+    /// map when the table carries no recipe-manifest keys (e.g. it was never
+    /// written, or was produced by an older engine).
+    pub async fn get_recipe_manifest_properties(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<BTreeMap<String, String>, CatalogManagerError> {
+        let sql = catalog_sql::generate_show_all_tblproperties_sql(catalog, schema, table)?;
+        debug!(
+            catalog,
+            schema, table, "reading recipe-manifest TBLPROPERTIES"
+        );
+        let result = self.connector.execute_sql(&sql).await?;
+        Ok(filter_recipe_manifest_rows(&result.rows))
+    }
+
     /// Lists schemas in a catalog.
     pub async fn list_schemas(&self, catalog: &str) -> Result<Vec<String>, CatalogManagerError> {
         let sql = catalog_sql::generate_show_schemas_sql(catalog)?;
@@ -323,6 +381,24 @@ fn parse_delta_retention_rows(rows: &[Vec<serde_json::Value>]) -> Option<u32> {
 /// Returns the first whitespace-split token that parses as `u32` (trimming
 /// a trailing `.0*` if present to handle the decimal form). Returns `None`
 /// if no token parses — the caller treats that as "no observation".
+/// Keeps only the `recipe_manifest.*` keys from a `SHOW TBLPROPERTIES`
+/// two-column (`key`, `value`) response, discarding `delta.*` reserved
+/// properties and any user tags.
+fn filter_recipe_manifest_rows(rows: &[Vec<serde_json::Value>]) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let Some(key) = row.first().and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !key.starts_with(catalog_sql::RECIPE_MANIFEST_TBLPROP_PREFIX) {
+            continue;
+        }
+        let value = row.get(1).and_then(|v| v.as_str()).unwrap_or_default();
+        out.insert(key.to_string(), value.to_string());
+    }
+    out
+}
+
 fn parse_delta_duration_days(value: &str) -> Option<u32> {
     for tok in value.split_whitespace() {
         // Handle the `"90.000000000"` decimal form by truncating at `.`
@@ -409,6 +485,37 @@ mod tests {
             ],
         ];
         assert_eq!(parse_delta_retention_rows(&rows), Some(120));
+    }
+
+    #[test]
+    fn filter_recipe_manifest_rows_keeps_only_prefixed_keys() {
+        let rows = vec![
+            vec![json!("delta.enableDeletionVectors"), json!("true")],
+            vec![
+                json!("recipe_manifest.program_hash"),
+                json!("2148e619b51421f51cfb3fac423145fe245bbe409b74f31c22d703ab07453036"),
+            ],
+            vec![json!("recipe_manifest.hash_scheme"), json!("v1")],
+            vec![json!("some_user_tag"), json!("whatever")],
+        ];
+        let got = filter_recipe_manifest_rows(&rows);
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got.get("recipe_manifest.program_hash").map(String::as_str),
+            Some("2148e619b51421f51cfb3fac423145fe245bbe409b74f31c22d703ab07453036")
+        );
+        assert_eq!(
+            got.get("recipe_manifest.hash_scheme").map(String::as_str),
+            Some("v1")
+        );
+        assert!(!got.contains_key("delta.enableDeletionVectors"));
+        assert!(!got.contains_key("some_user_tag"));
+    }
+
+    #[test]
+    fn filter_recipe_manifest_rows_empty_when_none_present() {
+        let rows = vec![vec![json!("delta.minReaderVersion"), json!("1")]];
+        assert!(filter_recipe_manifest_rows(&rows).is_empty());
     }
 
     #[test]

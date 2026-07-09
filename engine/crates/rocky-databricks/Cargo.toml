@@ -45,6 +45,12 @@ required-features = ["test-support"]
 [dev-dependencies]
 rocky-core = { path = "../rocky-core" }
 rocky-ir = { path = "../rocky-ir" }
+# rocky-verify is the standalone, no-engine-dep offline manifest verifier.
+# Used here (dev-only) to validate the reconstituted manifest against the
+# published rocky-manifest v0.1 schema in creds-free unit tests; it never
+# depends on this crate, so the graph stays acyclic and rocky-verify's purity
+# is untouched.
+rocky-verify = { path = "../rocky-verify" }
 arrow = { workspace = true }
 tokio = { workspace = true }
 wiremock = { workspace = true }
