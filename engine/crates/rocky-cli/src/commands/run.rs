@@ -6012,11 +6012,36 @@ fn build_reuse_target_by_model<'a, I>(models: I) -> std::collections::HashMap<St
 where
     I: IntoIterator<Item = (&'a str, &'a rocky_core::models::TargetConfig)>,
 {
-    let mut map = std::collections::HashMap::new();
+    // Each model contributes two lookup keys — its lowercased bare name and its
+    // lowercased 3-part `catalog.schema.table` — both resolving to the model's
+    // target full name. When two *different* models would claim the same key
+    // with two *different* targets (case-colliding names, or a name that folds
+    // onto another model's target), the key is **poisoned** (removed) rather
+    // than resolved last-writer-wins: a consumer reading through an ambiguous
+    // key would otherwise compare the wrong producer's column hashes and could
+    // skip on a real content change (a false SKIP / silent staleness). A
+    // poisoned key resolves to `None`, so `compute_consumer_baseline` records no
+    // column baseline for that read and the gate builds. Mirrors the
+    // case-folding-collision guard in `compute_consumer_baseline`.
+    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut poisoned: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, t) in models {
         let target_full = format!("{}.{}.{}", t.catalog, t.schema, t.table);
-        map.insert(target_full.to_lowercase(), target_full.clone());
-        map.insert(name.to_lowercase(), target_full);
+        for key in [target_full.to_lowercase(), name.to_lowercase()] {
+            if poisoned.contains(&key) {
+                continue;
+            }
+            match map.get(&key) {
+                Some(existing) if existing != &target_full => {
+                    map.remove(&key);
+                    poisoned.insert(key);
+                }
+                Some(_) => {}
+                None => {
+                    map.insert(key, target_full.clone());
+                }
+            }
+        }
     }
     map
 }
@@ -14198,6 +14223,49 @@ merge_keys = ["id"]
         assert_eq!(
             sigs[0].consumed_column_hashes, None,
             "a consumed column absent from the producer's hashes ⇒ no baseline for that upstream"
+        );
+    }
+
+    #[test]
+    fn consumer_baseline_fails_closed_on_ambiguous_case_colliding_model_key() {
+        // Two distinct models whose bare names collide case-insensitively
+        // (`Orders` / `orders`) resolve to *different* targets. Their shared
+        // lookup key `orders` is ambiguous, so `build_reuse_target_by_model`
+        // poisons it instead of resolving last-writer-wins — a consumer reading
+        // `orders` would otherwise compare the wrong sibling's producer hashes
+        // and could skip on a real content change (silent staleness). The read
+        // yields no column baseline ⇒ the later gate builds (fail closed).
+        let t_a = target_cfg("cat", "sch", "a");
+        let t_b = target_cfg("cat", "sch", "b");
+        let target_by_model = build_reuse_target_by_model([("Orders", &t_a), ("orders", &t_b)]);
+
+        // The ambiguous bare-name key is dropped; the unambiguous full-target
+        // keys still resolve.
+        assert!(
+            !target_by_model.contains_key("orders"),
+            "an ambiguous case-colliding model key must be poisoned, not resolved"
+        );
+        assert_eq!(
+            target_by_model.get("cat.sch.a"),
+            Some(&"cat.sch.a".to_string())
+        );
+        assert_eq!(
+            target_by_model.get("cat.sch.b"),
+            Some(&"cat.sch.b".to_string())
+        );
+
+        // Even though the wrong sibling recorded matching hashes, the consumed
+        // read via the poisoned key resolves to no baseline.
+        let mut built = std::collections::HashMap::new();
+        built.insert("cat.sch.a".to_string(), vec![ch("id", "h_id")]);
+        built.insert("cat.sch.b".to_string(), vec![ch("id", "h_id")]);
+
+        let sigs = compute_consumer_baseline("SELECT id FROM orders", &target_by_model, &built)
+            .expect("consumed set is complete");
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(
+            sigs[0].consumed_column_hashes, None,
+            "an ambiguous case-colliding model key must yield no column baseline (fail closed)"
         );
     }
 
