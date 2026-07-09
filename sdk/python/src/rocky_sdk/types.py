@@ -1111,6 +1111,7 @@ from .types_generated import (  # noqa: E402, F401
     AssetKind,
     AuditEvent,
     AuditEventKind,
+    BackfillOutput,
     BranchDeleteOutput,
     BranchEntry,
     BranchListOutput,
@@ -1281,6 +1282,7 @@ RockyOutput = (
     | MetricsResult
     | OptimizeResult
     | CostOutput
+    | BackfillOutput
     | AiResult
     | AiSyncResult
     | AiExplainResult
@@ -1320,6 +1322,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "metrics": MetricsResult,
     "optimize": OptimizeResult,
     "cost": CostOutput,
+    "backfill": BackfillOutput,
     "ai": AiResult,
     "ai_sync": AiSyncResult,
     "ai_explain": AiExplainResult,

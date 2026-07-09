@@ -1,0 +1,200 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "BackfillCostEstimate": {
+      "description": "A best-effort, label-as-estimate cost projection for a backfill.\n\nThe projection re-uses the same historical-observed cost formula as `rocky cost`: each closure model's most recent recorded execution is priced by the warehouse cost model. It is offline (no warehouse round-trip) and therefore approximate — `is_estimate` is always `true`.",
+      "properties": {
+        "basis": {
+          "description": "How the figure was derived: `\"historical_observed\"` when at least one closure model had a prior execution to price, else `\"unavailable\"`.",
+          "type": "string"
+        },
+        "is_estimate": {
+          "description": "Always `true` — this is a projection, not a measured cost.",
+          "type": "boolean"
+        },
+        "per_model": {
+          "description": "Per-model breakdown, in closure order.",
+          "items": {
+            "$ref": "#/definitions/BackfillModelCost"
+          },
+          "type": "array"
+        },
+        "total_cost_usd": {
+          "description": "Summed estimated compute cost in USD, or `None` when no closure model has priced execution history (or the warehouse is unbilled, e.g. DuckDB).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "basis",
+        "is_estimate",
+        "per_model"
+      ],
+      "type": "object"
+    },
+    "BackfillModelCost": {
+      "description": "Per-model entry in a [`BackfillCostEstimate`].",
+      "properties": {
+        "cost_usd": {
+          "description": "Estimated compute cost in USD for one rebuild, or `None` when the model has no priced execution history.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "duration_ms": {
+          "description": "Observed duration (ms) of the priced historical execution, when found.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model_name": {
+          "description": "The model name.",
+          "type": "string"
+        },
+        "source_run_id": {
+          "description": "The run the historical figure was read from, for provenance.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "model_name"
+      ],
+      "type": "object"
+    },
+    "BackfillPartitionScope": {
+      "description": "The partition window a backfill scopes partitioned models to.",
+      "properties": {
+        "from": {
+          "description": "Range lower bound (`--from`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "models": {
+          "description": "The closure models that declare a partitioned (`time_interval`) materialization — the ones the window actually applies to. Empty when no model in the closure is partitioned (the window is then inert).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "to": {
+          "description": "Range upper bound (`--to`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "models"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "The composed, review-gated recovery plan emitted by `rocky backfill`.\n\nA backfill re-runs *existing* recipes over a scoped window — it never rewrites SQL to \"fix\" data. The command composes the set of models to rebuild (the affected models plus their downstream lineage closure), the order to rebuild them in, the partition window where models are partitioned, and an estimated cost. The plan is persisted and **always** requires a human sign-off (`rocky review <plan-id> --approve`) before `rocky apply` will execute it, regardless of any configured policy — backfills are where blast radius hides.",
+  "properties": {
+    "apply_command": {
+      "description": "The exact command that executes the plan once reviewed.",
+      "type": "string"
+    },
+    "command": {
+      "description": "Always `\"backfill\"`.",
+      "type": "string"
+    },
+    "cost_estimate": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/BackfillCostEstimate"
+        }
+      ],
+      "description": "Best-effort cost projection for the rebuild. Always an *estimate*."
+    },
+    "execution_layers": {
+      "description": "Topological execution layers over the closure. Models in the same layer are independent; each layer runs after the previous completes.",
+      "items": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "type": "array"
+    },
+    "message": {
+      "description": "Human-readable one-line summary.",
+      "type": "string"
+    },
+    "models": {
+      "description": "The full set of models to rebuild — the seeds plus their downstream lineage closure — in topological (dependency-first) order.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "partition_scope": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BackfillPartitionScope"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Partition window applied to partitioned models in the closure, when a `--from`/`--to` range was supplied. Absent when the backfill is a full rebuild of each model."
+    },
+    "plan_id": {
+      "description": "The persisted plan identifier (64-char blake3 hex). Feed it to `rocky review <plan-id> --approve` then `rocky apply <plan-id>`.",
+      "type": "string"
+    },
+    "requires_review": {
+      "description": "Always `true` — a backfill plan is unconditionally review-gated.",
+      "type": "boolean"
+    },
+    "review_command": {
+      "description": "The exact command that clears the review gate.",
+      "type": "string"
+    },
+    "seed_models": {
+      "description": "The models that triggered the backfill (the failure/gap seeds), before the downstream closure is added.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "trigger": {
+      "description": "What surfaced the affected models: `\"manual\"` (explicit `--model`) or `\"last_run_failure\"` (seeded from the previous run's failed models, i.e. the contained/quarantined window).",
+      "type": "string"
+    },
+    "version": {
+      "description": "Rocky version that composed the plan.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "apply_command",
+    "command",
+    "cost_estimate",
+    "execution_layers",
+    "message",
+    "models",
+    "plan_id",
+    "requires_review",
+    "review_command",
+    "seed_models",
+    "trigger",
+    "version"
+  ],
+  "title": "BackfillOutput",
+  "type": "object"
+}

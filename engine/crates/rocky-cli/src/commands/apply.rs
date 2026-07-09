@@ -108,6 +108,9 @@ pub(crate) async fn run_apply_in(
         PlanKind::AiAuthored => {
             run_apply_ai_authored_plan(root, config_path, plan_id, state_path, output_json).await
         }
+        PlanKind::Backfill => {
+            run_apply_backfill_plan(root, config_path, plan_id, state_path, output_json).await
+        }
     }
 }
 
@@ -666,6 +669,110 @@ async fn run_apply_ai_authored_plan(
     }
 
     execute_run_plan(config_path, plan_id, run_plan, state_path, output_json).await
+}
+
+/// Apply a `PlanKind::Backfill` plan — a scoped, review-gated recovery run.
+///
+/// A backfill plan is composed by the engine (`rocky backfill`) in response to
+/// a failure or gap, so its gate is stricter than a normal plan and is a hard
+/// rule rather than policy-tunable:
+///
+/// - It is **always** review-gated. A `rocky review <plan-id> --approve` marker
+///   must exist regardless of any configured policy — a permissive `[policy]`
+///   never relaxes this. Backfills are where blast radius hides.
+/// - Policy may make the gate *stricter*: an agent-scoped `deny backfill {…}`
+///   rule hard-refuses even a reviewed plan. A policy `require_review` is
+///   already satisfied by the marker the always-on gate demands.
+///
+/// Once cleared, execution reuses the standard run path
+/// ([`crate::commands::run::execute_backfill_set`]) so classified retry (R1)
+/// and failure containment (R2) apply to the rebuild. The closure is never
+/// re-authored — a backfill only re-runs existing recipes over its window.
+async fn run_apply_backfill_plan(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    output_json: bool,
+) -> Result<()> {
+    let plan = read_plan(root, plan_id)
+        .with_context(|| format!("failed to read backfill plan '{plan_id}'"))?;
+
+    if plan.kind != PlanKind::Backfill {
+        bail!(
+            "plan '{plan_id}' is a {} plan, not a backfill plan. \
+             Use `rocky apply {plan_id}` and let the dispatcher route it.",
+            plan.kind,
+        );
+    }
+
+    let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
+        .context("failed to deserialize backfill plan payload")?;
+
+    // HARD RULE: a backfill is always review-gated, regardless of policy.
+    if !ai_plan_is_reviewed(root, plan_id) {
+        bail!(
+            "backfill plan '{plan_id}' has not been reviewed and approved. \
+             A backfill re-runs recipes over a scoped window and can hide blast \
+             radius, so it always requires a human sign-off — a permissive policy \
+             does not waive it. Review the scope and approve it with \
+             `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
+        );
+    }
+
+    // Policy can only tighten the gate: a `deny` hard-refuses even a reviewed
+    // backfill. The marker above already satisfies any policy `require_review`.
+    let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
+    let touched = touched_models_for_run(&plan, &run_plan);
+    let gate = evaluate_apply_policy(
+        config_path,
+        plan_id,
+        plan.resolved_principal(),
+        &touched,
+        models_dir,
+        state_path,
+    );
+    if let PolicyGate::Deny {
+        model,
+        rule_id,
+        reason,
+    } = gate
+    {
+        let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+        bail!(
+            "policy DENIES backfill plan '{plan_id}': model '{model}'{rule} — {reason}. \
+             A deny cannot be satisfied by review; re-scope the backfill or have a \
+             human apply it."
+        );
+    }
+
+    let set: BTreeSet<String> = run_plan.models.iter().cloned().collect();
+    if set.is_empty() {
+        bail!("backfill plan '{plan_id}' names no models to rebuild");
+    }
+
+    // Only the partition window carries over — a backfill never resumes,
+    // shadows, or runs `--latest`/`--missing`.
+    let partition_opts = crate::commands::run::PartitionRunOptions {
+        partition: None,
+        from: run_plan.partition_from.clone(),
+        to: run_plan.partition_to.clone(),
+        latest: false,
+        missing: false,
+        lookback: None,
+        parallel: run_plan.parallel,
+    };
+
+    crate::commands::run::execute_backfill_set(
+        config_path,
+        state_path,
+        models_dir,
+        &set,
+        &partition_opts,
+        output_json,
+    )
+    .await
+    .with_context(|| format!("rocky apply backfill plan '{plan_id}' failed"))
 }
 
 /// Apply a `PlanKind::Replication` plan by re-running discovery, asserting

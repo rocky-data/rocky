@@ -450,6 +450,41 @@ enum Command {
         models: PathBuf,
     },
 
+    /// Compose a scoped, review-gated backfill plan for recovery.
+    ///
+    /// A backfill re-runs *existing* recipes over a scoped window — it never
+    /// rewrites SQL. Given the affected models (explicit `--model`, or the
+    /// previous run's failed models via `--from-last-run`), it composes the
+    /// downstream lineage closure to rebuild, orders it topologically, scopes
+    /// partitioned models to a `--from`/`--to` window, and estimates the cost.
+    ///
+    /// The plan is ALWAYS review-gated: `rocky apply <plan-id>` refuses it until
+    /// `rocky review <plan-id> --approve` records a sign-off, regardless of
+    /// policy. Once approved, execution reuses the standard run path (classified
+    /// retry + failure containment).
+    Backfill {
+        /// A model to rebuild (repeatable). Its downstream lineage closure is
+        /// rebuilt with it. Mutually exclusive with `--from-last-run`.
+        #[arg(long = "model")]
+        model: Vec<String>,
+        /// Seed the backfill from the previous run's failed models — the
+        /// contained/quarantined window a partial failure left behind.
+        #[arg(long, conflicts_with = "model")]
+        from_last_run: bool,
+        /// Partition-window lower bound applied to partitioned models.
+        #[arg(long)]
+        from: Option<String>,
+        /// Partition-window upper bound applied to partitioned models.
+        #[arg(long)]
+        to: Option<String>,
+        /// Rebuild only the named/seed models, not their downstream closure.
+        #[arg(long)]
+        no_downstream: bool,
+        /// Models directory to compose the backfill against.
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
+    },
+
     /// Agent-authority policy plane (explain-mode in v0).
     ///
     /// `rocky policy check` reports the effect the policy plane *would*
@@ -2699,6 +2734,27 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 };
                 rocky_cli::commands::run_review(&cli.config, &plan_id, &base, approve, json).await
             }
+        }
+        Command::Backfill {
+            model,
+            from_last_run,
+            from,
+            to,
+            no_downstream,
+            models,
+        } => {
+            rocky_cli::commands::run_backfill(
+                &cli.config,
+                &state_path,
+                &models,
+                &model,
+                from_last_run,
+                from.as_deref(),
+                to.as_deref(),
+                !no_downstream,
+                json,
+            )
+            .await
         }
         Command::Policy { subcommand } => match subcommand {
             PolicySubcommand::Check {
