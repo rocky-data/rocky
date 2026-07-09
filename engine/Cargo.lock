@@ -4040,6 +4040,7 @@ dependencies = [
  "axum",
  "base64",
  "blake3",
+ "boon",
  "bytes",
  "chrono",
  "clap",

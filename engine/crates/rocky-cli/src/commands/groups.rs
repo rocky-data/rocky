@@ -90,7 +90,7 @@ pub fn classify_command(name: &str) -> Option<CommandGroup> {
         }
         // Dev
         "init" | "playground" | "serve" | "lsp" | "list" | "shell" | "validate" | "bench"
-        | "export-schemas" | "fmt" => Some(CommandGroup::Dev),
+        | "export-schemas" | "export-openapi" | "fmt" => Some(CommandGroup::Dev),
         // Migrate
         "import-dbt" | "validate-migration" | "init-adapter" | "test-adapter" | "adapter" => {
             Some(CommandGroup::Migrate)
@@ -144,6 +144,10 @@ fn commands_for_group(group: CommandGroup) -> &'static [(&'static str, &'static 
             ("validate", "Validate config without connecting"),
             ("bench", "Run performance benchmarks"),
             ("export-schemas", "Export JSON Schema files for codegen"),
+            (
+                "export-openapi",
+                "Generate the OpenAPI 3.1 document for `rocky serve`",
+            ),
             ("fmt", "Format .rocky files"),
         ],
         CommandGroup::Migrate => &[

@@ -33,6 +33,7 @@ clap_complete = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
+boon = { workspace = true }
 indexmap = { workspace = true }
 chrono = { workspace = true }
 tempfile = "3"

@@ -42,7 +42,11 @@ use crate::output::{
 /// type derives `JsonSchema`. The `roundtrip` test below catches the
 /// case where someone adds a new output struct but forgets to register
 /// it (it asserts the count matches the committed `schemas/` directory).
-fn schemas() -> Vec<(&'static str, serde_json::Value)> {
+///
+/// Exposed to the crate so the OpenAPI generator ([`super::export_openapi`])
+/// can reuse the exact same registry as its source of `components/schemas`,
+/// keeping the served HTTP surface and the exported bindings in lockstep.
+pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
     fn entry<T: JsonSchema + Serialize>(name: &'static str) -> (&'static str, serde_json::Value) {
         let schema = schema_for!(T);
         (

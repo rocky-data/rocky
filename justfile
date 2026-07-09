@@ -90,7 +90,7 @@ vendor-dagster:
 # or output shapes that show up in dagster fixtures — use `just codegen-all`
 # instead, which also runs `regen-fixtures`. Release CI fails
 # (codegen-drift.yml) if either side is stale.
-codegen: codegen-rust codegen-sdk codegen-vscode codegen-vscode-project-schema
+codegen: codegen-rust codegen-sdk codegen-vscode codegen-vscode-project-schema codegen-openapi
 
 # Bundle `codegen` + `regen-fixtures` for release cuts and any change that
 # alters the shape of command output (e.g. new fields on MaterializationOutput,
@@ -107,6 +107,19 @@ codegen-all: codegen regen-fixtures
 # regen-fixtures` invocation only compiles the engine once.
 codegen-rust:
     cd engine && cargo run --quiet --release --bin rocky -- export-schemas ../schemas
+
+# Generate the OpenAPI 3.1 document for the `rocky serve` HTTP API from the
+# same typed schema registry as `codegen-rust` plus the `/api/v1` route table.
+#
+# Reuses the release binary built by `codegen-rust` (it runs after it in the
+# `codegen` aggregate), so a `just codegen` run compiles the engine only once.
+# The document is validated against the OpenAPI 3.1 meta-schema offline before
+# it is written; a structurally invalid or dangling-ref document fails here.
+# The artifact lives under `docs/public/` so it is both servable and outside
+# `schemas/` (avoiding the export-schemas count-guard). codegen-drift CI fails
+# if the committed document is stale.
+codegen-openapi:
+    cd engine && cargo run --quiet --release --bin rocky -- export-openapi ../docs/public/openapi.json
 
 # Regenerate Pydantic v2 models in the rocky-sdk package from schemas/
 # (writes to sdk/python/src/rocky_sdk/types_generated/). dagster-rocky
