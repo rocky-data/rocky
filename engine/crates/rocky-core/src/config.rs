@@ -2491,12 +2491,15 @@ pub struct RockyConfig {
     #[serde(default)]
     pub run: RunConfig,
 
-    /// Opt-in auditable reuse. Default-OFF: an absent `[reuse]` block keeps
-    /// `rocky run` byte- and cost-identical (no per-model hashing, no extra
-    /// state write). When enabled, an eligible content-addressed model whose
-    /// inputs match a prior strong run may **point-to** that run's parquet
-    /// (zero-copy) instead of re-executing its SQL — fail-closed to BUILD on
-    /// any doubt. See [`ReuseConfig`].
+    /// Auditable reuse for content-addressed models — two orthogonal knobs.
+    /// `enabled` (byte-level point-to reuse) is **default-OFF**: an absent
+    /// `[reuse]` block writes no input-match spine and pays no per-model hashing
+    /// for it. `column_level` (column-level skip) is **default-ON** but engages
+    /// only on the content-addressed path, so on the common
+    /// non-content-addressed run it is inert. When `enabled`, an eligible
+    /// content-addressed model whose inputs match a prior strong run may
+    /// **point-to** that run's parquet (zero-copy) instead of re-executing its
+    /// SQL — fail-closed to BUILD on any doubt. See [`ReuseConfig`].
     #[serde(default)]
     pub reuse: ReuseConfig,
 
@@ -2553,7 +2556,7 @@ pub struct RunConfig {
     pub lag_tolerance_seconds: u64,
 }
 
-/// `[reuse]` — opt-in auditable reuse for content-addressed models.
+/// `[reuse]` — auditable reuse for content-addressed models.
 ///
 /// When `enabled = true`, a successful run records, per model, an input-match
 /// index entry and an offline-verifiable provenance record (the model's logic
@@ -2564,12 +2567,13 @@ pub struct RunConfig {
 /// skips the SQL — provided every clause of the runner's fail-closed reuse
 /// decision holds. Any doubt builds.
 ///
-/// **Default-OFF.** `enabled = false` (the default) keeps `rocky run` byte-
-/// *and* cost-identical to before the spine existed: no extra normalize+hash
-/// work, no extra state write, no reuse decision. The point-to path is strong
-/// (byte-identical) only on the content-addressed/UniForm write path;
-/// experimental, opt-in.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// **`enabled` is default-OFF.** `enabled = false` (the default) writes no
+/// input-match spine: no extra normalize+hash work, no extra state write, no
+/// point-to decision. The point-to path is strong (byte-identical) only on the
+/// content-addressed/UniForm write path. Column-level skip is a separate,
+/// orthogonal knob — [`ReuseConfig::column_level`], **default-ON** — that
+/// engages only on that same content-addressed path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReuseConfig {
     /// Master switch for auditable reuse: populates the input-match spine and
@@ -2578,8 +2582,8 @@ pub struct ReuseConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Opt-in **column-level skip** for content-addressed models. When `true`,
-    /// an unpartitioned content-addressed model whose logic, environment, and
+    /// **Column-level skip** for content-addressed models. When `true`, an
+    /// unpartitioned content-addressed model whose logic, environment, and
     /// every provably-consumed upstream column are unchanged since its last
     /// successful build is **skipped** — its SQL does not run and no new commit
     /// is written; the prior output stays authoritative. Skipping on a value
@@ -2589,13 +2593,30 @@ pub struct ReuseConfig {
     /// un-enumerable consumed set, a missing or moved column hash) forces a
     /// build.
     ///
-    /// **Default-OFF.** `false` (the default) keeps `rocky run` byte- and
-    /// cost-identical: no column-level comparison runs and no model is skipped
-    /// on this basis. Independent of [`Self::enabled`] (byte-level point-to
-    /// reuse) — the two are orthogonal opt-ins on the content-addressed path.
-    /// Experimental; off the content-addressed path the feature does not apply.
-    #[serde(default)]
+    /// **Default-ON.** `true` (the default) lets a content-addressed model skip
+    /// when its consumed inputs are provably unchanged; set
+    /// `column_level = false` to restore the always-build behavior. Independent
+    /// of [`Self::enabled`] (byte-level point-to reuse) — the two are orthogonal
+    /// on the content-addressed path, and off that path the feature does not
+    /// apply (so on the common non-content-addressed run this default is inert).
+    #[serde(default = "default_reuse_column_level")]
     pub column_level: bool,
+}
+
+/// The default for [`ReuseConfig::column_level`] — **on**. Content-addressed
+/// column-level skip is enabled by default; it only engages on the
+/// content-addressed path and fails closed on any unproven input.
+fn default_reuse_column_level() -> bool {
+    true
+}
+
+impl Default for ReuseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            column_level: default_reuse_column_level(),
+        }
+    }
 }
 
 /// Who is attempting an action.
@@ -5542,6 +5563,33 @@ pin = "*"
         assert_eq!(entry.snapshot, "current.json");
         assert_eq!(entry.baseline.as_deref(), Some("baseline.json"));
         assert_eq!(entry.pin.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn reuse_column_level_defaults_on_via_both_paths() {
+        // `[reuse]` block absent entirely ⇒ `ReuseConfig::default()`.
+        let d = ReuseConfig::default();
+        assert!(d.column_level, "column_level defaults ON");
+        assert!(!d.enabled, "point-to reuse (enabled) stays default-OFF");
+
+        // The whole parent config with no `[reuse]` block resolves the same.
+        let parent: RockyConfig = toml::from_str("").unwrap();
+        assert!(parent.reuse.column_level);
+        assert!(!parent.reuse.enabled);
+
+        // `[reuse]` present but `column_level` omitted ⇒ serde field default.
+        let present: ReuseConfig = toml::from_str("").unwrap();
+        assert!(present.column_level, "omitted column_level defaults ON");
+
+        // Explicit override is honored — proves the default is real, not a
+        // hardcoded value (non-vacuous: fails on the old default-OFF too).
+        let off: ReuseConfig = toml::from_str("column_level = false").unwrap();
+        assert!(
+            !off.column_level,
+            "explicit `column_level = false` is honored"
+        );
+        let on: ReuseConfig = toml::from_str("column_level = true").unwrap();
+        assert!(on.column_level);
     }
 
     #[test]

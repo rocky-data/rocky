@@ -4878,7 +4878,7 @@ pub(crate) async fn execute_models(
     // populated AND an eligible model whose inputs match a prior strong run
     // points-to that run's parquet instead of executing its SQL.
     reuse_enabled: bool,
-    // Opt-in `[reuse] column_level`. When `true`, an unpartitioned
+    // `[reuse] column_level` (default-ON). When `true`, an unpartitioned
     // content-addressed model whose logic, environment, and every
     // provably-consumed upstream column are unchanged since its last successful
     // build is column-skipped (SQL not run, prior output authoritative). When
@@ -5595,7 +5595,7 @@ pub(crate) async fn execute_models(
         for &(idx, model_name, model) in &matched {
             let model_name: &str = model_name.as_str();
 
-            // Content-addressed column-level skip, default-OFF behind
+            // Content-addressed column-level skip, default-ON behind
             // `[reuse] column_level`. Evaluated before the Built record and the
             // reuse/build dispatch so a proven skip records `Skipped` and never
             // runs the SQL. Content-addressed + unpartitioned only; any doubt
