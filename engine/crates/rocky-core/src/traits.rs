@@ -1516,6 +1516,49 @@ pub trait GovernanceAdapter: Send + Sync {
     async fn read_retention_days(&self, _table: &TableRef) -> AdapterResult<Option<u32>> {
         Ok(None)
     }
+
+    /// Write a recipe-manifest attestation into a table's warehouse-side
+    /// metadata.
+    ///
+    /// `properties` is a set of already-built `recipe_manifest.<field>` keys
+    /// (see
+    /// [`RECIPE_MANIFEST_TBLPROP_PREFIX`](crate::catalog::RECIPE_MANIFEST_TBLPROP_PREFIX))
+    /// carrying the recipe-identity triple plus manifest carrier fields
+    /// (`producer`, `subject`). Rocky calls this after a model materializes so
+    /// the attestation travels with the table and can be read back and verified
+    /// offline by [`rocky-verify`] with no engine installed.
+    ///
+    /// The write is issued as a post-create `ALTER TABLE ... SET TBLPROPERTIES`
+    /// on adapters that support it — deliberately **not** folded into the
+    /// CREATE DDL, whose inline properties feed the hashed IR. Writing after
+    /// creation keeps the identity hash-neutral.
+    ///
+    /// # Default: silent no-op
+    ///
+    /// Unlike the user-declared capabilities ([`Self::apply_column_tags`],
+    /// [`Self::apply_retention_policy`]) whose trait default *errors* to force
+    /// adapters to declare explicit semantics, the recipe-manifest write is an
+    /// **ambient engine attestation** the user did not opt into per-model. The
+    /// honest degrade on a warehouse without a custom-property carrier is to
+    /// skip it silently, so the default returns `Ok(())`. This is why the write
+    /// no-ops "automatically" on DuckDB (its [`NoopGovernanceAdapter`]),
+    /// Snowflake, and BigQuery without any per-adapter override — only
+    /// Databricks (Delta `TBLPROPERTIES`) implements it. The `rocky run` caller
+    /// treats a failure here as best-effort (warn, never fail the run).
+    ///
+    /// [`rocky-verify`]: https://rocky-data.dev/reference/rocky-manifest-spec/
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AdapterError`] on a network / auth / SQL failure for
+    /// adapters that implement the write. The default never errors.
+    async fn write_recipe_manifest(
+        &self,
+        _table: &TableRef,
+        _properties: &BTreeMap<String, String>,
+    ) -> AdapterResult<()> {
+        Ok(())
+    }
 }
 
 /// No-op governance adapter for warehouses that don't support catalog
@@ -1769,6 +1812,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("remove_workspace_binding"));
+    }
+
+    #[tokio::test]
+    async fn trait_default_write_recipe_manifest_is_ok_noop() {
+        // Unlike the workspace-binding primitives, the recipe-manifest write
+        // defaults to a silent no-op so it degrades gracefully on adapters
+        // without a custom-property carrier — MinimalGovernance inherits it.
+        let table = TableRef {
+            catalog: "c".into(),
+            schema: "s".into(),
+            table: "t".into(),
+        };
+        let mut props = BTreeMap::new();
+        props.insert("recipe_manifest.program_hash".to_string(), "ab".to_string());
+        assert!(
+            MinimalGovernance
+                .write_recipe_manifest(&table, &props)
+                .await
+                .is_ok()
+        );
+        // And the DuckDB-backing NoopGovernanceAdapter no-ops the same way,
+        // without any override of its own.
+        assert!(
+            NoopGovernanceAdapter
+                .write_recipe_manifest(&table, &props)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

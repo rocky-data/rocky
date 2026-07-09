@@ -4169,6 +4169,7 @@ dependencies = [
  "rocky-ir",
  "rocky-observe",
  "rocky-sql",
+ "rocky-verify",
  "serde",
  "serde_json",
  "thiserror",

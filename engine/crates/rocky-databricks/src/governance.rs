@@ -372,6 +372,29 @@ impl GovernanceAdapter for DatabricksGovernanceAdapter {
         .map_err(AdapterError::new)
     }
 
+    async fn write_recipe_manifest(
+        &self,
+        table: &TableRef,
+        properties: &BTreeMap<String, String>,
+    ) -> AdapterResult<()> {
+        if properties.is_empty() {
+            return Ok(());
+        }
+        // Post-create ALTER TABLE ... SET TBLPROPERTIES on the Delta table.
+        // Deliberately separate from the CREATE DDL so the recipe-identity
+        // triple this carries never perturbs the IR its own hash is computed
+        // over (the write is hash-neutral by construction).
+        let mgr = CatalogManager::new(&self.connector);
+        mgr.set_recipe_manifest_properties(
+            &table.catalog,
+            &table.schema,
+            table.table.as_str(),
+            properties,
+        )
+        .await
+        .map_err(AdapterError::new)
+    }
+
     async fn read_retention_days(&self, table: &TableRef) -> AdapterResult<Option<u32>> {
         // Reads the same Delta TBLPROPERTIES pair that `apply_retention_policy`
         // writes (`delta.logRetentionDuration` +

@@ -1323,6 +1323,11 @@ pub async fn run(
                     Some(target_model),
                 )
                 .await;
+                // Write the recipe-identity attestation into the built table's
+                // warehouse metadata (Databricks Delta TBLPROPERTIES; no-op
+                // elsewhere). Reads the triple off the materialization; never
+                // recomputes it.
+                write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
             }
             Err(e) => {
                 output.tables_failed += 1;
@@ -4038,6 +4043,13 @@ pub async fn run(
     output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
     let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
 
+    // Write the recipe-identity attestation into each materialized table's
+    // warehouse metadata (Databricks Delta TBLPROPERTIES; no-op elsewhere).
+    // This single hook, keyed off `output.materializations`, covers every
+    // replication / transformation / time-interval model built by this
+    // pipeline path. Best-effort — never flips the run's exit code.
+    write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
+
     // Persist the RunRecord so `rocky history`, `rocky replay`,
     // `rocky trace`, and `rocky cost` have real data to read.
     // Record-store failures never fail the command — the user's run
@@ -6407,6 +6419,64 @@ pub(crate) async fn apply_model_governance_tags(
     }
 }
 
+/// Write recipe-manifest attestations into warehouse table metadata for every
+/// model materialized this run.
+///
+/// Reads the recipe-identity triple straight off each
+/// [`MaterializationOutput::recipe_identity`](crate::output::MaterializationOutput)
+/// — never recomputing it — and hands the mapped `recipe_manifest.*` key set
+/// to [`GovernanceAdapter::write_recipe_manifest`], which issues a post-create
+/// `ALTER TABLE ... SET TBLPROPERTIES` on Databricks (Delta) and no-ops
+/// elsewhere.
+///
+/// Keyed off the universal `output.materializations` collection — which
+/// *every* materialization path pushes into (replication, transformation,
+/// time-interval, model-only) and every path stamps `recipe_identity` onto —
+/// so this single hook inherits all-path coverage rather than being patched
+/// into one site and silently missing the others.
+///
+/// Best-effort: a write failure warns but never fails the run (matching the
+/// per-model governance-tag application it sits alongside). No-ops on
+/// warehouses without a custom-property carrier via the trait default.
+pub(crate) async fn write_recipe_manifests(
+    output: &RunOutput,
+    governance_adapter: &dyn GovernanceAdapter,
+    run_id: &str,
+) {
+    let engine_version = env!("CARGO_PKG_VERSION");
+    for mat in &output.materializations {
+        let Some(props) = crate::output::recipe_manifest_properties(mat, run_id, engine_version)
+        else {
+            continue;
+        };
+        // The carrier needs a three-part `catalog.schema.table` target for the
+        // ALTER. Other key shapes (e.g. a DuckDB two-part key) are skipped —
+        // and DuckDB no-ops the write regardless.
+        let [catalog, schema, table] = mat.asset_key.as_slice() else {
+            debug!(
+                asset_key = ?mat.asset_key,
+                "skipping recipe-manifest write: asset key is not catalog.schema.table"
+            );
+            continue;
+        };
+        let target = rocky_ir::TableRef {
+            catalog: catalog.clone(),
+            schema: schema.clone(),
+            table: table.clone(),
+        };
+        if let Err(e) = governance_adapter
+            .write_recipe_manifest(&target, &props)
+            .await
+        {
+            warn!(
+                model = %mat.asset_key.join("."),
+                error = %e,
+                "recipe-manifest metadata write failed (best-effort; run not affected)"
+            );
+        }
+    }
+}
+
 pub(crate) fn governance_tag_target(
     strategy: &rocky_core::models::StrategyConfig,
     catalog: &str,
@@ -8330,6 +8400,151 @@ fn is_rate_limit_error(error_msg: &str) -> bool {
 mod tests {
     use super::*;
     use rocky_core::plan_partition::PartitionSelection;
+
+    /// A recording [`GovernanceAdapter`] that captures every
+    /// `write_recipe_manifest` call — the coverage-proof analogue of the
+    /// `set_tags`-recording `CountingGovernance` mock below.
+    struct RecordingRecipeGovernance {
+        writes: std::sync::Mutex<Vec<(String, BTreeMap<String, String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl rocky_core::traits::GovernanceAdapter for RecordingRecipeGovernance {
+        async fn set_tags(
+            &self,
+            _target: &TagTarget,
+            _tags: &BTreeMap<String, String>,
+        ) -> rocky_core::traits::AdapterResult<()> {
+            Ok(())
+        }
+        async fn get_grants(
+            &self,
+            _target: &rocky_ir::ir::GrantTarget,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ir::Grant>> {
+            Ok(vec![])
+        }
+        async fn apply_grants(
+            &self,
+            _grants: &[rocky_ir::ir::Grant],
+        ) -> rocky_core::traits::AdapterResult<()> {
+            Ok(())
+        }
+        async fn revoke_grants(
+            &self,
+            _grants: &[rocky_ir::ir::Grant],
+        ) -> rocky_core::traits::AdapterResult<()> {
+            Ok(())
+        }
+        async fn bind_workspace(
+            &self,
+            _catalog: &str,
+            _workspace_id: u64,
+            _binding_type: &str,
+        ) -> rocky_core::traits::AdapterResult<()> {
+            Ok(())
+        }
+        async fn set_isolation(
+            &self,
+            _catalog: &str,
+            _enabled: bool,
+        ) -> rocky_core::traits::AdapterResult<()> {
+            Ok(())
+        }
+        async fn write_recipe_manifest(
+            &self,
+            table: &rocky_ir::TableRef,
+            properties: &BTreeMap<String, String>,
+        ) -> rocky_core::traits::AdapterResult<()> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((table.full_name(), properties.clone()));
+            Ok(())
+        }
+    }
+
+    fn mat_for_manifest(
+        asset_key: &[&str],
+        identity: Option<crate::output::RecipeIdentityInternal>,
+    ) -> crate::output::MaterializationOutput {
+        crate::output::MaterializationOutput {
+            asset_key: asset_key.iter().map(|s| (*s).to_string()).collect(),
+            attempts: Vec::new(),
+            rows_copied: None,
+            duration_ms: 1,
+            started_at: Utc::now(),
+            metadata: crate::output::MaterializationMetadata {
+                strategy: "full_refresh".to_string(),
+                watermark: None,
+                target_table_full_name: None,
+                sql_hash: None,
+                column_count: None,
+                compile_time_ms: None,
+            },
+            partition: None,
+            cost_usd: None,
+            bytes_scanned: None,
+            bytes_written: None,
+            tenant: None,
+            job_ids: Vec::new(),
+            skip_internal: None,
+            recipe_identity: identity,
+            output_column_hashes: None,
+            consumed_column_baseline: None,
+        }
+    }
+
+    /// The all-paths coverage proof: `write_recipe_manifests` writes exactly
+    /// the materializations that stamped a recipe-identity (and skips those
+    /// that did not), keyed off the universal `output.materializations`
+    /// collection every run path pushes into. Creds-free — no warehouse.
+    #[tokio::test]
+    async fn write_recipe_manifests_writes_identity_bearing_and_skips_others() {
+        let identity = crate::output::RecipeIdentityInternal {
+            recipe_hash: "2148e619b51421f51cfb3fac423145fe245bbe409b74f31c22d703ab07453036"
+                .to_string(),
+            env_hash: "bbf2c2045328f738683a6336df5fa61b5f00076aeaed7c495c04f9d6991d92bd"
+                .to_string(),
+            hash_scheme: "v1".to_string(),
+        };
+        let mut output = RunOutput::new(String::new(), 1000, 3);
+        output.materializations.push(mat_for_manifest(
+            &["wh", "silver", "orders"],
+            Some(identity.clone()),
+        ));
+        output.materializations.push(mat_for_manifest(
+            &["wh", "silver", "customers"],
+            Some(identity.clone()),
+        ));
+        // Never stamped recipe_identity (a path that did not compute it) → skipped.
+        output
+            .materializations
+            .push(mat_for_manifest(&["wh", "silver", "no_identity"], None));
+
+        let gov = RecordingRecipeGovernance {
+            writes: std::sync::Mutex::new(Vec::new()),
+        };
+        write_recipe_manifests(&output, &gov, "run-cov").await;
+
+        let writes = gov.writes.lock().unwrap();
+        let tables: Vec<&str> = writes.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            tables,
+            vec!["wh.silver.orders", "wh.silver.customers"],
+            "every identity-bearing model is written; the identity-less one is skipped"
+        );
+        let (_, props) = &writes[0];
+        assert_eq!(
+            props["recipe_manifest.program_hash"],
+            "2148e619b51421f51cfb3fac423145fe245bbe409b74f31c22d703ab07453036"
+        );
+        assert_eq!(props["recipe_manifest.producer.name"], "rocky");
+        assert_eq!(props["recipe_manifest.subject.run_id"], "run-cov");
+        assert_eq!(props["recipe_manifest.subject.model"], "orders");
+        // Default run observed no inputs → both-or-neither honesty invariant.
+        assert!(!props.contains_key("recipe_manifest.inputs_hash"));
+        assert!(!props.contains_key("recipe_manifest.inputs_proof_class"));
+    }
 
     #[test]
     fn governance_tag_target_dispatches_view_strategy_to_view() {

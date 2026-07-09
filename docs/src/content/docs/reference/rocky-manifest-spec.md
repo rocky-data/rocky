@@ -119,7 +119,11 @@ The same manifest content can travel in more than one place:
 
 1. **A standalone file.** A `.json` document, suitable for an export bundle handed to an auditor or a downstream consumer. This is the form the reference verifier reads.
 2. **Alongside content-addressed artifacts.** On the content-addressed write path, the output bytes are already named by their BLAKE3 hash and recorded in the artifact ledger, which is what populates `output_hashes`.
-3. **Table-format metadata.** Embedding the identity in a table format's own commit metadata (for example Iceberg snapshot-summary properties or Delta commit info) is a natural carrier so the attestation travels with the table. Aligning those keys to these field names is future work and is not part of v0.1.
+3. **Table-format metadata.** Embedding the identity in a table's own warehouse-side metadata is a natural carrier, so the attestation travels with the table. Rocky writes it into Delta `TBLPROPERTIES`: each manifest field is carried under a vendor-neutral namespace prefix, `recipe_manifest.`, with the field's dotted path appended, for example `recipe_manifest.program_hash`, `recipe_manifest.env_hash`, `recipe_manifest.hash_scheme`, `recipe_manifest.inputs_hash`, `recipe_manifest.inputs_proof_class`, `recipe_manifest.manifest_version`, `recipe_manifest.producer.name`, `recipe_manifest.producer.version`, `recipe_manifest.subject.model`, `recipe_manifest.subject.run_id`, `recipe_manifest.subject.status`. The prefix is deliberately not a vendor brand such as `rocky.`: vendor identity belongs in the `producer` field, not the key, and a shared neutral namespace lets a reader glob the manifest keys and tell them apart from `delta.*` reserved properties and arbitrary user tags. The write is issued as a post-create `ALTER TABLE ... SET TBLPROPERTIES`, never folded into the CREATE, so it cannot perturb the IR the program hash is computed over.
+
+   A reader reverses that mapping — strip the prefix, split the remaining dotted path — to reconstitute a standalone manifest that `rocky-verify` checks offline. Note the boundary: a managed (non-content-addressed) run carries the identity triple but no `output_hashes`, so offline verification of a table-metadata manifest is schema validation only. It proves the carrier round-tripped and the triple is well-formed, not that the table's bytes are reproducible. Byte-verifiable teeth still live only in `output_hashes` on the content-addressed path.
+
+   The Delta `TBLPROPERTIES` carrier is where this ships today. Managed Iceberg rejects engine-managed property writes (`MANAGED_ICEBERG_OPERATION_NOT_SUPPORTED`), so the documented fallback for an Iceberg table is the snapshot-summary carrier, which remains future work.
 
 ## The reference verifier
 
@@ -157,5 +161,6 @@ It does not attest that re-running the program would reproduce the same output. 
 | Manifest derivable from `rocky history --recipe --output json` | Shipped |
 | `rocky-verify` schema validation and offline byte verification | Shipped |
 | `output_hashes` populated for a general (non-content-addressed) run | Not yet — output byte-hashes are recorded on the content-addressed write path only |
-| Table-format metadata carrier with these field names | Not yet — future work |
+| Table-format metadata carrier (Delta `TBLPROPERTIES` under the `recipe_manifest.` namespace) | Shipped for Delta — reconstitutes to a manifest `rocky-verify` validates offline (schema-only on a managed run) |
+| Table-format metadata carrier for Iceberg (snapshot-summary) | Not yet — managed Iceberg rejects engine-managed property writes; snapshot-summary carrier is future work |
 | Signature block for signed custody | Not yet — intentionally unspecified until the signing model lands |
