@@ -14343,6 +14343,1072 @@ merge_keys = ["id"]
         ));
     }
 
+    /// Full-stack soak + regression proof for the content-addressed
+    /// **column-level sound skip** ("an upstream was rebuilt, but the specific
+    /// columns this downstream consumes did NOT change → skip it").
+    ///
+    /// # What this adds over the sibling tests
+    ///
+    /// The pure decision ([`crate::commands::column_skip::decide_column_skip`]) and
+    /// the completeness guard ([`rocky_sql::consumed_columns`]) each have their
+    /// own exhaustive unit tests, but they run over *synthetic* inputs — hand-
+    /// typed column hashes and SQL strings. This module closes the loop by
+    /// driving the **real producer hasher through the real gate**: it writes
+    /// genuine Arrow batches through the real
+    /// [`rocky_iceberg::uniform_writer::UniformWriter`] (against an in-memory
+    /// object store), takes the real per-column content hashes it computes on
+    /// the write path, feeds them through the production consumer-baseline
+    /// recorder ([`super::super::compute_consumer_baseline`], over the
+    /// production completeness guard + FROM→upstream resolver) and into the
+    /// gate. A value change to a consumed column that the hasher fails to notice
+    /// — or a completeness gap that lets a predicate/join/group/window column
+    /// escape the consumed set — is a **false skip**, i.e. silent production
+    /// staleness, so every case asserts an exact verdict (and, on a BUILD, the
+    /// exact [`ColumnSkipReason`]) so it can never pass for the wrong reason.
+    ///
+    /// # Why the harness is in-memory, not DuckDB (design reconciliation)
+    ///
+    /// The feature's design names a "differential DuckDB byte-identity oracle":
+    /// build the downstream both ways on DuckDB and assert byte-identical
+    /// output. That literal form **cannot run creds-free**: the content-
+    /// addressed write path is `s3://`-only
+    /// ([`crate::commands::run_content_addressed::build_object_store`] rejects every
+    /// other scheme) and per-column producer/consumer hashes are recorded *only*
+    /// for content-addressed models — so a DuckDB playground run records nothing
+    /// and never reaches the gate. The oracle is therefore re-homed onto the
+    /// in-memory `object_store` harness that already backs
+    /// [`crate::commands::run_content_addressed`]'s own tests, driving the same
+    /// real `UniformWriter`. The one honest thing the byte oracle then proves is
+    /// **producer determinism + the hash comparison's fidelity** (design
+    /// Fork 4's producer half): identical consumed inputs ⇒ byte-identical
+    /// rebuild ⇒ the skip preserves exactly what a rebuild would have produced.
+    /// It does **not** prove consumed-set *completeness* — modelling the
+    /// downstream's output as a function of one column *assumes* that column is
+    /// the only input, which is the very thing completeness must establish. That
+    /// half rests on [`rocky_sql::consumed_columns`]'s own corpus plus the
+    /// force-build assertions here, not on the byte oracle. (See the report /
+    /// PR description for the explicit live-verify boundary.)
+    ///
+    /// Everything here runs with the feature flag ON *in-test only*; the shipped
+    /// default stays OFF.
+    mod t2_column_skip_soak {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjPath;
+        use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+        use rocky_core::state::ColumnHash;
+        use rocky_iceberg::uniform_writer::{
+            Result as UfResult, SqlClient, UniformWriter, UniformWriterConfig, WriteResult,
+        };
+
+        use super::super::{
+            ColumnSkipOutcome, build_reuse_target_by_model, compute_consumer_baseline,
+            try_content_addressed_column_skip,
+        };
+        use super::target_cfg;
+        use crate::commands::column_skip::ColumnSkipReason::{
+            ConsumedColumnChanged, ConsumedColumnsNotEnumerable,
+        };
+        use crate::commands::column_skip::ColumnSkipVerdict::{Build, Skip};
+        use crate::commands::column_skip::{
+            ColumnSkipInputs, ColumnSkipVerdict, decide_column_skip,
+        };
+
+        /// The writer never issues SQL on the `write_batch` path (only
+        /// `sync_iceberg_metadata` does, which the soak never calls), so an
+        /// `execute` here is a wiring regression — panic to catch it.
+        struct PanicSqlClient;
+
+        #[async_trait::async_trait]
+        impl SqlClient for PanicSqlClient {
+            async fn execute(&self, _sql: &str) -> UfResult<()> {
+                panic!("soak writer must not issue SQL (write_batch does not call MSCK)");
+            }
+        }
+
+        /// A test column: a name plus Int64 or Utf8 values (the only two types
+        /// the soak needs — enough to exercise the Arrow-IPC per-column hash).
+        enum Col {
+            I64(Vec<i64>),
+            Str(Vec<&'static str>),
+        }
+
+        impl Col {
+            /// The Delta `schemaString` type token discover() expects.
+            fn delta_type(&self) -> &'static str {
+                match self {
+                    Col::I64(_) => "long",
+                    Col::Str(_) => "string",
+                }
+            }
+
+            fn arrow(&self) -> (DataType, ArrayRef) {
+                match self {
+                    Col::I64(v) => (DataType::Int64, Arc::new(Int64Array::from(v.clone()))),
+                    Col::Str(v) => (DataType::Utf8, Arc::new(StringArray::from(v.clone()))),
+                }
+            }
+        }
+
+        fn make_batch(cols: &[(&str, Col)]) -> RecordBatch {
+            let mut fields = Vec::with_capacity(cols.len());
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(cols.len());
+            for (name, c) in cols {
+                let (dt, arr) = c.arrow();
+                fields.push(Field::new(*name, dt, false));
+                arrays.push(arr);
+            }
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("valid batch")
+        }
+
+        /// Seed an unpartitioned, name-mapped Delta UniForm bootstrap declaring
+        /// exactly `cols` (each with a column-mapping id + physical UUID), so
+        /// `discover()` succeeds and `build_parquet` can resolve every column.
+        async fn seed_bootstrap(store: &InMemory, prefix: &str, cols: &[(&str, Col)]) {
+            let fields: Vec<serde_json::Value> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, (name, c))| {
+                    serde_json::json!({
+                        "name": *name,
+                        "type": c.delta_type(),
+                        "nullable": false,
+                        "metadata": {
+                            "delta.columnMapping.id": i + 1,
+                            "delta.columnMapping.physicalName": format!("col-{}-uuid", *name),
+                        }
+                    })
+                })
+                .collect();
+            let bootstrap = serde_json::json!({
+                "protocol": {
+                    "minReaderVersion": 2,
+                    "minWriterVersion": 7,
+                    "writerFeatures": ["columnMapping", "icebergCompatV2", "invariants", "appendOnly"],
+                }
+            });
+            let metadata = serde_json::json!({
+                "metaData": {
+                    "id": "00000000-0000-0000-0000-000000000000",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": serde_json::to_string(&serde_json::json!({
+                        "type": "struct", "fields": fields
+                    })).unwrap(),
+                    "partitionColumns": [],
+                    "configuration": {
+                        "delta.columnMapping.mode": "name",
+                        "delta.universalFormat.enabledFormats": "iceberg",
+                        "delta.enableIcebergCompatV2": "true"
+                    },
+                    "createdTime": 0
+                }
+            });
+            let body = format!(
+                "{}\n{}\n",
+                serde_json::to_string(&bootstrap).unwrap(),
+                serde_json::to_string(&metadata).unwrap(),
+            );
+            store
+                .put(
+                    &ObjPath::from(format!("{prefix}/_delta_log/00000000000000000000.json")),
+                    PutPayload::from(body.into_bytes()),
+                )
+                .await
+                .unwrap();
+        }
+
+        /// Drive the **real** `UniformWriter` over a fresh in-memory store and
+        /// return its full [`WriteResult`] — including the per-column content
+        /// hashes computed on the genuine write path. A throwaway store per call
+        /// keeps the soak free of commit-version / double-count reasoning: all
+        /// the gate consumes is the column hashes.
+        async fn write_result(cols: &[(&str, Col)]) -> WriteResult {
+            let store: Arc<InMemory> = Arc::new(InMemory::new());
+            let prefix = "soak";
+            seed_bootstrap(&store, prefix, cols).await;
+            let writer = UniformWriter::new(
+                UniformWriterConfig {
+                    catalog: "cat".into(),
+                    schema: "sch".into(),
+                    table: "u".into(),
+                    prefix: prefix.into(),
+                    engine_info: "rocky-cli/soak".into(),
+                },
+                store as Arc<dyn ObjectStore>,
+                Arc::new(PanicSqlClient),
+            );
+            let state = writer.discover().await.expect("discover seeded bootstrap");
+            writer
+                .write_batch_with_state(make_batch(cols), state)
+                .await
+                .expect("write_batch must succeed on the seeded in-memory store")
+        }
+
+        /// Real producer column hashes for `cols`.
+        async fn column_hashes(cols: &[(&str, Col)]) -> Vec<ColumnHash> {
+            write_result(cols).await.column_hashes
+        }
+
+        fn built_map(entries: Vec<(&str, Vec<ColumnHash>)>) -> HashMap<String, Vec<ColumnHash>> {
+            entries
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect()
+        }
+
+        /// Run the gate purely over the consumed-column comparison: compute the
+        /// prior and current baselines the **same way** (the production
+        /// recorder) from `built_prior` / `built_current`, and hold the three
+        /// orthogonal clauses (determinism, recipe, env) true so the
+        /// consumed-column hash comparison is the *sole* deciding variable. This
+        /// is the design's "computed the same way it is recorded" invariant, and
+        /// asserting the exact verdict below is the structural non-vacuity guard.
+        fn gate(
+            d_sql: &str,
+            tbm: &HashMap<String, String>,
+            built_prior: &HashMap<String, Vec<ColumnHash>>,
+            built_current: &HashMap<String, Vec<ColumnHash>>,
+        ) -> ColumnSkipVerdict {
+            let prior = compute_consumer_baseline(d_sql, tbm, built_prior);
+            let current = compute_consumer_baseline(d_sql, tbm, built_current);
+            decide_column_skip(&ColumnSkipInputs {
+                deterministic: true,
+                recipe_unchanged: true,
+                env_unchanged: true,
+                current_baseline: current.as_deref(),
+                prior_baseline: prior.as_deref(),
+            })
+        }
+
+        fn tbm_u() -> HashMap<String, String> {
+            build_reuse_target_by_model([("u", &target_cfg("cat", "sch", "u"))])
+        }
+
+        // ── The headline trap ───────────────────────────────────────────────
+
+        /// THE most important assertion in the suite: a *schema-stable* value
+        /// change to a **consumed** column flips its real content hash ⇒ BUILD.
+        /// This is precisely the case a schema-diff classifier is blind to. Real
+        /// writer, real hashes, real gate.
+        #[tokio::test]
+        async fn consumed_value_change_builds() {
+            let tbm = tbm_u();
+            let v1 = column_hashes(&[("amount", Col::I64(vec![100, 200, 300]))]).await;
+            // Schema-identical, one value moved.
+            let v2 = column_hashes(&[("amount", Col::I64(vec![100, 200, 999]))]).await;
+            let built_v1 = built_map(vec![("cat.sch.u", v1)]);
+            let built_v2 = built_map(vec![("cat.sch.u", v2)]);
+
+            assert_eq!(
+                gate("SELECT amount FROM u", &tbm, &built_v1, &built_v2),
+                Build(ConsumedColumnChanged),
+                "a schema-stable value change to a consumed column must force a build"
+            );
+        }
+
+        /// The win: a change confined to a column the downstream never reads
+        /// leaves the consumed baseline untouched ⇒ SKIP. `note` churns; the
+        /// consumed set is `{amount}`, whose real hash is byte-identical across
+        /// the two producer writes.
+        #[tokio::test]
+        async fn non_consumed_column_churn_skips() {
+            let tbm = tbm_u();
+            let v1 = column_hashes(&[
+                ("amount", Col::I64(vec![1, 2, 3])),
+                ("note", Col::Str(vec!["a", "b", "c"])),
+            ])
+            .await;
+            let v2 = column_hashes(&[
+                ("amount", Col::I64(vec![1, 2, 3])), // consumed column unchanged
+                ("note", Col::Str(vec!["x", "y", "z"])), // non-consumed churn
+            ])
+            .await;
+            let built_v1 = built_map(vec![("cat.sch.u", v1)]);
+            let built_v2 = built_map(vec![("cat.sch.u", v2)]);
+
+            assert_eq!(
+                gate("SELECT amount FROM u", &tbm, &built_v1, &built_v2),
+                Skip,
+                "churn confined to a non-consumed column must still skip"
+            );
+        }
+
+        /// Over-sensitivity is the safe failure direction (design Fork 4): an
+        /// order-unstable producer's column hash moves every run (the Arrow-IPC
+        /// hash is order-sensitive, no normalisation in v1) ⇒ BUILD. The feature
+        /// never *skips* such a producer — it declines to, which is the accepted,
+        /// documented inertness, not a silent wrong skip.
+        #[tokio::test]
+        async fn order_unstable_producer_never_skips() {
+            let tbm = tbm_u();
+            let v1 = column_hashes(&[("amount", Col::I64(vec![1, 2, 3]))]).await;
+            // Same multiset, different stored order.
+            let v2 = column_hashes(&[("amount", Col::I64(vec![3, 2, 1]))]).await;
+            assert_ne!(
+                v1, v2,
+                "the writer's per-column hash must be order-sensitive (proves inertness is real)"
+            );
+            let built_v1 = built_map(vec![("cat.sch.u", v1)]);
+            let built_v2 = built_map(vec![("cat.sch.u", v2)]);
+
+            assert_eq!(
+                gate("SELECT amount FROM u", &tbm, &built_v1, &built_v2),
+                Build(ConsumedColumnChanged),
+                "a reorder-only rebuild must build (over-sensitive, never a wrong skip)"
+            );
+        }
+
+        // ── Fork-1 completeness: non-projection consumed columns build ───────
+
+        /// A column read **only in a `WHERE` predicate** (never projected) is
+        /// consumed — a value change to it must build. A projection-only
+        /// consumed set would false-skip here.
+        #[tokio::test]
+        async fn where_only_column_change_builds() {
+            let tbm = tbm_u();
+            let v1 = column_hashes(&[
+                ("amount", Col::I64(vec![10, 20, 30])),
+                ("region", Col::Str(vec!["US", "US", "EU"])),
+            ])
+            .await;
+            let v2 = column_hashes(&[
+                ("amount", Col::I64(vec![10, 20, 30])), // projected, unchanged
+                ("region", Col::Str(vec!["US", "US", "US"])), // predicate-only, moved
+            ])
+            .await;
+            let built_v1 = built_map(vec![("cat.sch.u", v1)]);
+            let built_v2 = built_map(vec![("cat.sch.u", v2)]);
+
+            assert_eq!(
+                gate(
+                    "SELECT amount FROM u WHERE region = 'US'",
+                    &tbm,
+                    &built_v1,
+                    &built_v2
+                ),
+                Build(ConsumedColumnChanged),
+                "a WHERE-only column is consumed — its value change must build"
+            );
+        }
+
+        /// A column read **only as a `GROUP BY` key** is consumed.
+        #[tokio::test]
+        async fn group_by_key_change_builds() {
+            let tbm = tbm_u();
+            let v1 = column_hashes(&[
+                ("customer_id", Col::I64(vec![1, 1, 2])),
+                ("amount", Col::I64(vec![10, 20, 30])),
+            ])
+            .await;
+            let v2 = column_hashes(&[
+                ("customer_id", Col::I64(vec![1, 2, 2])), // grouping key moved
+                ("amount", Col::I64(vec![10, 20, 30])),
+            ])
+            .await;
+            let built_v1 = built_map(vec![("cat.sch.u", v1)]);
+            let built_v2 = built_map(vec![("cat.sch.u", v2)]);
+
+            assert_eq!(
+                gate(
+                    "SELECT customer_id, SUM(amount) AS total FROM u GROUP BY customer_id",
+                    &tbm,
+                    &built_v1,
+                    &built_v2
+                ),
+                Build(ConsumedColumnChanged),
+                "a GROUP BY key is consumed — its value change must build"
+            );
+        }
+
+        /// A column read **only in a window `PARTITION BY`** is consumed.
+        #[tokio::test]
+        async fn window_partition_change_builds() {
+            let tbm = tbm_u();
+            let v1 = column_hashes(&[
+                ("x", Col::I64(vec![1, 2, 3])),
+                ("region", Col::Str(vec!["a", "a", "b"])),
+            ])
+            .await;
+            let v2 = column_hashes(&[
+                ("x", Col::I64(vec![1, 2, 3])),
+                ("region", Col::Str(vec!["a", "b", "b"])), // partition key moved
+            ])
+            .await;
+            let built_v1 = built_map(vec![("cat.sch.u", v1)]);
+            let built_v2 = built_map(vec![("cat.sch.u", v2)]);
+
+            assert_eq!(
+                gate(
+                    "SELECT SUM(x) OVER (PARTITION BY region) AS s FROM u",
+                    &tbm,
+                    &built_v1,
+                    &built_v2
+                ),
+                Build(ConsumedColumnChanged),
+                "a window PARTITION BY column is consumed — its value change must build"
+            );
+        }
+
+        /// A column read **only as a join key** on a *different* upstream than
+        /// the one projected is consumed — the strongest completeness case
+        /// (multi-upstream, join key never projected). `customers.id` moves;
+        /// nothing of `customers` is projected; the gate must still build.
+        #[tokio::test]
+        async fn join_key_change_on_other_upstream_builds() {
+            let t_o = target_cfg("cat", "sch", "orders");
+            let t_c = target_cfg("cat", "sch", "customers");
+            let tbm = build_reuse_target_by_model([("orders", &t_o), ("customers", &t_c)]);
+            let d_sql = "SELECT o.amt FROM cat.sch.orders o \
+                         JOIN cat.sch.customers c ON o.cid = c.id";
+
+            let orders = column_hashes(&[
+                ("amt", Col::I64(vec![10, 20])),
+                ("cid", Col::I64(vec![1, 2])),
+            ])
+            .await;
+            let cust_id_v1 = column_hashes(&[("id", Col::I64(vec![1, 2]))]).await;
+            let cust_id_v2 = column_hashes(&[("id", Col::I64(vec![1, 99]))]).await; // join key moved
+
+            let built_v1 = built_map(vec![
+                ("cat.sch.orders", orders.clone()),
+                ("cat.sch.customers", cust_id_v1),
+            ]);
+            let built_v2 = built_map(vec![
+                ("cat.sch.orders", orders),
+                ("cat.sch.customers", cust_id_v2),
+            ]);
+
+            assert_eq!(
+                gate(d_sql, &tbm, &built_v1, &built_v2),
+                Build(ConsumedColumnChanged),
+                "a join-key value change on a non-projected upstream must build"
+            );
+        }
+
+        // ── Fork-1 completeness: un-enumerable shapes force build ────────────
+
+        /// Shapes whose consumed set cannot be proven exhaustive force a build
+        /// **before any hash is consulted** — the consumer baseline is `None`,
+        /// so the gate's clause 4 (`ConsumedColumnsNotEnumerable`) fires
+        /// regardless of what the producer hashed. Real upstream hashes are
+        /// present precisely to show they are irrelevant here.
+        #[tokio::test]
+        async fn unenumerable_shapes_force_build() {
+            let tbm = tbm_u();
+            let real = column_hashes(&[("id", Col::I64(vec![1, 2, 3]))]).await;
+            let built = built_map(vec![("cat.sch.u", real)]);
+
+            for sql in [
+                "SELECT * FROM u",
+                "WITH s AS (SELECT id FROM u) SELECT id FROM s",
+                "SELECT id FROM (SELECT id FROM u) t",
+                "SELECT o.id, c.name FROM cat.sch.orders o \
+                 JOIN cat.sch.customers c USING (cust_id)",
+            ] {
+                assert!(
+                    compute_consumer_baseline(sql, &tbm, &built).is_none(),
+                    "un-enumerable shape must yield no baseline (fail closed): {sql}"
+                );
+                assert_eq!(
+                    gate(sql, &tbm, &built, &built),
+                    Build(ConsumedColumnsNotEnumerable),
+                    "un-enumerable shape must build with the enumerability reason: {sql}"
+                );
+            }
+        }
+
+        // ── Fork-3: one built upstream, per-downstream verdict ───────────────
+
+        /// The central new behavior: an upstream that was rebuilt is **not one
+        /// verdict for all downstreams**. `u.amount` moved but `u.region` did
+        /// not; `D` (consumes `amount`) must BUILD while `E` (consumes `region`)
+        /// must SKIP — both evaluated off the *same* current producer hashes.
+        /// `E`'s SKIP is also the suite's proof that the full clause chain is
+        /// satisfiable (not a global always-build), and `D`'s BUILD proves the
+        /// per-downstream discrimination.
+        #[tokio::test]
+        async fn multi_downstream_split_verdict() {
+            let tbm = tbm_u();
+            let v1 = column_hashes(&[
+                ("amount", Col::I64(vec![10, 20, 30])),
+                ("region", Col::Str(vec!["US", "EU", "US"])),
+            ])
+            .await;
+            let v2 = column_hashes(&[
+                ("amount", Col::I64(vec![10, 20, 999])),      // moved
+                ("region", Col::Str(vec!["US", "EU", "US"])), // unchanged
+            ])
+            .await;
+            let built_v1 = built_map(vec![("cat.sch.u", v1)]);
+            let built_v2 = built_map(vec![("cat.sch.u", v2)]);
+
+            assert_eq!(
+                gate("SELECT amount FROM u", &tbm, &built_v1, &built_v2),
+                Build(ConsumedColumnChanged),
+                "D consumes the moved column ⇒ build"
+            );
+            assert_eq!(
+                gate("SELECT region FROM u", &tbm, &built_v1, &built_v2),
+                Skip,
+                "E consumes only the unchanged column ⇒ skip (Fork-3 per-downstream verdict)"
+            );
+        }
+
+        // ── Differential byte-identity oracle (re-homed on in-memory) ────────
+
+        /// The differential oracle, honestly re-homed (see the module docs for
+        /// why it can't run on DuckDB). The downstream's output is a
+        /// deterministic function of its consumed input `amount`. When the gate
+        /// says SKIP (consumed input unchanged), a forced rebuild through the
+        /// real writer reproduces **byte-identical** output (same whole-body
+        /// blake3 *and* same per-column hashes) — so the skip preserves exactly
+        /// what a rebuild would have produced. When the gate says BUILD (consumed
+        /// input changed), the rebuild genuinely differs — so the gate never
+        /// skipped a case whose output would have moved. This proves producer
+        /// determinism + the hash comparison's fidelity; it does NOT prove
+        /// consumed-set completeness (that rests on the completeness guard).
+        #[tokio::test]
+        async fn differential_byte_identity_oracle() {
+            let tbm = tbm_u();
+
+            // The downstream deterministically derives its output from `amount`.
+            fn d_output(amount: &[i64]) -> Vec<(&'static str, Col)> {
+                vec![
+                    ("amount", Col::I64(amount.to_vec())),
+                    ("doubled", Col::I64(amount.iter().map(|x| x * 2).collect())),
+                ]
+            }
+
+            let amount_v1 = [10_i64, 20, 30];
+
+            // SKIP branch: consumed input unchanged.
+            let prior = write_result(&d_output(&amount_v1)).await;
+            let rebuild = write_result(&d_output(&amount_v1)).await;
+            assert_eq!(
+                prior.blake3_hash, rebuild.blake3_hash,
+                "SKIP is byte-sound: an unchanged consumed input rebuilds byte-identically"
+            );
+            assert_eq!(
+                prior.column_hashes, rebuild.column_hashes,
+                "SKIP is byte-sound at column granularity too"
+            );
+            let uv1 = column_hashes(&[("amount", Col::I64(amount_v1.to_vec()))]).await;
+            let built_v1 = built_map(vec![("cat.sch.u", uv1.clone())]);
+            assert_eq!(
+                gate("SELECT amount FROM u", &tbm, &built_v1, &built_v1),
+                Skip,
+                "the gate skips exactly the byte-identical case"
+            );
+
+            // BUILD branch: consumed input changed.
+            let amount_v2 = [10_i64, 20, 999];
+            let changed = write_result(&d_output(&amount_v2)).await;
+            assert_ne!(
+                prior.blake3_hash, changed.blake3_hash,
+                "a consumed-value change changes the downstream's bytes — a skip here would be \
+                 silent staleness"
+            );
+            let uv2 = column_hashes(&[("amount", Col::I64(amount_v2.to_vec()))]).await;
+            let built_v2 = built_map(vec![("cat.sch.u", uv2)]);
+            assert_eq!(
+                gate("SELECT amount FROM u", &tbm, &built_v1, &built_v2),
+                Build(ConsumedColumnChanged),
+                "the gate builds exactly the byte-differing case"
+            );
+        }
+
+        // ── Property / fuzz layer ────────────────────────────────────────────
+
+        /// A tiny deterministic LCG so the fuzz layer needs no RNG crate and no
+        /// wall-clock seed (the workflow runtime has neither). Seeded from a
+        /// fixed constant ⇒ identical mutation stream every run.
+        struct Lcg(u64);
+
+        impl Lcg {
+            fn new(seed: u64) -> Self {
+                Lcg(seed)
+            }
+            fn next_u64(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                self.0
+            }
+        }
+
+        /// The automated guard against a future completeness/hash regression
+        /// silently dropping a consumed-column class: over many deterministic,
+        /// schema-stable value mutations of a **consumed** column, the gate must
+        /// **never** skip. Each mutation is constructed to genuinely move the
+        /// column's content (asserted against the real baseline hash per
+        /// iteration — the non-vacuity guard), so a Skip would be a false skip.
+        #[tokio::test]
+        async fn fuzz_consumed_value_mutation_never_skips() {
+            let tbm = tbm_u();
+            let base: Vec<i64> = vec![100, 200, 300, 400, 500];
+            let base_hashes = column_hashes(&[("amount", Col::I64(base.clone()))]).await;
+            let built_prior = built_map(vec![("cat.sch.u", base_hashes.clone())]);
+            let d_sql = "SELECT amount FROM u";
+
+            let mut rng = Lcg::new(0x0123_4567_89AB_CDEF);
+            let iterations = 64;
+            for _ in 0..iterations {
+                let mut mutated = base.clone();
+                let idx = (rng.next_u64() as usize) % mutated.len();
+                // A guaranteed-nonzero delta ⇒ the value at `idx` genuinely
+                // changes ⇒ the column's content (and hash) genuinely moves.
+                let delta = 1 + (rng.next_u64() % 1_000_000) as i64;
+                mutated[idx] = mutated[idx].wrapping_add(delta);
+
+                let mutated_hashes = column_hashes(&[("amount", Col::I64(mutated))]).await;
+                assert_ne!(
+                    mutated_hashes, base_hashes,
+                    "each mutation must genuinely move the real content hash (non-vacuity)"
+                );
+                let built_current = built_map(vec![("cat.sch.u", mutated_hashes)]);
+                assert_eq!(
+                    gate(d_sql, &tbm, &built_prior, &built_current),
+                    Build(ConsumedColumnChanged),
+                    "a schema-stable consumed-value mutation must never skip"
+                );
+            }
+        }
+
+        // ── Bridging case: the full wrapper over REAL producer hashes ────────
+
+        /// Upgrades the sibling synthetic-hash wiring test: it drives the real
+        /// `try_content_addressed_column_skip` wrapper (real `StateStore`, real
+        /// recipe/env identity, real prior `ModelExecution`) but feeds it column
+        /// hashes produced by the **real writer**, not hand-typed constants —
+        /// so the composition of producer → baseline recorder → state store →
+        /// gate is proven end-to-end (only the s3 materialization glue is left
+        /// to the live test). Unchanged consumed column ⇒ SKIP (propagating the
+        /// prior output hashes); moved consumed column ⇒ BUILD.
+        #[tokio::test]
+        async fn wrapper_over_real_writer_hashes_skips_then_builds() {
+            use rocky_ir::{GovernanceConfig, MaterializationStrategy, ModelIr, TargetRef};
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = rocky_core::state::StateStore::open(&tmp.path().join("state")).unwrap();
+
+            let mut d_ir = ModelIr::transformation(
+                TargetRef {
+                    catalog: "cat".into(),
+                    schema: "sch".into(),
+                    table: "fct".into(),
+                },
+                MaterializationStrategy::ContentAddressed {
+                    storage_prefix: "s3://bucket/fct".into(),
+                    partition_columns: vec![],
+                },
+                vec![],
+                "SELECT amount FROM u".into(),
+                GovernanceConfig {
+                    permissions_file: None,
+                    auto_create_catalogs: false,
+                    auto_create_schemas: false,
+                },
+                None,
+                None,
+            );
+            d_ir.name = Arc::from("fct");
+            let adapter = "duckdb";
+            let identity = crate::output::recipe_identity_internal(&d_ir, adapter);
+
+            let tbm = tbm_u();
+            let u_v1 = column_hashes(&[("amount", Col::I64(vec![10, 20, 30]))]).await;
+            let built_v1 = built_map(vec![("cat.sch.u", u_v1)]);
+
+            // Baseline recorded at fct's last build, computed the production way.
+            let prior_baseline = compute_consumer_baseline(&d_ir.sql, &tbm, &built_v1).unwrap();
+            // fct's own real output hashes, propagated to downstreams on a skip.
+            let fct_out = column_hashes(&[("amount", Col::I64(vec![7, 7, 7]))]).await;
+
+            let now = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+            let prior_exec = rocky_core::state::ModelExecution {
+                model_name: "fct".to_string(),
+                started_at: now,
+                finished_at: now,
+                duration_ms: 0,
+                rows_affected: None,
+                status: "success".to_string(),
+                sql_hash: String::new(),
+                skip_hash: None,
+                upstream_freshness: Some(prior_baseline),
+                bytes_scanned: None,
+                bytes_written: None,
+                tenant: None,
+                recipe_hash: Some(identity.recipe_hash.clone()),
+                input_hash: None,
+                input_proof_class: None,
+                env_hash: Some(identity.env_hash.clone()),
+                hash_scheme: Some(identity.hash_scheme.clone()),
+                output_column_hashes: Some(fct_out.clone()),
+                attempts: Vec::new(),
+            };
+            let run = rocky_core::state::RunRecord {
+                run_id: "run-1".to_string(),
+                started_at: now,
+                finished_at: now,
+                status: rocky_core::state::RunStatus::Success,
+                models_executed: vec![prior_exec],
+                trigger: rocky_core::state::RunTrigger::Manual,
+                config_hash: "cfg".to_string(),
+                triggering_identity: None,
+                session_source: rocky_core::state::SessionSource::Cli,
+                git_commit: None,
+                git_branch: None,
+                idempotency_key: None,
+                target_catalog: None,
+                hostname: "test".to_string(),
+                rocky_version: "test".to_string(),
+            };
+            store.record_run(&run).unwrap();
+
+            // Unchanged consumed column ⇒ SKIP, propagating fct's output hashes.
+            match try_content_addressed_column_skip(
+                true,
+                "fct",
+                &d_ir,
+                adapter,
+                Some(&store),
+                &tbm,
+                &built_v1,
+            ) {
+                ColumnSkipOutcome::Skip(propagated) => assert_eq!(
+                    propagated,
+                    Some(fct_out),
+                    "a column-skip propagates the prior build's real output hashes"
+                ),
+                ColumnSkipOutcome::Build => panic!("unchanged consumed column must skip"),
+            }
+
+            // Moved consumed column (real writer, schema-stable) ⇒ BUILD.
+            let u_v2 = column_hashes(&[("amount", Col::I64(vec![10, 20, 999]))]).await;
+            let built_v2 = built_map(vec![("cat.sch.u", u_v2)]);
+            assert!(
+                matches!(
+                    try_content_addressed_column_skip(
+                        true,
+                        "fct",
+                        &d_ir,
+                        adapter,
+                        Some(&store),
+                        &tbm,
+                        &built_v2,
+                    ),
+                    ColumnSkipOutcome::Build
+                ),
+                "a moved consumed-column hash (real writer) must force a build"
+            );
+        }
+
+        // ── Databricks live-verify (env-gated, #[ignore], NOT run here) ──────
+
+        /// Live verification of the column-level sound skip against a real
+        /// Databricks-backed content-addressed UniForm table. **Written, not
+        /// run** in this change (no credentials here).
+        ///
+        /// # Reachability boundary (read before running)
+        ///
+        /// The content-addressed write path is `s3://`-only and reads a
+        /// **pre-provisioned external** Delta UniForm table (it never `CREATE`s
+        /// or `DROP`s a schema), so this test mirrors the sibling
+        /// `content_addressed_e2e_live_sandbox` / reuse-live convention rather
+        /// than the warehouse-adapter live tests:
+        /// - env-gated on `ROCKY_TEST_S3_BUCKET` / `ROCKY_TEST_S3_PREFIX` /
+        ///   `ROCKY_TEST_CATALOG` / `ROCKY_TEST_SCHEMA` / `ROCKY_TEST_TABLE` +
+        ///   `DATABRICKS_*` — the proven-reachable scheme for this path (it is
+        ///   deliberately *not* a fresh `ROCKY_TEST_DATABRICKS_*` scheme:
+        ///   consistency with the sibling live tests wins);
+        /// - the target must be an unpartitioned, name-column-mapped external
+        ///   UniForm table living under an `hc_`/`hcv2_`-prefixed sandbox schema
+        ///   with the canonical `(id BIGINT, name STRING, ts TIMESTAMP)` shape;
+        /// - teardown is an **idempotent `DELETE`** of the row ids this test
+        ///   adds (a `DROP SCHEMA … CASCADE` would destroy the externally
+        ///   provisioned fixture).
+        ///
+        /// The column-skip *decision* is not wired into
+        /// [`crate::commands::run_content_addressed::execute_content_addressed_model`]
+        /// (it lives in the DAG runner), so this test composes the **real**
+        /// producer (`execute_content_addressed_model`, which writes real bytes
+        /// to s3 and returns the per-column hashes the live writer computed) with
+        /// the gate building blocks (`compute_consumer_baseline` +
+        /// `try_content_addressed_column_skip`) — the closest honest live
+        /// assertion: only the downstream `D` is a paper model (the decision
+        /// reads the state store + producer hashes, never `D`'s own table).
+        #[tokio::test]
+        #[ignore = "requires Databricks + s3 credentials; run manually — see doc comment"]
+        async fn column_skip_live_sandbox() {
+            use rocky_core::traits::WarehouseAdapter;
+            use rocky_databricks::adapter::DatabricksWarehouseAdapter;
+            use rocky_databricks::auth::{Auth, AuthConfig};
+            use rocky_databricks::connector::{ConnectorConfig, DatabricksConnector};
+            use rocky_ir::{
+                GovernanceConfig, MaterializationStrategy, ModelIr, RockyType, TargetRef,
+                TypedColumn,
+            };
+            use std::time::Duration;
+
+            let (Ok(bucket), Ok(prefix), Ok(catalog), Ok(schema), Ok(table)) = (
+                std::env::var("ROCKY_TEST_S3_BUCKET"),
+                std::env::var("ROCKY_TEST_S3_PREFIX"),
+                std::env::var("ROCKY_TEST_CATALOG"),
+                std::env::var("ROCKY_TEST_SCHEMA"),
+                std::env::var("ROCKY_TEST_TABLE"),
+            ) else {
+                eprintln!("skipping column_skip_live_sandbox: ROCKY_TEST_* env vars not set");
+                return;
+            };
+            let (Ok(host), Ok(http_path)) = (
+                std::env::var("DATABRICKS_HOST"),
+                std::env::var("DATABRICKS_HTTP_PATH"),
+            ) else {
+                eprintln!("skipping column_skip_live_sandbox: DATABRICKS_* env vars not set");
+                return;
+            };
+            let Some(warehouse_id) = ConnectorConfig::warehouse_id_from_http_path(&http_path)
+            else {
+                eprintln!("skipping: DATABRICKS_HTTP_PATH has no warehouse id");
+                return;
+            };
+            let Ok(auth) = Auth::from_config(AuthConfig {
+                host: host.clone(),
+                token: std::env::var("DATABRICKS_TOKEN").ok(),
+                client_id: std::env::var("DATABRICKS_CLIENT_ID").ok(),
+                client_secret: std::env::var("DATABRICKS_CLIENT_SECRET").ok(),
+            }) else {
+                eprintln!("skipping: Databricks auth could not be constructed");
+                return;
+            };
+            let warehouse = DatabricksWarehouseAdapter::new(DatabricksConnector::new(
+                ConnectorConfig {
+                    host,
+                    warehouse_id,
+                    timeout: Duration::from_secs(120),
+                    retry: Default::default(),
+                },
+                auth,
+            ));
+            let warehouse_dyn: &dyn WarehouseAdapter = &warehouse;
+            let storage_prefix = format!("s3://{bucket}/{prefix}");
+            let u_full = format!("{catalog}.{schema}.{table}");
+
+            // Distinct id range so re-runs are self-cleaning; clean up any leak
+            // from a prior aborted run first.
+            let (id_a, id_b, id_c, id_c_moved) = (970_001_i64, 970_002, 970_003, 979_999);
+            let teardown =
+                format!("DELETE FROM {u_full} WHERE id IN ({id_a}, {id_b}, {id_c}, {id_c_moved})");
+            warehouse_dyn
+                .execute_statement(&teardown)
+                .await
+                .expect("pre-clean");
+
+            // The upstream U: a real content-addressed build that appends a
+            // 3-row batch and returns the per-column hashes the live writer
+            // computed over it.
+            let u_model = |ids: [i64; 3], names: [&str; 3]| -> ModelIr {
+                let ts = chrono::Utc::now()
+                    .format("%Y-%m-%dT%H:%M:%S%.6f")
+                    .to_string();
+                let sql = format!(
+                    "SELECT * FROM VALUES \
+                     (CAST({} AS BIGINT), CAST('{}' AS STRING), TIMESTAMP'{ts}'), \
+                     (CAST({} AS BIGINT), CAST('{}' AS STRING), TIMESTAMP'{ts}'), \
+                     (CAST({} AS BIGINT), CAST('{}' AS STRING), TIMESTAMP'{ts}') AS t(id, name, ts)",
+                    ids[0], names[0], ids[1], names[1], ids[2], names[2],
+                );
+                let mut m = ModelIr::transformation(
+                    TargetRef {
+                        catalog: catalog.clone(),
+                        schema: schema.clone(),
+                        table: table.clone(),
+                    },
+                    MaterializationStrategy::ContentAddressed {
+                        storage_prefix: storage_prefix.clone(),
+                        partition_columns: vec![],
+                    },
+                    vec![],
+                    sql,
+                    GovernanceConfig {
+                        permissions_file: None,
+                        auto_create_catalogs: false,
+                        auto_create_schemas: false,
+                    },
+                    None,
+                    None,
+                );
+                m.name = Arc::from("live_u");
+                m.typed_columns = vec![
+                    TypedColumn {
+                        name: "id".into(),
+                        data_type: RockyType::Int64,
+                        nullable: false,
+                    },
+                    TypedColumn {
+                        name: "name".into(),
+                        data_type: RockyType::String,
+                        nullable: false,
+                    },
+                    TypedColumn {
+                        name: "ts".into(),
+                        data_type: RockyType::Timestamp,
+                        nullable: false,
+                    },
+                ];
+                m
+            };
+
+            let exec = crate::commands::run_content_addressed::execute_content_addressed_model;
+
+            // U build v1 — the baseline `id` column values.
+            let u_v1 = exec(
+                &u_model([id_a, id_b, id_c], ["a", "b", "c"]),
+                warehouse_dyn,
+                None,
+            )
+            .await
+            .expect("live U build v1");
+            let tbm = build_reuse_target_by_model([("u", &target_cfg(&catalog, &schema, &table))]);
+            let built_v1 = built_map(vec![(u_full.as_str(), u_v1.output_column_hashes.clone())]);
+
+            // Downstream D consumes only `id` (a paper model; never built).
+            let mut d_ir = ModelIr::transformation(
+                TargetRef {
+                    catalog: catalog.clone(),
+                    schema: schema.clone(),
+                    table: "live_d".into(),
+                },
+                MaterializationStrategy::ContentAddressed {
+                    storage_prefix: format!("s3://{bucket}/{prefix}-d"),
+                    partition_columns: vec![],
+                },
+                vec![],
+                format!("SELECT id FROM {u_full}"),
+                GovernanceConfig {
+                    permissions_file: None,
+                    auto_create_catalogs: false,
+                    auto_create_schemas: false,
+                },
+                None,
+                None,
+            );
+            d_ir.name = Arc::from("live_d");
+            let adapter = "databricks";
+            let identity = crate::output::recipe_identity_internal(&d_ir, adapter);
+            let prior_baseline =
+                compute_consumer_baseline(&d_ir.sql, &tbm, &built_v1).expect("D baseline");
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = rocky_core::state::StateStore::open(&tmp.path().join("state")).unwrap();
+            let now = chrono::Utc::now();
+            let prior_exec = rocky_core::state::ModelExecution {
+                model_name: "live_d".to_string(),
+                started_at: now,
+                finished_at: now,
+                duration_ms: 0,
+                rows_affected: None,
+                status: "success".to_string(),
+                sql_hash: String::new(),
+                skip_hash: None,
+                upstream_freshness: Some(prior_baseline),
+                bytes_scanned: None,
+                bytes_written: None,
+                tenant: None,
+                recipe_hash: Some(identity.recipe_hash.clone()),
+                input_hash: None,
+                input_proof_class: None,
+                env_hash: Some(identity.env_hash.clone()),
+                hash_scheme: Some(identity.hash_scheme.clone()),
+                output_column_hashes: None,
+                attempts: Vec::new(),
+            };
+            store
+                .record_run(&rocky_core::state::RunRecord {
+                    run_id: "run-live-1".to_string(),
+                    started_at: now,
+                    finished_at: now,
+                    status: rocky_core::state::RunStatus::Success,
+                    models_executed: vec![prior_exec],
+                    trigger: rocky_core::state::RunTrigger::Manual,
+                    config_hash: "cfg".to_string(),
+                    triggering_identity: None,
+                    session_source: rocky_core::state::SessionSource::Cli,
+                    git_commit: None,
+                    git_branch: None,
+                    idempotency_key: None,
+                    target_catalog: None,
+                    hostname: "test".to_string(),
+                    rocky_version: "test".to_string(),
+                })
+                .unwrap();
+
+            // U build v2 (THE TRAP): the consumed `id` column moves (id_c →
+            // id_c_moved). The live writer's per-column hash for `id` must move
+            // ⇒ D BUILDs.
+            let u_v2 = exec(
+                &u_model([id_a, id_b, id_c_moved], ["a", "b", "c"]),
+                warehouse_dyn,
+                None,
+            )
+            .await
+            .expect("live U build v2");
+            let built_v2 = built_map(vec![(u_full.as_str(), u_v2.output_column_hashes)]);
+            assert!(
+                matches!(
+                    try_content_addressed_column_skip(
+                        true,
+                        "live_d",
+                        &d_ir,
+                        adapter,
+                        Some(&store),
+                        &tbm,
+                        &built_v2,
+                    ),
+                    ColumnSkipOutcome::Build
+                ),
+                "a live schema-stable value change to the consumed `id` column must build"
+            );
+
+            // U build v3 (SKIP): identical `id` values, only `name` churns. The
+            // consumed `id` hash matches the baseline ⇒ D SKIPs.
+            let u_v3 = exec(
+                &u_model([id_a, id_b, id_c], ["x", "y", "z"]),
+                warehouse_dyn,
+                None,
+            )
+            .await
+            .expect("live U build v3");
+            let built_v3 = built_map(vec![(u_full.as_str(), u_v3.output_column_hashes)]);
+            assert!(
+                matches!(
+                    try_content_addressed_column_skip(
+                        true,
+                        "live_d",
+                        &d_ir,
+                        adapter,
+                        Some(&store),
+                        &tbm,
+                        &built_v3,
+                    ),
+                    ColumnSkipOutcome::Skip(_)
+                ),
+                "an unchanged consumed `id` column (only non-consumed `name` churned) must skip"
+            );
+
+            // Teardown: idempotent DELETE of the rows this test added.
+            warehouse_dyn
+                .execute_statement(&teardown)
+                .await
+                .expect("teardown DELETE");
+        }
+    }
+
     /// Runtime regression: a first run of an incremental transformation
     /// model against a missing target must bootstrap the table (via
     /// `generate_transformation_initial_ddl`) and load the source **exactly
