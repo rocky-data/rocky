@@ -291,7 +291,17 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   guarded by `test_v16_run_record_forward_deserializes_check_outcomes_empty`.
 ///   The bump tracks the record-shape addition so `[state] on_schema_mismatch`
 ///   engages as usual; no blob walk.
-const CURRENT_SCHEMA_VERSION: u32 = 17;
+/// - **v18** — adds the serde-additive [`PolicyDecisionRecord::auto_apply`]
+///   custody field ([`AutoApplyCustody`]) for the governed additive-drift
+///   auto-apply path: what drift the run auto-applied (or refused), its
+///   classification, and a revert pointer where a rollback substrate exists.
+///   Not a table change — the redb table set is unchanged (`EXPECTED_TABLES`
+///   is untouched). A v17 blob (which lacks the field) forward-deserializes
+///   with it `None`, guarded by
+///   `test_v17_policy_decision_forward_deserializes_auto_apply_none`. The bump
+///   tracks the record-shape addition so `[state] on_schema_mismatch` engages
+///   as usual; no blob walk.
+const CURRENT_SCHEMA_VERSION: u32 = 18;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -3419,6 +3429,42 @@ pub struct PolicyDecisionRecord {
     /// apply halted) and `reason` states the outcome and rollback status.
     #[serde(default)]
     pub verify_after: Vec<String>,
+    /// Custody detail for a governed auto-apply of additive source drift.
+    /// Present only on rows the auto-apply path writes; `None` on ordinary
+    /// apply/promote evaluations. Serde-defaulted so a pre-v18 row
+    /// forward-deserializes with it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_apply: Option<AutoApplyCustody>,
+}
+
+/// Custody detail attached to a [`PolicyDecisionRecord`] when the run loop
+/// auto-applies (or refuses) additive source drift on its own authority.
+///
+/// Records what the run auto-applied (or refused): a human-readable drift
+/// summary, the change classification the eligibility gate resolved, whether
+/// the migration was applied, and — where a rollback substrate exists — the
+/// pointer a revert would restore. On backends with no rollback substrate
+/// (e.g. DuckDB) `revert_pointer` is `None` and a failed post-apply
+/// verification is halt-only: the mutation stands until a human reverts it.
+///
+/// Forward-compatible via `#[serde(default)]` on any field added later.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AutoApplyCustody {
+    /// Human-readable summary of the drift (e.g. `added nullable column
+    /// 'email' (VARCHAR)`).
+    pub drift_summary: String,
+    /// The change classification the eligibility gate resolved
+    /// (e.g. `schema_change.additive`, `schema_change.breaking`).
+    pub classification: String,
+    /// `true` when the migration was auto-applied; `false` when it was refused
+    /// and left for review.
+    pub applied: bool,
+    /// Pointer to the pre-mutation state a rollback could restore, when a
+    /// rollback substrate exists (a content-addressed / Iceberg snapshot).
+    /// `None` on substrates with no rollback — the mutation is halt-only on a
+    /// verification failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revert_pointer: Option<String>,
 }
 
 /// One row in the input-match index ([`INPUT_INDEX`]).
@@ -6870,6 +6916,7 @@ mod tests {
             rule_id: Some(1),
             reason: "allow by rule 1".to_string(),
             verify_after: Vec::new(),
+            auto_apply: None,
         };
         let later = PolicyDecisionRecord {
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T11:00:00Z")
@@ -6883,6 +6930,7 @@ mod tests {
             rule_id: Some(0),
             reason: "denied by rule 0 (deny overrides)".to_string(),
             verify_after: Vec::new(),
+            auto_apply: None,
         };
         // Insert out of order; the ledger must return them chronologically.
         store.record_policy_decision(&later).unwrap();
@@ -6892,6 +6940,53 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0], earlier, "oldest decision first");
         assert_eq!(all[1], later);
+    }
+
+    #[test]
+    fn test_v17_policy_decision_forward_deserializes_auto_apply_none() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+
+        // A full v17 record serialized with `auto_apply` stripped.
+        let record = PolicyDecisionRecord {
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            plan_id: "plan_v17".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::SchemaChangeAdditive,
+            model: "raw_events".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: Some(1),
+            reason: "allow by rule 1".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        };
+        let mut value = serde_json::to_value(&record).expect("serialize record");
+        value
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("auto_apply");
+        let blob = serde_json::to_vec(&value).expect("reserialize without field");
+
+        let read: PolicyDecisionRecord = serde_json::from_slice(&blob)
+            .expect("pre-v18 PolicyDecisionRecord must forward-deserialize");
+        assert_eq!(read.plan_id, "plan_v17");
+        assert!(
+            read.auto_apply.is_none(),
+            "a pre-v18 record reads back with no auto-apply custody"
+        );
+
+        // A v18 record carrying custody round-trips losslessly.
+        let mut with_custody = record.clone();
+        with_custody.auto_apply = Some(AutoApplyCustody {
+            drift_summary: "added nullable column 'email' (VARCHAR)".to_string(),
+            classification: "schema_change.additive".to_string(),
+            applied: true,
+            revert_pointer: None,
+        });
+        let round: PolicyDecisionRecord =
+            serde_json::from_slice(&serde_json::to_vec(&with_custody).unwrap()).unwrap();
+        assert_eq!(round.auto_apply, with_custody.auto_apply);
     }
 
     #[test]
@@ -7314,7 +7409,11 @@ mod tests {
         // check_outcomes`, `PolicyDecisionRecord::verify_after`), also
         // serde-additive fields — guarded by
         // `test_v16_run_record_forward_deserializes_check_outcomes_empty`.
-        const EXPECTED_VERSION: u32 = 17;
+        // v18 adds `PolicyDecisionRecord::auto_apply` (the governed
+        // additive-drift auto-apply custody), another serde-additive field —
+        // the redb table set is untouched, only the version moves; guarded by
+        // `test_v17_policy_decision_forward_deserializes_auto_apply_none`.
+        const EXPECTED_VERSION: u32 = 18;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",

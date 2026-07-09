@@ -664,6 +664,7 @@ mod tests {
             rule_id: None,
             reason: "test".to_string(),
             verify_after: Vec::new(),
+            auto_apply: None,
         }
     }
 

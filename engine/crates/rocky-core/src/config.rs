@@ -963,6 +963,18 @@ pub struct ResilienceConfig {
     /// dependency graph, contain-more on any doubt).
     #[serde(default = "default_contain_failures")]
     pub contain_failures: bool,
+    /// Opt in to policy-governed auto-apply of **additive** source drift.
+    /// Default `false` — a run detecting a new nullable upstream column
+    /// evolves the target exactly as it does today (unconditionally), with no
+    /// policy gate. When `true`, any drift mutation must first clear the
+    /// policy plane: only a *provably additive* change with an `allow` verdict
+    /// for the `schema_change.additive` capability is auto-applied; anything
+    /// else (a drop, retype, narrowing, or a scope without the grant) is
+    /// refused and left for review rather than mutated. Has no effect unless a
+    /// `[policy]` block grants the capability, so both the opt-in **and** a
+    /// policy rule are required to change behaviour.
+    #[serde(default = "default_auto_apply_additive_drift")]
+    pub auto_apply_additive_drift: bool,
 }
 
 impl ResilienceConfig {
@@ -996,6 +1008,7 @@ impl Default for ResilienceConfig {
             circuit_breaker_threshold: default_resilience_breaker_threshold(),
             max_retries_per_run: default_resilience_max_retries_per_run(),
             contain_failures: default_contain_failures(),
+            auto_apply_additive_drift: default_auto_apply_additive_drift(),
         }
     }
 }
@@ -1019,6 +1032,9 @@ fn default_resilience_max_retries_per_run() -> Option<u32> {
     Some(8)
 }
 fn default_contain_failures() -> bool {
+    false
+}
+fn default_auto_apply_additive_drift() -> bool {
     false
 }
 

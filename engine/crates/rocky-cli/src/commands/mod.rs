@@ -25,6 +25,7 @@ mod dag;
 mod discover;
 mod docs;
 mod doctor;
+mod drift_governance;
 mod emit_sql;
 mod estimate;
 mod export_openapi;

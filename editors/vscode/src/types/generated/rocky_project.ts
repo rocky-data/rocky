@@ -1966,6 +1966,10 @@ export interface PortabilityConfig {
  */
 export interface ResilienceConfig {
   /**
+   * Opt in to policy-governed auto-apply of **additive** source drift. Default `false` — a run detecting a new nullable upstream column evolves the target exactly as it does today (unconditionally), with no policy gate. When `true`, any drift mutation must first clear the policy plane: only a *provably additive* change with an `allow` verdict for the `schema_change.additive` capability is auto-applied; anything else (a drop, retype, narrowing, or a scope without the grant) is refused and left for review rather than mutated. Has no effect unless a `[policy]` block grants the capability, so both the opt-in **and** a policy rule are required to change behaviour.
+   */
+  auto_apply_additive_drift?: boolean;
+  /**
    * Multiplier applied to the backoff after each retry.
    */
   backoff_multiplier?: number;
