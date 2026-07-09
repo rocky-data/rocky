@@ -58,6 +58,8 @@ expect                = "require_review"
 
 A scenario describes the target model directly rather than pointing at a model in your project. The fields — `model` (the name, matched against a rule's `scope.models` globs), `tags`, `classifications`, `contracted`, `layer`, `downstreams`, and `reachable_downstreams` — are the exact attributes the evaluator reads at a real enforcement seam. The runner assembles them into the same value the policy engine sees when it gates a live `apply`, then compares the resolved effect against `expect`.
 
+One convenience mirrors production: a live seam reads a model's layer from its `layer` tag, so if you set `tags = { layer = "gold" }` and leave `layer` unset, the runner fills `layer` from that tag. A rule scoped with `layer = "gold"` then matches the scenario just as it would the real model. Set `layer` explicitly only when you want to model a value that differs from the tag.
+
 Declaring the attributes, rather than resolving them from a live model, is deliberate. A scenario pins the behaviour of the *policy*, not the current state of your graph. It keeps meaning the same whether or not the project compiles today, and it lets you assert cases your project does not happen to contain right now: a model with forty downstream consumers, a table classified `pii`, a change to something behind a contract.
 
 ### The blast-radius ceiling

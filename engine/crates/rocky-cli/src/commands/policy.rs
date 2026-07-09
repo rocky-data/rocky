@@ -160,14 +160,24 @@ pub fn run_policy_test(config_path: &Path, json: bool) -> Result<()> {
 
     let mut results = Vec::with_capacity(policy.tests.len());
     for test in &policy.tests {
-        // Build the evaluator's input verbatim from the scenario — the same
-        // `ModelAttributes` shape a real enforcement seam constructs. No
-        // derivation, no compile: the scenario *is* the input.
+        // Build the evaluator's input from the scenario — the same
+        // `ModelAttributes` a real enforcement seam constructs, with no compile
+        // step. Every field is taken as written except `layer`, which mirrors
+        // the seam's tag-derivation (see below).
         let attrs = ModelAttributes {
             name: test.model.clone(),
             tags: test.tags.clone(),
             classifications: test.classifications.iter().cloned().collect(),
-            layer: test.layer.clone(),
+            // Mirror how a real seam builds `layer`: `rocky policy check` reads
+            // it from the model's `layer` tag. An explicit `layer` field still
+            // wins (it lets a scenario model a hypothetical), but when omitted
+            // we derive it from `tags["layer"]` so a `tags = { layer = ... }`
+            // scenario matches a `scope.layer` rule exactly as it would in
+            // production — otherwise the scenario would mispredict a live apply.
+            layer: test
+                .layer
+                .clone()
+                .or_else(|| test.tags.get("layer").cloned()),
             contracted: test.contracted,
             downstreams: test.downstreams,
             reachable_downstreams: test.reachable_downstreams,
@@ -442,6 +452,45 @@ expect = \"require_review\"
 ";
         let (_dir, path) = config_with(body);
         run_policy_test(&path, true).expect("sticky cap must keep the scenario green");
+    }
+
+    #[test]
+    fn layer_is_derived_from_the_layer_tag_like_a_real_seam() {
+        // At a live seam `attrs.layer` comes from the model's `layer` tag, so a
+        // `scope.layer` rule must match a scenario that sets `tags.layer` even
+        // without an explicit `layer` field. Were the runner to take `layer`
+        // verbatim (leaving it `None`), the rule would miss, the scenario would
+        // resolve to the default posture, and the test would mispredict
+        // production. Both scenarios below must pass.
+        let body = "
+[policy]
+version = 1
+default_agent_effect = \"deny\"
+
+[[policy.rules]]
+principal = \"agent\"
+capability = \"apply\"
+scope = { layer = \"gold\" }
+effect = \"allow\"
+
+[[policy.tests]]
+name = \"layer derived from the tag matches a scope.layer rule\"
+principal = \"agent\"
+capability = \"apply\"
+model = \"fct_revenue\"
+tags = { layer = \"gold\" }
+expect = \"allow\"
+
+[[policy.tests]]
+name = \"a non-gold layer does not match and falls to default\"
+principal = \"agent\"
+capability = \"apply\"
+model = \"stg_orders\"
+tags = { layer = \"bronze\" }
+expect = \"deny\"
+";
+        let (_dir, path) = config_with(body);
+        run_policy_test(&path, true).expect("layer-derivation scenarios must pass");
     }
 
     #[test]

@@ -2854,6 +2854,10 @@ pub struct PolicyTest {
     #[serde(default)]
     pub contracted: bool,
     /// Synthetic medallion/semantic layer (matched against `scope.layer`).
+    /// When omitted, the runner derives it from `tags["layer"]`, mirroring how
+    /// a real enforcement seam reads the model's `layer` tag — so a
+    /// `tags = { layer = ... }` scenario matches a `scope.layer` rule without
+    /// restating the value. An explicit value here always wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer: Option<String>,
     /// Synthetic direct downstream count. Informational — the

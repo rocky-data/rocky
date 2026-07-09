@@ -2366,7 +2366,7 @@
           "description": "The effect the evaluator must resolve for this scenario. A mismatch fails the scenario (and the `rocky policy test` run)."
         },
         "layer": {
-          "description": "Synthetic medallion/semantic layer (matched against `scope.layer`).",
+          "description": "Synthetic medallion/semantic layer (matched against `scope.layer`). When omitted, the runner derives it from `tags[\"layer\"]`, mirroring how a real enforcement seam reads the model's `layer` tag — so a `tags = { layer = ... }` scenario matches a `scope.layer` rule without restating the value. An explicit value here always wins.",
           "type": [
             "string",
             "null"

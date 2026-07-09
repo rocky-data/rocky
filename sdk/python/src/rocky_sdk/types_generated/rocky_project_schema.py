@@ -1061,7 +1061,7 @@ class PolicyTest(BaseModel):
     """
     layer: str | None = None
     """
-    Synthetic medallion/semantic layer (matched against `scope.layer`).
+    Synthetic medallion/semantic layer (matched against `scope.layer`). When omitted, the runner derives it from `tags["layer"]`, mirroring how a real enforcement seam reads the model's `layer` tag — so a `tags = { layer = ... }` scenario matches a `scope.layer` rule without restating the value. An explicit value here always wins.
     """
     model: str | None = ""
     """
