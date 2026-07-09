@@ -69,6 +69,10 @@ pub fn run_policy_check(
         .iter()
         .filter(|m| m.config.depends_on.iter().any(|d| d == model_name))
         .count() as u64;
+    // Transitive blast radius for the `max_downstreams` ceiling. `None` when
+    // the model is absent from the compiled graph (the ceiling fails closed).
+    let reachable_downstreams = crate::commands::audit::blast_radius_of(&result, model_name)
+        .map(|(_direct, transitive)| transitive.len() as u64);
 
     let attrs = ModelAttributes {
         name: model.config.name.clone(),
@@ -77,6 +81,7 @@ pub fn run_policy_check(
         layer,
         contracted,
         downstreams,
+        reachable_downstreams,
     };
 
     let decision = policy::evaluate(&policy, principal, capability, &attrs);
@@ -96,6 +101,7 @@ pub fn run_policy_check(
             layer: attrs.layer,
             contracted: attrs.contracted,
             downstreams: attrs.downstreams,
+            reachable_downstreams: attrs.reachable_downstreams,
         },
     };
 
@@ -126,12 +132,17 @@ fn render_text(out: &PolicyCheckOutput) {
     } else {
         attrs.classifications.join(", ")
     };
+    let reachable = attrs
+        .reachable_downstreams
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "(uncomputable)".to_string());
     println!(
-        "  model: contracted={} layer={} classifications=[{}] downstreams={}",
+        "  model: contracted={} layer={} classifications=[{}] downstreams={} blast_radius={}",
         attrs.contracted,
         attrs.layer.as_deref().unwrap_or("(none)"),
         classifications,
         attrs.downstreams,
+        reachable,
     );
 }
 

@@ -6519,9 +6519,16 @@ pub struct PolicyModelAttributes {
     /// Whether the model sits behind a contract (best-effort: a sibling
     /// `.contract.toml` exists).
     pub contracted: bool,
-    /// Direct downstream-consumer count (informational; `max_downstreams`
-    /// is parse-only in v0).
+    /// Direct downstream-consumer count (models that `depends_on` this one).
+    /// Informational — the `max_downstreams` ceiling reads
+    /// [`Self::reachable_downstreams`].
     pub downstreams: u64,
+    /// Transitive downstream reachability — the full blast radius (direct +
+    /// indirect), excluding the model itself. This is what a rule's
+    /// `max_downstreams` ceiling is compared against. `null` when the blast
+    /// radius could not be computed (the ceiling then fails closed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reachable_downstreams: Option<u64>,
 }
 
 /// JSON output for `rocky audit` — the agent-policy decision ledger.

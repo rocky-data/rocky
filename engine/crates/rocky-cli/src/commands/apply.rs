@@ -366,6 +366,10 @@ fn model_attributes(models_dir: &Path) -> BTreeMap<String, ModelAttributes> {
             .iter()
             .filter(|m| m.config.depends_on.iter().any(|d| d == &name))
             .count() as u64;
+        // Transitive blast radius for the `max_downstreams` ceiling. `None`
+        // when the model is absent from the compiled graph (fails closed).
+        let reachable_downstreams = super::audit::blast_radius_of(&result, &name)
+            .map(|(_direct, transitive)| transitive.len() as u64);
         out.insert(
             name.clone(),
             ModelAttributes {
@@ -375,6 +379,7 @@ fn model_attributes(models_dir: &Path) -> BTreeMap<String, ModelAttributes> {
                 layer,
                 contracted,
                 downstreams,
+                reachable_downstreams,
             },
         );
     }

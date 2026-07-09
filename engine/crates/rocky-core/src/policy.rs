@@ -25,6 +25,14 @@
 //! 5. **Default posture.** No rule matches ⇒ an `agent` on a mutating
 //!    capability falls to `default_agent_effect`; a `human` is never gated
 //!    (`allow`).
+//! 6. **`max_downstreams` degrades, never no-matches.** A rule may carry a
+//!    `scope.max_downstreams = N` blast-radius ceiling. It does **not** change
+//!    whether the rule's scope matches; instead, when the rule's effect is
+//!    `allow` and the target's transitive downstream reachability is either
+//!    over `N` **or** uncomputable, the matched effect degrades to
+//!    `require_review` (fail-safe). A ceiling can therefore never let an
+//!    `allow` stand for an oversized or unverifiable blast radius; `deny` and
+//!    `require_review` rules are unaffected (`deny` is unconditional).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -113,9 +121,19 @@ pub struct ModelAttributes {
     /// Whether the model sits behind a contract (best-effort v0: a sibling
     /// `.contract.toml` exists).
     pub contracted: bool,
-    /// Downstream-consumer count. Surfaced for context; `scope.max_downstreams`
-    /// is parse-only in v0, so this does not affect matching.
+    /// Direct downstream-consumer count (models that `depends_on` this one).
+    /// Informational only — the `max_downstreams` ceiling reads
+    /// [`Self::reachable_downstreams`], the transitive blast radius.
     pub downstreams: u64,
+    /// Transitive downstream reachability — the count of every model in this
+    /// model's blast radius (direct + indirect), excluding itself. This is
+    /// what a rule's `max_downstreams` ceiling is compared against.
+    ///
+    /// `None` means the blast radius could **not** be computed (the model is
+    /// absent from the compiled graph, or the project did not compile). A
+    /// `max_downstreams` ceiling **fails closed** on `None`: it never grants
+    /// `allow`, because an uncounted blast radius is treated as too large.
+    pub reachable_downstreams: Option<u64>,
 }
 
 /// A single satisfied constraint contributed by a matching rule. The set
@@ -147,8 +165,10 @@ pub struct PolicyDecision {
 /// Returns the satisfied-constraint set for `scope` against `attrs`, or
 /// `None` when the scope is not satisfied (so the rule does not match).
 ///
-/// `scope.any` yields the empty set. `max_downstreams` is parse-only in
-/// v0 and never contributes a constraint or a match failure.
+/// `scope.any` yields the empty set. `max_downstreams` is **not** a scope
+/// predicate — it is a post-match condition evaluated in [`evaluate`] (it
+/// degrades an `allow`, it never turns a match into a no-match), so it never
+/// contributes a constraint or a match failure here.
 fn scope_constraints(scope: &PolicyScope, attrs: &ModelAttributes) -> Option<BTreeSet<Constraint>> {
     if scope.any {
         return Some(BTreeSet::new());
@@ -209,7 +229,8 @@ fn scope_constraints(scope: &PolicyScope, attrs: &ModelAttributes) -> Option<BTr
             return None;
         }
     }
-    // `max_downstreams` is parse-only in v0: neither required nor counted.
+    // `max_downstreams` is a post-match condition (evaluated in `evaluate`),
+    // not a scope predicate: never required, never counted here.
     Some(set)
 }
 
@@ -230,6 +251,49 @@ fn restrictiveness(effect: PolicyEffect) -> u8 {
         PolicyEffect::Allow => 0,
         PolicyEffect::RequireReview => 1,
         PolicyEffect::Deny => 2,
+    }
+}
+
+/// Apply a rule's `max_downstreams` blast-radius ceiling as a post-match
+/// condition. Returns the (possibly degraded) effect and, when a degrade
+/// happened, a human-readable reason.
+///
+/// The ceiling is a **narrowing guard on `allow`** and fails closed:
+///
+/// - No ceiling, or a non-`allow` effect → unchanged (`deny` /
+///   `require_review` are never softened; a `deny` ceiling is a no-op).
+/// - `allow` with the target's [`ModelAttributes::reachable_downstreams`]
+///   present and `≤ limit` → stays `allow`.
+/// - `allow` with reachability over the limit → degrades to
+///   `require_review`.
+/// - `allow` with reachability **uncomputable** (`None`) → degrades to
+///   `require_review` — an uncounted blast radius is treated as too large, so
+///   a ceiling can never grant `allow` when it cannot be verified.
+fn degrade_for_ceiling(
+    effect: PolicyEffect,
+    limit: Option<u64>,
+    attrs: &ModelAttributes,
+) -> (PolicyEffect, Option<String>) {
+    let Some(limit) = limit else {
+        return (effect, None);
+    };
+    if effect != PolicyEffect::Allow {
+        return (effect, None);
+    }
+    match attrs.reachable_downstreams {
+        Some(count) if count <= limit => (effect, None),
+        Some(count) => (
+            PolicyEffect::RequireReview,
+            Some(format!(
+                "max_downstreams={limit} exceeded (blast radius {count}) — allow degraded to require_review"
+            )),
+        ),
+        None => (
+            PolicyEffect::RequireReview,
+            Some(format!(
+                "max_downstreams={limit} unverifiable (blast radius uncomputable) — allow degraded to require_review"
+            )),
+        ),
     }
 }
 
@@ -256,6 +320,9 @@ pub fn evaluate(
         idx: usize,
         effect: PolicyEffect,
         constraints: BTreeSet<Constraint>,
+        /// Set when a `max_downstreams` ceiling degraded this rule's `allow`
+        /// to `require_review`; carried into the winning-rule reason string.
+        degraded: Option<String>,
     }
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut first_deny: Option<usize> = None;
@@ -272,14 +339,22 @@ pub fn evaluate(
         if rule.capability.is_refinement() {
             constraints.insert(Constraint::CapabilityRefinement);
         }
-        // 2. Deny is a hard override — any deny match wins.
+        // 2. Deny is a hard override — any deny match wins. Keyed on the rule's
+        // *declared* effect: the `max_downstreams` degrade below only ever
+        // touches `allow`, so a `deny` is never softened away.
         if rule.effect == PolicyEffect::Deny {
             first_deny.get_or_insert(idx);
         }
+        // 6. `max_downstreams` ceiling — a post-match condition that degrades
+        // an `allow` (never a no-match). Fail-closed: an oversized OR
+        // uncomputable blast radius degrades the `allow` to `require_review`.
+        let (effect, degraded) =
+            degrade_for_ceiling(rule.effect, rule.scope.max_downstreams, attrs);
         candidates.push(Candidate {
             idx,
-            effect: rule.effect,
+            effect,
             constraints,
+            degraded,
         });
     }
 
@@ -336,7 +411,7 @@ pub fn evaluate(
         })
         .expect("non_dominated is non-empty when candidates is non-empty");
 
-    let reason = if non_dominated.len() == 1 {
+    let mut reason = if non_dominated.len() == 1 {
         format!(
             "{} by rule {} (most-specific match)",
             effect_label(winner.effect),
@@ -362,6 +437,10 @@ pub fn evaluate(
             )
         }
     };
+    if let Some(degrade) = &winner.degraded {
+        reason.push_str("; ");
+        reason.push_str(degrade);
+    }
 
     PolicyDecision {
         effect: winner.effect,
@@ -854,6 +933,135 @@ mod tests {
     fn effect_rank_orders_deny_over_review_over_allow() {
         assert!(effect_rank(PolicyEffect::Deny) > effect_rank(PolicyEffect::RequireReview));
         assert!(effect_rank(PolicyEffect::RequireReview) > effect_rank(PolicyEffect::Allow));
+    }
+
+    // ---------- max_downstreams ceiling (§1.4, degrade-not-no-match) ----------
+
+    fn bronze_additive_model(reachable: Option<u64>) -> ModelAttributes {
+        ModelAttributes {
+            name: "raw_events".to_string(),
+            layer: Some("bronze".to_string()),
+            reachable_downstreams: reachable,
+            ..Default::default()
+        }
+    }
+
+    /// An `allow …{max_downstreams=5}` rule on a bronze additive model.
+    fn ceilinged_allow_policy() -> PolicyConfig {
+        policy(vec![rule(
+            PolicyPrincipal::Agent,
+            PolicyCapability::SchemaChangeAdditive,
+            PolicyScope {
+                layer: Some("bronze".to_string()),
+                max_downstreams: Some(5),
+                ..Default::default()
+            },
+            PolicyEffect::Allow,
+        )])
+    }
+
+    #[test]
+    fn max_downstreams_within_ceiling_allows() {
+        let d = evaluate(
+            &ceilinged_allow_policy(),
+            PolicyPrincipal::Agent,
+            PolicyCapability::SchemaChangeAdditive,
+            &bronze_additive_model(Some(3)),
+        );
+        assert_eq!(d.effect, PolicyEffect::Allow);
+        assert_eq!(d.matched_rule, Some(0));
+    }
+
+    #[test]
+    fn max_downstreams_exceeded_degrades_to_require_review() {
+        let d = evaluate(
+            &ceilinged_allow_policy(),
+            PolicyPrincipal::Agent,
+            PolicyCapability::SchemaChangeAdditive,
+            &bronze_additive_model(Some(20)),
+        );
+        // The load-bearing soundness invariant: an over-limit blast radius can
+        // never yield `allow`.
+        assert_eq!(d.effect, PolicyEffect::RequireReview);
+        assert!(
+            d.reason.contains("max_downstreams=5 exceeded"),
+            "{}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn max_downstreams_unverifiable_degrades_to_require_review() {
+        // Reachability uncomputable (model absent from the compiled graph):
+        // fail closed — the ceiling never grants `allow` when it can't verify.
+        let d = evaluate(
+            &ceilinged_allow_policy(),
+            PolicyPrincipal::Agent,
+            PolicyCapability::SchemaChangeAdditive,
+            &bronze_additive_model(None),
+        );
+        assert_eq!(d.effect, PolicyEffect::RequireReview);
+        assert!(d.reason.contains("unverifiable"), "{}", d.reason);
+    }
+
+    #[test]
+    fn max_downstreams_does_not_soften_a_deny() {
+        // A `deny` carrying a ceiling stays `deny` regardless of blast radius —
+        // the degrade only ever touches `allow`.
+        let p = policy(vec![rule(
+            PolicyPrincipal::Agent,
+            PolicyCapability::Apply,
+            PolicyScope {
+                layer: Some("bronze".to_string()),
+                max_downstreams: Some(5),
+                ..Default::default()
+            },
+            PolicyEffect::Deny,
+        )]);
+        let d = evaluate(
+            &p,
+            PolicyPrincipal::Agent,
+            PolicyCapability::Apply,
+            &bronze_additive_model(Some(9999)),
+        );
+        assert_eq!(d.effect, PolicyEffect::Deny);
+    }
+
+    #[test]
+    fn ceilinged_allow_does_not_leak_via_equal_specificity_sibling() {
+        // A broad ceilingless `allow` next to an equally-specific ceilinged
+        // `allow` must not grant `allow` for an oversized blast radius: the
+        // ceilinged rule degrades to `require_review` and, being equally
+        // specific, wins the tie on most-restrictive-effect.
+        let p = policy(vec![
+            rule(
+                PolicyPrincipal::Agent,
+                PolicyCapability::SchemaChangeAdditive,
+                PolicyScope {
+                    layer: Some("bronze".to_string()),
+                    ..Default::default()
+                },
+                PolicyEffect::Allow,
+            ),
+            rule(
+                PolicyPrincipal::Agent,
+                PolicyCapability::SchemaChangeAdditive,
+                PolicyScope {
+                    layer: Some("bronze".to_string()),
+                    max_downstreams: Some(5),
+                    ..Default::default()
+                },
+                PolicyEffect::Allow,
+            ),
+        ]);
+        let d = evaluate(
+            &p,
+            PolicyPrincipal::Agent,
+            PolicyCapability::SchemaChangeAdditive,
+            &bronze_additive_model(Some(20)),
+        );
+        assert_eq!(d.effect, PolicyEffect::RequireReview);
+        assert_eq!(d.matched_rule, Some(1));
     }
 
     #[test]
