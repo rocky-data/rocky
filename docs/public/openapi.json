@@ -11185,7 +11185,7 @@
             "type": "boolean"
           },
           "downstreams": {
-            "description": "Direct downstream-consumer count (informational; `max_downstreams` is parse-only in v0).",
+            "description": "Direct downstream-consumer count (models that `depends_on` this one). Informational — the `max_downstreams` ceiling reads [`Self::reachable_downstreams`].",
             "format": "uint64",
             "minimum": 0.0,
             "type": "integer"
@@ -11194,6 +11194,15 @@
             "description": "Medallion/semantic layer (the model's `layer` tag), if any.",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "reachable_downstreams": {
+            "description": "Transitive downstream reachability — the full blast radius (direct + indirect), excluding the model itself. This is what a rule's `max_downstreams` ceiling is compared against. `null` when the blast radius could not be computed (the ceiling then fails closed).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -11245,7 +11254,7 @@
             "description": "Which capability this rule governs."
           },
           "conditions": {
-            "description": "Optional v1 conditional refinements. **Parsed and ignored in v0** — captured as opaque JSON so a config authored for v1 still loads."
+            "description": "Optional v1 conditional refinements not yet promoted to typed fields (`budget`, `window`). **Parsed and ignored** — captured as opaque JSON so a config authored against a later version still loads."
           },
           "effect": {
             "allOf": [
@@ -11277,6 +11286,13 @@
               "tags": {}
             },
             "description": "The models this rule covers. Defaults to the empty scope, which is *not* `any` — an all-default scope with no `any = true` matches nothing and is rejected at validation."
+          },
+          "verify_after": {
+            "description": "Post-apply verification: named checks that must pass after a mutation governed by this rule lands. Once the apply's run completes, each named check is confirmed against the run's executed checks; a failing **or absent** named check halts the apply (fail closed) and raises an alert. Auto-rollback runs only where a rollback substrate exists; today none does, so a failure is halt-only and the mutation stands until a human reverts it. Empty ⇒ no post-apply gate.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [

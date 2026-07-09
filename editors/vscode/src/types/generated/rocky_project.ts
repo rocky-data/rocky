@@ -1797,7 +1797,7 @@ export interface PolicyRule {
    */
   capability: PolicyCapability;
   /**
-   * Optional v1 conditional refinements. **Parsed and ignored in v0** — captured as opaque JSON so a config authored for v1 still loads.
+   * Optional v1 conditional refinements not yet promoted to typed fields (`budget`, `window`). **Parsed and ignored** — captured as opaque JSON so a config authored against a later version still loads.
    */
   conditions?: {
     [k: string]: unknown;
@@ -1814,6 +1814,10 @@ export interface PolicyRule {
    * The models this rule covers. Defaults to the empty scope, which is *not* `any` — an all-default scope with no `any = true` matches nothing and is rejected at validation.
    */
   scope?: PolicyScope;
+  /**
+   * Post-apply verification: named checks that must pass after a mutation governed by this rule lands. Once the apply's run completes, each named check is confirmed against the run's executed checks; a failing **or absent** named check halts the apply (fail closed) and raises an alert. Auto-rollback runs only where a rollback substrate exists; today none does, so a failure is halt-only and the mutation stands until a human reverts it. Empty ⇒ no post-apply gate.
+   */
+  verify_after?: string[];
 }
 /**
  * Scope of a policy rule — the AND of every present predicate. A model matches the scope only when it satisfies *all* set keys.

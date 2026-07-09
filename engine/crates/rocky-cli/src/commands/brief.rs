@@ -1053,6 +1053,7 @@ mod tests {
             effect,
             rule_id,
             reason: "test".to_string(),
+            verify_after: Vec::new(),
         }
     }
 
@@ -1097,6 +1098,7 @@ mod tests {
             target_catalog: None,
             hostname: "host".to_string(),
             rocky_version: "0.0.0-test".to_string(),
+            check_outcomes: Vec::new(),
         }
     }
 

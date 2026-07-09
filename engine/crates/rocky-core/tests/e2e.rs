@@ -510,6 +510,7 @@ fn test_run_history_flow() {
         target_catalog: None,
         hostname: "e2e-test-host".to_string(),
         rocky_version: "0.0.0-e2e".to_string(),
+        check_outcomes: Vec::new(),
     };
 
     store.record_run(&run).unwrap();

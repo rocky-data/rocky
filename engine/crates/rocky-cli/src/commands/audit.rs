@@ -1054,6 +1054,7 @@ mod tests {
             effect,
             rule_id: Some(0),
             reason: "test".to_string(),
+            verify_after: Vec::new(),
         }
     }
 
@@ -1182,6 +1183,7 @@ mod tests {
             effect,
             rule_id,
             reason: "test".to_string(),
+            verify_after: Vec::new(),
         }
     }
 

@@ -135,11 +135,15 @@ class PolicyModelAttributes(BaseModel):
     """
     downstreams: conint(ge=0)
     """
-    Direct downstream-consumer count (informational; `max_downstreams` is parse-only in v0).
+    Direct downstream-consumer count (models that `depends_on` this one). Informational — the `max_downstreams` ceiling reads [`Self::reachable_downstreams`].
     """
     layer: str | None = None
     """
     Medallion/semantic layer (the model's `layer` tag), if any.
+    """
+    reachable_downstreams: conint(ge=0) | None = None
+    """
+    Transitive downstream reachability — the full blast radius (direct + indirect), excluding the model itself. This is what a rule's `max_downstreams` ceiling is compared against. `null` when the blast radius could not be computed (the ceiling then fails closed).
     """
     tags: dict[str, str]
     """

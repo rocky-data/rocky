@@ -1273,6 +1273,7 @@ fn seed_run_history(models_dir: &Path) {
         target_catalog: None,
         hostname: "test-host".to_string(),
         rocky_version: "0.0.0-test".to_string(),
+        check_outcomes: Vec::new(),
     };
     store.record_run(&run).expect("record run");
 
