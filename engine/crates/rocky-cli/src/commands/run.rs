@@ -1274,6 +1274,7 @@ pub async fn run(
             partition_opts,
             &run_id,
             Some(target_model),
+            None, // single-model path drives selection via `model_name_filter`
             &mut output,
             None, // model-only run has no pipeline hooks
             None,
@@ -3754,6 +3755,7 @@ pub async fn run(
                     partition_opts,
                     &run_id,
                     None, // no model filter in replication path
+                    None, // full-pipeline path builds every model (no backfill scope)
                     &mut output,
                     Some(&hook_registry),
                     Some(pipeline_name),
@@ -4661,6 +4663,165 @@ fn record_contained_cause(
     containment.poison(model_name);
 }
 
+/// Execute a supervised backfill over an explicit set of transformation
+/// models — the two-step `rocky apply <backfill-plan>` execution path.
+///
+/// This is a focused sibling of the `--model` entry point in [`run`]: it skips
+/// replication and builds only the models in `model_set` (the affected
+/// downstream closure the backfill composed), in the project's topological
+/// order. Selection is driven entirely by `model_set`, so the retry (R1) and
+/// failure-containment (R2) behaviour inside [`execute_models`] applies to the
+/// backfill exactly as it would to a normal run — a poisoned seed still
+/// withholds its in-closure downstream, and a transient failure is still
+/// retried under `[resilience]`.
+///
+/// It never rewrites SQL — a backfill re-runs existing recipes over a scoped
+/// window; the "what to fix" question is out of scope by construction.
+pub(crate) async fn execute_backfill_set(
+    config_path: &Path,
+    state_path: &Path,
+    models_dir: &Path,
+    model_set: &std::collections::BTreeSet<String>,
+    partition_opts: &PartitionRunOptions,
+    output_json: bool,
+) -> Result<()> {
+    if output_json {
+        crate::output::reserve_stdout_for_json();
+    }
+
+    let start = Instant::now();
+    let started_at = Utc::now();
+    let run_id = format!("run-{}", started_at.format("%Y%m%d-%H%M%S-%3f"));
+    let config_hash = crate::output::config_fingerprint(config_path);
+
+    let rocky_cfg = rocky_core::config::load_rocky_config(config_path)
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+
+    anyhow::ensure!(
+        models_dir.exists(),
+        "models directory '{}' not found (required for backfill)",
+        models_dir.display()
+    );
+
+    let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
+    // Mirror the `--model` path: the first transformation pipeline's target
+    // adapter, falling back to the first replication pipeline's.
+    let target_adapter_name = rocky_cfg
+        .pipelines
+        .values()
+        .find_map(|p| match p {
+            rocky_core::config::PipelineConfig::Transformation(t) => Some(t.target.adapter.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            rocky_cfg.pipelines.values().find_map(|p| match p {
+                rocky_core::config::PipelineConfig::Replication(r) => {
+                    Some(r.target.adapter.clone())
+                }
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| "default".to_string());
+
+    let warehouse = adapter_registry.warehouse_adapter(&target_adapter_name)?;
+    let state_store = Some(
+        rocky_core::state::StateStore::open_with_policy(
+            state_path,
+            rocky_cfg.state.on_schema_mismatch,
+        )
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?,
+    );
+
+    let mut output = RunOutput::new(String::new(), 0, 1);
+
+    let schema_cache_cfg = rocky_cfg.cache.schemas.clone().with_ttl_override(None);
+    // A backfill never runs shadowed, so the skip gate resolves against the
+    // `[run]` config alone; it stays inert unless the operator enabled it.
+    let skip_gate = SkipGateConfig::resolve(&SkipRunOptions::default(), &rocky_cfg.run, false);
+    let run_vars = rocky_core::run_vars::RunVars::new();
+
+    let exec_result = execute_models(
+        models_dir,
+        warehouse.as_ref(),
+        state_store.as_ref(),
+        partition_opts,
+        &run_id,
+        None, // selection is driven by `model_set`, not the single-name filter
+        Some(model_set),
+        &mut output,
+        None, // backfill has no pipeline hook context
+        None,
+        &schema_cache_cfg,
+        // Target schemas already exist (the closure was built before); do not
+        // auto-create, matching the `--model` entry point.
+        false,
+        &DeferOptions::default(),
+        skip_gate,
+        rocky_cfg.reuse.enabled,
+        rocky_cfg.reuse.column_level,
+        &run_vars,
+        rocky_cfg.resilience.clone(),
+        super::resilience::retry_policy_allows(&rocky_cfg),
+    )
+    .await;
+
+    match exec_result {
+        Ok(()) => {
+            // Re-apply each rebuilt model's `[governance.tags]`, scoped to the
+            // closure so unrelated models are untouched.
+            let governance_adapter = adapter_registry.governance_adapter(&target_adapter_name);
+            for model in model_set {
+                apply_model_governance_tags(
+                    models_dir,
+                    governance_adapter.as_ref(),
+                    &rocky_cfg,
+                    &run_vars,
+                    Some(model.as_str()),
+                )
+                .await;
+            }
+            write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
+        }
+        Err(e) => {
+            output.tables_failed += 1;
+            output.errors.push(crate::output::TableErrorOutput {
+                asset_key: vec!["backfill".to_string()],
+                error: format!("{e:#}"),
+                failure_kind: crate::output::FailureKind::Unknown,
+                cooldown_seconds: None,
+            });
+        }
+    }
+
+    output.duration_ms = start.elapsed().as_millis() as u64;
+
+    let adapter_type = rocky_cfg
+        .adapters
+        .get(&target_adapter_name)
+        .map(|a| a.adapter_type.clone())
+        .unwrap_or_default();
+    output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
+    let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
+
+    let audit_ctx = AuditContext::detect(None, None);
+    let audit = audit_to_record(&audit_ctx);
+    persist_run_record(
+        state_store.as_ref(),
+        &output,
+        &run_id,
+        started_at,
+        &config_hash,
+        &audit,
+    );
+
+    output.status = output.derive_run_status();
+    if output_json {
+        print_json(&output)?;
+    }
+    budget_result?;
+    run_status_exit_result(&output, &run_id)
+}
+
 #[tracing::instrument(skip_all, name = "execute_models")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_models(
@@ -4670,6 +4831,13 @@ pub(crate) async fn execute_models(
     partition_opts: &PartitionRunOptions,
     run_id: &str,
     model_name_filter: Option<&str>,
+    // Supervised-backfill scoping. When `Some(set)`, only models whose name is
+    // in `set` are built (the two-step backfill apply passes the affected
+    // downstream closure here); every other compiled model is skipped. `None`
+    // (every non-backfill caller) is byte-identical to today — no restriction.
+    // Orthogonal to `model_name_filter`: the backfill path leaves that `None`
+    // and drives selection entirely through this set, so the two never fight.
+    model_set: Option<&std::collections::BTreeSet<String>>,
     output: &mut RunOutput,
     // §P2.6 hook plumbing — optional so `rocky run --model <X>`
     // (which skips the full pipeline context) can pass `None` without
@@ -5114,6 +5282,9 @@ pub(crate) async fn execute_models(
         let matched: Vec<(usize, &String, &rocky_core::models::Model)> = layer
             .iter()
             .filter(|name| model_name_filter.is_none_or(|target| target == name.as_str()))
+            // Supervised-backfill scope: restrict the build to the affected
+            // closure. `None` (every non-backfill run) imposes no restriction.
+            .filter(|name| model_set.is_none_or(|set| set.contains(name.as_str())))
             // Exclude models that failed to compile — they're already
             // recorded as failures in `output.errors` above. A downstream
             // model that `ref()`s an excluded one will fail at execution
@@ -10952,6 +11123,7 @@ merge_keys = ["id"]
             &opts,
             "test-run",
             None,
+            None, // model_set: no backfill scope in this test
             &mut output,
             None,
             None,
@@ -10991,6 +11163,7 @@ merge_keys = ["id"]
             &opts,
             "test-run",
             None,
+            None, // model_set: no backfill scope in this test
             &mut output,
             None,
             None,
@@ -11031,6 +11204,7 @@ merge_keys = ["id"]
             opts,
             "test-run",
             None,
+            None, // model_set: no backfill scope in this test
             &mut output,
             None,
             None,
@@ -11077,6 +11251,7 @@ merge_keys = ["id"]
             &opts,
             "test-run",
             None,
+            None, // model_set: no backfill scope in this test
             &mut output,
             None,
             None,
@@ -11992,6 +12167,7 @@ merge_keys = ["id"]
             &opts,
             "test-run",
             None,
+            None, // model_set: no backfill scope in this test
             &mut output,
             None,
             None,
@@ -12096,6 +12272,7 @@ merge_keys = ["id"]
             &opts,
             "test-defer",
             Some("down"), // build only `down`
+            None,         // model_set: no backfill scope in this test
             &mut output,
             None,
             None,
@@ -12215,6 +12392,7 @@ merge_keys = ["id"]
             &opts,
             "test-no-defer",
             Some("down"),
+            None, // model_set: no backfill scope in this test
             &mut output,
             None,
             None,
@@ -12495,6 +12673,7 @@ merge_keys = ["id"]
                 &opts,
                 "test-run",
                 None,
+                None, // model_set: no backfill scope in this test
                 &mut output,
                 None,
                 None,
@@ -12618,6 +12797,7 @@ merge_keys = ["id"]
             &opts,
             run_id,
             None,
+            None, // model_set: no backfill scope in this test
             &mut output,
             None,
             None,
@@ -13588,6 +13768,7 @@ merge_keys = ["id"]
                 &opts,
                 "run-2",
                 None,
+                None, // model_set: no backfill scope in this test
                 &mut output,
                 None,
                 None,

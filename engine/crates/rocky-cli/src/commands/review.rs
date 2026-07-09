@@ -94,6 +94,7 @@ pub(crate) async fn run_review_in(
     // gated, so reviewing one is a no-op the guard rejects rather than
     // silently writing a marker that means nothing.
     let reviewable = plan.kind == PlanKind::AiAuthored
+        || plan.kind == PlanKind::Backfill
         || (plan.kind == PlanKind::Run
             && plan.resolved_principal() == rocky_core::config::PolicyPrincipal::Agent);
     if !reviewable {

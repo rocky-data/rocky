@@ -110,6 +110,7 @@ pub async fn run_transformation(
             partition_opts,
             run_id,
             None, // no model filter in local execution path
+            None, // no backfill model-set scope in local execution path
             &mut output,
             None, // run_local doesn't build a HookRegistry
             None,

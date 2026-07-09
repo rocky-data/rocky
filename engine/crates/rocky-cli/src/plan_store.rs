@@ -86,6 +86,15 @@ pub enum PlanKind {
     /// before dispatching the same execution path as a `Run` plan.
     #[serde(rename = "ai_authored")]
     AiAuthored,
+    /// A supervised-backfill plan composed by `rocky backfill`. The payload is
+    /// a `RunPlan` struct — the same shape as [`PlanKind::Run`] — scoping the
+    /// rebuild to the affected models' downstream closure (and, where
+    /// partitioned, a partition window). The engine composed it in response to
+    /// a failure or gap, so it is **unconditionally** review-gated: `rocky
+    /// apply` requires a `rocky review <plan-id> --approve` marker before
+    /// executing it, regardless of any configured policy. Backfills are where
+    /// blast radius hides, so this gate is a hard rule, not policy-tunable.
+    Backfill,
 }
 
 impl std::fmt::Display for PlanKind {
@@ -97,6 +106,7 @@ impl std::fmt::Display for PlanKind {
             PlanKind::Replication => write!(f, "replication"),
             PlanKind::Promote => write!(f, "promote"),
             PlanKind::AiAuthored => write!(f, "ai_authored"),
+            PlanKind::Backfill => write!(f, "backfill"),
         }
     }
 }
@@ -193,7 +203,10 @@ pub struct EmbeddedCapabilities {
 /// other kind is `human`.
 fn default_principal_for_kind(kind: &PlanKind) -> PolicyPrincipal {
     match kind {
-        PlanKind::AiAuthored => PolicyPrincipal::Agent,
+        // Both are machine-composed by construction, so an unstamped plan
+        // evaluates as `agent` (never `human`, which would let it escape the
+        // agent-scoped policy rules a governor writes).
+        PlanKind::AiAuthored | PlanKind::Backfill => PolicyPrincipal::Agent,
         _ => PolicyPrincipal::Human,
     }
 }

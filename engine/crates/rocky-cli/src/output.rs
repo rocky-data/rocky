@@ -3403,6 +3403,113 @@ fn default_parallel() -> u32 {
     1
 }
 
+// ---------------------------------------------------------------------------
+// Supervised backfill (propose-only)
+// ---------------------------------------------------------------------------
+
+/// The composed, review-gated recovery plan emitted by `rocky backfill`.
+///
+/// A backfill re-runs *existing* recipes over a scoped window — it never
+/// rewrites SQL to "fix" data. The command composes the set of models to
+/// rebuild (the affected models plus their downstream lineage closure), the
+/// order to rebuild them in, the partition window where models are
+/// partitioned, and an estimated cost. The plan is persisted and **always**
+/// requires a human sign-off (`rocky review <plan-id> --approve`) before
+/// `rocky apply` will execute it, regardless of any configured policy —
+/// backfills are where blast radius hides.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BackfillOutput {
+    /// Rocky version that composed the plan.
+    pub version: String,
+    /// Always `"backfill"`.
+    pub command: String,
+    /// What surfaced the affected models: `"manual"` (explicit `--model`) or
+    /// `"last_run_failure"` (seeded from the previous run's failed models,
+    /// i.e. the contained/quarantined window).
+    pub trigger: String,
+    /// The persisted plan identifier (64-char blake3 hex). Feed it to
+    /// `rocky review <plan-id> --approve` then `rocky apply <plan-id>`.
+    pub plan_id: String,
+    /// Always `true` — a backfill plan is unconditionally review-gated.
+    pub requires_review: bool,
+    /// The models that triggered the backfill (the failure/gap seeds), before
+    /// the downstream closure is added.
+    pub seed_models: Vec<String>,
+    /// The full set of models to rebuild — the seeds plus their downstream
+    /// lineage closure — in topological (dependency-first) order.
+    pub models: Vec<String>,
+    /// Topological execution layers over the closure. Models in the same layer
+    /// are independent; each layer runs after the previous completes.
+    pub execution_layers: Vec<Vec<String>>,
+    /// Partition window applied to partitioned models in the closure, when a
+    /// `--from`/`--to` range was supplied. Absent when the backfill is a full
+    /// rebuild of each model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_scope: Option<BackfillPartitionScope>,
+    /// Best-effort cost projection for the rebuild. Always an *estimate*.
+    pub cost_estimate: BackfillCostEstimate,
+    /// The exact command that clears the review gate.
+    pub review_command: String,
+    /// The exact command that executes the plan once reviewed.
+    pub apply_command: String,
+    /// Human-readable one-line summary.
+    pub message: String,
+}
+
+/// The partition window a backfill scopes partitioned models to.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BackfillPartitionScope {
+    /// Range lower bound (`--from`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Range upper bound (`--to`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// The closure models that declare a partitioned (`time_interval`)
+    /// materialization — the ones the window actually applies to. Empty when
+    /// no model in the closure is partitioned (the window is then inert).
+    pub models: Vec<String>,
+}
+
+/// A best-effort, label-as-estimate cost projection for a backfill.
+///
+/// The projection re-uses the same historical-observed cost formula as
+/// `rocky cost`: each closure model's most recent recorded execution is
+/// priced by the warehouse cost model. It is offline (no warehouse
+/// round-trip) and therefore approximate — `is_estimate` is always `true`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BackfillCostEstimate {
+    /// Always `true` — this is a projection, not a measured cost.
+    pub is_estimate: bool,
+    /// How the figure was derived: `"historical_observed"` when at least one
+    /// closure model had a prior execution to price, else `"unavailable"`.
+    pub basis: String,
+    /// Summed estimated compute cost in USD, or `None` when no closure model
+    /// has priced execution history (or the warehouse is unbilled, e.g.
+    /// DuckDB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    /// Per-model breakdown, in closure order.
+    pub per_model: Vec<BackfillModelCost>,
+}
+
+/// Per-model entry in a [`BackfillCostEstimate`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BackfillModelCost {
+    /// The model name.
+    pub model_name: String,
+    /// Estimated compute cost in USD for one rebuild, or `None` when the model
+    /// has no priced execution history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// Observed duration (ms) of the priced historical execution, when found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// The run the historical figure was read from, for provenance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<String>,
+}
+
 /// Current version of the `rocky dag` graph-export contract.
 ///
 /// See [`DagOutput::schema_version`] for the bump policy.

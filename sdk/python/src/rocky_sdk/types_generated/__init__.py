@@ -166,6 +166,14 @@ from .compare_schema import CompareOutput, TableCompareResult
 # Cost command (historical per-run cost attribution)
 from .cost_schema import CostOutput, PerModelCostHistorical
 
+# Backfill command (scoped, review-gated recovery plan)
+from .backfill_schema import (
+    BackfillCostEstimate,
+    BackfillModelCost,
+    BackfillOutput,
+    BackfillPartitionScope,
+)
+
 # Gc command (derivability inventory — dry-run reclamation report)
 from .gc_schema import (
     GcCandidateOutput,
@@ -433,6 +441,11 @@ __all__ = [
     # cost
     "CostOutput",
     "PerModelCostHistorical",
+    # backfill
+    "BackfillOutput",
+    "BackfillCostEstimate",
+    "BackfillModelCost",
+    "BackfillPartitionScope",
     # gc
     "GcCandidateOutput",
     "GcCheckOutput",
