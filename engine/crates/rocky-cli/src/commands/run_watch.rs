@@ -288,6 +288,8 @@ async fn iter_once(
         skip_opts,
         // `--watch` does not expose `--var` today; pass an empty set.
         &rocky_core::run_vars::RunVars::new(),
+        // `--watch` mints the usual timestamp run_id per iteration.
+        None,
     )
     .await;
     let elapsed_ms = started.elapsed().as_millis();

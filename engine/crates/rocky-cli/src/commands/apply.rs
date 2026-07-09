@@ -167,8 +167,25 @@ async fn run_apply_run_plan(
     // into execution (the run plan owns the models_dir the resolver reads).
     let verify_checks = required_verify_after(config_path, principal, &touched, models_dir);
 
-    execute_run_plan(config_path, plan_id, run_plan, state_path, output_json).await?;
-    run_verify_after(plan_id, principal, &verify_checks, state_path)
+    // One unique id for this apply's run, threaded into execution and into the
+    // post-apply gate so the gate reads exactly this run, not "latest".
+    let apply_run_id = new_apply_run_id();
+    execute_run_plan(
+        config_path,
+        plan_id,
+        run_plan,
+        state_path,
+        output_json,
+        &apply_run_id,
+    )
+    .await?;
+    run_verify_after(
+        plan_id,
+        principal,
+        &verify_checks,
+        &apply_run_id,
+        state_path,
+    )
 }
 
 /// Execute a deserialized [`RunPlan`] against the warehouse.
@@ -187,6 +204,12 @@ async fn execute_run_plan(
     run_plan: RunPlan,
     state_path: &Path,
     output_json: bool,
+    // The unique run_id this apply forces `run` to record under, so the
+    // post-apply `verify_after` gate can resolve *this apply's own* run by id
+    // (see [`run_verify_after`]). The `--dag` early-return below does not thread
+    // it — a `dag` apply that also carries `verify_after` fails closed there
+    // because no run is recorded under this id.
+    apply_run_id: &str,
 ) -> Result<()> {
     // Build partition options from the persisted flags.
     let partition_opts = crate::commands::run::PartitionRunOptions {
@@ -284,6 +307,9 @@ async fn execute_run_plan(
         // Per-run `--var` values are not persisted on the plan; an
         // `@var()` model would compile-error on a two-step apply.
         &rocky_core::run_vars::RunVars::new(),
+        // Force `run` to record under this apply's unique id so the
+        // post-apply `verify_after` gate resolves this run (not "latest").
+        Some(apply_run_id),
     )
     .await
     .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))?;
@@ -313,6 +339,15 @@ pub(crate) fn ai_plan_is_reviewed(root: &Path, plan_id: &str) -> bool {
 // ---------------------------------------------------------------------------
 // agent-policy plane — apply/promote enforcement (seams 2 & 3)
 // ---------------------------------------------------------------------------
+
+/// Mint a unique run_id for a two-step `rocky apply` so the run it drives
+/// records under an id no concurrent run can share. The post-apply
+/// `verify_after` gate resolves *this* id (see [`run_verify_after`]), which is
+/// what makes the gate immune to a sibling run finishing in between and being
+/// mistaken for this apply's run.
+fn new_apply_run_id() -> String {
+    format!("run-apply-{}", uuid::Uuid::new_v4())
+}
 
 /// A resolved agent-policy decision, aggregated most-restrictive across every
 /// model a plan touches.
@@ -669,13 +704,30 @@ fn required_verify_after(
 }
 
 /// Run the `verify_after` post-apply gate: confirm every named check ran and
-/// **passed** in the just-completed run, and record a verification custody
+/// **passed** in *this apply's own run*, and record a verification custody
 /// entry either way.
 ///
-/// Fail-closed: a named check that failed *or is absent* from the run's
-/// captured outcomes halts the apply. On success the custody entry records
-/// `effect = allow`; on failure it records `effect = deny`, an alert is raised,
-/// and an error is returned.
+/// `run_id` is the unique id this apply forced its run to record under (see
+/// [`new_apply_run_id`] / the `run_id_override` on `commands::run::run`). The
+/// gate resolves the run by that id via [`StateStore::get_run`] rather than
+/// reading "the latest run" — a concurrent run finishing in between must never
+/// be mistaken for this apply's run and satisfy its gate.
+///
+/// Fail-closed on three fronts:
+/// - **Run not found** for `run_id` (e.g. the run was skipped by idempotency,
+///   or a `--dag` apply never recorded under this id) ⇒ every required check is
+///   unverifiable ⇒ halt.
+/// - A named check that **failed** ⇒ halt.
+/// - A named check **absent** from the run's captured outcomes ⇒ halt.
+///
+/// Duplicate check names are aggregated with **AND**: per-table checks share a
+/// fixed name (e.g. `row_count` is emitted once per table), so a required check
+/// passes only if it ran at least once *and every occurrence passed*. A naive
+/// last-writer-wins map would let a later passing table mask an earlier failing
+/// one.
+///
+/// On success the custody entry records `effect = allow`; on failure it records
+/// `effect = deny`, an alert is raised, and an error is returned.
 ///
 /// Auto-rollback runs only where a rollback substrate exists. None does today
 /// (the content-addressed / Iceberg pointer-swap path is object-store-only and
@@ -687,6 +739,7 @@ fn run_verify_after(
     plan_id: &str,
     principal: PolicyPrincipal,
     required: &[String],
+    run_id: &str,
     state_path: &Path,
 ) -> Result<()> {
     if required.is_empty() {
@@ -696,25 +749,41 @@ fn run_verify_after(
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
-    // The apply's run just finished, so it is the most recent run on record.
-    let latest = store.list_runs(1).ok().and_then(|mut v| v.pop());
-    let outcomes: BTreeMap<&str, bool> = latest
-        .as_ref()
-        .map(|r| {
-            r.check_outcomes
-                .iter()
-                .map(|c| (c.name.as_str(), c.passed))
-                .collect()
-        })
-        .unwrap_or_default();
+    // Resolve *this apply's own* run by id (not "latest"). `None` means no run
+    // was recorded under this id — fail closed below (every check unverifiable).
+    let run = store
+        .get_run(run_id)
+        .with_context(|| format!("failed to read run '{run_id}' from state store"))?;
+
+    // AND-aggregate every occurrence of each check name: any `false` occurrence
+    // fails the name. Presence in the map ⇒ the check ran at least once.
+    let mut outcomes: BTreeMap<&str, bool> = BTreeMap::new();
+    if let Some(record) = run.as_ref() {
+        for c in &record.check_outcomes {
+            outcomes
+                .entry(c.name.as_str())
+                .and_modify(|passed| *passed &= c.passed)
+                .or_insert(c.passed);
+        }
+    }
 
     let mut failures: Vec<String> = Vec::new();
-    for name in required {
-        match outcomes.get(name.as_str()) {
-            Some(true) => {}
-            Some(false) => failures.push(format!("{name} (failed)")),
-            // Fail closed: a named check that did not run cannot be confirmed.
-            None => failures.push(format!("{name} (absent — did not run)")),
+    if run.is_none() {
+        // The run this apply produced could not be found — treat every required
+        // check as unverifiable and halt (fail closed).
+        for name in required {
+            failures.push(format!(
+                "{name} (apply run '{run_id}' not found — unverifiable)"
+            ));
+        }
+    } else {
+        for name in required {
+            match outcomes.get(name.as_str()) {
+                Some(true) => {}
+                Some(false) => failures.push(format!("{name} (failed)")),
+                // Fail closed: a named check that did not run cannot be confirmed.
+                None => failures.push(format!("{name} (absent — did not run)")),
+            }
         }
     }
     let passed = failures.is_empty();
@@ -842,8 +911,25 @@ async fn run_apply_ai_authored_plan(
     // Resolve the post-apply verification checks before the run plan is moved.
     let verify_checks = required_verify_after(config_path, principal, &touched, models_dir);
 
-    execute_run_plan(config_path, plan_id, run_plan, state_path, output_json).await?;
-    run_verify_after(plan_id, principal, &verify_checks, state_path)
+    // One unique id for this apply's run, threaded into execution and into the
+    // post-apply gate so the gate reads exactly this run, not "latest".
+    let apply_run_id = new_apply_run_id();
+    execute_run_plan(
+        config_path,
+        plan_id,
+        run_plan,
+        state_path,
+        output_json,
+        &apply_run_id,
+    )
+    .await?;
+    run_verify_after(
+        plan_id,
+        principal,
+        &verify_checks,
+        &apply_run_id,
+        state_path,
+    )
 }
 
 /// Apply a `PlanKind::Backfill` plan — a scoped, review-gated recovery run.
@@ -1097,6 +1183,8 @@ async fn run_apply_replication_plan(
         &crate::commands::run::SkipRunOptions::default(),
         // Replication apply runs no transformation models; vars are inert.
         &rocky_core::run_vars::RunVars::new(),
+        // Replication apply has no `verify_after` gate; mint the usual id.
+        None,
     )
     .await
     .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
@@ -1506,6 +1594,9 @@ pub async fn run_apply_inline_for_run(
         defer_opts,
         skip_opts,
         run_vars,
+        // The inline `rocky run` path mints its own timestamp run_id; the
+        // two-step apply's verify_after gate is the only override consumer.
+        None,
     )
     .await
 }
@@ -2687,16 +2778,23 @@ effect = "deny"
 
     // ---------- verify_after post-apply gate ----------
 
-    fn record_run_with_checks(state_path: &Path, checks: &[(&str, bool)]) {
+    /// Record a run under an explicit `run_id` + `started_at`, so a test can
+    /// control which run is "latest" (by timestamp) independently of which run
+    /// it later asks `run_verify_after` to resolve (by id).
+    fn record_run_with_checks_id(
+        state_path: &Path,
+        run_id: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+        checks: &[(&str, bool)],
+    ) {
         use rocky_core::state::{
             CheckOutcome, RunRecord, RunStatus, RunTrigger, SessionSource, StateStore,
         };
         let store = StateStore::open(state_path).unwrap();
-        let now = chrono::Utc::now();
         let record = RunRecord {
-            run_id: format!("run-{}", now.timestamp_nanos_opt().unwrap_or(0)),
-            started_at: now,
-            finished_at: now,
+            run_id: run_id.to_string(),
+            started_at,
+            finished_at: started_at,
             status: RunStatus::Success,
             models_executed: vec![],
             trigger: RunTrigger::Manual,
@@ -2720,15 +2818,26 @@ effect = "deny"
         store.record_run(&record).unwrap();
     }
 
+    /// Record a run with a generated id and return that id so the caller can
+    /// thread it into `run_verify_after` (which now resolves the run by id).
+    fn record_run_with_checks(state_path: &Path, checks: &[(&str, bool)]) -> String {
+        let now = chrono::Utc::now();
+        let run_id = format!("run-{}", now.timestamp_nanos_opt().unwrap_or(0));
+        record_run_with_checks_id(state_path, &run_id, now, checks);
+        run_id
+    }
+
     #[test]
     fn verify_after_passes_when_all_named_checks_pass() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state.redb");
-        record_run_with_checks(&state, &[("row_count", true), ("not_null_keys", true)]);
+        let run_id =
+            record_run_with_checks(&state, &[("row_count", true), ("not_null_keys", true)]);
         let r = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
             &["row_count".to_string(), "not_null_keys".to_string()],
+            &run_id,
             &state,
         );
         assert!(
@@ -2741,11 +2850,13 @@ effect = "deny"
     fn verify_after_halts_when_named_check_fails() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state.redb");
-        record_run_with_checks(&state, &[("row_count", true), ("not_null_keys", false)]);
+        let run_id =
+            record_run_with_checks(&state, &[("row_count", true), ("not_null_keys", false)]);
         let err = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
             &["not_null_keys".to_string()],
+            &run_id,
             &state,
         )
         .expect_err("a failing named check halts the apply");
@@ -2765,11 +2876,12 @@ effect = "deny"
         // soundness direction.
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state.redb");
-        record_run_with_checks(&state, &[("row_count", true)]);
+        let run_id = record_run_with_checks(&state, &[("row_count", true)]);
         let err = super::run_verify_after(
             "plan-x",
             PolicyPrincipal::Agent,
             &["freshness".to_string()],
+            &run_id,
             &state,
         )
         .expect_err("an absent named check fails closed");
@@ -2781,6 +2893,76 @@ effect = "deny"
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state.redb");
         // No required checks → the gate is a no-op and never touches state.
-        assert!(super::run_verify_after("plan-x", PolicyPrincipal::Agent, &[], &state).is_ok());
+        assert!(
+            super::run_verify_after("plan-x", PolicyPrincipal::Agent, &[], "unused-id", &state)
+                .is_ok()
+        );
+    }
+
+    /// 🔴 Regression (false-verified): the gate must resolve *this apply's own*
+    /// run by id, NOT "the latest run". Two runs share the state store: run A
+    /// (this apply, older) failed its required check; a concurrent run B (newer,
+    /// "latest") passed the same-named check. If the gate read "latest" it would
+    /// verify against B and wrongly pass — so it MUST fail when handed A's id.
+    #[test]
+    fn verify_after_reads_this_applys_run_not_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb");
+
+        let older = chrono::Utc::now() - chrono::Duration::seconds(60); // A @ 10:00
+        let newer = chrono::Utc::now(); // B @ 10:01 (the "latest" by started_at)
+        // A is this apply's run: its required check FAILED.
+        record_run_with_checks_id(&state, "run-A", older, &[("row_count", false)]);
+        // B is a concurrent run that finished later: same check PASSED.
+        record_run_with_checks_id(&state, "run-B", newer, &[("row_count", true)]);
+
+        let err = super::run_verify_after(
+            "plan-x",
+            PolicyPrincipal::Agent,
+            &["row_count".to_string()],
+            "run-A",
+            &state,
+        )
+        .expect_err(
+            "the gate must fail against THIS apply's run (A, failed), not the latest run (B, passed)",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verify_after gate FAILED") && msg.contains("row_count"),
+            "must fail on A's failed check, got: {msg}"
+        );
+    }
+
+    /// 🔴 Regression (false-verified): duplicate check names must AND-aggregate.
+    /// Per-table checks share a fixed name (`row_count` per table), so a run's
+    /// outcomes can carry the same name failed *and* passed. A last-writer-wins
+    /// map would let the passing occurrence overwrite the failing one and the
+    /// gate would wrongly pass. Every occurrence must be AND-ed → fail.
+    #[test]
+    fn verify_after_duplicate_check_name_failed_then_passed_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb");
+        // Same name, failed first then passed — order chosen so a naive
+        // last-writer-wins map would land on `true` and wrongly pass.
+        record_run_with_checks_id(
+            &state,
+            "run-dup",
+            chrono::Utc::now(),
+            &[("row_count", false), ("row_count", true)],
+        );
+
+        let err = super::run_verify_after(
+            "plan-x",
+            PolicyPrincipal::Agent,
+            &["row_count".to_string()],
+            "run-dup",
+            &state,
+        )
+        .expect_err("a failing occurrence of a duplicate check name must fail the gate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verify_after gate FAILED") && msg.contains("row_count"),
+            "duplicate-name AND-aggregation must surface the failure: {msg}"
+        );
     }
 }

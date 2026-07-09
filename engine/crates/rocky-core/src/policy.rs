@@ -33,6 +33,17 @@
 //!    `require_review` (fail-safe). A ceiling can therefore never let an
 //!    `allow` stand for an oversized or unverifiable blast radius; `deny` and
 //!    `require_review` rules are unaffected (`deny` is unconditional).
+//! 7. **Sticky `max_downstreams` safety cap.** A ceiling breach is *sticky*:
+//!    if **any** matched rule's `max_downstreams` was exceeded or uncomputable,
+//!    the final effect is capped to at least `require_review` — even when a
+//!    more-specific sibling `allow` (with no ceiling, or a superset of matched
+//!    constraints) would otherwise win the specificity contest and stand as an
+//!    ungated `allow`. This closes the false-allow where a broad sibling `allow`
+//!    *dominates* a ceilinged rule via the non-dominated filter and thereby lets
+//!    an oversized blast radius through. It is applied as a post-winner check:
+//!    it never softens a `deny` (deny is resolved first, before any winner) and
+//!    it never overrides the uncomputable-blast-radius fail-closed rule (both
+//!    point the same way — toward `require_review`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -442,8 +453,30 @@ pub fn evaluate(
         reason.push_str(degrade);
     }
 
+    // 7. Sticky `max_downstreams` safety cap (post-winner). A ceiling breach on
+    // ANY matched rule caps the final effect to at least `require_review`, even
+    // when a more-specific sibling `allow` won the specificity contest above.
+    // The winner's own `allow` is never ceiling-degraded — a degraded rule is
+    // already `require_review`, so `winner.effect == Allow` guarantees the cap
+    // reason comes from a *non-winning* breached candidate. Without this, a
+    // broad ungated `allow` that dominates a ceilinged sibling (superset of
+    // constraints, no ceiling) would let an oversized or unverifiable blast
+    // radius stand — the exact false-allow the ceiling exists to prevent.
+    let mut effect = winner.effect;
+    if effect == PolicyEffect::Allow
+        && let Some(breach) = candidates.iter().find(|c| c.degraded.is_some())
+    {
+        effect = PolicyEffect::RequireReview;
+        let detail = breach.degraded.as_deref().unwrap_or("ceiling breached");
+        reason.push_str(&format!(
+            "; sticky safety cap: max_downstreams ceiling breached on rule {} ({detail}) \
+             — allow capped to require_review",
+            breach.idx
+        ));
+    }
+
     PolicyDecision {
-        effect: winner.effect,
+        effect,
         matched_rule: Some(winner.idx),
         reason,
     }
@@ -1063,6 +1096,121 @@ mod tests {
         );
         assert_eq!(d.effect, PolicyEffect::RequireReview);
         assert_eq!(d.matched_rule, Some(1));
+    }
+
+    /// 🔴 Sticky safety cap — the load-bearing false-allow fix. A ceilinged
+    /// `allow` (rule 0, `max_downstreams=5`) is *dominated* by a more-specific
+    /// ungated sibling `allow` (rule 1, a strict-superset scope with no
+    /// ceiling). The non-dominated filter drops the degraded rule 0, so the
+    /// winner is rule 1's ungated `allow`. Without the sticky cap this yields
+    /// `allow` for a blast radius of 20 that a matching ceiling of 5 forbids.
+    /// The cap must force the final effect to `require_review`.
+    #[test]
+    fn sticky_cap_more_specific_sibling_allow_cannot_bypass_breached_ceiling() {
+        let attrs = ModelAttributes {
+            name: "raw_events".to_string(),
+            layer: Some("bronze".to_string()),
+            classifications: BTreeSet::from(["public".to_string()]),
+            reachable_downstreams: Some(20),
+            ..Default::default()
+        };
+        // rule 0: allow {layer=bronze, max_downstreams=5}  ({Layer}, degrades)
+        // rule 1: allow {layer=bronze, classifications=[public]}
+        //         ({Layer, Classifications}) — strict superset dominates rule 0.
+        let p = policy(vec![
+            rule(
+                PolicyPrincipal::Agent,
+                PolicyCapability::SchemaChangeAdditive,
+                PolicyScope {
+                    layer: Some("bronze".to_string()),
+                    max_downstreams: Some(5),
+                    ..Default::default()
+                },
+                PolicyEffect::Allow,
+            ),
+            rule(
+                PolicyPrincipal::Agent,
+                PolicyCapability::SchemaChangeAdditive,
+                PolicyScope {
+                    layer: Some("bronze".to_string()),
+                    classifications: vec!["public".to_string()],
+                    ..Default::default()
+                },
+                PolicyEffect::Allow,
+            ),
+        ]);
+        let d = evaluate(
+            &p,
+            PolicyPrincipal::Agent,
+            PolicyCapability::SchemaChangeAdditive,
+            &attrs,
+        );
+        assert_eq!(
+            d.effect,
+            PolicyEffect::RequireReview,
+            "a breached ceiling on a matched rule must cap the final effect, \
+             even when a more-specific ungated sibling allow wins: {}",
+            d.reason
+        );
+        assert!(
+            d.reason.contains("sticky safety cap")
+                && d.reason.contains("max_downstreams=5 exceeded"),
+            "reason must name the sticky cap and the breach: {}",
+            d.reason
+        );
+    }
+
+    /// The cap is *only* a cap: a non-breached ceiling still allows. Same two
+    /// rules as above, but the blast radius (3) is within rule 0's ceiling (5),
+    /// so no candidate degraded and the more-specific sibling `allow` stands.
+    #[test]
+    fn sticky_cap_non_breached_ceiling_still_allows() {
+        let attrs = ModelAttributes {
+            name: "raw_events".to_string(),
+            layer: Some("bronze".to_string()),
+            classifications: BTreeSet::from(["public".to_string()]),
+            reachable_downstreams: Some(3),
+            ..Default::default()
+        };
+        let p = policy(vec![
+            rule(
+                PolicyPrincipal::Agent,
+                PolicyCapability::SchemaChangeAdditive,
+                PolicyScope {
+                    layer: Some("bronze".to_string()),
+                    max_downstreams: Some(5),
+                    ..Default::default()
+                },
+                PolicyEffect::Allow,
+            ),
+            rule(
+                PolicyPrincipal::Agent,
+                PolicyCapability::SchemaChangeAdditive,
+                PolicyScope {
+                    layer: Some("bronze".to_string()),
+                    classifications: vec!["public".to_string()],
+                    ..Default::default()
+                },
+                PolicyEffect::Allow,
+            ),
+        ]);
+        let d = evaluate(
+            &p,
+            PolicyPrincipal::Agent,
+            PolicyCapability::SchemaChangeAdditive,
+            &attrs,
+        );
+        assert_eq!(
+            d.effect,
+            PolicyEffect::Allow,
+            "a within-ceiling blast radius must still allow: {}",
+            d.reason
+        );
+        assert!(
+            !d.reason.contains("sticky safety cap"),
+            "no cap should fire when nothing breached: {}",
+            d.reason
+        );
     }
 
     #[test]

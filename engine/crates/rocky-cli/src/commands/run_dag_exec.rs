@@ -285,6 +285,8 @@ impl NodeDispatcher for CliDispatcher {
                         // empty set so `@var()` models would compile-error rather
                         // than silently resolve under a DAG run.
                         &rocky_core::run_vars::RunVars::new(),
+                        // No run_id override — DAG sub-runs mint their own ids.
+                        None,
                     )
                     .await
                     .map_err(|e| e.to_string())

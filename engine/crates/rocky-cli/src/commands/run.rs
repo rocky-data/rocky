@@ -1095,6 +1095,13 @@ pub async fn run(
     // placeholders in model SQL at compile time. Empty ⇒ no `@var()` model
     // resolves and behavior is byte-identical.
     run_vars: &rocky_core::run_vars::RunVars,
+    // Caller-supplied run_id override. `None` (every caller except the two-step
+    // `rocky apply` path) mints the usual `run-{timestamp}` id, so behavior is
+    // byte-identical. `Some(id)` forces this run to record under exactly `id`
+    // at every persistence site — used by `rocky apply` so its post-apply
+    // `verify_after` gate can resolve *this apply's own* run (not "latest") by
+    // id, immune to a concurrent run finishing in between.
+    run_id_override: Option<&str>,
 ) -> Result<()> {
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
@@ -1113,7 +1120,9 @@ pub async fn run(
     // `IdempotencyEntry::run_id` == `RunRecord::run_id` so operators can
     // cross-reference a `skipped_by_run_id` directly against
     // `rocky history`.
-    let run_id = format!("run-{}", started_at.format("%Y%m%d-%H%M%S-%3f"));
+    let run_id = run_id_override
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("run-{}", started_at.format("%Y%m%d-%H%M%S-%3f")));
     // Record `run_id` on the `run` span declared by `#[tracing::instrument]`
     // above so every event nested under this scope (and emitted into the
     // JSONL trace file) carries the identifier in its `spans[]` chain.
@@ -9507,6 +9516,7 @@ adapter = "default"
             &DeferOptions::default(),
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
+            None, // no run_id override — mint the usual timestamp id
         )
         .await
         .expect("transformation run should succeed");
@@ -9614,6 +9624,7 @@ schema = "mart"
             &DeferOptions::default(),
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
+            None, // no run_id override — mint the usual timestamp id
         )
         .await
         .expect(
