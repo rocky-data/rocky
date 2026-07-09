@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.59.0] - 2026-07-09
+
+### Added
+
+- **Recipe-identity attestation travels in Databricks table metadata, verifiable offline.** On a Databricks (Delta) materialization Rocky writes the recipe-identity triple it already records — `program_hash`, `env_hash`, `hash_scheme`, plus the input-match keys when the run observed its inputs — into the table's `TBLPROPERTIES` under a vendor-neutral `recipe_manifest.*` namespace. The write is a post-create `ALTER TABLE … SET TBLPROPERTIES`, deliberately separate from the CREATE DDL so it never enters the IR the recipe hash is computed over (hash-neutral by construction). A generic `SHOW TBLPROPERTIES` read-back reconstitutes a standalone `rocky-manifest v0.1` document that the engine-free `rocky-verify` validates offline. DuckDB, Snowflake, and BigQuery inherit a silent no-op via the new `write_recipe_manifest` governance hook; only Databricks implements the carrier. On a managed (non-content-addressed) run the manifest carries the identity triple but no output byte-hashes, so offline verification is structural, not byte-identity. (#1062)
+
+- **`rocky export-openapi` — an OpenAPI 3.1 document for the `rocky serve` HTTP API.** Assembles a single OpenAPI 3.1 document from the same typed JSON-schema registry that backs the CLI plus the `/api/v1` route table: shared components are deduplicated, Draft-07 schemas are bridged to the 2020-12 dialect, `$ref`s are rewritten, and the document is validated against the OpenAPI 3.1 meta-schema before it is written. The artifact is published at `docs/public/openapi.json` and drift-gated in CI alongside the other codegen. Paired with a new **Embedding Rocky** guide covering the four integration patterns (subprocess, SDK, MCP, serve API), the async job model, `/meta` feature detection, the schema-stability promise, and the single-tenant sidecar posture. (#1064)
+
+### Fixed
+
+- **Column-level sound-skip now fails closed on a case-folding producer-column collision.** The consumer-baseline builder folded producer output-column names to lowercase, so two columns differing only by case (for example `id` and `ID`) collapsed to one key and a consumed column could resolve to whichever entry won the insert. If the consumed column changed but its case-colliding sibling did not, the gate compared the unchanged sibling and could skip a genuinely-changed column. The baseline now fails closed on the collision — no column baseline for that upstream, so the model builds — mirroring the guard already present in the per-column hash comparison. The per-column skip gate remains default-off (`[reuse] column_level`). (#1063)
+
 ## [1.58.0] - 2026-07-08
 
 ### Added

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-07-09
+
 ### Fixed
 
 - **`RunResult.contained` now surfaces through `parse_rocky_output`.** The `contained[]` model-failure containment field shipped on the generated `RunOutput` in 0.3.0, but `parse_rocky_output` dispatches `run` to the hand-written `RunResult`, which did not declare the field — so Pydantic's default `extra="ignore"` silently dropped it. The hand-written `RunResult` now carries `contained: list[ContainedModel]` (empty when the engine omits it), so a consumer surfacing the withheld-model blast radius (e.g. `dagster-rocky`) reads the values instead of always seeing nothing.
