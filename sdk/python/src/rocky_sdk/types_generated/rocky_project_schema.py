@@ -853,7 +853,7 @@ class PolicyCapability(StrEnum):
     read = "read"
 
 
-class PolicyCapability59(StrEnum):
+class PolicyCapability71(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -861,7 +861,7 @@ class PolicyCapability59(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability60(StrEnum):
+class PolicyCapability72(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -869,7 +869,7 @@ class PolicyCapability60(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability61(StrEnum):
+class PolicyCapability73(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -877,7 +877,7 @@ class PolicyCapability61(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability62(StrEnum):
+class PolicyCapability74(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -885,7 +885,7 @@ class PolicyCapability62(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability63(StrEnum):
+class PolicyCapability75(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -893,7 +893,7 @@ class PolicyCapability63(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability64(StrEnum):
+class PolicyCapability76(StrEnum):
     """
     Retry a failed run.
     """
@@ -901,7 +901,7 @@ class PolicyCapability64(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability65(StrEnum):
+class PolicyCapability77(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -909,7 +909,7 @@ class PolicyCapability65(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability66(StrEnum):
+class PolicyCapability78(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -917,7 +917,7 @@ class PolicyCapability66(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability67(StrEnum):
+class PolicyCapability79(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -925,7 +925,7 @@ class PolicyCapability67(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability68(StrEnum):
+class PolicyCapability80(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -933,7 +933,7 @@ class PolicyCapability68(StrEnum):
     value_change = "value_change"
 
 
-class PolicyEffect13(StrEnum):
+class PolicyEffect17(StrEnum):
     """
     Permit the action outright.
     """
@@ -941,7 +941,7 @@ class PolicyEffect13(StrEnum):
     allow = "allow"
 
 
-class PolicyEffect14(StrEnum):
+class PolicyEffect18(StrEnum):
     """
     Permit only after human review. The safe default posture.
     """
@@ -949,7 +949,7 @@ class PolicyEffect14(StrEnum):
     require_review = "require_review"
 
 
-class PolicyEffect15(StrEnum):
+class PolicyEffect19(StrEnum):
     """
     Refuse the action. A hard override — no `allow` overturns it.
     """
@@ -965,7 +965,7 @@ class PolicyPrincipal(StrEnum):
     human = "human"
 
 
-class PolicyPrincipal14(StrEnum):
+class PolicyPrincipal17(StrEnum):
     """
     A non-human caller (AI agent / automation).
     """
@@ -1014,6 +1014,74 @@ class PolicyScope(BaseModel):
     tags: dict[str, str] | None = {}
     """
     Required model tags (AND of `key = value` pairs). Satisfied when the model carries every listed tag with the exact value.
+    """
+
+
+class PolicyTest(BaseModel):
+    """
+    One `[[policy.tests]]` scenario: a self-contained assertion over the policy evaluator.
+
+    A scenario names a `principal`, a `capability`, a synthetic target model (its attributes spelled out inline), and the `expect`ed effect. The `rocky policy test` runner constructs a [`crate::policy::ModelAttributes`] from these fields *verbatim* — the same value the evaluator receives at a real enforcement seam — feeds it to [`crate::policy::evaluate`], and asserts the resolved effect equals `expect`. Because the attributes are declared, not compiled, a scenario is stable regardless of the current project graph: it pins the *policy's* behaviour, which is exactly what a policy edit must not silently change.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    capability: (
+        PolicyCapability
+        | PolicyCapability71
+        | PolicyCapability72
+        | PolicyCapability73
+        | PolicyCapability74
+        | PolicyCapability75
+        | PolicyCapability76
+        | PolicyCapability77
+        | PolicyCapability78
+        | PolicyCapability79
+        | PolicyCapability80
+    )
+    """
+    The capability being attempted.
+    """
+    classifications: list[str] | None = []
+    """
+    Synthetic column classifications present on the model (matched against `scope.classifications` / `scope.exclude_classifications`).
+    """
+    contracted: bool | None = False
+    """
+    Whether the synthetic model sits behind a contract (matched against `scope.contracted`).
+    """
+    downstreams: conint(ge=0) | None = 0
+    """
+    Synthetic direct downstream count. Informational — the `max_downstreams` ceiling reads `reachable_downstreams`.
+    """
+    expect: PolicyEffect17 | PolicyEffect18 | PolicyEffect19
+    """
+    The effect the evaluator must resolve for this scenario. A mismatch fails the scenario (and the `rocky policy test` run).
+    """
+    layer: str | None = None
+    """
+    Synthetic medallion/semantic layer (matched against `scope.layer`).
+    """
+    model: str | None = ""
+    """
+    Synthetic model name, matched against rule `scope.models` globs. Empty (the default) matches no name-scoped rule — only `any`/attribute rules apply.
+    """
+    name: str
+    """
+    Human-readable name for the scenario, echoed in the pass/fail report.
+    """
+    principal: PolicyPrincipal | PolicyPrincipal17
+    """
+    The principal attempting the action.
+    """
+    reachable_downstreams: conint(ge=0) | None = None
+    """
+    Synthetic transitive blast radius, compared against a rule's `max_downstreams` ceiling. Omit (the default `null`) to model an **uncomputable** blast radius — the ceiling then fails closed, exactly as at a real seam where the graph did not compile.
+    """
+    tags: dict[str, str] | None = {}
+    """
+    Synthetic model-level tags (matched against rule `scope.tags`).
     """
 
 
@@ -2049,16 +2117,16 @@ class PolicyRule(BaseModel):
     )
     capability: (
         PolicyCapability
-        | PolicyCapability59
-        | PolicyCapability60
-        | PolicyCapability61
-        | PolicyCapability62
-        | PolicyCapability63
-        | PolicyCapability64
-        | PolicyCapability65
-        | PolicyCapability66
-        | PolicyCapability67
-        | PolicyCapability68
+        | PolicyCapability71
+        | PolicyCapability72
+        | PolicyCapability73
+        | PolicyCapability74
+        | PolicyCapability75
+        | PolicyCapability76
+        | PolicyCapability77
+        | PolicyCapability78
+        | PolicyCapability79
+        | PolicyCapability80
     )
     """
     Which capability this rule governs.
@@ -2067,11 +2135,11 @@ class PolicyRule(BaseModel):
     """
     Optional v1 conditional refinements not yet promoted to typed fields (`budget`, `window`). **Parsed and ignored** — captured as opaque JSON so a config authored against a later version still loads.
     """
-    effect: PolicyEffect13 | PolicyEffect14 | PolicyEffect15
+    effect: PolicyEffect17 | PolicyEffect18 | PolicyEffect19
     """
     The verdict when this rule matches.
     """
-    principal: PolicyPrincipal | PolicyPrincipal14
+    principal: PolicyPrincipal | PolicyPrincipal17
     """
     Who this rule applies to.
     """
@@ -2876,7 +2944,7 @@ class PolicyConfig(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
     )
-    default_agent_effect: PolicyEffect13 | PolicyEffect14 | PolicyEffect15 | None = (
+    default_agent_effect: PolicyEffect17 | PolicyEffect18 | PolicyEffect19 | None = (
         "require_review"
     )
     """
@@ -2885,6 +2953,10 @@ class PolicyConfig(BaseModel):
     rules: list[PolicyRule] | None = Field([], validate_default=True)
     """
     Ordered list of rules. Evaluated as a set (order only breaks final ties); see [`crate::policy::evaluate`].
+    """
+    tests: list[PolicyTest] | None = None
+    """
+    Scenario assertions run by `rocky policy test`. Each pins the effect the evaluator must resolve for a `(principal, capability, target)` triple, so a policy edit that would silently open a hole fails CI. Never read by any enforcement path — purely a testing surface.
     """
     version: conint(ge=0)
     """

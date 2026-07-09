@@ -1,0 +1,108 @@
+# 07-policy — the SAME project after a careless policy edit opened a hole.
+#
+# The only change from rocky.toml is on the first rule: the contract-boundary
+# `deny` was loosened to `allow` (imagine a hurried edit to unblock one change).
+# Every scenario below is byte-identical to rocky.toml — none was touched. The
+# pinned "an agent may not apply to a contracted model" assertion now fails,
+# and `rocky policy test` exits non-zero. That is the guardrail firing: the
+# hole is a red CI check, not a silent diff.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.warehouse]
+strategy = "full_refresh"
+source.schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+target = { catalog_template = "poc", schema_template = "bronze__{source}" }
+
+[policy]
+version = 1
+default_agent_effect = "require_review"
+
+# THE HOLE: this was `effect = "deny"` in rocky.toml.
+[[policy.rules]]
+principal  = "agent"
+capability = "apply"
+scope      = { contracted = true }
+effect     = "allow"
+
+[[policy.rules]]
+principal  = "agent"
+capability = "schema_change.additive"
+scope      = { tags = { layer = "bronze" }, exclude_classifications = ["pii"], max_downstreams = 5 }
+effect     = "allow"
+
+[[policy.rules]]
+principal  = "agent"
+capability = "retry"
+scope      = { any = true }
+effect     = "allow"
+
+# --- Scenarios: identical to rocky.toml, not touched by the edit ------------
+
+[[policy.tests]]
+name       = "an agent may not apply to a contracted model"
+principal  = "agent"
+capability = "apply"
+model      = "fct_revenue"
+contracted = true
+expect     = "deny"
+
+[[policy.tests]]
+name       = "a small additive bronze change flows automatically"
+principal  = "agent"
+capability = "schema_change.additive"
+model                 = "stg_orders"
+tags                  = { layer = "bronze" }
+reachable_downstreams = 3
+expect                = "allow"
+
+[[policy.tests]]
+name       = "the same change with a wide blast radius stops for review"
+principal  = "agent"
+capability = "schema_change.additive"
+model                 = "stg_orders"
+tags                  = { layer = "bronze" }
+reachable_downstreams = 42
+expect                = "require_review"
+
+[[policy.tests]]
+name       = "an uncomputable blast radius is never auto-approved"
+principal  = "agent"
+capability = "schema_change.additive"
+model  = "stg_orders"
+tags   = { layer = "bronze" }
+expect = "require_review"
+
+[[policy.tests]]
+name       = "a PII bronze change is carved out and falls to review"
+principal  = "agent"
+capability = "schema_change.additive"
+model                 = "stg_customers"
+tags                  = { layer = "bronze" }
+classifications       = ["pii"]
+reachable_downstreams = 2
+expect                = "require_review"
+
+[[policy.tests]]
+name       = "a transient retry is always allowed"
+principal  = "agent"
+capability = "retry"
+model      = "stg_orders"
+expect     = "allow"
+
+[[policy.tests]]
+name       = "a human is never gated by the policy"
+principal  = "human"
+capability = "apply"
+model      = "fct_revenue"
+contracted = true
+expect     = "allow"
+
+[[policy.tests]]
+name       = "an unmatched agent action falls to the default posture"
+principal  = "agent"
+capability = "promote"
+model      = "stg_orders"
+expect     = "require_review"

@@ -517,6 +517,7 @@ mod tests {
             version: 1,
             default_agent_effect: PolicyEffect::RequireReview,
             rules,
+            tests: Vec::new(),
         }
     }
 

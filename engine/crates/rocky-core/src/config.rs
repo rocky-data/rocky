@@ -2813,6 +2813,61 @@ pub struct PolicyRule {
     pub conditions: Option<serde_json::Value>,
 }
 
+/// One `[[policy.tests]]` scenario: a self-contained assertion over the
+/// policy evaluator.
+///
+/// A scenario names a `principal`, a `capability`, a synthetic target model
+/// (its attributes spelled out inline), and the `expect`ed effect. The
+/// `rocky policy test` runner constructs a
+/// [`crate::policy::ModelAttributes`] from these fields *verbatim* — the same
+/// value the evaluator receives at a real enforcement seam — feeds it to
+/// [`crate::policy::evaluate`], and asserts the resolved effect equals
+/// `expect`. Because the attributes are declared, not compiled, a scenario is
+/// stable regardless of the current project graph: it pins the *policy's*
+/// behaviour, which is exactly what a policy edit must not silently change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyTest {
+    /// Human-readable name for the scenario, echoed in the pass/fail report.
+    pub name: String,
+    /// The principal attempting the action.
+    pub principal: PolicyPrincipal,
+    /// The capability being attempted.
+    pub capability: PolicyCapability,
+    /// The effect the evaluator must resolve for this scenario. A mismatch
+    /// fails the scenario (and the `rocky policy test` run).
+    pub expect: PolicyEffect,
+    /// Synthetic model name, matched against rule `scope.models` globs.
+    /// Empty (the default) matches no name-scoped rule — only `any`/attribute
+    /// rules apply.
+    #[serde(default)]
+    pub model: String,
+    /// Synthetic model-level tags (matched against rule `scope.tags`).
+    #[serde(default)]
+    pub tags: std::collections::BTreeMap<String, String>,
+    /// Synthetic column classifications present on the model (matched against
+    /// `scope.classifications` / `scope.exclude_classifications`).
+    #[serde(default)]
+    pub classifications: Vec<String>,
+    /// Whether the synthetic model sits behind a contract (matched against
+    /// `scope.contracted`).
+    #[serde(default)]
+    pub contracted: bool,
+    /// Synthetic medallion/semantic layer (matched against `scope.layer`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// Synthetic direct downstream count. Informational — the
+    /// `max_downstreams` ceiling reads `reachable_downstreams`.
+    #[serde(default)]
+    pub downstreams: u64,
+    /// Synthetic transitive blast radius, compared against a rule's
+    /// `max_downstreams` ceiling. Omit (the default `null`) to model an
+    /// **uncomputable** blast radius — the ceiling then fails closed, exactly
+    /// as at a real seam where the graph did not compile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachable_downstreams: Option<u64>,
+}
+
 /// The `[policy]` block: agent-authority policy for this project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -2827,6 +2882,12 @@ pub struct PolicyConfig {
     /// ties); see [`crate::policy::evaluate`].
     #[serde(default, rename = "rules")]
     pub rules: Vec<PolicyRule>,
+    /// Scenario assertions run by `rocky policy test`. Each pins the effect
+    /// the evaluator must resolve for a `(principal, capability, target)`
+    /// triple, so a policy edit that would silently open a hole fails CI.
+    /// Never read by any enforcement path — purely a testing surface.
+    #[serde(default, rename = "tests", skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<PolicyTest>,
 }
 
 impl PolicyConfig {
@@ -2837,6 +2898,7 @@ impl PolicyConfig {
             version: 1,
             default_agent_effect: PolicyEffect::RequireReview,
             rules: Vec::new(),
+            tests: Vec::new(),
         }
     }
 }

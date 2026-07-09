@@ -1784,6 +1784,10 @@ export interface PolicyConfig {
    */
   rules?: PolicyRule[];
   /**
+   * Scenario assertions run by `rocky policy test`. Each pins the effect the evaluator must resolve for a `(principal, capability, target)` triple, so a policy edit that would silently open a hole fails CI. Never read by any enforcement path — purely a testing surface.
+   */
+  tests?: PolicyTest[];
+  /**
    * Schema version. Must be `1`.
    */
   version: number;
@@ -1855,6 +1859,59 @@ export interface PolicyScope {
   models?: string[];
   /**
    * Required model tags (AND of `key = value` pairs). Satisfied when the model carries every listed tag with the exact value.
+   */
+  tags?: {
+    [k: string]: string;
+  };
+}
+/**
+ * One `[[policy.tests]]` scenario: a self-contained assertion over the policy evaluator.
+ *
+ * A scenario names a `principal`, a `capability`, a synthetic target model (its attributes spelled out inline), and the `expect`ed effect. The `rocky policy test` runner constructs a [`crate::policy::ModelAttributes`] from these fields *verbatim* — the same value the evaluator receives at a real enforcement seam — feeds it to [`crate::policy::evaluate`], and asserts the resolved effect equals `expect`. Because the attributes are declared, not compiled, a scenario is stable regardless of the current project graph: it pins the *policy's* behaviour, which is exactly what a policy edit must not silently change.
+ */
+export interface PolicyTest {
+  /**
+   * The capability being attempted.
+   */
+  capability: PolicyCapability;
+  /**
+   * Synthetic column classifications present on the model (matched against `scope.classifications` / `scope.exclude_classifications`).
+   */
+  classifications?: string[];
+  /**
+   * Whether the synthetic model sits behind a contract (matched against `scope.contracted`).
+   */
+  contracted?: boolean;
+  /**
+   * Synthetic direct downstream count. Informational — the `max_downstreams` ceiling reads `reachable_downstreams`.
+   */
+  downstreams?: number;
+  /**
+   * The effect the evaluator must resolve for this scenario. A mismatch fails the scenario (and the `rocky policy test` run).
+   */
+  expect: PolicyEffect;
+  /**
+   * Synthetic medallion/semantic layer (matched against `scope.layer`).
+   */
+  layer?: string | null;
+  /**
+   * Synthetic model name, matched against rule `scope.models` globs. Empty (the default) matches no name-scoped rule — only `any`/attribute rules apply.
+   */
+  model?: string;
+  /**
+   * Human-readable name for the scenario, echoed in the pass/fail report.
+   */
+  name: string;
+  /**
+   * The principal attempting the action.
+   */
+  principal: PolicyPrincipal;
+  /**
+   * Synthetic transitive blast radius, compared against a rule's `max_downstreams` ceiling. Omit (the default `null`) to model an **uncomputable** blast radius — the ceiling then fails closed, exactly as at a real seam where the graph did not compile.
+   */
+  reachable_downstreams?: number | null;
+  /**
+   * Synthetic model-level tags (matched against rule `scope.tags`).
    */
   tags?: {
     [k: string]: string;

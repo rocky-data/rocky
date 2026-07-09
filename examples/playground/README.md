@@ -38,7 +38,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**86 of 98 POCs run with no external credentials.** See each POC's README for prerequisites.
+**87 of 99 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -105,9 +105,9 @@ Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive 
 | [13-estimate-explain-cost](pocs/02-performance/13-estimate-explain-cost) | `rocky estimate` runs each model's SELECT through DuckDB `EXPLAIN` — row estimates, join strategy, filter pushdown — as a pure dry-run, no tables materialized |
 | [14-skip-unchanged](pocs/02-performance/14-skip-unchanged) | `rocky run --skip-unchanged` — opt-in model-skip gate: unchanged logic + unchanged upstream data ⇒ SKIP (`tables_skipped: 1`); mutate the upstream ⇒ BUILD. Best-effort, default-off, fail-safe |
 
-### 03 — AI (6 POCs · `ANTHROPIC_API_KEY` for 01–05, DuckDB for 06)
+### 03 — AI (7 POCs · `ANTHROPIC_API_KEY` for 01–05, DuckDB for 06–07)
 
-AI-powered model generation, intent extraction, schema sync, test generation, schema-grounded validation, and MCP data-grounding.
+AI-powered model generation, intent extraction, schema sync, test generation, schema-grounded validation, MCP data-grounding, and agent-policy testing.
 
 | POC | Feature |
 |---|---|
@@ -117,6 +117,7 @@ AI-powered model generation, intent extraction, schema sync, test generation, sc
 | [04-ai-test-generation](pocs/03-ai/04-ai-test-generation) | `rocky ai-test --all --save` generates SQL assertions from intent + schema |
 | [05-schema-grounded-validation](pocs/03-ai/05-schema-grounded-validation) | **Trust arc 5** — `ValidationContext` schema grounding + compile-verify retry loop |
 | [06-mcp-grounding](pocs/03-ai/06-mcp-grounding) | `rocky mcp` server — a schema-only model compiles but reconciles wrong; sampling the data via the MCP tools fixes it (creds-free `run.sh`) |
+| [07-policy](pocs/03-ai/07-policy) | `rocky policy test` — scenario assertions pin an agent `[policy]` so a careless edit that opens a hole becomes a red CI check (creds-free `run.sh`) |
 
 ### 04 — Governance (11 POCs · Databricks / DuckDB)
 

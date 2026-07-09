@@ -2230,6 +2230,15 @@ enum PolicySubcommand {
         #[arg(long, default_value = "models")]
         models: PathBuf,
     },
+
+    /// Run the project's `[[policy.tests]]` scenario assertions.
+    ///
+    /// Each scenario declares a `(principal, capability, target)` triple and
+    /// the effect it must resolve to; the runner feeds each through the same
+    /// evaluator `rocky policy check` uses and exits non-zero if any resolved
+    /// effect differs from its expectation — the CI safety net that stops a
+    /// policy edit from silently opening a hole.
+    Test {},
 }
 
 /// Subcommands under `rocky plan`.
@@ -2770,6 +2779,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 &model,
                 json,
             ),
+            PolicySubcommand::Test {} => rocky_cli::commands::run_policy_test(&cli.config, json),
         },
         Command::Audit {
             for_subject,
