@@ -7236,6 +7236,138 @@ pub struct ReplayExecuteModelOutput {
     pub reasons: Vec<String>,
 }
 
+/// JSON output for `rocky gc --derivable --dry-run`.
+///
+/// A read-only inventory of Rocky-managed content-addressed artifacts that
+/// are provably rebuildable — *derivable* — and therefore reclamation
+/// candidates. Nothing is deleted or planned for deletion: this surface is
+/// inventory-only, so the whole product is the report.
+///
+/// The candidate universe is the content-addressed artifact ledger, grouped
+/// by content hash (each distinct hash is one physical artifact; managed
+/// bytes count each hash once). An artifact is `derivable` only when **all
+/// five** eligibility checks hold — recipe recorded, replayable,
+/// unreferenced, policy allows, past the age threshold. Every check fails
+/// closed (any doubt keeps the artifact non-derivable) and is reported per
+/// candidate, so each verdict is auditable rather than asserted.
+///
+/// Scope caveat surfaced in [`Self::notes`]: refcounts see *Rocky's* pointers
+/// only. A warehouse-side reference Rocky never recorded (a BI extract, a
+/// notebook `SELECT INTO`) is invisible here; the age threshold is the
+/// mitigation, and this release measures written-age, not read-recency.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GcReportOutput {
+    pub version: String,
+    pub command: String,
+    /// Total physical bytes of Rocky-managed artifacts, counting each
+    /// distinct content hash once.
+    pub managed_bytes: u64,
+    /// Physical bytes of the derivable subset (distinct content hashes whose
+    /// five checks all pass).
+    pub derivable_bytes: u64,
+    /// [`Self::derivable_bytes`] as a percentage of [`Self::managed_bytes`];
+    /// `null` when there are no managed bytes (nothing to divide by).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derivable_pct: Option<f64>,
+    /// Number of distinct content hashes considered.
+    pub artifact_count: usize,
+    /// How many of those are derivable.
+    pub derivable_count: usize,
+    /// Whether read-activity tracking backed the age/activity check. Always
+    /// `false` in this release: the age check is written-age only (see
+    /// [`GcCheckOutput`]), stated conservatively rather than inferred.
+    pub read_tracking_available: bool,
+    /// The minimum written-age (in days) an artifact must reach to pass the
+    /// age/activity check.
+    pub min_age_days: i64,
+    /// Report-wide caveats an operator must read before trusting the numbers
+    /// (Rocky-external references, estimate labeling, unwired policy plane).
+    pub notes: Vec<String>,
+    /// One entry per distinct content hash, newest write first.
+    pub candidates: Vec<GcCandidateOutput>,
+}
+
+/// One reclamation candidate inside a [`GcReportOutput`] — a single
+/// content-addressed artifact (identified by its content hash) with its five
+/// printed eligibility checks.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GcCandidateOutput {
+    /// Model that produced the artifact.
+    pub model_name: String,
+    /// Run that produced it (joins to the provenance + execution records).
+    pub run_id: String,
+    /// Content hash (hex) of the artifact bytes — the reclamation unit.
+    pub blake3_hash: String,
+    /// Physical size of the artifact in bytes.
+    pub size_bytes: u64,
+    /// When the artifact was written (RFC 3339). Doubles as the conservative
+    /// last-access proxy: Rocky has no read-tracking on this adapter, so
+    /// write-time is the only defensible recency signal.
+    pub written_at: String,
+    /// How many ledger rows point at these bytes. `1` means Rocky holds a
+    /// single reference (reclaimable on that axis); `> 1` means the bytes are
+    /// shared (a branch or replayed run) and must never be evicted.
+    pub refcount: u64,
+    /// The recipe-identity key (hex) of the producing execution — the "what
+    /// exact program produced this?" id. `null` when the producing execution
+    /// predates recipe-identity capture; the provenance record still carries
+    /// the canonical program.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe_id: Option<String>,
+    /// Input match-strength label carried on the provenance record (`strong`
+    /// or `heuristic`); `null` when no provenance was found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_proof_class: Option<String>,
+    /// Estimated cost to rebuild the artifact via replay.
+    pub rebuild_cost: GcRebuildCostOutput,
+    /// `true` iff every one of [`Self::checks`] passed.
+    pub derivable: bool,
+    /// The five eligibility checks, each with its pass/fail and a
+    /// human-readable justification. Order is stable:
+    /// `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`,
+    /// `age_threshold`.
+    pub checks: Vec<GcCheckOutput>,
+}
+
+/// One printed eligibility check inside a [`GcCandidateOutput`].
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GcCheckOutput {
+    /// Stable check id: `recipe_recorded`, `replayable`, `unreferenced`,
+    /// `policy_allows`, or `age_threshold`.
+    pub check: String,
+    /// Whether the check passed. A candidate is derivable only when all five
+    /// are `true`.
+    pub passed: bool,
+    /// Why the check reached that verdict — the auditable justification.
+    pub detail: String,
+}
+
+/// Estimated rebuild cost for a [`GcCandidateOutput`].
+///
+/// Derived from the *recorded* build's metrics via the same cost model
+/// `rocky cost` uses — a replay re-runs the recipe, so its original
+/// execution's duration and scanned bytes are the honest predictor. Always
+/// an estimate ([`Self::estimated`] is always `true`), never a measured
+/// rebuild.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GcRebuildCostOutput {
+    /// Always `true`: this figure is modeled from the recorded build, not
+    /// measured by re-running it.
+    pub estimated: bool,
+    /// Duration of the recorded build in milliseconds — the wall-clock a
+    /// replay would repeat.
+    pub source_duration_ms: u64,
+    /// Bytes scanned by the recorded build; `null` when the adapter didn't
+    /// report a figure (mirrors [`rocky_core::state::ModelExecution::bytes_scanned`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_bytes_scanned: Option<u64>,
+    /// Estimated USD to rebuild, priced by `compute_observed_cost_usd` over
+    /// the recorded metrics; `null` when the config or adapter can't price it
+    /// (no `rocky.toml`, or a non-billed adapter).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_usd: Option<f64>,
+}
+
 /// JSON output for `rocky trace <run_id|latest>`.
 ///
 /// Sibling to [`ReplayOutput`] but with offset-relative timings so

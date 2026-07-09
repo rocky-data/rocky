@@ -195,8 +195,14 @@ fn short_hash(hash: &str) -> &str {
 /// Classify one model in a recorded run.
 ///
 /// Read-only: consults only the provenance record + artifact ledger. Never
-/// reconstructs the model from the working tree.
-fn classify_model(store: &StateStore, run_id: &str, model_name: &str) -> ReplayCheckModelOutput {
+/// reconstructs the model from the working tree. Shared with the
+/// derivability inventory (`rocky gc`), which reuses this verdict as its
+/// replayability eligibility check rather than re-deriving one.
+pub(crate) fn classify_model(
+    store: &StateStore,
+    run_id: &str,
+    model_name: &str,
+) -> ReplayCheckModelOutput {
     let provenance: Option<ProvenanceRecord> =
         store.get_provenance(run_id, model_name).ok().flatten();
 

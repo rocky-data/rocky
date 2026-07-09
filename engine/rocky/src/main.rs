@@ -1813,6 +1813,32 @@ enum Command {
         by: Option<String>,
     },
 
+    /// Inventory Rocky-managed artifacts that are provably rebuildable.
+    ///
+    /// `--derivable --dry-run` joins the content-addressed artifact ledger
+    /// against replayability verdicts, ledger refcounts, and recipe
+    /// provenance to report which stored bytes Rocky can prove it can rebuild
+    /// bit-exact — and are therefore reclaimable cache rather than assets.
+    /// Each candidate prints all five eligibility checks (recipe recorded,
+    /// replayable, unreferenced, policy allows, past the age threshold), and
+    /// the header states how much of managed storage is derivable.
+    ///
+    /// Read-only: this release has no deletion path at all — the report is
+    /// the whole surface.
+    Gc {
+        /// Restrict to the derivability inventory (the only mode today).
+        #[arg(long)]
+        derivable: bool,
+        /// Preview only. Required — this release never deletes.
+        #[arg(long)]
+        dry_run: bool,
+        /// Minimum written-age, in days, an artifact must reach to pass the
+        /// age/activity eligibility check. Conservative: this measures build
+        /// time, not read-recency (no read-tracking on this adapter).
+        #[arg(long, value_name = "DAYS", default_value_t = 7)]
+        min_age_days: i64,
+    },
+
     /// PR preview workflow — pruned re-run on a per-PR branch with
     /// data + cost diff vs. the base ref.
     ///
@@ -3729,6 +3755,23 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             by.as_deref(),
             json,
         ),
+        Command::Gc {
+            derivable,
+            dry_run,
+            min_age_days,
+        } => {
+            if !derivable {
+                anyhow::bail!(
+                    "`rocky gc` currently supports only the derivability inventory — pass `--derivable`"
+                );
+            }
+            if !dry_run {
+                anyhow::bail!(
+                    "`rocky gc --derivable` currently supports only `--dry-run` — this release has no deletion path"
+                );
+            }
+            rocky_cli::commands::run_gc_derivable(&state_path, &cli.config, min_age_days, json)
+        }
         Command::Preview { action } => match action {
             PreviewAction::Create { base, name, models } => {
                 rocky_cli::commands::run_preview_create(
