@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.60.0] - 2026-07-09
+
+### Added
+
+- **`rocky gc --derivable --dry-run` — a reclamation inventory for provably-rebuildable artifacts.** A read-only report that joins the content-addressed artifact ledger with replay-check verdicts, refcounts, and recipe-identity triples to inventory which managed artifacts are *derivable* — recorded with a strong recipe, replayable and deterministic, unreferenced, policy-eligible, and past an age threshold (`--min-age-days`, default 7). Each candidate prints why it is (or isn't) safe to reclaim, and the report headlines the aggregate "X bytes / Y% of managed storage is derivable". This phase has **no deletion path** — every eligibility check fails closed and the command only ever reports. (#1067)
+
+- **`rocky backfill` — a scoped, review-gated recovery plan.** On a failure or gap (a freshness breach, or the withheld window of a contained run via `--from-last-run`; or an explicit `--model`), the engine composes a backfill plan: the affected models plus their downstream lineage closure, ordered dependency-first, scoped to the affected partition window (`--from`/`--to`), with a cost estimate from historical observations. The plan is persisted and emitted as JSON, and is **always review-gated regardless of policy** — a backfill re-runs existing recipes over a scoped window and can hide blast radius, so it always requires a human sign-off (`rocky review <plan> --approve`) before `rocky apply`. It never rewrites SQL. (#1068)
+
+- **Agent-policy v1 conditions — `max_downstreams` blast-radius ceiling and `verify_after` post-apply gate.** A `[[policy.rules]]` rule may now carry `max_downstreams = N`: an `allow` only stands when the target model's *transitive* downstream blast radius is ≤ N; an oversized **or uncomputable** blast radius degrades the allow to `require_review` (fail closed), and the ceiling is a **sticky safety cap** — it cannot be bypassed by a more-specific sibling `allow` that omits it. A rule may also carry `verify_after = ["check", …]`: after an apply mutates, the named checks must have passed in that apply's own run or the apply halts; a check that failed **or did not run** fails the gate. Where no rollback substrate exists the failure is honest halt-only (the mutation stands and must be reverted manually — never a fabricated rollback). State schema bumps to v17 (additive per-check outcomes on the run record + the decision record's `verify_after`; pre-v17 records read back empty). (#1069)
+
+### Fixed
+
+- **Column-level sound-skip now fails closed on an ambiguous case-colliding model key.** The consumer-baseline builder resolves each consumed upstream through a lowercased lookup map keyed by both the bare model name and the 3-part `catalog.schema.table`. The map was built last-writer-wins, so two distinct models whose name or target folds to the same key case-insensitively (for example `Orders` and `orders`) silently aliased — a consumer reading that key could compare the *wrong* producer's column hashes and skip on a genuine content change. An ambiguous key is now poisoned (removed) rather than resolved, so the read yields no column baseline and the gate builds. The per-column skip gate remains default-off (`[reuse] column_level`). (#1066)
+
 ## [1.59.0] - 2026-07-09
 
 ### Added

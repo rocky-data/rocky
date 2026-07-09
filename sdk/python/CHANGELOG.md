@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-07-09
+
+### Added
+
+- **Generated types for the new CLI surfaces.** `rocky gc --derivable` (`GcReportOutput` + `GcCandidateOutput` / `GcCheckOutput` / `GcRebuildCostOutput`), `rocky backfill` (`BackfillOutput` + `BackfillCostEstimate` / `BackfillModelCost` / `BackfillPartitionScope`), and the new `reachable_downstreams` field on the policy-check model attributes. Additive — existing parses are unaffected.
+
 ## [0.3.1] — 2026-07-09
 
 ### Fixed

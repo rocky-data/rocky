@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.57.0] — 2026-07-09
+
+### Changed
+
+- **Floor raised to `rocky-sdk>=0.4.0`.** Picks up the SDK's generated types for the new `rocky gc --derivable`, `rocky backfill`, and policy-check surfaces, so a `dagster-rocky` consumer resolves them through `dagster_rocky.types` without relying on latest-SDK resolution. No behavior change in the integration itself.
+
 ## [1.56.0] — 2026-07-09
 
 ### Added
