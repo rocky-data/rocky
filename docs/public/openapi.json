@@ -1740,6 +1740,27 @@
           }
         ]
       },
+      "AutonomyBudget": {
+        "additionalProperties": false,
+        "description": "An autonomy budget on a policy rule — the SRE error-budget move applied to agent authority.\n\nA rule that carries `autonomy_budget = { failures = 3, window = \"7d\" }` tolerates at most `failures - 1` post-apply verification failures inside a rolling `window`. The moment the count reaches `failures`, the budget is exhausted and the rule **automatically degrades to `require_review`** at enforcement time (an `allow` can no longer stand un-reviewed). This is a one-directional breaker: it only ever tightens the rule, never widens it. Widening autonomy remains a deliberate human act on scorecard evidence.\n\nThe failure count is a *projection over the existing decision ledger* — it is never a persisted counter, so recovery is automatic: once the failing applies age out of the window the count falls below the limit and the rule returns to its authored effect. The rule is never made more permissive than the effect the author wrote.",
+        "properties": {
+          "failures": {
+            "description": "Verify-after failures within `window` that exhaust the budget. The `failures`-th failure trips the breaker (must be `>= 1`).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "window": {
+            "description": "Rolling window over which failures are counted, as a `<N>d` / `<N>h` duration (e.g. `\"7d\"`, `\"24h\"`). Failures older than this do not count.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "failures",
+          "window"
+        ],
+        "type": "object"
+      },
       "BackfillCostEstimate": {
         "description": "A best-effort, label-as-estimate cost projection for a backfill.\n\nThe projection re-uses the same historical-observed cost formula as `rocky cost`: each closure model's most recent recorded execution is priced by the warehouse cost model. It is offline (no warehouse round-trip) and therefore approximate — `is_estimate` is always `true`.",
         "properties": {
@@ -2743,6 +2764,33 @@
           }
         ]
       },
+      "BriefActiveFreeze": {
+        "description": "An active policy freeze inside [`BriefAutonomySection`].",
+        "properties": {
+          "frozen_at": {
+            "description": "RFC 3339 wall clock when the freeze was recorded — the citation.",
+            "type": "string"
+          },
+          "plan_id": {
+            "description": "The freeze decision's `plan_id`.",
+            "type": "string"
+          },
+          "principal": {
+            "$ref": "#/components/schemas/PolicyPrincipal"
+          },
+          "scope": {
+            "description": "The scope selector the freeze targets.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "frozen_at",
+          "plan_id",
+          "principal",
+          "scope"
+        ],
+        "type": "object"
+      },
       "BriefAgentActivitySection": {
         "description": "Agent-activity section — the policy-decision ledger rolled up by principal.",
         "properties": {
@@ -2798,6 +2846,40 @@
           "deny",
           "require_review",
           "total"
+        ],
+        "type": "object"
+      },
+      "BriefAutonomySection": {
+        "description": "Autonomy section — rules whose autonomy budget is currently exhausted (degraded to `require_review`) and policy freezes in force.\n\nThis is a *current-state* projection over the whole decision ledger — each budget uses its own configured window, independent of the digest's `--since`. It fails closed: `unavailable` when the ledger or config can't be read, `no_data` when nothing is degraded or frozen.",
+        "properties": {
+          "active_freezes": {
+            "description": "Policy freezes currently in force.",
+            "items": {
+              "$ref": "#/components/schemas/BriefActiveFreeze"
+            },
+            "type": "array"
+          },
+          "availability": {
+            "$ref": "#/components/schemas/SectionAvailability"
+          },
+          "degraded_rules": {
+            "description": "Rules whose budget is exhausted right now — each auto-degraded to `require_review` until its failures age out of the window.",
+            "items": {
+              "$ref": "#/components/schemas/BriefDegradedRule"
+            },
+            "type": "array"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "active_freezes",
+          "availability",
+          "degraded_rules"
         ],
         "type": "object"
       },
@@ -2959,6 +3041,40 @@
           "principal",
           "reason",
           "timestamp"
+        ],
+        "type": "object"
+      },
+      "BriefDegradedRule": {
+        "description": "A budget-exhausted (degraded) rule inside [`BriefAutonomySection`].",
+        "properties": {
+          "failures": {
+            "description": "Verify-after failures counted in the window.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "limit": {
+            "description": "The rule's configured failure ceiling.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "rule_id": {
+            "description": "Index of the degraded `[[policy.rules]]` entry.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "window": {
+            "description": "The rule's configured window (`7d`, `24h`, …).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "failures",
+          "limit",
+          "rule_id",
+          "window"
         ],
         "type": "object"
       },
@@ -3126,6 +3242,14 @@
             ],
             "description": "Agent- and human-authored policy decisions in the window, grouped by principal and effect."
           },
+          "autonomy": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/BriefAutonomySection"
+              }
+            ],
+            "description": "Autonomy-budget degradations and active policy freezes — the dynamic tightening currently in force across the estate."
+          },
           "command": {
             "type": "string"
           },
@@ -3202,6 +3326,7 @@
         },
         "required": [
           "agent_activity",
+          "autonomy",
           "command",
           "cost",
           "drift",
@@ -11177,6 +11302,87 @@
           }
         ]
       },
+      "PolicyFreezeEntry": {
+        "description": "One principal's freeze/unfreeze record inside a [`PolicyFreezeOutput`].",
+        "properties": {
+          "decision_ref": {
+            "description": "Composite ledger key citation (`\"{timestamp}|{plan_id}|{scope}\"`).",
+            "type": "string"
+          },
+          "effect": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyEffect"
+              }
+            ],
+            "description": "The recorded effect (`deny` for a freeze, `allow` for an unfreeze)."
+          },
+          "plan_id": {
+            "description": "The freeze decision's `plan_id`.",
+            "type": "string"
+          },
+          "principal": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyPrincipal"
+              }
+            ],
+            "description": "The principal whose actions were frozen/unfrozen."
+          },
+          "reason": {
+            "description": "Human-readable description of the freeze/unfreeze.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision_ref",
+          "effect",
+          "plan_id",
+          "principal",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "PolicyFreezeOutput": {
+        "description": "JSON output for `rocky policy freeze` / `rocky policy unfreeze` — the kill switch.\n\nA freeze records a decision entry per matched principal into the existing policy-decision ledger; at the enforcement seam an active freeze forces `deny`. `unfreeze` records a superseding entry that lifts it. No config file is rewritten and no new table is created.",
+        "properties": {
+          "command": {
+            "description": "`policy_freeze` or `policy_unfreeze`.",
+            "type": "string"
+          },
+          "entries": {
+            "description": "One entry per affected principal.",
+            "items": {
+              "$ref": "#/components/schemas/PolicyFreezeEntry"
+            },
+            "type": "array"
+          },
+          "lifted": {
+            "description": "`true` when this call lifted a freeze rather than establishing one.",
+            "type": "boolean"
+          },
+          "recorded_at": {
+            "description": "RFC 3339 wall clock when the freeze/unfreeze was recorded.",
+            "type": "string"
+          },
+          "scope": {
+            "description": "The scope selector the freeze targets (`any`, `layer=…`, `tag=…`, …).",
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "entries",
+          "lifted",
+          "recorded_at",
+          "scope",
+          "version"
+        ],
+        "type": "object"
+      },
       "PolicyModelAttributes": {
         "description": "The compiled attributes of the checked model, echoed back so the explain output is self-contained.",
         "properties": {
@@ -11252,6 +11458,17 @@
         "additionalProperties": false,
         "description": "One `[[policy.rules]]` entry: `(principal, capability, scope) → effect`.",
         "properties": {
+          "autonomy_budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutonomyBudget"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional autonomy budget: a rolling failure ceiling that degrades this rule to `require_review` when its verify-after failures exhaust it. See [`AutonomyBudget`]. Absent ⇒ the rule's effect is never budget-degraded."
+          },
           "capability": {
             "allOf": [
               {
@@ -11261,7 +11478,7 @@
             "description": "Which capability this rule governs."
           },
           "conditions": {
-            "description": "Optional v1 conditional refinements not yet promoted to typed fields (`budget`, `window`). **Parsed and ignored** — captured as opaque JSON so a config authored against a later version still loads."
+            "description": "Optional v1 conditional refinements not yet promoted to typed fields. **Parsed and ignored** — captured as opaque JSON so a config authored against a later version still loads."
           },
           "effect": {
             "allOf": [

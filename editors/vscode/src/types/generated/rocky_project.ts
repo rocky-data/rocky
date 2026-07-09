@@ -1797,11 +1797,15 @@ export interface PolicyConfig {
  */
 export interface PolicyRule {
   /**
+   * Optional autonomy budget: a rolling failure ceiling that degrades this rule to `require_review` when its verify-after failures exhaust it. See [`AutonomyBudget`]. Absent ⇒ the rule's effect is never budget-degraded.
+   */
+  autonomy_budget?: AutonomyBudget | null;
+  /**
    * Which capability this rule governs.
    */
   capability: PolicyCapability;
   /**
-   * Optional v1 conditional refinements not yet promoted to typed fields (`budget`, `window`). **Parsed and ignored** — captured as opaque JSON so a config authored against a later version still loads.
+   * Optional v1 conditional refinements not yet promoted to typed fields. **Parsed and ignored** — captured as opaque JSON so a config authored against a later version still loads.
    */
   conditions?: {
     [k: string]: unknown;
@@ -1822,6 +1826,23 @@ export interface PolicyRule {
    * Post-apply verification: named checks that must pass after a mutation governed by this rule lands. Once the apply's run completes, each named check is confirmed against the run's executed checks; a failing **or absent** named check halts the apply (fail closed) and raises an alert. Auto-rollback runs only where a rollback substrate exists; today none does, so a failure is halt-only and the mutation stands until a human reverts it. Empty ⇒ no post-apply gate.
    */
   verify_after?: string[];
+}
+/**
+ * An autonomy budget on a policy rule — the SRE error-budget move applied to agent authority.
+ *
+ * A rule that carries `autonomy_budget = { failures = 3, window = "7d" }` tolerates at most `failures - 1` post-apply verification failures inside a rolling `window`. The moment the count reaches `failures`, the budget is exhausted and the rule **automatically degrades to `require_review`** at enforcement time (an `allow` can no longer stand un-reviewed). This is a one-directional breaker: it only ever tightens the rule, never widens it. Widening autonomy remains a deliberate human act on scorecard evidence.
+ *
+ * The failure count is a *projection over the existing decision ledger* — it is never a persisted counter, so recovery is automatic: once the failing applies age out of the window the count falls below the limit and the rule returns to its authored effect. The rule is never made more permissive than the effect the author wrote.
+ */
+export interface AutonomyBudget {
+  /**
+   * Verify-after failures within `window` that exhaust the budget. The `failures`-th failure trips the breaker (must be `>= 1`).
+   */
+  failures: number;
+  /**
+   * Rolling window over which failures are counted, as a `<N>d` / `<N>h` duration (e.g. `"7d"`, `"24h"`). Failures older than this do not count.
+   */
+  window: string;
 }
 /**
  * Scope of a policy rule — the AND of every present predicate. A model matches the scope only when it satisfies *all* set keys.

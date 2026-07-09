@@ -184,10 +184,13 @@ from .gc_schema import (
 
 # Brief command (the governor's estate digest)
 from .brief_schema import (
+    BriefActiveFreeze,
     BriefAgentActivitySection,
+    BriefAutonomySection,
     BriefBudgetStatus,
     BriefCostSection,
     BriefDecisionEntry,
+    BriefDegradedRule,
     BriefDriftEntry,
     BriefDriftSection,
     BriefEscalationsSection,
@@ -469,6 +472,9 @@ __all__ = [
     "BriefCostSection",
     "BriefRunCost",
     "BriefBudgetStatus",
+    "BriefAutonomySection",
+    "BriefDegradedRule",
+    "BriefActiveFreeze",
     # compact (canonical source for NamedStatement)
     "CompactOutput",
     "NamedStatement",

@@ -28,6 +28,29 @@ class BriefBudgetStatus(BaseModel):
     """
 
 
+class BriefDegradedRule(BaseModel):
+    """
+    A budget-exhausted (degraded) rule inside [`BriefAutonomySection`].
+    """
+
+    failures: conint(ge=0)
+    """
+    Verify-after failures counted in the window.
+    """
+    limit: conint(ge=0)
+    """
+    The rule's configured failure ceiling.
+    """
+    rule_id: conint(ge=0)
+    """
+    Index of the degraded `[[policy.rules]]` entry.
+    """
+    window: str
+    """
+    The rule's configured window (`7d`, `24h`, …).
+    """
+
+
 class BriefDriftEntry(BaseModel):
     """
     A single schema-drift observation inside [`BriefDriftSection`].
@@ -285,6 +308,55 @@ class SectionAvailability9(StrEnum):
     unavailable = "unavailable"
 
 
+class BriefActiveFreeze(BaseModel):
+    """
+    An active policy freeze inside [`BriefAutonomySection`].
+    """
+
+    frozen_at: str
+    """
+    RFC 3339 wall clock when the freeze was recorded — the citation.
+    """
+    plan_id: str
+    """
+    The freeze decision's `plan_id`.
+    """
+    principal: PolicyPrincipal5 | PolicyPrincipal6
+    """
+    Who is attempting an action.
+
+    `agent` is a non-human caller (an AI harness authoring, applying, or remediating). `human` is a person. In v0 the principal is supplied explicitly (`rocky policy check --principal …`); auto-detection is a later phase.
+    """
+    scope: str
+    """
+    The scope selector the freeze targets.
+    """
+
+
+class BriefAutonomySection(BaseModel):
+    """
+    Autonomy section — rules whose autonomy budget is currently exhausted (degraded to `require_review`) and policy freezes in force.
+
+    This is a *current-state* projection over the whole decision ledger — each budget uses its own configured window, independent of the digest's `--since`. It fails closed: `unavailable` when the ledger or config can't be read, `no_data` when nothing is degraded or frozen.
+    """
+
+    active_freezes: list[BriefActiveFreeze]
+    """
+    Policy freezes currently in force.
+    """
+    availability: SectionAvailability7 | SectionAvailability8 | SectionAvailability9
+    """
+    Whether a brief section's underlying query succeeded and had data.
+
+    The digest is composed section-by-section from independent typed queries over the state store and the decision ledger. Each section fails closed: a query that returns nothing renders as [`SectionAvailability::NoData`], and a source that is not wired into the state store at all renders as [`SectionAvailability::Unavailable`] with a note — never as a smoothed-over "all clear". A brief that claims more than the ledger holds poisons the whole surface, so the marker is machine-readable, not prose.
+    """
+    degraded_rules: list[BriefDegradedRule]
+    """
+    Rules whose budget is exhausted right now — each auto-degraded to `require_review` until its failures age out of the window.
+    """
+    note: str | None = None
+
+
 class BriefCostSection(BaseModel):
     """
     Cost section — per-run cost re-derived over the window, plus budget burn.
@@ -533,6 +605,10 @@ class BriefOutput(BaseModel):
     agent_activity: BriefAgentActivitySection
     """
     Agent- and human-authored policy decisions in the window, grouped by principal and effect.
+    """
+    autonomy: BriefAutonomySection
+    """
+    Autonomy-budget degradations and active policy freezes — the dynamic tightening currently in force across the estate.
     """
     command: str
     cost: BriefCostSection

@@ -17,11 +17,15 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use rocky_compiler::compile::{self, CompilerConfig};
-use rocky_core::config::{ConfigError, PolicyCapability, PolicyConfig, PolicyPrincipal};
+use rocky_core::config::{
+    ConfigError, PolicyCapability, PolicyConfig, PolicyEffect, PolicyPrincipal,
+};
 use rocky_core::policy::{self, ModelAttributes};
+use rocky_core::state::{PolicyDecisionRecord, StateStore};
 
 use crate::output::{
-    PolicyCheckOutput, PolicyModelAttributes, PolicyTestOutput, PolicyTestResult, print_json,
+    PolicyCheckOutput, PolicyFreezeEntry, PolicyFreezeOutput, PolicyModelAttributes,
+    PolicyTestOutput, PolicyTestResult, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -280,6 +284,14 @@ fn render_text(out: &PolicyCheckOutput) {
         attrs.downstreams,
         reachable,
     );
+    // This is the static base effect. The dynamic breakers — autonomy-budget
+    // burn and active policy freezes — are ledger-derived and applied at the
+    // mutating enforcement seam (apply / promote); they can only tighten this
+    // effect. See `rocky brief` for the current budget/freeze state.
+    println!(
+        "  note: base effect only; autonomy-budget burn and active freezes apply at enforcement \
+         (apply/promote) and can only tighten it"
+    );
 }
 
 /// Serialize a small serde enum to its wire spelling for text output.
@@ -288,6 +300,127 @@ fn serde_plain<T: serde::Serialize>(value: &T) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_default()
+}
+
+/// Execute `rocky policy freeze` — the kill switch.
+///
+/// Flips every matched `(principal, scope)` to `deny` by recording a **freeze
+/// decision** into the existing policy-decision ledger. No config file is
+/// rewritten and no new table is created: the enforcement seam reads the ledger
+/// and an active freeze forces `deny`. Freezing is always allowed.
+///
+/// `principal = None` freezes both principals (`agent` + `human`); `scope =
+/// None` freezes every model (`any`). The inverse (`lift = true`) records an
+/// unfreeze that supersedes a matching freeze — the normal way to lift one.
+pub fn run_policy_freeze(
+    state_path: &Path,
+    principal: Option<PolicyPrincipal>,
+    scope: Option<String>,
+    lift: bool,
+    json: bool,
+) -> Result<()> {
+    let scope = scope.unwrap_or_else(|| "any".to_string());
+    policy::validate_scope_selector(&scope).map_err(|e| anyhow::anyhow!(e))?;
+
+    let principals = match principal {
+        Some(p) => vec![p],
+        None => vec![PolicyPrincipal::Agent, PolicyPrincipal::Human],
+    };
+
+    let store = StateStore::open(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+
+    let now = chrono::Utc::now();
+    let prefix = if lift {
+        policy::UNFREEZE_PLAN_PREFIX
+    } else {
+        policy::FREEZE_PLAN_PREFIX
+    };
+
+    let mut entries = Vec::new();
+    for p in principals {
+        let principal_label = serde_plain(&p);
+        // The plan_id carries the principal so a "freeze all" (two records at
+        // the same timestamp + scope) does not collide on the ledger key
+        // `(timestamp, plan_id, model)`.
+        let plan_id = format!("{prefix}{principal_label}:{}", now.to_rfc3339());
+        let effect = if lift {
+            PolicyEffect::Allow
+        } else {
+            PolicyEffect::Deny
+        };
+        let reason = if lift {
+            format!("policy unfreeze: lifted freeze for {principal_label} on scope '{scope}'")
+        } else {
+            format!("policy freeze: {principal_label} actions on scope '{scope}' frozen to deny")
+        };
+        let record = PolicyDecisionRecord {
+            timestamp: now,
+            plan_id: plan_id.clone(),
+            principal: p,
+            capability: PolicyCapability::Apply,
+            model: scope.clone(),
+            effect,
+            rule_id: None,
+            reason: reason.clone(),
+            verify_after: Vec::new(),
+        };
+        store
+            .record_policy_decision(&record)
+            .context("failed to record the freeze decision to the ledger")?;
+        entries.push(PolicyFreezeEntry {
+            principal: p,
+            effect,
+            decision_ref: format!("{}|{plan_id}|{scope}", now.to_rfc3339()),
+            plan_id,
+            reason,
+        });
+    }
+
+    let output = PolicyFreezeOutput {
+        version: VERSION.to_string(),
+        command: if lift {
+            "policy_unfreeze".to_string()
+        } else {
+            "policy_freeze".to_string()
+        },
+        lifted: lift,
+        scope,
+        recorded_at: now.to_rfc3339(),
+        entries,
+    };
+
+    if json {
+        print_json(&output)?;
+    } else {
+        render_freeze_text(&output);
+    }
+    Ok(())
+}
+
+fn render_freeze_text(out: &PolicyFreezeOutput) {
+    let verb = if out.lifted { "unfreeze" } else { "freeze" };
+    println!(
+        "policy {verb}: scope '{}' ({} rule set(s))",
+        out.scope,
+        out.entries.len()
+    );
+    for e in &out.entries {
+        println!(
+            "  {} -> {} [{}]",
+            serde_plain(&e.principal),
+            serde_plain(&e.effect),
+            e.decision_ref,
+        );
+    }
+    if out.lifted {
+        println!("  the matching freeze is lifted; agents resume their authored policy effect");
+    } else {
+        println!(
+            "  frozen — matched actions now DENY at enforcement; lift with `rocky policy unfreeze` \
+             (same --principal/--scope) or a policy-change PR"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -113,6 +113,28 @@ class AllowedTypeChange(BaseModel):
     to: str
 
 
+class AutonomyBudget(BaseModel):
+    """
+    An autonomy budget on a policy rule — the SRE error-budget move applied to agent authority.
+
+    A rule that carries `autonomy_budget = { failures = 3, window = "7d" }` tolerates at most `failures - 1` post-apply verification failures inside a rolling `window`. The moment the count reaches `failures`, the budget is exhausted and the rule **automatically degrades to `require_review`** at enforcement time (an `allow` can no longer stand un-reviewed). This is a one-directional breaker: it only ever tightens the rule, never widens it. Widening autonomy remains a deliberate human act on scorecard evidence.
+
+    The failure count is a *projection over the existing decision ledger* — it is never a persisted counter, so recovery is automatic: once the failing applies age out of the window the count falls below the limit and the rule returns to its authored effect. The rule is never made more permissive than the effect the author wrote.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    failures: conint(ge=0)
+    """
+    Verify-after failures within `window` that exhaust the budget. The `failures`-th failure trips the breaker (must be `>= 1`).
+    """
+    window: str
+    """
+    Rolling window over which failures are counted, as a `<N>d` / `<N>h` duration (e.g. `"7d"`, `"24h"`). Failures older than this do not count.
+    """
+
+
 class BindingType(StrEnum):
     """
     Workspace binding access level.
@@ -933,7 +955,7 @@ class PolicyCapability80(StrEnum):
     value_change = "value_change"
 
 
-class PolicyEffect17(StrEnum):
+class PolicyEffect21(StrEnum):
     """
     Permit the action outright.
     """
@@ -941,7 +963,7 @@ class PolicyEffect17(StrEnum):
     allow = "allow"
 
 
-class PolicyEffect18(StrEnum):
+class PolicyEffect22(StrEnum):
     """
     Permit only after human review. The safe default posture.
     """
@@ -949,7 +971,7 @@ class PolicyEffect18(StrEnum):
     require_review = "require_review"
 
 
-class PolicyEffect19(StrEnum):
+class PolicyEffect23(StrEnum):
     """
     Refuse the action. A hard override — no `allow` overturns it.
     """
@@ -965,7 +987,7 @@ class PolicyPrincipal(StrEnum):
     human = "human"
 
 
-class PolicyPrincipal17(StrEnum):
+class PolicyPrincipal19(StrEnum):
     """
     A non-human caller (AI agent / automation).
     """
@@ -1055,7 +1077,7 @@ class PolicyTest(BaseModel):
     """
     Synthetic direct downstream count. Informational — the `max_downstreams` ceiling reads `reachable_downstreams`.
     """
-    expect: PolicyEffect17 | PolicyEffect18 | PolicyEffect19
+    expect: PolicyEffect21 | PolicyEffect22 | PolicyEffect23
     """
     The effect the evaluator must resolve for this scenario. A mismatch fails the scenario (and the `rocky policy test` run).
     """
@@ -1071,7 +1093,7 @@ class PolicyTest(BaseModel):
     """
     Human-readable name for the scenario, echoed in the pass/fail report.
     """
-    principal: PolicyPrincipal | PolicyPrincipal17
+    principal: PolicyPrincipal | PolicyPrincipal19
     """
     The principal attempting the action.
     """
@@ -2115,6 +2137,10 @@ class PolicyRule(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
     )
+    autonomy_budget: AutonomyBudget | None = None
+    """
+    Optional autonomy budget: a rolling failure ceiling that degrades this rule to `require_review` when its verify-after failures exhaust it. See [`AutonomyBudget`]. Absent ⇒ the rule's effect is never budget-degraded.
+    """
     capability: (
         PolicyCapability
         | PolicyCapability71
@@ -2133,13 +2159,13 @@ class PolicyRule(BaseModel):
     """
     conditions: Any | None = None
     """
-    Optional v1 conditional refinements not yet promoted to typed fields (`budget`, `window`). **Parsed and ignored** — captured as opaque JSON so a config authored against a later version still loads.
+    Optional v1 conditional refinements not yet promoted to typed fields. **Parsed and ignored** — captured as opaque JSON so a config authored against a later version still loads.
     """
-    effect: PolicyEffect17 | PolicyEffect18 | PolicyEffect19
+    effect: PolicyEffect21 | PolicyEffect22 | PolicyEffect23
     """
     The verdict when this rule matches.
     """
-    principal: PolicyPrincipal | PolicyPrincipal17
+    principal: PolicyPrincipal | PolicyPrincipal19
     """
     Who this rule applies to.
     """
@@ -2944,7 +2970,7 @@ class PolicyConfig(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
     )
-    default_agent_effect: PolicyEffect17 | PolicyEffect18 | PolicyEffect19 | None = (
+    default_agent_effect: PolicyEffect21 | PolicyEffect22 | PolicyEffect23 | None = (
         "require_review"
     )
     """

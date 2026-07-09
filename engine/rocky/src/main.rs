@@ -2239,6 +2239,36 @@ enum PolicySubcommand {
     /// effect differs from its expectation — the CI safety net that stops a
     /// policy edit from silently opening a hole.
     Test {},
+
+    /// Freeze matched rules to `deny` — the kill switch.
+    ///
+    /// Records a freeze decision into the policy-decision ledger; at the
+    /// enforcement seam an active freeze forces `deny` for the matched
+    /// `(principal, scope)`. No config file is rewritten. Omitting
+    /// `--principal` freezes both principals; omitting `--scope` freezes every
+    /// model. Freezing is always allowed. Lift with `rocky policy unfreeze`.
+    Freeze {
+        /// Principal to freeze (default: both `agent` and `human`).
+        #[arg(long, value_enum)]
+        principal: Option<PolicyPrincipalArg>,
+        /// Scope selector to freeze: `any` (default), `layer=<n>`,
+        /// `model=<glob>`, `classification=<v>`, or `tag=<key>[=<value>]`.
+        #[arg(long)]
+        scope: Option<String>,
+    },
+
+    /// Lift a matching freeze (records a superseding decision).
+    ///
+    /// Pass the same `--principal` / `--scope` used to freeze. This is the
+    /// in-band inverse; a policy-change PR is the other way to lift a freeze.
+    Unfreeze {
+        /// Principal to unfreeze (default: both `agent` and `human`).
+        #[arg(long, value_enum)]
+        principal: Option<PolicyPrincipalArg>,
+        /// Scope selector to unfreeze (must match the freeze's scope).
+        #[arg(long)]
+        scope: Option<String>,
+    },
 }
 
 /// Subcommands under `rocky plan`.
@@ -2780,6 +2810,24 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 json,
             ),
             PolicySubcommand::Test {} => rocky_cli::commands::run_policy_test(&cli.config, json),
+            PolicySubcommand::Freeze { principal, scope } => {
+                rocky_cli::commands::run_policy_freeze(
+                    &state_path,
+                    principal.map(Into::into),
+                    scope,
+                    false,
+                    json,
+                )
+            }
+            PolicySubcommand::Unfreeze { principal, scope } => {
+                rocky_cli::commands::run_policy_freeze(
+                    &state_path,
+                    principal.map(Into::into),
+                    scope,
+                    true,
+                    json,
+                )
+            }
         },
         Command::Audit {
             for_subject,

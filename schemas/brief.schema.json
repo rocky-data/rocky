@@ -1,6 +1,33 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "BriefActiveFreeze": {
+      "description": "An active policy freeze inside [`BriefAutonomySection`].",
+      "properties": {
+        "frozen_at": {
+          "description": "RFC 3339 wall clock when the freeze was recorded — the citation.",
+          "type": "string"
+        },
+        "plan_id": {
+          "description": "The freeze decision's `plan_id`.",
+          "type": "string"
+        },
+        "principal": {
+          "$ref": "#/definitions/PolicyPrincipal"
+        },
+        "scope": {
+          "description": "The scope selector the freeze targets.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "frozen_at",
+        "plan_id",
+        "principal",
+        "scope"
+      ],
+      "type": "object"
+    },
     "BriefAgentActivitySection": {
       "description": "Agent-activity section — the policy-decision ledger rolled up by principal.",
       "properties": {
@@ -56,6 +83,40 @@
         "deny",
         "require_review",
         "total"
+      ],
+      "type": "object"
+    },
+    "BriefAutonomySection": {
+      "description": "Autonomy section — rules whose autonomy budget is currently exhausted (degraded to `require_review`) and policy freezes in force.\n\nThis is a *current-state* projection over the whole decision ledger — each budget uses its own configured window, independent of the digest's `--since`. It fails closed: `unavailable` when the ledger or config can't be read, `no_data` when nothing is degraded or frozen.",
+      "properties": {
+        "active_freezes": {
+          "description": "Policy freezes currently in force.",
+          "items": {
+            "$ref": "#/definitions/BriefActiveFreeze"
+          },
+          "type": "array"
+        },
+        "availability": {
+          "$ref": "#/definitions/SectionAvailability"
+        },
+        "degraded_rules": {
+          "description": "Rules whose budget is exhausted right now — each auto-degraded to `require_review` until its failures age out of the window.",
+          "items": {
+            "$ref": "#/definitions/BriefDegradedRule"
+          },
+          "type": "array"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "active_freezes",
+        "availability",
+        "degraded_rules"
       ],
       "type": "object"
     },
@@ -217,6 +278,40 @@
         "principal",
         "reason",
         "timestamp"
+      ],
+      "type": "object"
+    },
+    "BriefDegradedRule": {
+      "description": "A budget-exhausted (degraded) rule inside [`BriefAutonomySection`].",
+      "properties": {
+        "failures": {
+          "description": "Verify-after failures counted in the window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "limit": {
+          "description": "The rule's configured failure ceiling.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "rule_id": {
+          "description": "Index of the degraded `[[policy.rules]]` entry.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "window": {
+          "description": "The rule's configured window (`7d`, `24h`, …).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "failures",
+        "limit",
+        "rule_id",
+        "window"
       ],
       "type": "object"
     },
@@ -779,6 +874,14 @@
       ],
       "description": "Agent- and human-authored policy decisions in the window, grouped by principal and effect."
     },
+    "autonomy": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/BriefAutonomySection"
+        }
+      ],
+      "description": "Autonomy-budget degradations and active policy freezes — the dynamic tightening currently in force across the estate."
+    },
     "command": {
       "type": "string"
     },
@@ -855,6 +958,7 @@
   },
   "required": [
     "agent_activity",
+    "autonomy",
     "command",
     "cost",
     "drift",

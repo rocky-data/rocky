@@ -26,18 +26,19 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 
-use rocky_core::config::{PolicyEffect, PolicyPrincipal, load_rocky_config};
+use rocky_core::config::{PolicyEffect, PolicyPrincipal, load_rocky_config, parse_window_duration};
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
+use rocky_core::policy;
 use rocky_core::state::{
     DagChange, PolicyDecisionRecord, QualitySnapshot, RunRecord, RunStatus, RunTrigger, StateStore,
 };
 
 use crate::output::{
-    BriefAgentActivitySection, BriefBudgetStatus, BriefCostSection, BriefDecisionEntry,
-    BriefDriftEntry, BriefDriftSection, BriefEscalationsSection, BriefFailedModel,
-    BriefFreshnessEntry, BriefFreshnessSection, BriefOutput, BriefPrincipalActivity,
-    BriefQualityEntry, BriefQualitySection, BriefRunCost, BriefRunEntry, BriefRunsSection,
-    BriefSinceMode, SectionAvailability, print_json,
+    BriefActiveFreeze, BriefAgentActivitySection, BriefAutonomySection, BriefBudgetStatus,
+    BriefCostSection, BriefDecisionEntry, BriefDegradedRule, BriefDriftEntry, BriefDriftSection,
+    BriefEscalationsSection, BriefFailedModel, BriefFreshnessEntry, BriefFreshnessSection,
+    BriefOutput, BriefPrincipalActivity, BriefQualityEntry, BriefQualitySection, BriefRunCost,
+    BriefRunEntry, BriefRunsSection, BriefSinceMode, SectionAvailability, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -146,6 +147,10 @@ pub fn run_brief(
     let drift = build_drift(&store, since_ts);
     let (freshness, quality) = build_freshness_and_quality(&store, &windowed_runs, since_ts);
     let cost = build_cost(config_path, &windowed_runs);
+    // Autonomy state is a *current-state* projection: each budget uses its own
+    // window and freezes are current, so it reads the full ledger, not the
+    // `--since` slice.
+    let autonomy = build_autonomy(config_path, &decisions, now);
 
     let output = BriefOutput {
         version: VERSION.to_string(),
@@ -160,6 +165,7 @@ pub fn run_brief(
         freshness,
         quality,
         cost,
+        autonomy,
     };
 
     // Advance the cursor only after a successful render, and only for the
@@ -628,6 +634,83 @@ fn build_budget(ceiling: f64, per_run: &[BriefRunCost]) -> BriefBudgetStatus {
     }
 }
 
+/// Build the autonomy section: rules whose autonomy budget is exhausted right
+/// now (auto-degraded to `require_review`) and policy freezes in force.
+///
+/// Freezes come from the ledger alone; budget degradations additionally need
+/// the `[policy]` block to know which rules carry a budget and its window. Both
+/// are current-state projections over the full `decisions` slice. Fails closed:
+/// an unreadable config still shows freezes but notes budgets are unavailable.
+fn build_autonomy(
+    config_path: &Path,
+    decisions: &[PolicyDecisionRecord],
+    now: DateTime<Utc>,
+) -> BriefAutonomySection {
+    let active_freezes: Vec<BriefActiveFreeze> = policy::active_freezes(decisions)
+        .into_iter()
+        .map(|f| BriefActiveFreeze {
+            principal: f.principal,
+            scope: f.scope,
+            frozen_at: f.frozen_at.to_rfc3339(),
+            plan_id: f.plan_id,
+        })
+        .collect();
+
+    let cfg = load_rocky_config(config_path).ok();
+    let mut degraded_rules: Vec<BriefDegradedRule> = Vec::new();
+    let mut note: Option<String> = None;
+
+    match cfg.as_ref() {
+        Some(cfg) => match &cfg.policy {
+            Some(pol) => {
+                for (idx, rule) in pol.rules.iter().enumerate() {
+                    let Some(budget) = &rule.autonomy_budget else {
+                        continue;
+                    };
+                    let Some(window) = parse_window_duration(&budget.window) else {
+                        continue;
+                    };
+                    let failures = policy::budget_failures_in_window(decisions, idx, window, now);
+                    if failures >= budget.failures {
+                        degraded_rules.push(BriefDegradedRule {
+                            rule_id: idx,
+                            failures,
+                            limit: budget.failures,
+                            window: budget.window.clone(),
+                        });
+                    }
+                }
+            }
+            None => note = Some("no [policy] block configured — no autonomy budgets".to_string()),
+        },
+        None => {
+            note = Some(
+                "rocky.toml not loaded — budget degradations unavailable; freezes shown from the \
+                 ledger"
+                    .to_string(),
+            );
+        }
+    }
+
+    if degraded_rules.is_empty() && active_freezes.is_empty() {
+        return BriefAutonomySection {
+            availability: SectionAvailability::NoData,
+            note: Some(note.unwrap_or_else(|| {
+                "no autonomy budgets exhausted and no active freezes".to_string()
+            })),
+            degraded_rules,
+            active_freezes,
+        };
+    }
+
+    BriefAutonomySection {
+        availability: SectionAvailability::Available,
+        note,
+        degraded_rules,
+        active_freezes,
+    }
+}
+
 /// Resolve the billed-warehouse type for the project's adapters. Prefers the
 /// `default` adapter for determinism, then the first declared. Returns `None`
 /// for non-billed sources (Fivetran, Airbyte). Mirrors the resolution
@@ -787,7 +870,7 @@ fn empty_brief(
         },
         cost: BriefCostSection {
             availability: SectionAvailability::Unavailable,
-            note: Some(note),
+            note: Some(note.clone()),
             adapter_type: None,
             run_count: 0,
             total_cost_usd: None,
@@ -795,6 +878,12 @@ fn empty_brief(
             total_bytes_scanned: None,
             per_run: Vec::new(),
             budget: None,
+        },
+        autonomy: BriefAutonomySection {
+            availability: SectionAvailability::Unavailable,
+            note: Some(note),
+            degraded_rules: Vec::new(),
+            active_freezes: Vec::new(),
         },
     }
 }
@@ -1004,6 +1093,46 @@ fn render_markdown(out: &BriefOutput) -> String {
             }
         }
         _ => s.push_str(&section_status(&out.cost.availability, &out.cost.note)),
+    }
+
+    // Autonomy — budget degradations + freezes. These are escalation classes:
+    // a degraded rule or an active freeze is a change in the estate's posture.
+    s.push_str("\n## Autonomy\n");
+    match out.autonomy.availability {
+        SectionAvailability::Available => {
+            if out.autonomy.degraded_rules.is_empty() {
+                s.push_str("No autonomy budgets exhausted.\n");
+            } else {
+                s.push_str("Budget-exhausted rules (auto-degraded to require_review):\n");
+                for r in &out.autonomy.degraded_rules {
+                    s.push_str(&format!(
+                        "- rule {} — {}/{} verify-after failures in {} [degraded to require_review]\n",
+                        r.rule_id, r.failures, r.limit, r.window,
+                    ));
+                }
+            }
+            if out.autonomy.active_freezes.is_empty() {
+                s.push_str("No active policy freezes.\n");
+            } else {
+                s.push_str("Active policy freezes (forcing deny):\n");
+                for f in &out.autonomy.active_freezes {
+                    s.push_str(&format!(
+                        "- {} on scope `{}` (since {}) [freeze {}]\n",
+                        plain(&f.principal),
+                        f.scope,
+                        f.frozen_at,
+                        short(&f.plan_id),
+                    ));
+                }
+            }
+            if let Some(note) = &out.autonomy.note {
+                s.push_str(&format!("_{note}_\n"));
+            }
+        }
+        _ => s.push_str(&section_status(
+            &out.autonomy.availability,
+            &out.autonomy.note,
+        )),
     }
 
     s
@@ -1266,6 +1395,12 @@ mod tests {
                 total_bytes_scanned: None,
                 per_run: Vec::new(),
                 budget: None,
+            },
+            autonomy: BriefAutonomySection {
+                availability: SectionAvailability::NoData,
+                note: None,
+                degraded_rules: Vec::new(),
+                active_freezes: Vec::new(),
             },
         };
         let md = render_markdown(&out);

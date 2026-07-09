@@ -491,6 +491,366 @@ fn effect_label(effect: PolicyEffect) -> &'static str {
     }
 }
 
+// ===========================================================================
+// Autonomy budgets + policy freeze — the dynamic, ledger-aware tightening layer
+// ===========================================================================
+//
+// `evaluate` above resolves the *static* effect from the `[policy]` block. Two
+// dynamic breakers can then tighten (never widen) that effect at enforcement
+// time, both computed as **projections over the existing decision ledger** — no
+// new persisted state:
+//
+// - **Autonomy budget** — a rule's verify-after failures within its rolling
+//   window, counted from the ledger. At exhaustion the rule's `allow` degrades
+//   to `require_review`.
+// - **Policy freeze** — a kill switch recorded as a decision entry. An active
+//   (unsuperseded) freeze whose principal + scope match the evaluation forces
+//   `deny`.
+//
+// Both are structurally **monotone toward restriction**: [`autonomy_degradation`]
+// only ever returns an effect at least as restrictive as the base, so the
+// "auto-tighten only, never auto-widen" guarantee is a property of the code
+// shape, not a runtime check.
+
+use chrono::{DateTime, Utc};
+
+use crate::config::{AutonomyBudget, parse_window_duration};
+use crate::state::PolicyDecisionRecord;
+
+/// `plan_id` prefix that marks a policy-freeze decision entry in the ledger.
+pub const FREEZE_PLAN_PREFIX: &str = "freeze:";
+/// `plan_id` prefix that marks a freeze-lifting (unfreeze) decision entry.
+pub const UNFREEZE_PLAN_PREFIX: &str = "unfreeze:";
+
+/// How a base effect was dynamically tightened, for the audit reason + brief.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutonomyDegradation {
+    /// No dynamic breaker fired — the base effect stands.
+    None,
+    /// The winning rule's autonomy budget is exhausted; `allow` degraded to
+    /// `require_review`.
+    BudgetExhausted {
+        /// Index of the rule whose budget burned.
+        rule_idx: usize,
+        /// Verify-after failures counted in the window.
+        failures: u64,
+        /// The rule's configured failure ceiling.
+        limit: u64,
+        /// The rule's configured window, verbatim.
+        window: String,
+    },
+    /// An active policy freeze matched; the effect was forced to `deny`.
+    Frozen {
+        /// The frozen principal.
+        principal: PolicyPrincipal,
+        /// The freeze's scope selector, verbatim.
+        scope: String,
+        /// The `plan_id` of the freeze decision — the citation.
+        plan_id: String,
+    },
+}
+
+impl AutonomyDegradation {
+    /// A human-readable clause to append to the decision reason, or `None`
+    /// when no breaker fired.
+    #[must_use]
+    pub fn reason_suffix(&self) -> Option<String> {
+        match self {
+            AutonomyDegradation::None => None,
+            AutonomyDegradation::BudgetExhausted {
+                rule_idx,
+                failures,
+                limit,
+                window,
+            } => Some(format!(
+                "autonomy budget exhausted on rule {rule_idx} ({failures}/{limit} verify-after \
+                 failures in {window}) — allow degraded to require_review"
+            )),
+            AutonomyDegradation::Frozen {
+                principal,
+                scope,
+                plan_id,
+            } => Some(format!(
+                "policy freeze active for {} on scope '{scope}' — forced to deny ({plan_id})",
+                effect_principal_label(*principal),
+            )),
+        }
+    }
+}
+
+fn effect_principal_label(principal: PolicyPrincipal) -> &'static str {
+    match principal {
+        PolicyPrincipal::Agent => "agent",
+        PolicyPrincipal::Human => "human",
+    }
+}
+
+/// Return `effect` unless `floor` is strictly more restrictive, in which case
+/// return `floor`. The monotone building block: the result is never *less*
+/// restrictive than either input, so a caller can only tighten.
+fn tighten_to_at_least(effect: PolicyEffect, floor: PolicyEffect) -> PolicyEffect {
+    if restrictiveness(effect) >= restrictiveness(floor) {
+        effect
+    } else {
+        floor
+    }
+}
+
+/// Count the verify-after failures attributable to rule `rule_idx` inside the
+/// rolling `window` ending at `now`, from the decision ledger.
+///
+/// A verify-after failure is recorded as a **custody row** — a
+/// [`PolicyDecisionRecord`] with a non-empty `verify_after` list and
+/// `effect = deny` — keyed to the `plan_id` of the apply that failed. A failure
+/// burns rule `rule_idx`'s budget when that same plan also carries a plain
+/// evaluation row whose winning `rule_id` is `rule_idx` (i.e. the rule governed
+/// a model in the failing apply). The count is over **distinct plans**, so one
+/// multi-model apply burns the budget once.
+#[must_use]
+pub fn budget_failures_in_window(
+    decisions: &[PolicyDecisionRecord],
+    rule_idx: usize,
+    window: chrono::Duration,
+    now: DateTime<Utc>,
+) -> u64 {
+    let lower_bound = now - window;
+    // Plans that suffered a verify-after failure inside the window.
+    let failed_plans: BTreeSet<&str> = decisions
+        .iter()
+        .filter(|d| {
+            !d.verify_after.is_empty()
+                && d.effect == PolicyEffect::Deny
+                && d.timestamp >= lower_bound
+                && !is_freeze_record(d)
+        })
+        .map(|d| d.plan_id.as_str())
+        .collect();
+    if failed_plans.is_empty() {
+        return 0;
+    }
+    // Distinct failing plans in which `rule_idx` was the winning rule.
+    decisions
+        .iter()
+        .filter(|d| {
+            d.verify_after.is_empty()
+                && d.rule_id == Some(rule_idx)
+                && !is_freeze_record(d)
+                && failed_plans.contains(d.plan_id.as_str())
+        })
+        .map(|d| d.plan_id.as_str())
+        .collect::<BTreeSet<&str>>()
+        .len() as u64
+}
+
+/// `true` when a rule's budget is exhausted: failures in the window reach or
+/// exceed the ceiling. Exhaustion is `>=` — the `N`-th failure trips a budget
+/// of `N`.
+#[must_use]
+pub fn budget_is_exhausted(
+    budget: &AutonomyBudget,
+    decisions: &[PolicyDecisionRecord],
+    rule_idx: usize,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(window) = parse_window_duration(&budget.window) else {
+        // An unparseable window fails closed to "not exhausted": config
+        // validation already rejects it, so this is belt-and-braces and never
+        // fabricates a degrade from a malformed budget.
+        return false;
+    };
+    budget_failures_in_window(decisions, rule_idx, window, now) >= budget.failures
+}
+
+/// One active (unsuperseded) policy freeze, projected from the ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveFreeze {
+    /// The frozen principal.
+    pub principal: PolicyPrincipal,
+    /// The scope selector the freeze targets (see [`scope_selector_matches`]).
+    pub scope: String,
+    /// When the freeze was recorded.
+    pub frozen_at: DateTime<Utc>,
+    /// The freeze decision's `plan_id` — the audit citation.
+    pub plan_id: String,
+    /// The freeze's human-readable reason.
+    pub reason: String,
+}
+
+fn is_freeze_record(d: &PolicyDecisionRecord) -> bool {
+    d.plan_id.starts_with(FREEZE_PLAN_PREFIX) || d.plan_id.starts_with(UNFREEZE_PLAN_PREFIX)
+}
+
+/// Project the set of currently-active freezes from the decision ledger.
+///
+/// A freeze and its lifting (unfreeze) are recorded as decision entries keyed
+/// by `(principal, scope-selector)`. Within each key the **latest** entry wins:
+/// a `freeze:` entry that no later `unfreeze:` entry supersedes is active. This
+/// is how a freeze persists with no new table and how the normal
+/// policy-change flow lifts it.
+#[must_use]
+pub fn active_freezes(decisions: &[PolicyDecisionRecord]) -> Vec<ActiveFreeze> {
+    // Latest freeze/unfreeze record per (principal, scope) key. Keyed on a
+    // principal rank because `PolicyPrincipal` is not `Ord`.
+    let principal_rank = |p: PolicyPrincipal| match p {
+        PolicyPrincipal::Human => 0u8,
+        PolicyPrincipal::Agent => 1u8,
+    };
+    let mut latest: BTreeMap<(u8, String), &PolicyDecisionRecord> = BTreeMap::new();
+    for d in decisions.iter().filter(|d| is_freeze_record(d)) {
+        let key = (principal_rank(d.principal), d.model.clone());
+        latest
+            .entry(key)
+            .and_modify(|cur| {
+                if d.timestamp >= cur.timestamp {
+                    *cur = d;
+                }
+            })
+            .or_insert(d);
+    }
+    latest
+        .into_values()
+        .filter(|d| d.plan_id.starts_with(FREEZE_PLAN_PREFIX))
+        .map(|d| ActiveFreeze {
+            principal: d.principal,
+            scope: d.model.clone(),
+            frozen_at: d.timestamp,
+            plan_id: d.plan_id.clone(),
+            reason: d.reason.clone(),
+        })
+        .collect()
+}
+
+/// Match a freeze scope selector against a model's attributes.
+///
+/// Grammar (validated at freeze time by [`validate_scope_selector`]):
+/// - `any` — matches every model.
+/// - `layer=<name>` — the model's layer equals `<name>`.
+/// - `model=<glob>` — the model name matches the glob (`*` / `?`).
+/// - `classification=<value>` — the model carries that column classification.
+/// - `tag=<key>` — the model carries a tag with that key (any value).
+/// - `tag=<key>=<value>` — the model carries that tag with that exact value.
+///
+/// An unrecognised selector matches **nothing** (fail-safe: a typo'd freeze is
+/// a no-op, never an over-broad deny). Freezes are validated before they are
+/// written, so a stored selector is always well-formed.
+#[must_use]
+pub fn scope_selector_matches(selector: &str, attrs: &ModelAttributes) -> bool {
+    let s = selector.trim();
+    if s.is_empty() || s == "any" {
+        return true;
+    }
+    if let Some(layer) = s.strip_prefix("layer=") {
+        return attrs.layer.as_deref() == Some(layer);
+    }
+    if let Some(glob) = s.strip_prefix("model=") {
+        return glob_match(glob, &attrs.name);
+    }
+    if let Some(classification) = s.strip_prefix("classification=") {
+        return attrs.classifications.contains(classification);
+    }
+    if let Some(tag) = s.strip_prefix("tag=") {
+        return match tag.split_once('=') {
+            Some((k, v)) => attrs.tags.get(k).is_some_and(|got| got == v),
+            None => attrs.tags.contains_key(tag),
+        };
+    }
+    false
+}
+
+/// Validate a freeze scope selector string, returning a usage error message on
+/// a malformed selector. Mirrors the grammar of [`scope_selector_matches`].
+pub fn validate_scope_selector(selector: &str) -> Result<(), String> {
+    let s = selector.trim();
+    if s.is_empty() || s == "any" {
+        return Ok(());
+    }
+    for prefix in ["layer=", "model=", "classification="] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            return if rest.is_empty() {
+                Err(format!(
+                    "scope selector '{selector}': '{prefix}' needs a value"
+                ))
+            } else {
+                Ok(())
+            };
+        }
+    }
+    if let Some(rest) = s.strip_prefix("tag=") {
+        // `tag=key` or `tag=key=value`; the key must be non-empty.
+        let key = rest.split_once('=').map_or(rest, |(k, _)| k);
+        return if key.is_empty() {
+            Err(format!(
+                "scope selector '{selector}': tag key must not be empty"
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    Err(format!(
+        "scope selector '{selector}' is not recognised — use 'any', 'layer=<n>', 'model=<glob>', \
+         'classification=<v>', or 'tag=<key>[=<value>]'"
+    ))
+}
+
+/// Apply the dynamic breakers to a base effect: an active freeze forces `deny`;
+/// an exhausted autonomy budget on the winning rule degrades `allow` to
+/// `require_review`. Returns the (possibly tightened) effect and a description
+/// of which breaker fired.
+///
+/// **Monotone toward restriction.** The returned effect is always at least as
+/// restrictive as `base` — there is no code path that widens. Callers apply
+/// this *after* [`evaluate`] at the mutating enforcement seam, passing the
+/// decision ledger snapshot read before the current action's rows are written.
+///
+/// Freeze is checked first and independent of `matched_rule`, so it overrides
+/// even the default posture; budget applies only to the winning rule.
+#[must_use]
+pub fn autonomy_degradation(
+    base: PolicyEffect,
+    matched_rule: Option<usize>,
+    policy: &PolicyConfig,
+    principal: PolicyPrincipal,
+    attrs: &ModelAttributes,
+    decisions: &[PolicyDecisionRecord],
+    now: DateTime<Utc>,
+) -> (PolicyEffect, AutonomyDegradation) {
+    // 1. Freeze — a kill switch that forces deny for a matching principal+scope.
+    for freeze in active_freezes(decisions) {
+        if freeze.principal == principal && scope_selector_matches(&freeze.scope, attrs) {
+            return (
+                tighten_to_at_least(base, PolicyEffect::Deny),
+                AutonomyDegradation::Frozen {
+                    principal,
+                    scope: freeze.scope,
+                    plan_id: freeze.plan_id,
+                },
+            );
+        }
+    }
+
+    // 2. Autonomy budget — degrades the winning rule's allow to require_review.
+    if let Some(idx) = matched_rule
+        && let Some(rule) = policy.rules.get(idx)
+        && let Some(budget) = &rule.autonomy_budget
+        && budget_is_exhausted(budget, decisions, idx, now)
+    {
+        let failures = parse_window_duration(&budget.window)
+            .map(|w| budget_failures_in_window(decisions, idx, w, now))
+            .unwrap_or(0);
+        return (
+            tighten_to_at_least(base, PolicyEffect::RequireReview),
+            AutonomyDegradation::BudgetExhausted {
+                rule_idx: idx,
+                failures,
+                limit: budget.failures,
+                window: budget.window.clone(),
+            },
+        );
+    }
+
+    (base, AutonomyDegradation::None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +869,7 @@ mod tests {
             effect,
             verify_after: Vec::new(),
             conditions: None,
+            autonomy_budget: None,
         }
     }
 
@@ -1231,5 +1592,380 @@ mod tests {
         )]);
         let d = evaluate(&p, PolicyPrincipal::Agent, PolicyCapability::Apply, &attrs);
         assert_eq!(d.effect, PolicyEffect::Deny);
+    }
+
+    // ---------- autonomy budgets + freeze (dynamic tightening) ----------
+
+    use crate::config::AutonomyBudget;
+    use crate::state::PolicyDecisionRecord;
+
+    fn now() -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    /// A plain evaluation row: winning `rule_id`, empty `verify_after`.
+    fn plain_row(plan_id: &str, rule_id: Option<usize>, ts: DateTime<Utc>) -> PolicyDecisionRecord {
+        PolicyDecisionRecord {
+            timestamp: ts,
+            plan_id: plan_id.to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::SchemaChangeAdditive,
+            model: "raw_events".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id,
+            reason: "plain".to_string(),
+            verify_after: Vec::new(),
+        }
+    }
+
+    /// A verify-after custody row: non-empty `verify_after`, `effect = deny`
+    /// means the post-apply verification FAILED (burns budget).
+    fn verify_fail_row(plan_id: &str, ts: DateTime<Utc>) -> PolicyDecisionRecord {
+        PolicyDecisionRecord {
+            timestamp: ts,
+            plan_id: plan_id.to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "*".to_string(),
+            effect: PolicyEffect::Deny,
+            rule_id: None,
+            reason: "verify_after FAILED".to_string(),
+            verify_after: vec!["row_count_drift".to_string()],
+        }
+    }
+
+    /// A passing verify-after custody row — must NOT burn budget.
+    fn verify_pass_row(plan_id: &str, ts: DateTime<Utc>) -> PolicyDecisionRecord {
+        PolicyDecisionRecord {
+            timestamp: ts,
+            plan_id: plan_id.to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "*".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: None,
+            reason: "verify_after passed".to_string(),
+            verify_after: vec!["row_count_drift".to_string()],
+        }
+    }
+
+    fn freeze_row(
+        prefix: &str,
+        principal: PolicyPrincipal,
+        scope: &str,
+        ts: DateTime<Utc>,
+    ) -> PolicyDecisionRecord {
+        PolicyDecisionRecord {
+            timestamp: ts,
+            plan_id: format!("{prefix}{}", ts.to_rfc3339()),
+            principal,
+            capability: PolicyCapability::Apply,
+            model: scope.to_string(),
+            effect: if prefix == FREEZE_PLAN_PREFIX {
+                PolicyEffect::Deny
+            } else {
+                PolicyEffect::Allow
+            },
+            rule_id: None,
+            reason: "freeze".to_string(),
+            verify_after: Vec::new(),
+        }
+    }
+
+    /// A one-failure `n`-plan burn history: `n` failing applies, each with a
+    /// plain row for `rule_idx` plus a verify-after failure custody row.
+    fn burn_history(n: usize, rule_idx: usize, base: DateTime<Utc>) -> Vec<PolicyDecisionRecord> {
+        let mut v = Vec::new();
+        for i in 0..n {
+            let plan = format!("plan-{i}");
+            let ts = base - chrono::Duration::hours(i as i64);
+            v.push(plain_row(&plan, Some(rule_idx), ts));
+            v.push(verify_fail_row(&plan, ts));
+        }
+        v
+    }
+
+    fn budget_policy(failures: u64, window: &str) -> PolicyConfig {
+        let mut rule = rule(
+            PolicyPrincipal::Agent,
+            PolicyCapability::SchemaChangeAdditive,
+            PolicyScope {
+                layer: Some("bronze".to_string()),
+                ..Default::default()
+            },
+            PolicyEffect::Allow,
+        );
+        rule.autonomy_budget = Some(AutonomyBudget {
+            failures,
+            window: window.to_string(),
+        });
+        policy(vec![rule])
+    }
+
+    /// Off-by-one: a budget of N trips on the N-th failure, not before, not
+    /// after. This is the load-bearing exhaustion boundary.
+    #[test]
+    fn budget_degrades_exactly_at_exhaustion() {
+        let n = now();
+        let p = budget_policy(3, "7d");
+        let attrs = bronze_additive_model(Some(0));
+
+        // Two failures: budget intact, allow stands.
+        let two = burn_history(2, 0, n);
+        let (effect, deg) = autonomy_degradation(
+            PolicyEffect::Allow,
+            Some(0),
+            &p,
+            PolicyPrincipal::Agent,
+            &attrs,
+            &two,
+            n,
+        );
+        assert_eq!(effect, PolicyEffect::Allow, "2 < 3 must not degrade");
+        assert_eq!(deg, AutonomyDegradation::None);
+
+        // Third failure: budget exhausted, allow degrades to require_review.
+        let three = burn_history(3, 0, n);
+        let (effect, deg) = autonomy_degradation(
+            PolicyEffect::Allow,
+            Some(0),
+            &p,
+            PolicyPrincipal::Agent,
+            &attrs,
+            &three,
+            n,
+        );
+        assert_eq!(effect, PolicyEffect::RequireReview, "3 >= 3 must degrade");
+        assert!(matches!(
+            deg,
+            AutonomyDegradation::BudgetExhausted {
+                failures: 3,
+                limit: 3,
+                ..
+            }
+        ));
+    }
+
+    /// The core soundness invariant: for *every* combination of base effect,
+    /// freeze state, and budget state, the dynamic layer never widens — the
+    /// output is always at least as restrictive as the base. A budget/freeze
+    /// can only ever make a rule more restrictive, never less.
+    #[test]
+    fn autonomy_degradation_never_widens() {
+        let n = now();
+        let attrs = bronze_additive_model(Some(0));
+        let exhausted = burn_history(5, 0, n); // well past a 3-budget
+        let frozen = vec![freeze_row(
+            FREEZE_PLAN_PREFIX,
+            PolicyPrincipal::Agent,
+            "any",
+            n - chrono::Duration::hours(1),
+        )];
+        let mut both = exhausted.clone();
+        both.extend(frozen.clone());
+
+        let bases = [
+            PolicyEffect::Allow,
+            PolicyEffect::RequireReview,
+            PolicyEffect::Deny,
+        ];
+        let ledgers: [&[PolicyDecisionRecord]; 4] = [&[], &exhausted, &frozen, &both];
+
+        for base in bases {
+            for ledger in ledgers {
+                let p = budget_policy(3, "7d");
+                let (out, _deg) = autonomy_degradation(
+                    base,
+                    Some(0),
+                    &p,
+                    PolicyPrincipal::Agent,
+                    &attrs,
+                    ledger,
+                    n,
+                );
+                assert!(
+                    restrictiveness(out) >= restrictiveness(base),
+                    "widened base {base:?} -> {out:?} (a dynamic breaker must never loosen)"
+                );
+            }
+        }
+    }
+
+    /// A passing verify-after custody row must not burn budget, and the count
+    /// is over distinct plans.
+    #[test]
+    fn budget_burn_ignores_passes_and_dedups_plans() {
+        let n = now();
+        let window = chrono::Duration::days(7);
+        let mut ledger = burn_history(2, 0, n); // 2 failing plans
+        // A passing custody row + its plain row: must not count.
+        ledger.push(plain_row("plan-pass", Some(0), n));
+        ledger.push(verify_pass_row("plan-pass", n));
+        // A duplicate plain row for an already-counted failing plan: still 1.
+        ledger.push(plain_row("plan-0", Some(0), n));
+
+        assert_eq!(budget_failures_in_window(&ledger, 0, window, n), 2);
+        // A rule that never won any failing plan burns nothing.
+        assert_eq!(budget_failures_in_window(&ledger, 9, window, n), 0);
+    }
+
+    /// Failures older than the window do not count.
+    #[test]
+    fn budget_burn_respects_window() {
+        let n = now();
+        let window = chrono::Duration::days(7);
+        // One failure inside the window, one well outside it.
+        let ledger = vec![
+            plain_row("recent", Some(0), n - chrono::Duration::days(1)),
+            verify_fail_row("recent", n - chrono::Duration::days(1)),
+            plain_row("stale", Some(0), n - chrono::Duration::days(30)),
+            verify_fail_row("stale", n - chrono::Duration::days(30)),
+        ];
+        assert_eq!(budget_failures_in_window(&ledger, 0, window, n), 1);
+    }
+
+    /// A freeze forces deny even when no rule matched (default posture).
+    #[test]
+    fn freeze_forces_deny_over_default_posture() {
+        let n = now();
+        let attrs = bronze_additive_model(Some(0));
+        let ledger = vec![freeze_row(
+            FREEZE_PLAN_PREFIX,
+            PolicyPrincipal::Agent,
+            "any",
+            n,
+        )];
+        let p = policy(vec![]);
+        let (effect, deg) = autonomy_degradation(
+            PolicyEffect::RequireReview, // agent default posture
+            None,                        // no rule matched
+            &p,
+            PolicyPrincipal::Agent,
+            &attrs,
+            &ledger,
+            n,
+        );
+        assert_eq!(effect, PolicyEffect::Deny);
+        assert!(matches!(deg, AutonomyDegradation::Frozen { .. }));
+    }
+
+    /// A scoped freeze only bites models its selector matches.
+    #[test]
+    fn freeze_scope_selector_is_honoured() {
+        let n = now();
+        let p = policy(vec![]);
+        let ledger = vec![freeze_row(
+            FREEZE_PLAN_PREFIX,
+            PolicyPrincipal::Agent,
+            "layer=bronze",
+            n,
+        )];
+
+        let bronze = ModelAttributes {
+            name: "raw_events".to_string(),
+            layer: Some("bronze".to_string()),
+            ..Default::default()
+        };
+        let silver = ModelAttributes {
+            name: "dim_customer".to_string(),
+            layer: Some("silver".to_string()),
+            ..Default::default()
+        };
+
+        let (bronze_effect, _) = autonomy_degradation(
+            PolicyEffect::Allow,
+            None,
+            &p,
+            PolicyPrincipal::Agent,
+            &bronze,
+            &ledger,
+            n,
+        );
+        let (silver_effect, _) = autonomy_degradation(
+            PolicyEffect::Allow,
+            None,
+            &p,
+            PolicyPrincipal::Agent,
+            &silver,
+            &ledger,
+            n,
+        );
+        assert_eq!(bronze_effect, PolicyEffect::Deny, "bronze is frozen");
+        assert_eq!(silver_effect, PolicyEffect::Allow, "silver is not frozen");
+    }
+
+    /// A freeze targeting the agent does not bite a human principal.
+    #[test]
+    fn freeze_is_per_principal() {
+        let n = now();
+        let attrs = bronze_additive_model(Some(0));
+        let ledger = vec![freeze_row(
+            FREEZE_PLAN_PREFIX,
+            PolicyPrincipal::Agent,
+            "any",
+            n,
+        )];
+        let p = policy(vec![]);
+        let (human_effect, _) = autonomy_degradation(
+            PolicyEffect::Allow,
+            None,
+            &p,
+            PolicyPrincipal::Human,
+            &attrs,
+            &ledger,
+            n,
+        );
+        assert_eq!(
+            human_effect,
+            PolicyEffect::Allow,
+            "an agent freeze must not bite a human"
+        );
+    }
+
+    /// A later unfreeze supersedes an earlier freeze on the same key.
+    #[test]
+    fn unfreeze_supersedes_freeze() {
+        let n = now();
+        let ledger = vec![
+            freeze_row(
+                FREEZE_PLAN_PREFIX,
+                PolicyPrincipal::Agent,
+                "any",
+                n - chrono::Duration::hours(2),
+            ),
+            freeze_row(
+                UNFREEZE_PLAN_PREFIX,
+                PolicyPrincipal::Agent,
+                "any",
+                n - chrono::Duration::hours(1),
+            ),
+        ];
+        assert!(
+            active_freezes(&ledger).is_empty(),
+            "an unfreeze must supersede the freeze"
+        );
+
+        // A re-freeze after the unfreeze is active again.
+        let mut ledger = ledger;
+        ledger.push(freeze_row(
+            FREEZE_PLAN_PREFIX,
+            PolicyPrincipal::Agent,
+            "any",
+            n,
+        ));
+        assert_eq!(active_freezes(&ledger).len(), 1);
+    }
+
+    #[test]
+    fn scope_selector_grammar_validates() {
+        assert!(validate_scope_selector("any").is_ok());
+        assert!(validate_scope_selector("layer=bronze").is_ok());
+        assert!(validate_scope_selector("model=stg_*").is_ok());
+        assert!(validate_scope_selector("classification=pii").is_ok());
+        assert!(validate_scope_selector("tag=finance").is_ok());
+        assert!(validate_scope_selector("tag=env=prod").is_ok());
+        assert!(validate_scope_selector("layer=").is_err());
+        assert!(validate_scope_selector("tag==prod").is_err());
+        assert!(validate_scope_selector("nonsense").is_err());
     }
 }
