@@ -6085,6 +6085,16 @@ fn compute_consumer_baseline(
                             .iter()
                             .map(|ch| (ch.column.to_lowercase(), ch))
                             .collect();
+                    // Fail closed on a case-folding collision: if two producer
+                    // columns collapse to one lowercased key the map is shorter
+                    // than the slice, and a consumed column would silently
+                    // resolve to whichever entry won the insert — masking a real
+                    // content change in its case-colliding sibling (a false
+                    // SKIP). No column baseline for this upstream ⇒ the gate
+                    // builds. Mirrors the same guard in `column_hashes_equal`.
+                    if by_col.len() != producer.len() {
+                        return None;
+                    }
                     let mut filtered = Vec::with_capacity(cols.len());
                     for col in cols {
                         filtered.push((*by_col.get(col)?).clone());
@@ -14411,7 +14421,7 @@ merge_keys = ["id"]
         };
         use super::target_cfg;
         use crate::commands::column_skip::ColumnSkipReason::{
-            ConsumedColumnChanged, ConsumedColumnsNotEnumerable,
+            ConsumedColumnChanged, ConsumedColumnsNotEnumerable, MissingCurrentColumnHash,
         };
         use crate::commands::column_skip::ColumnSkipVerdict::{Build, Skip};
         use crate::commands::column_skip::{
@@ -14855,6 +14865,54 @@ merge_keys = ["id"]
                 gate("SELECT region FROM u", &tbm, &built_v1, &built_v2),
                 Skip,
                 "E consumes only the unchanged column ⇒ skip (Fork-3 per-downstream verdict)"
+            );
+        }
+
+        /// Case-folding collision trap (adversarial red-team). A producer that
+        /// emits two output columns differing only by case (`id`, `ID`) must
+        /// NEVER let a consumed column silently resolve to the wrong sibling's
+        /// hash. Here the downstream consumes `id`, whose content changes, while
+        /// the case-colliding `ID` stays fixed. A last-wins lowercased producer
+        /// map collapses the two and would compare the unchanged `ID` hash
+        /// instead — a false SKIP (silent staleness). `compute_consumer_baseline`
+        /// must fail closed on the collision (ambiguous mapping ⇒ no column
+        /// baseline for that upstream ⇒ BUILD), mirroring the guard already in
+        /// `column_hashes_equal`.
+        #[tokio::test]
+        async fn case_colliding_producer_columns_force_build() {
+            let tbm = tbm_u();
+            let upper = ColumnHash {
+                column: "ID".to_string(),
+                hash: "c".repeat(64),
+            };
+            // Producer order [id, ID]: a last-wins lowercase map resolves the
+            // consumed "id" to the (unchanged) `ID` entry, masking the real
+            // change in `id`.
+            let prior = built_map(vec![(
+                "cat.sch.u",
+                vec![
+                    ColumnHash {
+                        column: "id".to_string(),
+                        hash: "a".repeat(64),
+                    },
+                    upper.clone(),
+                ],
+            )]);
+            let current = built_map(vec![(
+                "cat.sch.u",
+                vec![
+                    ColumnHash {
+                        column: "id".to_string(),
+                        hash: "b".repeat(64), // id's content changed
+                    },
+                    upper, // ID unchanged
+                ],
+            )]);
+            assert_eq!(
+                gate("SELECT id FROM u", &tbm, &prior, &current),
+                Build(MissingCurrentColumnHash),
+                "a case-folding collision in producer columns must fail closed to BUILD, \
+                 never silently resolve a consumed column to its case-colliding sibling"
             );
         }
 
