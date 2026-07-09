@@ -1,0 +1,221 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "GcCandidateOutput": {
+      "description": "One reclamation candidate inside a [`GcReportOutput`] — a single content-addressed artifact (identified by its content hash) with its five printed eligibility checks.",
+      "properties": {
+        "blake3_hash": {
+          "description": "Content hash (hex) of the artifact bytes — the reclamation unit.",
+          "type": "string"
+        },
+        "checks": {
+          "description": "The five eligibility checks, each with its pass/fail and a human-readable justification. Order is stable: `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`, `age_threshold`.",
+          "items": {
+            "$ref": "#/definitions/GcCheckOutput"
+          },
+          "type": "array"
+        },
+        "derivable": {
+          "description": "`true` iff every one of [`Self::checks`] passed.",
+          "type": "boolean"
+        },
+        "input_proof_class": {
+          "description": "Input match-strength label carried on the provenance record (`strong` or `heuristic`); `null` when no provenance was found.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_name": {
+          "description": "Model that produced the artifact.",
+          "type": "string"
+        },
+        "rebuild_cost": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GcRebuildCostOutput"
+            }
+          ],
+          "description": "Estimated cost to rebuild the artifact via replay."
+        },
+        "recipe_id": {
+          "description": "The recipe-identity key (hex) of the producing execution — the \"what exact program produced this?\" id. `null` when the producing execution predates recipe-identity capture; the provenance record still carries the canonical program.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "refcount": {
+          "description": "How many ledger rows point at these bytes. `1` means Rocky holds a single reference (reclaimable on that axis); `> 1` means the bytes are shared (a branch or replayed run) and must never be evicted.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "run_id": {
+          "description": "Run that produced it (joins to the provenance + execution records).",
+          "type": "string"
+        },
+        "size_bytes": {
+          "description": "Physical size of the artifact in bytes.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "written_at": {
+          "description": "When the artifact was written (RFC 3339). Doubles as the conservative last-access proxy: Rocky has no read-tracking on this adapter, so write-time is the only defensible recency signal.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "blake3_hash",
+        "checks",
+        "derivable",
+        "model_name",
+        "rebuild_cost",
+        "refcount",
+        "run_id",
+        "size_bytes",
+        "written_at"
+      ],
+      "type": "object"
+    },
+    "GcCheckOutput": {
+      "description": "One printed eligibility check inside a [`GcCandidateOutput`].",
+      "properties": {
+        "check": {
+          "description": "Stable check id: `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.",
+          "type": "string"
+        },
+        "detail": {
+          "description": "Why the check reached that verdict — the auditable justification.",
+          "type": "string"
+        },
+        "passed": {
+          "description": "Whether the check passed. A candidate is derivable only when all five are `true`.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "check",
+        "detail",
+        "passed"
+      ],
+      "type": "object"
+    },
+    "GcRebuildCostOutput": {
+      "description": "Estimated rebuild cost for a [`GcCandidateOutput`].\n\nDerived from the *recorded* build's metrics via the same cost model `rocky cost` uses — a replay re-runs the recipe, so its original execution's duration and scanned bytes are the honest predictor. Always an estimate ([`Self::estimated`] is always `true`), never a measured rebuild.",
+      "properties": {
+        "estimated": {
+          "description": "Always `true`: this figure is modeled from the recorded build, not measured by re-running it.",
+          "type": "boolean"
+        },
+        "estimated_usd": {
+          "description": "Estimated USD to rebuild, priced by `compute_observed_cost_usd` over the recorded metrics; `null` when the config or adapter can't price it (no `rocky.toml`, or a non-billed adapter).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "source_bytes_scanned": {
+          "description": "Bytes scanned by the recorded build; `null` when the adapter didn't report a figure (mirrors [`rocky_core::state::ModelExecution::bytes_scanned`]).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source_duration_ms": {
+          "description": "Duration of the recorded build in milliseconds — the wall-clock a replay would repeat.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "estimated",
+        "source_duration_ms"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky gc --derivable --dry-run`.\n\nA read-only inventory of Rocky-managed content-addressed artifacts that are provably rebuildable — *derivable* — and therefore reclamation candidates. Nothing is deleted or planned for deletion: this surface is inventory-only, so the whole product is the report.\n\nThe candidate universe is the content-addressed artifact ledger, grouped by content hash (each distinct hash is one physical artifact; managed bytes count each hash once). An artifact is `derivable` only when **all five** eligibility checks hold — recipe recorded, replayable, unreferenced, policy allows, past the age threshold. Every check fails closed (any doubt keeps the artifact non-derivable) and is reported per candidate, so each verdict is auditable rather than asserted.\n\nScope caveat surfaced in [`Self::notes`]: refcounts see *Rocky's* pointers only. A warehouse-side reference Rocky never recorded (a BI extract, a notebook `SELECT INTO`) is invisible here; the age threshold is the mitigation, and this release measures written-age, not read-recency.",
+  "properties": {
+    "artifact_count": {
+      "description": "Number of distinct content hashes considered.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "candidates": {
+      "description": "One entry per distinct content hash, newest write first.",
+      "items": {
+        "$ref": "#/definitions/GcCandidateOutput"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "derivable_bytes": {
+      "description": "Physical bytes of the derivable subset (distinct content hashes whose five checks all pass).",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "derivable_count": {
+      "description": "How many of those are derivable.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "derivable_pct": {
+      "description": "[`Self::derivable_bytes`] as a percentage of [`Self::managed_bytes`]; `null` when there are no managed bytes (nothing to divide by).",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "managed_bytes": {
+      "description": "Total physical bytes of Rocky-managed artifacts, counting each distinct content hash once.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "min_age_days": {
+      "description": "The minimum written-age (in days) an artifact must reach to pass the age/activity check.",
+      "format": "int64",
+      "type": "integer"
+    },
+    "notes": {
+      "description": "Report-wide caveats an operator must read before trusting the numbers (Rocky-external references, estimate labeling, unwired policy plane).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "read_tracking_available": {
+      "description": "Whether read-activity tracking backed the age/activity check. Always `false` in this release: the age check is written-age only (see [`GcCheckOutput`]), stated conservatively rather than inferred.",
+      "type": "boolean"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "artifact_count",
+    "candidates",
+    "command",
+    "derivable_bytes",
+    "derivable_count",
+    "managed_bytes",
+    "min_age_days",
+    "notes",
+    "read_tracking_available",
+    "version"
+  ],
+  "title": "GcReportOutput",
+  "type": "object"
+}

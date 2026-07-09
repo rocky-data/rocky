@@ -2969,6 +2969,32 @@ impl StateStore {
         Ok(count)
     }
 
+    /// Return every artifact record in the content-addressed ledger.
+    ///
+    /// One full table scan over [`OUTPUT_ARTIFACTS`]. Backs the read-only
+    /// derivability inventory (`rocky gc --derivable --dry-run`), which needs
+    /// the whole candidate universe to group by content hash, sum managed
+    /// bytes, and join each artifact to its provenance + refcount. Rows are
+    /// returned in the table's key order (`"{run_id}|{model_name}|…"`); the
+    /// caller imposes any grouping or ordering it needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::Db`] when the redb transaction fails to open the
+    /// table or iterate, and [`StateError::Serialize`] when a ledger row fails
+    /// to deserialize.
+    pub fn list_all_artifacts(&self) -> Result<Vec<ArtifactRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(OUTPUT_ARTIFACTS)?;
+        let mut results = Vec::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let record: ArtifactRecord = serde_json::from_slice(value.value())?;
+            results.push(record);
+        }
+        Ok(results)
+    }
+
     /// Count the number of ledger rows pointing at a given `blake3_hash`.
     ///
     /// This is the VACUUM refcount primitive. A content-addressed parquet

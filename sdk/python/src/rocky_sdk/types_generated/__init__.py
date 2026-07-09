@@ -166,6 +166,14 @@ from .compare_schema import CompareOutput, TableCompareResult
 # Cost command (historical per-run cost attribution)
 from .cost_schema import CostOutput, PerModelCostHistorical
 
+# Gc command (derivability inventory — dry-run reclamation report)
+from .gc_schema import (
+    GcCandidateOutput,
+    GcCheckOutput,
+    GcRebuildCostOutput,
+    GcReportOutput,
+)
+
 # Brief command (the governor's estate digest)
 from .brief_schema import (
     BriefAgentActivitySection,
@@ -425,6 +433,11 @@ __all__ = [
     # cost
     "CostOutput",
     "PerModelCostHistorical",
+    # gc
+    "GcCandidateOutput",
+    "GcCheckOutput",
+    "GcRebuildCostOutput",
+    "GcReportOutput",
     # brief
     "BriefOutput",
     "BriefAgentActivitySection",
