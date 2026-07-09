@@ -1221,6 +1221,7 @@ mod tests {
                 target_catalog: None,
                 hostname: "test-host".to_string(),
                 rocky_version: "test-version".to_string(),
+                check_outcomes: Vec::new(),
             }
         }
 

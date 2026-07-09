@@ -152,17 +152,23 @@ async fn run_apply_run_plan(
     // human-authored plan resolves to `allow` (humans are never gated in v0).
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
     let touched = touched_models_for_run(&plan, &run_plan);
+    let principal = plan.resolved_principal();
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
-        plan.resolved_principal(),
+        principal,
         &touched,
         models_dir,
         state_path,
     );
     apply_policy_gate(root, plan_id, gate)?;
 
-    execute_run_plan(config_path, plan_id, run_plan, state_path, output_json).await
+    // Resolve the post-apply verification checks *before* the run plan is moved
+    // into execution (the run plan owns the models_dir the resolver reads).
+    let verify_checks = required_verify_after(config_path, principal, &touched, models_dir);
+
+    execute_run_plan(config_path, plan_id, run_plan, state_path, output_json).await?;
+    run_verify_after(plan_id, principal, &verify_checks, state_path)
 }
 
 /// Execute a deserialized [`RunPlan`] against the warehouse.
@@ -460,6 +466,9 @@ pub fn evaluate_apply_policy(
                 effect: decision.effect,
                 rule_id: decision.matched_rule,
                 reason: decision.reason.clone(),
+                // A plain evaluation row carries no verify_after; the
+                // post-apply verification writes its own custody row.
+                verify_after: Vec::new(),
             };
             if let Err(e) = store.record_policy_decision(&record) {
                 warn!(
@@ -612,6 +621,162 @@ fn apply_policy_gate(root: &Path, plan_id: &str, gate: PolicyGate) -> Result<()>
     }
 }
 
+/// The union of `verify_after` check names the winning rules require for a
+/// plan's *proceeding* models.
+///
+/// Re-evaluates the policy per touched model and, for every model that did
+/// **not** resolve to `deny` (a `deny` never reaches apply), collects the
+/// winning rule's `verify_after` list. Returns a sorted, de-duplicated set;
+/// empty when no `[policy]` block is configured or no matched rule carries a
+/// `verify_after` (the common case — no post-apply gate).
+fn required_verify_after(
+    config_path: &Path,
+    principal: PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+) -> Vec<String> {
+    let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) else {
+        return Vec::new();
+    };
+    let Some(policy) = cfg.policy else {
+        return Vec::new();
+    };
+    let attrs_map = model_attributes(models_dir);
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for (model, capability) in touched {
+        let owned;
+        let attrs = match attrs_map.get(model) {
+            Some(a) => a,
+            None => {
+                owned = ModelAttributes {
+                    name: model.clone(),
+                    ..Default::default()
+                };
+                &owned
+            }
+        };
+        let decision = policy::evaluate(&policy, principal, *capability, attrs);
+        if decision.effect == PolicyEffect::Deny {
+            continue;
+        }
+        if let Some(idx) = decision.matched_rule
+            && let Some(rule) = policy.rules.get(idx)
+        {
+            names.extend(rule.verify_after.iter().cloned());
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// Run the `verify_after` post-apply gate: confirm every named check ran and
+/// **passed** in the just-completed run, and record a verification custody
+/// entry either way.
+///
+/// Fail-closed: a named check that failed *or is absent* from the run's
+/// captured outcomes halts the apply. On success the custody entry records
+/// `effect = allow`; on failure it records `effect = deny`, an alert is raised,
+/// and an error is returned.
+///
+/// Auto-rollback runs only where a rollback substrate exists. None does today
+/// (the content-addressed / Iceberg pointer-swap path is object-store-only and
+/// has no local read-back), so a failed verification is **halt-only**: the
+/// mutation has already landed and stays in place until a human reverts it.
+/// That state is stated plainly in the error rather than papered over with a
+/// rollback that would not actually run.
+fn run_verify_after(
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    required: &[String],
+    state_path: &Path,
+) -> Result<()> {
+    if required.is_empty() {
+        return Ok(());
+    }
+
+    let store = StateStore::open(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+
+    // The apply's run just finished, so it is the most recent run on record.
+    let latest = store.list_runs(1).ok().and_then(|mut v| v.pop());
+    let outcomes: BTreeMap<&str, bool> = latest
+        .as_ref()
+        .map(|r| {
+            r.check_outcomes
+                .iter()
+                .map(|c| (c.name.as_str(), c.passed))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut failures: Vec<String> = Vec::new();
+    for name in required {
+        match outcomes.get(name.as_str()) {
+            Some(true) => {}
+            Some(false) => failures.push(format!("{name} (failed)")),
+            // Fail closed: a named check that did not run cannot be confirmed.
+            None => failures.push(format!("{name} (absent — did not run)")),
+        }
+    }
+    let passed = failures.is_empty();
+
+    let reason = if passed {
+        format!("verify_after passed: [{}]", required.join(", "))
+    } else {
+        format!(
+            "verify_after FAILED: {}. No rollback substrate available — the mutation stands; halt-only.",
+            failures.join("; ")
+        )
+    };
+    // Best-effort custody entry — the gate below is the safety boundary; the
+    // ledger is the trail.
+    let record = PolicyDecisionRecord {
+        timestamp: chrono::Utc::now(),
+        plan_id: plan_id.to_string(),
+        principal,
+        capability: PolicyCapability::Apply,
+        model: "*".to_string(),
+        effect: if passed {
+            PolicyEffect::Allow
+        } else {
+            PolicyEffect::Deny
+        },
+        rule_id: None,
+        reason: reason.clone(),
+        verify_after: required.to_vec(),
+    };
+    if let Err(e) = store.record_policy_decision(&record) {
+        warn!(
+            target: "rocky::policy",
+            error = %e,
+            "failed to record verify_after custody entry to the ledger (continuing)"
+        );
+    }
+
+    if passed {
+        eprintln!(
+            "verify_after: {} post-apply check(s) passed [{}].",
+            required.len(),
+            required.join(", ")
+        );
+        Ok(())
+    } else {
+        // Alert: a post-apply verification failure is an operational event, not
+        // a routine warning.
+        warn!(
+            target: "rocky::policy",
+            plan_id,
+            failures = %failures.join("; "),
+            "verify_after post-apply gate FAILED"
+        );
+        bail!(
+            "verify_after gate FAILED for plan '{plan_id}': {}. \
+             No rollback substrate is available, so the mutation HAS ALREADY LANDED and remains in \
+             place — it must be reverted manually. The failure is recorded in the policy-decision ledger.",
+            failures.join("; ")
+        )
+    }
+}
+
 /// Apply a `PlanKind::AiAuthored` plan.
 ///
 /// AI-authored plans carry a `RunPlan` payload identical in shape to a plain
@@ -651,10 +816,11 @@ async fn run_apply_ai_authored_plan(
     // constructed and the pre-policy-plane marker gate remains — byte-identical to today.
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
     let touched = touched_models_for_run(&plan, &run_plan);
+    let principal = plan.resolved_principal();
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
-        plan.resolved_principal(),
+        principal,
         &touched,
         models_dir,
         state_path,
@@ -673,7 +839,11 @@ async fn run_apply_ai_authored_plan(
         gate => apply_policy_gate(root, plan_id, gate)?,
     }
 
-    execute_run_plan(config_path, plan_id, run_plan, state_path, output_json).await
+    // Resolve the post-apply verification checks before the run plan is moved.
+    let verify_checks = required_verify_after(config_path, principal, &touched, models_dir);
+
+    execute_run_plan(config_path, plan_id, run_plan, state_path, output_json).await?;
+    run_verify_after(plan_id, principal, &verify_checks, state_path)
 }
 
 /// Apply a `PlanKind::Backfill` plan — a scoped, review-gated recovery run.
@@ -2513,5 +2683,104 @@ effect = "deny"
         };
         assert!(connector_matches_filter(&s, &pattern, "id", "duckdb_local"));
         assert!(!connector_matches_filter(&s, &pattern, "client", "acme"));
+    }
+
+    // ---------- verify_after post-apply gate ----------
+
+    fn record_run_with_checks(state_path: &Path, checks: &[(&str, bool)]) {
+        use rocky_core::state::{
+            CheckOutcome, RunRecord, RunStatus, RunTrigger, SessionSource, StateStore,
+        };
+        let store = StateStore::open(state_path).unwrap();
+        let now = chrono::Utc::now();
+        let record = RunRecord {
+            run_id: format!("run-{}", now.timestamp_nanos_opt().unwrap_or(0)),
+            started_at: now,
+            finished_at: now,
+            status: RunStatus::Success,
+            models_executed: vec![],
+            trigger: RunTrigger::Manual,
+            config_hash: "h".to_string(),
+            triggering_identity: None,
+            session_source: SessionSource::Cli,
+            git_commit: None,
+            git_branch: None,
+            idempotency_key: None,
+            target_catalog: None,
+            hostname: "test".to_string(),
+            rocky_version: "test".to_string(),
+            check_outcomes: checks
+                .iter()
+                .map(|(n, p)| CheckOutcome {
+                    name: n.to_string(),
+                    passed: *p,
+                })
+                .collect(),
+        };
+        store.record_run(&record).unwrap();
+    }
+
+    #[test]
+    fn verify_after_passes_when_all_named_checks_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb");
+        record_run_with_checks(&state, &[("row_count", true), ("not_null_keys", true)]);
+        let r = super::run_verify_after(
+            "plan-x",
+            PolicyPrincipal::Agent,
+            &["row_count".to_string(), "not_null_keys".to_string()],
+            &state,
+        );
+        assert!(
+            r.is_ok(),
+            "all named checks passed → verify_after ok: {r:?}"
+        );
+    }
+
+    #[test]
+    fn verify_after_halts_when_named_check_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb");
+        record_run_with_checks(&state, &[("row_count", true), ("not_null_keys", false)]);
+        let err = super::run_verify_after(
+            "plan-x",
+            PolicyPrincipal::Agent,
+            &["not_null_keys".to_string()],
+            &state,
+        )
+        .expect_err("a failing named check halts the apply");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verify_after gate FAILED") && msg.contains("not_null_keys"),
+            "{msg}"
+        );
+        // The halt-only state (no rollback substrate) must be stated plainly.
+        assert!(msg.contains("HAS ALREADY LANDED"), "halt-only state: {msg}");
+    }
+
+    #[test]
+    fn verify_after_fails_closed_when_named_check_absent() {
+        // A named check that did not run cannot be confirmed → halt (fail
+        // closed). This is the verify_after analog of the false-additive
+        // soundness direction.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb");
+        record_run_with_checks(&state, &[("row_count", true)]);
+        let err = super::run_verify_after(
+            "plan-x",
+            PolicyPrincipal::Agent,
+            &["freshness".to_string()],
+            &state,
+        )
+        .expect_err("an absent named check fails closed");
+        assert!(err.to_string().contains("absent"), "{}", err);
+    }
+
+    #[test]
+    fn verify_after_empty_is_noop_even_without_a_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.redb");
+        // No required checks → the gate is a no-op and never touches state.
+        assert!(super::run_verify_after("plan-x", PolicyPrincipal::Agent, &[], &state).is_ok());
     }
 }

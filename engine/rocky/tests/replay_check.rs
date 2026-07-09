@@ -165,6 +165,7 @@ fn record_run(store: &StateStore, models: &[&str]) {
             target_catalog: None,
             hostname: "replay-check-test".to_string(),
             rocky_version: "0.0.0-test".to_string(),
+            check_outcomes: Vec::new(),
         })
         .expect("record run");
 }

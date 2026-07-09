@@ -584,6 +584,7 @@ mod tests {
             target_catalog: Some("warehouse_main".to_string()),
             hostname: "dev-laptop".to_string(),
             rocky_version: "1.16.0".to_string(),
+            check_outcomes: Vec::new(),
         }
     }
 
@@ -670,6 +671,7 @@ mod tests {
             target_catalog: None,
             hostname: "host".to_string(),
             rocky_version: "0.0.0-test".to_string(),
+            check_outcomes: Vec::new(),
         }
     }
 

@@ -13341,6 +13341,7 @@ merge_keys = ["id"]
             target_catalog: None,
             hostname: "test".to_string(),
             rocky_version: "test".to_string(),
+            check_outcomes: Vec::new(),
         };
         state.record_run(&failed).unwrap();
 
@@ -14544,6 +14545,7 @@ merge_keys = ["id"]
             target_catalog: None,
             hostname: "test".to_string(),
             rocky_version: "test".to_string(),
+            check_outcomes: Vec::new(),
         };
         store.record_run(&run).unwrap();
 
@@ -15374,6 +15376,7 @@ merge_keys = ["id"]
                 target_catalog: None,
                 hostname: "test".to_string(),
                 rocky_version: "test".to_string(),
+                check_outcomes: Vec::new(),
             };
             store.record_run(&run).unwrap();
 
@@ -15652,6 +15655,7 @@ merge_keys = ["id"]
                     target_catalog: None,
                     hostname: "test".to_string(),
                     rocky_version: "test".to_string(),
+                    check_outcomes: Vec::new(),
                 })
                 .unwrap();
 

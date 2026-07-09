@@ -283,6 +283,7 @@ mod tests {
             target_catalog: None,
             hostname: "trace-test-host".to_string(),
             rocky_version: "0.0.0-test".to_string(),
+            check_outcomes: Vec::new(),
         }
     }
 

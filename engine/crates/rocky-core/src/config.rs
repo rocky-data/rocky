@@ -2776,8 +2776,18 @@ pub struct PolicyRule {
     pub scope: PolicyScope,
     /// The verdict when this rule matches.
     pub effect: PolicyEffect,
-    /// Optional v1 conditional refinements. **Parsed and ignored in v0** —
-    /// captured as opaque JSON so a config authored for v1 still loads.
+    /// Post-apply verification: named checks that must pass after a mutation
+    /// governed by this rule lands. Once the apply's run completes, each named
+    /// check is confirmed against the run's executed checks; a failing **or
+    /// absent** named check halts the apply (fail closed) and raises an alert.
+    /// Auto-rollback runs only where a rollback substrate exists; today none
+    /// does, so a failure is halt-only and the mutation stands until a human
+    /// reverts it. Empty ⇒ no post-apply gate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verify_after: Vec<String>,
+    /// Optional v1 conditional refinements not yet promoted to typed fields
+    /// (`budget`, `window`). **Parsed and ignored** — captured as opaque JSON
+    /// so a config authored against a later version still loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<serde_json::Value>,
 }
@@ -5894,6 +5904,45 @@ conditions = { time_window = "business_hours" }
         );
         assert!(validate_policy(&cfg).is_empty());
         assert!(cfg.policy.unwrap().rules[0].conditions.is_some());
+    }
+
+    #[test]
+    fn policy_rule_parses_verify_after() {
+        // `verify_after` is a first-class rule field (not opaque `conditions`),
+        // so it parses under `deny_unknown_fields` and round-trips typed.
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "schema_change.additive"
+scope = { layer = "bronze" }
+effect = "allow"
+verify_after = ["row_count_drift", "not_null_keys"]
+"#,
+        );
+        assert!(validate_policy(&cfg).is_empty());
+        let rule = &cfg.policy.unwrap().rules[0];
+        assert_eq!(rule.verify_after, vec!["row_count_drift", "not_null_keys"]);
+    }
+
+    #[test]
+    fn policy_rule_without_verify_after_defaults_empty() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+"#,
+        );
+        assert!(cfg.policy.unwrap().rules[0].verify_after.is_empty());
     }
 
     #[test]

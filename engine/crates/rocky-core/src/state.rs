@@ -282,7 +282,16 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   `test_v15_model_execution_forward_deserializes_attempts_empty`. The bump
 ///   exists so the on-disk version tracks the record-shape addition and the
 ///   `[state] on_schema_mismatch` handling engages as usual; no blob walk.
-const CURRENT_SCHEMA_VERSION: u32 = 16;
+/// - **v17** — adds two serde-additive *fields* for the policy plane's
+///   `verify_after` post-apply gate: [`RunRecord::check_outcomes`] (per-check
+///   pass/fail captured on every run) and [`PolicyDecisionRecord::verify_after`]
+///   (the named checks a verification custody row required). Neither is a table
+///   change — the redb table set is unchanged (`EXPECTED_TABLES` is untouched).
+///   A v16 blob (which lacks the fields) forward-deserializes with both empty,
+///   guarded by `test_v16_run_record_forward_deserializes_check_outcomes_empty`.
+///   The bump tracks the record-shape addition so `[state] on_schema_mismatch`
+///   engages as usual; no blob walk.
+const CURRENT_SCHEMA_VERSION: u32 = 17;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -1429,6 +1438,26 @@ pub struct RunRecord {
     /// `"unknown"` version string.
     #[serde(default = "default_rocky_version_sentinel")]
     pub rocky_version: String,
+
+    /// Per-check pass/fail outcomes this run produced, one entry per executed
+    /// data-quality check (flattened across every model). Empty on pre-v17
+    /// records and on runs that ran no checks. Consumed by the policy plane's
+    /// `verify_after` post-apply gate to confirm named checks passed.
+    #[serde(default)]
+    pub check_outcomes: Vec<CheckOutcome>,
+}
+
+/// One executed data-quality check's pass/fail outcome, captured on a
+/// [`RunRecord`] so a later reader (the `verify_after` policy gate) can confirm
+/// a named check ran and passed without re-executing it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CheckOutcome {
+    /// The check's name (e.g. `row_count`, `not_null:email`), matching the
+    /// `CheckResult.name` the run emitted and the names a `verify_after` rule
+    /// lists.
+    pub name: String,
+    /// Whether the check passed.
+    pub passed: bool,
 }
 
 /// Default-value contract for `RunRecord.hostname` on v5→v6 upgrade.
@@ -3383,6 +3412,13 @@ pub struct PolicyDecisionRecord {
     /// Human-readable explanation of how the effect was reached.
     #[serde(default)]
     pub reason: String,
+    /// Named checks a `verify_after` condition required post-apply. Empty on a
+    /// plain evaluation row; non-empty on a **post-apply verification custody**
+    /// row, where `effect` records the verification verdict (`allow` = every
+    /// named check passed, `deny` = a named check failed or was absent and the
+    /// apply halted) and `reason` states the outcome and rollback status.
+    #[serde(default)]
+    pub verify_after: Vec<String>,
 }
 
 /// One row in the input-match index ([`INPUT_INDEX`]).
@@ -4354,7 +4390,48 @@ mod tests {
             target_catalog: None,
             hostname: "test-host".to_string(),
             rocky_version: "0.0.0-test".to_string(),
+            check_outcomes: Vec::new(),
         }
+    }
+
+    /// v16 → v17 forward-compat: a `RunRecord` blob written before the
+    /// `check_outcomes` field existed (no `check_outcomes` key) must
+    /// forward-deserialize with the outcomes defaulting to empty — never crash
+    /// the read. Also asserts a v17 record carrying outcomes round-trips.
+    #[test]
+    fn test_v16_run_record_forward_deserializes_check_outcomes_empty() {
+        // A full v16 record serialized with `check_outcomes` stripped.
+        let mut value = serde_json::to_value(minimal_run_record("run-v16", vec![]))
+            .expect("serialize run record");
+        value
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("check_outcomes");
+        let blob = serde_json::to_vec(&value).expect("reserialize without field");
+
+        let record: RunRecord =
+            serde_json::from_slice(&blob).expect("pre-v17 RunRecord must forward-deserialize");
+        assert_eq!(record.run_id, "run-v16");
+        assert!(
+            record.check_outcomes.is_empty(),
+            "a pre-v17 record reads back with no check outcomes"
+        );
+
+        // A v17 record carrying outcomes round-trips losslessly.
+        let mut with_outcomes = minimal_run_record("run-v17", vec![]);
+        with_outcomes.check_outcomes = vec![
+            CheckOutcome {
+                name: "row_count".to_string(),
+                passed: true,
+            },
+            CheckOutcome {
+                name: "not_null:email".to_string(),
+                passed: false,
+            },
+        ];
+        let round: RunRecord =
+            serde_json::from_slice(&serde_json::to_vec(&with_outcomes).unwrap()).unwrap();
+        assert_eq!(round.check_outcomes, with_outcomes.check_outcomes);
     }
 
     #[test]
@@ -6792,6 +6869,7 @@ mod tests {
             effect: PolicyEffect::Allow,
             rule_id: Some(1),
             reason: "allow by rule 1".to_string(),
+            verify_after: Vec::new(),
         };
         let later = PolicyDecisionRecord {
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-07-07T11:00:00Z")
@@ -6804,6 +6882,7 @@ mod tests {
             effect: PolicyEffect::Deny,
             rule_id: Some(0),
             reason: "denied by rule 0 (deny overrides)".to_string(),
+            verify_after: Vec::new(),
         };
         // Insert out of order; the ledger must return them chronologically.
         store.record_policy_decision(&later).unwrap();
@@ -7231,9 +7310,11 @@ mod tests {
         // v16 adds `ModelExecution.attempts` (the classified-retry trail). That
         // is a serde-additive *field* on a blob — the redb table set does NOT
         // change, so EXPECTED_TABLES below is untouched; only the version moves.
-        // A v15 blob forward-deserializes with the trail empty (guarded by
-        // `test_v15_model_execution_forward_deserializes_attempts_empty`).
-        const EXPECTED_VERSION: u32 = 16;
+        // v17 adds the `verify_after` post-apply-gate fields (`RunRecord::
+        // check_outcomes`, `PolicyDecisionRecord::verify_after`), also
+        // serde-additive fields — guarded by
+        // `test_v16_run_record_forward_deserializes_check_outcomes_empty`.
+        const EXPECTED_VERSION: u32 = 17;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",

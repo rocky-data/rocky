@@ -474,6 +474,7 @@ mod tests {
             capability,
             scope,
             effect,
+            verify_after: Vec::new(),
             conditions: None,
         }
     }
