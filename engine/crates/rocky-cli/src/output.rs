@@ -1136,6 +1136,73 @@ fn derive_input_identity(mat: &MaterializationOutput) -> (Option<String>, Option
     (Some(input_hash), Some(proof_class))
 }
 
+/// Build the `recipe_manifest.*` warehouse-metadata key-value set for one
+/// materialized model, ready to hand to
+/// [`GovernanceAdapter::write_recipe_manifest`](rocky_core::traits::GovernanceAdapter::write_recipe_manifest).
+///
+/// This is the **engine → manifest** name mapping applied at write time. It
+/// reads the recipe-identity triple stamped on
+/// [`MaterializationOutput::recipe_identity`] (never recomputing it) and folds
+/// in the manifest carrier fields, keying each under
+/// [`RECIPE_MANIFEST_TBLPROP_PREFIX`](rocky_core::catalog::RECIPE_MANIFEST_TBLPROP_PREFIX):
+///
+/// | manifest field | `recipe_manifest.*` key | source |
+/// |---|---|---|
+/// | `manifest_version` | `manifest_version` | constant `"0.1"` |
+/// | `hash_scheme` | `hash_scheme` | `recipe_identity.hash_scheme` |
+/// | `program_hash` | `program_hash` | `recipe_identity.recipe_hash` |
+/// | `env_hash` | `env_hash` | `recipe_identity.env_hash` |
+/// | `inputs_hash` | `inputs_hash` | `derive_input_identity` (omitted when `None`) |
+/// | `inputs_proof_class` | `inputs_proof_class` | `derive_input_identity` (travels with `inputs_hash`) |
+/// | `producer.name` | `producer.name` | constant `"rocky"` |
+/// | `producer.version` | `producer.version` | `engine_version` |
+/// | `subject.model` | `subject.model` | last segment of `asset_key` |
+/// | `subject.run_id` | `subject.run_id` | `run_id` |
+/// | `subject.status` | `subject.status` | `"success"` (a materialized model succeeded) |
+///
+/// The `inputs_hash` / `inputs_proof_class` pair is written **both or
+/// neither** — the manifest spec's honesty invariant. On a default
+/// (non-`--skip-unchanged`, non-reuse) run neither is present, matching a
+/// managed Databricks run that observes no content-hashed inputs.
+///
+/// Returns `None` when the materialization carries no recipe-identity (a path
+/// that did not stamp it) or has no `asset_key` to name the subject — the
+/// caller then skips the write for that model.
+pub(crate) fn recipe_manifest_properties(
+    mat: &MaterializationOutput,
+    run_id: &str,
+    engine_version: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let identity = mat.recipe_identity.as_ref()?;
+    let model = mat.asset_key.last()?;
+
+    let prefix = rocky_core::catalog::RECIPE_MANIFEST_TBLPROP_PREFIX;
+    let mut props = std::collections::BTreeMap::new();
+    let mut put = |field: &str, value: String| {
+        props.insert(format!("{prefix}{field}"), value);
+    };
+
+    put("manifest_version", "0.1".to_string());
+    put("hash_scheme", identity.hash_scheme.clone());
+    put("program_hash", identity.recipe_hash.clone());
+    put("env_hash", identity.env_hash.clone());
+
+    let (input_hash, proof_class) = derive_input_identity(mat);
+    // Both-or-neither: the manifest spec's dependentRequired invariant.
+    if let (Some(ih), Some(pc)) = (input_hash, proof_class) {
+        put("inputs_hash", ih);
+        put("inputs_proof_class", pc);
+    }
+
+    put("producer.name", "rocky".to_string());
+    put("producer.version", engine_version.to_string());
+    put("subject.model", model.clone());
+    put("subject.run_id", run_id.to_string());
+    put("subject.status", "success".to_string());
+
+    Some(props)
+}
+
 /// The per-model build decision the engine made this run — what the
 /// skip-gate and content-addressed reuse machinery actually decided.
 ///
@@ -5125,6 +5192,82 @@ mod cost_finalize_tests {
             output_column_hashes: None,
             consumed_column_baseline: None,
         }
+    }
+
+    fn sample_identity() -> RecipeIdentityInternal {
+        RecipeIdentityInternal {
+            recipe_hash: "2148e619b51421f51cfb3fac423145fe245bbe409b74f31c22d703ab07453036"
+                .to_string(),
+            env_hash: "bbf2c2045328f738683a6336df5fa61b5f00076aeaed7c495c04f9d6991d92bd"
+                .to_string(),
+            hash_scheme: "v1".to_string(),
+        }
+    }
+
+    #[test]
+    fn recipe_manifest_properties_none_without_identity() {
+        let m = mat(&["wh", "silver", "orders"], 100);
+        assert!(
+            super::recipe_manifest_properties(&m, "run-1", "1.58.0").is_none(),
+            "a materialization without recipe_identity yields no manifest props"
+        );
+    }
+
+    #[test]
+    fn recipe_manifest_properties_default_run_omits_inputs() {
+        // Default run path: recipe_identity stamped, but skip_internal is None
+        // (no observed inputs) — inputs_hash/inputs_proof_class must both be
+        // absent, matching a managed Databricks run.
+        let mut m = mat(&["wh", "silver", "orders"], 100);
+        m.recipe_identity = Some(sample_identity());
+        let props = super::recipe_manifest_properties(&m, "run-42", "1.58.0").unwrap();
+
+        assert_eq!(props["recipe_manifest.manifest_version"], "0.1");
+        assert_eq!(props["recipe_manifest.hash_scheme"], "v1");
+        assert_eq!(
+            props["recipe_manifest.program_hash"],
+            "2148e619b51421f51cfb3fac423145fe245bbe409b74f31c22d703ab07453036"
+        );
+        assert_eq!(
+            props["recipe_manifest.env_hash"],
+            "bbf2c2045328f738683a6336df5fa61b5f00076aeaed7c495c04f9d6991d92bd"
+        );
+        assert_eq!(props["recipe_manifest.producer.name"], "rocky");
+        assert_eq!(props["recipe_manifest.producer.version"], "1.58.0");
+        assert_eq!(props["recipe_manifest.subject.model"], "orders");
+        assert_eq!(props["recipe_manifest.subject.run_id"], "run-42");
+        assert_eq!(props["recipe_manifest.subject.status"], "success");
+        assert!(
+            !props.contains_key("recipe_manifest.inputs_hash"),
+            "no observed inputs → inputs_hash omitted"
+        );
+        assert!(
+            !props.contains_key("recipe_manifest.inputs_proof_class"),
+            "no observed inputs → inputs_proof_class omitted (both-or-neither)"
+        );
+    }
+
+    #[test]
+    fn recipe_manifest_properties_with_observed_inputs_writes_pair() {
+        // When the run observed inputs (skip-gate populated upstream
+        // signatures), inputs_hash + inputs_proof_class travel together.
+        let mut m = mat(&["wh", "silver", "orders"], 100);
+        m.recipe_identity = Some(sample_identity());
+        m.skip_internal = Some(ModelSkipState {
+            skip_hash: Some("skip-key-fixed".to_string()),
+            upstream_freshness: vec![rocky_core::state::UpstreamSig {
+                upstream_key: "wh.raw.events".to_string(),
+                max_ts: None,
+                row_count: Some(42),
+                consumed_column_hashes: None,
+            }],
+        });
+        let props = super::recipe_manifest_properties(&m, "run-7", "1.58.0").unwrap();
+        assert!(props.contains_key("recipe_manifest.inputs_hash"));
+        assert_eq!(
+            props["recipe_manifest.inputs_proof_class"], "heuristic",
+            "a watermark upstream is a heuristic (freshness, not byte-identity) claim"
+        );
     }
 
     #[test]
