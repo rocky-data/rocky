@@ -10,6 +10,7 @@ on:
     paths:
       - 'engine/**'
       - 'schemas/**'
+      - 'docs/public/openapi.json'
       - 'sdk/python/src/rocky_sdk/types_generated/**'
       - 'integrations/dagster/tests/fixtures_generated/**'
       - 'editors/vscode/src/types/generated/**'
@@ -23,6 +24,7 @@ on:
     paths:
       - 'engine/**'
       - 'schemas/**'
+      - 'docs/public/openapi.json'
       - 'sdk/python/src/rocky_sdk/types_generated/**'
       - 'integrations/dagster/tests/fixtures_generated/**'
       - 'editors/vscode/src/types/generated/**'
@@ -131,6 +133,7 @@ jobs:
       - name: Fail if anything drifted
         run: |
           if ! git diff --exit-code schemas/ \
+                                    docs/public/openapi.json \
                                     sdk/python/src/rocky_sdk/types_generated/ \
                                     integrations/dagster/tests/fixtures_generated/ \
                                     editors/vscode/src/types/generated/ \

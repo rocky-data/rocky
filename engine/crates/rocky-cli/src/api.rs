@@ -324,7 +324,11 @@ fn state_path_for(state: &ServerState) -> std::path::PathBuf {
 
 /// The `/api/v1` routes this build serves — the feature-detection surface
 /// exposed via `GET /api/v1/meta`.
-fn api_v1_routes() -> Vec<String> {
+///
+/// Exposed to the crate so the OpenAPI generator ([`crate::commands::export_openapi`])
+/// can assert its `paths` table covers exactly this route set — the anti-drift
+/// guard that keeps the generated document honest when a route is added here.
+pub(crate) fn api_v1_routes() -> Vec<String> {
     [
         "GET /api/v1/health",
         "GET /api/v1/meta",
@@ -657,9 +661,15 @@ async fn dag_status(
 /// Optional JSON body for a job submission. Every field is optional; an empty
 /// body runs the verb with its defaults (all pipelines, no filter). Unknown
 /// fields are ignored so an embedder on a newer client stays forward-compatible.
-#[derive(Debug, Default, Deserialize)]
+///
+/// Derives `JsonSchema` (crate-visible) so the OpenAPI generator can emit the
+/// `POST /api/v1/jobs/{run|plan|apply}` request-body schema from this single
+/// source of truth rather than a hand-copied duplicate. It is deliberately not
+/// registered in [`super::commands::export_schemas`], so it stays out of the
+/// Pydantic/TypeScript codegen cascade.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
-struct JobRequest {
+pub(crate) struct JobRequest {
     /// `--filter <component=value>` for `run`/`plan`.
     filter: Option<String>,
     /// `--pipeline <name>` for `run`/`plan`.

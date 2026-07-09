@@ -1969,6 +1969,19 @@ enum Command {
         output_dir: PathBuf,
     },
 
+    /// Generate an OpenAPI 3.1 document for the `rocky serve` HTTP API.
+    ///
+    /// Assembles `components/schemas` from the same JSON Schema registry as
+    /// `export-schemas`, builds `paths` from the `/api/v1` route table, and
+    /// validates the result against the OpenAPI 3.1 meta-schema before writing.
+    /// Run `rocky export-openapi docs/public/openapi.json` from the monorepo
+    /// root to refresh the committed artifact.
+    ExportOpenapi {
+        /// Output path for the OpenAPI document (`.json`)
+        #[arg(default_value = "docs/public/openapi.json")]
+        output_path: PathBuf,
+    },
+
     /// Generate shell completion script for the given shell
     #[command(
         long_about = "Generate shell completion script for the given shell.\n\nEXAMPLES\n    rocky completions zsh  > ~/.zsh/completions/_rocky\n    rocky completions bash > /etc/bash_completion.d/rocky\n    rocky completions fish > ~/.config/fish/completions/rocky.fish"
@@ -3894,6 +3907,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         }
         Command::Fmt { paths, check } => rocky_cli::commands::run_fmt(&paths, check),
         Command::ExportSchemas { output_dir } => rocky_cli::commands::export_schemas(&output_dir),
+        Command::ExportOpenapi { output_path } => rocky_cli::commands::export_openapi(&output_path),
         Command::Completions { shell } => {
             rocky_cli::commands::run_completions::<Cli>(shell, &mut std::io::stdout());
             Ok(())
