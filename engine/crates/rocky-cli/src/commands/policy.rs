@@ -406,6 +406,45 @@ expect = \"allow\"
     }
 
     #[test]
+    fn dominant_allow_cannot_mask_a_ceilinged_sibling() {
+        // The false-allow class the sticky safety cap exists to prevent: a
+        // broad ungated `allow` (constraints {Tags, Models}) strictly dominates
+        // a ceilinged sibling ({Tags}) on specificity, so the ceilinged rule is
+        // filtered out of the non-dominated tier. The sticky cap — not
+        // most-restrictive selection — is what still degrades the dominant
+        // `allow` when the sibling's ceiling is breached. A scenario pins that:
+        // were the cap broken, the resolved effect would be `allow` and this
+        // assertion (expecting require_review) would fail.
+        let body = "
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = \"agent\"
+capability = \"schema_change.additive\"
+scope = { tags = { layer = \"bronze\" }, models = [\"stg_*\"] }
+effect = \"allow\"
+
+[[policy.rules]]
+principal = \"agent\"
+capability = \"schema_change.additive\"
+scope = { tags = { layer = \"bronze\" }, max_downstreams = 5 }
+effect = \"allow\"
+
+[[policy.tests]]
+name = \"dominant broad allow cannot mask a ceilinged sibling\"
+principal = \"agent\"
+capability = \"schema_change.additive\"
+model = \"stg_orders\"
+tags = { layer = \"bronze\" }
+reachable_downstreams = 99
+expect = \"require_review\"
+";
+        let (_dir, path) = config_with(body);
+        run_policy_test(&path, true).expect("sticky cap must keep the scenario green");
+    }
+
+    #[test]
     fn missing_config_errors() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("does-not-exist.toml");
