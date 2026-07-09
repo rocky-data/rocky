@@ -1,0 +1,112 @@
+# 07-policy — agent-policy scenario testing with `rocky policy test`
+#
+# A small governed pipeline whose `[policy]` block grades what an AI agent may
+# do on its own. The `[[policy.tests]]` scenarios pin every rule so a later
+# edit to the policy can't silently open a hole.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[pipeline.warehouse]
+strategy = "full_refresh"
+source.schema_pattern = { prefix = "raw__", separator = "__", components = ["source"] }
+target = { catalog_template = "poc", schema_template = "bronze__{source}" }
+
+# --- The policy: grade agent autonomy by blast radius and boundary ----------
+
+[policy]
+version = 1
+default_agent_effect = "require_review"   # the dial's safe factory position
+
+# Humans own contract boundaries. An agent may not apply there — not even with
+# review; a `deny` cannot be satisfied interactively, which is the point.
+[[policy.rules]]
+principal  = "agent"
+capability = "apply"
+scope      = { contracted = true }
+effect     = "deny"
+
+# A small additive change to non-PII bronze flows automatically. The
+# `max_downstreams` ceiling fails closed: a wide or uncomputable blast radius
+# is degraded back to review.
+[[policy.rules]]
+principal  = "agent"
+capability = "schema_change.additive"
+scope      = { tags = { layer = "bronze" }, exclude_classifications = ["pii"], max_downstreams = 5 }
+effect     = "allow"
+
+# Transient retries are always free — rung-1 autonomy.
+[[policy.rules]]
+principal  = "agent"
+capability = "retry"
+scope      = { any = true }
+effect     = "allow"
+
+# --- The scenarios: one assertion per behaviour the policy must keep --------
+
+[[policy.tests]]
+name       = "an agent may not apply to a contracted model"
+principal  = "agent"
+capability = "apply"
+model      = "fct_revenue"
+contracted = true
+expect     = "deny"
+
+[[policy.tests]]
+name       = "a small additive bronze change flows automatically"
+principal  = "agent"
+capability = "schema_change.additive"
+model                 = "stg_orders"
+tags                  = { layer = "bronze" }
+reachable_downstreams = 3
+expect                = "allow"
+
+[[policy.tests]]
+name       = "the same change with a wide blast radius stops for review"
+principal  = "agent"
+capability = "schema_change.additive"
+model                 = "stg_orders"
+tags                  = { layer = "bronze" }
+reachable_downstreams = 42
+expect                = "require_review"
+
+[[policy.tests]]
+name       = "an uncomputable blast radius is never auto-approved"
+principal  = "agent"
+capability = "schema_change.additive"
+model  = "stg_orders"
+tags   = { layer = "bronze" }
+expect = "require_review"
+
+[[policy.tests]]
+name       = "a PII bronze change is carved out and falls to review"
+principal  = "agent"
+capability = "schema_change.additive"
+model                 = "stg_customers"
+tags                  = { layer = "bronze" }
+classifications       = ["pii"]
+reachable_downstreams = 2
+expect                = "require_review"
+
+[[policy.tests]]
+name       = "a transient retry is always allowed"
+principal  = "agent"
+capability = "retry"
+model      = "stg_orders"
+expect     = "allow"
+
+[[policy.tests]]
+name       = "a human is never gated by the policy"
+principal  = "human"
+capability = "apply"
+model      = "fct_revenue"
+contracted = true
+expect     = "allow"
+
+[[policy.tests]]
+name       = "an unmatched agent action falls to the default posture"
+principal  = "agent"
+capability = "promote"
+model      = "stg_orders"
+expect     = "require_review"

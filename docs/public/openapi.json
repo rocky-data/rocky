@@ -11132,6 +11132,13 @@
             },
             "type": "array"
           },
+          "tests": {
+            "description": "Scenario assertions run by `rocky policy test`. Each pins the effect the evaluator must resolve for a `(principal, capability, target)` triple, so a policy edit that would silently open a hole fails CI. Never read by any enforcement path — purely a testing surface.",
+            "items": {
+              "$ref": "#/components/schemas/PolicyTest"
+            },
+            "type": "array"
+          },
           "version": {
             "description": "Schema version. Must be `1`.",
             "format": "uint32",
@@ -11367,6 +11374,214 @@
             "type": "object"
           }
         },
+        "type": "object"
+      },
+      "PolicyTest": {
+        "additionalProperties": false,
+        "description": "One `[[policy.tests]]` scenario: a self-contained assertion over the policy evaluator.\n\nA scenario names a `principal`, a `capability`, a synthetic target model (its attributes spelled out inline), and the `expect`ed effect. The `rocky policy test` runner constructs a [`crate::policy::ModelAttributes`] from these fields *verbatim* — the same value the evaluator receives at a real enforcement seam — feeds it to [`crate::policy::evaluate`], and asserts the resolved effect equals `expect`. Because the attributes are declared, not compiled, a scenario is stable regardless of the current project graph: it pins the *policy's* behaviour, which is exactly what a policy edit must not silently change.",
+        "properties": {
+          "capability": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyCapability"
+              }
+            ],
+            "description": "The capability being attempted."
+          },
+          "classifications": {
+            "default": [],
+            "description": "Synthetic column classifications present on the model (matched against `scope.classifications` / `scope.exclude_classifications`).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "contracted": {
+            "default": false,
+            "description": "Whether the synthetic model sits behind a contract (matched against `scope.contracted`).",
+            "type": "boolean"
+          },
+          "downstreams": {
+            "default": 0,
+            "description": "Synthetic direct downstream count. Informational — the `max_downstreams` ceiling reads `reachable_downstreams`.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "expect": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyEffect"
+              }
+            ],
+            "description": "The effect the evaluator must resolve for this scenario. A mismatch fails the scenario (and the `rocky policy test` run)."
+          },
+          "layer": {
+            "description": "Synthetic medallion/semantic layer (matched against `scope.layer`). When omitted, the runner derives it from `tags[\"layer\"]`, mirroring how a real enforcement seam reads the model's `layer` tag — so a `tags = { layer = ... }` scenario matches a `scope.layer` rule without restating the value. An explicit value here always wins.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "default": "",
+            "description": "Synthetic model name, matched against rule `scope.models` globs. Empty (the default) matches no name-scoped rule — only `any`/attribute rules apply.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Human-readable name for the scenario, echoed in the pass/fail report.",
+            "type": "string"
+          },
+          "principal": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyPrincipal"
+              }
+            ],
+            "description": "The principal attempting the action."
+          },
+          "reachable_downstreams": {
+            "description": "Synthetic transitive blast radius, compared against a rule's `max_downstreams` ceiling. Omit (the default `null`) to model an **uncomputable** blast radius — the ceiling then fails closed, exactly as at a real seam where the graph did not compile.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tags": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Synthetic model-level tags (matched against rule `scope.tags`).",
+            "type": "object"
+          }
+        },
+        "required": [
+          "capability",
+          "expect",
+          "name",
+          "principal"
+        ],
+        "type": "object"
+      },
+      "PolicyTestOutput": {
+        "description": "JSON output for `rocky policy test` — the scenario-assertion runner.\n\nRuns every `[[policy.tests]]` scenario through the real policy evaluator and reports, per scenario, whether the resolved effect matched the expectation. A non-empty `failed` count fails the command (non-zero exit), so a policy edit that would silently open a hole is caught in CI.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "failed": {
+            "description": "How many scenarios resolved to a different effect than expected.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "passed": {
+            "description": "How many scenarios resolved to their expected effect.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "results": {
+            "description": "Per-scenario results, in declaration order.",
+            "items": {
+              "$ref": "#/components/schemas/PolicyTestResult"
+            },
+            "type": "array"
+          },
+          "total": {
+            "description": "Total scenarios asserted.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "failed",
+          "passed",
+          "results",
+          "total",
+          "version"
+        ],
+        "type": "object"
+      },
+      "PolicyTestResult": {
+        "description": "The outcome of one `[[policy.tests]]` scenario.",
+        "properties": {
+          "actual": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyEffect"
+              }
+            ],
+            "description": "The effect the evaluator actually resolved."
+          },
+          "capability": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyCapability"
+              }
+            ],
+            "description": "The capability that was checked."
+          },
+          "expected": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyEffect"
+              }
+            ],
+            "description": "The effect the scenario expected."
+          },
+          "matched_rule": {
+            "description": "Zero-based index of the rule that decided `actual`, or `null` when the decision came from a short-circuit (`read`) or the default posture.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "The synthetic model name the scenario targeted.",
+            "type": "string"
+          },
+          "name": {
+            "description": "The scenario's name.",
+            "type": "string"
+          },
+          "passed": {
+            "description": "`true` when the resolved effect equalled `expected`.",
+            "type": "boolean"
+          },
+          "principal": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PolicyPrincipal"
+              }
+            ],
+            "description": "The principal that was checked."
+          },
+          "reason": {
+            "description": "The evaluator's explanation of how `actual` was reached — the decisive context on a failure.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "actual",
+          "capability",
+          "expected",
+          "model",
+          "name",
+          "passed",
+          "principal",
+          "reason"
+        ],
         "type": "object"
       },
       "PortabilityConfig": {

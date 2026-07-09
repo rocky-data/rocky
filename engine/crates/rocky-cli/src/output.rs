@@ -6545,6 +6545,52 @@ pub struct PolicyModelAttributes {
     pub reachable_downstreams: Option<u64>,
 }
 
+/// JSON output for `rocky policy test` — the scenario-assertion runner.
+///
+/// Runs every `[[policy.tests]]` scenario through the real policy evaluator
+/// and reports, per scenario, whether the resolved effect matched the
+/// expectation. A non-empty `failed` count fails the command (non-zero exit),
+/// so a policy edit that would silently open a hole is caught in CI.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyTestOutput {
+    pub version: String,
+    pub command: String,
+    /// Total scenarios asserted.
+    pub total: usize,
+    /// How many scenarios resolved to their expected effect.
+    pub passed: usize,
+    /// How many scenarios resolved to a different effect than expected.
+    pub failed: usize,
+    /// Per-scenario results, in declaration order.
+    pub results: Vec<PolicyTestResult>,
+}
+
+/// The outcome of one `[[policy.tests]]` scenario.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyTestResult {
+    /// The scenario's name.
+    pub name: String,
+    /// `true` when the resolved effect equalled `expected`.
+    pub passed: bool,
+    /// The principal that was checked.
+    pub principal: rocky_core::config::PolicyPrincipal,
+    /// The capability that was checked.
+    pub capability: rocky_core::config::PolicyCapability,
+    /// The synthetic model name the scenario targeted.
+    pub model: String,
+    /// The effect the scenario expected.
+    pub expected: rocky_core::config::PolicyEffect,
+    /// The effect the evaluator actually resolved.
+    pub actual: rocky_core::config::PolicyEffect,
+    /// Zero-based index of the rule that decided `actual`, or `null` when the
+    /// decision came from a short-circuit (`read`) or the default posture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_rule: Option<usize>,
+    /// The evaluator's explanation of how `actual` was reached — the decisive
+    /// context on a failure.
+    pub reason: String,
+}
+
 /// JSON output for `rocky audit` — the agent-policy decision ledger.
 ///
 /// Lists every policy decision recorded at a mutating enforcement seam

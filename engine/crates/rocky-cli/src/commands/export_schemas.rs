@@ -27,11 +27,12 @@ use crate::output::{
     DagRunOutput, DiscoverOutput, DriftOutput, ErrorEnvelope, EstimateOutput, GcReportOutput,
     HistoryOutput, HooksListOutput, HooksTestOutput, ImportDbtOutput, JobStatus, LineageDiffOutput,
     LineageOutput, LoadOutput, MetaOutput, MetricsOutput, ModelHistoryOutput, OptimizeOutput,
-    PlanOutput, PolicyCheckOutput, PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput,
-    PreviewRowsOutput, ProfileOutput, ProfileStorageOutput, PromotePlan, RecipeHistoryOutput,
-    ReplayCheckOutput, ReplayExecuteOutput, ReplayOutput, RetentionStatusOutput,
-    RetentionSweepOutput, ReviewOutput, ReviewQueueOutput, RunOutput, SeedOutput, StateOutput,
-    TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
+    PlanOutput, PolicyCheckOutput, PolicyTestOutput, PreviewCostOutput, PreviewCreateOutput,
+    PreviewDiffOutput, PreviewRowsOutput, ProfileOutput, ProfileStorageOutput, PromotePlan,
+    RecipeHistoryOutput, ReplayCheckOutput, ReplayExecuteOutput, ReplayOutput,
+    RetentionStatusOutput, RetentionSweepOutput, ReviewOutput, ReviewQueueOutput, RunOutput,
+    SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TraceOutput, ValidateMigrationOutput,
+    ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -128,6 +129,7 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<ReviewOutput>("review"),
         entry::<ReviewQueueOutput>("review_queue"),
         entry::<PolicyCheckOutput>("policy_check"),
+        entry::<PolicyTestOutput>("policy_test"),
         entry::<AuditOutput>("audit"),
         entry::<AuditForOutput>("audit_for"),
         entry::<AuditScorecardOutput>("audit_scorecard"),
