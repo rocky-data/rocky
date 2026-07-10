@@ -273,6 +273,56 @@ pub struct DriftPreviewArgs {
 }
 
 // ---------------------------------------------------------------------------
+// Governor tool parameter structs.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct EstateBriefArgs {
+    /// Time window for the digest: `"last"`, `"24h"`, or `"7d"`. Defaults to
+    /// `"7d"`. `"last"` reads the digest cursor **read-only** and never advances
+    /// it, so a conversational query does not consume the Slack/email hook's
+    /// `--since last` cursor.
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AuditQueryArgs {
+    /// The subject to trace the custody chain for: a model name, a run id, or a
+    /// 64-character plan id. The chain resolves principal → decision → plan →
+    /// diff → run → downstream blast radius, with each link failing closed to
+    /// `unavailable` rather than fabricating a value.
+    pub subject: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ScorecardArgs {
+    /// Grouping dimension: `"principal"`, `"rule"`, or `"scope"`. Defaults to
+    /// `"principal"`.
+    #[serde(default)]
+    pub by: Option<String>,
+    /// Window: `"all"` or a `"<N>d"` / `"<N>h"` duration (e.g. `"30d"`).
+    /// Defaults to all-time.
+    #[serde(default)]
+    pub window: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReviewQueueArgs {
+    /// When set, APPROVE this pending plan_id instead of listing the queue. The
+    /// plan must be one currently awaiting review — call with this unset first
+    /// to see the pending plan_ids.
+    #[serde(default)]
+    pub approve_plan_id: Option<String>,
+    /// Explicit confirmation for the approve action. Approving writes a human
+    /// sign-off marker that unblocks `rocky apply`, so it is refused unless this
+    /// is `true`. Set it ONLY when the human has explicitly authorized approving
+    /// this exact plan — it stands in for that human intent.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Prompt argument structs (schemars 1.x — rmcp's `Parameters<T>` bound).
 // MCP prompt arguments are string-typed on the wire; `Serialize` is part of
 // the prompt-macro contract (mirrors rmcp's own examples).
@@ -2392,6 +2442,280 @@ impl RockyMcpServer {
                 ))
             }
         }
+    }
+
+    // ------------------------- governor tools ------------------------------
+    // The human-oversight surface for an agent-operated estate — typed
+    // projections of the same decision/run ledger the worker-agent tools write
+    // to, so "what did agents do this week, and why was that apply allowed?" is
+    // a cited, conversational query. `estate_brief` / `audit_query` /
+    // `scorecard` are read-only; `review_queue` reads the pending queue and,
+    // behind an explicit `confirm`, writes the human sign-off marker. Every
+    // projection reuses the shipped `brief` / `audit` / `review` cores, so a
+    // section whose underlying query fails renders `unavailable` rather than a
+    // smoothed-over narrative — the ledger grounds, no LLM narrates here.
+
+    #[tool(
+        description = "The governor's estate digest: agent activity by principal (proposals, \
+         applies, denials with rule names), pending review escalations ranked, runs needing \
+         attention, drift observed vs auto-handled, freshness/quality, cost + autonomy-budget \
+         burn, and degraded/frozen rules — every line carrying a ledger citation \
+         (run_id/plan_id/decision_ref). Template-first: a section whose query fails renders \
+         `unavailable`, never a fabricated summary. `since` is `last` | `24h` | `7d` (default \
+         `7d`); reads are side-effect-free (never advances the `--since last` cursor)."
+    )]
+    async fn estate_brief(
+        &self,
+        params: Parameters<EstateBriefArgs>,
+    ) -> ToolResult<serde_json::Value> {
+        let since = match params.0.since.as_deref().unwrap_or("7d") {
+            "last" => commands::BriefSince::Last,
+            "24h" => commands::BriefSince::Hours24,
+            "7d" => commands::BriefSince::Days7,
+            other => {
+                return Err(ToolError::invalid_argument(
+                    format!("unknown since window '{other}'"),
+                    "Pass one of: last, 24h, 7d.",
+                ));
+            }
+        };
+        let output = commands::compute_brief(
+            &self.state_path(),
+            &self.config_path,
+            since,
+            chrono::Utc::now(),
+        )
+        .map_err(|e| {
+            ToolError::internal(
+                format!("{e:#}"),
+                "Could not read the state store to compose the digest; ensure the project's \
+                 state store is present and readable.",
+            )
+        })?;
+        let value = serde_json::to_value(&output).map_err(|e| {
+            ToolError::internal(
+                format!("failed to serialize the estate brief: {e}"),
+                "Retry; if it persists this is an internal serialization bug.",
+            )
+        })?;
+        Ok(Json(value))
+    }
+
+    #[tool(
+        description = "Trace the custody chain for a subject: a model name, a run id, or a \
+         64-character plan id. Returns the one-query drill-down — who proposed it (principal), \
+         what the policy plane decided (rule id + effect), what the plan changed (typed diff), \
+         which runs materialized it, what post-apply verification found, and the downstream \
+         blast radius. Each link fails closed: a link whose signal is genuinely not recorded \
+         renders `unavailable` with a note rather than a fabricated value. Read-only."
+    )]
+    async fn audit_query(
+        &self,
+        params: Parameters<AuditQueryArgs>,
+    ) -> ToolResult<serde_json::Value> {
+        let subject = params.0.subject;
+        if subject.trim().is_empty() {
+            return Err(ToolError::invalid_argument(
+                "subject is empty",
+                "Pass a model name, a run id, or a 64-character plan id to trace.",
+            ));
+        }
+        let output = commands::compute_audit_for(
+            &self.root,
+            &self.config_path,
+            &self.state_path(),
+            &self.models_dir,
+            &subject,
+        )
+        .map_err(|e| {
+            ToolError::internal(
+                format!("{e:#}"),
+                "Could not assemble the custody chain; ensure the project's state store is \
+                 present and readable.",
+            )
+        })?;
+        let value = serde_json::to_value(&output).map_err(|e| {
+            ToolError::internal(
+                format!("failed to serialize the custody chain: {e}"),
+                "Retry; if it persists this is an internal serialization bug.",
+            )
+        })?;
+        Ok(Json(value))
+    }
+
+    #[tool(
+        description = "The trust scorecard: a decisions-by-group aggregation over the policy \
+         ledger — acceptance rate, denial rate, and require-review rate per group. `by` is \
+         `principal` | `rule` | `scope` (default `principal`); `window` is `all` or a `<N>d` / \
+         `<N>h` duration (e.g. `30d`, default all-time). Only metrics the ledger actually \
+         persists are computed; verify-after / revert / escalation-latency metrics are declared \
+         `unavailable` with a reason, never faked. This informs human judgment — nothing here is \
+         wired to any automatic policy change. Read-only."
+    )]
+    async fn scorecard(&self, params: Parameters<ScorecardArgs>) -> ToolResult<serde_json::Value> {
+        let by = match params.0.by.as_deref().unwrap_or("principal") {
+            "principal" => rocky_cli::output::ScorecardDimension::Principal,
+            "rule" => rocky_cli::output::ScorecardDimension::Rule,
+            "scope" => rocky_cli::output::ScorecardDimension::Scope,
+            other => {
+                return Err(ToolError::invalid_argument(
+                    format!("unknown scorecard dimension '{other}'"),
+                    "Pass one of: principal, rule, scope.",
+                ));
+            }
+        };
+        // The only error path is a malformed `window` (a usage error); a ledger
+        // read failure renders the scorecard `unavailable` inside the core.
+        let output =
+            commands::compute_audit_scorecard(&self.state_path(), by, params.0.window.as_deref())
+                .map_err(|e| {
+                ToolError::invalid_argument(
+                    format!("{e:#}"),
+                    "Pass `window` as 'all' or a '<N>d' / '<N>h' duration (e.g. 30d).",
+                )
+            })?;
+        let value = serde_json::to_value(&output).map_err(|e| {
+            ToolError::internal(
+                format!("failed to serialize the scorecard: {e}"),
+                "Retry; if it persists this is an internal serialization bug.",
+            )
+        })?;
+        Ok(Json(value))
+    }
+
+    #[tool(
+        description = "The ranked pending-review queue, and a GATED approve action. With no \
+         `approve_plan_id`, lists every `require_review` escalation not yet signed off, ranked by \
+         blast_radius × classification × staleness, each carrying its decision_ref, plan_id, and \
+         `approve_command`. With `approve_plan_id` + `confirm=true`, writes the human sign-off \
+         marker that unblocks `rocky apply` for that plan — refused unless the plan is actually in \
+         the pending queue AND `confirm` is set (the require-review-grade confirmation stands in \
+         for explicit human intent). Policy applies to the governor's agent too: the approval is \
+         attributed to the operator's git identity, not a cryptographically bound principal (a \
+         signed human confirmation is a later step). Never approve on the user's behalf."
+    )]
+    async fn review_queue(
+        &self,
+        params: Parameters<ReviewQueueArgs>,
+    ) -> ToolResult<ReviewQueueResult> {
+        let args = params.0;
+        let state_path = self.state_path();
+
+        // Always compute the current queue first — it is both the read result
+        // and the guard that an approve targets a genuinely pending escalation.
+        let queue = commands::compute_review_queue(
+            &self.root,
+            &self.config_path,
+            &state_path,
+            &self.models_dir,
+        )
+        .map_err(|e| {
+            ToolError::internal(
+                format!("{e:#}"),
+                "Could not build the review queue; ensure the project's state store is present \
+                 and readable.",
+            )
+        })?;
+
+        let Some(plan_id) = args.approve_plan_id.as_deref() else {
+            // Read mode.
+            let pending = serde_json::to_value(&queue.pending).map_err(|e| {
+                ToolError::internal(
+                    format!("failed to serialize the review queue: {e}"),
+                    "Retry; if it persists this is an internal serialization bug.",
+                )
+            })?;
+            return Ok(Json(ReviewQueueResult {
+                total: queue.total,
+                ranking: queue.ranking,
+                pending,
+                approval: None,
+            }));
+        };
+
+        // The plan must be an outstanding escalation in THIS queue — not an
+        // arbitrary reviewable plan.
+        if !queue.pending.iter().any(|e| e.plan_id == plan_id) {
+            return Err(ToolError::invalid_argument(
+                format!("plan '{plan_id}' is not in the pending review queue"),
+                "Call review_queue with no approve_plan_id to see the plan_ids currently awaiting \
+                 review, then approve one of those.",
+            ));
+        }
+
+        // The gate: approving writes a human sign-off marker, so it requires an
+        // explicit, require-review-grade confirmation.
+        if !args.confirm {
+            return Err(ToolError::policy_review_required(
+                format!(
+                    "approving '{plan_id}' writes a human sign-off marker that unblocks \
+                     `rocky apply`; it requires explicit confirmation."
+                ),
+                "Re-call review_queue with confirm=true ONLY when the human has explicitly \
+                 authorized approving this exact plan. The approval is attributed to the \
+                 operator's git identity — never approve on the user's behalf.",
+                None,
+            ));
+        }
+
+        // Write the sign-off marker (the artifact `rocky apply` checks),
+        // attributed to the operator running this server. Reuses the exact
+        // `rocky review --approve` core; the breaking-change gate is best-effort
+        // and the marker writes regardless.
+        let review = commands::compute_review(&self.root, &self.config_path, plan_id, "HEAD", true)
+            .await
+            .map_err(|e| {
+                ToolError::internal(
+                    format!("{e:#}"),
+                    "Confirm the plan is an AI-authored or agent-authored plan and the project \
+                     directory is writable so the sign-off marker can be persisted.",
+                )
+            })?;
+
+        let breaking_change_count = review
+            .breaking_changes
+            .as_ref()
+            .map(|f| f.iter().filter(|x| x.is_breaking()).count() as u64)
+            .unwrap_or(0);
+        let approval = ReviewApprovalOutcome {
+            plan_id: plan_id.to_string(),
+            marker_written: review.marker_written,
+            breaking_change_count,
+            message: review.message.unwrap_or_default(),
+            attribution: "Recorded via the governor MCP surface and attributed to the operator's \
+                 git identity (name/email/host), not a cryptographically bound principal. A signed \
+                 human confirmation is a later step; the confirm flag stands in for explicit human \
+                 intent today."
+                .to_string(),
+        };
+
+        // Re-list the queue post-approval so the caller sees this escalation
+        // cleared by the marker just written.
+        let queue_after = commands::compute_review_queue(
+            &self.root,
+            &self.config_path,
+            &state_path,
+            &self.models_dir,
+        )
+        .map_err(|e| {
+            ToolError::internal(
+                format!("{e:#}"),
+                "The sign-off marker was written, but re-listing the queue failed; re-call \
+                 review_queue to see the current state.",
+            )
+        })?;
+        let pending = serde_json::to_value(&queue_after.pending).map_err(|e| {
+            ToolError::internal(
+                format!("failed to serialize the review queue: {e}"),
+                "Retry; if it persists this is an internal serialization bug.",
+            )
+        })?;
+        Ok(Json(ReviewQueueResult {
+            total: queue_after.total,
+            ranking: queue_after.ranking,
+            pending,
+            approval: Some(approval),
+        }))
     }
 
     /// Resolve the project's target warehouse adapter from `rocky.toml`.

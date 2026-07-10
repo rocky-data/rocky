@@ -800,3 +800,57 @@ pub struct DriftPreviewResult {
     /// `"add_columns"`, `"alter_column_types"`, or `"drop_and_recreate"`.
     pub action: String,
 }
+
+// ---------------------------------------------------------------------------
+// Governor tools
+// ---------------------------------------------------------------------------
+//
+// The three read projections (`estate_brief`, `audit_query`, `scorecard`)
+// return the shipped `*Output` core re-serialized as a `serde_json::Value` —
+// the most faithful projection, preserving every ledger citation
+// (`run_id` / `plan_id` / `decision_ref`) with no lossy field-by-field
+// re-mapping. `review_queue` is the exception: it carries the queue **and** the
+// outcome of the gated approve action, so it needs a typed envelope.
+
+/// Result of the `review_queue` tool.
+///
+/// In the read mode (`approve_plan_id` unset) `approval` is `None` and `pending`
+/// carries the full ranked queue. In the approve mode it carries the
+/// [`ReviewApprovalOutcome`] and `pending` is re-listed *after* the sign-off, so
+/// the caller sees the just-approved escalation cleared.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReviewQueueResult {
+    /// Number of escalations still awaiting review after this call.
+    pub total: u64,
+    /// Human-readable description of the queue ordering.
+    pub ranking: String,
+    /// The ranked pending escalations, each carrying its `decision_ref`,
+    /// `plan_id`, `blast_radius`, `score`, and `approve_command` citation — the
+    /// shipped `ReviewQueueOutput.pending` serialized verbatim so no citation is
+    /// dropped.
+    pub pending: serde_json::Value,
+    /// Present only when this call approved a plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ReviewApprovalOutcome>,
+}
+
+/// Outcome of the gated `review_queue` approve action.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReviewApprovalOutcome {
+    /// The plan the sign-off marker was written for.
+    pub plan_id: String,
+    /// Whether the sign-off marker (`.rocky/plans/<plan_id>.reviewed.json`, the
+    /// artifact `rocky apply` checks) was written.
+    pub marker_written: bool,
+    /// Count of breaking-severity findings the sign-off covers (0 when the
+    /// breaking-change gate could not run — a non-git project or a compile
+    /// failure — which is not itself a blocker).
+    pub breaking_change_count: u64,
+    /// Human-readable summary of the review outcome.
+    pub message: String,
+    /// How this approval is attributed and its limits — an honest note that the
+    /// marker records the operator's git identity, not a cryptographically bound
+    /// principal. A signed human confirmation is a later step; today the
+    /// `confirm` argument stands in for that explicit human intent.
+    pub attribution: String,
+}

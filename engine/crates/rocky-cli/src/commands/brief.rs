@@ -95,25 +95,58 @@ pub fn run_brief(
     json: bool,
 ) -> Result<()> {
     let now = Utc::now();
+    let output = compute_brief(state_path, config_path, since, now)?;
+    emit(&output, json)?;
 
+    // Advance the digest cursor only after a successful render, and only for
+    // the `--since last` mode — the relative windows never touch it. Advancing
+    // to the same `now` the digest was composed at keeps the next `--since
+    // last` window contiguous. `compute_brief` opened the store read-only, so
+    // this is a separate short write (the read handle is already dropped).
+    if let BriefSince::Last = since
+        && state_path.exists()
+    {
+        let store = StateStore::open(state_path)
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+        store
+            .set_last_brief_at(now)
+            .context("failed to advance the brief cursor")?;
+    }
+
+    Ok(())
+}
+
+/// Compose the estate digest without rendering or advancing the cursor.
+///
+/// This is the reusable core behind both `rocky brief` and the governor's
+/// `estate_brief` MCP tool: it opens the state store **read-only**, projects
+/// every section over the `--since` window at the caller-supplied `now`, and
+/// returns the typed [`BriefOutput`]. It performs no I/O to stdout and never
+/// mutates the brief cursor — the cursor advance is [`run_brief`]'s job, so the
+/// conversational MCP surface can query the digest without consuming the Slack
+/// hook's `--since last` cursor.
+///
+/// Fails closed: an absent state store yields a fully `unavailable` digest
+/// rather than an error.
+pub fn compute_brief(
+    state_path: &Path,
+    config_path: &Path,
+    since: BriefSince,
+    now: DateTime<Utc>,
+) -> Result<BriefOutput> {
     // Fail closed on an absent state store: there is no history to project.
     if !state_path.exists() {
-        let output = empty_brief(
+        return Ok(empty_brief(
             now,
             since,
             None,
             "state store not found — no runs, decisions, or metrics have been recorded yet",
-        );
-        return emit(&output, json);
+        ));
     }
 
-    // `--since last` advances the digest cursor, so it needs write access;
-    // the relative windows are read-only.
-    let store = match since {
-        BriefSince::Last => StateStore::open(state_path),
-        _ => StateStore::open_read_only(state_path),
-    }
-    .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    // Read-only throughout — the cursor advance is the caller's concern.
+    let store = StateStore::open_read_only(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     let since_ts: Option<DateTime<Utc>> = match since {
         BriefSince::Last => store
@@ -152,7 +185,7 @@ pub fn run_brief(
     // `--since` slice.
     let autonomy = build_autonomy(config_path, &decisions, now);
 
-    let output = BriefOutput {
+    Ok(BriefOutput {
         version: VERSION.to_string(),
         command: "brief".to_string(),
         generated_at: now.to_rfc3339(),
@@ -166,17 +199,7 @@ pub fn run_brief(
         quality,
         cost,
         autonomy,
-    };
-
-    // Advance the cursor only after a successful render, and only for the
-    // digest mode — relative windows never touch it.
-    if let BriefSince::Last = since {
-        store
-            .set_last_brief_at(now)
-            .context("failed to advance the brief cursor")?;
-    }
-
-    emit(&output, json)
+    })
 }
 
 /// True when `ts` falls at or after the window's lower bound. An unbounded

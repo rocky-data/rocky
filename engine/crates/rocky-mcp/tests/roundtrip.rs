@@ -80,6 +80,7 @@ async fn tools_list_returns_expected_set() {
         vec![
             "ai_contract",
             "ai_test",
+            "audit_query",
             "breaking_change",
             "catalog",
             "compile",
@@ -88,6 +89,7 @@ async fn tools_list_returns_expected_set() {
             "draft_contract",
             "draft_model",
             "drift_preview",
+            "estate_brief",
             "explain_model",
             "governance_preview",
             "history",
@@ -99,7 +101,9 @@ async fn tools_list_returns_expected_set() {
             "plan_preview",
             "profile_column",
             "propose",
+            "review_queue",
             "sample_rows",
+            "scorecard",
             "suggest_freshness_block",
             "test",
         ]
@@ -346,6 +350,218 @@ effect = "require_review"
     assert!(
         message.contains(plan_id) || hint.contains(plan_id),
         "the recorded plan_id is surfaced: message={message} hint={hint}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// End-to-end reachability for the four governor tools over the real stdio
+/// server: an agent `propose` under a `require_review` policy plants one
+/// escalation in the ledger, then every governor projection surfaces it with
+/// citations, the scorecard matches hand-computed truth, and the `review_queue`
+/// approve action is gated on an explicit confirmation before it writes the
+/// sign-off marker that unblocks `rocky apply`.
+#[tokio::test]
+async fn governor_tools_surface_escalation_and_gate_the_approve() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "require_review"
+"#,
+    );
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // An agent proposes → recorded as a require_review escalation in the ledger,
+    // and the AI-authored plan is persisted for a reviewer.
+    let _ = client
+        .call_tool(CallToolRequestParams::new("propose"))
+        .await
+        .expect("propose returns a result");
+    let plans = plan_files(dir.path());
+    assert_eq!(plans.len(), 1, "the propose persisted one plan for review");
+    let plan_id = plans[0].file_stem().unwrap().to_str().unwrap().to_string();
+
+    // review_queue (read) lists the escalation, cited.
+    let queue = client
+        .call_tool(CallToolRequestParams::new("review_queue"))
+        .await
+        .expect("review_queue call");
+    assert_ne!(
+        queue.is_error,
+        Some(true),
+        "listing the queue is not an error"
+    );
+    let sc = queue.structured_content.expect("queue structured content");
+    assert_eq!(sc["total"], serde_json::json!(1));
+    let pending = sc["pending"].as_array().unwrap();
+    assert_eq!(pending.len(), 1, "one escalation awaits review");
+    assert_eq!(pending[0]["plan_id"], serde_json::json!(plan_id));
+    assert_eq!(pending[0]["principal"], serde_json::json!("agent"));
+    assert!(
+        pending[0]["decision_ref"]
+            .as_str()
+            .unwrap()
+            .contains(&plan_id),
+        "the queue entry carries a ledger citation naming the plan"
+    );
+    assert!(
+        pending[0]["approve_command"]
+            .as_str()
+            .unwrap()
+            .contains(&plan_id)
+    );
+
+    // Approving a plan that is NOT in the pending queue is refused up front —
+    // the approve action only clears genuinely-pending escalations.
+    let bogus = serde_json::json!({ "approve_plan_id": "0".repeat(64), "confirm": true })
+        .as_object()
+        .unwrap()
+        .clone();
+    let bogus_res = client
+        .call_tool(CallToolRequestParams::new("review_queue").with_arguments(bogus))
+        .await
+        .expect("review_queue bogus approve returns a result");
+    assert_eq!(bogus_res.is_error, Some(true));
+    assert_eq!(
+        bogus_res.structured_content.expect("error envelope")["code"],
+        serde_json::json!("invalid_argument"),
+        "approving a non-pending plan is rejected even with confirm=true"
+    );
+
+    // estate_brief surfaces the escalation + agent activity, cited.
+    let brief = client
+        .call_tool(CallToolRequestParams::new("estate_brief"))
+        .await
+        .expect("estate_brief call");
+    assert_ne!(brief.is_error, Some(true));
+    let bc = brief.structured_content.expect("brief structured content");
+    assert_eq!(
+        bc["agent_activity"]["require_review"],
+        serde_json::json!(1),
+        "the brief counts the agent escalation"
+    );
+    let escalations = bc["escalations"]["pending"].as_array().unwrap();
+    assert!(
+        escalations
+            .iter()
+            .any(|e| e["plan_id"] == serde_json::json!(plan_id)),
+        "the brief's escalations name the pending plan: {bc:?}"
+    );
+
+    // audit_query --for <plan_id> returns the resolved custody chain.
+    let audit_args = serde_json::json!({ "subject": plan_id })
+        .as_object()
+        .unwrap()
+        .clone();
+    let audit = client
+        .call_tool(CallToolRequestParams::new("audit_query").with_arguments(audit_args))
+        .await
+        .expect("audit_query call");
+    let ac = audit.structured_content.expect("audit structured content");
+    assert_eq!(ac["subject_kind"], serde_json::json!("plan"));
+    assert_eq!(ac["resolved"], serde_json::json!(true));
+    assert!(
+        ac["decisions"]["total"].as_u64().unwrap() >= 1,
+        "the custody chain carries the governing decision: {ac:?}"
+    );
+
+    // scorecard --by principal matches hand truth: 1 agent decision, all review.
+    let scorecard_args = serde_json::json!({ "by": "principal" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let scorecard = client
+        .call_tool(CallToolRequestParams::new("scorecard").with_arguments(scorecard_args))
+        .await
+        .expect("scorecard call");
+    let sco = scorecard.structured_content.expect("scorecard content");
+    assert_eq!(sco["by"], serde_json::json!("principal"));
+    assert_eq!(sco["total_decisions"], serde_json::json!(1));
+    let groups = sco["groups"].as_array().unwrap();
+    let agent = groups
+        .iter()
+        .find(|g| g["key"] == serde_json::json!("agent"))
+        .expect("an agent group in the scorecard");
+    assert_eq!(agent["total"], serde_json::json!(1));
+    assert_eq!(agent["require_review"], serde_json::json!(1));
+    assert_eq!(agent["allow"], serde_json::json!(0));
+    assert_eq!(agent["deny"], serde_json::json!(0));
+    assert!(
+        (agent["review_rate"].as_f64().unwrap() - 1.0).abs() < 1e-9,
+        "escalation rate is 1.0: {agent:?}"
+    );
+
+    // review_queue approve WITHOUT confirm → the gate refuses.
+    let approve_no_confirm = serde_json::json!({ "approve_plan_id": plan_id })
+        .as_object()
+        .unwrap()
+        .clone();
+    let refused = client
+        .call_tool(CallToolRequestParams::new("review_queue").with_arguments(approve_no_confirm))
+        .await
+        .expect("review_queue approve (no confirm) returns a result");
+    assert_eq!(
+        refused.is_error,
+        Some(true),
+        "an unconfirmed approve is refused"
+    );
+    let err = refused
+        .structured_content
+        .expect("structured error envelope");
+    assert_eq!(err["code"], serde_json::json!("policy_review_required"));
+
+    // No sign-off marker before confirmation — the gate held.
+    let marker = dir
+        .path()
+        .join(".rocky")
+        .join("plans")
+        .join(format!("{plan_id}.reviewed.json"));
+    assert!(!marker.exists(), "no sign-off marker before confirmation");
+
+    // review_queue approve WITH confirm=true → writes the marker, attributed.
+    let approve = serde_json::json!({ "approve_plan_id": plan_id, "confirm": true })
+        .as_object()
+        .unwrap()
+        .clone();
+    let approved = client
+        .call_tool(CallToolRequestParams::new("review_queue").with_arguments(approve))
+        .await
+        .expect("review_queue approve call");
+    assert_ne!(
+        approved.is_error,
+        Some(true),
+        "a confirmed approve succeeds: {approved:?}"
+    );
+    let ap = approved.structured_content.expect("approval content");
+    assert_eq!(ap["approval"]["marker_written"], serde_json::json!(true));
+    assert_eq!(ap["approval"]["plan_id"], serde_json::json!(plan_id));
+    assert!(
+        ap["approval"]["attribution"]
+            .as_str()
+            .unwrap()
+            .contains("git identity"),
+        "the approval is honest that attribution is the operator's git identity"
+    );
+    assert_eq!(
+        ap["total"],
+        serde_json::json!(0),
+        "the approved escalation is cleared from the re-listed queue"
+    );
+
+    // The sign-off marker that unblocks `rocky apply` now exists on disk.
+    assert!(
+        marker.exists(),
+        "the confirmed approve wrote the sign-off marker"
     );
 
     client.cancel().await.unwrap();
