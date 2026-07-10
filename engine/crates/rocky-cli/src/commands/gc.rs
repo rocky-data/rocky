@@ -67,7 +67,10 @@ use tracing::warn;
 
 use rocky_core::config::{PolicyCapability, PolicyPrincipal, load_rocky_config};
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
-use rocky_core::state::{ArtifactRecord, ModelExecution, RunRecord, StateStore, TombstoneRecord};
+use rocky_core::state::{
+    ArtifactRecord, EvictOutcome, ModelExecution, ProvenanceRecord, RunRecord, StateStore,
+    TombstoneRecord,
+};
 
 use crate::commands::apply::{PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy};
 use crate::commands::replay::classify_model;
@@ -85,7 +88,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 type AdapterCost = (String, WarehouseType, f64, f64);
 
 // ---------------------------------------------------------------------------
-// The five eligibility checks — each a pure function, each fails closed.
+// The eligibility checks — each a pure function, each fails closed.
 // ---------------------------------------------------------------------------
 
 /// Check 1 — recipe recorded with a strong (non-weak) input closure.
@@ -117,7 +120,76 @@ fn check_recipe_recorded(class: &ReplayCheckModelOutput) -> GcCheckOutput {
     }
 }
 
-/// Check 2 — replayable and deterministic.
+/// Check 2 — the recipe provably produces THESE EXACT bytes.
+///
+/// The `derivable` verdict for a `(run, model)` recipe comes from its
+/// provenance, but a `(run, model)` can have recorded a **different** output
+/// than the artifact under consideration — a sibling output, or a
+/// re-materialization at a new hash. Without this check, that artifact would
+/// inherit the recipe's "derivable" verdict even though the recipe rebuilds
+/// *other* bytes, and evicting it would delete bytes nothing can rebuild.
+///
+/// So the verdict is bound to the specific candidate: its content hash (and,
+/// when the provenance recorded paths, the aligned object path) must appear
+/// among the provenance's recorded outputs. Anything else fails closed. This is
+/// what makes the hash — not the `(run, model)` pair — the eviction identity.
+fn check_recipe_produces_output(
+    artifact_hash: &str,
+    artifact_path: &str,
+    prov: Option<&ProvenanceRecord>,
+) -> GcCheckOutput {
+    let (passed, detail) = match prov {
+        None => (
+            false,
+            "no provenance for the producing (run, model) — cannot prove the recipe produces \
+             these exact bytes"
+                .to_string(),
+        ),
+        Some(p) if p.output_blake3.is_empty() => (
+            false,
+            "provenance records no output hashes — cannot prove the recipe produces these exact \
+             bytes"
+                .to_string(),
+        ),
+        Some(p) => {
+            // Prefer an exact (hash, path) pair when paths were recorded; fall
+            // back to hash membership when the provenance carries no paths.
+            // Either way the content hash must match — that is the identity.
+            let matched = if p.output_path.is_empty() {
+                p.output_blake3.iter().any(|h| h == artifact_hash)
+            } else {
+                p.output_blake3
+                    .iter()
+                    .zip(p.output_path.iter())
+                    .any(|(h, path)| h == artifact_hash && path == artifact_path)
+            };
+            if matched {
+                (
+                    true,
+                    "provenance records this exact output hash — the recipe rebuilds these bytes"
+                        .to_string(),
+                )
+            } else {
+                (
+                    false,
+                    format!(
+                        "the producing (run, model)'s provenance records a DIFFERENT output than \
+                         this artifact ({}…) — the recipe rebuilds other bytes, so evicting this \
+                         would be unrecoverable",
+                        artifact_hash.get(..12).unwrap_or(artifact_hash)
+                    ),
+                )
+            }
+        }
+    };
+    GcCheckOutput {
+        check: "recipe_produces_output".to_string(),
+        passed,
+        detail,
+    }
+}
+
+/// Check 3 — replayable and deterministic.
 ///
 /// Reuses the [`classify_model`] verdict: the recording must be sufficient to
 /// re-execute (`replayable`) *and* the SQL must be deterministic. A
@@ -146,7 +218,7 @@ fn check_replayable(class: &ReplayCheckModelOutput) -> GcCheckOutput {
     }
 }
 
-/// Check 3 — unreferenced: no other live ledger pointer at these bytes.
+/// Check 4 — unreferenced: no other live ledger pointer at these bytes.
 ///
 /// `refcount == 1` means Rocky holds exactly one reference (this candidate),
 /// so retiring it releases the bytes. `refcount > 1` means the bytes are
@@ -174,7 +246,7 @@ fn check_unreferenced(refcount: u64) -> GcCheckOutput {
     }
 }
 
-/// Check 4 — policy allows (surfaced, not yet enforced).
+/// Check 5 — policy allows (surfaced, not yet enforced).
 ///
 /// The GC policy plane — classification holds (`legal_hold` / `finance`),
 /// retention windows, and the `gc` capability — arrives in a later phase.
@@ -192,7 +264,7 @@ fn check_policy_allows() -> GcCheckOutput {
     }
 }
 
-/// Check 5 — age / activity threshold.
+/// Check 6 — age / activity threshold.
 ///
 /// The artifact must be at least `min_age_days` old. This adapter has no
 /// read-tracking, so the age is *written*-age (build time), not read-recency
@@ -248,17 +320,25 @@ fn build_rebuild_cost(
 /// Build one candidate from its representative artifact row + the joined
 /// verdicts. Pure: the CLI wires store reads into these arguments, tests drive
 /// them directly.
+///
+/// `prov` is the producing `(run, model)`'s provenance — required for the
+/// hash-binding check ([`check_recipe_produces_output`]) so the derivable
+/// verdict is bound to *this artifact's* content hash, never inherited from a
+/// sibling output of the same recipe.
+#[allow(clippy::too_many_arguments)]
 fn build_candidate(
     artifact: &ArtifactRecord,
     refcount: u64,
     class: &ReplayCheckModelOutput,
     exec: Option<&ModelExecution>,
+    prov: Option<&ProvenanceRecord>,
     now: DateTime<Utc>,
     min_age_days: i64,
     adapter: Option<&AdapterCost>,
 ) -> GcCandidateOutput {
     let checks = vec![
         check_recipe_recorded(class),
+        check_recipe_produces_output(&artifact.blake3_hash, &artifact.file_path, prov),
         check_replayable(class),
         check_unreferenced(refcount),
         check_policy_allows(),
@@ -368,6 +448,14 @@ fn gather_eviction_candidates(
 
         let class = classify_model(store, &representative.run_id, &representative.model_name);
 
+        // Provenance for the producing (run, model) — used to bind the
+        // derivable verdict to THIS artifact's exact content hash (a (run,
+        // model) can have produced a different output than this row).
+        let prov = store
+            .get_provenance(&representative.run_id, &representative.model_name)
+            .ok()
+            .flatten();
+
         let run = run_cache
             .entry(representative.run_id.clone())
             .or_insert_with(|| store.get_run(&representative.run_id).ok().flatten());
@@ -382,6 +470,7 @@ fn gather_eviction_candidates(
             refcount,
             &class,
             exec,
+            prov.as_ref(),
             now,
             min_age_days,
             adapter,
@@ -843,20 +932,33 @@ fn gc_apply_notes() -> Vec<String> {
     ]
 }
 
-/// The eviction engine: re-verify each planned eviction against the live
-/// ledger, then for each still-derivable artifact write its tombstone and
-/// retire its ledger row atomically before a best-effort physical delete.
+/// The eviction engine: re-derive eligibility against the live ledger, then for
+/// each planned artifact that is **still derivable AND an exact identity match**
+/// write its tombstone and retire its ledger row atomically before a
+/// best-effort physical delete.
 ///
 /// Pure over its inputs (`store`, `evictor`, `now`) so tests drive it directly
 /// with a seeded store and a recording evictor. The review + policy gates live
 /// in [`run_gc_apply_in`] and run *before* this is called.
 ///
-/// Fail-closed re-verification is the real safety net: the reviewed plan_id
-/// approves the *plan*, but the ledger can drift between plan and apply (a new
-/// reference raising a refcount, an artifact becoming non-derivable), so each
-/// entry is re-checked with the exact [`gather_eviction_candidates`] verdict
-/// the report and plan used. Only entries whose hash is derivable *now* are
-/// evicted; everything else is refused with its live failing checks.
+/// **Apply re-derives; it does not trust the plan.** The reviewed plan_id
+/// approves a *proposal*, but the persisted rows carry a `blake3_hash` that
+/// could be stale, drifted, or hand-authored to point a `file_path` at
+/// *different* bytes than the hash claims. So apply:
+///
+/// 1. re-runs [`gather_eviction_candidates`] against the live ledger and indexes
+///    candidates by their FULL identity `(run, model, file_path, blake3_hash)`;
+/// 2. resolves the exact live row the plan row names, and refuses unless the
+///    live row's hash equals the planned hash;
+/// 3. evicts only when a freshly-derived candidate matches that full identity
+///    and is derivable *now* — building the tombstone from the LIVE candidate,
+///    never the plan payload, so the tombstone records the exact bytes deleted;
+/// 4. relies on [`StateStore::evict_artifact`]'s in-transaction hash check as a
+///    final guard against a race.
+///
+/// Any plan row that fails to match a current derivable candidate is refused —
+/// nothing is deleted. The hash is the eviction identity, never the `(run,
+/// model)` pair.
 async fn execute_gc_apply(
     store: &StateStore,
     evictor: &dyn ArtifactEvictor,
@@ -864,11 +966,24 @@ async fn execute_gc_apply(
     plan: &GcPlan,
     now: DateTime<Utc>,
 ) -> Result<GcApplyOutput> {
-    // Re-run the SAME eligibility path the plan used, against the live ledger.
+    // Re-run the SAME eligibility path the plan used, against the live ledger,
+    // indexed by FULL identity — so a plan row only matches a candidate that is
+    // byte-for-byte the same artifact. A plan naming a hash but pointing its
+    // path at different bytes finds no match and is refused.
     let fresh = gather_eviction_candidates(store, None, now, plan.min_age_days)?;
-    let by_hash: HashMap<&str, &EvictionCandidate> = fresh
+    let by_key: HashMap<(&str, &str, &str, &str), &EvictionCandidate> = fresh
         .iter()
-        .map(|c| (c.artifact.blake3_hash.as_str(), c))
+        .map(|c| {
+            (
+                (
+                    c.artifact.run_id.as_str(),
+                    c.artifact.model_name.as_str(),
+                    c.artifact.file_path.as_str(),
+                    c.artifact.blake3_hash.as_str(),
+                ),
+                c,
+            )
+        })
         .collect();
 
     let mut evicted: Vec<GcEvictedOutput> = Vec::new();
@@ -876,56 +991,111 @@ async fn execute_gc_apply(
     let mut already_evicted: Vec<String> = Vec::new();
 
     for ev in &plan.evictions {
-        // Idempotency + correct-row guard: resolve the EXACT row this entry
-        // names. Absent ⇒ a prior apply already evicted it (or it never
-        // existed) — a clean no-op, never a refusal and never a delete of a
-        // different row that merely shares the hash.
+        // Resolve the EXACT row this entry names. Absent ⇒ a prior apply evicted
+        // it (or it never existed) — a clean idempotent no-op.
         let row = store
             .get_artifact(&ev.run_id, &ev.model_name, &ev.file_path)
             .with_context(|| format!("failed to read artifact row for {}", ev.blake3_hash))?;
-        if row.is_none() {
+        let Some(row) = row else {
             already_evicted.push(ev.blake3_hash.clone());
+            continue;
+        };
+
+        // The live row's hash MUST match the plan's claimed hash. A mismatch
+        // means the plan is stale or hand-authored to point at other bytes:
+        // refuse and delete nothing. (Without this, apply could verify one
+        // hash's derivability and delete a different-hash row.)
+        if row.blake3_hash != ev.blake3_hash {
+            refused.push(GcRefusedOutput {
+                model_name: ev.model_name.clone(),
+                run_id: ev.run_id.clone(),
+                blake3_hash: ev.blake3_hash.clone(),
+                size_bytes: ev.size_bytes,
+                reason: format!(
+                    "planned hash {}… does not match the live artifact at this location ({}…) — \
+                     the plan is stale or hand-authored; refused (fail-closed)",
+                    ev.blake3_hash.get(..12).unwrap_or(&ev.blake3_hash),
+                    row.blake3_hash.get(..12).unwrap_or(&row.blake3_hash),
+                ),
+                failed_checks: Vec::new(),
+            });
             continue;
         }
 
-        // Fresh derivable verdict for this hash. Evict only if still derivable.
-        match by_hash.get(ev.blake3_hash.as_str()) {
+        // Re-derive: does a FRESH candidate with this EXACT identity qualify as
+        // derivable NOW? Trust the live candidate, never the plan payload.
+        let key = (
+            ev.run_id.as_str(),
+            ev.model_name.as_str(),
+            ev.file_path.as_str(),
+            row.blake3_hash.as_str(),
+        );
+        match by_key.get(&key).copied() {
             Some(cand) if cand.output.derivable => {
+                // Tombstone built from the LIVE candidate (authoritative identity
+                // + recipe triple), so it records the bytes actually evicted.
                 let tombstone = TombstoneRecord {
-                    blake3_hash: ev.blake3_hash.clone(),
-                    run_id: ev.run_id.clone(),
-                    model_name: ev.model_name.clone(),
-                    file_path: ev.file_path.clone(),
-                    size_bytes: ev.size_bytes,
-                    commit_version: ev.commit_version,
-                    recipe_hash: ev.recipe_hash.clone(),
-                    input_hash: ev.input_hash.clone(),
-                    input_proof_class: ev.input_proof_class.clone(),
-                    env_hash: ev.env_hash.clone(),
-                    hash_scheme: ev.hash_scheme.clone(),
+                    blake3_hash: cand.artifact.blake3_hash.clone(),
+                    run_id: cand.artifact.run_id.clone(),
+                    model_name: cand.artifact.model_name.clone(),
+                    file_path: cand.artifact.file_path.clone(),
+                    size_bytes: cand.artifact.size_bytes,
+                    commit_version: cand.artifact.commit_version,
+                    recipe_hash: cand.recipe_hash.clone(),
+                    input_hash: cand.input_hash.clone(),
+                    input_proof_class: cand.input_proof_class.clone(),
+                    env_hash: cand.env_hash.clone(),
+                    hash_scheme: cand.hash_scheme.clone(),
                     evicted_at: now,
                     plan_id: plan_id.to_string(),
                     physical_reclaimed: false,
                 };
 
-                // Tombstone + ledger-row retirement, ONE atomic transaction.
-                // The restore safety net is committed before anything else can
-                // touch the bytes.
-                let removed = store
-                    .evict_artifact(&tombstone, &ev.run_id, &ev.model_name, &ev.file_path)
-                    .with_context(|| format!("failed to evict artifact {}", ev.blake3_hash))?;
-                if !removed {
-                    // Lost a race — the row vanished between the read and the
-                    // atomic evict. No tombstone was written; treat as no-op.
-                    already_evicted.push(ev.blake3_hash.clone());
-                    continue;
+                // Atomic tombstone + ledger-row retirement, hash-checked inside
+                // `evict_artifact` (final guard against a race). The restore
+                // safety net commits before anything else can touch the bytes.
+                let outcome = store
+                    .evict_artifact(
+                        &tombstone,
+                        &cand.artifact.run_id,
+                        &cand.artifact.model_name,
+                        &cand.artifact.file_path,
+                    )
+                    .with_context(|| {
+                        format!("failed to evict artifact {}", cand.artifact.blake3_hash)
+                    })?;
+                match outcome {
+                    EvictOutcome::AlreadyAbsent => {
+                        // Lost a race — the row vanished after we read it. No
+                        // tombstone written; treat as an idempotent no-op.
+                        already_evicted.push(cand.artifact.blake3_hash.clone());
+                        continue;
+                    }
+                    EvictOutcome::HashMismatch { found, .. } => {
+                        // The row was rewritten to different bytes between
+                        // derivation and eviction. Refuse — deleted nothing.
+                        refused.push(GcRefusedOutput {
+                            model_name: cand.artifact.model_name.clone(),
+                            run_id: cand.artifact.run_id.clone(),
+                            blake3_hash: cand.artifact.blake3_hash.clone(),
+                            size_bytes: cand.artifact.size_bytes,
+                            reason: format!(
+                                "the ledger row changed to hash {}… between derivation and \
+                                 eviction — refused (fail-closed)",
+                                found.get(..12).unwrap_or(&found),
+                            ),
+                            failed_checks: Vec::new(),
+                        });
+                        continue;
+                    }
+                    EvictOutcome::Evicted => {}
                 }
 
                 // Physical reclamation happens LAST and is best-effort — a
                 // failure here leaves a safe leaked orphan, never a dangling
                 // reference (the row is already gone, the tombstone stands).
                 let (physical_reclaimed, physical_status) =
-                    match evictor.evict_bytes(&ev.file_path).await {
+                    match evictor.evict_bytes(&cand.artifact.file_path).await {
                         PhysicalReclaim::Deleted => (true, "deleted".to_string()),
                         PhysicalReclaim::Deferred(m) => (false, format!("deferred: {m}")),
                         PhysicalReclaim::Failed(m) => (false, format!("failed: {m}")),
@@ -940,17 +1110,17 @@ async fn execute_gc_apply(
                         warn!(
                             target: "rocky::gc",
                             error = %e,
-                            hash = %ev.blake3_hash,
+                            hash = %cand.artifact.blake3_hash,
                             "evicted bytes but failed to update the tombstone's reclaimed flag"
                         );
                     }
                 }
 
                 evicted.push(GcEvictedOutput {
-                    model_name: ev.model_name.clone(),
-                    run_id: ev.run_id.clone(),
-                    blake3_hash: ev.blake3_hash.clone(),
-                    size_bytes: ev.size_bytes,
+                    model_name: cand.artifact.model_name.clone(),
+                    run_id: cand.artifact.run_id.clone(),
+                    blake3_hash: cand.artifact.blake3_hash.clone(),
+                    size_bytes: cand.artifact.size_bytes,
                     tombstone_recorded: true,
                     physical_reclaimed,
                     physical_status,
@@ -979,8 +1149,8 @@ async fn execute_gc_apply(
                         )
                     }
                     None => (
-                        "no longer derivable at apply time — the artifact is absent from the \
-                         live derivability set"
+                        "no matching live derivable artifact at this identity — refused \
+                         (fail-closed)"
                             .to_string(),
                         Vec::new(),
                     ),
@@ -1253,13 +1423,31 @@ mod tests {
         }
     }
 
+    /// A provenance record whose recorded output is exactly `art` — so the
+    /// hash-binding check ([`check_recipe_produces_output`]) passes for it.
+    fn prov_for(art: &ArtifactRecord) -> ProvenanceRecord {
+        ProvenanceRecord {
+            run_id: art.run_id.clone(),
+            model_name: art.model_name.clone(),
+            input_hash: "ih".to_string(),
+            skip_hash: "sh".to_string(),
+            model_ir_canonical_json: "{}".to_string(),
+            upstreams: Vec::new(),
+            output_blake3: vec![art.blake3_hash.clone()],
+            output_path: vec![art.file_path.clone()],
+            proof_class: "strong".to_string(),
+            recorded_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn candidate_derivable_when_all_checks_pass() {
         let now = Utc::now();
         let art = artifact(HA, "orders", "r1", 100, now - Duration::days(30));
-        let c = build_candidate(&art, 1, &model("orders"), None, now, 7, None);
+        let prov = prov_for(&art);
+        let c = build_candidate(&art, 1, &model("orders"), None, Some(&prov), now, 7, None);
         assert!(c.derivable);
-        assert_eq!(c.checks.len(), 5);
+        assert_eq!(c.checks.len(), 6);
         assert!(c.checks.iter().all(|k| k.passed));
     }
 
@@ -1267,10 +1455,80 @@ mod tests {
     fn candidate_not_derivable_when_shared() {
         let now = Utc::now();
         let art = artifact(HA, "orders", "r1", 100, now - Duration::days(30));
-        let c = build_candidate(&art, 2, &model("orders"), None, now, 7, None);
+        let prov = prov_for(&art);
+        let c = build_candidate(&art, 2, &model("orders"), None, Some(&prov), now, 7, None);
         assert!(!c.derivable);
         let unref = c.checks.iter().find(|k| k.check == "unreferenced").unwrap();
         assert!(!unref.passed);
+    }
+
+    #[test]
+    fn candidate_not_derivable_when_recipe_produces_different_output() {
+        // 🔴 facet 1: the (run, model) recipe provably produces H_GOOD, but the
+        // artifact under consideration is H_BAD. H_BAD must NOT inherit the
+        // recipe's derivability — evicting it would delete bytes the recipe
+        // cannot rebuild. Fail-closed.
+        let now = Utc::now();
+        let bad = artifact(HB, "orders", "r1", 100, now - Duration::days(30));
+        // Provenance records a DIFFERENT output (HA@its path), not HB.
+        let good = artifact(HA, "orders", "r1", 100, now - Duration::days(30));
+        let prov = prov_for(&good);
+        let c = build_candidate(&bad, 1, &model("orders"), None, Some(&prov), now, 7, None);
+        assert!(!c.derivable, "H_BAD must not inherit H_GOOD's derivability");
+        let bind = c
+            .checks
+            .iter()
+            .find(|k| k.check == "recipe_produces_output")
+            .unwrap();
+        assert!(!bind.passed);
+        // The other five checks still pass — the report shows exactly why it's held.
+        assert_eq!(c.checks.iter().filter(|k| k.passed).count(), 5);
+    }
+
+    #[test]
+    fn hash_binding_holds_via_membership_when_provenance_records_no_paths() {
+        // The empty-`output_path` fallback branch of `check_recipe_produces_output`:
+        // some provenance carries output hashes but no aligned paths. The content
+        // hash is the identity, so hash membership is both sufficient and required
+        // — a member hash is derivable, a non-member hash is refused. Fail-closed.
+        let now = Utc::now();
+        let art = artifact(HA, "orders", "r1", 100, now - Duration::days(30));
+        // Provenance records the output hash but NO paths (forces the fallback).
+        let prov = ProvenanceRecord {
+            output_path: Vec::new(),
+            ..prov_for(&art)
+        };
+
+        // A member hash is derivable via membership alone.
+        let c = build_candidate(&art, 1, &model("orders"), None, Some(&prov), now, 7, None);
+        assert!(
+            c.derivable,
+            "a member hash must be derivable via membership"
+        );
+        assert!(
+            c.checks
+                .iter()
+                .find(|k| k.check == "recipe_produces_output")
+                .unwrap()
+                .passed
+        );
+
+        // A different-hash artifact against the same no-path provenance is refused
+        // — it must NOT inherit derivability just because paths were absent.
+        let bad = artifact(HB, "orders", "r1", 100, now - Duration::days(30));
+        let c_bad = build_candidate(&bad, 1, &model("orders"), None, Some(&prov), now, 7, None);
+        assert!(
+            !c_bad.derivable,
+            "a non-member hash must be refused even when provenance records no paths"
+        );
+        assert!(
+            !c_bad
+                .checks
+                .iter()
+                .find(|k| k.check == "recipe_produces_output")
+                .unwrap()
+                .passed
+        );
     }
 
     // -- end-to-end over a seeded ledger (real store, real join) ----------
@@ -1447,8 +1705,8 @@ mod tests {
             .find(|k| k.check == "age_threshold")
             .unwrap();
         assert!(!age.passed);
-        // The other four still pass — the report shows exactly why it's held.
-        assert_eq!(c.checks.iter().filter(|k| k.passed).count(), 4);
+        // The other five still pass — the report shows exactly why it's held.
+        assert_eq!(c.checks.iter().filter(|k| k.passed).count(), 5);
     }
 
     #[test]
@@ -1674,6 +1932,120 @@ mod tests {
         // No tombstone, both rows intact, the physical evictor never fired.
         assert!(store.list_tombstones().unwrap().is_empty());
         assert_eq!(store.refcount_for_hash(HC).unwrap(), 2);
+        assert!(evictor.calls().is_empty());
+    }
+
+    /// 🔴 facet 1, end-to-end over a seeded ledger: a `(run, model)` whose
+    /// provenance records output `HA` also has a stray `OUTPUT_ARTIFACTS` row at
+    /// a DIFFERENT hash `HB`. `HB` must be classified NOT derivable (its bytes
+    /// aren't what the recipe rebuilds) and must never enter a plan, even though
+    /// the recipe itself is strong + replayable.
+    #[test]
+    fn ledger_artifact_not_derivable_when_provenance_records_different_output() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        // Provenance + artifact for the GOOD output HA.
+        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+        record_run(&store, "r1", "orders");
+        // A stray artifact row at HB for the SAME (run, model) — provenance does
+        // NOT record HB.
+        store
+            .record_artifact(&ArtifactRecord {
+                blake3_hash: HB.to_string(),
+                run_id: "r1".to_string(),
+                model_name: "orders".to_string(),
+                file_path: format!("s3://b/{HB}.parquet"),
+                commit_version: 0,
+                size_bytes: 400,
+                written_at: old,
+            })
+            .unwrap();
+
+        let cands = gather_eviction_candidates(&store, None, Utc::now(), 7).unwrap();
+        let hb = cands
+            .iter()
+            .find(|c| c.artifact.blake3_hash == HB)
+            .expect("HB candidate present");
+        assert!(
+            !hb.output.derivable,
+            "HB must not inherit HA's derivability"
+        );
+        let bind = hb
+            .output
+            .checks
+            .iter()
+            .find(|k| k.check == "recipe_produces_output")
+            .unwrap();
+        assert!(!bind.passed);
+        // HA remains derivable, and the plan contains only HA.
+        let ha = cands
+            .iter()
+            .find(|c| c.artifact.blake3_hash == HA)
+            .expect("HA candidate present");
+        assert!(ha.output.derivable);
+        let plan = build_gc_plan(&cands, 7).expect("HA is derivable");
+        assert_eq!(plan.evictions.len(), 1);
+        assert_eq!(plan.evictions[0].blake3_hash, HA);
+    }
+
+    /// 🔴 facets 2/3/4: a hand-authored plan claims a DERIVABLE hash (`HA`) but
+    /// points its `file_path` at a DIFFERENT artifact's row (`HB`). Apply must
+    /// refuse — verifying `HA`'s derivability while deleting `HB`'s row would be
+    /// permanent data loss with a false tombstone. Nothing is deleted.
+    #[tokio::test]
+    async fn apply_refuses_a_crafted_plan_whose_path_points_at_other_bytes() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        // HA — a genuinely derivable artifact.
+        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+        record_run(&store, "r1", "orders");
+        // HB — a different real artifact at its own (run, model, path).
+        seed(&store, "r2", "events", "SELECT 2 AS id", &[], HB, 400, old);
+        record_run(&store, "r2", "events");
+
+        // Craft a plan eviction that claims HA's (derivable) hash but points the
+        // file_path + (run, model) at HB's row. `plan_id` integrity only proves
+        // the payload is stable, not that it was engine-generated.
+        let crafted = GcPlan {
+            version: VERSION.to_string(),
+            min_age_days: 7,
+            total_bytes: 400,
+            evictions: vec![GcPlanEviction {
+                model_name: "events".to_string(),
+                run_id: "r2".to_string(),
+                blake3_hash: HA.to_string(),
+                file_path: format!("s3://b/{HB}.parquet"),
+                size_bytes: 400,
+                commit_version: 0,
+                written_at: old.to_rfc3339(),
+                recipe_hash: None,
+                input_hash: None,
+                input_proof_class: None,
+                env_hash: None,
+                hash_scheme: None,
+            }],
+        };
+
+        let evictor = TestEvictor::new(TestOutcome::Deferred);
+        let out = execute_gc_apply(&store, &evictor, "crafted", &crafted, Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(out.evicted_count, 0, "a crafted plan must delete nothing");
+        assert_eq!(out.refused_count, 1);
+        assert!(
+            out.refused[0]
+                .reason
+                .contains("does not match the live artifact"),
+            "got: {}",
+            out.refused[0].reason
+        );
+        // Both rows intact, no tombstone, the physical evictor never fired.
+        assert!(store.list_tombstones().unwrap().is_empty());
+        assert_eq!(store.refcount_for_hash(HA).unwrap(), 1);
+        assert_eq!(store.refcount_for_hash(HB).unwrap(), 1);
         assert!(evictor.calls().is_empty());
     }
 

@@ -152,7 +152,7 @@ pub async fn compute_review(
     // it is purely the human sign-off that unblocks the eviction. Branch here,
     // before the `RunPlan` deserialize the other kinds need.
     if plan.kind == PlanKind::Gc {
-        return review_gc_plan(root, plan_id, approve, output_json).await;
+        return compute_review_gc_plan(root, plan_id, approve).await;
     }
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
@@ -222,12 +222,7 @@ pub async fn compute_review(
 /// `--approve` writes the same marker (`<plan_id>.reviewed.json`) the apply gate
 /// checks; without it, apply stays blocked. The marker is payload-agnostic, so
 /// the existing `ai_plan_is_reviewed` gate in `commands::apply` recognises it.
-async fn review_gc_plan(
-    root: &Path,
-    plan_id: &str,
-    approve: bool,
-    output_json: bool,
-) -> Result<()> {
+async fn compute_review_gc_plan(root: &Path, plan_id: &str, approve: bool) -> Result<ReviewOutput> {
     let mut marker_written = false;
     if approve {
         let approver =
@@ -267,7 +262,7 @@ async fn review_gc_plan(
         )
     };
 
-    let output = ReviewOutput {
+    Ok(ReviewOutput {
         version: VERSION.to_string(),
         command: "review".to_string(),
         plan_id: plan_id.to_string(),
@@ -275,15 +270,8 @@ async fn review_gc_plan(
         approved: approve,
         marker_written,
         breaking_changes: None,
-        message: Some(message.clone()),
-    };
-
-    if output_json {
-        print_json(&output)?;
-    } else {
-        println!("{message}");
-    }
-    Ok(())
+        message: Some(message),
+    })
 }
 
 /// Build the human-readable summary line for the review outcome.

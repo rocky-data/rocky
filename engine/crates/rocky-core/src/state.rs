@@ -2860,7 +2860,8 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     /// Atomically retire an artifact's [`OUTPUT_ARTIFACTS`] row and record its
-    /// [`TombstoneRecord`], in a single write transaction.
+    /// [`TombstoneRecord`], in a single write transaction — but **only** when
+    /// the live row's content hash matches [`TombstoneRecord::blake3_hash`].
     ///
     /// This is the durability guarantee at the heart of `rocky gc`: the
     /// tombstone (the restore safety net) is committed **in the same
@@ -2869,10 +2870,21 @@ impl StateStore {
     /// delete happens *after* this call returns — an orphaned byte with a
     /// tombstone is safe; a deleted byte without one is not.
     ///
-    /// Returns `true` when a row was present and evicted, `false` when the row
-    /// was already absent — in which case **no tombstone is written** and the
-    /// transaction is dropped (aborted) unchanged, so a re-apply of the same
-    /// plan is an idempotent no-op rather than a spurious second tombstone.
+    /// The **hash check is the eviction's identity guard**: the caller
+    /// derives eligibility from a specific content hash, but the ledger key is
+    /// `(run_id, model_name, file_path)`. If the live row at that key carries a
+    /// *different* hash than the tombstone claims (a stale/hand-authored plan,
+    /// or a row rewritten between derivation and apply), this returns
+    /// [`EvictOutcome::HashMismatch`] and deletes **nothing** — the tombstone
+    /// would otherwise record the wrong bytes as evicted. Fail-closed.
+    ///
+    /// Outcomes:
+    /// - [`EvictOutcome::Evicted`] — row present, hash matched: row retired +
+    ///   tombstone written, committed together.
+    /// - [`EvictOutcome::AlreadyAbsent`] — no row at the key. No tombstone; the
+    ///   transaction is dropped, so a re-apply is an idempotent no-op.
+    /// - [`EvictOutcome::HashMismatch`] — row present but its hash differs. No
+    ///   tombstone, nothing removed; the transaction is dropped.
     ///
     /// Provenance ([`INPUT_PROVENANCE`]) and the input index ([`INPUT_INDEX`])
     /// are deliberately left untouched — restore replays the recipe located
@@ -2883,28 +2895,45 @@ impl StateStore {
         run_id: &str,
         model_name: &str,
         file_path: &str,
-    ) -> Result<bool, StateError> {
+    ) -> Result<EvictOutcome, StateError> {
         let art_key = artifact_key(run_id, model_name, file_path);
         let tomb_key = tombstone_key(&tombstone.evicted_at, &tombstone.blake3_hash);
         let tomb_bytes = serde_json::to_vec(tombstone)?;
         let txn = self.db.begin_write()?;
-        let removed;
+        let outcome;
         {
             let mut artifacts = txn.open_table(OUTPUT_ARTIFACTS)?;
-            removed = artifacts.remove(art_key.as_str())?.is_some();
-            if removed {
-                let mut tombstones = txn.open_table(TOMBSTONES)?;
-                tombstones.insert(tomb_key.as_str(), tomb_bytes.as_slice())?;
-            }
+            // Read the LIVE row inside the write txn and verify its hash before
+            // deleting anything. The row we tombstone must be exactly the bytes
+            // the caller proved derivable.
+            let live: Option<ArtifactRecord> = match artifacts.get(art_key.as_str())? {
+                Some(guard) => Some(serde_json::from_slice(guard.value())?),
+                None => None,
+            };
+            outcome = match live {
+                None => EvictOutcome::AlreadyAbsent,
+                Some(row) if row.blake3_hash != tombstone.blake3_hash => {
+                    EvictOutcome::HashMismatch {
+                        expected: tombstone.blake3_hash.clone(),
+                        found: row.blake3_hash,
+                    }
+                }
+                Some(_) => {
+                    artifacts.remove(art_key.as_str())?;
+                    let mut tombstones = txn.open_table(TOMBSTONES)?;
+                    tombstones.insert(tomb_key.as_str(), tomb_bytes.as_slice())?;
+                    EvictOutcome::Evicted
+                }
+            };
         }
-        if removed {
+        if matches!(outcome, EvictOutcome::Evicted) {
             txn.commit()?;
         } else {
-            // Nothing to evict — drop the transaction without committing so no
-            // tombstone is recorded for a row that was already gone.
+            // Nothing evicted — drop the transaction without committing so no
+            // tombstone is recorded for a row that was absent or hash-mismatched.
             drop(txn);
         }
-        Ok(removed)
+        Ok(outcome)
     }
 
     /// Upsert a tombstone row (keyed by `evicted_at` + `blake3_hash`).
@@ -3612,6 +3641,28 @@ pub struct TombstoneRecord {
     /// been re-materialized in the meantime).
     #[serde(default)]
     pub physical_reclaimed: bool,
+}
+
+/// The result of [`StateStore::evict_artifact`] — an eviction attempt keyed by
+/// `(run_id, model_name, file_path)` and guarded by the tombstone's content
+/// hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvictOutcome {
+    /// The row was present, its hash matched the tombstone, and it was retired
+    /// with its tombstone written atomically.
+    Evicted,
+    /// No row existed at the key — an idempotent no-op (a prior apply evicted
+    /// it, or it never existed). No tombstone written.
+    AlreadyAbsent,
+    /// A row existed at the key but its content hash differed from the one the
+    /// tombstone claims. **Nothing was deleted** and no tombstone was written —
+    /// evicting would have recorded the wrong bytes as reclaimed. Fail-closed.
+    HashMismatch {
+        /// The hash the caller expected (the tombstone's `blake3_hash`).
+        expected: String,
+        /// The hash actually stored in the live ledger row.
+        found: String,
+    },
 }
 
 /// One row in the agent-policy decision ledger ([`POLICY_DECISIONS`]).
@@ -7281,10 +7332,14 @@ mod tests {
         assert_eq!(store.refcount_for_hash("hA").unwrap(), 1);
 
         let tomb = make_tombstone("hA", "run-1", "orders", "s3://b/a.parquet", 500);
-        let evicted = store
+        let outcome = store
             .evict_artifact(&tomb, "run-1", "orders", "s3://b/a.parquet")
             .unwrap();
-        assert!(evicted, "a present row is evicted");
+        assert_eq!(
+            outcome,
+            EvictOutcome::Evicted,
+            "a present, hash-matched row is evicted"
+        );
 
         // Ledger row retired → refcount drops to zero.
         assert_eq!(store.refcount_for_hash("hA").unwrap(), 0);
@@ -7305,18 +7360,55 @@ mod tests {
     #[test]
     fn evict_artifact_absent_row_writes_no_tombstone() {
         // Idempotency + safety: evicting a row that is already gone is a no-op —
-        // it returns false and records NO tombstone (a spurious tombstone for a
-        // vanished row would be a lie in the custody ledger).
+        // it reports AlreadyAbsent and records NO tombstone (a spurious tombstone
+        // for a vanished row would be a lie in the custody ledger).
         let (store, _dir) = temp_store();
         let tomb = make_tombstone("hMissing", "run-x", "gone", "s3://b/x.parquet", 1);
-        let evicted = store
+        let outcome = store
             .evict_artifact(&tomb, "run-x", "gone", "s3://b/x.parquet")
             .unwrap();
-        assert!(!evicted, "an absent row cannot be evicted");
+        assert_eq!(
+            outcome,
+            EvictOutcome::AlreadyAbsent,
+            "an absent row cannot be evicted"
+        );
         assert!(
             store.list_tombstones().unwrap().is_empty(),
             "no tombstone is written for an already-absent row"
         );
+    }
+
+    #[test]
+    fn evict_artifact_refuses_on_hash_mismatch() {
+        // 🔴 Identity guard: the live row at the (run, model, file_path) key
+        // carries hash `H_BAD`, but the tombstone claims `H_GOOD`. Evicting would
+        // delete H_BAD's bytes while recording a tombstone for H_GOOD (whose
+        // recipe cannot rebuild H_BAD) — permanent data loss + a false restore
+        // record. `evict_artifact` must refuse: delete nothing, write no tombstone.
+        let (store, _dir) = temp_store();
+        let art = make_artifact("run-1", "orders", "H_BAD", "s3://b/a.parquet", 500);
+        store.record_artifact(&art).unwrap();
+
+        let tomb = make_tombstone("H_GOOD", "run-1", "orders", "s3://b/a.parquet", 500);
+        let outcome = store
+            .evict_artifact(&tomb, "run-1", "orders", "s3://b/a.parquet")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            EvictOutcome::HashMismatch {
+                expected: "H_GOOD".to_string(),
+                found: "H_BAD".to_string(),
+            }
+        );
+        // Nothing deleted, no tombstone written — fail-closed.
+        assert_eq!(store.refcount_for_hash("H_BAD").unwrap(), 1);
+        assert!(
+            store
+                .get_artifact("run-1", "orders", "s3://b/a.parquet")
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.list_tombstones().unwrap().is_empty());
     }
 
     #[test]
