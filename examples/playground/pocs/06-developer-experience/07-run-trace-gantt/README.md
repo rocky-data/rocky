@@ -53,8 +53,9 @@ platform's existing OpenTelemetry collector already consumes.
 1. Seed two source tables.
 2. Run the pipeline twice (once per source) so the state store has
    two runs to inspect.
-3. `rocky trace latest` — the read path for the timeline view (today:
-   inspection-only; run-record writes ship in Arc 1 wave 2).
+3. `rocky trace latest` — renders the recorded run as a timeline
+   (per-model offsets, duration bars, concurrency lanes), read from the
+   run record `rocky run` persists to the state store.
 4. `rocky replay latest` — the sibling inspection command.
 
 ## Related

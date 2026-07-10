@@ -1,24 +1,21 @@
-//! Integration tests for the [`OUTPUT_ARTIFACTS`] redb table (Arc 4 /
-//! Arc 1 wave 2 Phase 6 input).
+//! Integration tests for the [`OUTPUT_ARTIFACTS`] redb table — the
+//! content-addressed artifact ledger.
 //!
-//! These tests pin the **query shape** Phase 6 VACUUM refcount will use
-//! against the live `StateStore` API. The unit tests in `state.rs`
-//! cover correctness of individual methods; this file demonstrates the
-//! full end-to-end shape:
+//! These tests pin the **query shape** the reclamation path (`rocky gc`
+//! refcounting) builds on, against the live `StateStore` API. The unit
+//! tests in `state.rs` cover correctness of individual methods; this
+//! file demonstrates the full end-to-end shape:
 //!
 //! 1. Multiple runs record artifacts to the same physical state file.
-//! 2. Phase 6 queries "which (run, model) tuples reference hash X?"
-//!    via `list_artifacts_by_hash`.
-//! 3. The query result is enough to answer "is this file orphaned?"
-//!    (Phase 6 PR will add the actual orphan/refcount predicate;
-//!    this PR just provides the storage + lookup layer.)
+//! 2. "Which (run, model) tuples reference hash X?" is answered via
+//!    `list_artifacts_by_hash`.
+//! 3. The query result is enough to answer "is this file orphaned?" —
+//!    the refcount predicate `rocky gc` evaluates.
 //!
-//! Note: there's no end-to-end test against a live warehouse here.
-//! Content-addressed writes need Databricks Delta UniForm; the
-//! playground POC is DuckDB-only. The spike memo at
-//! `~/Developer/rocky-plans/plans/rocky-arc4-trace-persistence-spike-2026-05-20.md`
-//! §5 documents this gap — the live-verify against the Databricks
-//! sandbox will land alongside the Phase 6 refcount PR.
+//! Note: there's no end-to-end test against a live warehouse here, a
+//! known coverage gap — content-addressed writes need Databricks Delta
+//! UniForm, and the playground POC is DuckDB-only, so live verification
+//! of this path runs against a warehouse sandbox rather than in CI.
 
 use chrono::Utc;
 use rocky_core::state::{ArtifactRecord, StateStore};

@@ -671,7 +671,7 @@ class MaterializationOutput(BaseModel):
     """
     bytes_written: conint(ge=0) | None = None
     """
-    Adapter-reported bytes-written figure, summed across all statements. Currently `None` on every adapter — BigQuery doesn't expose a bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet. Reserved so future waves can populate it without a schema break.
+    Adapter-reported bytes-written figure, summed across all statements. Currently `None` on every adapter — BigQuery doesn't expose a bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet. Reserved so a future release can populate it without a schema break.
     """
     cost_usd: float | None = None
     """

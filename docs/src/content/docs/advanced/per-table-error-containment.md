@@ -71,6 +71,8 @@ Map each variant to one of four actions:
 | **Don't retry; alert the model owner** | `auth-failed`, `query-rejected`, `not-found`, `compile-error` |
 | **Surface raw `error` for triage** | `unknown` |
 
+Note that since engine 1.58.0 the run loop already retries proven-transient failures in-run, on by default (`[resilience] transient_max_retries`, default 2 — see [Classified retry](./failure-modes#classified-retry)). A `transient` entry that reaches your `errors[*]` has therefore already exhausted its in-run retry budget: "retry with backoff" at the orchestrator level should mean a *delayed* re-run or `--resume-latest`, not an immediate tight-loop retry that doubles the engine's own attempts.
+
 Treat `connection-failed` as retry-safe even though the warehouse never saw the request: `reqwest::is_connect()` is the discriminator, which fires on actual TCP / TLS / DNS failures, not on credentials issues (which land on `auth-failed` instead).
 
 ## Consuming from Dagster

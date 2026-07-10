@@ -22,7 +22,7 @@ non-zero exit code; the `on_budget_breach` hook fires either way.
 - **Cost appears in the run output**, not a separate billing export. The
   same JSON that carries row counts and timings carries cost: one
   artefact, one run, one source of truth.
-- **PR-time cost projection** is the natural next step (Arc 2 wave 2):
+- **PR-time cost projection** is the natural next step:
   a GitHub Action that runs `rocky estimate` against the diffed models
   and posts the projected delta as a check. The plumbing here is the
   precondition.

@@ -867,27 +867,23 @@ deterministic = true   # owner asserts the SQL is pure → re-eligible
 
 ## `[reuse]`
 
-:::caution[Experimental: not live-verified; do not enable in production]
-`[reuse]` is a **preview** surface. It applies **only** to the Databricks–Iceberg content-addressed write path (no DuckDB, Snowflake, or BigQuery), and it has **not yet been live-verified against a warehouse**. Do not enable it in production. This is a config-reference entry only; there is no how-to guide for it yet.
-:::
-
-When `enabled = true`, a successful run records, per model, an input-match index entry and an offline-verifiable provenance record. It attests two things and **only** two things:
-
-1. an **input-logic match** — the model's logic key plus its upstreams' input identities; and
-2. **byte-identity of the bytes Rocky recorded** for that build.
-
-It does **not** attest that a fresh re-run would reproduce those bytes. Even when enabled, the reuse decision path only ever resolves to **BUILD** today (an ONLY-BUILD posture): a fail-closed verdict is computed but nothing is reused; the live point-to reuse is not yet wired/verified. The spine only *populates* the index.
+Auditable reuse for **content-addressed models** — two orthogonal knobs. Both apply **only** to the content-addressed (S3/UniForm) write path; on DuckDB and plain warehouse targets they are inert and `rocky run` behaves exactly as if the block were absent.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `false` | Master switch for input-match spine population. `false` (default) keeps `rocky run` byte- **and** cost-identical to before the spine existed: no per-model hashing, no extra state write. |
+| `enabled` | bool | `false` | Byte-level **point-to reuse**. When `true`, a successful run records, per model, an input-match index entry and an offline-verifiable provenance record; on a later run, an eligible model whose recomputed `input_hash` hits the index for a prior **strong** run may point to that run's already-written Parquet — a zero-copy commit that skips the SQL. `false` (the default) writes no input-match spine: no per-model hashing cost, no extra state write, no reuse decision. Live-verified on the content-addressed path; active when you turn it on. |
+| `column_level` | bool | `true` | **Column-level skip.** An unpartitioned content-addressed model whose logic, environment, and every provably-consumed upstream column are unchanged since its last successful build is skipped — its SQL does not run and no new commit is written; the prior output stays authoritative. On by default since engine 1.61.0, after live S3/UniForm verification of the skip-on-unchanged / build-on-changed decision. Independent of `enabled`. |
+
+Both decisions are **fail-closed**: any unproven input — a non-deterministic model, a changed recipe or environment, an un-enumerable consumed-column set, a missing or moved column hash — forces a build, so doubt always resolves to executing the SQL.
+
+The kill switch for the default-on knob:
 
 ```toml
 [reuse]
-enabled = false   # default; preview-only, not live-verified — leave off in production
+column_level = false   # restore the always-build behavior
 ```
 
-The per-invocation `--no-reuse` flag forces every model to build (the escape hatch parallel to `--force-rebuild` for `--skip-unchanged`). The provenance side this records is what an auditor reads in [Verify a run](/guides/verify-a-run/).
+The per-invocation `--no-reuse` flag forces every model to build (the escape hatch parallel to `--force-rebuild` for `--skip-unchanged`). The provenance record this path writes is what an auditor reads in [Verify a run](/guides/verify-a-run/).
 
 ---
 
@@ -986,7 +982,7 @@ Project-wide configuration for Rocky's dialect-portability lint (**P001**). When
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `target_dialect` | string | | `"databricks"`, `"snowflake"`, `"bigquery"`, or `"duckdb"`. When unset, no lint runs (wave-1 "flag opt-in" behavior). |
+| `target_dialect` | string | | `"databricks"`, `"snowflake"`, `"bigquery"`, or `"duckdb"`. When unset, no lint runs (the flag-only opt-in behavior). |
 | `allow` | list of string | `[]` | Project-wide allow-list of construct labels (case-insensitive). Useful when a project standardizes on a non-portable extension like `QUALIFY`. Prefer per-model `-- rocky-allow: …` pragmas for targeted exemptions. |
 
 ```toml

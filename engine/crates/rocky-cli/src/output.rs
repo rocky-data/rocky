@@ -928,8 +928,8 @@ pub struct MaterializationOutput {
     /// Adapter-reported bytes-written figure, summed across all
     /// statements. Currently `None` on every adapter — BigQuery doesn't
     /// expose a bytes-written figure for query jobs, and the Databricks
-    /// / Snowflake paths haven't wired it yet. Reserved so future waves
-    /// can populate it without a schema break.
+    /// / Snowflake paths haven't wired it yet. Reserved so a future
+    /// release can populate it without a schema break.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
     /// Tenant this materialization is attributed to, taken from the
@@ -1412,9 +1412,9 @@ pub struct DriftActionOutput {
 /// `apply_retention_policy`). Projects without any `[classification]`,
 /// `[mask]`, or `retention` config get empty lists — the fields
 /// `skip_serializing_if = Vec::is_empty`, so JSON consumers written
-/// against the pre-Wave A shape are byte-stable.
+/// against the earlier shape are byte-stable.
 ///
-/// ## Phase 2 additions (Cluster 3 B)
+/// ## Plan-persistence additions
 ///
 /// `plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers`
 /// are additive — all have `skip_serializing_if` so existing fixtures and
@@ -2695,7 +2695,7 @@ pub struct ColumnLineageOutput {
     pub column: String,
     /// Direction of the trace walk: `"upstream"` (producers) or `"downstream"`
     /// (consumers). Defaults to upstream when `--column` is set without
-    /// direction flags, matching pre-Arc-1 behaviour.
+    /// direction flags, matching the historical default.
     pub direction: String,
     pub trace: Vec<LineageEdgeRecord>,
     /// Every downstream column that transitively consumes
@@ -2972,7 +2972,7 @@ pub struct RetentionSweepOutput {
     /// JSONL trace files removed by the last-N-by-mtime sweep. Always
     /// zero for the explicit `rocky state retention sweep` command —
     /// the trace sweep is only invoked from `rocky run`'s end-of-run
-    /// auto-sweep (Arc 4 span retention).
+    /// auto-sweep.
     pub traces_deleted: u64,
     /// Wall-clock duration of the sweep in milliseconds.
     pub duration_ms: u64,
@@ -4667,7 +4667,7 @@ impl RunOutput {
             // stub which returns `None`, so those adapters continue to
             // compute cost from `duration_ms` alone; wiring their native
             // stats (Databricks `result.manifest.total_byte_count`,
-            // Snowflake `statistics.queryLoad`) is a follow-up wave.
+            // Snowflake `statistics.queryLoad`) is a follow-up.
             let cost = rocky_core::cost::compute_observed_cost_usd(
                 wh,
                 mat.bytes_scanned,
@@ -7358,8 +7358,9 @@ pub struct BriefBudgetStatus {
 ///
 /// Inspection-only surface over the state store's [`RunRecord`]: shows every
 /// model that ran, with the SQL hash, row counts, bytes, and timings
-/// captured at the time. Re-execution (with pinned inputs + content-addressed
-/// writes) is deferred to a follow-up when the Arc-1 storage path arrives.
+/// captured at the time. Re-execution is the separate `rocky replay
+/// --execute` surface ([`ReplayExecuteOutput`]), which re-runs recorded
+/// models on an ephemeral engine and byte-compares to the recording.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ReplayOutput {
     pub version: String,
@@ -7705,13 +7706,14 @@ pub struct GcRebuildCostOutput {
 pub struct GcPlanEviction {
     /// Model that produced the artifact.
     pub model_name: String,
-    /// Run that produced it — half of the provenance key restore replays from.
+    /// Run that produced it — half of the provenance key a restore would
+    /// replay from.
     pub run_id: String,
     /// Content hash (hex) of the artifact bytes — the eviction unit and the
-    /// identity a restore re-computes and compares against.
+    /// identity a restore would re-compute and compare against.
     pub blake3_hash: String,
     /// Object-store path of the artifact — the byte location a physical
-    /// reclamation deletes and a restore re-materializes to.
+    /// reclamation deletes and a restore would re-materialize to.
     pub file_path: String,
     /// Physical size of the artifact in bytes.
     pub size_bytes: u64,
@@ -7774,7 +7776,9 @@ pub struct GcPlanOutput {
     pub total_bytes: u64,
     /// Always `true`: a `gc` plan is unconditionally review-gated before apply.
     pub review_required: bool,
-    /// Operator caveats (re-verification at apply, restore safety net, scope).
+    /// Operator caveats (e.g. re-verification at apply, scope). Each eviction
+    /// records what a restore will need; `rocky restore` itself is a planned
+    /// follow-up.
     pub notes: Vec<String>,
     /// The proposed evictions.
     pub evictions: Vec<GcPlanEviction>,
@@ -7793,7 +7797,8 @@ pub struct GcEvictedOutput {
     pub tombstone_recorded: bool,
     /// `true` when the bytes were physically deleted through the object-store
     /// adapter; `false` when the physical delete was deferred or failed (a safe
-    /// leaked orphan — the tombstone stands and restore still works).
+    /// leaked orphan — the tombstone still records everything a restore will
+    /// need; `rocky restore` itself is a planned follow-up).
     pub physical_reclaimed: bool,
     /// Human-readable physical-reclamation outcome (`deleted`, `deferred: …`,
     /// or `failed: …`).
@@ -7842,7 +7847,9 @@ pub struct GcApplyOutput {
     pub evicted_count: usize,
     /// Count of refused artifacts.
     pub refused_count: usize,
-    /// Operator caveats (physical-reclamation reachability, restore held).
+    /// Operator caveats (e.g. physical-reclamation reachability). Each
+    /// eviction's tombstone records what a restore will need; `rocky restore`
+    /// itself is a planned follow-up.
     pub notes: Vec<String>,
 }
 
@@ -7938,7 +7945,7 @@ pub struct TraceModelEntry {
 /// persisted, this command can return a real cost figure for BigQuery
 /// runs even though the live `rocky run` path currently reports
 /// `cost_usd: None` for BQ (adapter bytes-scanned plumbing is a
-/// follow-up wave).
+/// follow-up).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CostOutput {
     pub version: String,
@@ -8064,12 +8071,12 @@ pub struct PerModelCostHistorical {
 }
 
 // ---------------------------------------------------------------------------
-// `rocky compliance` — governance compliance rollup (Wave B)
+// `rocky compliance` — governance compliance rollup
 // ---------------------------------------------------------------------------
 
 /// JSON output for `rocky compliance`.
 ///
-/// A thin rollup over Wave A governance: classification sidecars
+/// A thin rollup over the project's governance config: classification sidecars
 /// (`[classification]` per model) + project-level `[mask]` / `[mask.<env>]`
 /// policy. Answers the question **"are all classified columns masked
 /// wherever policy says they should be?"** without making any warehouse
@@ -8177,13 +8184,13 @@ pub struct ComplianceException {
 }
 
 // ---------------------------------------------------------------------------
-// Retention status (Wave C-2)
+// Retention status
 // ---------------------------------------------------------------------------
 
 /// JSON output for `rocky retention-status`.
 ///
 /// Reports which models declare a `retention = "<N>[dy]"` sidecar value and
-/// — when `--drift` is set in a future wave — whether the warehouse's
+/// — when `--drift` is set in a future release — whether the warehouse's
 /// current retention matches. Today `warehouse_days` is always `None`
 /// because the probe is deferred to v2; the schema is stable so v2 can
 /// populate the field without a JSON shape break.
@@ -8225,7 +8232,7 @@ impl RetentionStatusOutput {
 }
 
 // ---------------------------------------------------------------------------
-// `rocky preview` — PR preview workflow (Arc 1 ∩ Arc 2 user-facing surface)
+// `rocky preview` — PR preview workflow
 //
 // Three subcommands compose into a single PR comment:
 //   * `preview create` — pruned re-run on a per-PR branch with copy-from-base

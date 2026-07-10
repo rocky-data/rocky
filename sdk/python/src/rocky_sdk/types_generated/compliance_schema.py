@@ -87,7 +87,7 @@ class ComplianceOutput(BaseModel):
     """
     JSON output for `rocky compliance`.
 
-    A thin rollup over Wave A governance: classification sidecars (`[classification]` per model) + project-level `[mask]` / `[mask.<env>]` policy. Answers the question **"are all classified columns masked wherever policy says they should be?"** without making any warehouse calls — purely a static resolver over `rocky.toml` + model sidecars.
+    A thin rollup over the project's governance config: classification sidecars (`[classification]` per model) + project-level `[mask]` / `[mask.<env>]` policy. Answers the question **"are all classified columns masked wherever policy says they should be?"** without making any warehouse calls — purely a static resolver over `rocky.toml` + model sidecars.
 
     Consumers (CI gates, dagster) dispatch on the top-level `command` field (`"compliance"`).
     """
