@@ -130,7 +130,29 @@ pub fn run_audit_for(
     output_json: bool,
 ) -> Result<()> {
     let root = std::env::current_dir().context("failed to get current working directory")?;
+    let output = compute_audit_for(&root, config_path, state_path, models_dir, selector)?;
 
+    if output_json {
+        print_json(&output)?;
+    } else {
+        render_chain_text(&output);
+    }
+    Ok(())
+}
+
+/// Assemble the custody chain for `selector` without rendering it.
+///
+/// The reusable core behind both `rocky audit --for` and the governor's
+/// `audit_query` MCP tool. `root` locates the on-disk plan files (the plan-vs-run
+/// vs-model subject disambiguation); the CLI resolves it from the process cwd,
+/// the MCP server passes its project root. Reads only — no mutation, no stdout.
+pub fn compute_audit_for(
+    root: &Path,
+    config_path: &Path,
+    state_path: &Path,
+    models_dir: &Path,
+    selector: &str,
+) -> Result<AuditForOutput> {
     let (decisions, runs): (Vec<PolicyDecisionRecord>, Vec<RunRecord>) = if state_path.exists() {
         let store = StateStore::open_read_only(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
@@ -145,7 +167,7 @@ pub fn run_audit_for(
 
     // Resolve the subject kind (plan file > run id > model name).
     let is_hex64 = selector.len() == 64 && selector.chars().all(|c| c.is_ascii_hexdigit());
-    let plan_on_disk = is_hex64 && plan_file_path(&root, selector).exists();
+    let plan_on_disk = is_hex64 && plan_file_path(root, selector).exists();
     let run_match = runs.iter().any(|r| r.run_id == selector);
     let kind = if plan_on_disk {
         AuditSubjectKind::Plan
@@ -163,7 +185,7 @@ pub fn run_audit_for(
     };
 
     let decisions_link = build_decisions_link(kind, selector, &decisions);
-    let plan_link = build_plan_link(kind, selector, &decisions_link, &root);
+    let plan_link = build_plan_link(kind, selector, &decisions_link, root);
     let runs_link = build_runs_link(kind, selector, subject_run, &runs);
     let verify_link = build_verify_link();
 
@@ -196,7 +218,7 @@ pub fn run_audit_for(
         }
     };
 
-    let output = AuditForOutput {
+    Ok(AuditForOutput {
         version: VERSION.to_string(),
         command: "audit".to_string(),
         subject: selector.to_string(),
@@ -207,14 +229,7 @@ pub fn run_audit_for(
         runs: runs_link,
         verify_after: verify_link,
         blast_radius: blast_link,
-    };
-
-    if output_json {
-        print_json(&output)?;
-    } else {
-        render_chain_text(&output);
-    }
-    Ok(())
+    })
 }
 
 /// Path a plan file would occupy — existence-checked without the
@@ -742,6 +757,27 @@ pub fn run_audit_scorecard(
     window: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
+    let output = compute_audit_scorecard(state_path, by, window)?;
+
+    if output_json {
+        print_json(&output)?;
+    } else {
+        render_scorecard_text(&output);
+    }
+    Ok(())
+}
+
+/// Aggregate the trust scorecard without rendering it.
+///
+/// The reusable core behind both `rocky audit --scorecard` and the governor's
+/// `scorecard` MCP tool. A malformed `--window` is a usage error (propagated);
+/// a ledger read failure renders the whole scorecard `unavailable` rather than a
+/// smoothed-over zero. Reads only — no stdout.
+pub fn compute_audit_scorecard(
+    state_path: &Path,
+    by: ScorecardDimension,
+    window: Option<&str>,
+) -> Result<AuditScorecardOutput> {
     let now = Utc::now();
     let window_label = window.unwrap_or("all").to_string();
     let window_start = parse_window(window, now)?;
@@ -764,13 +800,7 @@ pub fn run_audit_scorecard(
             unavailable_metrics: scorecard_unavailable_metrics(),
         },
     };
-
-    if output_json {
-        print_json(&output)?;
-    } else {
-        render_scorecard_text(&output);
-    }
-    Ok(())
+    Ok(output)
 }
 
 /// Read the decision ledger for a scorecard. An absent state file is not an

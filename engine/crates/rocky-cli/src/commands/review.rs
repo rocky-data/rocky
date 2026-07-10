@@ -84,6 +84,43 @@ pub(crate) async fn run_review_in(
     approve: bool,
     output_json: bool,
 ) -> Result<()> {
+    let output = compute_review(root, config_path, plan_id, base_ref, approve).await?;
+
+    if output_json {
+        print_json(&output)?;
+    } else {
+        if let Some(ref message) = output.message {
+            println!("{message}");
+        }
+        if let Some(ref f) = output.breaking_changes {
+            let breaking: Vec<&BreakingFinding> = f.iter().filter(|x| x.is_breaking()).collect();
+            if !breaking.is_empty() {
+                println!("breaking changes ({}):", breaking.len());
+                for finding in breaking {
+                    println!("  - {:?}", finding.change);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Review (and optionally sign off on) an AI-authored / agent-authored plan,
+/// returning the typed [`ReviewOutput`] without rendering it.
+///
+/// The reusable core behind both `rocky review <plan-id>` and the governor's
+/// `review_queue` approve action. When `approve` is `true` it writes the
+/// sign-off marker at `<root>/.rocky/plans/<plan_id>.reviewed.json` (the same
+/// artifact `rocky apply` checks); the marker records the caller's git identity
+/// and timestamp. Errors (bails) when the plan is not reviewable. No stdout.
+pub async fn compute_review(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    base_ref: &str,
+    approve: bool,
+) -> Result<ReviewOutput> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read plan '{plan_id}' for review"))?;
 
@@ -157,7 +194,7 @@ pub(crate) async fn run_review_in(
 
     let message = build_message(approve, breaking_count, &findings, plan_id);
 
-    let output = ReviewOutput {
+    Ok(ReviewOutput {
         version: VERSION.to_string(),
         command: "review".to_string(),
         plan_id: plan_id.to_string(),
@@ -165,25 +202,8 @@ pub(crate) async fn run_review_in(
         approved: approve,
         marker_written,
         breaking_changes: findings,
-        message: Some(message.clone()),
-    };
-
-    if output_json {
-        print_json(&output)?;
-    } else {
-        println!("{message}");
-        if let Some(ref f) = output.breaking_changes {
-            let breaking: Vec<&BreakingFinding> = f.iter().filter(|x| x.is_breaking()).collect();
-            if !breaking.is_empty() {
-                println!("breaking changes ({}):", breaking.len());
-                for finding in breaking {
-                    println!("  - {:?}", finding.change);
-                }
-            }
-        }
-    }
-
-    Ok(())
+        message: Some(message),
+    })
 }
 
 /// Build the human-readable summary line for the review outcome.
@@ -362,6 +382,28 @@ pub(crate) fn run_review_queue_in(
     models_dir: &Path,
     output_json: bool,
 ) -> Result<()> {
+    let output = compute_review_queue(root, config_path, state_path, models_dir)?;
+
+    if output_json {
+        print_json(&output)?;
+    } else {
+        render_queue_text(&output);
+    }
+    Ok(())
+}
+
+/// Build the ranked pending-review queue without rendering it.
+///
+/// The reusable core behind both `rocky review --queue` and the governor's
+/// `review_queue` MCP tool. `root` locates the sign-off markers that clear an
+/// escalation; the CLI resolves it from the process cwd, the MCP server passes
+/// its project root. Reads only — no stdout.
+pub fn compute_review_queue(
+    root: &Path,
+    config_path: &Path,
+    state_path: &Path,
+    models_dir: &Path,
+) -> Result<ReviewQueueOutput> {
     let decisions: Vec<PolicyDecisionRecord> = if state_path.exists() {
         let store = StateStore::open_read_only(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
@@ -381,20 +423,13 @@ pub(crate) fn run_review_queue_in(
         Utc::now(),
     );
 
-    let output = ReviewQueueOutput {
+    Ok(ReviewQueueOutput {
         version: VERSION.to_string(),
         command: "review".to_string(),
         ranking: QUEUE_RANKING.to_string(),
         total: pending.len() as u64,
         pending,
-    };
-
-    if output_json {
-        print_json(&output)?;
-    } else {
-        render_queue_text(&output);
-    }
-    Ok(())
+    })
 }
 
 /// Assemble the ranked queue from the decision ledger. Factored out so the

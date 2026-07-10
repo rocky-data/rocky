@@ -89,7 +89,9 @@ pub use ai::{
 pub use ai_contract::run_ai_contract;
 pub use apply::{PolicyGate, evaluate_apply_policy, run_apply, run_apply_inline_for_run};
 pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
-pub use audit::{run_audit, run_audit_for, run_audit_scorecard};
+pub use audit::{
+    compute_audit_for, compute_audit_scorecard, run_audit, run_audit_for, run_audit_scorecard,
+};
 pub use backfill::run_backfill;
 #[cfg(feature = "duckdb")]
 pub use bench::run_bench;
@@ -97,7 +99,7 @@ pub use branch::{
     run_branch_approve, run_branch_compare, run_branch_create, run_branch_delete, run_branch_list,
     run_branch_promote, run_branch_promote_from_plan, run_branch_show,
 };
-pub use brief::{BriefSince, run_brief};
+pub use brief::{BriefSince, compute_brief, run_brief};
 pub use catalog::{
     CatalogFormat, compute_catalog_output, default_out_dir as catalog_default_out_dir, run_catalog,
 };
@@ -151,7 +153,7 @@ pub use profile_storage::run_profile_storage;
 pub use publish_ir::run_publish_ir;
 pub use replay::{run_replay, run_replay_check, run_replay_execute};
 pub use retention_status::run_retention_status;
-pub use review::{run_review, run_review_queue};
+pub use review::{compute_review, compute_review_queue, run_review, run_review_queue};
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.
 pub use rocky_sql::transpile::Dialect;
