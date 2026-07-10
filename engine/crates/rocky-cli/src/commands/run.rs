@@ -1107,6 +1107,12 @@ pub async fn run(
     // `verify_after` gate can resolve *this apply's own* run (not "latest") by
     // id, immune to a concurrent run finishing in between.
     run_id_override: Option<&str>,
+    // Governance context for a two-step agent apply. `Some` only on the
+    // `rocky apply` path for a governed plan; `None` for bare `rocky run`, the
+    // DAG runner, and inline execution → the two extra fail-closed checks below
+    // (TOCTOU models-drift reject + post-discovery replication gate) are
+    // skipped and behaviour is byte-identical. See [`GovernedRunContext`].
+    governed_ctx: Option<&crate::commands::apply::GovernedRunContext<'_>>,
 ) -> Result<()> {
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
@@ -1232,6 +1238,12 @@ pub async fn run(
             "models directory '{}' not found (required for --model)",
             mdir.display()
         );
+
+        // Fail-closed TOCTOU reject (E): refuse if the models the plan
+        // authorized changed before execution.
+        if let Some(ctx) = governed_ctx {
+            ctx.reject_on_models_drift(mdir)?;
+        }
 
         let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
         // Use the first transformation pipeline's target adapter, or fall back
@@ -2250,6 +2262,23 @@ pub async fn run(
             connectors.len(),
         ))
         .await;
+
+    // Fail-closed replication gate (D): the concrete post-discovery replication
+    // target set is known now, before any table is materialized. The
+    // transformation-only apply gate never sees these targets, so a governed
+    // agent apply must evaluate them against the policy plane here (matched by
+    // table name under the `apply` verb) and refuse a denied / unreviewed
+    // agent replication before the first mutation. No-op absent a `[policy]`
+    // block or a governance context (bare `rocky run`).
+    if let Some(ctx) = governed_ctx {
+        let replication_targets: std::collections::BTreeSet<String> = tables_to_process
+            .iter()
+            .map(|t| t.table_name.clone())
+            .collect();
+        // Read/record through the write handle `run` already holds — never a
+        // fresh open (which would collide in-process and fail closed spuriously).
+        ctx.gate_replication_targets(&replication_targets, &state_store)?;
+    }
 
     let completed_keys: std::collections::HashSet<String> = if resume_latest {
         if let Ok(Some(prev)) = state_store.get_latest_run_progress() {
@@ -3780,6 +3809,11 @@ pub async fn run(
     // --- Compiled model execution (--all or --models) ---
     if run_all || models_dir.is_some() {
         let mdir = models_dir.unwrap_or_else(|| std::path::Path::new("models"));
+        // Fail-closed TOCTOU reject (E): refuse if the transformation models
+        // the plan authorized changed before this execution.
+        if let Some(ctx) = governed_ctx {
+            ctx.reject_on_models_drift(mdir)?;
+        }
         if mdir.exists() {
             // §P2.6 follow-up — execute_models + warehouse adapter
             // construction were the remaining `?`-propagation sites
@@ -9596,6 +9630,7 @@ adapter = "default"
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
             None, // no run_id override — mint the usual timestamp id
+            None, // no governance ctx (test)
         )
         .await
         .expect("transformation run should succeed");
@@ -9704,6 +9739,7 @@ schema = "mart"
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
             None, // no run_id override — mint the usual timestamp id
+            None, // no governance ctx (test)
         )
         .await
         .expect(

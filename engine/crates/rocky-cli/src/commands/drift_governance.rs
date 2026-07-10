@@ -371,6 +371,16 @@ fn govern_outcome(
     }
 }
 
+/// Whether an auto-heal verification outcome must halt the run.
+///
+/// Fail-closed (C): the run halts when the verification FAILED **or** when the
+/// verification-custody row could not be persisted (`!persisted`) — even on the
+/// passing path, an applied mutation with no durable proof of verification must
+/// not report success.
+fn verify_outcome_halts(passed: bool, persisted: bool) -> bool {
+    !persisted || !passed
+}
+
 /// Tighten `effect` to at least `require_review` — the fail-closed floor for
 /// an unreadable ledger. Never softens a `deny`.
 fn tighten_to_require_review(effect: PolicyEffect) -> PolicyEffect {
@@ -531,21 +541,35 @@ pub(crate) fn finalize_drift_verify_after(
             verify_after: required.clone(),
             auto_apply: d.auto_apply.clone(),
         };
-        if let Err(e) = store.record_policy_decision(&record) {
+        // Persist the verification-custody row. Fail-closed (C): the row is the
+        // durable record that an auto-applied mutation was verified; if its
+        // append fails — even on the PASSING path — the mutation stands with no
+        // durable proof, so the run must HALT rather than report success.
+        let persist_err = store.record_policy_decision(&record).err();
+        if let Some(e) = &persist_err {
             warn!(
                 target: "rocky::policy",
                 error = %e,
-                "failed to record verify_after custody entry (continuing)"
+                model = %d.model,
+                "failed to record verify_after custody entry — halting (fail-closed)"
             );
         }
-        if !passed {
-            warn!(
-                target: "rocky::policy",
-                model = %d.model,
-                failures = %failures.join("; "),
-                "verify_after post-apply gate FAILED for auto-applied drift"
-            );
-            halted.push(reason);
+        if verify_outcome_halts(passed, persist_err.is_none()) {
+            if let Some(e) = &persist_err {
+                halted.push(format!(
+                    "verify_after custody row for '{}' failed to persist ({e}) — no durable proof \
+                     of verification; halt-only",
+                    d.model
+                ));
+            } else {
+                warn!(
+                    target: "rocky::policy",
+                    model = %d.model,
+                    failures = %failures.join("; "),
+                    "verify_after post-apply gate FAILED for auto-applied drift"
+                );
+                halted.push(reason);
+            }
         }
     }
 
@@ -1195,5 +1219,24 @@ mod tests {
             panic!("a refused drift stays refused");
         };
         assert_eq!(reason, "additive proof failed");
+    }
+
+    /// 🔴 C regression: a verification-custody append failure halts even on the
+    /// PASSING path. Pre-fix, `passed = true` + a failed append only warned and
+    /// the finalizer returned success — an auto-applied mutation stood with no
+    /// durable proof of verification. `verify_outcome_halts` is the production
+    /// decision the finalize loop calls.
+    #[test]
+    fn passing_verify_with_lost_custody_row_halts() {
+        // Passing verification but the row did NOT persist → HALT.
+        assert!(
+            verify_outcome_halts(true, false),
+            "a passing verification whose custody row was lost must halt (fail-closed)"
+        );
+        // Passing + persisted → no halt (the normal success path).
+        assert!(!verify_outcome_halts(true, true));
+        // Failing verification always halts, regardless of persistence.
+        assert!(verify_outcome_halts(false, true));
+        assert!(verify_outcome_halts(false, false));
     }
 }

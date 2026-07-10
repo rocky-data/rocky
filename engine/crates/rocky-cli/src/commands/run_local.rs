@@ -1026,6 +1026,7 @@ mod tests {
             &skip_opts,
             &rocky_core::run_vars::RunVars::new(),
             None, // no run_id override — mint the usual timestamp id
+            None, // no governance ctx (test)
         )
         .await
         .expect("full-DAG transformation run should succeed");
@@ -1212,6 +1213,7 @@ auto_create_schemas = true
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
             None, // no run_id override — mint the usual timestamp id
+            None, // no governance ctx (test)
         )
         .await
         .expect("full-DAG transformation run with idempotency key should succeed");
@@ -1369,6 +1371,7 @@ auto_create_schemas = true
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
             None, // no run_id override — mint the usual timestamp id
+            None, // no governance ctx (test)
         )
         .await
         .expect("model-only run must reach the governance.tags apply path and succeed");
@@ -1444,6 +1447,7 @@ auto_create_schemas = true
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
             None, // no run_id override — mint the usual timestamp id
+            None, // no governance ctx (test)
         )
         .await;
 

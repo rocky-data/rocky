@@ -176,6 +176,11 @@ async fn run_apply_run_plan(
     // One unique id for this apply's run, threaded into execution and into the
     // post-apply gate so the gate reads exactly this run, not "latest".
     let apply_run_id = new_apply_run_id();
+    // Governance context — only for an AGENT apply (humans are ungated in v0, so
+    // their apply behaviour stays byte-identical). Carries the plan-authorized
+    // models fingerprint for the in-run TOCTOU reject and the identity for the
+    // post-discovery replication gate.
+    let governed = governed_run_context(&plan, principal, plan_id, root, config_path);
     execute_run_plan(
         config_path,
         plan_id,
@@ -183,6 +188,7 @@ async fn run_apply_run_plan(
         state_path,
         output_json,
         &apply_run_id,
+        governed.as_ref(),
     )
     .await?;
     run_verify_after(
@@ -192,6 +198,27 @@ async fn run_apply_run_plan(
         &apply_run_id,
         state_path,
     )
+}
+
+/// Build the [`GovernedRunContext`] for a two-step apply — `Some` only for an
+/// AGENT principal (a human apply is ungated in v0 and stays byte-identical).
+fn governed_run_context<'a>(
+    plan: &PersistedPlan,
+    principal: PolicyPrincipal,
+    plan_id: &'a str,
+    root: &'a Path,
+    config_path: &'a Path,
+) -> Option<GovernedRunContext<'a>> {
+    if principal != PolicyPrincipal::Agent {
+        return None;
+    }
+    Some(GovernedRunContext {
+        principal,
+        plan_id,
+        root,
+        config_path,
+        expected_models_fingerprint: plan.embedded_capabilities().models_fingerprint,
+    })
 }
 
 /// Execute a deserialized [`RunPlan`] against the warehouse.
@@ -216,6 +243,9 @@ async fn execute_run_plan(
     // it — a `dag` apply that also carries `verify_after` fails closed there
     // because no run is recorded under this id.
     apply_run_id: &str,
+    // Governance context (agent apply): the in-run TOCTOU models-drift reject +
+    // post-discovery replication gate. `None` for a human apply.
+    governed_ctx: Option<&GovernedRunContext<'_>>,
 ) -> Result<()> {
     // Build partition options from the persisted flags.
     let partition_opts = crate::commands::run::PartitionRunOptions {
@@ -274,6 +304,19 @@ async fn execute_run_plan(
     // unification land separately. This preserves the parity-with-`rocky run`
     // shape for the alias-deprecation path.
     if run_plan.dag {
+        // The DAG runner does not thread the governance context, so enforce the
+        // TOCTOU models-drift reject here before dispatching (fail-closed). The
+        // replication gate is best-effort covered by the models-drift bind for
+        // the dag path; a fuller dag-path gate lands with the dag/flag
+        // unification.
+        if let Some(ctx) = governed_ctx {
+            let mdir = run_plan
+                .models_dir
+                .as_deref()
+                .map(Path::new)
+                .unwrap_or_else(|| Path::new("models"));
+            ctx.reject_on_models_drift(mdir)?;
+        }
         return crate::commands::run_with_dag(config_path, state_path, output_json)
             .await
             .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"));
@@ -316,6 +359,8 @@ async fn execute_run_plan(
         // Force `run` to record under this apply's unique id so the
         // post-apply `verify_after` gate resolves this run (not "latest").
         Some(apply_run_id),
+        // Governance context: the in-run TOCTOU reject + replication gate.
+        governed_ctx,
     )
     .await
     .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))?;
@@ -461,25 +506,10 @@ pub fn evaluate_apply_policy(
     models_dir: &Path,
     state_path: &Path,
 ) -> PolicyGate {
-    let policy = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => match cfg.policy {
-            Some(p) => p,
-            None => return PolicyGate::NotConfigured,
-        },
-        // A missing or malformed config leaves the policy plane unconfigured —
-        // the caller keeps its pre-policy-plane gate. (The run path re-loads and surfaces
-        // any real config error itself.)
-        Err(_) => return PolicyGate::NotConfigured,
+    let (policy, attrs_map) = match load_policy_and_attrs(config_path, touched, models_dir) {
+        Ok(pair) => pair,
+        Err(gate) => return gate,
     };
-
-    // An empty touched set means the plan executes no models (a genuine
-    // no-op). A no-change-but-executing plan is never empty here — see the
-    // touched-set synthesis in `EmbeddedCapabilities::touched`.
-    if touched.is_empty() {
-        return PolicyGate::Allow;
-    }
-
-    let attrs_map = model_attributes(models_dir);
 
     // Snapshot the decision ledger *before* this apply writes any rows, so the
     // dynamic breakers (autonomy-budget burn, active freezes) reflect only
@@ -489,7 +519,6 @@ pub fn evaluate_apply_policy(
     // freeze/budget projection. The reader handle is dropped before the write
     // handle below is opened — redb forbids two live handles on one file
     // within a process.
-    let now = chrono::Utc::now();
     let prior_snapshot: Option<Vec<PolicyDecisionRecord>> = StateStore::open_read_only(state_path)
         .ok()
         .and_then(|reader| reader.list_policy_decisions().ok());
@@ -505,18 +534,135 @@ pub fn evaluate_apply_policy(
     let prior_snapshot =
         prior_snapshot.or_else(|| ledger.as_ref().and_then(|s| s.list_policy_decisions().ok()));
 
-    // Fail-closed floor: when the snapshot is genuinely unreadable (both opens
-    // failed — a corrupt or forward-incompatible store, or a real concurrent
-    // run holding a live redb handle so even the read-only open exhausts its
-    // retries and returns Busy), an AGENT mutation cannot be trusted, because an
-    // active freeze or exhausted budget would be invisible. It is HARD-REFUSED
-    // (deny) below instead of proceeding on an empty snapshot — a mere
-    // `require_review` would be satisfiable by a pre-existing review marker and
-    // would bypass the freeze. Humans are never gated in v0, so the floor does
-    // not apply to them.
     let snapshot_unreadable = prior_snapshot.is_none();
     let prior_decisions: Vec<PolicyDecisionRecord> = prior_snapshot.unwrap_or_default();
 
+    evaluate_apply_policy_core(
+        &policy,
+        plan_id,
+        principal,
+        touched,
+        &attrs_map,
+        &prior_decisions,
+        snapshot_unreadable,
+        |record| {
+            if let Some(store) = &ledger
+                && let Err(e) = store.record_policy_decision(record)
+            {
+                warn!(
+                    target: "rocky::policy",
+                    error = %e,
+                    "failed to record policy decision to the ledger (continuing)"
+                );
+            }
+        },
+    )
+}
+
+/// Ledger-through-a-held-handle variant of [`evaluate_apply_policy`].
+///
+/// The in-`run` replication gate (D) fires while `commands::run::run` already
+/// holds an open write handle on the state store. Re-opening the same store
+/// in-process would collide (`DatabaseAlreadyOpen` on the reader, advisory
+/// `LockHeldByOther` on the writer) and spuriously mark the snapshot
+/// unreadable — which the fail-closed D3 floor would then turn into a bogus
+/// `deny` for *every* agent replication, even under `allow`. So the snapshot
+/// and the decision-row writes both go through the caller's already-open
+/// `ledger`, never a fresh open.
+pub(crate) fn evaluate_apply_policy_with_store(
+    config_path: &Path,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    ledger: &StateStore,
+) -> PolicyGate {
+    let (policy, attrs_map) = match load_policy_and_attrs(config_path, touched, models_dir) {
+        Ok(pair) => pair,
+        Err(gate) => return gate,
+    };
+
+    // Snapshot + record through the held handle. A genuine list error (real
+    // corruption, not an in-process collision) still fails closed for agents.
+    let prior = ledger.list_policy_decisions();
+    let snapshot_unreadable = prior.is_err();
+    let prior_decisions = prior.unwrap_or_default();
+
+    evaluate_apply_policy_core(
+        &policy,
+        plan_id,
+        principal,
+        touched,
+        &attrs_map,
+        &prior_decisions,
+        snapshot_unreadable,
+        |record| {
+            if let Err(e) = ledger.record_policy_decision(record) {
+                warn!(
+                    target: "rocky::policy",
+                    error = %e,
+                    "failed to record policy decision to the ledger (continuing)"
+                );
+            }
+        },
+    )
+}
+
+/// Load the `[policy]` block and compile the per-model attributes, or return an
+/// early [`PolicyGate`] — `NotConfigured` when there is no loadable `[policy]`
+/// block, `Allow` when `touched` is empty (a genuine no-op executes nothing).
+fn load_policy_and_attrs(
+    config_path: &Path,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+) -> std::result::Result<
+    (
+        rocky_core::config::PolicyConfig,
+        BTreeMap<String, ModelAttributes>,
+    ),
+    PolicyGate,
+> {
+    let policy = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(cfg) => match cfg.policy {
+            Some(p) => p,
+            None => return Err(PolicyGate::NotConfigured),
+        },
+        // A missing or malformed config leaves the policy plane unconfigured —
+        // the caller keeps its pre-policy-plane gate. (The run path re-loads and
+        // surfaces any real config error itself.)
+        Err(_) => return Err(PolicyGate::NotConfigured),
+    };
+    // An empty touched set means the plan executes no models (a genuine no-op).
+    // A no-change-but-executing plan is never empty here — see the touched-set
+    // synthesis in `EmbeddedCapabilities::touched`.
+    if touched.is_empty() {
+        return Err(PolicyGate::Allow);
+    }
+    Ok((policy, model_attributes(models_dir)))
+}
+
+/// The per-model evaluation loop shared by [`evaluate_apply_policy`] and
+/// [`evaluate_apply_policy_with_store`]. The snapshot and the record sink are
+/// supplied by the caller so the two variants differ only in how they reach the
+/// ledger (fresh open vs. a held handle).
+#[allow(clippy::too_many_arguments)]
+fn evaluate_apply_policy_core(
+    policy: &rocky_core::config::PolicyConfig,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    attrs_map: &BTreeMap<String, ModelAttributes>,
+    prior_decisions: &[PolicyDecisionRecord],
+    // Fail-closed floor: when the snapshot is genuinely unreadable (a corrupt /
+    // forward-incompatible store, or a real cross-process run holding a live
+    // redb handle so even the read-only open exhausts its retries), an AGENT
+    // mutation cannot be trusted — an active freeze / exhausted budget would be
+    // invisible. It is HARD-REFUSED (deny), not `require_review` (which a
+    // pre-existing review marker could satisfy and so bypass the freeze).
+    snapshot_unreadable: bool,
+    mut record: impl FnMut(&PolicyDecisionRecord),
+) -> PolicyGate {
+    let now = chrono::Utc::now();
     let mut worst: Option<PolicyGate> = None;
     for (model, capability) in touched {
         let owned;
@@ -537,14 +683,14 @@ pub fn evaluate_apply_policy(
         // Static base decision, then the dynamic ledger-aware tightening
         // (freeze → deny; exhausted budget → require_review). The post-step
         // never widens the base and never changes the winning rule.
-        let decision = policy::evaluate(&policy, principal, *capability, attrs);
+        let decision = policy::evaluate(policy, principal, *capability, attrs);
         let (mut effect, degradation) = policy::autonomy_degradation(
             decision.effect,
             decision.matched_rule,
-            &policy,
+            policy,
             principal,
             attrs,
-            &prior_decisions,
+            prior_decisions,
             now,
         );
         let mut reason = decision.reason;
@@ -556,14 +702,6 @@ pub fn evaluate_apply_policy(
             && principal == PolicyPrincipal::Agent
             && effect != PolicyEffect::Deny
         {
-            // Fail-closed HARD-REFUSE (D3): when the freeze/budget snapshot is
-            // genuinely unavailable, an active freeze is invisible. Degrading to
-            // `require_review` is not enough — a pre-existing review marker would
-            // satisfy it and bypass the freeze under concurrent load (a real
-            // concurrent run holding a live redb handle makes even
-            // `open_read_only` fail Busy). Force `deny`, which no marker can
-            // satisfy, so an agent mutation cannot proceed while the ledger is
-            // unverifiable. Humans are never gated in v0.
             effect = PolicyEffect::Deny;
             reason.push_str(
                 "; policy ledger unreadable — freeze/budget state unverifiable, agent mutation \
@@ -571,30 +709,21 @@ pub fn evaluate_apply_policy(
             );
         }
 
-        if let Some(store) = &ledger {
-            let record = PolicyDecisionRecord {
-                timestamp: now,
-                plan_id: plan_id.to_string(),
-                principal,
-                capability: *capability,
-                model: model.clone(),
-                effect,
-                rule_id: decision.matched_rule,
-                reason: reason.clone(),
-                // A plain evaluation row carries no verify_after; the
-                // post-apply verification writes its own custody row.
-                verify_after: Vec::new(),
-                // Ordinary apply/promote evaluation — no auto-apply custody.
-                auto_apply: None,
-            };
-            if let Err(e) = store.record_policy_decision(&record) {
-                warn!(
-                    target: "rocky::policy",
-                    error = %e,
-                    "failed to record policy decision to the ledger (continuing)"
-                );
-            }
-        }
+        record(&PolicyDecisionRecord {
+            timestamp: now,
+            plan_id: plan_id.to_string(),
+            principal,
+            capability: *capability,
+            model: model.clone(),
+            effect,
+            rule_id: decision.matched_rule,
+            reason: reason.clone(),
+            // A plain evaluation row carries no verify_after; the post-apply
+            // verification writes its own custody row.
+            verify_after: Vec::new(),
+            // Ordinary apply/promote evaluation — no auto-apply custody.
+            auto_apply: None,
+        });
 
         let gate = match effect {
             PolicyEffect::Allow => PolicyGate::Allow,
@@ -758,6 +887,177 @@ fn touched_models_for_promote(
             (name, PolicyCapability::Promote)
         })
         .collect()
+}
+
+/// Content fingerprint of every file under `models_dir` — a blake3 digest over
+/// the sorted `(relative_path, bytes)` of each file.
+///
+/// Compile-config-independent (it hashes file bytes, not a compiled result), so
+/// the plan-time and execution-time fingerprints match exactly when the model
+/// files are unchanged. Any edit to a model's SQL/TOML, a new model file, or a
+/// deleted one changes the digest. `None` when the directory does not exist or
+/// cannot be walked (the caller then falls back to the pre-fingerprint gate).
+pub(crate) fn models_dir_fingerprint(models_dir: &Path) -> Option<String> {
+    if !models_dir.exists() {
+        return None;
+    }
+    // Depth-first collect every file's (relative path, bytes). A read error on
+    // any file yields `None` so the caller fails safe rather than hashing a
+    // partial view.
+    fn collect(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Option<()> {
+        let mut children: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .collect();
+        children.sort();
+        for path in children {
+            if path.is_dir() {
+                collect(&path, base, out)?;
+            } else if path.is_file() {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                let bytes = std::fs::read(&path).ok()?;
+                out.push((rel, bytes));
+            }
+        }
+        Some(())
+    }
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    collect(models_dir, models_dir, &mut entries)?;
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = blake3::Hasher::new();
+    for (rel, bytes) in &entries {
+        hasher.update(rel.as_bytes());
+        hasher.update(&[0u8]);
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// Governance context threaded into `commands::run::run` for a two-step agent
+/// apply. When present (`Some`), `run` performs two extra fail-closed checks at
+/// the point of execution that a plan-time / apply-time gate cannot:
+///
+/// 1. **TOCTOU reject** — re-fingerprints the models dir and refuses to execute
+///    when it differs from `expected_models_fingerprint` (the content the plan
+///    authorized), so no model runs under authorization computed against
+///    different content.
+/// 2. **Replication gate** — evaluates the agent-policy plane over the concrete
+///    post-discovery replication target set (which the transformation-only
+///    apply gate never sees) and refuses a denied / unreviewed agent
+///    replication.
+///
+/// `None` for bare `rocky run`, the DAG runner, and inline execution → neither
+/// check runs and behaviour is byte-identical.
+pub struct GovernedRunContext<'a> {
+    /// The plan's authoring principal (an agent plan evaluates as agent).
+    pub principal: PolicyPrincipal,
+    /// The plan id the decision rows are recorded against, and the review
+    /// marker the replication gate consults.
+    pub plan_id: &'a str,
+    /// Project root holding `.rocky/plans/<plan_id>.reviewed.json`.
+    pub root: &'a Path,
+    /// The config the policy block loads from.
+    pub config_path: &'a Path,
+    /// The models-dir content fingerprint the plan authorized (`None` on a
+    /// legacy plan → the TOCTOU reject is skipped).
+    pub expected_models_fingerprint: Option<String>,
+}
+
+impl GovernedRunContext<'_> {
+    /// Fail-closed TOCTOU reject: bail when the models dir the run is about to
+    /// execute no longer matches the fingerprint the plan authorized. A `None`
+    /// expected fingerprint (legacy plan) skips the check.
+    pub(crate) fn reject_on_models_drift(&self, models_dir: &Path) -> Result<()> {
+        let Some(expected) = self.expected_models_fingerprint.as_deref() else {
+            return Ok(());
+        };
+        let current = models_dir_fingerprint(models_dir);
+        if current.as_deref() != Some(expected) {
+            bail!(
+                "refusing to execute plan '{}': the models directory changed since the plan was \
+                 authorized and reviewed (content fingerprint mismatch). A model may have changed \
+                 (e.g. additive → breaking) or a new model added between planning and applying, so \
+                 the recorded authorization no longer covers what would execute. Re-plan with \
+                 `rocky plan` and (if AI-authored) re-review before applying.",
+                self.plan_id
+            );
+        }
+        Ok(())
+    }
+
+    /// Fail-closed replication gate: evaluate the agent-policy plane over the
+    /// concrete discovered replication target names and enforce the verdict
+    /// before any replication SQL runs. A `NotConfigured` plane (no `[policy]`)
+    /// is a no-op.
+    /// `ledger` is the state-store handle `run` already holds — the gate reads
+    /// and records through it rather than re-opening (which would collide
+    /// in-process and spuriously mark the snapshot unreadable → a bogus
+    /// fail-closed deny for every agent replication).
+    pub(crate) fn gate_replication_targets(
+        &self,
+        target_names: &BTreeSet<String>,
+        ledger: &StateStore,
+    ) -> Result<()> {
+        if target_names.is_empty() {
+            return Ok(());
+        }
+        // Replication targets are not compiled models; gate each under the bare
+        // `apply` verb (a mutation), matched by table name.
+        let touched: BTreeMap<String, PolicyCapability> = target_names
+            .iter()
+            .map(|n| (n.clone(), PolicyCapability::Apply))
+            .collect();
+        // No compiled model dir for replication targets — evaluate against
+        // bare-named attributes (a nonexistent dir yields an empty attr map, so
+        // every target matches by name / the default posture).
+        let models_dir = resolve_config_models_dir(self.config_path);
+        let gate = evaluate_apply_policy_with_store(
+            self.config_path,
+            self.plan_id,
+            self.principal,
+            &touched,
+            &models_dir,
+            ledger,
+        );
+        apply_policy_gate(self.root, self.plan_id, gate)
+    }
+}
+
+/// Evaluate the agent-policy plane over a `Promote` plan and enforce the
+/// resulting gate, before any promote SQL executes.
+///
+/// Shared by BOTH promote apply entry points — `rocky apply <promote-plan>`
+/// and `rocky branch promote --plan <id>` — so neither can execute a denied
+/// agent promote. Absent `[policy]` this is a no-op (`NotConfigured` → the
+/// pre-policy-plane behaviour). A human-authored promote resolves to `allow`;
+/// an agent-authored one is gated per target under the `promote` verb. The
+/// models dir is resolved from config so a name-scoped rule matches the
+/// target's logical name.
+pub(crate) fn gate_promote_plan(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    promote_plan: &PromotePlan,
+    state_path: &Path,
+) -> Result<()> {
+    let promote_models_dir = resolve_config_models_dir(config_path);
+    let touched = touched_models_for_promote(promote_plan, &promote_models_dir);
+    let gate = evaluate_apply_policy(
+        config_path,
+        plan_id,
+        principal,
+        &touched,
+        &promote_models_dir,
+        state_path,
+    );
+    apply_policy_gate(root, plan_id, gate)
 }
 
 /// Resolve the models directory for the promote gate from the loaded config:
@@ -1106,6 +1406,7 @@ async fn run_apply_ai_authored_plan(
     // One unique id for this apply's run, threaded into execution and into the
     // post-apply gate so the gate reads exactly this run, not "latest".
     let apply_run_id = new_apply_run_id();
+    let governed = governed_run_context(&plan, principal, plan_id, root, config_path);
     execute_run_plan(
         config_path,
         plan_id,
@@ -1113,6 +1414,7 @@ async fn run_apply_ai_authored_plan(
         state_path,
         output_json,
         &apply_run_id,
+        governed.as_ref(),
     )
     .await?;
     run_verify_after(
@@ -1351,6 +1653,13 @@ async fn run_apply_replication_plan(
     // main.rs, so a namespaced replication apply writes the namespaced file.
     let partition_opts = crate::commands::run::PartitionRunOptions::default();
 
+    // Governance context (agent apply): gates the discovered replication target
+    // set inside `run` before any table is materialized (D). A pure replication
+    // plan carries no models, so the fingerprint is absent and the TOCTOU reject
+    // is a no-op.
+    let governed =
+        governed_run_context(&plan, plan.resolved_principal(), plan_id, root, config_path);
+
     crate::commands::run::run(
         config_path,
         replication_plan.filter.as_deref(),
@@ -1384,6 +1693,7 @@ async fn run_apply_replication_plan(
         &rocky_core::run_vars::RunVars::new(),
         // Replication apply has no `verify_after` gate; mint the usual id.
         None,
+        governed.as_ref(),
     )
     .await
     .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
@@ -1651,24 +1961,14 @@ async fn run_apply_promote_plan(
         .context("failed to deserialize promote plan payload")?;
 
     // policy seam 3: mirror the apply-time policy enforcement on the promote path.
-    // Absent `[policy]` this is a no-op (promote was never gated). A
-    // human-authored promote resolves to `allow`; an agent-authored promote is
-    // gated per changed model under the `promote` verb.
-    //
-    // Resolve the models dir from config (not a hardcoded `models`) so the
-    // target→logical-name mapping compiles the right directory — a name-scoped
-    // `deny agent promote { models = [...] }` rule then matches.
-    let promote_models_dir = resolve_config_models_dir(config_path);
-    let touched = touched_models_for_promote(&promote_plan, &promote_models_dir);
-    let gate = evaluate_apply_policy(
+    gate_promote_plan(
+        root,
         config_path,
         plan_id,
         plan.resolved_principal(),
-        &touched,
-        &promote_models_dir,
+        &promote_plan,
         state_path,
-    );
-    apply_policy_gate(root, plan_id, gate)?;
+    )?;
 
     // Build actor identity for apply-time audit events.
     let actor = crate::commands::branch::approver_identity_pub().unwrap_or_else(|_| {
@@ -1799,6 +2099,8 @@ pub async fn run_apply_inline_for_run(
         run_vars,
         // The inline `rocky run` path mints its own timestamp run_id; the
         // two-step apply's verify_after gate is the only override consumer.
+        None,
+        // Inline `rocky run` is never a governed two-step apply — no gate.
         None,
     )
     .await
@@ -1978,20 +2280,35 @@ models = "models/**"
 auto_create_schemas = true
 "#;
 
-    /// Rewrite a just-written plan file to look like a *legacy* plan: strip the
-    /// `principal` field (as if written before the policy plane). The `plan_id` is unchanged
-    /// because `principal` rides outside the hash, so the integrity check still
-    /// passes on read.
-    fn strip_principal_from_plan(root: &Path, plan_id: &str) -> anyhow::Result<()> {
-        let path = root
-            .join(".rocky")
-            .join("plans")
-            .join(format!("{plan_id}.json"));
+    /// Rewrite a just-written plan file to look like a genuinely *legacy* plan:
+    /// strip the `principal` field (as if written before the policy plane) AND
+    /// recompute the `plan_id` the way the old binary did — over
+    /// `{kind, payload}` with **no** principal — so the integrity check still
+    /// passes. The file is renamed to the recomputed legacy id, which is
+    /// returned. (Since the principal is now part of the digest, simply
+    /// deleting the field would invalidate the id — that is exactly the tamper
+    /// protection under test elsewhere.)
+    fn strip_principal_from_plan(root: &Path, plan_id: &str) -> anyhow::Result<String> {
+        let plans = root.join(".rocky").join("plans");
+        let path = plans.join(format!("{plan_id}.json"));
         let raw = std::fs::read_to_string(&path)?;
         let mut v: serde_json::Value = serde_json::from_str(&raw)?;
-        v.as_object_mut().unwrap().remove("principal");
-        std::fs::write(&path, serde_json::to_vec_pretty(&v)?)?;
-        Ok(())
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("principal");
+        let kind: crate::plan_store::PlanKind =
+            serde_json::from_value(obj.get("kind").unwrap().clone())?;
+        let payload = obj.get("payload").unwrap().clone();
+        let legacy_id = crate::plan_store::compute_plan_id(&kind, None, &payload);
+        obj.insert(
+            "plan_id".to_string(),
+            serde_json::Value::String(legacy_id.clone()),
+        );
+        std::fs::remove_file(&path)?;
+        std::fs::write(
+            plans.join(format!("{legacy_id}.json")),
+            serde_json::to_vec_pretty(&v)?,
+        )?;
+        Ok(legacy_id)
     }
 
     /// 🔴 THE load-bearing regression: a legacy `ai_authored` plan file with NO
@@ -2028,7 +2345,9 @@ auto_create_schemas = true
         rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
         rp.models = vec!["orders".to_string()];
         let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
-        strip_principal_from_plan(dir.path(), &plan_id)?;
+        // Turn it into a genuinely-legacy (unstamped) plan with a valid legacy
+        // id — the returned id is the one apply must be invoked with.
+        let plan_id = strip_principal_from_plan(dir.path(), &plan_id)?;
 
         let state = dir.path().join("state.redb");
         let err = super::run_apply_ai_authored_plan(
@@ -2303,6 +2622,7 @@ effect = "deny"
         let caps = crate::plan_store::EmbeddedCapabilities {
             diff_available: true,
             changed: BTreeMap::new(),
+            models_fingerprint: None,
         };
         let touched = caps.touched(&["m".to_string()]);
         assert!(!touched.is_empty(), "FIX 3 must synthesize a touched set");
@@ -2336,6 +2656,7 @@ effect = "deny"
         let caps = crate::plan_store::EmbeddedCapabilities {
             diff_available: true,
             changed: BTreeMap::new(),
+            models_fingerprint: None,
         };
         let touched = caps.touched(&["m".to_string()]);
         let gate = super::evaluate_apply_policy(
@@ -2362,6 +2683,7 @@ effect = "deny"
         let caps = crate::plan_store::EmbeddedCapabilities {
             diff_available: true,
             changed: BTreeMap::new(),
+            models_fingerprint: None,
         };
         let touched = caps.touched(&["m".to_string()]);
         let gate = super::evaluate_apply_policy(
@@ -2545,6 +2867,7 @@ effect = "allow"
                 c.insert("stg_x".to_string(), PolicyCapability::SchemaChangeAdditive);
                 c
             },
+            models_fingerprint: None,
         };
         // Both models execute; only stg_x changed.
         let touched = caps.touched(&["stg_x".to_string(), "prod_critical".to_string()]);
@@ -2962,6 +3285,208 @@ auto_create_schemas = true
             super::resolve_config_models_dir(&dir.path().join("missing.toml")),
             dir.path().join("models")
         );
+    }
+
+    /// `models_dir_fingerprint` is stable for unchanged files and changes when
+    /// any model file changes or a new one is added.
+    #[test]
+    fn models_dir_fingerprint_tracks_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        let fp1 = super::models_dir_fingerprint(&models_dir).expect("fingerprint");
+        // Stable across re-reads of the same content.
+        assert_eq!(
+            fp1,
+            super::models_dir_fingerprint(&models_dir).unwrap(),
+            "unchanged files must fingerprint identically"
+        );
+        // A new model changes it.
+        write_min_model(&models_dir, "customers");
+        assert_ne!(
+            fp1,
+            super::models_dir_fingerprint(&models_dir).unwrap(),
+            "adding a model must change the fingerprint"
+        );
+        // Editing a model's SQL changes it.
+        std::fs::write(models_dir.join("orders.sql"), "SELECT 2 AS id").unwrap();
+        let fp3 = super::models_dir_fingerprint(&models_dir).unwrap();
+        write_min_model(&models_dir, "customers"); // no-op rewrite
+        assert_eq!(fp3, super::models_dir_fingerprint(&models_dir).unwrap());
+    }
+
+    /// 🔴 E regression (TOCTOU): a model changed between plan authoring and
+    /// execution must be REFUSED. `GovernedRunContext::reject_on_models_drift`
+    /// is the in-run check `run()` calls before executing. Pre-fix there was no
+    /// such check and the changed content executed under the stale
+    /// authorization.
+    #[test]
+    fn toctou_reject_fires_when_models_change_after_planning() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        let config = dir.path().join("rocky.toml");
+        // The fingerprint the plan authorized.
+        let expected = super::models_dir_fingerprint(&models_dir);
+        let ctx = super::GovernedRunContext {
+            principal: PolicyPrincipal::Agent,
+            plan_id: "plan_x",
+            root: dir.path(),
+            config_path: &config,
+            expected_models_fingerprint: expected,
+        };
+        // Unchanged → proceeds.
+        ctx.reject_on_models_drift(&models_dir)
+            .expect("unchanged models must not be rejected");
+
+        // A model changes additive→breaking (rewrite the SQL) → REJECT.
+        std::fs::write(models_dir.join("orders.sql"), "SELECT 1 AS id, 2 AS extra").unwrap();
+        let err = ctx
+            .reject_on_models_drift(&models_dir)
+            .expect_err("a models-dir change must be rejected (TOCTOU)");
+        assert!(
+            err.to_string().contains("fingerprint mismatch"),
+            "reject must cite the fingerprint mismatch, got: {err}"
+        );
+    }
+
+    /// A legacy plan (no bound fingerprint) skips the TOCTOU reject.
+    #[test]
+    fn toctou_reject_is_skipped_without_a_bound_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        let config = dir.path().join("rocky.toml");
+        let ctx = super::GovernedRunContext {
+            principal: PolicyPrincipal::Agent,
+            plan_id: "plan_x",
+            root: dir.path(),
+            config_path: &config,
+            expected_models_fingerprint: None,
+        };
+        std::fs::write(models_dir.join("orders.sql"), "SELECT 999 AS id").unwrap();
+        ctx.reject_on_models_drift(&models_dir)
+            .expect("no bound fingerprint ⇒ no reject (legacy plan)");
+    }
+
+    /// 🔴 D regression: the discovered replication target set is gated. An
+    /// agent replication under `deny agent apply { any }` must be refused before
+    /// any table materializes. Pre-fix the replication set was never
+    /// policy-evaluated.
+    #[test]
+    fn replication_gate_denies_agent_under_deny_rule() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "deny"
+"#,
+        )?;
+        let state = dir.path().join("state.redb");
+        let ledger = StateStore::open(&state)?;
+        let ctx = super::GovernedRunContext {
+            principal: PolicyPrincipal::Agent,
+            plan_id: "plan_x",
+            root: dir.path(),
+            config_path: &config,
+            expected_models_fingerprint: None,
+        };
+        let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
+        let err = ctx
+            .gate_replication_targets(&targets, &ledger)
+            .expect_err("an agent replication under a deny rule must be refused");
+        assert!(err.to_string().contains("DENIES"), "got: {err}");
+
+        // An empty target set is a no-op (nothing executes).
+        ctx.gate_replication_targets(&BTreeSet::new(), &ledger)
+            .expect("no targets ⇒ nothing to gate");
+        Ok(())
+    }
+
+    /// 🔴 Reentrancy regression: the replication gate runs while `run` already
+    /// holds a live write handle on the state store. It must read/record
+    /// through that held handle, NOT re-open — a re-open collides in-process,
+    /// marks the snapshot unreadable, and the fail-closed D3 floor would then
+    /// spuriously DENY every agent replication even under `allow`. This test
+    /// holds a live handle (as `run` does) and asserts the held-handle gate
+    /// allows, while contrasting the re-open path which spuriously denies.
+    #[test]
+    fn replication_gate_reads_through_held_handle_no_spurious_deny() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // A benign `allow agent apply { any }` — the gate must NOT deny.
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+"#,
+        )?;
+        let state = dir.path().join("state.redb");
+        // Simulate `run` holding a live write handle for the whole invocation.
+        let held = StateStore::open(&state)?;
+        let ctx = super::GovernedRunContext {
+            principal: PolicyPrincipal::Agent,
+            plan_id: "plan_x",
+            root: dir.path(),
+            config_path: &config,
+            expected_models_fingerprint: None,
+        };
+        let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
+
+        // Through the held handle → reads fine → allow (no spurious deny).
+        ctx.gate_replication_targets(&targets, &held).expect(
+            "the replication gate must read through the held handle and not spuriously deny \
+             under an `allow` rule",
+        );
+
+        // Contrast: the re-open path (evaluate_apply_policy via state_path)
+        // DOES fail closed while the handle is held — which is exactly why the
+        // gate uses the held-handle variant instead.
+        let touched: BTreeMap<String, PolicyCapability> = targets
+            .iter()
+            .map(|n| (n.clone(), PolicyCapability::Apply))
+            .collect();
+        let reopen_gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &touched,
+            &dir.path().join("models"),
+            &state,
+        );
+        assert!(
+            matches!(reopen_gate, PolicyGate::Deny { .. }),
+            "the re-open path spuriously denies under a held handle (the reentrancy bug the \
+             held-handle variant avoids), got {reopen_gate:?}"
+        );
+        Ok(())
+    }
+
+    /// The replication gate is a no-op absent a `[policy]` block (NotConfigured).
+    #[test]
+    fn replication_gate_noop_without_policy_block() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("rocky.toml"), NO_POLICY_TOML)?;
+        let state = dir.path().join("state.redb");
+        let ledger = StateStore::open(&state)?;
+        let ctx = super::GovernedRunContext {
+            principal: PolicyPrincipal::Agent,
+            plan_id: "plan_x",
+            root: dir.path(),
+            config_path: &dir.path().join("rocky.toml"),
+            expected_models_fingerprint: None,
+        };
+        let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
+        ctx.gate_replication_targets(&targets, &ledger)
+            .expect("no [policy] block ⇒ replication gate is a no-op");
+        Ok(())
     }
 
     #[test]

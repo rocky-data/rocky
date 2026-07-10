@@ -189,6 +189,9 @@ pub(crate) fn run_backfill_in(
             .iter()
             .map(|m| (m.clone(), PolicyCapability::Backfill))
             .collect(),
+        // A backfill executes the same on-disk models it plans; bind their
+        // content so an apply-time TOCTOU is rejected.
+        models_fingerprint: crate::commands::apply::models_dir_fingerprint(models_dir),
     };
     let plan_id = write_plan_governed(
         root,

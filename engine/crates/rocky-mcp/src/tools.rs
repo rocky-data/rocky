@@ -2376,6 +2376,9 @@ impl RockyMcpServer {
         // to persist the plan.
         let plan_id = rocky_cli::plan_store::governed_plan_id(
             &rocky_cli::plan_store::PlanKind::AiAuthored,
+            // propose always authors as the agent principal — must mirror the
+            // `write_plan_governed(..., Agent, ...)` call below so the id matches.
+            rocky_core::config::PolicyPrincipal::Agent,
             &run_plan,
             &capabilities,
         )

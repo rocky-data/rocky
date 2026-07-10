@@ -3,7 +3,11 @@
 //!
 //! Plans are written to `<root>/.rocky/plans/<plan_id>.json` where `plan_id`
 //! is the full 64-character blake3 hex digest of the canonical JSON
-//! `{"kind": "<kind>", "payload": <payload>}`.
+//! `{"kind": "<kind>", "principal": "<principal>", "payload": <payload>}` (the
+//! `principal` key is omitted for genuinely-legacy plans with no stamp, which
+//! reproduces the historical `{kind, payload}` id). Binding the authoring
+//! principal into the id is what makes a post-write principal tamper (agent →
+//! human, to drop agent-scoped denies) fail the integrity check.
 //!
 //! ## Determinism guarantee
 //!
@@ -42,7 +46,8 @@
 //! arms in [`crate::commands::compact`] and [`crate::commands::archive`].
 //!
 //! The `format_version` field is **not** included in the `plan_id`
-//! digest. The digest is computed over `{kind, payload}` only.
+//! digest. The digest is computed over `{kind, principal, payload}` (principal
+//! omitted when absent).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -155,12 +160,16 @@ pub struct PersistedPlan {
     pub format_version: u32,
     /// The principal that authored this plan (agent-policy plane).
     ///
-    /// Rides **outside** the `plan_id` digest (like `created_at` /
-    /// `format_version`) — the authoring identity must not perturb the hash,
-    /// while the reviewed capability classification (in `payload`) must bind
-    /// to it. Stamped at plan-creation.
+    /// **Part of the `plan_id` integrity digest** (see [`compute_plan_id`]) so
+    /// the authoring identity cannot be tampered after write — a `principal`
+    /// downgraded from `agent` to `human` (to drop agent-scoped denies/freezes)
+    /// changes the id and fails the integrity check in [`read_plan`]. Stamped
+    /// at plan-creation. (`created_at` / `format_version` still ride outside the
+    /// digest — they are not authorization-bearing.)
     ///
-    /// **Absent on legacy plans** (written before the field existed). An
+    /// **Absent on legacy plans** (written before the field existed); the digest
+    /// omits it in that case so a genuinely-legacy `{kind, payload}` id still
+    /// verifies. An
     /// absent value does NOT default to `human`: it resolves *by kind* via
     /// [`PersistedPlan::resolved_principal`] — an `ai_authored` plan with no
     /// stamp resolves to `agent` (never `human`, which would let a legacy
@@ -209,6 +218,17 @@ pub struct EmbeddedCapabilities {
     /// are not gated.
     #[serde(default)]
     pub changed: BTreeMap<String, PolicyCapability>,
+    /// Content fingerprint of the models directory the gate authorized at plan
+    /// time (a hash of every model file's path + bytes — see
+    /// `apply::models_dir_fingerprint`). Bound into the `plan_id` (it lives in
+    /// the hashed payload). At apply time the executing content is
+    /// re-fingerprinted and REJECTED (fail-closed) if it differs — a model
+    /// changed `additive → breaking`, or a new protected model added, between
+    /// plan authoring and execution can no longer run under the stale
+    /// authorization. `None` on a legacy plan or when the models dir could not
+    /// be read (the apply then falls back to the pre-fingerprint behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_fingerprint: Option<String>,
 }
 
 /// The principal an absent stamp resolves to, **by kind** (never a blanket
@@ -307,18 +327,41 @@ fn default_format_version() -> u32 {
     1
 }
 
-/// Compute the blake3 plan_id for the given `(kind, payload)` pair.
+/// Compute the blake3 plan_id for the given `(kind, principal, payload)`.
 ///
-/// The digest is over the JSON bytes of `{"kind": <kind>, "payload": <payload>}`.
+/// The digest is over the JSON bytes of the envelope. The **authoring
+/// principal is part of the digest** so that tampering an agent plan's
+/// `principal` down to `human` (or overwriting it with an identical human
+/// plan) changes the id and fails the integrity check in [`read_plan`] —
+/// otherwise the enforcement path would trust an unhashed principal and drop
+/// the agent-scoped denies/freezes that gate the plan.
+///
+/// `principal` is included **only when `Some`**, so a genuinely-legacy plan on
+/// disk (written before the field existed → `principal = None`) still hashes to
+/// `{kind, payload}` and passes its integrity check unchanged. Every plan this
+/// binary writes stamps `Some(principal)`, so tampering it to `None`/`human`
+/// changes the envelope and is rejected.
+///
 /// `payload` must be the pre-`plan_id` version (i.e. `plan_id` field is `None`
 /// or absent) so the id is stable.
-fn compute_plan_id(kind: &PlanKind, payload: &serde_json::Value) -> String {
+pub(crate) fn compute_plan_id(
+    kind: &PlanKind,
+    principal: Option<PolicyPrincipal>,
+    payload: &serde_json::Value,
+) -> String {
     #[derive(Serialize)]
     struct Envelope<'a> {
         kind: &'a PlanKind,
+        // Skipped when absent so legacy `{kind, payload}` ids reproduce.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        principal: Option<PolicyPrincipal>,
         payload: &'a serde_json::Value,
     }
-    let envelope = Envelope { kind, payload };
+    let envelope = Envelope {
+        kind,
+        principal,
+        payload,
+    };
     let bytes = serde_json::to_vec(&envelope).expect("envelope serialization is infallible");
     let hash = blake3::hash(&bytes);
     hash.to_hex().to_string()
@@ -383,9 +426,9 @@ pub fn write_plan_governed<T: Serialize>(
 /// classification (every eviction is uniformly a `gc` capability, computed at
 /// apply time from the plan's eviction list), so there is nothing to embed —
 /// but the invoker principal must still ride on the record so an agent-scoped
-/// `deny agent gc` rule fires on an agent-run GC. The `principal` rides outside
-/// the `plan_id` digest, exactly as [`write_plan`] and [`write_plan_governed`]
-/// stamp it.
+/// `deny agent gc` rule fires on an agent-run GC. The `principal` is part of
+/// the `plan_id` digest (see [`compute_plan_id`]), exactly as [`write_plan`]
+/// and [`write_plan_governed`] stamp it, so it cannot be tampered post-write.
 pub fn write_plan_with_principal<T: Serialize>(
     root: &Path,
     kind: PlanKind,
@@ -406,13 +449,15 @@ pub fn write_plan_with_principal<T: Serialize>(
 /// refuses to persist.
 pub fn governed_plan_id<T: Serialize>(
     kind: &PlanKind,
+    principal: PolicyPrincipal,
     payload: &T,
     capabilities: &EmbeddedCapabilities,
 ) -> Result<String> {
     let caps_value =
         serde_json::to_value(capabilities).context("failed to serialize embedded capabilities")?;
     let payload_value = payload_with_capabilities(payload, Some(caps_value))?;
-    Ok(compute_plan_id(kind, &payload_value))
+    // Must mirror `write_plan_inner`, which stamps `Some(principal)`.
+    Ok(compute_plan_id(kind, Some(principal), &payload_value))
 }
 
 /// Serialize a plan `payload` to a JSON value, injecting the embedded
@@ -473,7 +518,10 @@ fn write_plan_inner<T: Serialize>(
     // (run/ai_authored); typed-IR compact/archive payloads never carry it.
     let payload_value = payload_with_capabilities(payload, capabilities)?;
 
-    let plan_id = compute_plan_id(&kind, &payload_value);
+    // The authoring principal is part of the integrity digest (see
+    // `compute_plan_id`) so a later tamper of the stamped principal invalidates
+    // the id.
+    let plan_id = compute_plan_id(&kind, Some(principal), &payload_value);
 
     let record = PersistedPlan {
         plan_id: plan_id.clone(),
@@ -524,18 +572,22 @@ pub fn read_plan(root: &Path, plan_id: &str) -> Result<PersistedPlan> {
     let plan: PersistedPlan = serde_json::from_slice(&bytes)
         .with_context(|| format!("plan file at {} is not valid JSON", path.display()))?;
 
-    // Integrity check: the plan_id is the blake3 digest of `{kind, payload}`.
-    // Recompute it from the bytes we just parsed and reject the plan if it does
-    // not match the requested id (and the stored id). This binds the applied
-    // bytes to the reviewed plan id — a plan whose payload was tampered with or
-    // truncated-but-still-parseable after it was written (and reviewed) no
-    // longer matches its filename / stored id, so apply refuses it.
-    let recomputed = compute_plan_id(&plan.kind, &plan.payload);
+    // Integrity check: the plan_id is the blake3 digest of
+    // `{kind, principal, payload}` (principal omitted only for genuinely-legacy
+    // plans with no stamp — see [`compute_plan_id`]). Recompute it from the
+    // bytes we just parsed and reject the plan if it does not match the
+    // requested id (and the stored id). This binds the applied bytes AND the
+    // authoring principal to the reviewed plan id — a plan whose payload OR
+    // principal was tampered after it was written (e.g. an agent plan downgraded
+    // to `human` to escape agent-scoped denies) no longer matches its filename /
+    // stored id, so apply refuses it.
+    let recomputed = compute_plan_id(&plan.kind, plan.principal, &plan.payload);
     if recomputed != plan_id || recomputed != plan.plan_id {
         bail!(
-            "plan '{}' failed its integrity check: the payload hashes to '{}', \
+            "plan '{}' failed its integrity check: it hashes to '{}', \
              which does not match the requested id '{}' (stored id '{}'). \
-             The plan file at {} may have been modified after it was written — \
+             The plan file at {} may have been modified after it was written \
+             (payload or authoring principal) — \
              re-generate the plan and (if AI-authored) re-review it before applying.",
             plan_id,
             recomputed,
@@ -865,7 +917,7 @@ mod tests {
         let plans_dir = dir.path().join(".rocky").join("plans");
         std::fs::create_dir_all(&plans_dir)?;
         let payload = serde_json::json!({"models": ["db.s.t"]});
-        let plan_id = compute_plan_id(&PlanKind::AiAuthored, &payload);
+        let plan_id = compute_plan_id(&PlanKind::AiAuthored, None, &payload);
         // A pre-policy-plane plan file: kind = ai_authored, NO principal key at all.
         let legacy = serde_json::json!({
             "plan_id": plan_id,
@@ -900,7 +952,7 @@ mod tests {
         let plans_dir = dir.path().join(".rocky").join("plans");
         std::fs::create_dir_all(&plans_dir)?;
         let payload = serde_json::json!({"models": ["db.s.t"]});
-        let plan_id = compute_plan_id(&PlanKind::Run, &payload);
+        let plan_id = compute_plan_id(&PlanKind::Run, None, &payload);
         let legacy = serde_json::json!({
             "plan_id": plan_id,
             "kind": "run",
@@ -935,6 +987,82 @@ mod tests {
         assert_eq!(
             read_plan(dir.path(), &run_id)?.principal,
             Some(PolicyPrincipal::Human)
+        );
+        Ok(())
+    }
+
+    /// 🔴 B regression: the authoring principal is bound into the plan_id
+    /// integrity digest. Tampering a written agent plan's `principal` down to
+    /// `human` (to drop agent-scoped denies/freezes) — while keeping the
+    /// filename/plan_id — must fail the integrity check on read. Pre-fix the
+    /// digest covered only `{kind, payload}`, so the tamper passed and the plan
+    /// resolved to an ungated `human`.
+    #[test]
+    fn tampering_the_stamped_principal_fails_the_integrity_check() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = serde_json::json!({"branch_name": "b", "targets": []});
+        // An agent-authored promote plan.
+        let plan_id = write_plan_with_principal(
+            dir.path(),
+            PlanKind::Promote,
+            &payload,
+            PolicyPrincipal::Agent,
+        )?;
+        assert_eq!(
+            read_plan(dir.path(), &plan_id)?.resolved_principal(),
+            PolicyPrincipal::Agent,
+            "baseline: the untampered agent plan reads fine"
+        );
+
+        // Tamper: downgrade the stamped principal to human, keep the filename.
+        let path = dir
+            .path()
+            .join(".rocky")
+            .join("plans")
+            .join(format!("{plan_id}.json"));
+        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        v.as_object_mut()
+            .unwrap()
+            .insert("principal".to_string(), serde_json::json!("human"));
+        std::fs::write(&path, serde_json::to_vec_pretty(&v)?)?;
+
+        let err = read_plan(dir.path(), &plan_id).unwrap_err();
+        assert!(
+            err.to_string().contains("integrity check"),
+            "a tampered principal must fail the integrity check, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// 🔴 B regression: an agent plan and a human plan with an IDENTICAL payload
+    /// get DIFFERENT plan_ids, so a human plan cannot overwrite (collide with)
+    /// an agent plan's file and thereby drop its agent-scoped denies. Pre-fix
+    /// the principal was outside the hash → identical payload → identical id.
+    #[test]
+    fn agent_and_human_plans_with_identical_payload_have_distinct_ids() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = serde_json::json!({"branch_name": "b", "targets": []});
+        let agent_id = write_plan_with_principal(
+            dir.path(),
+            PlanKind::Promote,
+            &payload,
+            PolicyPrincipal::Agent,
+        )?;
+        let human_id = write_plan_with_principal(
+            dir.path(),
+            PlanKind::Promote,
+            &payload,
+            PolicyPrincipal::Human,
+        )?;
+        assert_ne!(
+            agent_id, human_id,
+            "principal is part of the digest, so agent and human plans differ"
+        );
+        // And a genuinely-legacy (unstamped) plan reproduces the pre-principal
+        // digest so it still verifies — backward compatibility.
+        assert_eq!(
+            compute_plan_id(&PlanKind::Promote, None, &payload),
+            compute_plan_id(&PlanKind::Promote, None, &payload)
         );
         Ok(())
     }
@@ -988,6 +1116,7 @@ mod tests {
         let caps = EmbeddedCapabilities {
             diff_available: true,
             changed: BTreeMap::new(),
+            models_fingerprint: None,
         };
         let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
         assert_eq!(
@@ -1006,6 +1135,7 @@ mod tests {
         let caps = EmbeddedCapabilities {
             diff_available: true,
             changed: BTreeMap::new(),
+            models_fingerprint: None,
         };
         assert!(caps.touched(&[]).is_empty());
     }
@@ -1026,6 +1156,7 @@ mod tests {
         let caps = EmbeddedCapabilities {
             diff_available: true,
             changed,
+            models_fingerprint: None,
         };
         let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
         assert_eq!(
@@ -1051,6 +1182,7 @@ mod tests {
         let caps = EmbeddedCapabilities {
             diff_available: true,
             changed,
+            models_fingerprint: None,
         };
         // Only `orders` executes; the change to the non-executing `customers`
         // is absent from the touched set.
@@ -1078,7 +1210,7 @@ mod tests {
 
     #[test]
     fn compute_plan_id_is_64_hex_chars() {
-        let id = compute_plan_id(&PlanKind::Compact, &json!({"foo": "bar"}));
+        let id = compute_plan_id(&PlanKind::Compact, None, &json!({"foo": "bar"}));
         assert_eq!(id.len(), 64);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -1167,7 +1299,7 @@ mod tests {
         // passes — this test exercises the `format_version` default, not a
         // tamper case. (Pre-integrity-check this used a fabricated all-`a` id.)
         let payload = serde_json::json!({"dummy": true});
-        let plan_id = compute_plan_id(&PlanKind::Compact, &payload);
+        let plan_id = compute_plan_id(&PlanKind::Compact, None, &payload);
         let legacy_json = serde_json::json!({
             "plan_id": plan_id,
             "kind": "compact",

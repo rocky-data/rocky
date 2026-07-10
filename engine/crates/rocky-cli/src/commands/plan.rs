@@ -1024,6 +1024,9 @@ pub fn compute_embedded_capabilities(
     EmbeddedCapabilities {
         diff_available: true,
         changed,
+        // Bind the content the gate authorized so apply can reject a
+        // models-dir change between planning and execution (TOCTOU).
+        models_fingerprint: crate::commands::apply::models_dir_fingerprint(models_dir),
     }
 }
 
