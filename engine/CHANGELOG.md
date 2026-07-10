@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.63.0] - 2026-07-10
+
+### Added
+
+- **Governor-side MCP tools** — `estate_brief`, `audit_query`, `scorecard`, and `review_queue` expose the decision/run ledger as typed, cited projections over the MCP surface, so an operator's own assistant can ask "what did agents do to finance models this week, and why was Tuesday's apply allowed?" and get grounded answers. `review_queue` carries a gated approve action, refused unless the plan is genuinely pending and confirmation is given. (#1077)
+- **`rocky gc` reclamation with deletion behind review.** `rocky gc --derivable` now writes a review-gated plan (alongside the existing `--dry-run` inventory); `rocky apply <plan>` re-derives eligibility against the live ledger and evicts only artifacts it can still prove are rebuildable — matched by full identity (run, model, file path, content hash) — committing a restore tombstone and retiring the ledger row in one transaction before a best-effort physical delete. Deletion is symmetric-caution gated: even a human gc goes through review, and policy can only tighten. Eligibility is hash-exact and fail-closed, so a derivability proof for one artifact can never authorize deleting another, and a stale or hand-authored plan is refused. (#1078)
+
+### Changed
+
+- State schema `v18 → v19`: an additive tombstones table recording each eviction's recipe identity and restore pointer. Additive — older state opens forward-compatibly.
+
+
 ## [1.62.0] - 2026-07-10
 
 ### Added

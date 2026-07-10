@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.34.3] — 2026-07-10
+
+### Added
+
+- **Generated TypeScript types for the engine-v1.63.0 output surface** — `rocky gc` plan + apply (`gc_plan`, `gc_apply`). Additive; the LSP client and existing commands are unchanged.
+
+
 ## [1.34.2] — 2026-07-10
 
 ### Added

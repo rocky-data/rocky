@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-07-10
+
+### Added
+
+- **Generated types for `rocky gc` plan + apply** (`gc_plan`, `gc_apply` and their nested candidate / tombstone shapes). Additive — existing parses are unaffected.
+
+
 ## [0.5.0] — 2026-07-10
 
 ### Added
