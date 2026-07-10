@@ -22,8 +22,8 @@ mkdir -p expected
 
 LOCATION="${BQ_LOCATION:-EU}"
 PROJ="$GCP_PROJECT_ID"
-DS_ALPHA="hc_phase14_disc_alpha"
-DS_BETA="hc_phase14_disc_beta"
+DS_ALPHA="poc_step14_disc_alpha"
+DS_BETA="poc_step14_disc_beta"
 
 drop_datasets() {
     bq --location="$LOCATION" --project_id="$PROJ" \
@@ -35,7 +35,7 @@ drop_datasets() {
 drop_datasets
 trap drop_datasets EXIT
 
-echo "==> seeding two datasets matching prefix 'hc_phase14_disc_'"
+echo "==> seeding two datasets matching prefix 'poc_step14_disc_'"
 bq --location="$LOCATION" --project_id="$PROJ" mk --dataset "$DS_ALPHA" > /dev/null
 bq --location="$LOCATION" --project_id="$PROJ" mk --dataset "$DS_BETA" > /dev/null
 bq --project_id="$PROJ" query --use_legacy_sql=false --quiet \
@@ -55,7 +55,7 @@ sources = out.get("sources", [])
 schemas = {s.get("components", {}).get("source") for s in sources if s.get("components")}
 # `source` component value is whatever the schema_pattern parser
 # extracted — it'll be the suffix after the prefix (e.g. "alpha").
-expected_components = {s.removeprefix("hc_phase14_disc_") for s in expected_schemas}
+expected_components = {s.removeprefix("poc_step14_disc_") for s in expected_schemas}
 if not expected_components.issubset(schemas):
     print(f"FAIL: expected components {expected_components} not all in {schemas}")
     sys.exit(1)
