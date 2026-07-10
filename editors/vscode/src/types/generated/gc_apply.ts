@@ -33,7 +33,7 @@ export interface GcApplyOutput {
    */
   evicted_count: number;
   /**
-   * Operator caveats (physical-reclamation reachability, restore held).
+   * Operator caveats (e.g. physical-reclamation reachability). Each eviction's tombstone records what a restore will need; `rocky restore` itself is a planned follow-up.
    */
   notes: string[];
   plan_id: string;
@@ -55,7 +55,7 @@ export interface GcEvictedOutput {
   blake3_hash: string;
   model_name: string;
   /**
-   * `true` when the bytes were physically deleted through the object-store adapter; `false` when the physical delete was deferred or failed (a safe leaked orphan — the tombstone stands and restore still works).
+   * `true` when the bytes were physically deleted through the object-store adapter; `false` when the physical delete was deferred or failed (a safe leaked orphan — the tombstone still records everything a restore will need; `rocky restore` itself is a planned follow-up).
    */
   physical_reclaimed: boolean;
   /**

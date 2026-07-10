@@ -142,28 +142,28 @@ mod tests {
     #[test]
     fn securable_display_catalog() {
         let s = Securable::Catalog {
-            name: "hcv2_cat".into(),
+            name: "cat_a".into(),
         };
-        assert_eq!(s.display_name(), "hcv2_cat");
+        assert_eq!(s.display_name(), "cat_a");
     }
 
     #[test]
     fn securable_display_schema() {
         let s = Securable::Schema {
-            catalog: "hcv2_cat".into(),
-            name: "hcv2_sch".into(),
+            catalog: "cat_a".into(),
+            name: "sch_a".into(),
         };
-        assert_eq!(s.display_name(), "hcv2_cat.hcv2_sch");
+        assert_eq!(s.display_name(), "cat_a.sch_a");
     }
 
     #[test]
     fn securable_display_table() {
         let s = Securable::Table {
-            catalog: "hcv2_cat".into(),
-            schema: "hcv2_sch".into(),
-            name: "hcv2_orders".into(),
+            catalog: "cat_a".into(),
+            schema: "sch_a".into(),
+            name: "orders_a".into(),
         };
-        assert_eq!(s.display_name(), "hcv2_cat.hcv2_sch.hcv2_orders");
+        assert_eq!(s.display_name(), "cat_a.sch_a.orders_a");
     }
 
     #[test]

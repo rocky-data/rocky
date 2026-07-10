@@ -12,4 +12,4 @@ first_partition = "2026-04-01"
 # honor ${VAR} env substitution today (see live/README.md for context).
 [target]
 catalog = "__GCP_PROJECT__"
-schema = "hc_phase1_live_ti"
+schema = "poc_step1_live_ti"

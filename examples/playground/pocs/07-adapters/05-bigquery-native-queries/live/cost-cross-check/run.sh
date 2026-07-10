@@ -25,7 +25,7 @@ mkdir -p expected
 
 LOCATION="${BQ_LOCATION:-EU}"
 PROJ="$GCP_PROJECT_ID"
-DATASET="hc_phase21_cost_check"
+DATASET="poc_step21_cost_check"
 
 drop_dataset() {
     bq --location="$LOCATION" --project_id="$PROJ" \

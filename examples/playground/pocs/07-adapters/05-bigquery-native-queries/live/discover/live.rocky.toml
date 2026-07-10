@@ -19,10 +19,10 @@ catalog = "${GCP_PROJECT_ID}"
 adapter = "default"
 
 [pipeline.live.source.schema_pattern]
-prefix = "hc_phase14_disc_"
+prefix = "poc_step14_disc_"
 separator = "_"
 components = ["source"]
 
 [pipeline.live.target]
 catalog_template = "${GCP_PROJECT_ID}"
-schema_template = "hc_phase14_disc_dummy_target"
+schema_template = "poc_step14_disc_dummy_target"

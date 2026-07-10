@@ -15,7 +15,7 @@ class GcPlanEviction(BaseModel):
 
     blake3_hash: str
     """
-    Content hash (hex) of the artifact bytes — the eviction unit and the identity a restore re-computes and compares against.
+    Content hash (hex) of the artifact bytes — the eviction unit and the identity a restore would re-compute and compare against.
     """
     commit_version: conint(ge=0)
     """
@@ -27,7 +27,7 @@ class GcPlanEviction(BaseModel):
     """
     file_path: str
     """
-    Object-store path of the artifact — the byte location a physical reclamation deletes and a restore re-materializes to.
+    Object-store path of the artifact — the byte location a physical reclamation deletes and a restore would re-materialize to.
     """
     hash_scheme: str | None = None
     """
@@ -51,7 +51,7 @@ class GcPlanEviction(BaseModel):
     """
     run_id: str
     """
-    Run that produced it — half of the provenance key restore replays from.
+    Run that produced it — half of the provenance key a restore would replay from.
     """
     size_bytes: conint(ge=0)
     """
@@ -81,7 +81,7 @@ class GcPlanOutput(BaseModel):
     """
     notes: list[str]
     """
-    Operator caveats (re-verification at apply, restore safety net, scope).
+    Operator caveats (e.g. re-verification at apply, scope). Each eviction records what a restore will need; `rocky restore` itself is a planned follow-up.
     """
     plan_id: str
     """

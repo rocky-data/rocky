@@ -30,6 +30,13 @@ struct Cli {
 enum Command {
     /// Verify a manifest against the rocky-manifest v0.1 schema, and
     /// optionally byte-check its output artifacts.
+    ///
+    /// When no artifact bytes are checked (no `--artifacts-dir`, or the
+    /// manifest carries no `output_hashes`), a passing human-readable verdict
+    /// reads "VERIFIED (schema only — no byte-identity attested)" rather than
+    /// a bare "VERIFIED". The JSON report's `passed` field means the same
+    /// thing in both cases — the document is schema-valid and every
+    /// *requested* byte-check matched — and the exit code is unchanged.
     Verify {
         /// Path to the manifest JSON file.
         manifest: PathBuf,
@@ -114,14 +121,23 @@ fn print_human(manifest: &std::path::Path, report: &VerifyReport) {
             }
         }
     }
-    println!(
-        "\n{}",
-        if report.passed() {
-            "VERIFIED"
-        } else {
-            "NOT VERIFIED"
-        }
-    );
+    println!("\n{}", verdict_line(report));
+}
+
+/// The human-readable bottom-line verdict.
+///
+/// A pass in which no artifact byte-check ran is labelled schema-only, so a
+/// bare `VERIFIED` can never be read as a byte-identity attestation. The JSON
+/// report's `passed` field and the process exit code are identical in both
+/// pass cases.
+fn verdict_line(report: &VerifyReport) -> &'static str {
+    if !report.passed() {
+        "NOT VERIFIED"
+    } else if report.artifact_checks.is_empty() {
+        "VERIFIED (schema only — no byte-identity attested)"
+    } else {
+        "VERIFIED"
+    }
 }
 
 fn print_json(manifest: &std::path::Path, report: &VerifyReport) {
@@ -146,4 +162,71 @@ fn print_json(manifest: &std::path::Path, report: &VerifyReport) {
         "artifact_checks": artifacts,
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+}
+
+#[cfg(test)]
+mod tests {
+    use rocky_verify::ArtifactCheck;
+
+    use super::*;
+
+    fn matched_check() -> ArtifactCheck {
+        ArtifactCheck {
+            expected: "aa".repeat(32),
+            file: Some(PathBuf::from("aa.parquet")),
+            actual: Some("aa".repeat(32)),
+            matched: true,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn schema_only_pass_is_labelled_schema_only() {
+        let report = VerifyReport {
+            schema_valid: true,
+            schema_errors: Vec::new(),
+            artifact_checks: Vec::new(),
+        };
+        assert!(report.passed(), "JSON `passed` semantics must not change");
+        assert_eq!(
+            verdict_line(&report),
+            "VERIFIED (schema only — no byte-identity attested)"
+        );
+    }
+
+    #[test]
+    fn byte_verified_pass_is_bare_verified() {
+        let report = VerifyReport {
+            schema_valid: true,
+            schema_errors: Vec::new(),
+            artifact_checks: vec![matched_check()],
+        };
+        assert!(report.passed());
+        assert_eq!(verdict_line(&report), "VERIFIED");
+    }
+
+    #[test]
+    fn schema_failure_is_not_verified() {
+        let report = VerifyReport {
+            schema_valid: false,
+            schema_errors: vec!["<root>: missing program_hash".into()],
+            artifact_checks: Vec::new(),
+        };
+        assert!(!report.passed());
+        assert_eq!(verdict_line(&report), "NOT VERIFIED");
+    }
+
+    #[test]
+    fn byte_mismatch_is_not_verified() {
+        let mut check = matched_check();
+        check.matched = false;
+        check.note = Some("recorded hash does not match the file's bytes".into());
+        let report = VerifyReport {
+            schema_valid: true,
+            schema_errors: Vec::new(),
+            artifact_checks: vec![check],
+        };
+        assert!(!report.passed());
+        assert_eq!(verdict_line(&report), "NOT VERIFIED");
+    }
 }

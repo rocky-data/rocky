@@ -34,7 +34,7 @@
           "type": "string"
         },
         "physical_reclaimed": {
-          "description": "`true` when the bytes were physically deleted through the object-store adapter; `false` when the physical delete was deferred or failed (a safe leaked orphan — the tombstone stands and restore still works).",
+          "description": "`true` when the bytes were physically deleted through the object-store adapter; `false` when the physical delete was deferred or failed (a safe leaked orphan — the tombstone still records everything a restore will need; `rocky restore` itself is a planned follow-up).",
           "type": "boolean"
         },
         "physical_status": {
@@ -143,7 +143,7 @@
       "type": "integer"
     },
     "notes": {
-      "description": "Operator caveats (physical-reclamation reachability, restore held).",
+      "description": "Operator caveats (e.g. physical-reclamation reachability). Each eviction's tombstone records what a restore will need; `rocky restore` itself is a planned follow-up.",
       "items": {
         "type": "string"
       },

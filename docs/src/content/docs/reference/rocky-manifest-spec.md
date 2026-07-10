@@ -19,7 +19,7 @@ The reference verifier is [`rocky-verify`](#the-reference-verifier), a standalon
 
 ## The identity it carries
 
-Rocky records a recipe-identity triple on every model execution. A manifest is that triple, plus the scheme tag and carrier metadata, serialized into an open shape:
+Rocky records a recipe-identity triple on every successful model execution. A manifest is that triple, plus the scheme tag and carrier metadata, serialized into an open shape:
 
 - **`program_hash`** — a BLAKE3 fingerprint of the model's canonical typed representation. It is the identity of the exact program. Two logically distinct programs have different program hashes; the same program has the same hash no matter when or how often it ran.
 - **`inputs_hash`** — a BLAKE3 over the inputs the run actually observed. It is present only when the run observed its inputs. On a run that observes nothing, the declared inputs are already folded into `program_hash`, so a bare "no inputs" hash would add nothing and is omitted.

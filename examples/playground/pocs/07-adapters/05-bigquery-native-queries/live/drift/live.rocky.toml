@@ -24,13 +24,13 @@ catalog = "${GCP_PROJECT_ID}"
 adapter = "default"
 
 [pipeline.live.source.schema_pattern]
-prefix = "hc_phase13_drift_src_"
+prefix = "poc_step13_drift_src_"
 separator = "_"
 components = ["source"]
 
 [pipeline.live.target]
 catalog_template = "${GCP_PROJECT_ID}"
-schema_template = "hc_phase13_drift_tgt_{source}"
+schema_template = "poc_step13_drift_tgt_{source}"
 
 [pipeline.live.target.governance]
 auto_create_schemas = true

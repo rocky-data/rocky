@@ -13,6 +13,7 @@ Rocky provides a single binary with subcommands for the full pipeline lifecycle.
 - **AI**: `ai`, `ai-sync`, `ai-explain`, `ai-test`
 - **Development**: `playground`, `shell`, `watch`, `fmt`, `list`, `serve`, `lsp`, `import-dbt`, `init-adapter`, `adapter`, `hooks`, `validate-migration`, `test-adapter`
 - **Administration**: `history`, `replay`, `trace`, `metrics`, `optimize`, `compact`, `profile-storage`, `archive`, `compliance`, `retention-status`
+- **Governance & Reclamation**: `policy`, `audit`, `review`, `brief`, `backfill`, `gc` — see [Governance & Reclamation Commands](/reference/commands/governance-reclamation/)
 - **Diagnostics**: `doctor`, `compare`
 
 The pages under **Reference → Commands** group these same commands by category.

@@ -110,7 +110,7 @@
       "type": "object"
     }
   },
-  "description": "JSON output for `rocky compliance`.\n\nA thin rollup over Wave A governance: classification sidecars (`[classification]` per model) + project-level `[mask]` / `[mask.<env>]` policy. Answers the question **\"are all classified columns masked wherever policy says they should be?\"** without making any warehouse calls — purely a static resolver over `rocky.toml` + model sidecars.\n\nConsumers (CI gates, dagster) dispatch on the top-level `command` field (`\"compliance\"`).",
+  "description": "JSON output for `rocky compliance`.\n\nA thin rollup over the project's governance config: classification sidecars (`[classification]` per model) + project-level `[mask]` / `[mask.<env>]` policy. Answers the question **\"are all classified columns masked wherever policy says they should be?\"** without making any warehouse calls — purely a static resolver over `rocky.toml` + model sidecars.\n\nConsumers (CI gates, dagster) dispatch on the top-level `command` field (`\"compliance\"`).",
   "properties": {
     "command": {
       "description": "Always `\"compliance\"`. Consumers key dispatch off this field.",

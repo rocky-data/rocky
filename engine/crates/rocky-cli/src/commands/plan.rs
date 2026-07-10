@@ -330,9 +330,8 @@ pub async fn plan(
     // row_count=1 / avg_row_bytes=sizeInBytes so `estimated_bytes` equals
     // the real table size.  `max_bytes_scanned` is therefore the correct
     // ceiling lever for Databricks; `max_usd` estimates are unreliable
-    // without per-row cost data.  The live-verify target
-    // (`dev_hcv2_uniform.spike.uniform_t1`) tests the `max_bytes_scanned`
-    // path end-to-end.
+    // without per-row cost data.  The live-verify sandbox schema tests the
+    // `max_bytes_scanned` path end-to-end.
     //
     // on_breach policy: per-model `on_breach` is honoured — "warn" → Warning
     // diagnostic (does not set has_budget_errors), "error" → Error diagnostic
