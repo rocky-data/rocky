@@ -2038,12 +2038,13 @@ mod tests {
     }
 
     /// A minimal-but-valid Delta bootstrap commit (v0): a commitInfo, a
-    /// liveness-neutral protocol (writer features the strict proof accepts), and
-    /// a metaData. The target's `add`/`remove` commits follow at v1+.
+    /// **supported** protocol (the real UniForm shape — reader v2 with NO reader
+    /// features, writer v7 with allowlisted writer features), and a metaData. The
+    /// target's `add`/`remove` commits follow at v1+.
     const BOOTSTRAP_V0: &str = concat!(
         r#"{"commitInfo":{}}"#,
         "\n",
-        r#"{"protocol":{"minReaderVersion":2,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping","icebergCompatV2","invariants","appendOnly"]}}"#,
+        r#"{"protocol":{"minReaderVersion":2,"minWriterVersion":7,"writerFeatures":["columnMapping","icebergCompatV2","invariants","appendOnly"]}}"#,
         "\n",
         r#"{"metaData":{"id":"t"}}"#,
     );
@@ -2798,10 +2799,101 @@ mod tests {
         ));
     }
 
+    /// 🔴 FINDING 1 (leading-slash absolute re-add). A bucket-root-absolute path
+    /// (`/tgt/raw/orders/H.parquet`) re-adding the file after a relative `remove`
+    /// makes it live — the proof must canonicalize it (not prefix-join it) and
+    /// HOLD. Non-vacuous: without the re-add the file reclaims.
+    #[tokio::test]
+    async fn leading_slash_absolute_re_add_holds() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        seed_ca(&store, "r1", "orders", HA, 500, old, 1);
+        let now = Utc::now();
+        let plan = plan_from_store(&store, now, 7);
+
+        // v1 add(rel), v2 remove(rel), v3 add(LEADING-SLASH absolute) → live.
+        let mut held = InMemoryLivenessOracle::new();
+        held.seed_table(
+            "s3://b/tgt/raw/orders",
+            &[
+                &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
+                &format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#),
+                &format!(r#"{{"add":{{"path":"/tgt/raw/orders/{HA}.parquet"}}}}"#),
+            ],
+        )
+        .await;
+        let out = execute_gc_apply(&store, &held, "plan-x", &plan, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.evicted_count, 0,
+            "a leading-slash absolute re-add aliasing the file must HOLD"
+        );
+        assert_eq!(out.refused_count, 1);
+    }
+
+    /// 🔴 FINDING 3 (same-version add+remove). A single commit that both `add`s
+    /// and `remove`s the target is a forbidden/malformed reconciliation — the
+    /// decision must not depend on JSONL line order → HOLD the malformed version.
+    /// Non-vacuous: an add at v1 and a remove at a SEPARATE v2 reclaims.
+    #[tokio::test]
+    async fn same_version_add_and_remove_of_target_holds() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        seed_ca(&store, "r1", "orders", HA, 500, old, 1);
+        let now = Utc::now();
+        let plan = plan_from_store(&store, now, 7);
+
+        // v1 add(HA), v2 = remove(HA)+add(HA) in ONE commit → malformed. The
+        // `remove` is FIRST so that, absent the per-version guard, any line-order
+        // heuristic that trusted a leading `remove` would wrongly evict — the
+        // guard must HOLD regardless of order.
+        let same_version = format!(
+            "{{\"remove\":{{\"path\":\"{HA}.parquet\"}}}}\n{{\"add\":{{\"path\":\"{HA}.parquet\"}}}}"
+        );
+        let mut malformed = InMemoryLivenessOracle::new();
+        malformed
+            .seed_table(
+                "s3://b/tgt/raw/orders",
+                &[
+                    &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
+                    &same_version,
+                ],
+            )
+            .await;
+        let out = execute_gc_apply(&store, &malformed, "plan-x", &plan, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.evicted_count, 0,
+            "an add+remove of the target in one commit must hold (malformed)"
+        );
+        assert_eq!(out.refused_count, 1);
+
+        // Non-vacuity: add at v1, remove at a SEPARATE v2 → reclaims.
+        let mut ok = InMemoryLivenessOracle::new();
+        ok.seed_table(
+            "s3://b/tgt/raw/orders",
+            &[
+                &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
+                &format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#),
+            ],
+        )
+        .await;
+        let out2 = execute_gc_apply(&store, &ok, "plan-x", &plan, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            out2.evicted_count, 1,
+            "add at v1 + remove at a separate v2 reclaims (control)"
+        );
+    }
+
     /// 🔴 FINDING 2 (empty / multi-key commit). A `{}` or a multi-key line must
     /// NOT pass as a benign commit — otherwise it leaves a stale earlier
-    /// `remove` as the highest reference and the proof would authorize eviction
-    /// of a file that a later real commit could have re-added.
+    /// `remove` as the highest reference and the proof would authorize eviction.
     #[tokio::test]
     async fn empty_or_multi_key_commit_holds() {
         let dir = TempDir::new().unwrap();
@@ -2811,13 +2903,13 @@ mod tests {
         let now = Utc::now();
         let plan = plan_from_store(&store, now, 7);
 
-        // v1 add(HA)+remove(HA), v2 = `{}` (empty object).
-        let add_remove = format!(
-            "{{\"add\":{{\"path\":\"{HA}.parquet\"}}}}\n{{\"remove\":{{\"path\":\"{HA}.parquet\"}}}}"
-        );
+        let add = format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#);
+        let remove = format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#);
+
+        // v1 add(HA), v2 remove(HA), v3 = `{}` (empty object).
         let mut empty = InMemoryLivenessOracle::new();
         empty
-            .seed_table("s3://b/tgt/raw/orders", &[&add_remove, "{}"])
+            .seed_table("s3://b/tgt/raw/orders", &[&add, &remove, "{}"])
             .await;
         let out = execute_gc_apply(&store, &empty, "plan-x", &plan, now)
             .await
@@ -2825,13 +2917,14 @@ mod tests {
         assert_eq!(out.evicted_count, 0, "an empty `{{}}` commit must hold");
         assert_eq!(out.refused_count, 1);
 
-        // v2 = a multi-key line also holds.
+        // v3 = a multi-key line also holds.
         let mut multi = InMemoryLivenessOracle::new();
         multi
             .seed_table(
                 "s3://b/tgt/raw/orders",
                 &[
-                    &add_remove,
+                    &add,
+                    &remove,
                     r#"{"add":{"path":"x.parquet"},"remove":{"path":"y.parquet"}}"#,
                 ],
             )
@@ -2842,11 +2935,11 @@ mod tests {
         assert_eq!(out2.evicted_count, 0, "a multi-key commit line must hold");
     }
 
-    /// 🔴 FINDING 2 (non-array protocol feature). A `protocol` whose feature
-    /// field is a bare string (or `null`) must HOLD — a deletion-vector table
-    /// must not slip through a malformed shape.
+    /// 🔴 FINDING 2 (invalid protocol). An empty/unsupported/non-array `protocol`
+    /// action anywhere in the history must HOLD — a deletion-vector or unknown
+    /// future protocol must not slip through.
     #[tokio::test]
-    async fn non_array_protocol_feature_holds() {
+    async fn invalid_protocol_holds() {
         let dir = TempDir::new().unwrap();
         let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
         let old = Utc::now() - Duration::days(30);
@@ -2854,27 +2947,27 @@ mod tests {
         let now = Utc::now();
         let plan = plan_from_store(&store, now, 7);
 
-        let add_remove = format!(
-            "{{\"add\":{{\"path\":\"{HA}.parquet\"}}}}\n{{\"remove\":{{\"path\":\"{HA}.parquet\"}}}}"
-        );
-        let mut oracle = InMemoryLivenessOracle::new();
-        oracle
-            .seed_table(
-                "s3://b/tgt/raw/orders",
-                &[
-                    &add_remove,
-                    r#"{"protocol":{"writerFeatures":"deletionVectors"}}"#,
-                ],
-            )
-            .await;
-        let out = execute_gc_apply(&store, &oracle, "plan-x", &plan, now)
-            .await
-            .unwrap();
-        assert_eq!(
-            out.evicted_count, 0,
-            "a non-array (string) protocol feature must hold"
-        );
-        assert_eq!(out.refused_count, 1);
+        let add = format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#);
+        let remove = format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#);
+
+        for bad_protocol in [
+            r#"{"protocol":{}}"#, // missing versions
+            r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":7,"writerFeatures":["appendOnly"]}}"#, // unsupported version
+            r#"{"protocol":{"minReaderVersion":2,"minWriterVersion":7,"writerFeatures":"deletionVectors"}}"#, // non-array
+            r#"{"protocol":{"minReaderVersion":2,"minWriterVersion":7,"writerFeatures":["deletionVectors"]}}"#, // DV feature
+        ] {
+            let mut oracle = InMemoryLivenessOracle::new();
+            oracle
+                .seed_table("s3://b/tgt/raw/orders", &[&add, &remove, bad_protocol])
+                .await;
+            let out = execute_gc_apply(&store, &oracle, "plan-x", &plan, now)
+                .await
+                .unwrap();
+            assert_eq!(
+                out.evicted_count, 0,
+                "an invalid protocol must hold: {bad_protocol}"
+            );
+        }
     }
 
     /// 🔴 FINDING 2 (real version gap). A non-contiguous `_delta_log` (a MISSING

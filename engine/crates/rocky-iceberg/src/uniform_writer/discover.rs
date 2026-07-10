@@ -696,7 +696,7 @@ pub(super) async fn add_path_liveness<S: ObjectStore + ?Sized>(
 /// presence does not by itself void a removal proof. Anything outside this set
 /// (notably `deletionVectors`, which lets a file stay logically present after
 /// a metadata-only change) forces a hold.
-const LIVENESS_NEUTRAL_WRITER_FEATURES: &[&str] = &[
+const SUPPORTED_TABLE_FEATURES: &[&str] = &[
     "appendOnly",
     "invariants",
     "columnMapping",
@@ -705,7 +705,15 @@ const LIVENESS_NEUTRAL_WRITER_FEATURES: &[&str] = &[
     "generatedColumns",
     "checkConstraints",
     "domainMetadata",
+    "rowTracking",
+    "v2Checkpoint",
 ];
+
+/// The highest Delta protocol versions the strict removal proof understands.
+/// A table declaring a higher `minReaderVersion`/`minWriterVersion` may carry
+/// semantics this reader cannot reason about, so it holds.
+const SUPPORTED_MAX_READER_VERSION: u64 = 3;
+const SUPPORTED_MAX_WRITER_VERSION: u64 = 7;
 
 /// Top-level Delta action keys this proof recognizes. Any other key in a
 /// commit line means the proof cannot reason about the commit → hold.
@@ -722,19 +730,33 @@ const KNOWN_ACTION_KEYS: &[&str] = &[
 
 /// The **strict removal proof** — see [`super::RemovalProof`].
 ///
-/// Affirmative by construction: it returns [`RemovalProof::Held`] on every
-/// anomaly and only reaches [`RemovalProof::ProvenRemoved`] after validating
-/// the entire readable history. Concretely it holds unless ALL hold:
+/// A tombstone/reclamation gate must never trust a Delta history it cannot fully
+/// account for (a hand-rolled reader has a long tail of edge cases), so this is
+/// a **strict whitelist**: it returns [`RemovalProof::ProvenRemoved`] ONLY when
+/// EVERY one of the following holds, and [`RemovalProof::Held`] on anything else
+/// — including any shape it does not explicitly understand. Over-holding is safe
+/// (it only forgoes reclamation); a false proof is not.
 ///
-/// - no checkpoint marker in `_delta_log` (`_last_checkpoint` /
-///   `*.checkpoint*.parquet`) — a truncated log can't prove non-re-add;
-/// - the `<20-digit>.json` versions are a contiguous run from 0, no duplicates;
-/// - every commit body parses, every line is a JSON object whose sole key is a
-///   recognized action, every `add`/`remove` has a string `path`, and no
-///   `protocol` declares a liveness-affecting/unknown writer feature;
-/// - the target's own `add` appears **at** `expected_add_version` (the finding-1
-///   own-add-in-this-table binding);
-/// - the highest-versioned commit referencing the target is a `remove`.
+/// - **Contiguous history.** The `<20-digit>.json` versions are a contiguous run
+///   from 0 with no duplicates.
+/// - **No checkpoint.** No `_last_checkpoint` / `*.checkpoint*.parquet` marker —
+///   a truncated log can't prove the file was not re-added inside a checkpoint.
+/// - **One typed-valid action per line.** Every non-blank commit line is a JSON
+///   object with exactly ONE recognized action key whose payload is an object;
+///   every `add`/`remove` has a string `path`; every `protocol` is a supported,
+///   well-formed protocol ([`protocol_is_supported`]) with no unsupported
+///   version or feature.
+/// - **Confident path canonicalization.** Every `add`/`remove` path resolves to
+///   a canonical `(bucket, key)` identity ([`canonical_key`]); an
+///   uncanonicalizable or cross-bucket path holds.
+/// - **At most one target file-action per version.** Delta commit actions are
+///   unordered, so line order must not decide same-version state; an `add`+
+///   `remove` of the target in a single commit is a forbidden reconciliation and
+///   holds.
+/// - **Own add at its recorded version.** The target's own `add` appears at
+///   `expected_add_version` (the table-binding check).
+/// - **Highest reference is a remove.** Across the whole history, the
+///   highest-versioned commit referencing the target is a `remove`.
 ///
 /// Any object-store / parse failure yields [`RemovalHoldReason::ReadError`] /
 /// [`RemovalHoldReason::MalformedCommit`] — never a proof.
@@ -805,7 +827,9 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
     // Contiguous from 0 ⇒ the head is the last version.
     let head_version = versions.last().map(|(v, _)| *v).expect("non-empty");
 
-    // 3. Scan ascending; validate every commit; track references to the target.
+    // 3. Scan ascending; validate every commit; track the target's file action
+    //    PER VERSION (Delta actions are unordered, so line order must NOT decide
+    //    same-version state).
     let mut own_add_at_expected = false;
     let mut highest_ref: Option<(u64, bool)> = None; // (version, is_remove)
     for (version, path) in &versions {
@@ -820,6 +844,8 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
             Ok(t) => t,
             Err(_) => return held(R::MalformedCommit),
         };
+        // The target's file actions in THIS version (each entry is `is_remove`).
+        let mut target_actions: Vec<bool> = Vec::new();
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -847,7 +873,7 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
             }
             match key.as_str() {
                 "protocol" => {
-                    if !protocol_is_liveness_neutral(action) {
+                    if !protocol_is_supported(action) {
                         return held(R::UnsupportedProtocol);
                     }
                 }
@@ -859,18 +885,25 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
                         return held(R::UncanonicalizablePath);
                     };
                     if canon == target_canonical {
-                        let is_remove = key == "remove";
-                        if !is_remove && *version == expected_add_version {
-                            own_add_at_expected = true;
-                        }
-                        match highest_ref {
-                            Some((hv, _)) if hv > *version => {}
-                            _ => highest_ref = Some((*version, is_remove)),
-                        }
+                        target_actions.push(key == "remove");
                     }
                 }
                 _ => {}
             }
+        }
+        // At most one target file-action per version: an `add`+`remove` of the
+        // target in one commit is a forbidden/malformed reconciliation → hold
+        // (finding 3). The single action's version-ordered value decides the
+        // highest reference — never line order.
+        if target_actions.len() > 1 {
+            return held(R::MalformedCommit);
+        }
+        if let Some(&is_remove) = target_actions.first() {
+            if !is_remove && *version == expected_add_version {
+                own_add_at_expected = true;
+            }
+            // Versions are ascending, so this leaves the highest version's action.
+            highest_ref = Some((*version, is_remove));
         }
     }
 
@@ -902,6 +935,9 @@ fn canonical_key(raw: &str, table_bucket: &str, key_prefix: &str) -> Option<Stri
         .ok()?
         .into_owned();
 
+    // Parse the URI-reference form BEFORE any prefix join: a scheme URI is
+    // absolute, a leading `/` is bucket-root absolute (NOT relative to the
+    // table prefix), and anything else is relative to the table root.
     let key_part = if let Some(idx) = decoded.find("://") {
         let scheme = &decoded[..idx];
         if !matches!(scheme, "s3" | "s3a" | "s3n") {
@@ -913,6 +949,10 @@ fn canonical_key(raw: &str, table_bucket: &str, key_prefix: &str) -> Option<Stri
             return None; // cross-bucket reference
         }
         key.to_string()
+    } else if let Some(bucket_root_absolute) = decoded.strip_prefix('/') {
+        // A leading slash is bucket-root absolute; joining it under the table
+        // prefix would double the prefix and miss a re-add of the target.
+        bucket_root_absolute.to_string()
     } else {
         format!("{}/{}", key_prefix.trim_end_matches('/'), decoded)
     };
@@ -935,29 +975,57 @@ fn canonical_key(raw: &str, table_bucket: &str, key_prefix: &str) -> Option<Stri
     Some(out.join("/"))
 }
 
-/// A `protocol` action is liveness-neutral when it is a JSON object whose
-/// reader/writer feature lists — **when present** — are arrays of strings all
-/// drawn from [`LIVENESS_NEUTRAL_WRITER_FEATURES`].
+/// Whether a `protocol` action is a **supported, well-formed** Delta protocol
+/// the removal proof can reason about — a strict typed whitelist, not a
+/// best-effort shape check.
 ///
-/// Returns `false` (→ hold) for a non-object protocol, a feature field that is
-/// present but not an array of strings (e.g. `"writerFeatures": "deletionVectors"`
-/// or `"protocol": null`), or any unrecognized feature — so a deletion-vector
-/// table can never slip through a malformed shape (finding 2).
-fn protocol_is_liveness_neutral(protocol: &serde_json::Value) -> bool {
+/// Returns `false` (→ hold) unless ALL hold:
+/// - the protocol is a JSON object with integer `minReaderVersion` and
+///   `minWriterVersion`, each within `1..=SUPPORTED_MAX_*_VERSION` (a
+///   version-99 future protocol holds);
+/// - feature-list / version consistency: `readerFeatures` appear **iff**
+///   `minReaderVersion == 3`, `writerFeatures` appear **iff**
+///   `minWriterVersion == 7` (real UniForm tables are reader v2 with no reader
+///   features + writer v7 with writer features);
+/// - every listed feature is a string in [`SUPPORTED_TABLE_FEATURES`] — an
+///   unknown feature, a non-array feature field (`"writerFeatures":
+///   "deletionVectors"`), or `deletionVectors` all hold.
+fn protocol_is_supported(protocol: &serde_json::Value) -> bool {
+    use serde_json::Value;
     let Some(obj) = protocol.as_object() else {
-        return false;
+        return false; // non-object / null protocol
     };
-    for field in ["readerFeatures", "writerFeatures"] {
-        let Some(value) = obj.get(field) else {
-            continue; // absent is neutral
+    let (Some(min_reader), Some(min_writer)) = (
+        obj.get("minReaderVersion").and_then(Value::as_u64),
+        obj.get("minWriterVersion").and_then(Value::as_u64),
+    ) else {
+        return false; // missing / non-integer required version
+    };
+    if !(1..=SUPPORTED_MAX_READER_VERSION).contains(&min_reader)
+        || !(1..=SUPPORTED_MAX_WRITER_VERSION).contains(&min_writer)
+    {
+        return false; // unsupported (e.g. future) protocol version
+    }
+
+    let reader_feats = obj.get("readerFeatures");
+    let writer_feats = obj.get("writerFeatures");
+    // Feature lists are the table-features (reader v3 / writer v7) construct and
+    // must be present iff at that version, absent otherwise.
+    if reader_feats.is_some() != (min_reader == 3) {
+        return false;
+    }
+    if writer_feats.is_some() != (min_writer == 7) {
+        return false;
+    }
+
+    for feats in [reader_feats, writer_feats].into_iter().flatten() {
+        let Some(arr) = feats.as_array() else {
+            return false; // present but not an array
         };
-        let Some(feats) = value.as_array() else {
-            return false; // present but not an array → hold
-        };
-        for f in feats {
+        for f in arr {
             match f.as_str() {
-                Some(name) if LIVENESS_NEUTRAL_WRITER_FEATURES.contains(&name) => {}
-                _ => return false, // non-string element or unknown feature → hold
+                Some(name) if SUPPORTED_TABLE_FEATURES.contains(&name) => {}
+                _ => return false, // unknown feature / non-string element
             }
         }
     }
@@ -1017,6 +1085,12 @@ mod tests {
             canonical_key("a/./b/../H.parquet", bucket, prefix).as_deref(),
             Some("tgt/raw/orders/a/H.parquet")
         );
+        // A LEADING-SLASH absolute path is bucket-root absolute — NOT joined
+        // under the table prefix — and aliases the relative form (finding 1).
+        assert_eq!(
+            canonical_key("/tgt/raw/orders/H.parquet", bucket, prefix),
+            target
+        );
 
         // Cross-bucket, a foreign scheme, and an escaping `..` are all rejected.
         assert_eq!(
@@ -1034,31 +1108,60 @@ mod tests {
     }
 
     #[test]
-    fn protocol_liveness_neutral_rejects_malformed_and_deletion_vectors() {
+    fn protocol_is_supported_typed_whitelist() {
         use serde_json::json;
-        // Neutral: absent features, or an array of known-neutral features.
-        assert!(protocol_is_liveness_neutral(&json!({})));
-        assert!(protocol_is_liveness_neutral(
-            &json!({"writerFeatures": ["appendOnly", "columnMapping"]})
+        // The real UniForm shape: reader v2 (no reader features) + writer v7
+        // with writer features, all in the allowlist.
+        assert!(protocol_is_supported(&json!({
+            "minReaderVersion": 2,
+            "minWriterVersion": 7,
+            "writerFeatures": ["columnMapping", "icebergCompatV2", "invariants", "appendOnly"],
+        })));
+        // A plain legacy protocol with no feature lists is fine.
+        assert!(protocol_is_supported(
+            &json!({"minReaderVersion": 1, "minWriterVersion": 2})
         ));
-        // Deletion vectors → hold.
-        assert!(!protocol_is_liveness_neutral(
-            &json!({"writerFeatures": ["deletionVectors"]})
-        ));
-        // A feature field that is a bare string (not an array) → hold.
-        assert!(!protocol_is_liveness_neutral(
-            &json!({"writerFeatures": "deletionVectors"})
+
+        // Empty protocol / missing versions → hold.
+        assert!(!protocol_is_supported(&json!({})));
+        assert!(!protocol_is_supported(
+            &json!({"writerFeatures": ["appendOnly"]})
         ));
         // A non-object protocol → hold.
-        assert!(!protocol_is_liveness_neutral(&serde_json::Value::Null));
-        // A non-string array element → hold.
-        assert!(!protocol_is_liveness_neutral(
-            &json!({"readerFeatures": [1, 2]})
+        assert!(!protocol_is_supported(&serde_json::Value::Null));
+        // Unsupported (future) version → hold.
+        assert!(!protocol_is_supported(
+            &json!({"minReaderVersion": 99, "minWriterVersion": 7})
         ));
+        assert!(!protocol_is_supported(
+            &json!({"minReaderVersion": 2, "minWriterVersion": 99})
+        ));
+        // writerFeatures present but not at writer v7 → inconsistent, hold.
+        assert!(!protocol_is_supported(
+            &json!({"minReaderVersion": 2, "minWriterVersion": 5, "writerFeatures": ["appendOnly"]})
+        ));
+        // Writer v7 but no writerFeatures listed → inconsistent, hold.
+        assert!(!protocol_is_supported(
+            &json!({"minReaderVersion": 2, "minWriterVersion": 7})
+        ));
+        // Deletion vectors → hold.
+        assert!(!protocol_is_supported(&json!({
+            "minReaderVersion": 2,
+            "minWriterVersion": 7,
+            "writerFeatures": ["deletionVectors"],
+        })));
+        // A feature field that is a bare string (not an array) → hold.
+        assert!(!protocol_is_supported(&json!({
+            "minReaderVersion": 2,
+            "minWriterVersion": 7,
+            "writerFeatures": "deletionVectors",
+        })));
         // An unknown feature → hold.
-        assert!(!protocol_is_liveness_neutral(
-            &json!({"writerFeatures": ["someFutureFeature"]})
-        ));
+        assert!(!protocol_is_supported(&json!({
+            "minReaderVersion": 2,
+            "minWriterVersion": 7,
+            "writerFeatures": ["someFutureFeature"],
+        })));
     }
 
     const EXP04_BOOTSTRAP: &[u8] = include_bytes!("../../tests/fixtures/exp04_bootstrap.json");
