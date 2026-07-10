@@ -2846,12 +2846,12 @@ mod tests {
         let now = Utc::now();
         let plan = plan_from_store(&store, now, 7);
 
-        // v1 add(HA), v2 = remove(HA)+add(HA) in ONE commit → malformed. The
-        // `remove` is FIRST so that, absent the per-version guard, any line-order
-        // heuristic that trusted a leading `remove` would wrongly evict — the
-        // guard must HOLD regardless of order.
+        // v1 add(HA), v2 = add(HA)+remove(HA) in ONE commit → malformed. The
+        // `remove` is the LAST line so that, absent the per-version guard, the
+        // prior last-line-wins heuristic would take the `remove` as the highest
+        // reference and WRONGLY evict — the guard must HOLD regardless of order.
         let same_version = format!(
-            "{{\"remove\":{{\"path\":\"{HA}.parquet\"}}}}\n{{\"add\":{{\"path\":\"{HA}.parquet\"}}}}"
+            "{{\"add\":{{\"path\":\"{HA}.parquet\"}}}}\n{{\"remove\":{{\"path\":\"{HA}.parquet\"}}}}"
         );
         let mut malformed = InMemoryLivenessOracle::new();
         malformed
@@ -2888,6 +2888,92 @@ mod tests {
         assert_eq!(
             out2.evicted_count, 1,
             "add at v1 + remove at a separate v2 reclaims (control)"
+        );
+    }
+
+    /// 🔴 ROUND-6 FIX 1 (network-path re-add). A `//authority/path` re-add of the
+    /// file after a relative `remove` names the same object, but the reader does
+    /// not canonicalize that form with confidence → HOLD (never a wrong evict).
+    #[tokio::test]
+    async fn network_path_re_add_holds() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        seed_ca(&store, "r1", "orders", HA, 500, old, 1);
+        let now = Utc::now();
+        let plan = plan_from_store(&store, now, 7);
+
+        // v1 add(rel), v2 remove(rel), v3 add(`//b/...` network-path) → held: the
+        // `//` form is not canonicalized, so the proof cannot rule out a re-add.
+        let mut oracle = InMemoryLivenessOracle::new();
+        oracle
+            .seed_table(
+                "s3://b/tgt/raw/orders",
+                &[
+                    &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
+                    &format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#),
+                    &format!(r#"{{"add":{{"path":"//b/tgt/raw/orders/{HA}.parquet"}}}}"#),
+                ],
+            )
+            .await;
+        let out = execute_gc_apply(&store, &oracle, "plan-x", &plan, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.evicted_count, 0,
+            "a `//authority` network-path add must hold (uncanonicalizable)"
+        );
+        assert_eq!(out.refused_count, 1);
+    }
+
+    /// 🔴 ROUND-6 FIX 3 (missing v0 protocol). A history whose v0 carries no
+    /// `protocol` action bypasses the protocol whitelist entirely — it must HOLD.
+    /// Non-vacuity: v0 WITH a supported protocol + metadata reclaims (the same
+    /// commits otherwise).
+    #[tokio::test]
+    async fn missing_v0_protocol_holds() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        seed_ca(&store, "r1", "orders", HA, 500, old, 1);
+        let now = Utc::now();
+        let plan = plan_from_store(&store, now, 7);
+
+        let add = format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#);
+        let remove = format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#);
+
+        // v0 = commitInfo + metaData only (NO protocol), v1 add, v2 remove.
+        let mut no_protocol = InMemoryLivenessOracle::new();
+        no_protocol
+            .seed_table_raw(
+                "s3://b/tgt/raw/orders",
+                &[
+                    (0, "{\"commitInfo\":{}}\n{\"metaData\":{\"id\":\"t\"}}"),
+                    (1, &add),
+                    (2, &remove),
+                ],
+            )
+            .await;
+        let out = execute_gc_apply(&store, &no_protocol, "plan-x", &plan, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.evicted_count, 0,
+            "a history with no v0 protocol must hold"
+        );
+        assert_eq!(out.refused_count, 1);
+
+        // Non-vacuity: v0 WITH a supported protocol + metadata (the standard
+        // bootstrap) reclaims.
+        let mut ok = InMemoryLivenessOracle::new();
+        ok.seed_table("s3://b/tgt/raw/orders", &[&add, &remove])
+            .await;
+        let out2 = execute_gc_apply(&store, &ok, "plan-x", &plan, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            out2.evicted_count, 1,
+            "a valid v0 bootstrap reclaims (control)"
         );
     }
 

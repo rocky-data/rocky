@@ -696,7 +696,13 @@ pub(super) async fn add_path_liveness<S: ObjectStore + ?Sized>(
 /// presence does not by itself void a removal proof. Anything outside this set
 /// (notably `deletionVectors`, which lets a file stay logically present after
 /// a metadata-only change) forces a hold.
-const SUPPORTED_TABLE_FEATURES: &[&str] = &[
+/// Writer-position table features the removal proof understands. All are
+/// liveness-neutral (none lets a "removed" file stay logically live the way
+/// `deletionVectors` does). `v2Checkpoint` is deliberately EXCLUDED — it is a
+/// reader+writer feature requiring reader-3/writer-7 placement in BOTH lists,
+/// which this reader does not fully validate, and Rocky's own writer never
+/// emits it — so a table declaring it holds (finding 2).
+const SUPPORTED_WRITER_FEATURES: &[&str] = &[
     "appendOnly",
     "invariants",
     "columnMapping",
@@ -706,8 +712,12 @@ const SUPPORTED_TABLE_FEATURES: &[&str] = &[
     "checkConstraints",
     "domainMetadata",
     "rowTracking",
-    "v2Checkpoint",
 ];
+
+/// Reader-position table features the removal proof understands (only present at
+/// `minReaderVersion == 3`). Real UniForm tables are reader v2 with NO reader
+/// features, so this stays intentionally small; anything else holds.
+const SUPPORTED_READER_FEATURES: &[&str] = &["columnMapping", "timestampNtz"];
 
 /// The highest Delta protocol versions the strict removal proof understands.
 /// A table declaring a higher `minReaderVersion`/`minWriterVersion` may carry
@@ -741,14 +751,17 @@ const KNOWN_ACTION_KEYS: &[&str] = &[
 ///   from 0 with no duplicates.
 /// - **No checkpoint.** No `_last_checkpoint` / `*.checkpoint*.parquet` marker —
 ///   a truncated log can't prove the file was not re-added inside a checkpoint.
+/// - **v0 declares a supported protocol + metadata.** Version 0 must carry a
+///   valid [`protocol_is_supported`] protocol action AND a `metaData` action;
+///   a protocol-less history is not a shape this proof understands.
 /// - **One typed-valid action per line.** Every non-blank commit line is a JSON
 ///   object with exactly ONE recognized action key whose payload is an object;
 ///   every `add`/`remove` has a string `path`; every `protocol` is a supported,
-///   well-formed protocol ([`protocol_is_supported`]) with no unsupported
-///   version or feature.
+///   well-formed protocol with no unsupported version or feature.
 /// - **Confident path canonicalization.** Every `add`/`remove` path resolves to
-///   a canonical `(bucket, key)` identity ([`canonical_key`]); an
-///   uncanonicalizable or cross-bucket path holds.
+///   a canonical `(bucket, key)` identity ([`canonical_key`]) — a plain relative
+///   key or an absolute reference to the exact expected bucket; an
+///   uncanonicalizable, cross-bucket, or `//authority/…` network-path form holds.
 /// - **At most one target file-action per version.** Delta commit actions are
 ///   unordered, so line order must not decide same-version state; an `add`+
 ///   `remove` of the target in a single commit is a forbidden reconciliation and
@@ -832,6 +845,11 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
     //    same-version state).
     let mut own_add_at_expected = false;
     let mut highest_ref: Option<(u64, bool)> = None; // (version, is_remove)
+    // v0 MUST declare a supported protocol + metadata (Rocky's writer always
+    // does). Without this, a history with NO protocol action at all would
+    // bypass the protocol whitelist entirely and reach a proof (finding 3).
+    let mut v0_has_protocol = false;
+    let mut v0_has_metadata = false;
     for (version, path) in &versions {
         let body = match store.get(path).await {
             Ok(r) => match r.bytes().await {
@@ -876,6 +894,14 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
                     if !protocol_is_supported(action) {
                         return held(R::UnsupportedProtocol);
                     }
+                    if *version == 0 {
+                        v0_has_protocol = true;
+                    }
+                }
+                "metaData" => {
+                    if *version == 0 {
+                        v0_has_metadata = true;
+                    }
                 }
                 "add" | "remove" => {
                     let Some(p) = action.get("path").and_then(|v| v.as_str()) else {
@@ -907,7 +933,13 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
         }
     }
 
-    // 4. Affirmative proof: own add at its recorded version, and the highest
+    // 4. v0 must declare a supported protocol AND metadata — otherwise a
+    //    protocol-less history would never exercise the protocol whitelist.
+    if !v0_has_protocol || !v0_has_metadata {
+        return held(R::UnsupportedProtocol);
+    }
+
+    // 5. Affirmative proof: own add at its recorded version, and the highest
     //    reference to the file is a remove.
     if !own_add_at_expected {
         return held(R::NeverAddedHere);
@@ -919,25 +951,36 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
 }
 
 /// Resolve a Delta `add`/`remove` path to a canonical, table-prefix-relative
-/// key within `table_bucket`, or `None` when it cannot be safely compared
-/// (foreign scheme, cross-bucket absolute URI, or a `..` escaping the root).
+/// key within `table_bucket`, or `None` when it cannot be safely compared with
+/// full confidence — a foreign scheme, a cross-bucket absolute URI, a `//…`
+/// network-path (authority) form, or a `..` escaping the root all yield `None`.
 ///
 /// Delta permits a path to be either **relative** to the table root
 /// (`H.parquet`, `region=eu/H.parquet`) or an **absolute URI**
 /// (`s3://bucket/<prefix>/H.parquet`), and either form may be percent-encoded.
 /// Comparing them as raw strings misses an absolute-URI re-add of a file a
-/// prior relative `remove` retired (finding 1). This normalizes both forms:
-/// percent-decode, strip a recognized `s3`/`s3a`/`s3n` scheme (verifying the
-/// bucket), prefix-join a relative path, and resolve `.`/`..` segments.
+/// prior relative `remove` retired (finding 1). This normalizes the forms it
+/// understands (percent-decode, strip a recognized `s3`/`s3a`/`s3n` scheme —
+/// verifying the bucket, or treat a single leading `/` as bucket-root absolute,
+/// else prefix-join a relative path, then resolve `.`/`..`) and **holds** any
+/// other shape (maximal conservatism — over-holding is safe).
 fn canonical_key(raw: &str, table_bucket: &str, key_prefix: &str) -> Option<String> {
     let decoded = percent_encoding::percent_decode_str(raw)
         .decode_utf8()
         .ok()?
         .into_owned();
 
+    // A `//authority/path` network-path reference (RFC 3986 §4.2 — the same
+    // object as `s3://authority/path`) is not something this reader parses with
+    // confidence, so hold. Checked BEFORE the single-leading-slash branch, which
+    // would otherwise mis-read `//b/tgt/H` as the key `b/tgt/H` and miss a re-add.
+    if decoded.starts_with("//") {
+        return None;
+    }
+
     // Parse the URI-reference form BEFORE any prefix join: a scheme URI is
-    // absolute, a leading `/` is bucket-root absolute (NOT relative to the
-    // table prefix), and anything else is relative to the table root.
+    // absolute, a single leading `/` is bucket-root absolute (NOT relative to
+    // the table prefix), and anything else is relative to the table root.
     let key_part = if let Some(idx) = decoded.find("://") {
         let scheme = &decoded[..idx];
         if !matches!(scheme, "s3" | "s3a" | "s3n") {
@@ -950,8 +993,8 @@ fn canonical_key(raw: &str, table_bucket: &str, key_prefix: &str) -> Option<Stri
         }
         key.to_string()
     } else if let Some(bucket_root_absolute) = decoded.strip_prefix('/') {
-        // A leading slash is bucket-root absolute; joining it under the table
-        // prefix would double the prefix and miss a re-add of the target.
+        // A single leading slash is bucket-root absolute; joining it under the
+        // table prefix would double the prefix and miss a re-add of the target.
         bucket_root_absolute.to_string()
     } else {
         format!("{}/{}", key_prefix.trim_end_matches('/'), decoded)
@@ -1018,14 +1061,20 @@ fn protocol_is_supported(protocol: &serde_json::Value) -> bool {
         return false;
     }
 
-    for feats in [reader_feats, writer_feats].into_iter().flatten() {
+    // Each list is validated against its OWN allowlist — a writer-only feature
+    // listed in `readerFeatures` (or vice versa) is a placement error and holds.
+    for (feats, allowlist) in [
+        (reader_feats, SUPPORTED_READER_FEATURES),
+        (writer_feats, SUPPORTED_WRITER_FEATURES),
+    ] {
+        let Some(feats) = feats else { continue };
         let Some(arr) = feats.as_array() else {
             return false; // present but not an array
         };
         for f in arr {
             match f.as_str() {
-                Some(name) if SUPPORTED_TABLE_FEATURES.contains(&name) => {}
-                _ => return false, // unknown feature / non-string element
+                Some(name) if allowlist.contains(&name) => {}
+                _ => return false, // unknown feature / wrong placement / non-string
             }
         }
     }
@@ -1105,6 +1154,17 @@ mod tests {
             canonical_key("../../../../../etc/passwd", bucket, prefix),
             None
         );
+
+        // A `//authority/path` network-path form is HELD (round-6 FIX 1) — both
+        // raw and percent-encoded (`%2F%2F`), even though it names the same file.
+        assert_eq!(
+            canonical_key("//b/tgt/raw/orders/H.parquet", bucket, prefix),
+            None
+        );
+        assert_eq!(
+            canonical_key("%2F%2Fb/tgt/raw/orders/H.parquet", bucket, prefix),
+            None
+        );
     }
 
     #[test]
@@ -1161,6 +1221,29 @@ mod tests {
             "minReaderVersion": 2,
             "minWriterVersion": 7,
             "writerFeatures": ["someFutureFeature"],
+        })));
+        // `v2Checkpoint` is deliberately not in the allowlist → hold (round-6
+        // FIX 2 — its reader-3/writer-7 dual placement isn't fully validated).
+        assert!(!protocol_is_supported(&json!({
+            "minReaderVersion": 2,
+            "minWriterVersion": 7,
+            "writerFeatures": ["v2Checkpoint"],
+        })));
+        // A valid reader-v3 / writer-v7 table-features protocol is accepted.
+        assert!(protocol_is_supported(&json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["columnMapping"],
+            "writerFeatures": ["columnMapping", "appendOnly"],
+        })));
+        // A writer-only feature (`appendOnly`) listed in `readerFeatures` is a
+        // placement error (round-6 FIX 2 — reader/writer allowlists are separate)
+        // → hold.
+        assert!(!protocol_is_supported(&json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["appendOnly"],
+            "writerFeatures": ["appendOnly", "columnMapping"],
         })));
     }
 
