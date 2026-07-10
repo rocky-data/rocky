@@ -1096,6 +1096,48 @@ effect = "deny"
     client.cancel().await.unwrap();
 }
 
+/// THE PIN for the structural gate: a spec that hides a `[target]` override
+/// behind a valid `[[tests]]` block is rejected as a structured
+/// `invalid_argument` naming the smuggled key, and the model's sidecar is
+/// untouched — the check write path cannot be used to rewrite model config.
+#[tokio::test]
+async fn draft_check_rejects_smuggled_sidecar_config() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n\n\
+                [target]\nschema = \"prod_finance\"\n";
+    let args = serde_json::json!({ "model": "orders", "spec": spec })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(args))
+        .await
+        .expect("draft_check call");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a smuggled [target] override is an error"
+    );
+    let err = result.structured_content.expect("structured envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["message"].as_str().unwrap().contains("target"),
+        "the offending key is named: {err:?}"
+    );
+
+    // The sidecar is byte-for-byte untouched: the gate fires BEFORE the write.
+    let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_eq!(after, before, "a rejected spec writes nothing");
+
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn sample_rows_returns_capped_rows_on_duckdb() {
     let dir = TempDir::new().unwrap();
