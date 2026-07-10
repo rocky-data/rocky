@@ -33,6 +33,9 @@ use rocky_core::state::{
     DagChange, PolicyDecisionRecord, QualitySnapshot, RunRecord, RunStatus, RunTrigger, StateStore,
 };
 
+use crate::commands::apply::ai_plan_is_reviewed;
+use crate::commands::audit::plan_file_path;
+use crate::commands::review::select_outstanding;
 use crate::output::{
     BriefActiveFreeze, BriefAgentActivitySection, BriefAutonomySection, BriefBudgetStatus,
     BriefCostSection, BriefDecisionEntry, BriefDegradedRule, BriefDriftEntry, BriefDriftSection,
@@ -88,14 +91,17 @@ impl BriefSince {
 /// Markdown digest. The digest reads the state store at `state_path` and
 /// loads `rocky.toml` at `config_path` best-effort (only the cost section
 /// depends on the config, and it degrades gracefully when it can't be read).
+/// The project root (for the review markers and plan files the "Needs you"
+/// section checks) resolves from the process cwd, mirroring `rocky review`.
 pub fn run_brief(
     state_path: &Path,
     config_path: &Path,
     since: BriefSince,
     json: bool,
 ) -> Result<()> {
+    let root = std::env::current_dir().context("failed to get current working directory")?;
     let now = Utc::now();
-    let output = compute_brief(state_path, config_path, since, now)?;
+    let output = compute_brief(&root, state_path, config_path, since, now)?;
     emit(&output, json)?;
 
     // Advance the digest cursor only after a successful render, and only for
@@ -126,9 +132,15 @@ pub fn run_brief(
 /// conversational MCP surface can query the digest without consuming the Slack
 /// hook's `--since last` cursor.
 ///
+/// `root` locates the on-disk review markers and plan files the escalations
+/// section filters on — the same anchoring `compute_review_queue` uses; the
+/// CLI resolves it from the process cwd, the MCP server passes its project
+/// root.
+///
 /// Fails closed: an absent state store yields a fully `unavailable` digest
 /// rather than an error.
 pub fn compute_brief(
+    root: &Path,
     state_path: &Path,
     config_path: &Path,
     since: BriefSince,
@@ -175,7 +187,7 @@ pub fn compute_brief(
     windowed_decisions.sort_by_key(|d| Reverse(d.timestamp));
 
     let agent_activity = build_agent_activity(&windowed_decisions);
-    let escalations = build_escalations(&windowed_decisions);
+    let escalations = build_escalations(root, &windowed_decisions);
     let runs_section = build_runs(&windowed_runs);
     let drift = build_drift(&store, since_ts);
     let (freshness, quality) = build_freshness_and_quality(&store, &windowed_runs, since_ts);
@@ -292,12 +304,27 @@ fn build_agent_activity(decisions: &[&PolicyDecisionRecord]) -> BriefAgentActivi
     }
 }
 
-fn build_escalations(decisions: &[&PolicyDecisionRecord]) -> BriefEscalationsSection {
-    let pending: Vec<BriefDecisionEntry> = decisions
-        .iter()
-        .filter(|d| matches!(d.effect, PolicyEffect::RequireReview))
-        .map(|d| decision_entry(d))
-        .collect();
+/// The "Needs you" section: decisions **still** awaiting review.
+///
+/// Reuses the review queue's outstanding-selection core
+/// ([`select_outstanding`]) rather than re-listing every windowed
+/// `require_review` row, so the digest and `rocky review --queue` agree: one
+/// entry per `(plan_id, model)` (the newest row), already-approved plans
+/// dropped (their sign-off marker exists), and decision-only custody rows
+/// with no persisted plan dropped (nothing to approve). The raw per-effect
+/// counts stay in the agent-activity section, which reports history, not the
+/// outstanding workload.
+fn build_escalations(root: &Path, decisions: &[&PolicyDecisionRecord]) -> BriefEscalationsSection {
+    let (outstanding, _excluded_non_plan) = select_outstanding(
+        decisions.iter().copied(),
+        |plan_id| ai_plan_is_reviewed(root, plan_id),
+        |plan_id| plan_file_path(root, plan_id).exists(),
+    );
+
+    // Newest first — the section's declared "recency" ranking.
+    let mut outstanding = outstanding;
+    outstanding.sort_by_key(|d| Reverse(d.timestamp));
+    let pending: Vec<BriefDecisionEntry> = outstanding.into_iter().map(decision_entry).collect();
 
     if pending.is_empty() {
         return BriefEscalationsSection {
@@ -1319,8 +1346,24 @@ mod tests {
         assert!(section.note.is_some());
     }
 
+    /// Create the plan file the escalation filter probes for, so a synthetic
+    /// decision row renders as an approvable escalation.
+    fn seed_plan_file(root: &std::path::Path, plan_id: &str) {
+        let dir = root.join(".rocky").join("plans");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{plan_id}.json")), "{}").unwrap();
+    }
+
+    /// Write the sign-off marker `rocky review --approve` would leave.
+    fn seed_review_marker(root: &std::path::Path, plan_id: &str) {
+        let dir = root.join(".rocky").join("plans");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{plan_id}.reviewed.json")), "{}").unwrap();
+    }
+
     #[test]
     fn escalations_only_require_review() {
+        let root = tempfile::tempdir().unwrap();
         let d = [
             decision(
                 9,
@@ -1337,14 +1380,74 @@ mod tests {
                 None,
             ),
         ];
+        seed_plan_file(root.path(), &d[0].plan_id);
+        seed_plan_file(root.path(), &d[1].plan_id);
         let refs: Vec<&PolicyDecisionRecord> = d.iter().collect();
-        let section = build_escalations(&refs);
+        let section = build_escalations(root.path(), &refs);
         assert_eq!(section.availability, SectionAvailability::Available);
         assert_eq!(section.total, 1);
         assert_eq!(section.pending[0].model, "dim_customer");
         // The pending entry carries its ledger citations.
         assert!(section.pending[0].decision_ref.contains("dim_customer"));
         assert!(section.pending[0].plan_id.contains("dim_customer"));
+    }
+
+    /// FIX: "Needs you" reports the *outstanding* workload, not history — it
+    /// must agree with the review queue's selection: dedup to the newest row
+    /// per `(plan_id, model)`, drop already-approved plans, and drop
+    /// decision-only custody rows with no persisted plan.
+    #[test]
+    fn escalations_drop_reviewed_plans_planless_rows_and_duplicates() {
+        let root = tempfile::tempdir().unwrap();
+        let mut approved = decision(
+            8,
+            PolicyPrincipal::Agent,
+            PolicyEffect::RequireReview,
+            "fct_orders",
+            Some(0),
+        );
+        approved.plan_id = "planApproved".to_string();
+        seed_plan_file(root.path(), "planApproved");
+        seed_review_marker(root.path(), "planApproved");
+
+        let mut draft = decision(
+            9,
+            PolicyPrincipal::Agent,
+            PolicyEffect::RequireReview,
+            "orders_daily",
+            None,
+        );
+        draft.plan_id = "draft:orders_daily".to_string();
+
+        let mut pending_old = decision(
+            10,
+            PolicyPrincipal::Agent,
+            PolicyEffect::RequireReview,
+            "dim_customer",
+            None,
+        );
+        pending_old.plan_id = "planPending".to_string();
+        let mut pending_new = decision(
+            11,
+            PolicyPrincipal::Agent,
+            PolicyEffect::RequireReview,
+            "dim_customer",
+            None,
+        );
+        pending_new.plan_id = "planPending".to_string();
+        seed_plan_file(root.path(), "planPending");
+
+        let d = [approved, draft, pending_old, pending_new];
+        let refs: Vec<&PolicyDecisionRecord> = d.iter().collect();
+        let section = build_escalations(root.path(), &refs);
+
+        // One outstanding escalation: the newest planPending/dim_customer row.
+        assert_eq!(section.total, 1, "pending: {:?}", section.pending);
+        assert_eq!(section.pending[0].plan_id, "planPending");
+        assert_eq!(section.pending[0].timestamp, ts(11).to_rfc3339());
+        // The history counts are the agent-activity section's job and stay raw.
+        let activity = build_agent_activity(&refs);
+        assert_eq!(activity.require_review, 4);
     }
 
     #[test]
@@ -1377,6 +1480,7 @@ mod tests {
 
     #[test]
     fn markdown_leads_with_needs_you_and_cites() {
+        let root = tempfile::tempdir().unwrap();
         let d = [decision(
             11,
             PolicyPrincipal::Agent,
@@ -1384,6 +1488,7 @@ mod tests {
             "dim_customer",
             Some(3),
         )];
+        seed_plan_file(root.path(), &d[0].plan_id);
         let refs: Vec<&PolicyDecisionRecord> = d.iter().collect();
         let out = BriefOutput {
             version: "0".to_string(),
@@ -1392,7 +1497,7 @@ mod tests {
             since_mode: BriefSinceMode::Hours24,
             since_timestamp: Some(ts(1).to_rfc3339()),
             agent_activity: build_agent_activity(&refs),
-            escalations: build_escalations(&refs),
+            escalations: build_escalations(root.path(), &refs),
             runs: build_runs(&[]),
             drift: BriefDriftSection {
                 availability: SectionAvailability::Unavailable,

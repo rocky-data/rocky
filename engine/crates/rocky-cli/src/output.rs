@@ -6447,6 +6447,12 @@ pub struct ReviewQueueOutput {
     pub ranking: String,
     /// Count of pending escalations in the queue.
     pub total: u64,
+    /// Count of outstanding `require_review` ledger rows excluded from the
+    /// queue because their `plan_id` resolves to no persisted plan file —
+    /// decision-only custody rows (e.g. refused drafts, auto-apply
+    /// evaluations) that nothing could approve. They stay in the audit
+    /// ledger; they are just not approvable queue items.
+    pub excluded_non_plan_rows: u64,
     /// The pending escalations, highest-priority first.
     pub pending: Vec<ReviewQueueEntry>,
 }
@@ -6696,9 +6702,10 @@ pub enum AuditSubjectKind {
 ///
 /// Every link fails closed the same way the estate brief does: a link whose
 /// signal is genuinely not recorded renders [`SectionAvailability::Unavailable`]
-/// with a note, never a fabricated or assumed value. Notably, post-apply
-/// verification outcomes are not persisted anywhere today, so
-/// [`Self::verify_after`] is always `unavailable`; and the run ledger is not
+/// with a note, never a fabricated or assumed value. Post-apply verification
+/// outcomes are persisted as decision-ledger custody rows (non-empty
+/// `verify_after`), so [`Self::verify_after`] renders them when they exist and
+/// says "not recorded" when none exist for the subject. The run ledger is not
 /// keyed to policy decisions, so a `run` selector cannot join back to a
 /// decision. The blast radius is recomputed from the current compiled graph
 /// (a live query, not a stored snapshot).
@@ -6722,7 +6729,8 @@ pub struct AuditForOutput {
     pub plan: AuditChainPlan,
     /// Runs that materialized the subject.
     pub runs: AuditChainRuns,
-    /// What a post-apply verification found — not recorded today.
+    /// What a post-apply verification found — the verification custody rows
+    /// recorded against the subject's plan.
     pub verify_after: AuditChainVerify,
     /// What sits downstream of the subject — the CLL blast radius.
     pub blast_radius: AuditChainBlastRadius,
@@ -6803,14 +6811,45 @@ pub struct AuditRunEntry {
 
 /// Verify-after link of the custody chain.
 ///
-/// Post-apply verification outcomes are not persisted to the state store
-/// today, so this link is always [`SectionAvailability::Unavailable`] with a
-/// note — never a smoothed-over "verification passed".
+/// Post-apply verification outcomes are persisted to the decision ledger as
+/// custody rows with a non-empty `verify_after` check list — the two-step
+/// `rocky apply` gate writes one per verified apply, and the drift auto-apply
+/// path writes them under its `autoapply-verify:<run_id>` plan id. This link
+/// renders those rows for the subject's plan. When none exist the link says
+/// so plainly ("not recorded") — never a smoothed-over "verification passed".
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AuditChainVerify {
     pub availability: SectionAvailability,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Count of verification custody rows found for the subject.
+    pub total: u64,
+    /// The verification outcomes, newest first.
+    pub entries: Vec<AuditVerifyEntry>,
+}
+
+/// One post-apply verification outcome inside [`AuditChainVerify`] — a
+/// decision-ledger custody row with a non-empty `verify_after` check list.
+///
+/// The ledger records the required check names, the aggregate verdict
+/// (`allow` = every named check passed, `deny` = a check failed or was absent
+/// and the apply halted), and a human-readable reason; per-check pass/fail
+/// detail beyond that lives only in the reason string, which is rendered
+/// verbatim rather than re-parsed.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuditVerifyEntry {
+    /// RFC 3339 timestamp when the verification outcome was recorded.
+    pub timestamp: String,
+    /// The plan id the custody row was filed under (the applied plan, or the
+    /// auto-apply path's `autoapply-verify:<run_id>`).
+    pub plan_id: String,
+    /// The named post-apply checks the verification required.
+    pub checks: Vec<String>,
+    /// Whether the verification passed (`allow` custody row) or failed
+    /// (`deny`).
+    pub passed: bool,
+    /// The recorded outcome, verbatim from the custody row.
+    pub reason: String,
 }
 
 /// Blast-radius link of the custody chain: the models that transitively
@@ -6860,14 +6899,16 @@ pub enum ScorecardDimension {
 /// autonomy, and it informs human judgment only — nothing here is wired to any
 /// automatic policy change.
 ///
-/// Only metrics the ledger actually persists are computed. The ledger records
-/// one row per policy *evaluation* — `(principal, capability, model, effect,
-/// rule_id)` — and nothing about what happened *after* the decision. So
-/// verify-after outcomes, reverts, and escalation-resolution latency are not
-/// derivable; they are declared, once, in [`Self::unavailable_metrics`] as
-/// `unavailable` with the reason, never faked into a number. A ledger read
-/// failure renders the whole scorecard `unavailable` rather than a
-/// smoothed-over zero.
+/// Only metrics the ledger actually persists are computed. Post-apply
+/// verification outcomes *are* persisted (custody rows with a non-empty
+/// `verify_after` check list), so [`Self::verify_after`] reports their pass
+/// rate when any fall in the window. Reverts and escalation-resolution
+/// latency are not persisted; they are declared in
+/// [`Self::unavailable_metrics`] as `unavailable` with the reason, never
+/// faked into a number — and `verify_after_pass_rate` joins that list only
+/// when no verification row falls in the window. A ledger read failure
+/// renders the whole scorecard `unavailable` rather than a smoothed-over
+/// zero.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AuditScorecardOutput {
     pub version: String,
@@ -6889,9 +6930,34 @@ pub struct AuditScorecardOutput {
     pub total_decisions: u64,
     /// One row per group, ranked by decision count descending.
     pub groups: Vec<ScorecardGroup>,
-    /// Metrics the ledger does not persist, declared plainly rather than
-    /// computed. Each is `unavailable` with the reason it cannot be derived.
+    /// Aggregate of the post-apply verification custody rows in the window
+    /// (rows with a non-empty `verify_after` check list). `null` when no
+    /// verification row falls in the window — then `verify_after_pass_rate`
+    /// is declared in [`Self::unavailable_metrics`] instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_after: Option<ScorecardVerifyAfter>,
+    /// Metrics the persisted ledger cannot support for this window, declared
+    /// plainly rather than computed. Each is `unavailable` with the reason it
+    /// cannot be derived.
     pub unavailable_metrics: Vec<ScorecardUnavailableMetric>,
+}
+
+/// The verify-after aggregate inside an [`AuditScorecardOutput`]: pass/fail
+/// counts over the post-apply verification custody rows in the window.
+///
+/// Each row's aggregate verdict is its recorded `effect` (`allow` = every
+/// named check passed, `deny` = a check failed or was absent and the apply
+/// halted), so the pass rate summarizes exactly what the ledger persists.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ScorecardVerifyAfter {
+    /// Verification custody rows in the window.
+    pub total: u64,
+    /// Rows whose verdict was `allow` (every named check passed).
+    pub passed: u64,
+    /// Rows whose verdict was `deny` (a named check failed or was absent).
+    pub failed: u64,
+    /// `passed / total`.
+    pub pass_rate: f64,
 }
 
 /// One group's decision aggregate in an [`AuditScorecardOutput`].
@@ -6924,16 +6990,17 @@ pub struct ScorecardGroup {
     pub decision_refs: Vec<String>,
 }
 
-/// A metric the scorecard cannot compute because the ledger does not persist
-/// its inputs.
+/// A metric the scorecard cannot compute from the persisted ledger for this
+/// window.
 ///
 /// Declared explicitly (not silently omitted) so the honesty is
 /// machine-readable: a consumer sees the metric name, that it is `unavailable`,
 /// and exactly why.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ScorecardUnavailableMetric {
-    /// The metric identifier (`verify_after_pass_rate`, `reverts`,
-    /// `escalation_latency`).
+    /// The metric identifier (`reverts`, `escalation_latency`, or
+    /// `verify_after_pass_rate` when no verification row falls in the
+    /// window).
     pub metric: String,
     /// Always [`SectionAvailability::Unavailable`].
     pub availability: SectionAvailability,

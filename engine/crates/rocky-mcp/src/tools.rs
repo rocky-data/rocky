@@ -2475,6 +2475,7 @@ impl RockyMcpServer {
             }
         };
         let output = commands::compute_brief(
+            &self.root,
             &self.state_path(),
             &self.config_path,
             since,

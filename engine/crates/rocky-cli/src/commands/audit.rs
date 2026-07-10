@@ -27,8 +27,8 @@ use rocky_core::state::{PolicyDecisionRecord, RunRecord, StateStore};
 use crate::output::{
     AuditChainBlastRadius, AuditChainDecisions, AuditChainPlan, AuditChainRuns, AuditChainVerify,
     AuditDecisionEntry, AuditForOutput, AuditOutput, AuditPlanChange, AuditRunEntry,
-    AuditScorecardOutput, AuditSubjectKind, ScorecardDimension, ScorecardGroup,
-    ScorecardUnavailableMetric, SectionAvailability, print_json,
+    AuditScorecardOutput, AuditSubjectKind, AuditVerifyEntry, ScorecardDimension, ScorecardGroup,
+    ScorecardUnavailableMetric, ScorecardVerifyAfter, SectionAvailability, print_json,
 };
 use crate::plan_store::read_plan;
 
@@ -187,7 +187,7 @@ pub fn compute_audit_for(
     let decisions_link = build_decisions_link(kind, selector, &decisions);
     let plan_link = build_plan_link(kind, selector, &decisions_link, root);
     let runs_link = build_runs_link(kind, selector, subject_run, &runs);
-    let verify_link = build_verify_link();
+    let verify_link = build_verify_link(kind, selector, &plan_link, &decisions);
 
     // Subject models for the blast radius: the model itself, the run's executed
     // models, or the plan's changed models.
@@ -234,7 +234,11 @@ pub fn compute_audit_for(
 
 /// Path a plan file would occupy — existence-checked without the
 /// dir-creating side effects of [`read_plan`].
-fn plan_file_path(root: &Path, plan_id: &str) -> PathBuf {
+///
+/// Shared with the review queue, which uses the same probe to drop
+/// decision-only custody rows (drafts, auto-apply evaluations) that resolve
+/// to no reviewable plan.
+pub(crate) fn plan_file_path(root: &Path, plan_id: &str) -> PathBuf {
     root.join(".rocky")
         .join("plans")
         .join(format!("{plan_id}.json"))
@@ -448,16 +452,79 @@ fn build_runs_link(
     }
 }
 
-/// The verify-after link is always unavailable: post-apply verification
-/// outcomes are not persisted to the state store today.
-fn build_verify_link() -> AuditChainVerify {
+/// The verify-after link: post-apply verification outcomes, read from the
+/// decision ledger's custody rows (state v17+ persists them with a non-empty
+/// `verify_after` check list).
+///
+/// The rows are keyed by plan id: the two-step `rocky apply` gate files its
+/// verification row under the applied plan's id, and the drift auto-apply
+/// path files its rows under `autoapply-verify:<run_id>`. A model subject
+/// therefore joins through its governing plan (the one the plan link
+/// resolved); a run subject joins through the auto-apply synthetic id. When
+/// no row matches, the link says so ("not recorded" for a subject with no
+/// resolvable plan; "no data" when the plan simply has no verification rows)
+/// — never a fabricated verdict.
+fn build_verify_link(
+    kind: AuditSubjectKind,
+    selector: &str,
+    plan_link: &AuditChainPlan,
+    decisions: &[PolicyDecisionRecord],
+) -> AuditChainVerify {
+    // Which plan id's custody rows count as this subject's verification?
+    let subject_plan_id: Option<String> = match kind {
+        AuditSubjectKind::Plan => Some(selector.to_string()),
+        AuditSubjectKind::Model => plan_link.plan_id.clone(),
+        AuditSubjectKind::Run => Some(format!("autoapply-verify:{selector}")),
+    };
+
+    let Some(subject_plan_id) = subject_plan_id else {
+        return AuditChainVerify {
+            availability: SectionAvailability::Unavailable,
+            note: Some(
+                "verification custody rows are keyed by plan id, and no plan governs this \
+                 subject, so no verify-after outcome can be joined to it"
+                    .to_string(),
+            ),
+            total: 0,
+            entries: Vec::new(),
+        };
+    };
+
+    let mut matched: Vec<&PolicyDecisionRecord> = decisions
+        .iter()
+        .filter(|d| d.plan_id == subject_plan_id && !d.verify_after.is_empty())
+        .collect();
+    // Newest first.
+    matched.sort_by_key(|d| std::cmp::Reverse(d.timestamp));
+
+    if matched.is_empty() {
+        return AuditChainVerify {
+            availability: SectionAvailability::NoData,
+            note: Some(format!(
+                "no post-apply verification outcome was recorded for plan '{subject_plan_id}' — \
+                 either its apply required no verify_after checks or it has not been applied"
+            )),
+            total: 0,
+            entries: Vec::new(),
+        };
+    }
+
+    let entries: Vec<AuditVerifyEntry> = matched
+        .into_iter()
+        .map(|d| AuditVerifyEntry {
+            timestamp: d.timestamp.to_rfc3339(),
+            plan_id: d.plan_id.clone(),
+            checks: d.verify_after.clone(),
+            passed: d.effect == PolicyEffect::Allow,
+            reason: d.reason.clone(),
+        })
+        .collect();
+
     AuditChainVerify {
-        availability: SectionAvailability::Unavailable,
-        note: Some(
-            "post-apply verification outcomes are not persisted to the state store, so the \
-             verify-after result for this subject is not recorded"
-                .to_string(),
-        ),
+        availability: SectionAvailability::Available,
+        note: None,
+        total: entries.len() as u64,
+        entries,
     }
 }
 
@@ -694,10 +761,24 @@ fn render_chain_text(out: &AuditForOutput) {
 
     // Verify-after.
     println!("\nverify-after — what verification found:");
-    println!(
-        "  {}",
-        status_line(&out.verify_after.availability, &out.verify_after.note)
-    );
+    match out.verify_after.availability {
+        SectionAvailability::Available => {
+            for v in &out.verify_after.entries {
+                let verdict = if v.passed { "PASSED" } else { "FAILED" };
+                println!(
+                    "  {} {} [{}] — {}",
+                    v.timestamp,
+                    verdict,
+                    v.checks.join(", "),
+                    v.reason,
+                );
+            }
+        }
+        _ => println!(
+            "  {}",
+            status_line(&out.verify_after.availability, &out.verify_after.note)
+        ),
+    }
 
     // Blast radius.
     println!("\nblast radius — what it touches downstream:");
@@ -797,7 +878,8 @@ pub fn compute_audit_scorecard(
             )),
             total_decisions: 0,
             groups: Vec::new(),
-            unavailable_metrics: scorecard_unavailable_metrics(),
+            verify_after: None,
+            unavailable_metrics: scorecard_unavailable_metrics(false),
         },
     };
     Ok(output)
@@ -969,6 +1051,8 @@ fn build_scorecard(
     // Busiest group first; deterministic tie-break on the label.
     groups.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.key.cmp(&b.key)));
 
+    let verify_after = build_scorecard_verify_after(&windowed);
+
     let (availability, note) = if total_decisions == 0 {
         (
             SectionAvailability::NoData,
@@ -988,37 +1072,75 @@ fn build_scorecard(
         note,
         total_decisions,
         groups,
-        unavailable_metrics: scorecard_unavailable_metrics(),
+        unavailable_metrics: scorecard_unavailable_metrics(verify_after.is_some()),
+        verify_after,
     }
 }
 
-/// The scorecard metrics the ledger does not persist, each rendered
-/// `unavailable` with the reason. Declared once — never faked into a number.
-fn scorecard_unavailable_metrics() -> Vec<ScorecardUnavailableMetric> {
-    vec![
-        ScorecardUnavailableMetric {
+/// Aggregate the window's post-apply verification custody rows (non-empty
+/// `verify_after`) into a pass rate. `None` when no such row falls in the
+/// window — the caller then declares `verify_after_pass_rate` unavailable
+/// rather than reporting a rate over nothing.
+fn build_scorecard_verify_after(
+    windowed: &[&PolicyDecisionRecord],
+) -> Option<ScorecardVerifyAfter> {
+    let rows: Vec<&&PolicyDecisionRecord> = windowed
+        .iter()
+        .filter(|d| !d.verify_after.is_empty())
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    let total = rows.len() as u64;
+    let passed = rows
+        .iter()
+        .filter(|d| d.effect == PolicyEffect::Allow)
+        .count() as u64;
+    let failed = rows
+        .iter()
+        .filter(|d| d.effect == PolicyEffect::Deny)
+        .count() as u64;
+    Some(ScorecardVerifyAfter {
+        total,
+        passed,
+        failed,
+        pass_rate: passed as f64 / total as f64,
+    })
+}
+
+/// The scorecard metrics the persisted ledger cannot support for this window,
+/// each rendered `unavailable` with the reason — never faked into a number.
+///
+/// `verify_after_pass_rate` is computed from the verification custody rows
+/// when any fall in the window (`verify_recorded`); it is declared
+/// unavailable only when none do.
+fn scorecard_unavailable_metrics(verify_recorded: bool) -> Vec<ScorecardUnavailableMetric> {
+    let mut metrics = Vec::with_capacity(3);
+    if !verify_recorded {
+        metrics.push(ScorecardUnavailableMetric {
             metric: "verify_after_pass_rate".to_string(),
             availability: SectionAvailability::Unavailable,
-            note: "post-apply verification outcomes are not persisted to the state store, so a \
-                   verify-after pass rate cannot be computed"
+            note: "no post-apply verification custody row falls in the window, so a \
+                   verify-after pass rate cannot be computed over it"
                 .to_string(),
-        },
-        ScorecardUnavailableMetric {
-            metric: "reverts".to_string(),
-            availability: SectionAvailability::Unavailable,
-            note: "reverts / rollbacks of an applied change are not recorded to the ledger, so a \
-                   revert count cannot be computed"
-                .to_string(),
-        },
-        ScorecardUnavailableMetric {
-            metric: "escalation_latency".to_string(),
-            availability: SectionAvailability::Unavailable,
-            note: "the resolution of a require_review escalation is not recorded to the ledger \
-                   (an approval leaves only an on-disk plan marker, a denial records nothing), so \
-                   escalation latency cannot be computed"
-                .to_string(),
-        },
-    ]
+        });
+    }
+    metrics.push(ScorecardUnavailableMetric {
+        metric: "reverts".to_string(),
+        availability: SectionAvailability::Unavailable,
+        note: "reverts / rollbacks of an applied change are not recorded to the ledger, so a \
+               revert count cannot be computed"
+            .to_string(),
+    });
+    metrics.push(ScorecardUnavailableMetric {
+        metric: "escalation_latency".to_string(),
+        availability: SectionAvailability::Unavailable,
+        note: "the resolution of a require_review escalation is not recorded to the ledger \
+               (an approval leaves only an on-disk plan marker, a denial records nothing), so \
+               escalation latency cannot be computed"
+            .to_string(),
+    });
+    metrics
 }
 
 /// Render the scorecard as a concise human-readable report.
@@ -1049,6 +1171,16 @@ fn render_scorecard_text(out: &AuditScorecardOutput) {
             }
         }
         _ => println!("  {}", status_line(&out.availability, &out.note)),
+    }
+
+    if let Some(v) = &out.verify_after {
+        println!(
+            "\nverify-after: {:.1}% pass rate over {} verification row(s) [{} passed, {} failed]",
+            v.pass_rate * 100.0,
+            v.total,
+            v.passed,
+            v.failed,
+        );
     }
 
     // The honesty footer: what the ledger cannot support, stated plainly.
@@ -1174,11 +1306,149 @@ mod tests {
         assert_eq!(link.total, 0);
     }
 
+    /// A verification custody row: the shape `run_verify_after` (two-step
+    /// apply) and the drift auto-apply path persist — non-empty
+    /// `verify_after`, effect = the aggregate verdict.
+    fn verify_row(
+        secs: u32,
+        plan_id: &str,
+        effect: PolicyEffect,
+        checks: &[&str],
+        reason: &str,
+    ) -> PolicyDecisionRecord {
+        PolicyDecisionRecord {
+            timestamp: Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, secs).unwrap(),
+            plan_id: plan_id.to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "*".to_string(),
+            effect,
+            rule_id: None,
+            reason: reason.to_string(),
+            verify_after: checks.iter().map(ToString::to_string).collect(),
+            auto_apply: None,
+        }
+    }
+
+    fn plan_link_naming(plan_id: Option<&str>) -> AuditChainPlan {
+        AuditChainPlan {
+            availability: SectionAvailability::Available,
+            note: None,
+            plan_id: plan_id.map(str::to_string),
+            principal: None,
+            kind: None,
+            diff_available: true,
+            changes: Vec::new(),
+        }
+    }
+
     #[test]
-    fn verify_after_is_always_unavailable() {
-        let link = build_verify_link();
-        assert_eq!(link.availability, SectionAvailability::Unavailable);
-        assert!(link.note.unwrap().contains("not persisted"));
+    fn verify_link_renders_persisted_rows_for_a_plan_subject() {
+        let decisions = vec![
+            // Plain evaluation row — not a verification outcome.
+            decision(1, "planA", "fct_orders", PolicyEffect::RequireReview),
+            verify_row(
+                2,
+                "planA",
+                PolicyEffect::Allow,
+                &["row_count", "not_null"],
+                "verify_after passed: [row_count, not_null]",
+            ),
+            verify_row(
+                3,
+                "planA",
+                PolicyEffect::Deny,
+                &["row_count"],
+                "verify_after FAILED: row_count (failed).",
+            ),
+            // Another plan's verification — out of scope.
+            verify_row(4, "planB", PolicyEffect::Allow, &["freshness"], "ok"),
+        ];
+        let link = build_verify_link(
+            AuditSubjectKind::Plan,
+            "planA",
+            &plan_link_naming(Some("planA")),
+            &decisions,
+        );
+        assert_eq!(link.availability, SectionAvailability::Available);
+        assert_eq!(link.total, 2);
+        // Newest first: the failed verification (secs=3) leads.
+        assert!(!link.entries[0].passed);
+        assert!(link.entries[0].reason.contains("FAILED"));
+        assert_eq!(link.entries[0].checks, vec!["row_count".to_string()]);
+        assert!(link.entries[1].passed);
+        assert_eq!(link.entries[1].checks.len(), 2);
+    }
+
+    #[test]
+    fn verify_link_for_a_model_joins_through_its_governing_plan() {
+        let decisions = vec![
+            decision(1, "planA", "fct_orders", PolicyEffect::Allow),
+            // The verification row carries model "*" — it is reachable from the
+            // model subject only through the governing plan id.
+            verify_row(
+                2,
+                "planA",
+                PolicyEffect::Allow,
+                &["row_count"],
+                "verify_after passed: [row_count]",
+            ),
+        ];
+        let link = build_verify_link(
+            AuditSubjectKind::Model,
+            "fct_orders",
+            &plan_link_naming(Some("planA")),
+            &decisions,
+        );
+        assert_eq!(link.availability, SectionAvailability::Available);
+        assert_eq!(link.total, 1);
+        assert!(link.entries[0].passed);
+
+        // No governing plan resolved → honest unavailable, not fabricated.
+        let none = build_verify_link(
+            AuditSubjectKind::Model,
+            "fct_orders",
+            &plan_link_naming(None),
+            &decisions,
+        );
+        assert_eq!(none.availability, SectionAvailability::Unavailable);
+        assert!(none.entries.is_empty());
+    }
+
+    #[test]
+    fn verify_link_for_a_run_joins_the_auto_apply_custody_rows() {
+        let decisions = vec![verify_row(
+            1,
+            "autoapply-verify:run-42",
+            PolicyEffect::Deny,
+            &["row_count"],
+            "verify_after FAILED: row_count (failed). No rollback substrate available.",
+        )];
+        let link = build_verify_link(
+            AuditSubjectKind::Run,
+            "run-42",
+            &plan_link_naming(None),
+            &decisions,
+        );
+        assert_eq!(link.availability, SectionAvailability::Available);
+        assert_eq!(link.total, 1);
+        assert!(!link.entries[0].passed);
+        assert_eq!(link.entries[0].plan_id, "autoapply-verify:run-42");
+    }
+
+    #[test]
+    fn verify_link_without_rows_stays_honestly_not_recorded() {
+        let decisions = vec![decision(1, "planA", "fct_orders", PolicyEffect::Allow)];
+        let link = build_verify_link(
+            AuditSubjectKind::Plan,
+            "planA",
+            &plan_link_naming(Some("planA")),
+            &decisions,
+        );
+        assert_eq!(link.availability, SectionAvailability::NoData);
+        assert_eq!(link.total, 0);
+        assert!(link.entries.is_empty());
+        assert!(link.note.unwrap().contains("no post-apply verification"));
     }
 
     #[test]
@@ -1370,8 +1640,11 @@ mod tests {
     }
 
     #[test]
-    fn scorecard_unavailable_metrics_are_the_three_unpersisted_and_all_unavailable() {
+    fn scorecard_unavailable_metrics_include_verify_only_when_no_rows_exist() {
+        // The seed carries no verification custody rows → the pass rate is
+        // honestly declared uncomputable, alongside the never-persisted two.
         let out = build_scorecard(ScorecardDimension::Principal, "all", None, &seed());
+        assert!(out.verify_after.is_none());
         let names: Vec<&str> = out
             .unavailable_metrics
             .iter()
@@ -1386,6 +1659,60 @@ mod tests {
             assert_eq!(m.availability, SectionAvailability::Unavailable);
             assert!(!m.note.is_empty());
         }
+    }
+
+    #[test]
+    fn scorecard_computes_verify_after_pass_rate_from_custody_rows() {
+        let mut decisions = seed();
+        decisions.push(verify_row(
+            11,
+            "p6",
+            PolicyEffect::Allow,
+            &["row_count"],
+            "verify_after passed: [row_count]",
+        ));
+        decisions.push(verify_row(
+            12,
+            "p6",
+            PolicyEffect::Allow,
+            &["not_null"],
+            "verify_after passed: [not_null]",
+        ));
+        decisions.push(verify_row(
+            13,
+            "p7",
+            PolicyEffect::Deny,
+            &["row_count"],
+            "verify_after FAILED: row_count (failed).",
+        ));
+
+        let out = build_scorecard(ScorecardDimension::Principal, "all", None, &decisions);
+        let v = out.verify_after.expect("verify rows exist in the window");
+        assert_eq!((v.total, v.passed, v.failed), (3, 2, 1));
+        assert!((v.pass_rate - 2.0 / 3.0).abs() < 1e-9);
+        // The pass rate is computed, so it is no longer declared unavailable.
+        assert!(
+            out.unavailable_metrics
+                .iter()
+                .all(|m| m.metric != "verify_after_pass_rate")
+        );
+
+        // Windowing applies to the verification rows too: a cutoff past them
+        // degrades back to the honest declaration.
+        let lo = Utc.with_ymd_and_hms(2026, 7, 7, 0, 0, 14).unwrap();
+        let windowed = build_scorecard(
+            ScorecardDimension::Principal,
+            "cutoff",
+            Some(lo),
+            &decisions,
+        );
+        assert!(windowed.verify_after.is_none());
+        assert!(
+            windowed
+                .unavailable_metrics
+                .iter()
+                .any(|m| m.metric == "verify_after_pass_rate")
+        );
     }
 
     #[test]

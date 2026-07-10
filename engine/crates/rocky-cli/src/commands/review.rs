@@ -21,17 +21,17 @@
 //! approval is informed.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use rocky_core::breaking_change::{self, BreakingFinding};
-use rocky_core::config::{PolicyCapability, PolicyEffect};
+use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
 use rocky_core::state::{PolicyDecisionRecord, StateStore};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::apply::{ai_plan_is_reviewed, review_marker_path};
-use crate::commands::audit::{blast_radius_of, compile_project};
+use crate::commands::audit::{blast_radius_of, compile_project, plan_file_path};
 use crate::output::{
     ApproverIdentity, ReviewOutput, ReviewQueueEntry, ReviewQueueOutput, RunPlan, print_json,
 };
@@ -158,9 +158,13 @@ pub async fn compute_review(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize plan payload")?;
 
-    let models_dir = run_plan.models_dir.as_deref().unwrap_or("models");
+    // Resolve the plan's models directory against the project `root`, never
+    // the process cwd — the governor's MCP server reviews from a cwd that is
+    // not the project, and a cwd-relative path would silently skip the
+    // breaking-change gate there.
+    let (models_dir, state_path) = review_gate_paths(root, run_plan.models_dir.as_deref());
 
-    let findings = compute_review_findings(config_path, Path::new(models_dir), base_ref);
+    let findings = compute_review_findings(config_path, &models_dir, &state_path, base_ref);
     let breaking_count = findings
         .as_ref()
         .map(|f| f.iter().filter(|x| x.is_breaking()).count())
@@ -321,6 +325,22 @@ fn build_message(
     }
 }
 
+/// Resolve the paths the review's breaking-change gate reads, anchored at the
+/// project `root` rather than the process cwd.
+///
+/// - `models_dir`: the plan's recorded models directory (default `models`),
+///   joined onto `root` (an already-absolute recorded path is used verbatim —
+///   `Path::join` replaces on absolute).
+/// - `state_path`: the schema-cache state store, resolved with the same
+///   [`rocky_core::state::resolve_state_path`] defaulting the CLI and the MCP
+///   server use (`<models_dir>/.rocky-state.redb` et al.) — not a hardcoded
+///   cwd-relative file.
+fn review_gate_paths(root: &Path, plan_models_dir: Option<&str>) -> (PathBuf, PathBuf) {
+    let models_dir = root.join(plan_models_dir.unwrap_or("models"));
+    let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+    (models_dir, state_path)
+}
+
 /// Compute the breaking-change findings between `base_ref` and the working
 /// tree, reusing the exact compile + classifier path that `rocky ci-diff`
 /// and the branch-promote gate use.
@@ -334,6 +354,7 @@ fn build_message(
 fn compute_review_findings(
     config_path: &Path,
     models_dir: &Path,
+    state_path: &Path,
     base_ref: &str,
 ) -> Option<Vec<BreakingFinding>> {
     use rocky_compiler::compile::{self, CompilerConfig};
@@ -354,8 +375,7 @@ fn compute_review_findings(
     let source_schemas = match rocky_core::config::load_rocky_config(config_path) {
         Ok(cfg) => {
             let schema_cfg = cfg.cache.schemas.with_ttl_override(None);
-            let state_path = std::path::PathBuf::from(".rocky/state.redb");
-            crate::source_schemas::load_cached_source_schemas(&schema_cfg, &state_path)
+            crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
         }
         Err(_) => std::collections::HashMap::new(),
     };
@@ -464,8 +484,9 @@ pub(crate) fn run_review_queue_in(
 ///
 /// The reusable core behind both `rocky review --queue` and the governor's
 /// `review_queue` MCP tool. `root` locates the sign-off markers that clear an
-/// escalation; the CLI resolves it from the process cwd, the MCP server passes
-/// its project root. Reads only — no stdout.
+/// escalation and the plan files that make one approvable; the CLI resolves it
+/// from the process cwd, the MCP server passes its project root. Reads only —
+/// no stdout.
 pub fn compute_review_queue(
     root: &Path,
     config_path: &Path,
@@ -482,13 +503,14 @@ pub fn compute_review_queue(
         Vec::new()
     };
 
-    let pending = build_queue(
+    let (pending, excluded_non_plan_rows) = build_queue(
         root,
         config_path,
         state_path,
         models_dir,
         &decisions,
         Utc::now(),
+        MAX_HISTORY_SCAN,
     );
 
     Ok(ReviewQueueOutput {
@@ -496,12 +518,17 @@ pub fn compute_review_queue(
         command: "review".to_string(),
         ranking: QUEUE_RANKING.to_string(),
         total: pending.len() as u64,
+        excluded_non_plan_rows,
         pending,
     })
 }
 
-/// Assemble the ranked queue from the decision ledger. Factored out so the
-/// ranking is unit-testable without a state store.
+/// Assemble the ranked queue from the decision ledger, scanning at most the
+/// `max_scan` **newest** ledger rows. Returns the ranked entries plus the
+/// count of outstanding escalations excluded because no plan file backs them.
+/// Factored out (with an injectable scan cap) so the ranking and the cap
+/// semantics are unit-testable without a state store.
+#[allow(clippy::too_many_arguments)]
 fn build_queue(
     root: &Path,
     config_path: &Path,
@@ -509,10 +536,18 @@ fn build_queue(
     models_dir: &Path,
     decisions: &[PolicyDecisionRecord],
     now: DateTime<Utc>,
-) -> Vec<ReviewQueueEntry> {
-    let outstanding = select_outstanding(decisions, |plan_id| ai_plan_is_reviewed(root, plan_id));
+    max_scan: usize,
+) -> (Vec<ReviewQueueEntry>, u64) {
+    // `list_policy_decisions` yields oldest-first; scan the NEWEST `max_scan`
+    // rows (matching `list_runs`' newest-first convention) so a long-lived
+    // ledger never ages genuinely-pending escalations out of the queue.
+    let (outstanding, excluded_non_plan) = select_outstanding(
+        decisions.iter().rev().take(max_scan),
+        |plan_id| ai_plan_is_reviewed(root, plan_id),
+        |plan_id| plan_file_path(root, plan_id).exists(),
+    );
     if outstanding.is_empty() {
-        return Vec::new();
+        return (Vec::new(), excluded_non_plan);
     }
 
     // One compile serves every model's blast radius. A compile failure leaves
@@ -555,25 +590,38 @@ fn build_queue(
             .then_with(|| a.plan_id.cmp(&b.plan_id))
             .then_with(|| a.model.cmp(&b.model))
     });
-    entries
+    (entries, excluded_non_plan)
 }
 
 /// The pending escalations to surface: the latest `require_review` decision
-/// per `(plan_id, model)` whose plan has not yet been signed off.
+/// per `(plan_id, model)` whose plan has not yet been signed off **and whose
+/// plan actually exists to be approved**.
 ///
 /// A re-evaluated plan appends a fresh ledger row each time, so the queue
 /// keeps only the newest row per `(plan_id, model)` — current state, not
 /// history — and drops any whose plan already carries a review marker
-/// (`is_reviewed`). Pure over the ledger + the marker predicate so the
-/// dedup/filter logic is testable without a state store.
-fn select_outstanding(
-    decisions: &[PolicyDecisionRecord],
+/// (`is_reviewed`).
+///
+/// Decision-only custody rows never map to a persisted plan: the MCP draft
+/// tools file refusals under `draft:*` / `draft-contract:*` / `draft-check:*`
+/// ids and the drift auto-apply path files evaluations under
+/// `autoapply:<run_id>`. Nothing can approve those (`rocky review` bails at
+/// `read_plan`), so surfacing them would pollute the queue with permanently
+/// unclearable entries. The `plan_exists` probe drops them from the *queue*
+/// while they remain in the *ledger* (the audit history); the count of
+/// dropped rows is returned so the queue can say so.
+///
+/// Pure over the ledger + the two predicates so the dedup/filter logic is
+/// testable without a state store. Accepts any iteration order — the dedup
+/// keeps the newest row per key regardless.
+pub(crate) fn select_outstanding<'a>(
+    decisions: impl IntoIterator<Item = &'a PolicyDecisionRecord>,
     is_reviewed: impl Fn(&str) -> bool,
-) -> Vec<&PolicyDecisionRecord> {
+    plan_exists: impl Fn(&str) -> bool,
+) -> (Vec<&'a PolicyDecisionRecord>, u64) {
     let mut latest: BTreeMap<(&str, &str), &PolicyDecisionRecord> = BTreeMap::new();
     for d in decisions
-        .iter()
-        .take(MAX_HISTORY_SCAN)
+        .into_iter()
         .filter(|d| d.effect == PolicyEffect::RequireReview)
     {
         latest
@@ -585,10 +633,65 @@ fn select_outstanding(
             })
             .or_insert(d);
     }
-    latest
+    let mut excluded_non_plan: u64 = 0;
+    let outstanding = latest
         .into_values()
         .filter(|d| !is_reviewed(&d.plan_id))
-        .collect()
+        .filter(|d| {
+            if plan_exists(&d.plan_id) {
+                true
+            } else {
+                excluded_non_plan += 1;
+                false
+            }
+        })
+        .collect();
+    (outstanding, excluded_non_plan)
+}
+
+/// Record the "this plan awaits review" escalation for an unconditionally
+/// review-gated plan (gc / backfill) at **plan creation**.
+///
+/// Those plans never pass through `evaluate_apply_policy` before their apply
+/// bails on the missing review marker, so without this row the decision-driven
+/// review queue (and the governor's MCP approve path) would never list them —
+/// even though `compute_review` was built to approve them. One plan-level row
+/// (a representative `model` summary, not one row per affected model) keeps
+/// the ledger lean.
+///
+/// Best-effort like every other ledger write: the review-marker gate at apply
+/// is the safety boundary, the ledger is the trail — a locked or unreadable
+/// state store must not fail plan creation.
+pub(crate) fn record_plan_review_escalation(
+    state_path: &Path,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    capability: PolicyCapability,
+    model: &str,
+    reason: &str,
+) {
+    let record = PolicyDecisionRecord {
+        timestamp: Utc::now(),
+        plan_id: plan_id.to_string(),
+        principal,
+        capability,
+        model: model.to_string(),
+        effect: PolicyEffect::RequireReview,
+        rule_id: None,
+        reason: reason.to_string(),
+        verify_after: Vec::new(),
+        auto_apply: None,
+    };
+    let written = StateStore::open(state_path).and_then(|s| s.record_policy_decision(&record));
+    if let Err(e) = written {
+        tracing::warn!(
+            target: "rocky::review",
+            plan_id,
+            error = %e,
+            "failed to record the plan's review escalation to the ledger (continuing) — \
+             the plan is still review-gated at apply, but the review queue will not list it"
+        );
+    }
 }
 
 /// Composite priority score: `(blast + 1) × classification_weight ×
@@ -618,12 +721,14 @@ fn classification_weight(capability: PolicyCapability) -> u32 {
 fn render_queue_text(out: &ReviewQueueOutput) {
     if out.pending.is_empty() {
         println!("review queue: no escalations awaiting review");
+        render_excluded_note(out.excluded_non_plan_rows);
         return;
     }
     println!(
         "review queue: {} escalation(s) awaiting review (ranked by {})",
         out.total, out.ranking
     );
+    render_excluded_note(out.excluded_non_plan_rows);
     for (i, e) in out.pending.iter().enumerate() {
         let blast = e
             .blast_radius
@@ -644,6 +749,17 @@ fn render_queue_text(out: &ReviewQueueOutput) {
         );
         println!("     {}", e.reason);
         println!("     approve: {}", e.approve_command);
+    }
+}
+
+/// One-line footnote for custody rows the queue excluded because no plan file
+/// backs them (nothing to approve). Silent when there are none.
+fn render_excluded_note(excluded: u64) {
+    if excluded > 0 {
+        println!(
+            "  ({excluded} decision-only custody row(s) excluded — no persisted plan to approve; \
+             they remain in `rocky audit`)"
+        );
     }
 }
 
@@ -842,14 +958,183 @@ mod tests {
             ),
         ];
 
-        let out = select_outstanding(&decisions, |plan_id| plan_id == "planReviewed");
+        let (out, excluded) =
+            select_outstanding(&decisions, |plan_id| plan_id == "planReviewed", |_| true);
 
         // Only planA/x survives: deny + allow excluded, planReviewed filtered.
         assert_eq!(out.len(), 1);
+        assert_eq!(excluded, 0);
         let d = out[0];
         assert_eq!(d.plan_id, "planA");
         assert_eq!(d.model, "x");
         // The newest of the two planA/x rows wins (the breaking one at secs=9).
         assert_eq!(d.capability, PolicyCapability::SchemaChangeBreaking);
+    }
+
+    /// FIX: decision-only custody rows (`draft:*`, `autoapply:*`, …) whose
+    /// plan_id resolves to no persisted plan must not render as approvable
+    /// queue items — `rocky review --approve` bails at `read_plan` for them,
+    /// so they would sit pending forever. They stay in the ledger; the queue
+    /// counts them out.
+    #[test]
+    fn select_outstanding_excludes_planless_custody_rows_and_counts_them() {
+        let decisions = vec![
+            qd(
+                1,
+                "draft:orders_daily",
+                "orders_daily",
+                PolicyEffect::RequireReview,
+                PolicyCapability::SchemaChangeBreaking,
+            ),
+            qd(
+                2,
+                "draft-contract:orders_daily",
+                "orders_daily",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+            qd(
+                3,
+                "autoapply:run-abc",
+                "raw_events",
+                PolicyEffect::RequireReview,
+                PolicyCapability::SchemaChangeAdditive,
+            ),
+            // A real planned escalation — its plan file exists.
+            qd(
+                4,
+                "planReal",
+                "dim_customer",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Apply,
+            ),
+        ];
+
+        let (out, excluded) =
+            select_outstanding(&decisions, |_| false, |plan_id| plan_id == "planReal");
+
+        assert_eq!(out.len(), 1, "only the plan-backed escalation surfaces");
+        assert_eq!(out[0].plan_id, "planReal");
+        assert_eq!(excluded, 3, "the three custody-only rows are counted out");
+    }
+
+    /// FIX: the scan cap must keep the NEWEST rows. `list_policy_decisions`
+    /// returns oldest-first, so a naive head-`take` would silently age the
+    /// newest genuinely-pending escalations out of a >cap ledger.
+    #[test]
+    fn queue_scan_cap_keeps_newest_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Every row references a real plan file so the existence filter is not
+        // what excludes anything here.
+        let plans_dir = root.join(".rocky").join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        std::fs::write(plans_dir.join("planX.json"), "{}").unwrap();
+
+        // Oldest-first ledger, one model per row (m1 oldest … m5 newest).
+        let decisions: Vec<PolicyDecisionRecord> = (1..=5)
+            .map(|i| {
+                qd(
+                    i,
+                    "planX",
+                    &format!("m{i}"),
+                    PolicyEffect::RequireReview,
+                    PolicyCapability::Apply,
+                )
+            })
+            .collect();
+
+        let now = Utc.with_ymd_and_hms(2026, 7, 7, 1, 0, 0).unwrap();
+        let (entries, excluded) = build_queue(
+            root,
+            &root.join("rocky.toml"),
+            &root.join("state.redb"),
+            &root.join("models"),
+            &decisions,
+            now,
+            2, // injected cap — production passes MAX_HISTORY_SCAN
+        );
+
+        assert_eq!(excluded, 0);
+        assert_eq!(entries.len(), 2, "only the capped scan window surfaces");
+        let models: Vec<&str> = entries.iter().map(|e| e.model.as_str()).collect();
+        assert!(
+            models.contains(&"m5"),
+            "the newest pending row must appear: {models:?}"
+        );
+        assert!(
+            models.contains(&"m4"),
+            "the second-newest pending row must appear: {models:?}"
+        );
+        assert!(
+            !models.contains(&"m1"),
+            "rows beyond the cap are the OLDEST, not the newest: {models:?}"
+        );
+    }
+
+    /// FIX: the review gate's paths anchor at the project root, not the
+    /// process cwd — a governor MCP approve runs from an unrelated cwd.
+    #[test]
+    fn review_gate_paths_resolve_against_root_not_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+
+        let (models_dir, state_path) = review_gate_paths(root, Some("models"));
+        assert_eq!(models_dir, root.join("models"));
+        assert!(
+            models_dir.is_dir(),
+            "root-joined models dir must be found regardless of cwd"
+        );
+        // The schema-cache state path follows the CLI/MCP default
+        // (`<models_dir>/.rocky-state.redb`), not the old hardcoded
+        // cwd-relative `.rocky/state.redb`.
+        assert_eq!(state_path, root.join("models").join(".rocky-state.redb"));
+
+        // An absolute recorded models_dir is used verbatim.
+        let (abs_dir, _) = review_gate_paths(
+            Path::new("/somewhere/else"),
+            Some(root.join("models").to_str().unwrap()),
+        );
+        assert_eq!(abs_dir, root.join("models"));
+
+        // Default when the plan recorded none.
+        let (default_dir, _) = review_gate_paths(root, None);
+        assert_eq!(default_dir, root.join("models"));
+    }
+
+    /// FIX: an approved plan's later apply-time re-evaluation rows (same
+    /// plan_id) must not resurrect it in the queue — the marker filter clears
+    /// every row of a reviewed plan, whatever model the row names.
+    #[test]
+    fn approved_plan_does_not_relist_after_apply_records_more_rows() {
+        let decisions = vec![
+            qd(
+                1,
+                "planB",
+                "a",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Backfill,
+            ),
+            // Post-approval apply evaluated policy again and recorded fresh
+            // rows under the same plan.
+            qd(
+                5,
+                "planB",
+                "a",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Backfill,
+            ),
+            qd(
+                6,
+                "planB",
+                "b",
+                PolicyEffect::RequireReview,
+                PolicyCapability::Backfill,
+            ),
+        ];
+        let (out, excluded) = select_outstanding(&decisions, |pid| pid == "planB", |_| true);
+        assert!(out.is_empty(), "a reviewed plan never re-lists: {out:?}");
+        assert_eq!(excluded, 0);
     }
 }

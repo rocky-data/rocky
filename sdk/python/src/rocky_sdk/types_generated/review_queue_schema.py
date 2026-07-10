@@ -191,6 +191,10 @@ class ReviewQueueOutput(BaseModel):
     """
 
     command: str
+    excluded_non_plan_rows: conint(ge=0)
+    """
+    Count of outstanding `require_review` ledger rows excluded from the queue because their `plan_id` resolves to no persisted plan file — decision-only custody rows (e.g. refused drafts, auto-apply evaluations) that nothing could approve. They stay in the audit ledger; they are just not approvable queue items.
+    """
     pending: list[ReviewQueueEntry]
     """
     The pending escalations, highest-priority first.

@@ -57,7 +57,7 @@
 //! object-store delete ([`ObjectStoreEvictor`]) is s3-only and is
 //! **code-reviewed here, driven on the sandbox** — creds-free it defers.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -74,6 +74,7 @@ use rocky_core::state::{
 
 use crate::commands::apply::{PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy};
 use crate::commands::replay::classify_model;
+use crate::commands::review::record_plan_review_escalation;
 use crate::output::{
     GcApplyOutput, GcCandidateOutput, GcCheckOutput, GcEvictedOutput, GcPlan, GcPlanEviction,
     GcPlanOutput, GcRebuildCostOutput, GcRefusedOutput, GcReportOutput, ReplayCheckModelOutput,
@@ -727,6 +728,22 @@ fn build_gc_plan(candidates: &[EvictionCandidate], min_age_days: i64) -> Option<
     })
 }
 
+/// The representative `model` field for the gc plan's single review-escalation
+/// ledger row — a plan-scope summary, since one reclamation plan spans many
+/// artifacts and models and one row per artifact would bloat the ledger.
+fn gc_plan_scope_summary(plan: &GcPlan) -> String {
+    let models: BTreeSet<&str> = plan
+        .evictions
+        .iter()
+        .map(|e| e.model_name.as_str())
+        .collect();
+    format!(
+        "gc: {} artifact(s) across {} model(s)",
+        plan.evictions.len(),
+        models.len()
+    )
+}
+
 /// Execute `rocky gc --derivable` in plan mode (no `--dry-run`): write a GC
 /// plan to the plan store. **Never deletes** — the plan is a scoped,
 /// review-gated proposal.
@@ -741,11 +758,28 @@ pub fn run_gc_plan(
     principal: PolicyPrincipal,
     json: bool,
 ) -> Result<()> {
-    let store = StateStore::open_read_only(state_path)
-        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    run_gc_plan_in(&cwd, state_path, config_path, min_age_days, principal, json)
+}
+
+/// Inner implementation — takes an explicit `root` for the plans directory so
+/// tests can pass a temp dir without touching the process-global cwd.
+pub(crate) fn run_gc_plan_in(
+    root: &Path,
+    state_path: &Path,
+    config_path: &Path,
+    min_age_days: i64,
+    principal: PolicyPrincipal,
+    json: bool,
+) -> Result<()> {
     let adapter = load_adapter_cost(config_path);
-    let candidates =
-        gather_eviction_candidates(&store, adapter.as_ref(), Utc::now(), min_age_days)?;
+    let candidates = {
+        let store = StateStore::open_read_only(state_path)
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+        gather_eviction_candidates(&store, adapter.as_ref(), Utc::now(), min_age_days)?
+        // The read handle drops here so the escalation write below can open
+        // its own handle on the same store.
+    };
 
     let Some(plan) = build_gc_plan(&candidates, min_age_days) else {
         if json {
@@ -767,9 +801,22 @@ pub fn run_gc_plan(
         return Ok(());
     };
 
-    let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    let plan_id = write_plan_with_principal(&cwd, PlanKind::Gc, &plan, principal)
+    let plan_id = write_plan_with_principal(root, PlanKind::Gc, &plan, principal)
         .context("failed to persist the gc plan")?;
+
+    // A gc plan never passes `evaluate_apply_policy` before its apply bails on
+    // the missing review marker, so record its escalation at creation — this
+    // one plan-level row is what puts it in the review queue (and in front of
+    // the governor's MCP approve path).
+    record_plan_review_escalation(
+        state_path,
+        &plan_id,
+        principal,
+        PolicyCapability::Gc,
+        &gc_plan_scope_summary(&plan),
+        "gc plan awaits review — deletion is unconditionally review-gated (even a human gc \
+         goes through review, never a direct delete)",
+    );
 
     let output = GcPlanOutput {
         version: VERSION.to_string(),
@@ -2167,6 +2214,72 @@ mod tests {
             .await
             .unwrap();
 
+        let store = StateStore::open(&state_path).unwrap();
+        assert_eq!(store.list_tombstones().unwrap().len(), 1);
+        assert_eq!(store.refcount_for_hash(HA).unwrap(), 0);
+    }
+
+    /// FIX: a gc plan must enter the decision-driven review queue at creation
+    /// (plan creation records its `require_review` escalation) and clear on
+    /// the same approve path the governor's MCP `review_queue` tool calls —
+    /// end to end: plan → queue lists it → approve → queue empties → apply
+    /// proceeds past the review gate.
+    #[tokio::test]
+    async fn gc_plan_enters_review_queue_and_clears_on_approve() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let state_path = root.join("state.redb");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+        } // drop the seeding handle before the plan path opens its own
+
+        // A missing config leaves the policy plane unconfigured — the queue
+        // and the gates run off the ledger + plan files alone.
+        let config = root.join("rocky.toml");
+        let models_dir = root.join("models");
+
+        // 1. Create the reclamation plan.
+        run_gc_plan_in(root, &state_path, &config, 7, PolicyPrincipal::Human, true).unwrap();
+        let plans_dir = root.join(".rocky").join("plans");
+        let plan_id = std::fs::read_dir(&plans_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                name.strip_suffix(".json").map(str::to_string)
+            })
+            .next()
+            .expect("a gc plan file must exist");
+
+        // 2. The review queue lists it: the creation-time escalation row is in
+        //    the ledger and the plan file passes the existence filter.
+        let queue =
+            crate::commands::review::compute_review_queue(root, &config, &state_path, &models_dir)
+                .unwrap();
+        assert_eq!(queue.total, 1, "pending: {:?}", queue.pending);
+        assert_eq!(queue.pending[0].plan_id, plan_id);
+        assert_eq!(queue.pending[0].capability, PolicyCapability::Gc);
+        assert_eq!(queue.excluded_non_plan_rows, 0);
+
+        // 3. Approve through the exact core the MCP review_queue tool calls.
+        let review = crate::commands::review::compute_review(root, &config, &plan_id, "HEAD", true)
+            .await
+            .unwrap();
+        assert!(review.marker_written);
+
+        // 4. The queue empties — the marker filter clears the escalation.
+        let queue_after =
+            crate::commands::review::compute_review_queue(root, &config, &state_path, &models_dir)
+                .unwrap();
+        assert_eq!(queue_after.total, 0, "pending: {:?}", queue_after.pending);
+
+        // 5. Apply proceeds past the review gate and evicts behind a tombstone.
+        run_gc_apply_in(root, &config, &plan_id, &state_path, true)
+            .await
+            .unwrap();
         let store = StateStore::open(&state_path).unwrap();
         assert_eq!(store.list_tombstones().unwrap().len(), 1);
         assert_eq!(store.refcount_for_hash(HA).unwrap(), 0);

@@ -47,6 +47,35 @@ class AuditSubjectKind3(StrEnum):
     plan = "plan"
 
 
+class AuditVerifyEntry(BaseModel):
+    """
+    One post-apply verification outcome inside [`AuditChainVerify`] — a decision-ledger custody row with a non-empty `verify_after` check list.
+
+    The ledger records the required check names, the aggregate verdict (`allow` = every named check passed, `deny` = a check failed or was absent and the apply halted), and a human-readable reason; per-check pass/fail detail beyond that lives only in the reason string, which is rendered verbatim rather than re-parsed.
+    """
+
+    checks: list[str]
+    """
+    The named post-apply checks the verification required.
+    """
+    passed: bool
+    """
+    Whether the verification passed (`allow` custody row) or failed (`deny`).
+    """
+    plan_id: str
+    """
+    The plan id the custody row was filed under (the applied plan, or the auto-apply path's `autoapply-verify:<run_id>`).
+    """
+    reason: str
+    """
+    The recorded outcome, verbatim from the custody row.
+    """
+    timestamp: str
+    """
+    RFC 3339 timestamp when the verification outcome was recorded.
+    """
+
+
 class PolicyCapability12(StrEnum):
     """
     Read model output / metadata. Always allowed.
@@ -252,7 +281,7 @@ class AuditChainVerify(BaseModel):
     """
     Verify-after link of the custody chain.
 
-    Post-apply verification outcomes are not persisted to the state store today, so this link is always [`SectionAvailability::Unavailable`] with a note — never a smoothed-over "verification passed".
+    Post-apply verification outcomes are persisted to the decision ledger as custody rows with a non-empty `verify_after` check list — the two-step `rocky apply` gate writes one per verified apply, and the drift auto-apply path writes them under its `autoapply-verify:<run_id>` plan id. This link renders those rows for the subject's plan. When none exist the link says so plainly ("not recorded") — never a smoothed-over "verification passed".
     """
 
     availability: SectionAvailability1 | SectionAvailability2 | SectionAvailability3
@@ -261,7 +290,15 @@ class AuditChainVerify(BaseModel):
 
     The digest is composed section-by-section from independent typed queries over the state store and the decision ledger. Each section fails closed: a query that returns nothing renders as [`SectionAvailability::NoData`], and a source that is not wired into the state store at all renders as [`SectionAvailability::Unavailable`] with a note — never as a smoothed-over "all clear". A brief that claims more than the ledger holds poisons the whole surface, so the marker is machine-readable, not prose.
     """
+    entries: list[AuditVerifyEntry]
+    """
+    The verification outcomes, newest first.
+    """
     note: str | None = None
+    total: conint(ge=0)
+    """
+    Count of verification custody rows found for the subject.
+    """
 
 
 class AuditDecisionEntry(BaseModel):
@@ -398,7 +435,7 @@ class AuditForOutput(BaseModel):
 
     A one-query drill-down assembled link by link from the data Rocky already records: who proposed the change and what the policy plane decided ([`Self::decisions`]), what the plan changed ([`Self::plan`]), which runs materialized it ([`Self::runs`]), what a post-apply verification found ([`Self::verify_after`]), and what sits downstream in its blast radius ([`Self::blast_radius`]).
 
-    Every link fails closed the same way the estate brief does: a link whose signal is genuinely not recorded renders [`SectionAvailability::Unavailable`] with a note, never a fabricated or assumed value. Notably, post-apply verification outcomes are not persisted anywhere today, so [`Self::verify_after`] is always `unavailable`; and the run ledger is not keyed to policy decisions, so a `run` selector cannot join back to a decision. The blast radius is recomputed from the current compiled graph (a live query, not a stored snapshot).
+    Every link fails closed the same way the estate brief does: a link whose signal is genuinely not recorded renders [`SectionAvailability::Unavailable`] with a note, never a fabricated or assumed value. Post-apply verification outcomes are persisted as decision-ledger custody rows (non-empty `verify_after`), so [`Self::verify_after`] renders them when they exist and says "not recorded" when none exist for the subject. The run ledger is not keyed to policy decisions, so a `run` selector cannot join back to a decision. The blast radius is recomputed from the current compiled graph (a live query, not a stored snapshot).
     """
 
     blast_radius: AuditChainBlastRadius
@@ -432,6 +469,6 @@ class AuditForOutput(BaseModel):
     """
     verify_after: AuditChainVerify
     """
-    What a post-apply verification found — not recorded today.
+    What a post-apply verification found — the verification custody rows recorded against the subject's plan.
     """
     version: str

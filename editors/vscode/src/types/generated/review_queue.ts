@@ -37,6 +37,10 @@ export type PolicyPrincipal = "human" | "agent";
 export interface ReviewQueueOutput {
   command: string;
   /**
+   * Count of outstanding `require_review` ledger rows excluded from the queue because their `plan_id` resolves to no persisted plan file — decision-only custody rows (e.g. refused drafts, auto-apply evaluations) that nothing could approve. They stay in the audit ledger; they are just not approvable queue items.
+   */
+  excluded_non_plan_rows: number;
+  /**
    * The pending escalations, highest-priority first.
    */
   pending: ReviewQueueEntry[];
