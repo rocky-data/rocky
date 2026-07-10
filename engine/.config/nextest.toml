@@ -1,0 +1,16 @@
+# nextest configuration.
+#
+# The `rocky-cli` `api::tests` each spin up a real HTTP server and open the
+# embedded redb state store. Under the full-suite global scheduler on a
+# loaded CI runner, several of them opening the store at once transiently
+# lose the file lock and the read path surfaces `503 engine_busy` — a real
+# behaviour, but one these tests assert against. Serialising the group
+# (never more than one at a time) removes the mutual contention without
+# changing any product code. Wall-clock impact is negligible: the ~30s
+# serial chain overlaps the rest of the suite.
+[test-groups]
+serial-api = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(rocky-cli) & test(api::tests)'
+test-group = 'serial-api'
