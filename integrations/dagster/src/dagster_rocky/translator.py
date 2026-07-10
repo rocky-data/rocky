@@ -292,14 +292,16 @@ class RockyDagsterTranslator:
     def get_dag_node_asset_key(self, node: DagNodeOutput) -> dg.AssetKey:
         """Returns the Dagster asset key for a unified DAG node.
 
-        Dispatches by node kind:
+        Dispatches by node kind. The engine emits at most one source, load,
+        quality, and snapshot node per pipeline, so the pipeline name alone
+        keeps these keys unique:
 
         - ``transformation`` → ``[catalog, schema, table]`` from target
         - ``seed`` → ``["seed", label]``
-        - ``source`` → ``[pipeline, "source", label]``
-        - ``load`` → ``[pipeline, label]``
-        - ``quality`` → ``["quality", pipeline, label]``
-        - ``snapshot`` → ``["snapshot", pipeline, label]``
+        - ``source`` → ``[pipeline, "source"]``
+        - ``load`` → ``[pipeline, "load"]``
+        - ``quality`` → ``["quality", pipeline]``
+        - ``snapshot`` → ``["snapshot", pipeline]``
 
         Override to customize key derivation for your pipeline layout.
         """
