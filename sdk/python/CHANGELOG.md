@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-10
+
+### Added
+
+- **Generated types for the new policy and self-healing surfaces.** `rocky policy test` (`PolicyTestOutput` / `PolicyTestResult`), `rocky policy freeze` (`PolicyFreezeOutput` / `PolicyFreezeEntry`), the `autonomy_budget` rule field on the policy config, and the auto-apply custody carried on the policy-decision / audit output for policy-gated additive-drift auto-apply. Additive — existing parses are unaffected.
+
+
 ## [0.4.0] — 2026-07-09
 
 ### Added
