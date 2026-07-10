@@ -182,6 +182,17 @@ from .gc_schema import (
     GcReportOutput,
 )
 
+# Gc plan (`rocky gc --derivable`) + apply (`rocky apply <gc-plan>`)
+from .gc_apply_schema import (
+    GcApplyOutput,
+    GcEvictedOutput,
+    GcRefusedOutput,
+)
+from .gc_plan_schema import (
+    GcPlanEviction,
+    GcPlanOutput,
+)
+
 # Brief command (the governor's estate digest)
 from .brief_schema import (
     BriefActiveFreeze,
@@ -454,6 +465,12 @@ __all__ = [
     "GcCheckOutput",
     "GcRebuildCostOutput",
     "GcReportOutput",
+    # gc plan + apply
+    "GcApplyOutput",
+    "GcEvictedOutput",
+    "GcRefusedOutput",
+    "GcPlanEviction",
+    "GcPlanOutput",
     # brief
     "BriefOutput",
     "BriefAgentActivitySection",

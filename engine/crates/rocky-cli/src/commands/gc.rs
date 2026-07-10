@@ -1,15 +1,27 @@
-//! `rocky gc --derivable --dry-run` — the read-only derivability inventory.
+//! `rocky gc --derivable` — derivability inventory, plan, and eviction.
 //!
 //! Answers one question over the content-addressed artifact ledger: *which
 //! stored bytes can Rocky prove it can rebuild, and are therefore a cache
 //! entry rather than an asset?* The recipe is the truth; a rebuildable table
 //! is derivable, and derivable bytes are reclaimable.
 //!
-//! This surface is **inventory-only**. It opens the state store read-only and
-//! never writes, deletes, or plans a deletion — there is no mutation path in
-//! this module at all. The report is the whole product: an aggregate ("X
-//! bytes / Y% of managed storage is derivable") plus a per-candidate
-//! justification that prints all five eligibility checks.
+//! Three surfaces, one eligibility path:
+//!
+//! - **`--dry-run`** ([`run_gc_derivable`]): the read-only inventory — an
+//!   aggregate ("X bytes / Y% of managed storage is derivable") plus a
+//!   per-candidate justification printing all five eligibility checks. No
+//!   mutation.
+//! - **plan** ([`run_gc_plan`], no `--dry-run`): writes a review-gated
+//!   [`crate::plan_store::PlanKind::Gc`] plan listing only the derivable
+//!   artifacts. Never deletes.
+//! - **apply** ([`run_gc_apply_in`], via `rocky apply <plan-id>`): after an
+//!   unconditional review gate, evicts each artifact that is *still* derivable
+//!   — a durable tombstone + ledger-row retirement committed atomically, then a
+//!   best-effort physical object-store delete.
+//!
+//! All three consume the single [`gather_eviction_candidates`] verdict, so the
+//! eligibility logic is never forked or loosened between report, plan, and the
+//! apply-time re-verification.
 //!
 //! # The join
 //!
@@ -26,28 +38,44 @@
 //! - the recorded [`rocky_core::state::ModelExecution`] — the recipe-identity
 //!   id and the rebuild-cost estimate.
 //!
-//! # Fail-closed
+//! # Fail-closed — a false *derivable* is data loss
 //!
-//! Each check fails closed: any doubt keeps the artifact non-derivable. In
-//! this phase there is no deletion, so a false *derivable* is only a dishonest
-//! report line — but the discipline is set here because the later evict path
-//! inherits these verdicts.
+//! Each check fails closed: any doubt keeps the artifact non-derivable. The
+//! plan approves a *set*, but the apply re-runs the exact same verdict against
+//! the live ledger and evicts only what is derivable *now* — a reference that
+//! appears between plan and apply refuses the eviction. Every eviction writes
+//! its tombstone (recipe triple + provenance pointer) atomically **before** the
+//! ledger row is retired, so an evicted cache entry is always restorable, and
+//! the physical byte-delete only ever happens after that commit.
+//!
+//! # Reachability
+//!
+//! Content-addressed writes are s3-only, so the creds-free playground holds no
+//! CAS artifacts. The plan → review → apply → tombstone → ledger-retire flow is
+//! driven creds-free over a ledger seeded through the production write APIs
+//! (see the `seed_demo_ledger` harness in the tests). The physical
+//! object-store delete ([`ObjectStoreEvictor`]) is s3-only and is
+//! **code-reviewed here, driven on the sandbox** — creds-free it defers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tracing::warn;
 
-use rocky_core::config::load_rocky_config;
+use rocky_core::config::{PolicyCapability, PolicyPrincipal, load_rocky_config};
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
-use rocky_core::state::{ArtifactRecord, ModelExecution, RunRecord, StateStore};
+use rocky_core::state::{ArtifactRecord, ModelExecution, RunRecord, StateStore, TombstoneRecord};
 
+use crate::commands::apply::{PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy};
 use crate::commands::replay::classify_model;
 use crate::output::{
-    GcCandidateOutput, GcCheckOutput, GcRebuildCostOutput, GcReportOutput, ReplayCheckModelOutput,
+    GcApplyOutput, GcCandidateOutput, GcCheckOutput, GcEvictedOutput, GcPlan, GcPlanEviction,
+    GcPlanOutput, GcRebuildCostOutput, GcRefusedOutput, GcReportOutput, ReplayCheckModelOutput,
 };
+use crate::plan_store::{PlanKind, read_plan, write_plan_with_principal};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -273,17 +301,38 @@ fn report_notes(min_age_days: i64) -> Vec<String> {
     ]
 }
 
-/// Assemble the full inventory from a state store. All store reads live here
-/// (the honest reachability seam); the report itself is a pure function of the
-/// ledger contents at `now`.
+/// A derivable-verdict candidate paired with the raw ledger row and the
+/// producing execution's recipe-identity triple that the *plan* and
+/// *tombstone* need but the public [`GcCandidateOutput`] does not carry
+/// (`file_path`, `commit_version`, `input_hash` / `env_hash` / `hash_scheme`).
 ///
-/// Read-only: opens no write transaction and touches no warehouse.
-fn gather_report(
+/// [`GcCandidateOutput`] is a projection of [`Self::output`]; the report, the
+/// plan, and the apply-time re-verification all consume the *same*
+/// [`gather_eviction_candidates`] verdict, so there is exactly one eligibility
+/// path — never a forked or loosened copy.
+struct EvictionCandidate {
+    artifact: ArtifactRecord,
+    output: GcCandidateOutput,
+    recipe_hash: Option<String>,
+    input_hash: Option<String>,
+    input_proof_class: Option<String>,
+    env_hash: Option<String>,
+    hash_scheme: Option<String>,
+}
+
+/// Assemble the derivability verdict for every distinct content hash in the
+/// ledger — the single source of truth the report, the plan, and the apply-time
+/// re-verification all share.
+///
+/// All store reads live here (the honest reachability seam); the verdicts are a
+/// pure function of the ledger contents at `now`. Read-only: opens no write
+/// transaction and touches no warehouse.
+fn gather_eviction_candidates(
     store: &StateStore,
     adapter: Option<&AdapterCost>,
     now: DateTime<Utc>,
     min_age_days: i64,
-) -> Result<GcReportOutput> {
+) -> Result<Vec<EvictionCandidate>> {
     let artifacts = store
         .list_all_artifacts()
         .context("failed to read the artifact ledger")?;
@@ -300,7 +349,7 @@ fn gather_report(
     }
 
     let mut run_cache: HashMap<String, Option<RunRecord>> = HashMap::new();
-    let mut candidates: Vec<GcCandidateOutput> = Vec::with_capacity(by_hash.len());
+    let mut out: Vec<EvictionCandidate> = Vec::with_capacity(by_hash.len());
 
     for (hash, mut rows) in by_hash {
         rows.sort_by(|a, b| {
@@ -309,7 +358,7 @@ fn gather_report(
                 .then_with(|| a.run_id.cmp(&b.run_id))
                 .then_with(|| a.model_name.cmp(&b.model_name))
         });
-        let representative = &rows[0];
+        let representative = rows.into_iter().next().expect("hash group is non-empty");
 
         // Refcount via the shipped Phase-6 primitive — the sanctioned "is any
         // other pointer live?" query, not a re-count of the group.
@@ -328,23 +377,65 @@ fn gather_report(
                 .find(|m| m.model_name == representative.model_name)
         });
 
-        candidates.push(build_candidate(
-            representative,
+        let output = build_candidate(
+            &representative,
             refcount,
             &class,
             exec,
             now,
             min_age_days,
             adapter,
-        ));
+        );
+        let (recipe_hash, input_hash, input_proof_class, env_hash, hash_scheme) = exec
+            .map(|e| {
+                (
+                    e.recipe_hash.clone(),
+                    e.input_hash.clone(),
+                    e.input_proof_class.clone(),
+                    e.env_hash.clone(),
+                    e.hash_scheme.clone(),
+                )
+            })
+            .unwrap_or((None, None, None, None, None));
+
+        out.push(EvictionCandidate {
+            artifact: representative,
+            output,
+            recipe_hash,
+            input_hash,
+            input_proof_class,
+            env_hash,
+            hash_scheme,
+        });
     }
 
     // Newest write first; stable tie-break on hash for deterministic output.
-    candidates.sort_by(|a, b| {
-        b.written_at
-            .cmp(&a.written_at)
-            .then_with(|| a.blake3_hash.cmp(&b.blake3_hash))
+    out.sort_by(|a, b| {
+        b.output
+            .written_at
+            .cmp(&a.output.written_at)
+            .then_with(|| a.output.blake3_hash.cmp(&b.output.blake3_hash))
     });
+
+    Ok(out)
+}
+
+/// Assemble the full inventory from a state store. A thin projection over
+/// [`gather_eviction_candidates`] — the report is the derivable verdicts plus
+/// the aggregate headline.
+///
+/// Read-only: opens no write transaction and touches no warehouse.
+fn gather_report(
+    store: &StateStore,
+    adapter: Option<&AdapterCost>,
+    now: DateTime<Utc>,
+    min_age_days: i64,
+) -> Result<GcReportOutput> {
+    let candidates: Vec<GcCandidateOutput> =
+        gather_eviction_candidates(store, adapter, now, min_age_days)?
+            .into_iter()
+            .map(|c| c.output)
+            .collect();
 
     let managed_bytes: u64 = candidates.iter().map(|c| c.size_bytes).sum();
     let derivable_bytes: u64 = candidates
@@ -489,6 +580,569 @@ pub fn run_gc_derivable(
         print_table(&report);
     }
     Ok(())
+}
+
+// ===========================================================================
+// Plan — `rocky gc --derivable` (no --dry-run)
+// ===========================================================================
+
+/// Operator caveats surfaced on a `gc` plan and its apply.
+fn gc_plan_notes() -> Vec<String> {
+    vec![
+        "This plan lists only artifacts proved derivable at plan time. `rocky apply` \
+         re-verifies each against the live ledger before evicting — a reference that \
+         appears between plan and apply refuses the eviction (fail-closed)."
+            .to_string(),
+        "Every eviction writes a durable tombstone (recipe triple + restore pointer) BEFORE \
+         the ledger row is retired, so an evicted cache entry is always restorable."
+            .to_string(),
+        "Deletion is symmetric-caution gated: review with `rocky review <plan-id> --approve`, \
+         then `rocky apply <plan-id>`. There is no direct-delete path."
+            .to_string(),
+    ]
+}
+
+/// Build a [`GcPlan`] from the derivable subset of the current inventory.
+///
+/// Returns `None` when nothing is derivable — the caller refuses to write an
+/// empty plan.
+fn build_gc_plan(candidates: &[EvictionCandidate], min_age_days: i64) -> Option<GcPlan> {
+    let evictions: Vec<GcPlanEviction> = candidates
+        .iter()
+        .filter(|c| c.output.derivable)
+        .map(|c| GcPlanEviction {
+            model_name: c.artifact.model_name.clone(),
+            run_id: c.artifact.run_id.clone(),
+            blake3_hash: c.artifact.blake3_hash.clone(),
+            file_path: c.artifact.file_path.clone(),
+            size_bytes: c.artifact.size_bytes,
+            commit_version: c.artifact.commit_version,
+            written_at: c.artifact.written_at.to_rfc3339(),
+            recipe_hash: c.recipe_hash.clone(),
+            input_hash: c.input_hash.clone(),
+            input_proof_class: c.input_proof_class.clone(),
+            env_hash: c.env_hash.clone(),
+            hash_scheme: c.hash_scheme.clone(),
+        })
+        .collect();
+
+    if evictions.is_empty() {
+        return None;
+    }
+    let total_bytes = evictions.iter().map(|e| e.size_bytes).sum();
+    Some(GcPlan {
+        version: VERSION.to_string(),
+        min_age_days,
+        total_bytes,
+        evictions,
+    })
+}
+
+/// Execute `rocky gc --derivable` in plan mode (no `--dry-run`): write a GC
+/// plan to the plan store. **Never deletes** — the plan is a scoped,
+/// review-gated proposal.
+///
+/// The `principal` is the CLI-resolved invoker (`ROCKY_PRINCIPAL` / default
+/// human). It rides on the plan so an agent-scoped `deny agent gc` rule fires
+/// on an agent-run GC; the review gate is unconditional regardless.
+pub fn run_gc_plan(
+    state_path: &Path,
+    config_path: &Path,
+    min_age_days: i64,
+    principal: PolicyPrincipal,
+    json: bool,
+) -> Result<()> {
+    let store = StateStore::open_read_only(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    let adapter = load_adapter_cost(config_path);
+    let candidates =
+        gather_eviction_candidates(&store, adapter.as_ref(), Utc::now(), min_age_days)?;
+
+    let Some(plan) = build_gc_plan(&candidates, min_age_days) else {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "version": VERSION,
+                    "command": "gc --derivable",
+                    "eviction_count": 0,
+                    "message": "nothing is provably derivable — no plan written"
+                })
+            );
+        } else {
+            println!(
+                "Nothing is provably derivable right now — no reclamation plan written. \
+                 Run `rocky gc --derivable --dry-run` to see why each artifact was held."
+            );
+        }
+        return Ok(());
+    };
+
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    let plan_id = write_plan_with_principal(&cwd, PlanKind::Gc, &plan, principal)
+        .context("failed to persist the gc plan")?;
+
+    let output = GcPlanOutput {
+        version: VERSION.to_string(),
+        command: "gc --derivable".to_string(),
+        plan_id: plan_id.clone(),
+        eviction_count: plan.evictions.len(),
+        total_bytes: plan.total_bytes,
+        review_required: true,
+        notes: gc_plan_notes(),
+        evictions: plan.evictions,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        print_plan_table(&output);
+    }
+    Ok(())
+}
+
+fn print_plan_table(output: &GcPlanOutput) {
+    println!(
+        "Rocky gc plan {} — {} derivable artifact(s), {} bytes proposed for reclamation",
+        output.plan_id.get(..12).unwrap_or(&output.plan_id),
+        output.eviction_count,
+        output.total_bytes
+    );
+    println!();
+    for e in &output.evictions {
+        println!(
+            "  {}  {} bytes  {}",
+            e.model_name,
+            e.size_bytes,
+            e.blake3_hash.get(..12).unwrap_or(&e.blake3_hash)
+        );
+        println!("      run: {}  path: {}", e.run_id, e.file_path);
+    }
+    println!();
+    println!("This plan is review-gated. To proceed:");
+    println!("  rocky review {} --approve", output.plan_id);
+    println!("  rocky apply  {}", output.plan_id);
+    println!();
+    println!("notes:");
+    for note in &output.notes {
+        println!("  - {note}");
+    }
+}
+
+// ===========================================================================
+// Apply — `rocky apply <gc-plan>`: tombstone + evict + physical reclaim
+// ===========================================================================
+
+/// Outcome of a best-effort physical reclamation of an evicted artifact's
+/// bytes through the object-store adapter.
+enum PhysicalReclaim {
+    /// The bytes were deleted from the object store.
+    Deleted,
+    /// The physical delete was intentionally not attempted (no reachable object
+    /// store / credentials on this adapter). The byte is a safe leaked orphan.
+    Deferred(String),
+    /// The physical delete was attempted and failed. The byte remains; the
+    /// tombstone stands, so it is a safe leaked orphan a later sweep reclaims.
+    Failed(String),
+}
+
+/// Physically reclaims an evicted artifact's bytes.
+///
+/// The abstraction is what makes the eviction path testable creds-free (tests
+/// inject a recording evictor) while the real object-store delete stays a
+/// single, reviewable implementation.
+#[async_trait]
+trait ArtifactEvictor: Send + Sync {
+    async fn evict_bytes(&self, file_path: &str) -> PhysicalReclaim;
+}
+
+/// Deletes evicted bytes through the `object_store` S3 adapter.
+///
+/// Content-addressed storage is s3-only (`AmazonS3Builder::from_env`), so this
+/// is the production reclamation path. The delete itself is exercised only
+/// against a live bucket — it is **code-reviewed here, driven on the sandbox**,
+/// never against the creds-free playground (which writes no CAS artifacts).
+struct ObjectStoreEvictor;
+
+#[async_trait]
+impl ArtifactEvictor for ObjectStoreEvictor {
+    async fn evict_bytes(&self, file_path: &str) -> PhysicalReclaim {
+        use object_store::ObjectStoreExt;
+
+        let store = match super::run_content_addressed::build_object_store(file_path) {
+            Ok(s) => s,
+            Err(e) => return PhysicalReclaim::Failed(format!("could not build object store: {e}")),
+        };
+        let Some(key) = s3_object_key(file_path) else {
+            return PhysicalReclaim::Failed(format!(
+                "could not derive an object key from '{file_path}'"
+            ));
+        };
+        match store.delete(&object_store::path::Path::from(key)).await {
+            Ok(()) => PhysicalReclaim::Deleted,
+            Err(e) => PhysicalReclaim::Failed(format!("object-store delete failed: {e}")),
+        }
+    }
+}
+
+/// Records every eviction as deferred without touching an object store — the
+/// creds-free / non-s3 posture. The ledger eviction (tombstone + row retire)
+/// still stands; the byte is a safe leaked orphan a later sweep can reclaim.
+struct DeferredEvictor {
+    reason: String,
+}
+
+#[async_trait]
+impl ArtifactEvictor for DeferredEvictor {
+    async fn evict_bytes(&self, _file_path: &str) -> PhysicalReclaim {
+        PhysicalReclaim::Deferred(self.reason.clone())
+    }
+}
+
+/// Parse the bucket-relative object key out of an `s3://bucket/key…` URL.
+fn s3_object_key(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    Some(parsed.path().trim_start_matches('/').to_string())
+}
+
+/// Select the physical evictor for this apply.
+///
+/// Content-addressed deletion is s3-only, so an `ObjectStoreEvictor` is chosen
+/// only when AWS credentials are present in the environment; otherwise the
+/// physical delete is deferred (no reachable object store). Gating on creds
+/// keeps the creds-free real-CLI drive fast and honest — it defers rather than
+/// stalling on an unreachable-bucket retry.
+fn choose_evictor() -> Box<dyn ArtifactEvictor> {
+    let has_creds = std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+        && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok();
+    if has_creds {
+        Box::new(ObjectStoreEvictor)
+    } else {
+        Box::new(DeferredEvictor {
+            reason: "no reachable object store — content-addressed deletion is s3-only and no \
+                     AWS credentials were found in the environment"
+                .to_string(),
+        })
+    }
+}
+
+/// Apply caveats surfaced on the eviction result.
+fn gc_apply_notes() -> Vec<String> {
+    vec![
+        "Refcounts see Rocky-ledger references only. Multi-ref safety on the UniForm path \
+         (branch / env / downstream-deferred-read pointers) is code-reviewed, not driven here."
+            .to_string(),
+        "Physical object-store deletion is s3-only and is driven only against a live bucket; \
+         on the creds-free path the byte-delete is deferred and the tombstone + retired ledger \
+         row are the eviction of record."
+            .to_string(),
+        "Restore (evict → rebuild → bit-exact) is a later phase and is not exercised here — an \
+         evicted artifact's tombstone captures the recipe to rebuild it, but the roundtrip is \
+         unverified."
+            .to_string(),
+    ]
+}
+
+/// The eviction engine: re-verify each planned eviction against the live
+/// ledger, then for each still-derivable artifact write its tombstone and
+/// retire its ledger row atomically before a best-effort physical delete.
+///
+/// Pure over its inputs (`store`, `evictor`, `now`) so tests drive it directly
+/// with a seeded store and a recording evictor. The review + policy gates live
+/// in [`run_gc_apply_in`] and run *before* this is called.
+///
+/// Fail-closed re-verification is the real safety net: the reviewed plan_id
+/// approves the *plan*, but the ledger can drift between plan and apply (a new
+/// reference raising a refcount, an artifact becoming non-derivable), so each
+/// entry is re-checked with the exact [`gather_eviction_candidates`] verdict
+/// the report and plan used. Only entries whose hash is derivable *now* are
+/// evicted; everything else is refused with its live failing checks.
+async fn execute_gc_apply(
+    store: &StateStore,
+    evictor: &dyn ArtifactEvictor,
+    plan_id: &str,
+    plan: &GcPlan,
+    now: DateTime<Utc>,
+) -> Result<GcApplyOutput> {
+    // Re-run the SAME eligibility path the plan used, against the live ledger.
+    let fresh = gather_eviction_candidates(store, None, now, plan.min_age_days)?;
+    let by_hash: HashMap<&str, &EvictionCandidate> = fresh
+        .iter()
+        .map(|c| (c.artifact.blake3_hash.as_str(), c))
+        .collect();
+
+    let mut evicted: Vec<GcEvictedOutput> = Vec::new();
+    let mut refused: Vec<GcRefusedOutput> = Vec::new();
+    let mut already_evicted: Vec<String> = Vec::new();
+
+    for ev in &plan.evictions {
+        // Idempotency + correct-row guard: resolve the EXACT row this entry
+        // names. Absent ⇒ a prior apply already evicted it (or it never
+        // existed) — a clean no-op, never a refusal and never a delete of a
+        // different row that merely shares the hash.
+        let row = store
+            .get_artifact(&ev.run_id, &ev.model_name, &ev.file_path)
+            .with_context(|| format!("failed to read artifact row for {}", ev.blake3_hash))?;
+        if row.is_none() {
+            already_evicted.push(ev.blake3_hash.clone());
+            continue;
+        }
+
+        // Fresh derivable verdict for this hash. Evict only if still derivable.
+        match by_hash.get(ev.blake3_hash.as_str()) {
+            Some(cand) if cand.output.derivable => {
+                let tombstone = TombstoneRecord {
+                    blake3_hash: ev.blake3_hash.clone(),
+                    run_id: ev.run_id.clone(),
+                    model_name: ev.model_name.clone(),
+                    file_path: ev.file_path.clone(),
+                    size_bytes: ev.size_bytes,
+                    commit_version: ev.commit_version,
+                    recipe_hash: ev.recipe_hash.clone(),
+                    input_hash: ev.input_hash.clone(),
+                    input_proof_class: ev.input_proof_class.clone(),
+                    env_hash: ev.env_hash.clone(),
+                    hash_scheme: ev.hash_scheme.clone(),
+                    evicted_at: now,
+                    plan_id: plan_id.to_string(),
+                    physical_reclaimed: false,
+                };
+
+                // Tombstone + ledger-row retirement, ONE atomic transaction.
+                // The restore safety net is committed before anything else can
+                // touch the bytes.
+                let removed = store
+                    .evict_artifact(&tombstone, &ev.run_id, &ev.model_name, &ev.file_path)
+                    .with_context(|| format!("failed to evict artifact {}", ev.blake3_hash))?;
+                if !removed {
+                    // Lost a race — the row vanished between the read and the
+                    // atomic evict. No tombstone was written; treat as no-op.
+                    already_evicted.push(ev.blake3_hash.clone());
+                    continue;
+                }
+
+                // Physical reclamation happens LAST and is best-effort — a
+                // failure here leaves a safe leaked orphan, never a dangling
+                // reference (the row is already gone, the tombstone stands).
+                let (physical_reclaimed, physical_status) =
+                    match evictor.evict_bytes(&ev.file_path).await {
+                        PhysicalReclaim::Deleted => (true, "deleted".to_string()),
+                        PhysicalReclaim::Deferred(m) => (false, format!("deferred: {m}")),
+                        PhysicalReclaim::Failed(m) => (false, format!("failed: {m}")),
+                    };
+                if physical_reclaimed {
+                    // Flip the custody flag now the bytes are actually gone so a
+                    // later sweep skips them. Best-effort — a failed update just
+                    // means a redundant future re-check.
+                    let mut updated = tombstone.clone();
+                    updated.physical_reclaimed = true;
+                    if let Err(e) = store.record_tombstone(&updated) {
+                        warn!(
+                            target: "rocky::gc",
+                            error = %e,
+                            hash = %ev.blake3_hash,
+                            "evicted bytes but failed to update the tombstone's reclaimed flag"
+                        );
+                    }
+                }
+
+                evicted.push(GcEvictedOutput {
+                    model_name: ev.model_name.clone(),
+                    run_id: ev.run_id.clone(),
+                    blake3_hash: ev.blake3_hash.clone(),
+                    size_bytes: ev.size_bytes,
+                    tombstone_recorded: true,
+                    physical_reclaimed,
+                    physical_status,
+                });
+            }
+            other => {
+                let (reason, failed_checks) = match other {
+                    Some(cand) => {
+                        let failed: Vec<GcCheckOutput> = cand
+                            .output
+                            .checks
+                            .iter()
+                            .filter(|c| !c.passed)
+                            .cloned()
+                            .collect();
+                        let names = failed
+                            .iter()
+                            .map(|c| c.check.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        (
+                            format!(
+                                "no longer derivable at apply time — failing checks: [{names}]"
+                            ),
+                            failed,
+                        )
+                    }
+                    None => (
+                        "no longer derivable at apply time — the artifact is absent from the \
+                         live derivability set"
+                            .to_string(),
+                        Vec::new(),
+                    ),
+                };
+                refused.push(GcRefusedOutput {
+                    model_name: ev.model_name.clone(),
+                    run_id: ev.run_id.clone(),
+                    blake3_hash: ev.blake3_hash.clone(),
+                    size_bytes: ev.size_bytes,
+                    reason,
+                    failed_checks,
+                });
+            }
+        }
+    }
+
+    let bytes_evicted = evicted.iter().map(|e| e.size_bytes).sum();
+    let bytes_refused = refused.iter().map(|r| r.size_bytes).sum();
+    Ok(GcApplyOutput {
+        version: VERSION.to_string(),
+        command: "apply".to_string(),
+        plan_id: plan_id.to_string(),
+        evicted_count: evicted.len(),
+        refused_count: refused.len(),
+        evicted,
+        refused,
+        already_evicted,
+        bytes_evicted,
+        bytes_refused,
+        notes: gc_apply_notes(),
+    })
+}
+
+/// Apply a `PlanKind::Gc` plan — evict its derivable artifacts, each behind a
+/// durable tombstone.
+///
+/// Deletion is symmetric-caution gated:
+///
+/// - It is **unconditionally** review-gated. A `rocky review <plan-id>
+///   --approve` marker must exist regardless of principal or of whether a
+///   `[policy]` block is configured — a human `gc` still goes through review,
+///   never a direct delete. This mirrors the backfill hard rule.
+/// - Policy may only make the gate *stricter*: an agent-scoped `deny gc {…}`
+///   rule hard-refuses even a reviewed plan.
+///
+/// Once cleared, [`execute_gc_apply`] re-verifies each planned eviction against
+/// the live ledger before deleting anything.
+pub(crate) async fn run_gc_apply_in(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    json: bool,
+) -> Result<()> {
+    let plan_record =
+        read_plan(root, plan_id).with_context(|| format!("failed to read gc plan '{plan_id}'"))?;
+
+    if plan_record.kind != PlanKind::Gc {
+        bail!(
+            "plan '{plan_id}' is a {} plan, not a gc plan. \
+             Use `rocky apply {plan_id}` and let the dispatcher route it.",
+            plan_record.kind,
+        );
+    }
+
+    let plan: GcPlan = serde_json::from_value(plan_record.payload.clone())
+        .context("failed to deserialize gc plan payload")?;
+
+    // HARD RULE: a gc plan is always review-gated, regardless of policy.
+    if !ai_plan_is_reviewed(root, plan_id) {
+        bail!(
+            "gc plan '{plan_id}' has not been reviewed and approved. \
+             Deletion is symmetric-caution gated — even a human gc goes through review, never a \
+             direct delete. Review the {} artifact(s) it evicts and approve with \
+             `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`.",
+            plan.evictions.len(),
+        );
+    }
+
+    // Policy can only tighten the gate: a `deny agent gc {…}` rule hard-refuses
+    // even a reviewed plan. Any `require_review` is already satisfied by the
+    // marker the always-on gate demands.
+    let touched: BTreeMap<String, PolicyCapability> = plan
+        .evictions
+        .iter()
+        .map(|e| (e.model_name.clone(), PolicyCapability::Gc))
+        .collect();
+    let models_dir = Path::new("models");
+    let gate = evaluate_apply_policy(
+        config_path,
+        plan_id,
+        plan_record.resolved_principal(),
+        &touched,
+        models_dir,
+        state_path,
+    );
+    if let PolicyGate::Deny {
+        model,
+        rule_id,
+        reason,
+    } = gate
+    {
+        let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+        bail!(
+            "policy DENIES gc plan '{plan_id}': model '{model}'{rule} — {reason}. \
+             A deny cannot be satisfied by review; re-scope the reclamation or have a \
+             human apply it."
+        );
+    }
+
+    let store = StateStore::open(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    let evictor = choose_evictor();
+    let output = execute_gc_apply(&store, evictor.as_ref(), plan_id, &plan, Utc::now()).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        print_apply_table(&output);
+    }
+    Ok(())
+}
+
+fn print_apply_table(output: &GcApplyOutput) {
+    println!(
+        "Rocky gc apply {} — {} evicted ({} bytes), {} refused, {} already evicted",
+        output.plan_id.get(..12).unwrap_or(&output.plan_id),
+        output.evicted_count,
+        output.bytes_evicted,
+        output.refused_count,
+        output.already_evicted.len(),
+    );
+    println!();
+    for e in &output.evicted {
+        println!(
+            "  EVICTED       {}  {} bytes  {}  (tombstone written; physical: {})",
+            e.model_name,
+            e.size_bytes,
+            e.blake3_hash.get(..12).unwrap_or(&e.blake3_hash),
+            e.physical_status,
+        );
+    }
+    for r in &output.refused {
+        println!(
+            "  REFUSED       {}  {} bytes  {}  — {}",
+            r.model_name,
+            r.size_bytes,
+            r.blake3_hash.get(..12).unwrap_or(&r.blake3_hash),
+            r.reason,
+        );
+    }
+    for h in &output.already_evicted {
+        println!(
+            "  already-gone  {}  (idempotent no-op)",
+            h.get(..12).unwrap_or(h)
+        );
+    }
+    println!();
+    println!("notes:");
+    for note in &output.notes {
+        println!("  - {note}");
+    }
 }
 
 #[cfg(test)]
@@ -839,6 +1493,311 @@ mod tests {
         assert_eq!(c.refcount, 2);
         let unref = c.checks.iter().find(|k| k.check == "unreferenced").unwrap();
         assert!(!unref.passed);
+    }
+
+    // -- plan + apply (tombstone / evict / refuse) ------------------------
+
+    /// A test evictor that records the paths it was asked to reclaim and
+    /// returns a fixed outcome — lets the eviction engine run creds-free while
+    /// asserting the physical-delete wiring and the tombstone-before-delete
+    /// invariant.
+    struct TestEvictor {
+        calls: std::sync::Mutex<Vec<String>>,
+        outcome: TestOutcome,
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestOutcome {
+        Deleted,
+        Deferred,
+        Failed,
+    }
+
+    impl TestEvictor {
+        fn new(outcome: TestOutcome) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                outcome,
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ArtifactEvictor for TestEvictor {
+        async fn evict_bytes(&self, file_path: &str) -> PhysicalReclaim {
+            self.calls.lock().unwrap().push(file_path.to_string());
+            match self.outcome {
+                TestOutcome::Deleted => PhysicalReclaim::Deleted,
+                TestOutcome::Deferred => PhysicalReclaim::Deferred("test-defer".to_string()),
+                TestOutcome::Failed => PhysicalReclaim::Failed("test-fail".to_string()),
+            }
+        }
+    }
+
+    fn plan_from_store(store: &StateStore, now: DateTime<Utc>, min_age_days: i64) -> GcPlan {
+        let cands = gather_eviction_candidates(store, None, now, min_age_days).unwrap();
+        build_gc_plan(&cands, min_age_days).expect("expected at least one derivable candidate")
+    }
+
+    #[test]
+    fn build_gc_plan_returns_none_on_empty_ledger() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let cands = gather_eviction_candidates(&store, None, Utc::now(), 7).unwrap();
+        assert!(
+            build_gc_plan(&cands, 7).is_none(),
+            "refuse to write an empty plan"
+        );
+    }
+
+    #[test]
+    fn build_gc_plan_excludes_non_derivable() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        // Derivable.
+        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+        record_run(&store, "r1", "orders");
+        // Nondeterministic — never derivable, must be excluded from the plan.
+        seed(
+            &store,
+            "r2",
+            "sample",
+            "SELECT random() AS id",
+            &[],
+            HB,
+            400,
+            old,
+        );
+        record_run(&store, "r2", "sample");
+
+        let plan = plan_from_store(&store, Utc::now(), 7);
+        assert_eq!(plan.evictions.len(), 1);
+        assert_eq!(plan.evictions[0].blake3_hash, HA);
+        assert_eq!(plan.total_bytes, 500);
+    }
+
+    /// The bucket-relative object key derivation is the only real logic on the
+    /// code-reviewed-not-driven physical-delete path, and restore-roundtrip is
+    /// held, so nothing else guards it: a regression here would delete the wrong
+    /// key. Lock the parse against the storage-prefix shape the writer emits.
+    #[test]
+    fn s3_object_key_strips_scheme_bucket_and_leading_slash() {
+        assert_eq!(
+            s3_object_key("s3://bucket/tgt/raw/orders/x.parquet").as_deref(),
+            Some("tgt/raw/orders/x.parquet")
+        );
+        assert_eq!(
+            s3_object_key("s3://b/x.parquet").as_deref(),
+            Some("x.parquet")
+        );
+        // A non-URL yields no key (the evictor then reports a failure rather
+        // than deleting anything).
+        assert!(s3_object_key("not a url").is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_evicts_still_derivable_artifact_with_tombstone() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+        record_run(&store, "r1", "orders");
+        let now = Utc::now();
+        let plan = plan_from_store(&store, now, 7);
+        assert_eq!(plan.evictions.len(), 1);
+
+        let evictor = TestEvictor::new(TestOutcome::Deferred);
+        let out = execute_gc_apply(&store, &evictor, "plan-x", &plan, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.evicted_count, 1);
+        assert_eq!(out.refused_count, 0);
+        assert!(out.already_evicted.is_empty());
+        assert_eq!(out.bytes_evicted, 500);
+        // Ledger row retired.
+        assert_eq!(store.refcount_for_hash(HA).unwrap(), 0);
+        // A durable tombstone with the full restore payload.
+        let tombs = store.list_tombstones().unwrap();
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(tombs[0].blake3_hash, HA);
+        assert_eq!(tombs[0].run_id, "r1");
+        assert_eq!(tombs[0].recipe_hash.as_deref(), Some("recipe-abc"));
+        assert!(!tombs[0].physical_reclaimed, "deferred physical delete");
+        assert!(out.evicted[0].physical_status.contains("deferred"));
+        // The physical evictor was invoked with the artifact's path (wiring).
+        assert_eq!(evictor.calls(), vec![format!("s3://b/{HA}.parquet")]);
+    }
+
+    /// 🔴 The core soundness surface: an artifact derivable at plan time whose
+    /// hash gains a SECOND live reference before apply must be REFUSED — never
+    /// evicted, never tombstoned — even though the plan approved it. This is the
+    /// non-vacuous multi-ref refusal.
+    #[tokio::test]
+    async fn apply_refuses_eviction_when_a_second_reference_appears() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HC, 500, old);
+        record_run(&store, "r1", "orders");
+        let now = Utc::now();
+        // Plan captures the artifact while it is derivable (refcount 1).
+        let plan = plan_from_store(&store, now, 7);
+        assert_eq!(plan.evictions.len(), 1);
+
+        // A second run materializes the SAME output hash → refcount 2 (shared).
+        seed(&store, "r2", "orders", "SELECT 1 AS id", &[], HC, 500, old);
+        assert_eq!(store.refcount_for_hash(HC).unwrap(), 2);
+
+        let evictor = TestEvictor::new(TestOutcome::Deferred);
+        let out = execute_gc_apply(&store, &evictor, "plan-x", &plan, now)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.evicted_count, 0,
+            "multi-ref bytes must never be evicted"
+        );
+        assert_eq!(out.refused_count, 1);
+        assert!(out.refused[0].reason.contains("no longer derivable"));
+        assert!(
+            out.refused[0]
+                .failed_checks
+                .iter()
+                .any(|c| c.check == "unreferenced"),
+            "the refusal cites the failed unreferenced check"
+        );
+        // No tombstone, both rows intact, the physical evictor never fired.
+        assert!(store.list_tombstones().unwrap().is_empty());
+        assert_eq!(store.refcount_for_hash(HC).unwrap(), 2);
+        assert!(evictor.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_is_idempotent_on_re_run() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+        record_run(&store, "r1", "orders");
+        let now = Utc::now();
+        let plan = plan_from_store(&store, now, 7);
+
+        let evictor = TestEvictor::new(TestOutcome::Deferred);
+        let first = execute_gc_apply(&store, &evictor, "plan-x", &plan, now)
+            .await
+            .unwrap();
+        assert_eq!(first.evicted_count, 1);
+
+        // Re-applying the same plan is a clean no-op — the row is already gone.
+        let second = execute_gc_apply(&store, &evictor, "plan-x", &plan, now)
+            .await
+            .unwrap();
+        assert_eq!(second.evicted_count, 0);
+        assert_eq!(second.refused_count, 0);
+        assert_eq!(second.already_evicted, vec![HA.to_string()]);
+        // No duplicate tombstone.
+        assert_eq!(store.list_tombstones().unwrap().len(), 1);
+    }
+
+    /// Tombstone-before-delete: even when the physical object-store delete
+    /// FAILS, the tombstone stands and the ledger row is retired. The eviction
+    /// of record is the atomic tombstone + row-retirement; the byte delete is
+    /// best-effort and its failure leaves only a safe leaked orphan.
+    #[tokio::test]
+    async fn apply_evicts_even_when_physical_delete_fails() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+        record_run(&store, "r1", "orders");
+        let now = Utc::now();
+        let plan = plan_from_store(&store, now, 7);
+
+        let evictor = TestEvictor::new(TestOutcome::Failed);
+        let out = execute_gc_apply(&store, &evictor, "plan-x", &plan, now)
+            .await
+            .unwrap();
+
+        assert_eq!(out.evicted_count, 1);
+        assert!(out.evicted[0].physical_status.contains("failed"));
+        assert!(!out.evicted[0].physical_reclaimed);
+        // The tombstone + retirement stand despite the failed byte delete.
+        assert_eq!(store.refcount_for_hash(HA).unwrap(), 0);
+        let tombs = store.list_tombstones().unwrap();
+        assert_eq!(tombs.len(), 1);
+        assert!(!tombs[0].physical_reclaimed);
+    }
+
+    #[tokio::test]
+    async fn apply_flips_reclaimed_flag_when_physical_delete_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+        record_run(&store, "r1", "orders");
+        let now = Utc::now();
+        let plan = plan_from_store(&store, now, 7);
+
+        let evictor = TestEvictor::new(TestOutcome::Deleted);
+        let out = execute_gc_apply(&store, &evictor, "plan-x", &plan, now)
+            .await
+            .unwrap();
+
+        assert!(out.evicted[0].physical_reclaimed);
+        assert_eq!(out.evicted[0].physical_status, "deleted");
+        assert!(store.list_tombstones().unwrap()[0].physical_reclaimed);
+    }
+
+    /// The apply entrypoint is unconditionally review-gated — no marker, no
+    /// eviction — regardless of principal or of a `[policy]` block. With a
+    /// marker present the eviction proceeds.
+    #[tokio::test]
+    async fn gc_apply_requires_a_review_marker() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let plan_id = {
+            let store = StateStore::open(&state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(dir.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        }; // drop the store so the apply path can open its own write handle
+
+        // A missing config leaves the policy plane unconfigured — the gate is
+        // the unconditional review marker, not policy.
+        let config = dir.path().join("nonexistent.toml");
+
+        // No marker → refuse.
+        let err = run_gc_apply_in(dir.path(), &config, &plan_id, &state_path, true)
+            .await
+            .expect_err("apply must refuse an unreviewed gc plan");
+        assert!(err.to_string().contains("not been reviewed"), "got: {err}");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            assert!(
+                store.list_tombstones().unwrap().is_empty(),
+                "nothing evicted while unreviewed"
+            );
+        }
+
+        // Write the review marker (as `rocky review --approve` would) → proceed.
+        let marker = crate::commands::apply::review_marker_path(dir.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+        run_gc_apply_in(dir.path(), &config, &plan_id, &state_path, true)
+            .await
+            .unwrap();
+
+        let store = StateStore::open(&state_path).unwrap();
+        assert_eq!(store.list_tombstones().unwrap().len(), 1);
+        assert_eq!(store.refcount_for_hash(HA).unwrap(), 0);
     }
 
     /// Seed a realistic multi-candidate ledger to the redb path in

@@ -1,0 +1,142 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "GcPlanEviction": {
+      "description": "One artifact scheduled for eviction inside a persisted `rocky gc` plan ([`GcPlan`]).\n\nCaptures the identity of a single derivable artifact — enough to (a) re-locate its exact ledger row at apply time, (b) re-verify eligibility against the live ledger, and (c) write a complete restore tombstone. The recipe-identity triple is captured at plan time from the producing execution.",
+      "properties": {
+        "blake3_hash": {
+          "description": "Content hash (hex) of the artifact bytes — the eviction unit and the identity a restore re-computes and compares against.",
+          "type": "string"
+        },
+        "commit_version": {
+          "description": "Delta commit version the artifact was attached to.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "env_hash": {
+          "description": "Environment hash of the producing execution; `null` when unrecorded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file_path": {
+          "description": "Object-store path of the artifact — the byte location a physical reclamation deletes and a restore re-materializes to.",
+          "type": "string"
+        },
+        "hash_scheme": {
+          "description": "Hash-scheme version of the producing execution; `null` when unrecorded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_hash": {
+          "description": "Input-closure hash of the producing execution; `null` when unrecorded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_proof_class": {
+          "description": "Input match-strength (`strong` / `heuristic`); `null` when unrecorded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_name": {
+          "description": "Model that produced the artifact.",
+          "type": "string"
+        },
+        "recipe_hash": {
+          "description": "Recipe-identity hash of the producing execution; `null` for a pre-identity build.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "description": "Run that produced it — half of the provenance key restore replays from.",
+          "type": "string"
+        },
+        "size_bytes": {
+          "description": "Physical size of the artifact in bytes.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "written_at": {
+          "description": "When the artifact was written (RFC 3339).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "blake3_hash",
+        "commit_version",
+        "file_path",
+        "model_name",
+        "run_id",
+        "size_bytes",
+        "written_at"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output of `rocky gc --derivable` (plan mode — no `--dry-run`).\n\nThe plan has been written to the plan store; this reports its id and the scoped proposal. Deletion is symmetric-caution gated: the operator must `rocky review <plan-id> --approve` and then `rocky apply <plan-id>` — the plan itself never deletes.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "eviction_count": {
+      "description": "Number of derivable artifacts proposed for eviction.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "evictions": {
+      "description": "The proposed evictions.",
+      "items": {
+        "$ref": "#/definitions/GcPlanEviction"
+      },
+      "type": "array"
+    },
+    "notes": {
+      "description": "Operator caveats (re-verification at apply, restore safety net, scope).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "plan_id": {
+      "description": "The persisted plan id — pass to `rocky review` then `rocky apply`.",
+      "type": "string"
+    },
+    "review_required": {
+      "description": "Always `true`: a `gc` plan is unconditionally review-gated before apply.",
+      "type": "boolean"
+    },
+    "total_bytes": {
+      "description": "Total bytes proposed for reclamation.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "eviction_count",
+    "evictions",
+    "notes",
+    "plan_id",
+    "review_required",
+    "total_bytes",
+    "version"
+  ],
+  "title": "GcPlanOutput",
+  "type": "object"
+}

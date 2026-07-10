@@ -7626,6 +7626,159 @@ pub struct GcRebuildCostOutput {
     pub estimated_usd: Option<f64>,
 }
 
+/// One artifact scheduled for eviction inside a persisted `rocky gc` plan
+/// ([`GcPlan`]).
+///
+/// Captures the identity of a single derivable artifact — enough to (a)
+/// re-locate its exact ledger row at apply time, (b) re-verify eligibility
+/// against the live ledger, and (c) write a complete restore tombstone. The
+/// recipe-identity triple is captured at plan time from the producing
+/// execution.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GcPlanEviction {
+    /// Model that produced the artifact.
+    pub model_name: String,
+    /// Run that produced it — half of the provenance key restore replays from.
+    pub run_id: String,
+    /// Content hash (hex) of the artifact bytes — the eviction unit and the
+    /// identity a restore re-computes and compares against.
+    pub blake3_hash: String,
+    /// Object-store path of the artifact — the byte location a physical
+    /// reclamation deletes and a restore re-materializes to.
+    pub file_path: String,
+    /// Physical size of the artifact in bytes.
+    pub size_bytes: u64,
+    /// Delta commit version the artifact was attached to.
+    pub commit_version: u64,
+    /// When the artifact was written (RFC 3339).
+    pub written_at: String,
+    /// Recipe-identity hash of the producing execution; `null` for a
+    /// pre-identity build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe_hash: Option<String>,
+    /// Input-closure hash of the producing execution; `null` when unrecorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_hash: Option<String>,
+    /// Input match-strength (`strong` / `heuristic`); `null` when unrecorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_proof_class: Option<String>,
+    /// Environment hash of the producing execution; `null` when unrecorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_hash: Option<String>,
+    /// Hash-scheme version of the producing execution; `null` when unrecorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash_scheme: Option<String>,
+}
+
+/// The persisted payload of a `rocky gc --derivable` plan
+/// ([`crate::plan_store::PlanKind::Gc`]).
+///
+/// Lists only the artifacts the derivability inventory proved are **derivable**
+/// — every one passed all five fail-closed checks at plan time. Apply
+/// re-verifies each against the live ledger before evicting, so this list is a
+/// scoped proposal, never a blind delete order.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GcPlan {
+    /// Engine version that authored the plan.
+    pub version: String,
+    /// The minimum written-age (days) threshold the inventory applied.
+    pub min_age_days: i64,
+    /// Sum of [`GcPlanEviction::size_bytes`] across [`Self::evictions`].
+    pub total_bytes: u64,
+    /// The derivable artifacts proposed for eviction.
+    pub evictions: Vec<GcPlanEviction>,
+}
+
+/// JSON output of `rocky gc --derivable` (plan mode — no `--dry-run`).
+///
+/// The plan has been written to the plan store; this reports its id and the
+/// scoped proposal. Deletion is symmetric-caution gated: the operator must
+/// `rocky review <plan-id> --approve` and then `rocky apply <plan-id>` — the
+/// plan itself never deletes.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GcPlanOutput {
+    pub version: String,
+    pub command: String,
+    /// The persisted plan id — pass to `rocky review` then `rocky apply`.
+    pub plan_id: String,
+    /// Number of derivable artifacts proposed for eviction.
+    pub eviction_count: usize,
+    /// Total bytes proposed for reclamation.
+    pub total_bytes: u64,
+    /// Always `true`: a `gc` plan is unconditionally review-gated before apply.
+    pub review_required: bool,
+    /// Operator caveats (re-verification at apply, restore safety net, scope).
+    pub notes: Vec<String>,
+    /// The proposed evictions.
+    pub evictions: Vec<GcPlanEviction>,
+}
+
+/// One artifact successfully evicted by `rocky apply <gc-plan>` — a tombstone
+/// was recorded and the ledger row retired.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GcEvictedOutput {
+    pub model_name: String,
+    pub run_id: String,
+    pub blake3_hash: String,
+    pub size_bytes: u64,
+    /// Always `true` on this list — the durable restore tombstone was written
+    /// atomically with the ledger-row retirement before anything else happened.
+    pub tombstone_recorded: bool,
+    /// `true` when the bytes were physically deleted through the object-store
+    /// adapter; `false` when the physical delete was deferred or failed (a safe
+    /// leaked orphan — the tombstone stands and restore still works).
+    pub physical_reclaimed: bool,
+    /// Human-readable physical-reclamation outcome (`deleted`, `deferred: …`,
+    /// or `failed: …`).
+    pub physical_status: String,
+}
+
+/// One artifact `rocky apply <gc-plan>` **refused** to evict because it was no
+/// longer derivable at apply time (the fail-closed re-verification caught
+/// ledger drift since plan time — e.g. a new reference appeared).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GcRefusedOutput {
+    pub model_name: String,
+    pub run_id: String,
+    pub blake3_hash: String,
+    pub size_bytes: u64,
+    /// Why the eviction was refused (the failing check summary).
+    pub reason: String,
+    /// The eligibility checks as re-evaluated at apply time, so the refusal is
+    /// auditable rather than asserted.
+    pub failed_checks: Vec<GcCheckOutput>,
+}
+
+/// JSON output of `rocky apply <gc-plan>`.
+///
+/// Reports the eviction outcome per planned artifact. Deletion is the highest
+/// -stakes operation, so the output is exhaustive: what was evicted (with its
+/// tombstone), what was refused (with the live failing checks), and what was
+/// an idempotent no-op (already evicted by a prior apply).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GcApplyOutput {
+    pub version: String,
+    pub command: String,
+    pub plan_id: String,
+    /// Artifacts evicted — tombstone written, ledger row retired.
+    pub evicted: Vec<GcEvictedOutput>,
+    /// Artifacts refused because they were no longer derivable at apply time.
+    pub refused: Vec<GcRefusedOutput>,
+    /// Content hashes of plan entries that were already absent from the ledger
+    /// (a prior apply evicted them) — idempotent no-ops, not failures.
+    pub already_evicted: Vec<String>,
+    /// Total bytes evicted.
+    pub bytes_evicted: u64,
+    /// Total bytes refused.
+    pub bytes_refused: u64,
+    /// Count of evicted artifacts.
+    pub evicted_count: usize,
+    /// Count of refused artifacts.
+    pub refused_count: usize,
+    /// Operator caveats (physical-reclamation reachability, restore held).
+    pub notes: Vec<String>,
+}
+
 /// JSON output for `rocky trace <run_id|latest>`.
 ///
 /// Sibling to [`ReplayOutput`] but with offset-relative timings so

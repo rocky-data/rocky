@@ -7379,6 +7379,86 @@
         ],
         "type": "object"
       },
+      "GcApplyOutput": {
+        "description": "JSON output of `rocky apply <gc-plan>`.\n\nReports the eviction outcome per planned artifact. Deletion is the highest -stakes operation, so the output is exhaustive: what was evicted (with its tombstone), what was refused (with the live failing checks), and what was an idempotent no-op (already evicted by a prior apply).",
+        "properties": {
+          "already_evicted": {
+            "description": "Content hashes of plan entries that were already absent from the ledger (a prior apply evicted them) — idempotent no-ops, not failures.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "bytes_evicted": {
+            "description": "Total bytes evicted.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "bytes_refused": {
+            "description": "Total bytes refused.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "command": {
+            "type": "string"
+          },
+          "evicted": {
+            "description": "Artifacts evicted — tombstone written, ledger row retired.",
+            "items": {
+              "$ref": "#/components/schemas/GcEvictedOutput"
+            },
+            "type": "array"
+          },
+          "evicted_count": {
+            "description": "Count of evicted artifacts.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "notes": {
+            "description": "Operator caveats (physical-reclamation reachability, restore held).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "plan_id": {
+            "type": "string"
+          },
+          "refused": {
+            "description": "Artifacts refused because they were no longer derivable at apply time.",
+            "items": {
+              "$ref": "#/components/schemas/GcRefusedOutput"
+            },
+            "type": "array"
+          },
+          "refused_count": {
+            "description": "Count of refused artifacts.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "already_evicted",
+          "bytes_evicted",
+          "bytes_refused",
+          "command",
+          "evicted",
+          "evicted_count",
+          "notes",
+          "plan_id",
+          "refused",
+          "refused_count",
+          "version"
+        ],
+        "type": "object"
+      },
       "GcCandidateOutput": {
         "description": "One reclamation candidate inside a [`GcReportOutput`] — a single content-addressed artifact (identified by its content hash) with its five printed eligibility checks.",
         "properties": {
@@ -7480,6 +7560,185 @@
         ],
         "type": "object"
       },
+      "GcEvictedOutput": {
+        "description": "One artifact successfully evicted by `rocky apply <gc-plan>` — a tombstone was recorded and the ledger row retired.",
+        "properties": {
+          "blake3_hash": {
+            "type": "string"
+          },
+          "model_name": {
+            "type": "string"
+          },
+          "physical_reclaimed": {
+            "description": "`true` when the bytes were physically deleted through the object-store adapter; `false` when the physical delete was deferred or failed (a safe leaked orphan — the tombstone stands and restore still works).",
+            "type": "boolean"
+          },
+          "physical_status": {
+            "description": "Human-readable physical-reclamation outcome (`deleted`, `deferred: …`, or `failed: …`).",
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "tombstone_recorded": {
+            "description": "Always `true` on this list — the durable restore tombstone was written atomically with the ledger-row retirement before anything else happened.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "blake3_hash",
+          "model_name",
+          "physical_reclaimed",
+          "physical_status",
+          "run_id",
+          "size_bytes",
+          "tombstone_recorded"
+        ],
+        "type": "object"
+      },
+      "GcPlanEviction": {
+        "description": "One artifact scheduled for eviction inside a persisted `rocky gc` plan ([`GcPlan`]).\n\nCaptures the identity of a single derivable artifact — enough to (a) re-locate its exact ledger row at apply time, (b) re-verify eligibility against the live ledger, and (c) write a complete restore tombstone. The recipe-identity triple is captured at plan time from the producing execution.",
+        "properties": {
+          "blake3_hash": {
+            "description": "Content hash (hex) of the artifact bytes — the eviction unit and the identity a restore re-computes and compares against.",
+            "type": "string"
+          },
+          "commit_version": {
+            "description": "Delta commit version the artifact was attached to.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "env_hash": {
+            "description": "Environment hash of the producing execution; `null` when unrecorded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file_path": {
+            "description": "Object-store path of the artifact — the byte location a physical reclamation deletes and a restore re-materializes to.",
+            "type": "string"
+          },
+          "hash_scheme": {
+            "description": "Hash-scheme version of the producing execution; `null` when unrecorded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "input_hash": {
+            "description": "Input-closure hash of the producing execution; `null` when unrecorded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "input_proof_class": {
+            "description": "Input match-strength (`strong` / `heuristic`); `null` when unrecorded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_name": {
+            "description": "Model that produced the artifact.",
+            "type": "string"
+          },
+          "recipe_hash": {
+            "description": "Recipe-identity hash of the producing execution; `null` for a pre-identity build.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_id": {
+            "description": "Run that produced it — half of the provenance key restore replays from.",
+            "type": "string"
+          },
+          "size_bytes": {
+            "description": "Physical size of the artifact in bytes.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "written_at": {
+            "description": "When the artifact was written (RFC 3339).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "blake3_hash",
+          "commit_version",
+          "file_path",
+          "model_name",
+          "run_id",
+          "size_bytes",
+          "written_at"
+        ],
+        "type": "object"
+      },
+      "GcPlanOutput": {
+        "description": "JSON output of `rocky gc --derivable` (plan mode — no `--dry-run`).\n\nThe plan has been written to the plan store; this reports its id and the scoped proposal. Deletion is symmetric-caution gated: the operator must `rocky review <plan-id> --approve` and then `rocky apply <plan-id>` — the plan itself never deletes.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "eviction_count": {
+            "description": "Number of derivable artifacts proposed for eviction.",
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "evictions": {
+            "description": "The proposed evictions.",
+            "items": {
+              "$ref": "#/components/schemas/GcPlanEviction"
+            },
+            "type": "array"
+          },
+          "notes": {
+            "description": "Operator caveats (re-verification at apply, restore safety net, scope).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "plan_id": {
+            "description": "The persisted plan id — pass to `rocky review` then `rocky apply`.",
+            "type": "string"
+          },
+          "review_required": {
+            "description": "Always `true`: a `gc` plan is unconditionally review-gated before apply.",
+            "type": "boolean"
+          },
+          "total_bytes": {
+            "description": "Total bytes proposed for reclamation.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "eviction_count",
+          "evictions",
+          "notes",
+          "plan_id",
+          "review_required",
+          "total_bytes",
+          "version"
+        ],
+        "type": "object"
+      },
       "GcRebuildCostOutput": {
         "description": "Estimated rebuild cost for a [`GcCandidateOutput`].\n\nDerived from the *recorded* build's metrics via the same cost model `rocky cost` uses — a replay re-runs the recipe, so its original execution's duration and scanned bytes are the honest predictor. Always an estimate ([`Self::estimated`] is always `true`), never a measured rebuild.",
         "properties": {
@@ -7514,6 +7773,45 @@
         "required": [
           "estimated",
           "source_duration_ms"
+        ],
+        "type": "object"
+      },
+      "GcRefusedOutput": {
+        "description": "One artifact `rocky apply <gc-plan>` **refused** to evict because it was no longer derivable at apply time (the fail-closed re-verification caught ledger drift since plan time — e.g. a new reference appeared).",
+        "properties": {
+          "blake3_hash": {
+            "type": "string"
+          },
+          "failed_checks": {
+            "description": "The eligibility checks as re-evaluated at apply time, so the refusal is auditable rather than asserted.",
+            "items": {
+              "$ref": "#/components/schemas/GcCheckOutput"
+            },
+            "type": "array"
+          },
+          "model_name": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why the eviction was refused (the failing check summary).",
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "blake3_hash",
+          "failed_checks",
+          "model_name",
+          "reason",
+          "run_id",
+          "size_bytes"
         ],
         "type": "object"
       },

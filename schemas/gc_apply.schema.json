@@ -1,0 +1,187 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "GcCheckOutput": {
+      "description": "One printed eligibility check inside a [`GcCandidateOutput`].",
+      "properties": {
+        "check": {
+          "description": "Stable check id: `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.",
+          "type": "string"
+        },
+        "detail": {
+          "description": "Why the check reached that verdict — the auditable justification.",
+          "type": "string"
+        },
+        "passed": {
+          "description": "Whether the check passed. A candidate is derivable only when all five are `true`.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "check",
+        "detail",
+        "passed"
+      ],
+      "type": "object"
+    },
+    "GcEvictedOutput": {
+      "description": "One artifact successfully evicted by `rocky apply <gc-plan>` — a tombstone was recorded and the ledger row retired.",
+      "properties": {
+        "blake3_hash": {
+          "type": "string"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "physical_reclaimed": {
+          "description": "`true` when the bytes were physically deleted through the object-store adapter; `false` when the physical delete was deferred or failed (a safe leaked orphan — the tombstone stands and restore still works).",
+          "type": "boolean"
+        },
+        "physical_status": {
+          "description": "Human-readable physical-reclamation outcome (`deleted`, `deferred: …`, or `failed: …`).",
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tombstone_recorded": {
+          "description": "Always `true` on this list — the durable restore tombstone was written atomically with the ledger-row retirement before anything else happened.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "blake3_hash",
+        "model_name",
+        "physical_reclaimed",
+        "physical_status",
+        "run_id",
+        "size_bytes",
+        "tombstone_recorded"
+      ],
+      "type": "object"
+    },
+    "GcRefusedOutput": {
+      "description": "One artifact `rocky apply <gc-plan>` **refused** to evict because it was no longer derivable at apply time (the fail-closed re-verification caught ledger drift since plan time — e.g. a new reference appeared).",
+      "properties": {
+        "blake3_hash": {
+          "type": "string"
+        },
+        "failed_checks": {
+          "description": "The eligibility checks as re-evaluated at apply time, so the refusal is auditable rather than asserted.",
+          "items": {
+            "$ref": "#/definitions/GcCheckOutput"
+          },
+          "type": "array"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why the eviction was refused (the failing check summary).",
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "blake3_hash",
+        "failed_checks",
+        "model_name",
+        "reason",
+        "run_id",
+        "size_bytes"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output of `rocky apply <gc-plan>`.\n\nReports the eviction outcome per planned artifact. Deletion is the highest -stakes operation, so the output is exhaustive: what was evicted (with its tombstone), what was refused (with the live failing checks), and what was an idempotent no-op (already evicted by a prior apply).",
+  "properties": {
+    "already_evicted": {
+      "description": "Content hashes of plan entries that were already absent from the ledger (a prior apply evicted them) — idempotent no-ops, not failures.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "bytes_evicted": {
+      "description": "Total bytes evicted.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "bytes_refused": {
+      "description": "Total bytes refused.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "command": {
+      "type": "string"
+    },
+    "evicted": {
+      "description": "Artifacts evicted — tombstone written, ledger row retired.",
+      "items": {
+        "$ref": "#/definitions/GcEvictedOutput"
+      },
+      "type": "array"
+    },
+    "evicted_count": {
+      "description": "Count of evicted artifacts.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "notes": {
+      "description": "Operator caveats (physical-reclamation reachability, restore held).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "plan_id": {
+      "type": "string"
+    },
+    "refused": {
+      "description": "Artifacts refused because they were no longer derivable at apply time.",
+      "items": {
+        "$ref": "#/definitions/GcRefusedOutput"
+      },
+      "type": "array"
+    },
+    "refused_count": {
+      "description": "Count of refused artifacts.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "already_evicted",
+    "bytes_evicted",
+    "bytes_refused",
+    "command",
+    "evicted",
+    "evicted_count",
+    "notes",
+    "plan_id",
+    "refused",
+    "refused_count",
+    "version"
+  ],
+  "title": "GcApplyOutput",
+  "type": "object"
+}
