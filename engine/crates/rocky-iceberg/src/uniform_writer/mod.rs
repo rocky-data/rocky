@@ -110,7 +110,12 @@ pub enum RemovalProof {
     /// Affirmatively proven removed: the target's own `add` is present in a
     /// clean, checkpoint-free, contiguous commit history and the
     /// highest-versioned commit referencing it is a `remove`. Safe to reclaim.
-    ProvenRemoved,
+    ///
+    /// Carries the Delta `head_version` (the highest `_delta_log` JSON commit)
+    /// the proof validated against, so the caller can (a) re-verify the head has
+    /// not advanced just before it mutates state — the TOCTOU narrowing — and
+    /// (b) version-scope the tombstone it writes.
+    ProvenRemoved { head_version: u64 },
     /// Not proven removed — HOLD (never reclaim). Carries a stable reason.
     Held(RemovalHoldReason),
 }
@@ -130,10 +135,15 @@ pub enum RemovalHoldReason {
     VersionGap,
     /// The `_delta_log` has two commits at the same version.
     DuplicateVersion,
-    /// A commit body did not parse, a line was not a JSON object, an `add`/
-    /// `remove` lacked a string `path`, or a commit carried an unrecognized
-    /// action key.
+    /// A commit body did not parse, a line was not a single-key JSON object, an
+    /// `add`/`remove` lacked a string `path` (or its action was not an object),
+    /// or a commit carried an unrecognized action key.
     MalformedCommit,
+    /// An `add`/`remove` path could not be resolved to a canonical `(bucket,
+    /// key)` identity in this table (a foreign scheme, a cross-bucket absolute
+    /// URI, or a dot-segment escaping the table root) — so relative-vs-absolute
+    /// aliases of the target could not be compared safely.
+    UncanonicalizablePath,
     /// A `protocol` action declared a feature that changes file liveness
     /// semantics (e.g. deletion vectors) or an unrecognized writer feature.
     UnsupportedProtocol,
@@ -159,6 +169,7 @@ impl RemovalHoldReason {
             RemovalHoldReason::VersionGap => "version_gap",
             RemovalHoldReason::DuplicateVersion => "duplicate_version",
             RemovalHoldReason::MalformedCommit => "malformed_commit",
+            RemovalHoldReason::UncanonicalizablePath => "uncanonicalizable_path",
             RemovalHoldReason::UnsupportedProtocol => "unsupported_protocol",
             RemovalHoldReason::NoCommits => "no_commits",
             RemovalHoldReason::NeverAddedHere => "never_added_here",
@@ -738,13 +749,24 @@ impl UniformWriter {
     /// gate a reclamation path (tombstone / future VACUUM) must pass; unlike
     /// [`Self::add_path_liveness`] it can never fall through to a
     /// reclaim-authorizing verdict.
+    ///
+    /// `table_bucket` is this table's object-store bucket, used to canonicalize
+    /// absolute `s3://…` add/remove paths and reject cross-bucket references.
     pub async fn proven_removed(
         &self,
+        table_bucket: &str,
         add_file_path: &str,
         expected_add_version: u64,
     ) -> RemovalProof {
         let prefix = self.config.prefix.trim_end_matches('/').to_string();
-        discover::proven_removed(&*self.store, &prefix, add_file_path, expected_add_version).await
+        discover::proven_removed(
+            &*self.store,
+            table_bucket,
+            &prefix,
+            add_file_path,
+            expected_add_version,
+        )
+        .await
     }
 
     /// Shared write pipeline used by both unpartitioned and partitioned

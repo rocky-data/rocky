@@ -740,6 +740,7 @@ const KNOWN_ACTION_KEYS: &[&str] = &[
 /// [`RemovalHoldReason::MalformedCommit`] — never a proof.
 pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
     store: &S,
+    table_bucket: &str,
     prefix: &str,
     add_file_path: &str,
     expected_add_version: u64,
@@ -749,6 +750,14 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
 
     let held = |r: R| RemovalProof::Held(r);
     let log_prefix = Path::from(format!("{prefix}/_delta_log"));
+
+    // The target's canonical identity — a relative path under the table prefix.
+    // Every commit path is canonicalized the same way and compared to this, so
+    // a relative `H.parquet` and an absolute `s3://bucket/<prefix>/H.parquet`
+    // reference the SAME file (finding 1).
+    let Some(target_canonical) = canonical_key(add_file_path, table_bucket, prefix) else {
+        return held(R::UncanonicalizablePath);
+    };
 
     // 1. List the log, separating JSON commits from checkpoint markers.
     let mut versions: Vec<(u64, Path)> = Vec::new();
@@ -793,6 +802,8 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
         }
         return held(R::VersionGap);
     }
+    // Contiguous from 0 ⇒ the head is the last version.
+    let head_version = versions.last().map(|(v, _)| *v).expect("non-empty");
 
     // 3. Scan ascending; validate every commit; track references to the target.
     let mut own_add_at_expected = false;
@@ -819,33 +830,46 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
             let Some(obj) = value.as_object() else {
                 return held(R::MalformedCommit);
             };
-            for (key, action) in obj {
-                if !KNOWN_ACTION_KEYS.contains(&key.as_str()) {
-                    return held(R::MalformedCommit);
+            // Exactly ONE recognized action per non-blank line. A `{}` or a
+            // multi-key line is malformed — otherwise an empty `{}` commit
+            // would pass validation and leave a stale earlier `remove` as the
+            // highest reference (finding 2).
+            if obj.len() != 1 {
+                return held(R::MalformedCommit);
+            }
+            let (key, action) = obj.iter().next().expect("len == 1");
+            if !KNOWN_ACTION_KEYS.contains(&key.as_str()) {
+                return held(R::MalformedCommit);
+            }
+            // Every recognized action must be a JSON object.
+            if !action.is_object() {
+                return held(R::MalformedCommit);
+            }
+            match key.as_str() {
+                "protocol" => {
+                    if !protocol_is_liveness_neutral(action) {
+                        return held(R::UnsupportedProtocol);
+                    }
                 }
-                match key.as_str() {
-                    "protocol" => {
-                        if !protocol_is_liveness_neutral(action) {
-                            return held(R::UnsupportedProtocol);
+                "add" | "remove" => {
+                    let Some(p) = action.get("path").and_then(|v| v.as_str()) else {
+                        return held(R::MalformedCommit);
+                    };
+                    let Some(canon) = canonical_key(p, table_bucket, prefix) else {
+                        return held(R::UncanonicalizablePath);
+                    };
+                    if canon == target_canonical {
+                        let is_remove = key == "remove";
+                        if !is_remove && *version == expected_add_version {
+                            own_add_at_expected = true;
+                        }
+                        match highest_ref {
+                            Some((hv, _)) if hv > *version => {}
+                            _ => highest_ref = Some((*version, is_remove)),
                         }
                     }
-                    "add" | "remove" => {
-                        let Some(p) = action.get("path").and_then(|v| v.as_str()) else {
-                            return held(R::MalformedCommit);
-                        };
-                        if p == add_file_path {
-                            let is_remove = key == "remove";
-                            if !is_remove && *version == expected_add_version {
-                                own_add_at_expected = true;
-                            }
-                            match highest_ref {
-                                Some((hv, _)) if hv > *version => {}
-                                _ => highest_ref = Some((*version, is_remove)),
-                            }
-                        }
-                    }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
@@ -856,22 +880,84 @@ pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
         return held(R::NeverAddedHere);
     }
     match highest_ref {
-        Some((_, true)) => RemovalProof::ProvenRemoved,
+        Some((_, true)) => RemovalProof::ProvenRemoved { head_version },
         _ => held(R::StillLive),
     }
 }
 
-/// A `protocol` action is liveness-neutral when it declares no reader/writer
-/// feature outside [`LIVENESS_NEUTRAL_WRITER_FEATURES`] — in particular no
-/// `deletionVectors`. Absent feature lists are neutral (a plain protocol row).
+/// Resolve a Delta `add`/`remove` path to a canonical, table-prefix-relative
+/// key within `table_bucket`, or `None` when it cannot be safely compared
+/// (foreign scheme, cross-bucket absolute URI, or a `..` escaping the root).
+///
+/// Delta permits a path to be either **relative** to the table root
+/// (`H.parquet`, `region=eu/H.parquet`) or an **absolute URI**
+/// (`s3://bucket/<prefix>/H.parquet`), and either form may be percent-encoded.
+/// Comparing them as raw strings misses an absolute-URI re-add of a file a
+/// prior relative `remove` retired (finding 1). This normalizes both forms:
+/// percent-decode, strip a recognized `s3`/`s3a`/`s3n` scheme (verifying the
+/// bucket), prefix-join a relative path, and resolve `.`/`..` segments.
+fn canonical_key(raw: &str, table_bucket: &str, key_prefix: &str) -> Option<String> {
+    let decoded = percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .ok()?
+        .into_owned();
+
+    let key_part = if let Some(idx) = decoded.find("://") {
+        let scheme = &decoded[..idx];
+        if !matches!(scheme, "s3" | "s3a" | "s3n") {
+            return None; // a foreign scheme cannot be compared
+        }
+        let rest = &decoded[idx + 3..];
+        let (bucket, key) = rest.split_once('/')?;
+        if bucket != table_bucket {
+            return None; // cross-bucket reference
+        }
+        key.to_string()
+    } else {
+        format!("{}/{}", key_prefix.trim_end_matches('/'), decoded)
+    };
+
+    // Resolve `.`/`..` and drop empty segments. A `..` that would escape above
+    // the (bucket) root is anomalous → `None`.
+    let mut out: Vec<&str> = Vec::new();
+    for seg in key_part.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop()?;
+            }
+            s => out.push(s),
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out.join("/"))
+}
+
+/// A `protocol` action is liveness-neutral when it is a JSON object whose
+/// reader/writer feature lists — **when present** — are arrays of strings all
+/// drawn from [`LIVENESS_NEUTRAL_WRITER_FEATURES`].
+///
+/// Returns `false` (→ hold) for a non-object protocol, a feature field that is
+/// present but not an array of strings (e.g. `"writerFeatures": "deletionVectors"`
+/// or `"protocol": null`), or any unrecognized feature — so a deletion-vector
+/// table can never slip through a malformed shape (finding 2).
 fn protocol_is_liveness_neutral(protocol: &serde_json::Value) -> bool {
+    let Some(obj) = protocol.as_object() else {
+        return false;
+    };
     for field in ["readerFeatures", "writerFeatures"] {
-        if let Some(feats) = protocol.get(field).and_then(|v| v.as_array()) {
-            for f in feats {
-                match f.as_str() {
-                    Some(name) if LIVENESS_NEUTRAL_WRITER_FEATURES.contains(&name) => {}
-                    _ => return false,
-                }
+        let Some(value) = obj.get(field) else {
+            continue; // absent is neutral
+        };
+        let Some(feats) = value.as_array() else {
+            return false; // present but not an array → hold
+        };
+        for f in feats {
+            match f.as_str() {
+                Some(name) if LIVENESS_NEUTRAL_WRITER_FEATURES.contains(&name) => {}
+                _ => return false, // non-string element or unknown feature → hold
             }
         }
     }
@@ -903,6 +989,77 @@ pub(super) async fn next_commit_version<S: ObjectStore + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_key_normalizes_relative_absolute_and_encoded_paths() {
+        let bucket = "b";
+        let prefix = "tgt/raw/orders";
+        let target = canonical_key("H.parquet", bucket, prefix);
+        assert_eq!(target.as_deref(), Some("tgt/raw/orders/H.parquet"));
+
+        // An absolute s3:// URI for the same file canonicalizes identically.
+        assert_eq!(
+            canonical_key("s3://b/tgt/raw/orders/H.parquet", bucket, prefix),
+            target
+        );
+        // s3a / s3n schemes are accepted too.
+        assert_eq!(
+            canonical_key("s3a://b/tgt/raw/orders/H.parquet", bucket, prefix),
+            target
+        );
+        // Percent-encoded path decodes to the same identity.
+        assert_eq!(
+            canonical_key("region%3Deu/H.parquet", bucket, prefix).as_deref(),
+            Some("tgt/raw/orders/region=eu/H.parquet")
+        );
+        // Dot-segments resolve.
+        assert_eq!(
+            canonical_key("a/./b/../H.parquet", bucket, prefix).as_deref(),
+            Some("tgt/raw/orders/a/H.parquet")
+        );
+
+        // Cross-bucket, a foreign scheme, and an escaping `..` are all rejected.
+        assert_eq!(
+            canonical_key("s3://other/tgt/raw/orders/H.parquet", bucket, prefix),
+            None
+        );
+        assert_eq!(
+            canonical_key("gs://b/tgt/raw/orders/H.parquet", bucket, prefix),
+            None
+        );
+        assert_eq!(
+            canonical_key("../../../../../etc/passwd", bucket, prefix),
+            None
+        );
+    }
+
+    #[test]
+    fn protocol_liveness_neutral_rejects_malformed_and_deletion_vectors() {
+        use serde_json::json;
+        // Neutral: absent features, or an array of known-neutral features.
+        assert!(protocol_is_liveness_neutral(&json!({})));
+        assert!(protocol_is_liveness_neutral(
+            &json!({"writerFeatures": ["appendOnly", "columnMapping"]})
+        ));
+        // Deletion vectors → hold.
+        assert!(!protocol_is_liveness_neutral(
+            &json!({"writerFeatures": ["deletionVectors"]})
+        ));
+        // A feature field that is a bare string (not an array) → hold.
+        assert!(!protocol_is_liveness_neutral(
+            &json!({"writerFeatures": "deletionVectors"})
+        ));
+        // A non-object protocol → hold.
+        assert!(!protocol_is_liveness_neutral(&serde_json::Value::Null));
+        // A non-string array element → hold.
+        assert!(!protocol_is_liveness_neutral(
+            &json!({"readerFeatures": [1, 2]})
+        ));
+        // An unknown feature → hold.
+        assert!(!protocol_is_liveness_neutral(
+            &json!({"writerFeatures": ["someFutureFeature"]})
+        ));
+    }
 
     const EXP04_BOOTSTRAP: &[u8] = include_bytes!("../../tests/fixtures/exp04_bootstrap.json");
     const EXP09_ROWTRACKING_BOOTSTRAP: &[u8] =

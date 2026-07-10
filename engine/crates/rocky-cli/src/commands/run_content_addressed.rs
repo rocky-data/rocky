@@ -176,6 +176,11 @@ pub(crate) async fn removal_proof_given_store(
         Ok(pair) => pair,
         Err(reason) => return RemovalProof::Held(reason),
     };
+    // The table's bucket, so the proof can canonicalize absolute `s3://…`
+    // add/remove paths and reject cross-bucket references.
+    let Ok((bucket, _)) = parse_s3_url(storage_prefix) else {
+        return RemovalProof::Held(RemovalHoldReason::PrefixMismatch);
+    };
     // catalog/schema/table are unused by the log read (it only consults
     // `config.prefix` + the store), so placeholders are fine here.
     let writer = UniformWriter::new(
@@ -190,7 +195,7 @@ pub(crate) async fn removal_proof_given_store(
         Arc::new(NoOpSqlClient),
     );
     writer
-        .proven_removed(&table_relative, expected_add_version)
+        .proven_removed(&bucket, &table_relative, expected_add_version)
         .await
 }
 

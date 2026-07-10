@@ -3641,6 +3641,20 @@ pub struct TombstoneRecord {
     /// been re-materialized in the meantime).
     #[serde(default)]
     pub physical_reclaimed: bool,
+    /// The Delta `_delta_log` head version this eviction's removal proof
+    /// validated against — the eviction is **version-scoped** to this snapshot.
+    ///
+    /// `rocky gc` re-verifies the head has not advanced immediately before
+    /// retiring the ledger row (the TOCTOU narrowing), but a residual window
+    /// remains between that re-check and the redb commit in which an external
+    /// Delta writer could re-add the exact path. A restore/reuse consumer must
+    /// therefore treat this tombstone as **void (superseded)** if the table's
+    /// log later re-adds the path at a version greater than this — the file is
+    /// live again and the tombstone is stale (fail-closed on the consumer
+    /// side). `None` for pre-field tombstones and any non-content-addressed
+    /// eviction path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_delta_version: Option<u64>,
 }
 
 /// The result of [`StateStore::evict_artifact`] — an eviction attempt keyed by
@@ -7318,6 +7332,7 @@ mod tests {
             evicted_at: chrono::Utc::now(),
             plan_id: "plan-1".to_string(),
             physical_reclaimed: false,
+            observed_delta_version: None,
         }
     }
 

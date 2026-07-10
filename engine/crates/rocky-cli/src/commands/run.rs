@@ -15067,6 +15067,7 @@ merge_keys = ["id"]
             evicted_at: chrono::Utc::now(),
             plan_id: "plan-test".to_string(),
             physical_reclaimed: false,
+            observed_delta_version: None,
         };
         let outcome = store
             .evict_artifact(&tombstone, "run-1", "fct", &file_path)
