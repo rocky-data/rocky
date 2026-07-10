@@ -421,6 +421,23 @@ effect = "require_review"
             .contains(&plan_id)
     );
 
+    // Approving a plan that is NOT in the pending queue is refused up front —
+    // the approve action only clears genuinely-pending escalations.
+    let bogus = serde_json::json!({ "approve_plan_id": "0".repeat(64), "confirm": true })
+        .as_object()
+        .unwrap()
+        .clone();
+    let bogus_res = client
+        .call_tool(CallToolRequestParams::new("review_queue").with_arguments(bogus))
+        .await
+        .expect("review_queue bogus approve returns a result");
+    assert_eq!(bogus_res.is_error, Some(true));
+    assert_eq!(
+        bogus_res.structured_content.expect("error envelope")["code"],
+        serde_json::json!("invalid_argument"),
+        "approving a non-pending plan is rejected even with confirm=true"
+    );
+
     // estate_brief surfaces the escalation + agent activity, cited.
     let brief = client
         .call_tool(CallToolRequestParams::new("estate_brief"))

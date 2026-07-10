@@ -850,7 +850,7 @@ pub struct ReviewApprovalOutcome {
     pub message: String,
     /// How this approval is attributed and its limits — an honest note that the
     /// marker records the operator's git identity, not a cryptographically bound
-    /// principal. A signed human confirmation is a later step (F3-v2); today the
+    /// principal. A signed human confirmation is a later step; today the
     /// `confirm` argument stands in for that explicit human intent.
     pub attribution: String,
 }
