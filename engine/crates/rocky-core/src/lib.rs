@@ -1,6 +1,7 @@
 pub mod access;
 pub mod adapter_capability;
 pub mod arrow_loader;
+pub mod auto_apply;
 pub mod breaking_change;
 pub mod bridge;
 pub mod catalog;

@@ -298,6 +298,11 @@ struct TableTask {
     /// strategy so per-table overrides apply ahead of pipeline-level
     /// defaults.
     effective_override: ResolvedTableOverride,
+    /// Policy-governed additive-drift auto-apply gate for this table.
+    /// `Some` only when `[resilience] auto_apply_additive_drift` is set and a
+    /// `[policy]` block is configured; `None` otherwise, in which case the
+    /// drift path runs unconditionally exactly as before (default-off).
+    auto_apply_gate: Option<super::drift_governance::DriftGovernor>,
 }
 
 /// CLI selection state for `time_interval` partition execution.
@@ -2147,6 +2152,14 @@ pub async fn run(
                     prefetched_source_cols: None,
                     prefetched_target_cols: None,
                     effective_override,
+                    // Default-off: `None` unless the opt-in + a `[policy]`
+                    // block are both configured. Scoped by the logical table
+                    // name so a `[policy]` rule can target `models = [...]`.
+                    auto_apply_gate: super::drift_governance::DriftGovernor::build(
+                        &rocky_cfg,
+                        &run_id,
+                        &table.name,
+                    ),
                 });
             }
             if skipped_source_missing > 0 {
@@ -4081,6 +4094,16 @@ pub async fn run(
     )
     .await;
 
+    // Post-apply `verify_after` gate for any additive drift this run
+    // auto-applied. Writes an allow/deny verification custody row per healed
+    // table and yields `Err` when a required check failed or did not run —
+    // propagated at the happy-path exit so an otherwise-green run halts. There
+    // is no rollback substrate on a plain warehouse target, so a failed
+    // verification is halt-only: the migration stands until a human reverts it.
+    // A no-op when nothing was auto-applied (default-off runs never hit it).
+    let verify_after_result =
+        super::drift_governance::finalize_drift_verify_after(state_store.as_ref(), &run_id);
+
     // Fire the `on_budget_breach` hook for each recorded breach so
     // shell hooks / webhooks configured via `[hook.on_budget_breach]`
     // see the breach alongside the bus event.
@@ -4211,6 +4234,10 @@ pub async fn run(
     // drained, so subscribers see the breach event before the CLI
     // exits non-zero.
     budget_result?;
+
+    // Halt an otherwise-green run when a post-apply `verify_after` gate on an
+    // auto-applied additive migration failed (custody already recorded above).
+    verify_after_result?;
 
         Ok(())
     }
@@ -7813,6 +7840,35 @@ async fn process_table(
 
     if target_exists {
         let drift_result = drift::detect_drift(&target_table, &source_cols, &target_cols, dialect);
+
+        // Governed additive-drift auto-apply (default-off). When the opt-in +
+        // a `[policy]` grant are configured (`task.auto_apply_gate` is `Some`),
+        // any drift mutation the branches below would apply is first routed
+        // through the policy plane: only a provably additive, policy-allowed
+        // change proceeds; anything else is refused here and surfaced as a
+        // require-review failure for this table — the target is left untouched.
+        // Absent the gate this is skipped entirely and behaviour is identical.
+        if let Some(gate) = &task.auto_apply_gate {
+            let would_mutate = drift_result.action != DriftAction::Ignore
+                || !drift_result.added_columns.is_empty();
+            if would_mutate {
+                match gate
+                    .govern(&drift_result, &target_table.full_name(), state)
+                    .await
+                {
+                    super::drift_governance::GovernDecision::Apply => {}
+                    super::drift_governance::GovernDecision::Refuse(reason) => {
+                        anyhow::bail!(
+                            "additive-drift auto-apply refused for {}: {reason}. The target was \
+                             NOT modified — grant `schema_change.additive` for this scope to \
+                             auto-apply it, or apply the migration under review.",
+                            target_table.full_name()
+                        );
+                    }
+                }
+            }
+        }
+
         if drift_result.action == DriftAction::DropAndRecreate {
             info!(
                 table = target_table.full_name(),

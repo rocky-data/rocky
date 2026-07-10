@@ -531,6 +531,8 @@ pub fn evaluate_apply_policy(
                 // A plain evaluation row carries no verify_after; the
                 // post-apply verification writes its own custody row.
                 verify_after: Vec::new(),
+                // Ordinary apply/promote evaluation — no auto-apply custody.
+                auto_apply: None,
             };
             if let Err(e) = store.record_policy_decision(&record) {
                 warn!(
@@ -839,6 +841,7 @@ fn run_verify_after(
         rule_id: None,
         reason: reason.clone(),
         verify_after: required.to_vec(),
+        auto_apply: None,
     };
     if let Err(e) = store.record_policy_decision(&record) {
         warn!(

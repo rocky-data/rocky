@@ -14070,6 +14070,11 @@
         "additionalProperties": false,
         "description": "`[resilience]` — the run loop's classified-retry policy.\n\nThis is a **distinct layer** from the per-adapter `[adapter.*.retry]` (which retries individual statements inside a connector) and from the run-level `[retry]` budget ([`RunRetryConfig`], which caps connector retries). `[resilience]` governs whether the run loop re-runs a whole *model* whose materialization failed, classifying the failure via [`crate::failure_class::FailureClass`] and retrying only a *proven* transient one.\n\n# Not default-OFF, but conservative\n\nUnlike the skip / reuse gates, this layer is **on by default** — a model that fails transiently today *will* be retried once this ships. The lever that keeps that safe is [`Self::transient_max_retries`] (default `2`): a small, bounded budget with capped exponential backoff. Set `transient_max_retries = 0` (or `enabled = false`) to restore the prior single-attempt behaviour, e.g. in CI where a fast-fail is preferred.\n\nPermanent and Unknown failures are **never** retried regardless of these settings — that is a property of the classifier, not of this config.",
         "properties": {
+          "auto_apply_additive_drift": {
+            "default": false,
+            "description": "Opt in to policy-governed auto-apply of **additive** source drift. Default `false` — a run detecting a new nullable upstream column evolves the target exactly as it does today (unconditionally), with no policy gate. When `true`, any drift mutation must first clear the policy plane: only a *provably additive* change with an `allow` verdict for the `schema_change.additive` capability is auto-applied; anything else (a drop, retype, narrowing, or a scope without the grant) is refused and left for review rather than mutated. Has no effect unless a `[policy]` block grants the capability, so both the opt-in **and** a policy rule are required to change behaviour.",
+            "type": "boolean"
+          },
           "backoff_multiplier": {
             "default": 2.0,
             "description": "Multiplier applied to the backoff after each retry.",
@@ -14735,6 +14740,7 @@
               }
             ],
             "default": {
+              "auto_apply_additive_drift": false,
               "backoff_multiplier": 2.0,
               "circuit_breaker_threshold": 3,
               "contain_failures": false,
