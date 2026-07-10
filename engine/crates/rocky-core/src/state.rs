@@ -175,6 +175,24 @@ const POLICY_DECISIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("pol
 /// in-memory only) is what lets a killed-and-restarted sidecar report honest
 /// status for jobs it launched instead of a blank slate.
 const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
+/// Eviction custody ledger for `rocky gc` — one row per artifact retired
+/// from the [`OUTPUT_ARTIFACTS`] ledger.
+///
+/// Key format: `"{evicted_at_rfc3339}|{blake3_hash}"` (chronological under
+/// redb's lexicographic order, so a forward scan replays evictions
+/// oldest-first). Value: serialized [`TombstoneRecord`]. A row is the durable
+/// record that these bytes *were* a cache entry Rocky proved it could rebuild,
+/// written **before** the artifact's ledger row is retired (in the same
+/// transaction — see [`StateStore::evict_artifact`]). It captures the
+/// recipe-identity triple and the provenance pointer (`run_id` / `model_name`)
+/// so a later `rocky restore` can replay the recipe and verify the rebuilt
+/// blake3 matches [`TombstoneRecord::blake3_hash`].
+///
+/// Mirrors [`POLICY_DECISIONS`] and [`OUTPUT_ARTIFACTS`]: replicates across
+/// backends by default (intentionally NOT in [`LOCAL_ONLY_TABLE_NAMES`]) so the
+/// eviction trail is global ground truth, not machine-local scratch. Remote
+/// keys are schema-version-qualified by `state_sync`.
+const TOMBSTONES: TableDefinition<&str, &[u8]> = TableDefinition::new("tombstones");
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -301,7 +319,16 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   `test_v17_policy_decision_forward_deserializes_auto_apply_none`. The bump
 ///   tracks the record-shape addition so `[state] on_schema_mismatch` engages
 ///   as usual; no blob walk.
-const CURRENT_SCHEMA_VERSION: u32 = 18;
+/// - **v19** — adds the [`TOMBSTONES`] table for `rocky gc` eviction custody:
+///   one row per artifact retired from the [`OUTPUT_ARTIFACTS`] ledger, written
+///   atomically with the ledger-row removal so a deleted cache entry always
+///   leaves a durable restore record. Pure additive schema change, same shape
+///   as the v14 [`POLICY_DECISIONS`] add: v18 databases auto-create the empty
+///   table on next open and stamp themselves as v19. No blob migration needed;
+///   existing tables are untouched. Empty until a `rocky gc --derivable` plan is
+///   applied, so pre-existing state resumes unchanged. Guarded by
+///   `test_v18_opens_and_creates_tombstones_table`.
+const CURRENT_SCHEMA_VERSION: u32 = 19;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -694,6 +721,7 @@ impl StateStore {
             let _table = txn.open_table(DISCOVER_SNAPSHOTS)?;
             let _table = txn.open_table(POLICY_DECISIONS)?;
             let _table = txn.open_table(JOBS)?;
+            let _table = txn.open_table(TOMBSTONES)?;
         }
         txn.commit()?;
         Ok(InitOutcome::Ready)
@@ -2805,6 +2833,146 @@ impl StateStore {
         Ok(())
     }
 
+    /// Fetch a single artifact ledger row by its `(run_id, model_name,
+    /// file_path)` identity, or `None` if no such row exists.
+    ///
+    /// Used by the `rocky gc` apply path to (a) resolve the exact row a plan
+    /// entry names before evicting — never a different row that merely shares
+    /// the hash — and (b) treat an already-absent row as an idempotent
+    /// "already evicted" skip rather than an error.
+    pub fn get_artifact(
+        &self,
+        run_id: &str,
+        model_name: &str,
+        file_path: &str,
+    ) -> Result<Option<ArtifactRecord>, StateError> {
+        let key = artifact_key(run_id, model_name, file_path);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(OUTPUT_ARTIFACTS)?;
+        match table.get(key.as_str())? {
+            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Eviction custody (TOMBSTONES) — `rocky gc` apply
+    // -----------------------------------------------------------------------
+
+    /// Atomically retire an artifact's [`OUTPUT_ARTIFACTS`] row and record its
+    /// [`TombstoneRecord`], in a single write transaction — but **only** when
+    /// the live row's content hash matches [`TombstoneRecord::blake3_hash`].
+    ///
+    /// This is the durability guarantee at the heart of `rocky gc`: the
+    /// tombstone (the restore safety net) is committed **in the same
+    /// transaction** as the ledger-row removal, so a crash can never leave a
+    /// retired reference without its restore record. The physical object-store
+    /// delete happens *after* this call returns — an orphaned byte with a
+    /// tombstone is safe; a deleted byte without one is not.
+    ///
+    /// The **hash check is the eviction's identity guard**: the caller
+    /// derives eligibility from a specific content hash, but the ledger key is
+    /// `(run_id, model_name, file_path)`. If the live row at that key carries a
+    /// *different* hash than the tombstone claims (a stale/hand-authored plan,
+    /// or a row rewritten between derivation and apply), this returns
+    /// [`EvictOutcome::HashMismatch`] and deletes **nothing** — the tombstone
+    /// would otherwise record the wrong bytes as evicted. Fail-closed.
+    ///
+    /// Outcomes:
+    /// - [`EvictOutcome::Evicted`] — row present, hash matched: row retired +
+    ///   tombstone written, committed together.
+    /// - [`EvictOutcome::AlreadyAbsent`] — no row at the key. No tombstone; the
+    ///   transaction is dropped, so a re-apply is an idempotent no-op.
+    /// - [`EvictOutcome::HashMismatch`] — row present but its hash differs. No
+    ///   tombstone, nothing removed; the transaction is dropped.
+    ///
+    /// Provenance ([`INPUT_PROVENANCE`]) and the input index ([`INPUT_INDEX`])
+    /// are deliberately left untouched — restore replays the recipe located
+    /// through them, so retiring them would strand the tombstone.
+    pub fn evict_artifact(
+        &self,
+        tombstone: &TombstoneRecord,
+        run_id: &str,
+        model_name: &str,
+        file_path: &str,
+    ) -> Result<EvictOutcome, StateError> {
+        let art_key = artifact_key(run_id, model_name, file_path);
+        let tomb_key = tombstone_key(&tombstone.evicted_at, &tombstone.blake3_hash);
+        let tomb_bytes = serde_json::to_vec(tombstone)?;
+        let txn = self.db.begin_write()?;
+        let outcome;
+        {
+            let mut artifacts = txn.open_table(OUTPUT_ARTIFACTS)?;
+            // Read the LIVE row inside the write txn and verify its hash before
+            // deleting anything. The row we tombstone must be exactly the bytes
+            // the caller proved derivable.
+            let live: Option<ArtifactRecord> = match artifacts.get(art_key.as_str())? {
+                Some(guard) => Some(serde_json::from_slice(guard.value())?),
+                None => None,
+            };
+            outcome = match live {
+                None => EvictOutcome::AlreadyAbsent,
+                Some(row) if row.blake3_hash != tombstone.blake3_hash => {
+                    EvictOutcome::HashMismatch {
+                        expected: tombstone.blake3_hash.clone(),
+                        found: row.blake3_hash,
+                    }
+                }
+                Some(_) => {
+                    artifacts.remove(art_key.as_str())?;
+                    let mut tombstones = txn.open_table(TOMBSTONES)?;
+                    tombstones.insert(tomb_key.as_str(), tomb_bytes.as_slice())?;
+                    EvictOutcome::Evicted
+                }
+            };
+        }
+        if matches!(outcome, EvictOutcome::Evicted) {
+            txn.commit()?;
+        } else {
+            // Nothing evicted — drop the transaction without committing so no
+            // tombstone is recorded for a row that was absent or hash-mismatched.
+            drop(txn);
+        }
+        Ok(outcome)
+    }
+
+    /// Upsert a tombstone row (keyed by `evicted_at` + `blake3_hash`).
+    ///
+    /// Used to update an existing tombstone's [`TombstoneRecord::physical_reclaimed`]
+    /// flag after a best-effort physical object-store delete succeeds — the
+    /// atomic [`Self::evict_artifact`] writes the tombstone with the flag
+    /// `false` (the byte-delete has not happened yet), and this flips it to
+    /// `true` once the bytes are gone.
+    pub fn record_tombstone(&self, tombstone: &TombstoneRecord) -> Result<(), StateError> {
+        let key = tombstone_key(&tombstone.evicted_at, &tombstone.blake3_hash);
+        let bytes = serde_json::to_vec(tombstone)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(TOMBSTONES)?;
+            table.insert(key.as_str(), bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Return every recorded tombstone, oldest first.
+    ///
+    /// Keys are `"{evicted_at_rfc3339}|{blake3_hash}"`, which sort
+    /// chronologically, so a forward table scan yields evictions in the order
+    /// they occurred. Backs the `rocky gc` apply summary and (later) `rocky
+    /// restore` resolution.
+    pub fn list_tombstones(&self) -> Result<Vec<TombstoneRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(TOMBSTONES)?;
+        let mut results = Vec::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let record: TombstoneRecord = serde_json::from_slice(value.value())?;
+            results.push(record);
+        }
+        Ok(results)
+    }
+
     // -----------------------------------------------------------------------
     // Agent-policy decision ledger (POLICY_DECISIONS)
     // -----------------------------------------------------------------------
@@ -3351,6 +3519,17 @@ fn policy_decision_key(
     format!("{}|{plan_id}|{model}", timestamp.to_rfc3339())
 }
 
+/// Builds the key for the [`TOMBSTONES`] table.
+///
+/// Composition: `"{evicted_at_rfc3339}|{blake3_hash}"`. The RFC 3339 timestamp
+/// prefix sorts chronologically under redb's lexicographic key order, so a
+/// forward scan replays evictions oldest-first; the `blake3_hash` disambiguates
+/// two artifacts evicted within the same timestamp tick and lets the same hash
+/// carry a distinct row each time it is evicted → restored → re-evicted.
+fn tombstone_key(evicted_at: &chrono::DateTime<chrono::Utc>, blake3_hash: &str) -> String {
+    format!("{}|{blake3_hash}", evicted_at.to_rfc3339())
+}
+
 /// One row in the content-addressed write ledger ([`OUTPUT_ARTIFACTS`]).
 ///
 /// Recorded once per `WriteResult` from
@@ -3390,6 +3569,100 @@ pub struct ArtifactRecord {
     /// same as the write's Delta `modification_time_millis` (that's in
     /// the log); close enough for retention sweep windows.
     pub written_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One row in the `rocky gc` eviction custody ledger ([`TOMBSTONES`]).
+///
+/// Written **before** (atomically with) the retirement of an artifact's
+/// [`OUTPUT_ARTIFACTS`] row, so a deleted cache entry always leaves a durable
+/// record of what it was and how to rebuild it. It captures everything a later
+/// `rocky restore` needs to re-derive the bytes and verify byte-identity:
+///
+/// - [`Self::blake3_hash`] — the identity a restore re-computes and compares
+///   against, the byte-proof half of the roundtrip;
+/// - [`Self::run_id`] / [`Self::model_name`] — the [`INPUT_PROVENANCE`] key
+///   (`"{run_id}|{model_name}"`) that still holds the canonical `ModelIr` +
+///   upstream identities to replay. Eviction **never** removes provenance —
+///   only the artifact ledger row — so this pointer always resolves;
+/// - the recipe-identity triple (`recipe_hash` / `input_hash` /
+///   `input_proof_class` / `env_hash` / `hash_scheme`) captured from the
+///   producing [`ModelExecution`], a self-describing redundant record of the
+///   identity the eviction was justified against;
+/// - [`Self::file_path`] — the object-store location to physically reclaim
+///   and the target a restore re-materializes to.
+///
+/// Forward-compatible via `#[serde(default)]` on any field added later, the
+/// same additive pattern [`ArtifactRecord`] and [`PolicyDecisionRecord`] use.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TombstoneRecord {
+    /// Hex blake3 of the evicted bytes — restore rebuilds and asserts equality
+    /// against this. Copied from the retired [`ArtifactRecord::blake3_hash`].
+    pub blake3_hash: String,
+    /// Run that produced the evicted artifact. Half of the [`INPUT_PROVENANCE`]
+    /// key restore replays from; joins to `RunRecord.run_id`.
+    pub run_id: String,
+    /// Model that produced the evicted artifact. Half of the
+    /// [`INPUT_PROVENANCE`] key; matches `ModelExecution.model_name`.
+    pub model_name: String,
+    /// Object-store path that was retired — the byte location a physical
+    /// reclamation deletes and a restore re-materializes to.
+    pub file_path: String,
+    /// Parquet size in bytes, copied from the retired [`ArtifactRecord`].
+    pub size_bytes: u64,
+    /// Delta commit version the artifact was attached to, for correlation.
+    #[serde(default)]
+    pub commit_version: u64,
+    /// Recipe-identity hash from the producing [`ModelExecution::recipe_hash`],
+    /// when recorded. `None` for a pre-identity build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe_hash: Option<String>,
+    /// Input-closure hash from [`ModelExecution::input_hash`], when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hash: Option<String>,
+    /// Input match-strength (`"strong"` / `"heuristic"`) from
+    /// [`ModelExecution::input_proof_class`], when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_proof_class: Option<String>,
+    /// Environment hash from [`ModelExecution::env_hash`], when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_hash: Option<String>,
+    /// Hash-scheme version from [`ModelExecution::hash_scheme`], when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_scheme: Option<String>,
+    /// Wall clock when the artifact was evicted.
+    pub evicted_at: chrono::DateTime<chrono::Utc>,
+    /// The `rocky gc` plan that authorized this eviction (custody).
+    pub plan_id: String,
+    /// `true` once the bytes were physically reclaimed through the object-store
+    /// adapter; `false` when the physical delete was deferred (no reachable
+    /// object store on this adapter) or failed. A `false` row is a safe leaked
+    /// orphan — the ledger reference is gone and the tombstone stands — that a
+    /// later sweep can reclaim after re-checking the refcount (a hash may have
+    /// been re-materialized in the meantime).
+    #[serde(default)]
+    pub physical_reclaimed: bool,
+}
+
+/// The result of [`StateStore::evict_artifact`] — an eviction attempt keyed by
+/// `(run_id, model_name, file_path)` and guarded by the tombstone's content
+/// hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvictOutcome {
+    /// The row was present, its hash matched the tombstone, and it was retired
+    /// with its tombstone written atomically.
+    Evicted,
+    /// No row existed at the key — an idempotent no-op (a prior apply evicted
+    /// it, or it never existed). No tombstone written.
+    AlreadyAbsent,
+    /// A row existed at the key but its content hash differed from the one the
+    /// tombstone claims. **Nothing was deleted** and no tombstone was written —
+    /// evicting would have recorded the wrong bytes as reclaimed. Fail-closed.
+    HashMismatch {
+        /// The hash the caller expected (the tombstone's `blake3_hash`).
+        expected: String,
+        /// The hash actually stored in the live ledger row.
+        found: String,
+    },
 }
 
 /// One row in the agent-policy decision ledger ([`POLICY_DECISIONS`]).
@@ -7008,6 +7281,174 @@ mod tests {
     }
 
     #[test]
+    fn test_v18_opens_and_creates_tombstones_table() {
+        // A store freshly opened under the current binary materializes the
+        // `tombstones` table (part of the eager EXPECTED_TABLES set) and stamps
+        // itself at v19. Reads succeed against an empty ledger.
+        let (store, _dir) = temp_store();
+        assert!(
+            current_schema_version() >= 19,
+            "tombstones ledger exists from schema v19 onward"
+        );
+        assert!(
+            store.list_tombstones().unwrap().is_empty(),
+            "a fresh store has an empty tombstone ledger"
+        );
+    }
+
+    fn make_tombstone(
+        hash: &str,
+        run: &str,
+        model: &str,
+        path: &str,
+        size: u64,
+    ) -> TombstoneRecord {
+        TombstoneRecord {
+            blake3_hash: hash.to_string(),
+            run_id: run.to_string(),
+            model_name: model.to_string(),
+            file_path: path.to_string(),
+            size_bytes: size,
+            commit_version: 0,
+            recipe_hash: Some("recipe-abc".to_string()),
+            input_hash: Some("input-abc".to_string()),
+            input_proof_class: Some("strong".to_string()),
+            env_hash: Some("env-abc".to_string()),
+            hash_scheme: Some("v1".to_string()),
+            evicted_at: chrono::Utc::now(),
+            plan_id: "plan-1".to_string(),
+            physical_reclaimed: false,
+        }
+    }
+
+    #[test]
+    fn evict_artifact_atomically_tombstones_and_retires_the_row() {
+        // The atomicity contract: `evict_artifact` writes the tombstone AND
+        // removes the OUTPUT_ARTIFACTS row in one transaction. After it, the
+        // artifact is gone from the ledger (refcount 0) and a tombstone stands.
+        let (store, _dir) = temp_store();
+        let art = make_artifact("run-1", "orders", "hA", "s3://b/a.parquet", 500);
+        store.record_artifact(&art).unwrap();
+        assert_eq!(store.refcount_for_hash("hA").unwrap(), 1);
+
+        let tomb = make_tombstone("hA", "run-1", "orders", "s3://b/a.parquet", 500);
+        let outcome = store
+            .evict_artifact(&tomb, "run-1", "orders", "s3://b/a.parquet")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            EvictOutcome::Evicted,
+            "a present, hash-matched row is evicted"
+        );
+
+        // Ledger row retired → refcount drops to zero.
+        assert_eq!(store.refcount_for_hash("hA").unwrap(), 0);
+        assert!(
+            store
+                .get_artifact("run-1", "orders", "s3://b/a.parquet")
+                .unwrap()
+                .is_none()
+        );
+        // Tombstone recorded with everything restore needs.
+        let tombs = store.list_tombstones().unwrap();
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(tombs[0].blake3_hash, "hA");
+        assert_eq!(tombs[0].run_id, "run-1");
+        assert_eq!(tombs[0].recipe_hash.as_deref(), Some("recipe-abc"));
+    }
+
+    #[test]
+    fn evict_artifact_absent_row_writes_no_tombstone() {
+        // Idempotency + safety: evicting a row that is already gone is a no-op —
+        // it reports AlreadyAbsent and records NO tombstone (a spurious tombstone
+        // for a vanished row would be a lie in the custody ledger).
+        let (store, _dir) = temp_store();
+        let tomb = make_tombstone("hMissing", "run-x", "gone", "s3://b/x.parquet", 1);
+        let outcome = store
+            .evict_artifact(&tomb, "run-x", "gone", "s3://b/x.parquet")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            EvictOutcome::AlreadyAbsent,
+            "an absent row cannot be evicted"
+        );
+        assert!(
+            store.list_tombstones().unwrap().is_empty(),
+            "no tombstone is written for an already-absent row"
+        );
+    }
+
+    #[test]
+    fn evict_artifact_refuses_on_hash_mismatch() {
+        // 🔴 Identity guard: the live row at the (run, model, file_path) key
+        // carries hash `H_BAD`, but the tombstone claims `H_GOOD`. Evicting would
+        // delete H_BAD's bytes while recording a tombstone for H_GOOD (whose
+        // recipe cannot rebuild H_BAD) — permanent data loss + a false restore
+        // record. `evict_artifact` must refuse: delete nothing, write no tombstone.
+        let (store, _dir) = temp_store();
+        let art = make_artifact("run-1", "orders", "H_BAD", "s3://b/a.parquet", 500);
+        store.record_artifact(&art).unwrap();
+
+        let tomb = make_tombstone("H_GOOD", "run-1", "orders", "s3://b/a.parquet", 500);
+        let outcome = store
+            .evict_artifact(&tomb, "run-1", "orders", "s3://b/a.parquet")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            EvictOutcome::HashMismatch {
+                expected: "H_GOOD".to_string(),
+                found: "H_BAD".to_string(),
+            }
+        );
+        // Nothing deleted, no tombstone written — fail-closed.
+        assert_eq!(store.refcount_for_hash("H_BAD").unwrap(), 1);
+        assert!(
+            store
+                .get_artifact("run-1", "orders", "s3://b/a.parquet")
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.list_tombstones().unwrap().is_empty());
+    }
+
+    #[test]
+    fn evict_artifact_leaves_provenance_intact() {
+        // Restore-critical: eviction retires the OUTPUT_ARTIFACTS row ONLY. The
+        // INPUT_PROVENANCE row the tombstone points at must survive, or restore
+        // could never replay the recipe.
+        let (store, _dir) = temp_store();
+        let art = make_artifact("run-1", "orders", "hA", "s3://b/a.parquet", 500);
+        store.record_artifact(&art).unwrap();
+        let prov = ProvenanceRecord {
+            run_id: "run-1".to_string(),
+            model_name: "orders".to_string(),
+            input_hash: "input-abc".to_string(),
+            skip_hash: "skip-abc".to_string(),
+            model_ir_canonical_json: "{}".to_string(),
+            upstreams: Vec::new(),
+            output_blake3: vec!["hA".to_string()],
+            output_path: vec!["s3://b/a.parquet".to_string()],
+            proof_class: "strong".to_string(),
+            recorded_at: chrono::Utc::now(),
+        };
+        store
+            .record_reuse_spine(&[], std::slice::from_ref(&prov))
+            .unwrap();
+
+        let tomb = make_tombstone("hA", "run-1", "orders", "s3://b/a.parquet", 500);
+        store
+            .evict_artifact(&tomb, "run-1", "orders", "s3://b/a.parquet")
+            .unwrap();
+
+        // Provenance still resolvable through the tombstone's (run_id, model).
+        let survived = store.get_provenance("run-1", "orders").unwrap();
+        assert!(
+            survived.is_some(),
+            "provenance must survive eviction so restore can replay"
+        );
+    }
+
+    #[test]
     fn artifact_round_trip_by_hash() {
         // Record one artifact, look it up by its blake3 hash.
         let (store, _dir) = temp_store();
@@ -7413,7 +7854,10 @@ mod tests {
         // additive-drift auto-apply custody), another serde-additive field —
         // the redb table set is untouched, only the version moves; guarded by
         // `test_v17_policy_decision_forward_deserializes_auto_apply_none`.
-        const EXPECTED_VERSION: u32 = 18;
+        // v19 adds the `tombstones` table (`rocky gc` eviction custody) — a new
+        // table, so it IS in EXPECTED_TABLES below; guarded by
+        // `test_v18_opens_and_creates_tombstones_table`.
+        const EXPECTED_VERSION: u32 = 19;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
@@ -7435,6 +7879,7 @@ mod tests {
             "run_progress_entries",
             "schema_cache",
             "source_markers",
+            "tombstones",
             "watermarks",
         ];
 

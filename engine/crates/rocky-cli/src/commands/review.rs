@@ -132,18 +132,27 @@ pub async fn compute_review(
     // silently writing a marker that means nothing.
     let reviewable = plan.kind == PlanKind::AiAuthored
         || plan.kind == PlanKind::Backfill
+        || plan.kind == PlanKind::Gc
         || (plan.kind == PlanKind::Run
             && plan.resolved_principal() == rocky_core::config::PolicyPrincipal::Agent);
     if !reviewable {
         bail!(
             "plan '{plan_id}' is a {} plan authored by {}; `rocky review` only applies to \
-             AI-authored plans or agent-authored run plans.",
+             AI-authored plans, agent-authored run plans, backfills, and gc plans.",
             plan.kind,
             serde_json::to_value(plan.resolved_principal())
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_else(|| "human".to_string()),
         );
+    }
+
+    // A gc plan carries a `GcPlan` payload (not a `RunPlan`) and changes no
+    // model definitions, so the breaking-change gate does not apply — reviewing
+    // it is purely the human sign-off that unblocks the eviction. Branch here,
+    // before the `RunPlan` deserialize the other kinds need.
+    if plan.kind == PlanKind::Gc {
+        return compute_review_gc_plan(root, plan_id, approve).await;
     }
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
@@ -202,6 +211,65 @@ pub async fn compute_review(
         approved: approve,
         marker_written,
         breaking_changes: findings,
+        message: Some(message),
+    })
+}
+
+/// Review (and optionally approve) a `PlanKind::Gc` reclamation plan.
+///
+/// A gc plan changes no model definitions, so there is no breaking-change gate
+/// to compute — reviewing it is the human sign-off that unblocks the eviction.
+/// `--approve` writes the same marker (`<plan_id>.reviewed.json`) the apply gate
+/// checks; without it, apply stays blocked. The marker is payload-agnostic, so
+/// the existing `ai_plan_is_reviewed` gate in `commands::apply` recognises it.
+async fn compute_review_gc_plan(root: &Path, plan_id: &str, approve: bool) -> Result<ReviewOutput> {
+    let mut marker_written = false;
+    if approve {
+        let approver =
+            crate::commands::branch::approver_identity_pub().unwrap_or_else(|_| ApproverIdentity {
+                email: "unknown".to_string(),
+                name: None,
+                host: "unknown".to_string(),
+                source: crate::output::ApproverSource::Local,
+            });
+        let marker = ReviewMarker {
+            plan_id: plan_id.to_string(),
+            reviewed_at: Utc::now(),
+            base_ref: String::new(),
+            breaking_change_count: 0,
+            approver,
+        };
+        write_review_marker(root, plan_id, &marker)?;
+        marker_written = true;
+        tracing::info!(
+            target: "rocky::review",
+            plan_id,
+            "gc plan approved — review marker written"
+        );
+    }
+
+    let message = if approve {
+        format!(
+            "approved gc plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked. Apply \
+             re-verifies each artifact against the live ledger before deleting, and every \
+             eviction is tombstoned for restore."
+        )
+    } else {
+        format!(
+            "reviewed gc plan '{plan_id}' — re-run with `--approve` to unblock \
+             `rocky apply {plan_id}`. Deletion is symmetric-caution gated: even a human gc goes \
+             through review."
+        )
+    };
+
+    Ok(ReviewOutput {
+        version: VERSION.to_string(),
+        command: "review".to_string(),
+        plan_id: plan_id.to_string(),
+        base_ref: String::new(),
+        approved: approve,
+        marker_written,
+        breaking_changes: None,
         message: Some(message),
     })
 }

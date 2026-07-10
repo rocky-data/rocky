@@ -111,6 +111,9 @@ pub(crate) async fn run_apply_in(
         PlanKind::Backfill => {
             run_apply_backfill_plan(root, config_path, plan_id, state_path, output_json).await
         }
+        PlanKind::Gc => {
+            super::gc::run_gc_apply_in(root, config_path, plan_id, state_path, output_json).await
+        }
     }
 }
 

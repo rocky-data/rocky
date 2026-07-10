@@ -1858,13 +1858,16 @@ enum Command {
     /// replayable, unreferenced, policy allows, past the age threshold), and
     /// the header states how much of managed storage is derivable.
     ///
-    /// Read-only: this release has no deletion path at all — the report is
-    /// the whole surface.
+    /// `--dry-run` is the read-only inventory. Without it, `--derivable` writes
+    /// a review-gated GC *plan* (it never deletes directly) — approve it with
+    /// `rocky review <plan-id> --approve`, then `rocky apply <plan-id>` executes
+    /// the eviction (a restore tombstone + ledger retirement per artifact).
     Gc {
-        /// Restrict to the derivability inventory (the only mode today).
+        /// Restrict to the derivability inventory / plan (the only mode today).
         #[arg(long)]
         derivable: bool,
-        /// Preview only. Required — this release never deletes.
+        /// Preview only — emit the read-only inventory instead of writing a
+        /// plan. Omit to write a review-gated reclamation plan.
         #[arg(long)]
         dry_run: bool,
         /// Minimum written-age, in days, an artifact must reach to pass the
@@ -3879,12 +3882,22 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     "`rocky gc` currently supports only the derivability inventory — pass `--derivable`"
                 );
             }
-            if !dry_run {
-                anyhow::bail!(
-                    "`rocky gc --derivable` currently supports only `--dry-run` — this release has no deletion path"
-                );
+            if dry_run {
+                rocky_cli::commands::run_gc_derivable(&state_path, &cli.config, min_age_days, json)
+            } else {
+                // Plan mode: write a review-gated GC plan. The invoker principal
+                // rides on the plan (an agent-scoped `deny agent gc` rule fires
+                // on an agent-run GC); the review gate is unconditional either
+                // way. Never deletes.
+                let principal = resolve_cli_principal(cli.principal)?;
+                rocky_cli::commands::run_gc_plan(
+                    &state_path,
+                    &cli.config,
+                    min_age_days,
+                    principal,
+                    json,
+                )
             }
-            rocky_cli::commands::run_gc_derivable(&state_path, &cli.config, min_age_days, json)
         }
         Command::Preview { action } => match action {
             PreviewAction::Create { base, name, models } => {

@@ -95,6 +95,19 @@ pub enum PlanKind {
     /// executing it, regardless of any configured policy. Backfills are where
     /// blast radius hides, so this gate is a hard rule, not policy-tunable.
     Backfill,
+    /// A `rocky gc --derivable` reclamation plan. The payload is a `GcPlan`
+    /// listing the content-addressed artifacts the engine proved are derivable
+    /// (rebuildable bit-exact) and therefore evictable cache. `rocky apply`
+    /// executes the eviction — a tombstone + ledger retirement per artifact,
+    /// then a best-effort physical object-store delete.
+    ///
+    /// Deletion is the one verb that is review-gated **symmetrically**: a `gc`
+    /// plan is **unconditionally** review-gated regardless of principal or of
+    /// whether a `[policy]` block is configured (a human `gc` still goes through
+    /// `rocky review` → `rocky apply`, never a direct delete). Policy may only
+    /// tighten the gate — an agent-scoped `deny gc {…}` rule hard-refuses even a
+    /// reviewed plan.
+    Gc,
 }
 
 impl std::fmt::Display for PlanKind {
@@ -107,6 +120,7 @@ impl std::fmt::Display for PlanKind {
             PlanKind::Promote => write!(f, "promote"),
             PlanKind::AiAuthored => write!(f, "ai_authored"),
             PlanKind::Backfill => write!(f, "backfill"),
+            PlanKind::Gc => write!(f, "gc"),
         }
     }
 }
@@ -332,6 +346,25 @@ pub fn write_plan_governed<T: Serialize>(
     let caps_value =
         serde_json::to_value(capabilities).context("failed to serialize embedded capabilities")?;
     write_plan_inner(root, kind, payload, 1, principal, Some(caps_value))
+}
+
+/// Persist a plan with an explicit authoring `principal` but **no**
+/// capability-embed.
+///
+/// Used by `rocky gc`: the `gc` verb carries no per-model change
+/// classification (every eviction is uniformly a `gc` capability, computed at
+/// apply time from the plan's eviction list), so there is nothing to embed —
+/// but the invoker principal must still ride on the record so an agent-scoped
+/// `deny agent gc` rule fires on an agent-run GC. The `principal` rides outside
+/// the `plan_id` digest, exactly as [`write_plan`] and [`write_plan_governed`]
+/// stamp it.
+pub fn write_plan_with_principal<T: Serialize>(
+    root: &Path,
+    kind: PlanKind,
+    payload: &T,
+    principal: PolicyPrincipal,
+) -> Result<String> {
+    write_plan_inner(root, kind, payload, 1, principal, None)
 }
 
 /// Compute the `plan_id` a governed `Run` / `AiAuthored` plan will carry,
@@ -623,6 +656,12 @@ mod tests {
             id_compact, id_ai,
             "compact and ai_authored must produce different plan_ids"
         );
+        let id_gc = write_plan(dir.path(), PlanKind::Gc, &payload)?;
+        assert_ne!(id_run, id_gc, "run and gc must produce different plan_ids");
+        assert_ne!(
+            id_compact, id_gc,
+            "compact and gc must produce different plan_ids"
+        );
         Ok(())
     }
 
@@ -740,6 +779,25 @@ mod tests {
         assert_eq!(PlanKind::Replication.to_string(), "replication");
         assert_eq!(PlanKind::Promote.to_string(), "promote");
         assert_eq!(PlanKind::AiAuthored.to_string(), "ai_authored");
+        assert_eq!(PlanKind::Backfill.to_string(), "backfill");
+        assert_eq!(PlanKind::Gc.to_string(), "gc");
+    }
+
+    /// A `gc` plan stamps the invoker principal (via `write_plan_with_principal`)
+    /// and round-trips it back, with no capability-embed on the payload.
+    #[test]
+    fn gc_kind_round_trip_stamps_principal() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = serde_json::json!({"evictions": [], "total_bytes": 0});
+        let plan_id =
+            write_plan_with_principal(dir.path(), PlanKind::Gc, &payload, PolicyPrincipal::Agent)?;
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(plan.kind, PlanKind::Gc);
+        assert_eq!(plan.principal, Some(PolicyPrincipal::Agent));
+        // No capability-embed for a gc plan (uniform `gc` capability at apply).
+        assert!(!plan.embedded_capabilities().diff_available);
+        assert!(plan.embedded_capabilities().changed.is_empty());
+        Ok(())
     }
 
     #[test]
