@@ -1615,6 +1615,7 @@ mod tests {
             rule_id,
             reason: "plain".to_string(),
             verify_after: Vec::new(),
+            auto_apply: None,
         }
     }
 
@@ -1631,6 +1632,7 @@ mod tests {
             rule_id: None,
             reason: "verify_after FAILED".to_string(),
             verify_after: vec!["row_count_drift".to_string()],
+            auto_apply: None,
         }
     }
 
@@ -1646,6 +1648,7 @@ mod tests {
             rule_id: None,
             reason: "verify_after passed".to_string(),
             verify_after: vec!["row_count_drift".to_string()],
+            auto_apply: None,
         }
     }
 
@@ -1669,6 +1672,7 @@ mod tests {
             rule_id: None,
             reason: "freeze".to_string(),
             verify_after: Vec::new(),
+            auto_apply: None,
         }
     }
 

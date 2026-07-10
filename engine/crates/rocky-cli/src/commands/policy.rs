@@ -364,6 +364,9 @@ pub fn run_policy_freeze(
             rule_id: None,
             reason: reason.clone(),
             verify_after: Vec::new(),
+            // A freeze/unfreeze is a policy-change decision, not a drift
+            // auto-apply, so it carries no auto-apply custody.
+            auto_apply: None,
         };
         store
             .record_policy_decision(&record)

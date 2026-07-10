@@ -86,7 +86,24 @@ impl DriftGovernor {
         if !cfg.resilience.auto_apply_additive_drift {
             return None;
         }
-        let policy = cfg.policy.as_ref()?;
+        // The opt-in is on. A missing `[policy]` block grants nothing — but it
+        // must NOT disable governance, or the pre-existing drift path would
+        // mutate UNGOVERNED (fail-open: a breaking retype would silently apply).
+        // Govern with a no-grant, fail-closed posture instead: the effect is
+        // `require_review`, so `is_auto_apply_eligible` refuses every drift until
+        // a `[policy]` rule explicitly grants `schema_change.additive`.
+        let Some(policy) = cfg.policy.as_ref() else {
+            return Some(Self {
+                run_id: run_id.to_string(),
+                effect: PolicyEffect::RequireReview,
+                matched_rule: None,
+                policy_reason:
+                    "auto-apply is enabled but no [policy] block grants schema_change.additive"
+                        .to_string(),
+                verify_after: Vec::new(),
+                contracted: false,
+            });
+        };
         let attrs = ModelAttributes {
             name: model_name.to_string(),
             ..Default::default()
@@ -361,12 +378,149 @@ pub(crate) fn finalize_drift_verify_after(store: Option<&StateStore>, run_id: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocky_core::config::ResilienceConfig;
     use rocky_core::state::CheckOutcome;
 
     fn temp_store() -> (StateStore, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         (store, dir)
+    }
+
+    /// A config with the auto-apply opt-in ON and no `[policy]` block — the
+    /// exact shape the fail-open regression guards.
+    fn cfg_opt_in_no_policy() -> RockyConfig {
+        RockyConfig {
+            state: Default::default(),
+            adapters: Default::default(),
+            pipelines: Default::default(),
+            hooks: Default::default(),
+            cost: Default::default(),
+            budget: Default::default(),
+            schema_evolution: Default::default(),
+            retry: None,
+            portability: Default::default(),
+            cache: Default::default(),
+            mask: Default::default(),
+            classifications: Default::default(),
+            roles: Default::default(),
+            ai: Default::default(),
+            branch: Default::default(),
+            freshness: Default::default(),
+            imports: Default::default(),
+            run: Default::default(),
+            reuse: Default::default(),
+            policy: None,
+            resilience: ResilienceConfig {
+                auto_apply_additive_drift: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn opt_in_without_policy_governs_fail_closed_not_open() {
+        // Codex red-team regression (fail-OPEN → fail-CLOSED): with the opt-in
+        // ON but NO `[policy]` block, `build` must still return a governor with
+        // a no-grant, require-review posture — never `None`. Returning `None`
+        // skipped governance entirely and let the pre-existing drift path mutate
+        // a breaking change ungoverned. Pre-fix, `build` returned `None` and the
+        // `.expect` below panics; post-fix it governs and refuses.
+        let cfg = cfg_opt_in_no_policy();
+        let gov = DriftGovernor::build(&cfg, "run-x", "wh.raw.orders")
+            .expect("opt-in on ⇒ a governor must exist even without a [policy] block");
+        assert_eq!(
+            gov.effect,
+            PolicyEffect::RequireReview,
+            "no [policy] grant ⇒ every drift is refused to require-review"
+        );
+    }
+
+    fn tref() -> rocky_ir::TableRef {
+        rocky_ir::TableRef {
+            catalog: "wh".to_string(),
+            schema: "raw".to_string(),
+            table: "orders".to_string(),
+        }
+    }
+
+    fn additive_add_drift() -> DriftResult {
+        DriftResult {
+            table: tref(),
+            drifted_columns: Vec::new(),
+            action: rocky_ir::DriftAction::Ignore,
+            added_columns: vec![rocky_ir::ColumnInfo {
+                name: "email".to_string(),
+                data_type: "VARCHAR".to_string(),
+                nullable: true,
+            }],
+            grace_period_columns: Vec::new(),
+            columns_to_drop: Vec::new(),
+        }
+    }
+
+    fn breaking_retype_drift() -> DriftResult {
+        DriftResult {
+            table: tref(),
+            drifted_columns: vec![rocky_ir::DriftedColumn {
+                name: "amount".to_string(),
+                source_type: "VARCHAR".to_string(),
+                target_type: "INT".to_string(),
+            }],
+            action: rocky_ir::DriftAction::DropAndRecreate,
+            added_columns: Vec::new(),
+            grace_period_columns: Vec::new(),
+            columns_to_drop: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_policy_governor_refuses_every_drift_at_the_run_loop() {
+        // Re-red-team Q5: prove the full fail-closed property end-to-end, not
+        // just that `build` returns a governor. With the opt-in on and no
+        // [policy] block, `govern` must REFUSE every drift the run loop would
+        // otherwise apply — a breaking retype AND a plain additive add (no
+        // grant ⇒ nothing auto-applies) — recording a require-review custody
+        // row and never authorising a mutation.
+        let cfg = cfg_opt_in_no_policy();
+        let gov = DriftGovernor::build(&cfg, "run-x", "wh.raw.orders").expect("governor present");
+        let (store, _d) = temp_store();
+        let state = Mutex::new(store);
+
+        // A breaking retype is refused (fails the additive proof first).
+        let d = gov
+            .govern(&breaking_retype_drift(), "wh.raw.orders", &state)
+            .await;
+        assert!(
+            matches!(d, GovernDecision::Refuse(_)),
+            "a breaking retype must be refused"
+        );
+
+        // A plain additive add is ALSO refused: additive-ness passes, but there
+        // is no policy grant, so `effect != Allow` refuses it too.
+        let d = gov
+            .govern(&additive_add_drift(), "wh.raw.orders", &state)
+            .await;
+        assert!(
+            matches!(d, GovernDecision::Refuse(_)),
+            "an additive add must be refused when no [policy] rule grants it"
+        );
+
+        // Both refusals recorded a require-review custody row; nothing applied.
+        let decisions = state.lock().await.list_policy_decisions().unwrap();
+        assert_eq!(decisions.len(), 2, "one custody row per governed drift");
+        assert!(
+            decisions
+                .iter()
+                .all(|r| r.effect == PolicyEffect::RequireReview),
+            "no-grant refusals record require-review, not allow/deny"
+        );
+        assert!(
+            decisions
+                .iter()
+                .all(|r| r.auto_apply.as_ref().is_some_and(|a| !a.applied)),
+            "nothing was auto-applied"
+        );
     }
 
     fn applied_decision(run_id: &str, model: &str, checks: &[&str]) -> PolicyDecisionRecord {
