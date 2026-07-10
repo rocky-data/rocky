@@ -2353,7 +2353,24 @@ impl RockyMcpServer {
         // structured, parseable verdict at propose time instead of a plan a
         // later apply silently refuses. Absent a `[policy]` block this resolves
         // to `NotConfigured` and behaviour is byte-identical to before the plane.
-        let touched = capabilities.touched(&run_plan.models);
+        //
+        // Gate on the models the apply will EXECUTE: the freshly-compiled
+        // project (`run_plan.models`) narrowed by the plan's `--model`
+        // selection — mirroring how `rocky apply` re-derives the execution set
+        // from a recompile. `run_plan.models` is authoritative here (just built
+        // from `result`), so filtering it matches the apply-time recompile.
+        let executable: Vec<String> = run_plan
+            .models
+            .iter()
+            .filter(|name| {
+                run_plan
+                    .model
+                    .as_deref()
+                    .is_none_or(|target| target == name.as_str())
+            })
+            .cloned()
+            .collect();
+        let touched = capabilities.touched(&executable);
         // The deterministic id the plan will carry if written — recorded in the
         // audit ledger (and named in a review message) even when a deny refuses
         // to persist the plan.

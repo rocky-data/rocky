@@ -154,7 +154,10 @@ async fn run_apply_run_plan(
     // `Run` was never gated — so behaviour is byte-identical to today. A
     // human-authored plan resolves to `allow` (humans are never gated in v0).
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
-    let touched = touched_models_for_run(&plan, &run_plan);
+    // Gate on the models this apply will ACTUALLY execute (fresh compile +
+    // `--model` selection), not the plan's informational `models` list.
+    let executable = run_executable_models(models_dir, &run_plan);
+    let touched = touched_models_for_run(&plan, &executable);
     let principal = plan.resolved_principal();
     let gate = evaluate_apply_policy(
         config_path,
@@ -503,11 +506,14 @@ pub fn evaluate_apply_policy(
         prior_snapshot.or_else(|| ledger.as_ref().and_then(|s| s.list_policy_decisions().ok()));
 
     // Fail-closed floor: when the snapshot is genuinely unreadable (both opens
-    // failed — a corrupt or forward-incompatible store), an AGENT's `allow`
-    // cannot be trusted, because an active freeze or exhausted budget would be
-    // invisible. Degrade it to `require_review` below instead of proceeding on
-    // an empty snapshot. Humans are never gated in v0, so the floor does not
-    // apply to them.
+    // failed — a corrupt or forward-incompatible store, or a real concurrent
+    // run holding a live redb handle so even the read-only open exhausts its
+    // retries and returns Busy), an AGENT mutation cannot be trusted, because an
+    // active freeze or exhausted budget would be invisible. It is HARD-REFUSED
+    // (deny) below instead of proceeding on an empty snapshot — a mere
+    // `require_review` would be satisfiable by a pre-existing review marker and
+    // would bypass the freeze. Humans are never gated in v0, so the floor does
+    // not apply to them.
     let snapshot_unreadable = prior_snapshot.is_none();
     let prior_decisions: Vec<PolicyDecisionRecord> = prior_snapshot.unwrap_or_default();
 
@@ -548,12 +554,20 @@ pub fn evaluate_apply_policy(
         }
         if snapshot_unreadable
             && principal == PolicyPrincipal::Agent
-            && effect == PolicyEffect::Allow
+            && effect != PolicyEffect::Deny
         {
-            effect = PolicyEffect::RequireReview;
+            // Fail-closed HARD-REFUSE (D3): when the freeze/budget snapshot is
+            // genuinely unavailable, an active freeze is invisible. Degrading to
+            // `require_review` is not enough — a pre-existing review marker would
+            // satisfy it and bypass the freeze under concurrent load (a real
+            // concurrent run holding a live redb handle makes even
+            // `open_read_only` fail Busy). Force `deny`, which no marker can
+            // satisfy, so an agent mutation cannot proceed while the ledger is
+            // unverifiable. Humans are never gated in v0.
+            effect = PolicyEffect::Deny;
             reason.push_str(
-                "; policy ledger unreadable — freeze/budget state unverifiable, allow degraded \
-                 to require_review (fail-closed)",
+                "; policy ledger unreadable — freeze/budget state unverifiable, agent mutation \
+                 refused (fail-closed deny; a review marker cannot satisfy it)",
             );
         }
 
@@ -650,67 +664,123 @@ fn gate_rank(gate: &PolicyGate) -> u8 {
 /// The `(model, capability)` set the policy plane evaluates for a run-shaped
 /// plan (`Run` / `AiAuthored`).
 ///
-/// - Diff available at propose time → the embedded per-changed-model
-///   classification. Unchanged models are absent and are not gated.
-/// - Diff unavailable (skipped, or a legacy plan with no embed) → **every**
-///   planned model, classified `schema_change.breaking` (fail closed).
+/// `executable_models` is the set the apply will actually execute — for
+/// `Run` / `AiAuthored` it is re-derived from a fresh compile narrowed by the
+/// plan's `--model` selection (see [`run_executable_models`]); for a
+/// `Backfill` it is the composed rebuild closure (`run_plan.models`, which is
+/// authoritative there). It is **never** the plan's informational `models`
+/// list, which serde-defaults to empty and can over-list — gating on that is a
+/// fail-open in both directions (see [`EmbeddedCapabilities::touched`]).
 fn touched_models_for_run(
     plan: &PersistedPlan,
-    run_plan: &RunPlan,
+    executable_models: &[String],
 ) -> BTreeMap<String, PolicyCapability> {
-    plan.embedded_capabilities().touched(&run_plan.models)
+    plan.embedded_capabilities().touched(executable_models)
+}
+
+/// Re-derive the set of models a `Run` / `AiAuthored` apply will actually
+/// execute, the same way the run does: compile `models_dir` and keep only the
+/// models the plan's `--model` selection targets (all of them when unset).
+///
+/// The plan's persisted `models` list is *informational* (serde-default,
+/// re-derived at apply via recompile), so the gate must recompute the real
+/// execution selection rather than trust it. A compile failure here yields an
+/// empty set — the apply's own recompile will fail identically and execute
+/// nothing, so there is nothing to gate.
+fn run_executable_models(models_dir: &Path, run_plan: &RunPlan) -> Vec<String> {
+    use rocky_compiler::compile::{self, CompilerConfig};
+    let config = CompilerConfig {
+        models_dir: models_dir.to_path_buf(),
+        ..Default::default()
+    };
+    let Ok(result) = compile::compile(&config) else {
+        return Vec::new();
+    };
+    result
+        .project
+        .models
+        .iter()
+        .map(|m| m.config.name.clone())
+        .filter(|name| {
+            run_plan
+                .model
+                .as_deref()
+                .is_none_or(|target| target == name.as_str())
+        })
+        .collect()
 }
 
 /// The `(model, capability)` set the policy plane evaluates for a `Promote`
-/// plan: every model the branch changed (from the plan's captured
-/// breaking-change findings), gated under the bare `promote` verb.
+/// plan, gated under the bare `promote` verb.
 ///
 /// The `promote` verb — not a `schema_change.*` refinement — is used so a
 /// `deny agent promote {…}` rule governs promotions while an `apply`-scoped
 /// rule does not accidentally fire on a promote (the refinements are shared
 /// between the two verbs).
 ///
-/// Fail-closed on two fronts (mirroring the run path's posture):
+/// The gated set is the **full executable target set** — every target the
+/// promote will `CREATE OR REPLACE` (`promote.targets`) unioned with every
+/// target the breaking-change findings named. Gating only finding-scoped
+/// targets was a fail-open: a `deny agent promote { models = ["X"] }` rule
+/// scoped to a target that executes but produced no finding (an unchanged or
+/// additive-only target) would silently not fire while its SQL ran. Each FQN
+/// is mapped to its logical model name (via a compile of `models_dir`) so a
+/// name-scoped rule matches; an FQN that cannot be mapped (project doesn't
+/// compile, or the target vanished from the project) stays under its FQN
+/// (fail-closed) rather than being dropped.
 ///
-/// - **Findings absent or empty while the plan carries SQL targets** — the
-///   promote will still `CREATE OR REPLACE` every target, so the mutation set
-///   is unclassified, not empty. Every plan target is gated under `promote`
-///   rather than resolving to an ungated `Allow`.
-/// - **Target→name mapping unavailable** (the project fails to compile at
-///   apply time, or a changed target vanished from the compiled project) —
-///   the changed target is gated under its target name instead of being
-///   silently dropped from the touched set. A bare-named evaluation still
-///   meets `any`-scoped rules and the default agent posture.
-///
-/// Only a plan with no findings **and** no targets — a promote that executes
+/// Only a plan with no targets **and** no findings — a promote that executes
 /// nothing — yields an empty set.
 fn touched_models_for_promote(
     promote: &PromotePlan,
     models_dir: &Path,
 ) -> BTreeMap<String, PolicyCapability> {
-    let Some(findings) = promote.breaking_changes.as_ref().filter(|f| !f.is_empty()) else {
-        // No captured findings, but the plan still executes SQL against these
-        // targets — gate the execution set instead of failing open.
-        return promote
-            .targets
-            .iter()
-            .map(|t| (t.target.clone(), PolicyCapability::Promote))
-            .collect();
-    };
-    let changed_targets: BTreeSet<String> = findings
-        .iter()
-        .map(|f| f.change.model().to_string())
-        .collect();
+    // The full executable target set: every SQL target plus every target a
+    // finding named (a finding target may, in principle, not appear in
+    // `targets` — union both so nothing escapes).
+    let mut target_fqns: BTreeSet<String> =
+        promote.targets.iter().map(|t| t.target.clone()).collect();
+    if let Some(findings) = promote.breaking_changes.as_ref() {
+        for f in findings {
+            target_fqns.insert(f.change.model().to_string());
+        }
+    }
+    if target_fqns.is_empty() {
+        return BTreeMap::new();
+    }
     let target_to_name = compile_target_to_name(models_dir);
-    changed_targets
+    target_fqns
         .into_iter()
-        .map(|t| {
-            // Fail-closed: an unmapped target stays in the touched set under
-            // its target name rather than being dropped.
-            let name = target_to_name.get(&t).cloned().unwrap_or(t);
+        .map(|fqn| {
+            // Map FQN → logical name so a name-scoped rule matches; fail-closed
+            // to the FQN when unmappable rather than dropping the target.
+            let name = target_to_name.get(&fqn).cloned().unwrap_or(fqn);
             (name, PolicyCapability::Promote)
         })
         .collect()
+}
+
+/// Resolve the models directory for the promote gate from the loaded config:
+/// the first transformation pipeline's `models` glob base (everything before
+/// the first wildcard), relative to the config file's parent. Falls back to
+/// `<project>/models` when the config does not load or declares no
+/// transformation pipeline. Mirrors the backfill/gc resolution.
+fn resolve_config_models_dir(config_path: &Path) -> std::path::PathBuf {
+    let project_root = config_path.parent().unwrap_or(Path::new(""));
+    let glob = rocky_core::config::load_rocky_config(config_path)
+        .ok()
+        .and_then(|cfg| {
+            cfg.pipelines.values().find_map(|p| match p {
+                rocky_core::config::PipelineConfig::Transformation(t) => Some(t.models.clone()),
+                _ => None,
+            })
+        });
+    let base = glob
+        .as_deref()
+        .and_then(|g| g.split(&['*', '?', '['][..]).next())
+        .filter(|b| !b.is_empty())
+        .unwrap_or("models");
+    project_root.join(base.trim_end_matches('/'))
 }
 
 /// Compile `models_dir` and map each model's `target.full_name()` to its
@@ -1003,7 +1073,10 @@ async fn run_apply_ai_authored_plan(
     // AiAuthored gate. Absent a `[policy]` block the evaluator is never
     // constructed and the pre-policy-plane marker gate remains — byte-identical to today.
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
-    let touched = touched_models_for_run(&plan, &run_plan);
+    // Gate on the models this apply will ACTUALLY execute (fresh compile +
+    // `--model` selection), not the plan's informational `models` list.
+    let executable = run_executable_models(models_dir, &run_plan);
+    let touched = touched_models_for_run(&plan, &executable);
     let principal = plan.resolved_principal();
     let gate = evaluate_apply_policy(
         config_path,
@@ -1107,7 +1180,10 @@ async fn run_apply_backfill_plan(
     // than silently unenforcing a possibly-configured `[policy]` block.
     bail_on_config_load_error(config_path, "backfill", plan_id)?;
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
-    let touched = touched_models_for_run(&plan, &run_plan);
+    // A backfill's `models` list IS the authoritative rebuild closure the
+    // engine composed and will execute (see `execute_backfill_set` below), not
+    // an informational hint — gate on it directly.
+    let touched = touched_models_for_run(&plan, &run_plan.models);
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
@@ -1578,14 +1654,18 @@ async fn run_apply_promote_plan(
     // Absent `[policy]` this is a no-op (promote was never gated). A
     // human-authored promote resolves to `allow`; an agent-authored promote is
     // gated per changed model under the `promote` verb.
-    let promote_models_dir = Path::new("models");
-    let touched = touched_models_for_promote(&promote_plan, promote_models_dir);
+    //
+    // Resolve the models dir from config (not a hardcoded `models`) so the
+    // target→logical-name mapping compiles the right directory — a name-scoped
+    // `deny agent promote { models = [...] }` rule then matches.
+    let promote_models_dir = resolve_config_models_dir(config_path);
+    let touched = touched_models_for_promote(&promote_plan, &promote_models_dir);
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
         plan.resolved_principal(),
         &touched,
-        promote_models_dir,
+        &promote_models_dir,
         state_path,
     );
     apply_policy_gate(root, plan_id, gate)?;
@@ -1920,11 +2000,34 @@ auto_create_schemas = true
     /// principal default (`ai_authored` ⟹ agent) is load-bearing: were it to
     /// resolve to `human`, the policy would `allow` and the plan would apply
     /// unreviewed.
+    /// Write a minimal compilable transformation model under `models_dir` so
+    /// the apply-time re-derivation of the executable set (a fresh compile)
+    /// finds at least one model to gate.
+    fn write_min_model(models_dir: &Path, name: &str) {
+        std::fs::create_dir_all(models_dir).unwrap();
+        std::fs::write(models_dir.join(format!("{name}.sql")), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn legacy_ai_authored_with_empty_policy_still_requires_review() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("rocky.toml"), EMPTY_POLICY_TOML)?;
-        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &minimal_run_plan())?;
+        // The gate re-derives the executable set from a real compile, so the
+        // plan must point at a real models dir with a compilable model.
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        let mut rp = minimal_run_plan();
+        rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        rp.models = vec!["orders".to_string()];
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
         strip_principal_from_plan(dir.path(), &plan_id)?;
 
         let state = dir.path().join("state.redb");
@@ -2273,6 +2376,194 @@ effect = "deny"
         Ok(())
     }
 
+    /// 🔴 D1 regression: the executable set is re-derived from a fresh compile,
+    /// NOT the plan's informational `models` list. A run plan whose `models`
+    /// list is EMPTY but whose models dir compiles real models must still gate
+    /// the real models. Pre-fix `touched()` read the empty list → gated nothing
+    /// → an agent apply executed every real model UNGATED.
+    #[test]
+    fn run_executable_models_ignores_the_informational_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        write_min_model(&models_dir, "customers");
+        let mut rp = minimal_run_plan();
+        rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        rp.models = Vec::new(); // the informational list is EMPTY
+        rp.model = None;
+        let exec = super::run_executable_models(&models_dir, &rp);
+        assert!(
+            exec.contains(&"orders".to_string()) && exec.contains(&"customers".to_string()),
+            "the executable set must come from the compile, not the empty list: {exec:?}"
+        );
+    }
+
+    /// 🔴 D1 regression (over-listing): `--model orders` must narrow the
+    /// executable set to just `orders`, even if the plan's informational
+    /// `models` list names every compiled model — so a rule scoped to an
+    /// unexecuted model does not wrongly fire.
+    #[test]
+    fn run_executable_models_honors_the_model_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        write_min_model(&models_dir, "customers");
+        let mut rp = minimal_run_plan();
+        rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        rp.models = vec!["orders".to_string(), "customers".to_string()]; // over-lists
+        rp.model = Some("orders".to_string());
+        let exec = super::run_executable_models(&models_dir, &rp);
+        assert_eq!(
+            exec,
+            vec!["orders".to_string()],
+            "only the selected model executes"
+        );
+    }
+
+    /// 🔴 D1(a) end-to-end: an agent run plan with an EMPTY informational
+    /// `models` list but real compilable models is DENIED by `deny agent apply
+    /// { any }`. Pre-fix the empty list → empty touched → `Allow` → the run
+    /// executed every model past the deny.
+    #[test]
+    fn empty_informational_list_with_real_models_is_gated() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "deny"
+"#,
+        )?;
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        let mut rp = minimal_run_plan();
+        rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        rp.models = Vec::new();
+        rp.model = None;
+        let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
+        let plan = read_plan(dir.path(), &plan_id)?;
+
+        let exec = super::run_executable_models(&models_dir, &rp);
+        let touched = super::touched_models_for_run(&plan, &exec);
+        assert!(!touched.is_empty(), "D1: real models must be gated");
+        let gate = super::evaluate_apply_policy(
+            &config,
+            &plan_id,
+            PolicyPrincipal::Agent,
+            &touched,
+            &models_dir,
+            &dir.path().join("state.redb"),
+        );
+        assert!(
+            matches!(gate, PolicyGate::Deny { .. }),
+            "an agent run over real models must hit the deny, got {gate:?}"
+        );
+        Ok(())
+    }
+
+    /// 🔴 D1(b) end-to-end: `--model orders` must NOT fire a `deny agent apply
+    /// { models = ["customers"] }` rule, because `customers` does not execute.
+    /// Pre-fix the over-listing informational `models` gated `customers` too →
+    /// the run was wrongly denied.
+    #[test]
+    fn model_filter_does_not_fire_an_unexecuted_models_rule() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { models = ["customers"] }
+effect = "deny"
+"#,
+        )?;
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        write_min_model(&models_dir, "customers");
+        let mut rp = minimal_run_plan();
+        rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        rp.models = vec!["orders".to_string(), "customers".to_string()]; // over-lists
+        rp.model = Some("orders".to_string());
+        let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
+        let plan = read_plan(dir.path(), &plan_id)?;
+
+        let exec = super::run_executable_models(&models_dir, &rp);
+        let touched = super::touched_models_for_run(&plan, &exec);
+        assert!(
+            !touched.contains_key("customers"),
+            "customers does not execute and must not be gated: {touched:?}"
+        );
+        let gate = super::evaluate_apply_policy(
+            &config,
+            &plan_id,
+            PolicyPrincipal::Agent,
+            &touched,
+            &models_dir,
+            &dir.path().join("state.redb"),
+        );
+        assert!(
+            !matches!(gate, PolicyGate::Deny { .. }),
+            "the customers deny must not fire for a run scoped to orders, got {gate:?}"
+        );
+        Ok(())
+    }
+
+    /// 🔴 D4-analog (run side): a partial-change agent run must still gate an
+    /// UNCHANGED sibling that re-materializes. With `deny agent apply {
+    /// models = ["prod_critical"] }` + `allow agent schema_change.additive
+    /// { any }`, a run where `stg_x` changed additively (allowed) but
+    /// `prod_critical` is unchanged yet executes must be DENIED — the unchanged
+    /// sibling is gated under `apply` and hits the deny. A narrow "gate only
+    /// changed models" would have let `prod_critical` rebuild ungated.
+    #[test]
+    fn partial_change_run_gates_unchanged_sibling_under_model_scoped_deny() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { models = ["prod_critical"] }
+effect = "deny"
+
+[[policy.rules]]
+principal = "agent"
+capability = "schema_change.additive"
+scope = { any = true }
+effect = "allow"
+"#,
+        )?;
+        let caps = crate::plan_store::EmbeddedCapabilities {
+            diff_available: true,
+            changed: {
+                let mut c = BTreeMap::new();
+                c.insert("stg_x".to_string(), PolicyCapability::SchemaChangeAdditive);
+                c
+            },
+        };
+        // Both models execute; only stg_x changed.
+        let touched = caps.touched(&["stg_x".to_string(), "prod_critical".to_string()]);
+        assert_eq!(touched.get("prod_critical"), Some(&PolicyCapability::Apply));
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &touched,
+            &dir.path().join("models"),
+            &dir.path().join("state.redb"),
+        );
+        assert!(
+            matches!(gate, PolicyGate::Deny { .. }),
+            "the unchanged executing sibling must hit the model-scoped deny, got {gate:?}"
+        );
+        Ok(())
+    }
+
     /// 🔴 FIX 8 regression (read-only snapshot ignores the write lock): a
     /// freeze recorded in the ledger must still gate an apply while another
     /// process holds the advisory WRITE lock. Pre-fix the snapshot was taken
@@ -2323,14 +2614,13 @@ effect = "deny"
         Ok(())
     }
 
-    /// 🔴 FIX 8 regression (fail-closed on a genuinely unreadable store): when
-    /// BOTH opens fail (a corrupt / forward-incompatible store) an AGENT's
-    /// otherwise-`allow` decision degrades to `require_review` — a possibly
-    /// active freeze or exhausted budget must never be silently invisible.
-    /// Pre-fix an unreadable store yielded an empty snapshot and the `allow`
-    /// stood unmodified.
+    /// 🔴 FIX 8 + D3 regression (fail-closed HARD-REFUSE on a genuinely
+    /// unreadable store): when BOTH opens fail (a corrupt / forward-incompatible
+    /// store) an AGENT's otherwise-`allow` decision is DENIED — not merely
+    /// `require_review`, which a pre-existing review marker could satisfy and so
+    /// bypass a possibly-active freeze. Pre-D3 this degraded to `require_review`.
     #[test]
-    fn unreadable_store_degrades_agent_allow_to_require_review() -> anyhow::Result<()> {
+    fn unreadable_store_hard_refuses_agent_mutation() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         // A rule that would otherwise grant the agent an outright allow.
         let config = write_config(
@@ -2363,9 +2653,55 @@ effect = "allow"
             &state,
         );
         assert!(
-            matches!(gate, PolicyGate::RequireReview { .. }),
-            "an unreadable ledger must fail closed for an agent (allow → require_review), got \
-             {gate:?}"
+            matches!(gate, PolicyGate::Deny { .. }),
+            "an unreadable ledger must HARD-REFUSE an agent mutation (deny, not require_review), \
+             got {gate:?}"
+        );
+        Ok(())
+    }
+
+    /// 🔴 D3 regression (live redb handle, not just the advisory lock): a REAL
+    /// concurrent run holds an actual `StateStore` write handle (redb's own
+    /// exclusive flock), so even `open_read_only` exhausts its retries and
+    /// returns `Busy` → the snapshot is unavailable. An agent apply must be
+    /// hard-refused (deny). The advisory-lock-only test above never exercised a
+    /// live redb handle; this one does.
+    #[test]
+    fn live_redb_handle_hard_refuses_agent_apply() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+"#,
+        )?;
+        let state = dir.path().join("state.redb");
+        // Hold a LIVE redb write handle for the whole evaluation — redb takes an
+        // in-process exclusive handle, so both `open` and the retrying
+        // `open_read_only` fail (DatabaseAlreadyOpen → Busy). The snapshot is
+        // genuinely unavailable even though the file is a perfectly valid store.
+        let _live = StateStore::open(&state)?;
+
+        let touched = {
+            let mut m = BTreeMap::new();
+            m.insert("m".to_string(), PolicyCapability::Apply);
+            m
+        };
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &touched,
+            &dir.path().join("models"),
+            &state,
+        );
+        assert!(
+            matches!(gate, PolicyGate::Deny { .. }),
+            "a live concurrent redb handle must hard-refuse an agent apply (deny), got {gate:?}"
         );
         Ok(())
     }
@@ -2398,12 +2734,14 @@ effect = "allow"
     #[test]
     fn touched_models_for_run_fail_closed_without_embed() {
         // A plan with no embedded classification (legacy / diff skipped) marks
-        // every planned model breaking.
+        // every EXECUTABLE model breaking.
         let dir = tempfile::tempdir().unwrap();
         let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &minimal_run_plan()).unwrap();
         let plan = read_plan(dir.path(), &plan_id).unwrap();
-        let run_plan: RunPlan = serde_json::from_value(plan.payload.clone()).unwrap();
-        let touched = super::touched_models_for_run(&plan, &run_plan);
+        // The executable set is passed explicitly now (re-derived from a
+        // compile at the real call sites); here we pass the model directly.
+        let executable = vec!["schema.orders".to_string()];
+        let touched = super::touched_models_for_run(&plan, &executable);
         assert_eq!(
             touched.get("schema.orders"),
             Some(&PolicyCapability::SchemaChangeBreaking)
@@ -2497,6 +2835,133 @@ effect = "allow"
             created_at: chrono::Utc::now(),
         };
         assert!(super::touched_models_for_promote(&promote, Path::new("/nonexistent")).is_empty());
+    }
+
+    /// 🔴 D4 regression: with NON-empty findings, the promote gate must still
+    /// gate EVERY executable target — not just the finding-scoped ones. A SQL
+    /// target that produced no finding (unchanged / additive-only) must not
+    /// escape a `deny agent promote { models = [...] }` rule. Pre-fix only
+    /// finding targets were gated and the other targets ran silently.
+    #[test]
+    fn promote_with_findings_still_gates_non_finding_targets() {
+        use rocky_core::breaking_change::{BreakingChange, BreakingFinding, BreakingSeverity};
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders"); // FQN c.s.orders
+        write_min_model(&models_dir, "customers"); // FQN c.s.customers
+
+        let promote = crate::output::PromotePlan {
+            branch_name: "fix".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "abc".to_string(),
+            branch_state_hash: "h".to_string(),
+            approvals_used: vec![],
+            approvals_rejected: vec![],
+            // Only `orders` produced a finding …
+            breaking_changes: Some(vec![BreakingFinding {
+                change: BreakingChange::SqlBodyChanged {
+                    model: "c.s.orders".to_string(),
+                },
+                severity: BreakingSeverity::Breaking,
+            }]),
+            allow_breaking: true,
+            // … but BOTH targets execute.
+            targets: vec![
+                crate::output::PromoteTargetPlan {
+                    target: "c.s.orders".to_string(),
+                    source: "c.b.orders".to_string(),
+                    statement: "CREATE OR REPLACE ...".to_string(),
+                },
+                crate::output::PromoteTargetPlan {
+                    target: "c.s.customers".to_string(),
+                    source: "c.b.customers".to_string(),
+                    statement: "CREATE OR REPLACE ...".to_string(),
+                },
+            ],
+            plan_audit: vec![],
+            created_at: chrono::Utc::now(),
+        };
+        let touched = super::touched_models_for_promote(&promote, &models_dir);
+        // Both targets — mapped to their logical names — are gated, even though
+        // only `orders` produced a finding.
+        assert_eq!(touched.get("orders"), Some(&PolicyCapability::Promote));
+        assert_eq!(
+            touched.get("customers"),
+            Some(&PolicyCapability::Promote),
+            "the non-finding target must still be gated (D4), got {touched:?}"
+        );
+    }
+
+    /// 🔴 D5 regression: with a real models dir, a target FQN is mapped to its
+    /// LOGICAL model name so a `models = ["orders"]`-scoped rule matches. Pre-
+    /// fix the call site hardcoded `models/` (unresolved in the test cwd) so the
+    /// target stayed an FQN and a name-scoped rule missed.
+    #[test]
+    fn promote_maps_target_fqn_to_logical_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders"); // logical "orders" → FQN c.s.orders
+
+        let promote = crate::output::PromotePlan {
+            branch_name: "fix".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "abc".to_string(),
+            branch_state_hash: "h".to_string(),
+            approvals_used: vec![],
+            approvals_rejected: vec![],
+            breaking_changes: None,
+            allow_breaking: false,
+            targets: vec![crate::output::PromoteTargetPlan {
+                target: "c.s.orders".to_string(),
+                source: "c.b.orders".to_string(),
+                statement: "CREATE OR REPLACE ...".to_string(),
+            }],
+            plan_audit: vec![],
+            created_at: chrono::Utc::now(),
+        };
+        let touched = super::touched_models_for_promote(&promote, &models_dir);
+        assert!(
+            touched.contains_key("orders"),
+            "the FQN must map to the logical name 'orders': {touched:?}"
+        );
+        assert!(
+            !touched.contains_key("c.s.orders"),
+            "the FQN must not remain when it is mappable: {touched:?}"
+        );
+    }
+
+    /// `resolve_config_models_dir` reads the transformation pipeline's `models`
+    /// glob base relative to the config parent (the D5 threading), falling back
+    /// to `<project>/models`.
+    #[test]
+    fn resolve_config_models_dir_reads_the_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "custom_models/**"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::resolve_config_models_dir(&config),
+            dir.path().join("custom_models")
+        );
+        // Missing config → fallback to <project>/models.
+        assert_eq!(
+            super::resolve_config_models_dir(&dir.path().join("missing.toml")),
+            dir.path().join("models")
+        );
     }
 
     #[test]

@@ -3088,6 +3088,111 @@ auto_create_schemas = true
         );
     }
 
+    /// 🔴 D9 regression (drives the PRODUCTION call site): an agent-invoked
+    /// promote plan must PERSIST `principal = agent`. This drives
+    /// `build_promote_plan_inner` — the call site FIX 2 changed — end-to-end and
+    /// reads the persisted plan back. Reverting the production fix (back to a
+    /// bare `write_plan` / dropping the threaded principal) makes this fail: the
+    /// persisted plan would resolve to the `Human` default.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn build_promote_plan_inner_stamps_agent_principal() {
+        use crate::plan_store::{PlanKind, read_plan};
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+
+        // Self-contained git repo with a local identity (approver_identity runs
+        // `git config --get user.email` in cwd; CI runners have no ambient one).
+        for git_args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "test@rocky.invalid"].as_slice(),
+            ["config", "user.name", "Rocky Test"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git setup");
+            assert!(status.success(), "git {git_args:?} failed");
+        }
+
+        write_transformation_model(
+            &models_dir,
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "default"
+
+[pipeline.t.target.governance]
+auto_create_schemas = true
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        run_branch_create(&state_path, "fix-price", None, false).unwrap();
+
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        let result = crate::commands::plan::build_promote_plan_inner(
+            dir,
+            &config_path,
+            &models_dir,
+            "main", // base_ref — repo is fresh so the breaking-change gate skips
+            "fix-price",
+            None, // filter
+            None, // pipeline
+            true, // allow_breaking — irrelevant; gate skips fail-open anyway
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Agent, // the agent-invoked promote
+        )
+        .await;
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        let result = result.expect("build_promote_plan_inner must succeed");
+        let plan_id = result
+            .plan_output
+            .plan_id
+            .expect("a plan_id must be persisted");
+
+        // The PERSISTED plan must resolve to Agent — not the Human default.
+        let persisted = read_plan(dir, &plan_id).expect("read persisted promote plan");
+        assert_eq!(
+            persisted.kind,
+            PlanKind::Promote,
+            "the persisted plan is a promote plan"
+        );
+        assert_eq!(
+            persisted.resolved_principal(),
+            rocky_core::config::PolicyPrincipal::Agent,
+            "an agent-invoked promote must persist principal = agent (FIX 2), not fall to Human"
+        );
+    }
+
     /// `branch promote` on a transformation pipeline must reject filter keys
     /// that only make sense on the replication path (`client=acme` and
     /// friends). Without this fast-fail, a stale CI invocation would

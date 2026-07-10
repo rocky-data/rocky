@@ -1546,10 +1546,20 @@ pub async fn run(
     let pattern = pipeline.schema_pattern()?;
     let parsed_filter = filter.map(parse_filter).transpose()?;
 
-    // Download state from remote storage (S3/GCS/Valkey) if configured
-    if let Err(e) = rocky_core::state_sync::download_state(&rocky_cfg.state, state_path).await {
-        warn!(error = %e, "state download failed, continuing with local state");
-    }
+    // Download state from remote storage (S3/GCS/Valkey) if configured.
+    // A no-op `Ok(())` when no remote is configured; an `Err` when a configured
+    // remote download failed — in which case the local ledger may be missing
+    // freeze/budget history recorded by another pod, so it is not authoritative
+    // for the auto-apply governor below (fail-closed).
+    let state_download_ok = match rocky_core::state_sync::download_state(&rocky_cfg.state, state_path)
+        .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(error = %e, "state download failed, continuing with local state");
+            false
+        }
+    };
 
     // Build adapter registry and resolve adapters
     let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
@@ -1589,6 +1599,15 @@ pub async fn run(
     // remote tier — doing so would clobber the newer state that already-upgraded
     // pods depend on. Suppress both the periodic and the end-of-run upload.
     let suppress_state_upload = state_store.was_recreated_for_forward_incompat();
+
+    // The decision ledger is authoritative for the auto-apply governor only
+    // when it carries the estate's real freeze/budget history: the store was
+    // NOT bootstrapped fresh for a forward-incompatible schema, AND any
+    // configured remote download succeeded. When it is non-authoritative an
+    // active freeze / exhausted budget recorded elsewhere would be invisible,
+    // so the governor refuses every auto-apply (fail-closed).
+    let ledger_authoritative =
+        !state_store.was_recreated_for_forward_incompat() && state_download_ok;
 
     // Discover sources
     let discovery_result = async {
@@ -2159,6 +2178,7 @@ pub async fn run(
                         &rocky_cfg,
                         &run_id,
                         &table.name,
+                        ledger_authoritative,
                     ),
                 });
             }

@@ -85,6 +85,13 @@ pub(crate) struct DriftGovernor {
     /// the dynamic breakers so freeze scope selectors match the same identity
     /// the `[policy]` scope matched.
     attrs: ModelAttributes,
+    /// Whether the decision ledger this run opened is authoritative. `false`
+    /// when the local store was bootstrapped fresh for a forward-incompatible
+    /// schema (`on_schema_mismatch = recreate`) or an authoritative remote
+    /// state download failed — in either case an active freeze or an exhausted
+    /// budget recorded elsewhere is invisible, so auto-apply must refuse
+    /// (fail-closed) rather than proceed with no memory of it.
+    ledger_authoritative: bool,
 }
 
 impl DriftGovernor {
@@ -97,7 +104,16 @@ impl DriftGovernor {
     /// the blast radius is uncomputable (a `max_downstreams` ceiling therefore
     /// fails closed inside the evaluator). `contracted` is `false`: the
     /// bronze layer sits behind no contract.
-    pub(crate) fn build(cfg: &RockyConfig, run_id: &str, model_name: &str) -> Option<Self> {
+    /// `ledger_authoritative` is `false` when the state store this run opened
+    /// cannot be trusted to carry prior freeze/budget history (recreated for a
+    /// forward-incompatible schema, or an authoritative remote download
+    /// failed); [`Self::govern`] then refuses every auto-apply (fail-closed).
+    pub(crate) fn build(
+        cfg: &RockyConfig,
+        run_id: &str,
+        model_name: &str,
+        ledger_authoritative: bool,
+    ) -> Option<Self> {
         if !cfg.resilience.auto_apply_additive_drift {
             return None;
         }
@@ -123,6 +139,7 @@ impl DriftGovernor {
                 contracted: false,
                 policy: None,
                 attrs,
+                ledger_authoritative,
             });
         };
         let decision = policy::evaluate(
@@ -145,6 +162,7 @@ impl DriftGovernor {
             contracted: false,
             policy: Some(policy.clone()),
             attrs,
+            ledger_authoritative,
         })
     }
 
@@ -179,7 +197,24 @@ impl DriftGovernor {
         // Dynamic tightening over the prior decision ledger (freeze → deny,
         // exhausted budget → require_review). Monotone: never widens the
         // static effect.
-        let (effect, degrade_suffix): (PolicyEffect, Option<String>) =
+        let (effect, degrade_suffix): (PolicyEffect, Option<String>) = if !self.ledger_authoritative
+        {
+            // The store this run opened cannot be trusted to carry prior
+            // freeze/budget history (recreated for a forward-incompatible
+            // schema, or an authoritative remote download failed). An active
+            // freeze or exhausted budget recorded elsewhere would be invisible,
+            // so refuse auto-apply outright — `require_review` makes
+            // `is_auto_apply_eligible` refuse.
+            (
+                tighten_to_require_review(self.effect),
+                Some(
+                    "policy ledger non-authoritative (recreated for a forward-incompatible \
+                     schema, or an authoritative remote state download failed) — auto-apply \
+                     refused (fail-closed)"
+                        .to_string(),
+                ),
+            )
+        } else {
             match guard.list_policy_decisions() {
                 Ok(prior) => match &self.policy {
                     Some(policy) => {
@@ -208,7 +243,8 @@ impl DriftGovernor {
                          degraded to require_review (fail-closed)"
                     )),
                 ),
-            };
+            }
+        };
 
         let findings = auto_apply::drift_findings(drift, model);
         let refs: Vec<&BreakingFinding> = findings.iter().collect();
@@ -235,12 +271,22 @@ impl DriftGovernor {
                 .refuse_reason()
                 .map(RefuseReason::to_string)
                 .unwrap_or_default();
-            // A hard `deny` is preserved; every other refusal is a
-            // require-review fallback (fail-safe, never a silent apply).
-            let row_effect = match verdict.refuse_reason() {
+            // The recorded effect for a refusal is the MOST RESTRICTIVE of the
+            // eligibility-derived effect and the tightened policy effect. The
+            // eligibility gate can trip on a non-policy reason first (e.g.
+            // `NotAdditive`), but a freeze that resolved the tightened policy
+            // to `deny` must still record `deny` — otherwise a hard freeze on
+            // non-additive drift would be logged as a mere `require_review`.
+            let eligibility_effect = match verdict.refuse_reason() {
                 Some(RefuseReason::PolicyNotAllow(PolicyEffect::Deny)) => PolicyEffect::Deny,
                 _ => PolicyEffect::RequireReview,
             };
+            let row_effect =
+                if policy::effect_rank(effect) >= policy::effect_rank(eligibility_effect) {
+                    effect
+                } else {
+                    eligibility_effect
+                };
             (
                 row_effect,
                 format!("auto-apply of drift on '{model}' refused: {detail} ({summary})"),
@@ -279,21 +325,49 @@ impl DriftGovernor {
                 revert_pointer: revert_pointer_for(),
             }),
         };
-        if let Err(e) = guard.record_policy_decision(&record) {
+        let write_result = guard.record_policy_decision(&record);
+        drop(guard);
+
+        if let Err(e) = &write_result {
             warn!(
                 target: "rocky::policy",
                 error = %e,
                 model,
-                "failed to record auto-apply custody entry (continuing)"
+                "failed to record auto-apply custody entry"
             );
         }
-        drop(guard);
 
-        if applied {
-            GovernDecision::Apply
-        } else {
-            GovernDecision::Refuse(reason)
-        }
+        govern_outcome(applied, write_result.is_ok(), model, reason)
+    }
+}
+
+/// Decide the govern outcome from the applied verdict and whether the custody
+/// row persisted.
+///
+/// Fail-closed on a lost custody row (D7): the plain decision row carries the
+/// authorization + budget-attribution state, so an *applied* mutation whose row
+/// failed to persist is REFUSED — a later verification failure could never pair
+/// with a missing row to burn the granting rule's budget, and no mutation may
+/// stand without a durable custody record. A refused drift mutated nothing, so
+/// a lost refusal row is best-effort and keeps the original refusal reason.
+fn govern_outcome(
+    applied: bool,
+    row_persisted: bool,
+    model: &str,
+    refuse_reason: String,
+) -> GovernDecision {
+    if applied && !row_persisted {
+        return GovernDecision::Refuse(format!(
+            "auto-apply refused for '{model}': the mutation was authorized but its \
+             policy-decision row failed to persist. Refusing rather than mutating without a \
+             durable custody record that a later verification failure can account against the \
+             granting rule's autonomy budget."
+        ));
+    }
+    if applied {
+        GovernDecision::Apply
+    } else {
+        GovernDecision::Refuse(refuse_reason)
     }
 }
 
@@ -538,7 +612,7 @@ mod tests {
         // a breaking change ungoverned. Pre-fix, `build` returned `None` and the
         // `.expect` below panics; post-fix it governs and refuses.
         let cfg = cfg_opt_in_no_policy();
-        let gov = DriftGovernor::build(&cfg, "run-x", "wh.raw.orders")
+        let gov = DriftGovernor::build(&cfg, "run-x", "wh.raw.orders", true)
             .expect("opt-in on ⇒ a governor must exist even without a [policy] block");
         assert_eq!(
             gov.effect,
@@ -594,7 +668,8 @@ mod tests {
         // grant ⇒ nothing auto-applies) — recording a require-review custody
         // row and never authorising a mutation.
         let cfg = cfg_opt_in_no_policy();
-        let gov = DriftGovernor::build(&cfg, "run-x", "wh.raw.orders").expect("governor present");
+        let gov =
+            DriftGovernor::build(&cfg, "run-x", "wh.raw.orders", true).expect("governor present");
         let (store, _d) = temp_store();
         let state = Mutex::new(store);
 
@@ -834,7 +909,8 @@ mod tests {
     #[tokio::test]
     async fn active_freeze_blocks_auto_apply_even_with_a_granting_rule() {
         let cfg = cfg_opt_in_with_policy(granting_policy(&[], None));
-        let gov = DriftGovernor::build(&cfg, "run-fz", "wh.raw.orders").expect("governor present");
+        let gov =
+            DriftGovernor::build(&cfg, "run-fz", "wh.raw.orders", true).expect("governor present");
         assert_eq!(
             gov.effect,
             PolicyEffect::Allow,
@@ -873,7 +949,7 @@ mod tests {
     #[tokio::test]
     async fn human_scoped_freeze_does_not_block_agent_auto_apply() {
         let cfg = cfg_opt_in_with_policy(granting_policy(&[], None));
-        let gov = DriftGovernor::build(&cfg, "run-hfz", "wh.raw.orders").expect("governor");
+        let gov = DriftGovernor::build(&cfg, "run-hfz", "wh.raw.orders", true).expect("governor");
         let (store, _d) = temp_store();
         store
             .record_policy_decision(&freeze_record(PolicyPrincipal::Human, "any"))
@@ -899,7 +975,7 @@ mod tests {
             window: "7d".to_string(),
         };
         let cfg = cfg_opt_in_with_policy(granting_policy(&["row_count"], Some(budget)));
-        let gov = DriftGovernor::build(&cfg, "run-b2", "wh.raw.orders").expect("governor");
+        let gov = DriftGovernor::build(&cfg, "run-b2", "wh.raw.orders", true).expect("governor");
         assert_eq!(gov.effect, PolicyEffect::Allow);
 
         let (store, _d) = temp_store();
@@ -949,7 +1025,7 @@ mod tests {
     async fn auto_heal_verify_failure_burns_the_granting_rules_budget() {
         let policy = granting_policy(&["row_count"], None);
         let cfg = cfg_opt_in_with_policy(policy.clone());
-        let gov = DriftGovernor::build(&cfg, "run-burn", "wh.raw.orders").expect("governor");
+        let gov = DriftGovernor::build(&cfg, "run-burn", "wh.raw.orders", true).expect("governor");
 
         let (store, _d) = temp_store();
         let state = Mutex::new(store);
@@ -1002,77 +1078,122 @@ mod tests {
         );
     }
 
-    /// 🔴 Load-bearing pin for the FIX 1 row-shape change: prove the reshape
-    /// is *necessary*, not just sufficient. `budget_failures_in_window` (in
-    /// rocky-core, untouched here) counts a failure only when a plain
-    /// evaluation row (empty `verify_after`, `rule_id = Some(idx)`) and a
-    /// verify-failure row (non-empty `verify_after`, `deny`) share the SAME
-    /// `plan_id`. This test constructs BOTH the old and the new row shapes
-    /// directly and asserts the pairing outcome for each:
-    ///   - OLD shapes (decision row with NON-empty `verify_after`; verify row
-    ///     under a DIFFERENT `autoapply-verify:` plan id) → count 0. This is
-    ///     the pre-fix bug: repeated failures never burned the budget.
-    ///   - NEW shapes (plain decision row; verify row under the SAME
-    ///     `autoapply:` plan id) → count 1.
-    ///
-    /// If a future edit reverted either row shape, this test would fail — it
-    /// pins the fix without depending on `govern`/`finalize` internals.
+    /// 🔴 D2 regression: a non-authoritative ledger (recreated for a
+    /// forward-incompatible schema, or an authoritative remote download failed)
+    /// must refuse every auto-apply — an active freeze / exhausted budget
+    /// recorded elsewhere is invisible to a fresh-empty local store. Pre-fix
+    /// the governor had no authority signal and would auto-apply against the
+    /// empty ledger. Driven through the real `govern` producer.
+    #[tokio::test]
+    async fn non_authoritative_ledger_refuses_auto_apply() {
+        // A granting policy that WOULD auto-apply an additive add on an
+        // authoritative ledger — so a refusal here is due solely to authority.
+        let cfg = cfg_opt_in_with_policy(granting_policy(&[], None));
+        let gov = DriftGovernor::build(
+            &cfg,
+            "run-na",
+            "wh.raw.orders",
+            /* authoritative */ false,
+        )
+        .expect("governor");
+        let (store, _d) = temp_store();
+        let state = Mutex::new(store);
+
+        let d = gov
+            .govern(&additive_add_drift(), "wh.raw.orders", &state)
+            .await;
+        let GovernDecision::Refuse(reason) = d else {
+            panic!("a non-authoritative ledger must refuse the auto-apply");
+        };
+        assert!(
+            reason.contains("non-authoritative"),
+            "refusal must cite the non-authoritative ledger: {reason}"
+        );
+        // Sanity: the SAME governor with an authoritative ledger applies — proves
+        // the refusal is authority-driven, not policy-driven (non-vacuous).
+        let gov_ok = DriftGovernor::build(&cfg, "run-ok", "wh.raw.orders", true).expect("governor");
+        let (store2, _d2) = temp_store();
+        let d2 = gov_ok
+            .govern(&additive_add_drift(), "wh.raw.orders", &Mutex::new(store2))
+            .await;
+        assert!(
+            matches!(d2, GovernDecision::Apply),
+            "the same grant on an authoritative ledger must apply"
+        );
+    }
+
+    /// 🔴 D6 regression: freeze composition records the tightened policy
+    /// effect. With an Agent freeze active AND non-additive drift, eligibility
+    /// returns `NotAdditive` *before* the policy check — so the naive refusal
+    /// effect is `require_review`. But the tightened policy resolved to `deny`
+    /// (the freeze), and the custody row MUST record `deny`. Pre-fix the row
+    /// recorded `require_review`, understating the freeze. Driven through the
+    /// real `govern` producer.
+    #[tokio::test]
+    async fn freeze_plus_non_additive_records_deny_not_require_review() {
+        let cfg = cfg_opt_in_with_policy(granting_policy(&[], None));
+        let gov = DriftGovernor::build(&cfg, "run-d6", "wh.raw.orders", true).expect("governor");
+        let (store, _d) = temp_store();
+        store
+            .record_policy_decision(&freeze_record(PolicyPrincipal::Agent, "any"))
+            .unwrap();
+        let state = Mutex::new(store);
+
+        // A breaking retype: eligibility trips on NotAdditive before the policy
+        // check, yet the active freeze tightened the policy effect to deny.
+        let d = gov
+            .govern(&breaking_retype_drift(), "wh.raw.orders", &state)
+            .await;
+        assert!(matches!(d, GovernDecision::Refuse(_)), "must refuse");
+
+        let row = state
+            .lock()
+            .await
+            .list_policy_decisions()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.plan_id == decision_plan_id("run-d6"))
+            .expect("custody row");
+        assert_eq!(
+            row.effect,
+            PolicyEffect::Deny,
+            "a freeze that resolved policy to deny must record deny, even when a non-policy \
+             eligibility gate (NotAdditive) tripped first"
+        );
+    }
+
+    /// 🔴 D7 regression: a lost custody row must fail closed. `govern_outcome`
+    /// is the production decision the write path calls: an *applied* mutation
+    /// whose row failed to persist is REFUSED (never Apply), while a refused
+    /// drift keeps its refusal reason regardless of the write result. Pre-fix
+    /// govern returned Apply even when the plain-row append failed, so a later
+    /// verification failure could never burn the budget.
     #[test]
-    fn old_row_shapes_never_paired_the_budget_new_shapes_do() {
-        let now = chrono::Utc::now();
-        let window = chrono::Duration::days(7);
+    fn lost_custody_row_fails_closed_for_an_applied_mutation() {
+        // Applied + row did NOT persist → refuse (fail-closed).
+        let d = govern_outcome(true, false, "wh.raw.orders", "n/a".to_string());
+        let GovernDecision::Refuse(reason) = d else {
+            panic!("an applied mutation with a lost custody row must be refused");
+        };
+        assert!(reason.contains("failed to persist"), "{reason}");
 
-        // --- OLD shapes (pre-fix) ---
-        // Decision row carried the verify_after list (non-empty) → fails the
-        // attribution leg (which requires empty verify_after).
-        let old_decision = PolicyDecisionRecord {
-            timestamp: now,
-            plan_id: "autoapply:run-old".to_string(),
-            principal: PolicyPrincipal::Agent,
-            capability: PolicyCapability::SchemaChangeAdditive,
-            model: "wh.raw.orders".to_string(),
-            effect: PolicyEffect::Allow,
-            rule_id: Some(0),
-            reason: "auto-applied".to_string(),
-            verify_after: vec!["row_count".to_string()], // NON-empty (the bug)
-            auto_apply: None,
-        };
-        // Verify-failure row filed under a DIFFERENT plan id.
-        let old_verify = PolicyDecisionRecord {
-            timestamp: now,
-            plan_id: "autoapply-verify:run-old".to_string(), // DIFFERENT
-            principal: PolicyPrincipal::Agent,
-            capability: PolicyCapability::SchemaChangeAdditive,
-            model: "wh.raw.orders".to_string(),
-            effect: PolicyEffect::Deny,
-            rule_id: None,
-            reason: "verify_after FAILED".to_string(),
-            verify_after: vec!["row_count".to_string()],
-            auto_apply: None,
-        };
-        let old = vec![old_decision, old_verify];
-        assert_eq!(
-            policy::budget_failures_in_window(&old, 0, window, now),
-            0,
-            "the OLD row shapes must never pair — this is the pre-fix data-loss bug"
-        );
+        // Applied + row persisted → apply.
+        assert!(matches!(
+            govern_outcome(true, true, "wh.raw.orders", "n/a".to_string()),
+            GovernDecision::Apply
+        ));
 
-        // --- NEW shapes (post-fix) ---
-        // Plain decision row + verify-failure row under the SAME plan id.
-        let new_decision = PolicyDecisionRecord {
-            verify_after: Vec::new(), // PLAIN
-            plan_id: "autoapply:run-new".to_string(),
-            ..old[0].clone()
-        };
-        let new_verify = PolicyDecisionRecord {
-            plan_id: "autoapply:run-new".to_string(), // SAME as the decision row
-            ..old[1].clone()
-        };
-        let new = vec![new_decision, new_verify];
-        assert_eq!(
-            policy::budget_failures_in_window(&new, 0, window, now),
-            1,
-            "the NEW row shapes must pair so the failure burns rule 0's budget"
+        // Refused + row lost → still refuse, keeping the original reason (the
+        // drift mutated nothing, so the lost row is best-effort).
+        let d = govern_outcome(
+            false,
+            false,
+            "wh.raw.orders",
+            "additive proof failed".to_string(),
         );
+        let GovernDecision::Refuse(reason) = d else {
+            panic!("a refused drift stays refused");
+        };
+        assert_eq!(reason, "additive proof failed");
     }
 }
