@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.34.2] — 2026-07-10
+
+### Added
+
+- **Generated TypeScript types for the engine-v1.62.0 output surface** — `rocky policy test` (`policy_test`), `rocky policy freeze` (`policy_freeze`), the autonomy-budget policy config fields, and the auto-apply drift custody. Additive; the LSP client and existing commands are unchanged.
+
+
 ## [1.34.1] — 2026-07-08
 
 ### Added

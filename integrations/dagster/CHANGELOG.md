@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.58.0] — 2026-07-10
+
+### Changed
+
+- **Floor raised to `rocky-sdk>=0.5.0`.** Picks up the SDK's generated types for the new policy and self-healing surfaces (`rocky policy test`, `rocky policy freeze`, autonomy budgets, and policy-gated additive-drift auto-apply custody) so a `dagster-rocky` consumer resolves them through `dagster_rocky.types` without relying on latest-SDK resolution. No behavior change in the integration itself.
+
+
 ## [1.57.0] — 2026-07-09
 
 ### Changed

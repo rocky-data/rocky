@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.62.0] - 2026-07-10
+
+### Added
+
+- **`rocky policy test` — scenario assertions for agent policy.** A policy file can declare `[[policy.tests]]` scenarios (`(principal, capability, target)` and the effect they must resolve to) that run through the real evaluator; `rocky policy test` exits non-zero if any resolved effect differs from its expectation, so a policy edit cannot silently open a hole in CI. (#1073)
+- **Autonomy budgets + `rocky policy freeze`.** A `[policy]` rule may carry `autonomy_budget = { failures = N, window = "7d" }`: verify-after failures within the window burn the budget, and at exhaustion the rule auto-degrades from `allow` to `require_review` (surfaced in `rocky brief`). It only ever tightens, never widens. `rocky policy freeze [--principal] [--scope]` records a freeze decision that forces `deny` for matched actions at the enforcement seam; `rocky policy unfreeze` lifts it. Both are projections over the existing decision ledger — no state-schema change. (#1074)
+- **Policy-gated auto-apply of additive source drift (`[resilience] auto_apply_additive_drift`, default-off).** The first self-healing rung that mutates a warehouse schema: when a replication run detects an additive, non-breaking upstream column and the opt-in is set and a `[policy]` rule grants `schema_change.additive` for the table's scope, the engine applies the `ALTER TABLE ADD COLUMN` migration itself, records a custody entry, and runs the `verify_after` gate. It is deliberately narrow and fail-closed: any change that is not provably additive — a drop, retype, narrowing, non-null add, contract-boundary crossing, or absent grant — is refused and left for review, and with the opt-in on but no `[policy]` block every drift is governed to require-review rather than mutating ungoverned. A failed `verify_after` halts (halt-only where no rollback substrate exists). (#1075)
+
+### Changed
+
+- State schema `v17 → v18`: a serde-defaulted auto-apply custody field on the policy-decision record. Additive — older state opens forward-compatibly.
+
+
 ## [1.61.0] - 2026-07-09
 
 ### Changed
