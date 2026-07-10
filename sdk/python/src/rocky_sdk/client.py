@@ -642,12 +642,17 @@ class RockyClient:
         stdout_reader.start()
 
         # Watchdog: hard-kill the process group if not dismissed within timeout.
+        # `watchdog_killed` records that the watchdog itself performed the kill,
+        # so a timeout is never inferred from the exit status alone — an external
+        # SIGKILL (e.g. the kernel OOM killer) also yields returncode == -9 and
+        # must surface as a command failure, not a timeout.
         fired = threading.Event()
+        watchdog_killed = threading.Event()
 
         def _watchdog() -> None:
             if not fired.wait(effective_timeout):
+                watchdog_killed.set()
                 kill_process_group(proc)
-                fired.set()
 
         watchdog = threading.Thread(target=_watchdog, daemon=True, name="rocky-watchdog")
         watchdog.start()
@@ -669,9 +674,14 @@ class RockyClient:
         stdout = "".join(stdout_chunks)
         stderr_tail = "\n".join(stderr_lines[-20:])
 
-        # On POSIX a SIGKILL'd process has returncode == -SIGKILL — the canonical
-        # timeout marker. On Windows proc.kill() leaves returncode == 1.
-        killed_by_watchdog = os.name != "nt" and proc.returncode == -signal.SIGKILL
+        # A timeout requires both signals: the watchdog fired AND the exit status
+        # reflects its kill (POSIX: -SIGKILL; Windows: proc.kill() exits non-zero).
+        # The returncode guard drops the race where the process finished on its
+        # own in the instant before the kill landed.
+        if os.name == "nt":
+            killed_by_watchdog = watchdog_killed.is_set() and proc.returncode != 0
+        else:
+            killed_by_watchdog = watchdog_killed.is_set() and proc.returncode == -signal.SIGKILL
 
         if killed_by_watchdog:
             outcome = "timeout-killed"
