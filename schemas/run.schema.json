@@ -451,7 +451,6 @@
         }
       },
       "required": [
-        "adaptive_concurrency",
         "concurrency",
         "tables_failed",
         "tables_processed"
@@ -894,7 +893,6 @@
         }
       },
       "required": [
-        "batched_with",
         "end",
         "key",
         "start"
@@ -933,7 +931,6 @@
         "model",
         "partitions_failed",
         "partitions_planned",
-        "partitions_skipped",
         "partitions_succeeded"
       ],
       "type": "object"
@@ -1024,9 +1021,7 @@
       "required": [
         "asset_key",
         "mode",
-        "ok",
-        "quarantine_table",
-        "valid_table"
+        "ok"
       ],
       "type": "object"
     },
@@ -1360,24 +1355,18 @@
     }
   },
   "required": [
-    "anomalies",
     "check_results",
     "command",
     "drift",
     "duration_ms",
-    "errors",
     "execution",
     "filter",
     "interrupted",
     "materializations",
-    "partition_summaries",
     "permissions",
-    "quarantine",
-    "shadow",
     "status",
     "tables_copied",
     "tables_failed",
-    "tables_skipped",
     "version"
   ],
   "title": "RunOutput",

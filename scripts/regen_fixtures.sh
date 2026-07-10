@@ -106,6 +106,26 @@ capture dag dag --models models
 # so `rocky cost latest` rolls up real per-model durations / bytes / cost.
 capture cost cost latest
 
+# apply: `rocky apply` emits NO wrapping envelope — it prints the plan-kind's
+# own output. The 01-replication-basics POC is a replication pipeline, so a
+# fresh `rocky plan` + `rocky apply <plan_id>` prints a run-shaped `RunOutput`
+# (command:"run"). We plan first, extract the content-addressed plan_id, then
+# apply it and capture the result as apply.json — a live capture of what the
+# engine actually emits (replacing the old hand-made `{plan_id, plan_kind,
+# success, result}` envelope the engine never produced). Placed LAST in this
+# section because the apply performs another run, which would otherwise
+# pollute the history / optimize / cost captures above with an extra record.
+echo "==> apply (plan then apply)"
+_PLAN_JSON=$("$ROCKY" plan --filter source=orders 2>/dev/null || true)
+_PLAN_ID=$(printf '%s' "$_PLAN_JSON" \
+    | python3 -c "import sys, json; print(json.load(sys.stdin).get('plan_id', ''))" 2>/dev/null || true)
+if [[ -n "$_PLAN_ID" ]]; then
+    "$ROCKY" apply "$_PLAN_ID" 2>/dev/null > "$DEST/apply.json" || true
+    python3 "$NORMALIZER" "$DEST/apply.json"
+else
+    echo "==> WARNING: could not extract plan_id for apply capture; skipping apply.json" >&2
+fi
+
 # Drift detection requires the engine to detect schema changes against an
 # already-existing target. The 01-replication-basics POC always uses
 # full_refresh, so there's no drift to detect. We capture an empty drift

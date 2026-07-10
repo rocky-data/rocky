@@ -71,7 +71,7 @@ export interface PreviewPrunedModel {
   /**
    * Columns the diff reports as changed on this model. Only populated when `reason = "changed"`.
    */
-  changed_columns: string[];
+  changed_columns?: string[];
   model_name: string;
   /**
    * `"changed"` for models the diff identified directly, or `"downstream_of_changed"` for models pulled in by column-level lineage from a changed model.

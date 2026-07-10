@@ -112,11 +112,7 @@ from .types import (
     Diagnostic,
     DiscoverResult,
     DoctorResult,
-    DriftActionKind,
-    DriftDetectResult,
-    DriftedColumn,
     DriftInfo,
-    DriftTableResult,
     ExecutionSummary,
     FailedSourceOutput,
     FreshnessConfig,
@@ -322,11 +318,6 @@ __all__ = [
     "DoctorResult",
     "HealthCheck",
     "HealthStatus",
-    # Drift
-    "DriftDetectResult",
-    "DriftTableResult",
-    "DriftedColumn",
-    "DriftActionKind",
     # Governance (Waves B + C-2 — compliance + retention)
     "ComplianceOutput",
     "ComplianceException",
