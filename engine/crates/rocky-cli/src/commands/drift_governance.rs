@@ -29,7 +29,9 @@ use tracing::warn;
 
 use rocky_core::auto_apply::{self, RefuseReason};
 use rocky_core::breaking_change::BreakingFinding;
-use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal, RockyConfig};
+use rocky_core::config::{
+    PolicyCapability, PolicyConfig, PolicyEffect, PolicyPrincipal, RockyConfig,
+};
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::state::{AutoApplyCustody, PolicyDecisionRecord, StateStore};
 use rocky_ir::DriftResult;
@@ -65,11 +67,24 @@ pub(crate) enum GovernDecision {
 #[derive(Debug, Clone)]
 pub(crate) struct DriftGovernor {
     run_id: String,
+    /// The *static* policy effect resolved at build time. [`Self::govern`]
+    /// tightens it with the ledger-derived breakers (active freezes, autonomy
+    /// budget burn) before deciding — the same
+    /// [`policy::autonomy_degradation`] step the shared apply seam runs.
     effect: PolicyEffect,
     matched_rule: Option<usize>,
     policy_reason: String,
     verify_after: Vec<String>,
     contracted: bool,
+    /// The `[policy]` block, kept so `govern` can project the winning rule's
+    /// autonomy budget over the decision ledger. `None` when the governor was
+    /// built in the no-`[policy]` fail-closed posture (nothing is granted, so
+    /// there is no budget to project).
+    policy: Option<PolicyConfig>,
+    /// The attributes the static decision was evaluated against — reused for
+    /// the dynamic breakers so freeze scope selectors match the same identity
+    /// the `[policy]` scope matched.
+    attrs: ModelAttributes,
 }
 
 impl DriftGovernor {
@@ -92,6 +107,10 @@ impl DriftGovernor {
         // Govern with a no-grant, fail-closed posture instead: the effect is
         // `require_review`, so `is_auto_apply_eligible` refuses every drift until
         // a `[policy]` rule explicitly grants `schema_change.additive`.
+        let attrs = ModelAttributes {
+            name: model_name.to_string(),
+            ..Default::default()
+        };
         let Some(policy) = cfg.policy.as_ref() else {
             return Some(Self {
                 run_id: run_id.to_string(),
@@ -102,11 +121,9 @@ impl DriftGovernor {
                         .to_string(),
                 verify_after: Vec::new(),
                 contracted: false,
+                policy: None,
+                attrs,
             });
-        };
-        let attrs = ModelAttributes {
-            name: model_name.to_string(),
-            ..Default::default()
         };
         let decision = policy::evaluate(
             policy,
@@ -126,41 +143,93 @@ impl DriftGovernor {
             policy_reason: decision.reason,
             verify_after,
             contracted: false,
+            policy: Some(policy.clone()),
+            attrs,
         })
     }
 
     /// Govern one detected drift: classify, decide, and record custody.
     ///
     /// `model` is the fully-qualified target name the custody row is attributed
-    /// to. Writes exactly one decision row (applied or refused) via the shared
-    /// state store, then returns the decision. Fail-closed: anything not
+    /// to. The static build-time effect is first tightened by the dynamic
+    /// ledger breakers — an active `rocky policy freeze` matching the agent
+    /// principal forces `deny`, an exhausted autonomy budget degrades `allow`
+    /// to `require_review` — exactly as the shared apply seam does after
+    /// `policy::evaluate`. The ledger snapshot is taken per govern call,
+    /// before this decision's own row is written. Fail-closed: an unreadable
+    /// ledger degrades the effect to at least `require_review` (a possibly
+    /// active freeze must never be silently invisible), and anything not
     /// provably additive+allowed is a [`GovernDecision::Refuse`].
+    ///
+    /// Writes exactly one **plain** decision row (empty `verify_after`,
+    /// `rule_id` = the winning rule) under `autoapply:<run_id>`, mirroring the
+    /// apply seam's row shape so [`policy::budget_failures_in_window`] can
+    /// pair it with the post-run verification row
+    /// [`finalize_drift_verify_after`] files under the *same* plan id — the
+    /// pairing that lets repeated auto-heal verification failures burn the
+    /// granting rule's autonomy budget.
     pub(crate) async fn govern(
         &self,
         drift: &DriftResult,
         model: &str,
         state: &Mutex<StateStore>,
     ) -> GovernDecision {
+        let guard = state.lock().await;
+
+        // Dynamic tightening over the prior decision ledger (freeze → deny,
+        // exhausted budget → require_review). Monotone: never widens the
+        // static effect.
+        let (effect, degrade_suffix): (PolicyEffect, Option<String>) =
+            match guard.list_policy_decisions() {
+                Ok(prior) => match &self.policy {
+                    Some(policy) => {
+                        let (effect, degradation) = policy::autonomy_degradation(
+                            self.effect,
+                            self.matched_rule,
+                            policy,
+                            PolicyPrincipal::Agent,
+                            &self.attrs,
+                            &prior,
+                            chrono::Utc::now(),
+                        );
+                        (effect, degradation.reason_suffix())
+                    }
+                    // No [policy] block: the static posture is already the
+                    // fail-closed require-review floor and grants nothing, so
+                    // there is no budget (or enforceable freeze) to project.
+                    None => (self.effect, None),
+                },
+                // Fail-closed: with the ledger unreadable, a possibly-active
+                // freeze is invisible — never proceed on the static allow.
+                Err(e) => (
+                    tighten_to_require_review(self.effect),
+                    Some(format!(
+                        "policy ledger unreadable ({e}) — freeze/budget state unverifiable, \
+                         degraded to require_review (fail-closed)"
+                    )),
+                ),
+            };
+
         let findings = auto_apply::drift_findings(drift, model);
         let refs: Vec<&BreakingFinding> = findings.iter().collect();
         let classification = policy::classify_model_findings(&refs);
-        let verdict = auto_apply::is_auto_apply_eligible(
-            &findings,
-            classification,
-            self.effect,
-            self.contracted,
-        );
+        let verdict =
+            auto_apply::is_auto_apply_eligible(&findings, classification, effect, self.contracted);
         let applied = verdict.is_apply();
         let summary = auto_apply::drift_summary(drift);
 
-        let (effect, reason) = if applied {
-            (
-                PolicyEffect::Allow,
-                format!(
-                    "auto-applied additive drift on '{model}' ({summary}); {}",
-                    self.policy_reason
-                ),
-            )
+        let (row_effect, mut reason) = if applied {
+            let mut reason = format!(
+                "auto-applied additive drift on '{model}' ({summary}); {}",
+                self.policy_reason
+            );
+            if !self.verify_after.is_empty() {
+                reason.push_str(&format!(
+                    "; verify_after due post-run: [{}]",
+                    self.verify_after.join(", ")
+                ));
+            }
+            (PolicyEffect::Allow, reason)
         } else {
             let detail = verdict
                 .refuse_reason()
@@ -168,15 +237,19 @@ impl DriftGovernor {
                 .unwrap_or_default();
             // A hard `deny` is preserved; every other refusal is a
             // require-review fallback (fail-safe, never a silent apply).
-            let effect = match verdict.refuse_reason() {
+            let row_effect = match verdict.refuse_reason() {
                 Some(RefuseReason::PolicyNotAllow(PolicyEffect::Deny)) => PolicyEffect::Deny,
                 _ => PolicyEffect::RequireReview,
             };
             (
-                effect,
+                row_effect,
                 format!("auto-apply of drift on '{model}' refused: {detail} ({summary})"),
             )
         };
+        if let Some(suffix) = &degrade_suffix {
+            reason.push_str("; ");
+            reason.push_str(suffix);
+        }
 
         let record = PolicyDecisionRecord {
             timestamp: chrono::Utc::now(),
@@ -184,16 +257,16 @@ impl DriftGovernor {
             principal: PolicyPrincipal::Agent,
             capability: PolicyCapability::SchemaChangeAdditive,
             model: model.to_string(),
-            effect,
+            effect: row_effect,
             rule_id: self.matched_rule,
             reason: reason.clone(),
-            // The applied row carries the checks the post-run gate must
-            // confirm; a refused row applied nothing, so it carries none.
-            verify_after: if applied {
-                self.verify_after.clone()
-            } else {
-                Vec::new()
-            },
+            // A PLAIN evaluation row — the required post-run checks ride on
+            // the verification outcome row `finalize_drift_verify_after`
+            // files under the same plan id. Keeping this row plain is what
+            // lets `budget_failures_in_window` attribute a later verification
+            // failure to `rule_id` (its attribution leg only matches rows
+            // with an empty `verify_after`).
+            verify_after: Vec::new(),
             auto_apply: Some(AutoApplyCustody {
                 drift_summary: summary,
                 classification: capability_wire(classification).to_string(),
@@ -206,23 +279,30 @@ impl DriftGovernor {
                 revert_pointer: revert_pointer_for(),
             }),
         };
-        {
-            let guard = state.lock().await;
-            if let Err(e) = guard.record_policy_decision(&record) {
-                warn!(
-                    target: "rocky::policy",
-                    error = %e,
-                    model,
-                    "failed to record auto-apply custody entry (continuing)"
-                );
-            }
+        if let Err(e) = guard.record_policy_decision(&record) {
+            warn!(
+                target: "rocky::policy",
+                error = %e,
+                model,
+                "failed to record auto-apply custody entry (continuing)"
+            );
         }
+        drop(guard);
 
         if applied {
             GovernDecision::Apply
         } else {
             GovernDecision::Refuse(reason)
         }
+    }
+}
+
+/// Tighten `effect` to at least `require_review` — the fail-closed floor for
+/// an unreadable ledger. Never softens a `deny`.
+fn tighten_to_require_review(effect: PolicyEffect) -> PolicyEffect {
+    match effect {
+        PolicyEffect::Allow => PolicyEffect::RequireReview,
+        PolicyEffect::RequireReview | PolicyEffect::Deny => effect,
     }
 }
 
@@ -239,16 +319,17 @@ fn revert_pointer_for() -> Option<String> {
     None
 }
 
-/// The `plan_id` under which this run's auto-apply *decision* rows are filed.
+/// The `plan_id` under which this run's auto-apply rows are filed — both the
+/// plain decision rows `govern` writes and the post-run verification rows
+/// [`finalize_drift_verify_after`] writes. Sharing one plan id is what lets
+/// [`policy::budget_failures_in_window`] pair a verification failure (a
+/// `deny` row with a non-empty `verify_after`) with the plain decision row
+/// carrying the granting `rule_id`, so repeated auto-heal verification
+/// failures burn that rule's autonomy budget. The two row shapes stay
+/// distinguishable by `verify_after` (empty = decision, non-empty =
+/// verification outcome).
 fn decision_plan_id(run_id: &str) -> String {
     format!("autoapply:{run_id}")
-}
-
-/// The `plan_id` under which this run's post-apply *verification* rows are
-/// filed (kept distinct from the decision rows so a re-scan never confuses
-/// the two).
-fn verify_plan_id(run_id: &str) -> String {
-    format!("autoapply-verify:{run_id}")
 }
 
 /// Run the post-apply `verify_after` gate over every table this run
@@ -256,16 +337,24 @@ fn verify_plan_id(run_id: &str) -> String {
 ///
 /// Reads the run's recorded [`check_outcomes`](rocky_core::state::RunRecord)
 /// — the same pass/fail the two-step `rocky apply` gate reads — and, for each
-/// applied auto-heal that required named checks, confirms every required check
-/// ran and passed. Duplicate check names (a per-table check emitted once per
-/// table) are AND-aggregated, so a required check passes only if every
-/// occurrence passed. Records an `allow`/`deny` verification custody row per
-/// table and returns `Err` (halting the run) when any required check failed or
-/// was absent — the migration already landed and, with no rollback substrate,
-/// stays in place until a human reverts it.
+/// applied auto-heal whose granting rule requires named checks (`policy`
+/// resolves `rule_id` → the rule's `verify_after` list), confirms every
+/// required check ran and passed. Duplicate check names (a per-table check
+/// emitted once per table) are AND-aggregated, so a required check passes only
+/// if every occurrence passed. Records an `allow`/`deny` verification custody
+/// row per table — under the **same** `autoapply:<run_id>` plan id as the
+/// decision rows, so a failure burns the granting rule's autonomy budget (see
+/// [`decision_plan_id`]) — and returns `Err` (halting the run) when any
+/// required check failed or was absent. The migration already landed and,
+/// with no rollback substrate, stays in place until a human reverts it.
 ///
-/// A no-op when the store is unavailable or nothing was auto-applied.
-pub(crate) fn finalize_drift_verify_after(store: Option<&StateStore>, run_id: &str) -> Result<()> {
+/// A no-op when the store is unavailable, nothing was auto-applied, or no
+/// granting rule demanded checks.
+pub(crate) fn finalize_drift_verify_after(
+    store: Option<&StateStore>,
+    run_id: &str,
+    policy: Option<&PolicyConfig>,
+) -> Result<()> {
     let Some(store) = store else {
         return Ok(());
     };
@@ -273,12 +362,15 @@ pub(crate) fn finalize_drift_verify_after(store: Option<&StateStore>, run_id: &s
         return Ok(());
     };
     let decision_plan = decision_plan_id(run_id);
+    // Applied decision rows are PLAIN (empty verify_after); the non-empty
+    // filter excludes verification-outcome rows a partial earlier finalize
+    // may have written under the same plan id.
     let healed: Vec<&PolicyDecisionRecord> = decisions
         .iter()
         .filter(|d| {
             d.plan_id == decision_plan
                 && d.auto_apply.as_ref().is_some_and(|a| a.applied)
-                && !d.verify_after.is_empty()
+                && d.verify_after.is_empty()
         })
         .collect();
     if healed.is_empty() {
@@ -304,11 +396,24 @@ pub(crate) fn finalize_drift_verify_after(store: Option<&StateStore>, run_id: &s
         _ => std::collections::BTreeMap::new(),
     };
 
-    let verify_plan = verify_plan_id(run_id);
     let mut halted: Vec<String> = Vec::new();
     for d in healed {
+        // The checks the granting rule requires, resolved from the plain
+        // decision row's `rule_id`. No rule / no policy / no checks ⇒ this
+        // heal carries no post-run gate.
+        let required: Vec<String> = match (d.rule_id, policy) {
+            (Some(idx), Some(policy)) => policy
+                .rules
+                .get(idx)
+                .map(|r| r.verify_after.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if required.is_empty() {
+            continue;
+        }
         let mut failures: Vec<String> = Vec::new();
-        for name in &d.verify_after {
+        for name in &required {
             match outcomes.get(name) {
                 Some(true) => {}
                 Some(false) => failures.push(format!("{name} (failed)")),
@@ -320,7 +425,7 @@ pub(crate) fn finalize_drift_verify_after(store: Option<&StateStore>, run_id: &s
             format!(
                 "verify_after passed for auto-applied drift on '{}': [{}]",
                 d.model,
-                d.verify_after.join(", ")
+                required.join(", ")
             )
         } else {
             format!(
@@ -330,9 +435,13 @@ pub(crate) fn finalize_drift_verify_after(store: Option<&StateStore>, run_id: &s
                 failures.join("; ")
             )
         };
+        // Filed under the SAME plan id as the decision row (see
+        // `decision_plan_id`): a `deny` outcome here + the plain decision row
+        // carrying `rule_id` is exactly the pair
+        // `budget_failures_in_window` counts against the granting rule.
         let record = PolicyDecisionRecord {
             timestamp: chrono::Utc::now(),
-            plan_id: verify_plan.clone(),
+            plan_id: decision_plan.clone(),
             principal: PolicyPrincipal::Agent,
             capability: PolicyCapability::SchemaChangeAdditive,
             model: d.model.clone(),
@@ -341,9 +450,11 @@ pub(crate) fn finalize_drift_verify_after(store: Option<&StateStore>, run_id: &s
             } else {
                 PolicyEffect::Deny
             },
-            rule_id: None,
+            // Keep the granting rule on the outcome row for the audit trail;
+            // budget attribution reads the plain decision row, never this one.
+            rule_id: d.rule_id,
             reason: reason.clone(),
-            verify_after: d.verify_after.clone(),
+            verify_after: required.clone(),
             auto_apply: d.auto_apply.clone(),
         };
         if let Err(e) = store.record_policy_decision(&record) {
@@ -523,7 +634,43 @@ mod tests {
         );
     }
 
-    fn applied_decision(run_id: &str, model: &str, checks: &[&str]) -> PolicyDecisionRecord {
+    /// A `[policy]` block whose rule 0 grants `schema_change.additive` on any
+    /// scope with the given `verify_after` checks and optional budget — the
+    /// shape the finalize gate resolves required checks from.
+    fn granting_policy(
+        checks: &[&str],
+        budget: Option<rocky_core::config::AutonomyBudget>,
+    ) -> PolicyConfig {
+        PolicyConfig {
+            version: 1,
+            default_agent_effect: PolicyEffect::RequireReview,
+            rules: vec![rocky_core::config::PolicyRule {
+                principal: PolicyPrincipal::Agent,
+                capability: PolicyCapability::SchemaChangeAdditive,
+                scope: rocky_core::config::PolicyScope {
+                    any: true,
+                    ..Default::default()
+                },
+                effect: PolicyEffect::Allow,
+                verify_after: checks.iter().map(ToString::to_string).collect(),
+                conditions: None,
+                autonomy_budget: budget,
+            }],
+            tests: Vec::new(),
+        }
+    }
+
+    /// A config with the auto-apply opt-in ON and the given `[policy]` block.
+    fn cfg_opt_in_with_policy(policy: PolicyConfig) -> RockyConfig {
+        let mut cfg = cfg_opt_in_no_policy();
+        cfg.policy = Some(policy);
+        cfg
+    }
+
+    /// An applied auto-heal *decision* row in the post-fix shape: PLAIN
+    /// (empty `verify_after`), `rule_id` = the granting rule, custody payload
+    /// attached. Written by `govern` under `autoapply:<run_id>`.
+    fn applied_decision(run_id: &str, model: &str) -> PolicyDecisionRecord {
         PolicyDecisionRecord {
             timestamp: chrono::Utc::now(),
             plan_id: decision_plan_id(run_id),
@@ -533,7 +680,7 @@ mod tests {
             effect: PolicyEffect::Allow,
             rule_id: Some(0),
             reason: "auto-applied".to_string(),
-            verify_after: checks.iter().map(ToString::to_string).collect(),
+            verify_after: Vec::new(),
             auto_apply: Some(AutoApplyCustody {
                 drift_summary: "added nullable column 'email' (VARCHAR)".to_string(),
                 classification: "schema_change.additive".to_string(),
@@ -541,6 +688,17 @@ mod tests {
                 revert_pointer: None,
             }),
         }
+    }
+
+    /// Find this run's verification-outcome rows: filed under the SAME plan id
+    /// as the decision rows, distinguished by a non-empty `verify_after`.
+    fn verify_rows(store: &StateStore, run_id: &str) -> Vec<PolicyDecisionRecord> {
+        store
+            .list_policy_decisions()
+            .unwrap()
+            .into_iter()
+            .filter(|d| d.plan_id == decision_plan_id(run_id) && !d.verify_after.is_empty())
+            .collect()
     }
 
     fn run_with_checks(run_id: &str, checks: &[(&str, bool)]) -> rocky_core::state::RunRecord {
@@ -573,69 +731,70 @@ mod tests {
     #[test]
     fn no_auto_heals_is_ok() {
         let (store, _d) = temp_store();
-        assert!(finalize_drift_verify_after(Some(&store), "run-1").is_ok());
+        let policy = granting_policy(&["row_count"], None);
+        assert!(finalize_drift_verify_after(Some(&store), "run-1", Some(&policy)).is_ok());
     }
 
     #[test]
     fn passing_verify_after_records_allow_and_succeeds() {
         let (store, _d) = temp_store();
+        let policy = granting_policy(&["row_count"], None);
         store
-            .record_policy_decision(&applied_decision("run-1", "wh.raw.orders", &["row_count"]))
+            .record_policy_decision(&applied_decision("run-1", "wh.raw.orders"))
             .unwrap();
         store
             .record_run(&run_with_checks("run-1", &[("row_count", true)]))
             .unwrap();
-        assert!(finalize_drift_verify_after(Some(&store), "run-1").is_ok());
-        // A verification custody row was written with effect=allow.
-        let all = store.list_policy_decisions().unwrap();
-        let verify = verify_plan_id("run-1");
-        let v = all
-            .iter()
-            .find(|d| d.plan_id == verify)
-            .expect("verify row");
-        assert_eq!(v.effect, PolicyEffect::Allow);
+        assert!(finalize_drift_verify_after(Some(&store), "run-1", Some(&policy)).is_ok());
+        // A verification custody row was written with effect=allow, under the
+        // same plan id as the decision row.
+        let rows = verify_rows(&store, "run-1");
+        assert_eq!(rows.len(), 1, "one verification outcome row");
+        assert_eq!(rows[0].effect, PolicyEffect::Allow);
+        assert_eq!(rows[0].verify_after, vec!["row_count".to_string()]);
     }
 
     #[test]
     fn failing_verify_after_halts_and_records_deny() {
         let (store, _d) = temp_store();
+        let policy = granting_policy(&["row_count"], None);
         store
-            .record_policy_decision(&applied_decision("run-2", "wh.raw.orders", &["row_count"]))
+            .record_policy_decision(&applied_decision("run-2", "wh.raw.orders"))
             .unwrap();
         store
             .record_run(&run_with_checks("run-2", &[("row_count", false)]))
             .unwrap();
-        let err = finalize_drift_verify_after(Some(&store), "run-2").unwrap_err();
+        let err = finalize_drift_verify_after(Some(&store), "run-2", Some(&policy)).unwrap_err();
         assert!(
             err.to_string().contains("verify_after gate FAILED"),
             "{err}"
         );
-        let all = store.list_policy_decisions().unwrap();
-        let verify = verify_plan_id("run-2");
-        let v = all
-            .iter()
-            .find(|d| d.plan_id == verify)
-            .expect("verify row");
-        assert_eq!(v.effect, PolicyEffect::Deny);
+        let rows = verify_rows(&store, "run-2");
+        assert_eq!(rows.len(), 1, "one verification outcome row");
+        assert_eq!(rows[0].effect, PolicyEffect::Deny);
+        // Custody detail from the decision row is preserved on the outcome row.
+        assert!(rows[0].auto_apply.as_ref().is_some_and(|a| a.applied));
     }
 
     #[test]
     fn absent_required_check_halts() {
         // The required check never ran ⇒ fail closed (halt).
         let (store, _d) = temp_store();
+        let policy = granting_policy(&["row_count"], None);
         store
-            .record_policy_decision(&applied_decision("run-3", "wh.raw.orders", &["row_count"]))
+            .record_policy_decision(&applied_decision("run-3", "wh.raw.orders"))
             .unwrap();
         store.record_run(&run_with_checks("run-3", &[])).unwrap();
-        assert!(finalize_drift_verify_after(Some(&store), "run-3").is_err());
+        assert!(finalize_drift_verify_after(Some(&store), "run-3", Some(&policy)).is_err());
     }
 
     #[test]
     fn duplicate_check_names_and_aggregate() {
         // Same check emitted twice, one failing ⇒ the name fails (AND).
         let (store, _d) = temp_store();
+        let policy = granting_policy(&["row_count"], None);
         store
-            .record_policy_decision(&applied_decision("run-4", "wh.raw.orders", &["row_count"]))
+            .record_policy_decision(&applied_decision("run-4", "wh.raw.orders"))
             .unwrap();
         store
             .record_run(&run_with_checks(
@@ -643,6 +802,277 @@ mod tests {
                 &[("row_count", true), ("row_count", false)],
             ))
             .unwrap();
-        assert!(finalize_drift_verify_after(Some(&store), "run-4").is_err());
+        assert!(finalize_drift_verify_after(Some(&store), "run-4", Some(&policy)).is_err());
+    }
+
+    /// A freeze-decision row exactly as `rocky policy freeze` records it.
+    fn freeze_record(principal: PolicyPrincipal, scope: &str) -> PolicyDecisionRecord {
+        let now = chrono::Utc::now();
+        let label = match principal {
+            PolicyPrincipal::Agent => "agent",
+            PolicyPrincipal::Human => "human",
+        };
+        PolicyDecisionRecord {
+            timestamp: now,
+            plan_id: format!("{}{label}:{}", policy::FREEZE_PLAN_PREFIX, now.to_rfc3339()),
+            principal,
+            capability: PolicyCapability::Apply,
+            model: scope.to_string(),
+            effect: PolicyEffect::Deny,
+            rule_id: None,
+            reason: "policy freeze: agent actions frozen to deny".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        }
+    }
+
+    /// 🔴 Regression (freeze seam): an active `rocky policy freeze` matching
+    /// the agent principal must make the auto-apply governor refuse a drift
+    /// that a `[policy]` rule statically grants. Pre-fix, `govern` used only
+    /// the build-time static effect — the freeze ledger was never consulted —
+    /// so the additive add auto-applied straight through an active freeze.
+    #[tokio::test]
+    async fn active_freeze_blocks_auto_apply_even_with_a_granting_rule() {
+        let cfg = cfg_opt_in_with_policy(granting_policy(&[], None));
+        let gov = DriftGovernor::build(&cfg, "run-fz", "wh.raw.orders").expect("governor present");
+        assert_eq!(
+            gov.effect,
+            PolicyEffect::Allow,
+            "the static grant must be allow — otherwise this test is vacuous"
+        );
+
+        let (store, _d) = temp_store();
+        store
+            .record_policy_decision(&freeze_record(PolicyPrincipal::Agent, "any"))
+            .unwrap();
+        let state = Mutex::new(store);
+
+        let d = gov
+            .govern(&additive_add_drift(), "wh.raw.orders", &state)
+            .await;
+        let GovernDecision::Refuse(reason) = d else {
+            panic!("an active agent freeze must refuse the auto-apply");
+        };
+        assert!(
+            reason.contains("freeze"),
+            "refusal must cite the freeze: {reason}"
+        );
+
+        // The custody row records the freeze-forced deny.
+        let decisions = state.lock().await.list_policy_decisions().unwrap();
+        let row = decisions
+            .iter()
+            .find(|r| r.plan_id == decision_plan_id("run-fz"))
+            .expect("custody row");
+        assert_eq!(row.effect, PolicyEffect::Deny);
+        assert!(row.auto_apply.as_ref().is_some_and(|a| !a.applied));
+    }
+
+    /// A human-scoped freeze does not gate the agent's auto-apply (principals
+    /// are matched, not blanket): the granting rule still applies.
+    #[tokio::test]
+    async fn human_scoped_freeze_does_not_block_agent_auto_apply() {
+        let cfg = cfg_opt_in_with_policy(granting_policy(&[], None));
+        let gov = DriftGovernor::build(&cfg, "run-hfz", "wh.raw.orders").expect("governor");
+        let (store, _d) = temp_store();
+        store
+            .record_policy_decision(&freeze_record(PolicyPrincipal::Human, "any"))
+            .unwrap();
+        let state = Mutex::new(store);
+        let d = gov
+            .govern(&additive_add_drift(), "wh.raw.orders", &state)
+            .await;
+        assert!(
+            matches!(d, GovernDecision::Apply),
+            "a human-principal freeze must not gate the agent grant"
+        );
+    }
+
+    /// 🔴 Regression (budget seam): an exhausted autonomy budget on the
+    /// granting rule must degrade the auto-apply grant to require-review.
+    /// Pre-fix, `govern` never projected the budget, so the grant stood
+    /// regardless of prior verify-after failures.
+    #[tokio::test]
+    async fn exhausted_autonomy_budget_degrades_auto_apply_to_refuse() {
+        let budget = rocky_core::config::AutonomyBudget {
+            failures: 1,
+            window: "7d".to_string(),
+        };
+        let cfg = cfg_opt_in_with_policy(granting_policy(&["row_count"], Some(budget)));
+        let gov = DriftGovernor::build(&cfg, "run-b2", "wh.raw.orders").expect("governor");
+        assert_eq!(gov.effect, PolicyEffect::Allow);
+
+        let (store, _d) = temp_store();
+        // Seed a prior run's failed auto-heal in the post-fix row shape: a
+        // plain decision row attributing rule 0 + a deny verification row with
+        // a non-empty verify_after, both under the same plan id.
+        store
+            .record_policy_decision(&applied_decision("run-b1", "wh.raw.orders"))
+            .unwrap();
+        store
+            .record_policy_decision(&PolicyDecisionRecord {
+                timestamp: chrono::Utc::now(),
+                plan_id: decision_plan_id("run-b1"),
+                principal: PolicyPrincipal::Agent,
+                capability: PolicyCapability::SchemaChangeAdditive,
+                model: "wh.raw.orders".to_string(),
+                effect: PolicyEffect::Deny,
+                rule_id: Some(0),
+                reason: "verify_after FAILED".to_string(),
+                verify_after: vec!["row_count".to_string()],
+                auto_apply: None,
+            })
+            .unwrap();
+        let state = Mutex::new(store);
+
+        let d = gov
+            .govern(&additive_add_drift(), "wh.raw.orders", &state)
+            .await;
+        let GovernDecision::Refuse(reason) = d else {
+            panic!("an exhausted autonomy budget must refuse the auto-apply");
+        };
+        assert!(
+            reason.contains("autonomy budget exhausted"),
+            "refusal must cite the budget: {reason}"
+        );
+    }
+
+    /// 🔴 THE row-shape regression: a failed auto-heal verification must burn
+    /// the granting rule's autonomy budget. Pre-fix the two ledger rows could
+    /// never pair — the decision row carried a non-empty `verify_after` (so it
+    /// failed the attribution leg of `budget_failures_in_window`) and the
+    /// verification row was filed under a *different* plan id
+    /// (`autoapply-verify:<run_id>`), so the failure leg pointed at a plan
+    /// with no attribution row. The count stayed 0 forever, and repeated
+    /// auto-heal failures never degraded the rule.
+    #[tokio::test]
+    async fn auto_heal_verify_failure_burns_the_granting_rules_budget() {
+        let policy = granting_policy(&["row_count"], None);
+        let cfg = cfg_opt_in_with_policy(policy.clone());
+        let gov = DriftGovernor::build(&cfg, "run-burn", "wh.raw.orders").expect("governor");
+
+        let (store, _d) = temp_store();
+        let state = Mutex::new(store);
+
+        // The governed heal applies (grant is allow, drift provably additive).
+        let d = gov
+            .govern(&additive_add_drift(), "wh.raw.orders", &state)
+            .await;
+        assert!(matches!(d, GovernDecision::Apply), "the heal must apply");
+
+        let store = state.into_inner();
+
+        // The decision row is PLAIN (empty verify_after) with the granting
+        // rule attributed, and preserves the custody payload.
+        let decision = store
+            .list_policy_decisions()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.plan_id == decision_plan_id("run-burn"))
+            .expect("decision row");
+        assert!(
+            decision.verify_after.is_empty(),
+            "the decision row must be plain so budget attribution can match it"
+        );
+        assert_eq!(decision.rule_id, Some(0));
+        let custody = decision.auto_apply.as_ref().expect("custody payload");
+        assert!(custody.applied);
+        assert_eq!(custody.classification, "schema_change.additive");
+        assert!(custody.drift_summary.contains("email"));
+
+        // The required check fails post-run; the finalize gate halts and files
+        // the deny verification row under the SAME plan id.
+        store
+            .record_run(&run_with_checks("run-burn", &[("row_count", false)]))
+            .unwrap();
+        let err = finalize_drift_verify_after(Some(&store), "run-burn", Some(&policy)).unwrap_err();
+        assert!(err.to_string().contains("verify_after gate FAILED"));
+
+        // The pair now counts against rule 0's budget.
+        let decisions = store.list_policy_decisions().unwrap();
+        let failures = policy::budget_failures_in_window(
+            &decisions,
+            0,
+            chrono::Duration::days(7),
+            chrono::Utc::now(),
+        );
+        assert_eq!(
+            failures, 1,
+            "the failed auto-heal verification must burn the granting rule's budget"
+        );
+    }
+
+    /// 🔴 Load-bearing pin for the FIX 1 row-shape change: prove the reshape
+    /// is *necessary*, not just sufficient. `budget_failures_in_window` (in
+    /// rocky-core, untouched here) counts a failure only when a plain
+    /// evaluation row (empty `verify_after`, `rule_id = Some(idx)`) and a
+    /// verify-failure row (non-empty `verify_after`, `deny`) share the SAME
+    /// `plan_id`. This test constructs BOTH the old and the new row shapes
+    /// directly and asserts the pairing outcome for each:
+    ///   - OLD shapes (decision row with NON-empty `verify_after`; verify row
+    ///     under a DIFFERENT `autoapply-verify:` plan id) → count 0. This is
+    ///     the pre-fix bug: repeated failures never burned the budget.
+    ///   - NEW shapes (plain decision row; verify row under the SAME
+    ///     `autoapply:` plan id) → count 1.
+    ///
+    /// If a future edit reverted either row shape, this test would fail — it
+    /// pins the fix without depending on `govern`/`finalize` internals.
+    #[test]
+    fn old_row_shapes_never_paired_the_budget_new_shapes_do() {
+        let now = chrono::Utc::now();
+        let window = chrono::Duration::days(7);
+
+        // --- OLD shapes (pre-fix) ---
+        // Decision row carried the verify_after list (non-empty) → fails the
+        // attribution leg (which requires empty verify_after).
+        let old_decision = PolicyDecisionRecord {
+            timestamp: now,
+            plan_id: "autoapply:run-old".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::SchemaChangeAdditive,
+            model: "wh.raw.orders".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: Some(0),
+            reason: "auto-applied".to_string(),
+            verify_after: vec!["row_count".to_string()], // NON-empty (the bug)
+            auto_apply: None,
+        };
+        // Verify-failure row filed under a DIFFERENT plan id.
+        let old_verify = PolicyDecisionRecord {
+            timestamp: now,
+            plan_id: "autoapply-verify:run-old".to_string(), // DIFFERENT
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::SchemaChangeAdditive,
+            model: "wh.raw.orders".to_string(),
+            effect: PolicyEffect::Deny,
+            rule_id: None,
+            reason: "verify_after FAILED".to_string(),
+            verify_after: vec!["row_count".to_string()],
+            auto_apply: None,
+        };
+        let old = vec![old_decision, old_verify];
+        assert_eq!(
+            policy::budget_failures_in_window(&old, 0, window, now),
+            0,
+            "the OLD row shapes must never pair — this is the pre-fix data-loss bug"
+        );
+
+        // --- NEW shapes (post-fix) ---
+        // Plain decision row + verify-failure row under the SAME plan id.
+        let new_decision = PolicyDecisionRecord {
+            verify_after: Vec::new(), // PLAIN
+            plan_id: "autoapply:run-new".to_string(),
+            ..old[0].clone()
+        };
+        let new_verify = PolicyDecisionRecord {
+            plan_id: "autoapply:run-new".to_string(), // SAME as the decision row
+            ..old[1].clone()
+        };
+        let new = vec![new_decision, new_verify];
+        assert_eq!(
+            policy::budget_failures_in_window(&new, 0, window, now),
+            1,
+            "the NEW row shapes must pair so the failure burns rule 0's budget"
+        );
     }
 }

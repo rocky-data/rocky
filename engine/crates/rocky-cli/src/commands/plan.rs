@@ -10,7 +10,9 @@ use rocky_core::traits::SqlDialect;
 use rocky_ir::*;
 
 use crate::output::*;
-use crate::plan_store::{EmbeddedCapabilities, PlanKind, write_plan, write_plan_governed};
+use crate::plan_store::{
+    EmbeddedCapabilities, PlanKind, write_plan, write_plan_governed, write_plan_with_principal,
+};
 use crate::registry;
 
 use super::run::PartitionRunOptions;
@@ -1661,6 +1663,7 @@ pub async fn plan_promote(
     pipeline_name: Option<&str>,
     allow_breaking: bool,
     state_path: &Path,
+    principal: PolicyPrincipal,
     output_json: bool,
 ) -> Result<()> {
     let result = build_promote_plan_inner(
@@ -1673,6 +1676,7 @@ pub async fn plan_promote(
         pipeline_name,
         allow_breaking,
         state_path,
+        principal,
     )
     .await?;
 
@@ -1731,6 +1735,12 @@ pub(crate) async fn build_promote_plan_inner(
     pipeline_name: Option<&str>,
     allow_breaking: bool,
     state_path: &Path,
+    // The resolved CLI authoring principal, stamped onto the persisted plan so
+    // a later `rocky apply` evaluates the promote against the identity that
+    // authored it. A human-invoked promote stays `human` (ungated in v0); an
+    // agent-invoked one (`--principal agent` / `ROCKY_PRINCIPAL=agent`) is
+    // gated by `deny agent promote {…}` rules and agent freezes.
+    principal: PolicyPrincipal,
 ) -> Result<PromotePlanResult> {
     use crate::commands::branch::{
         APPROVAL_SKIP_ENV, approver_identity_pub, compute_branch_state_hash_pub,
@@ -1882,7 +1892,7 @@ pub(crate) async fn build_promote_plan_inner(
         created_at,
     };
 
-    let plan_id = write_plan(root, PlanKind::Promote, &promote_plan)
+    let plan_id = write_plan_with_principal(root, PlanKind::Promote, &promote_plan, principal)
         .context("failed to write promote plan")?;
 
     let mut plan_output = PlanOutput::new(filter.unwrap_or("").to_string());

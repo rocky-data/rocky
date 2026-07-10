@@ -4046,6 +4046,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "criterion",
+ "fs4",
  "futures",
  "hostname",
  "indexmap",

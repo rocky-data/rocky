@@ -1184,6 +1184,33 @@ async fn execute_gc_apply(
     })
 }
 
+/// Resolve the models directory the policy evaluator compiles for gc gating.
+///
+/// Mirrors how the backfill apply threads `run_plan.models_dir` instead of a
+/// hardcoded `models`: the base directory comes from the first transformation
+/// pipeline's `models` glob (everything before the first wildcard), resolved
+/// relative to the config file's parent — the same derivation
+/// `crate::scope::resolve_transformation_managed_tables` uses. Falls back to
+/// `models` when no config or no transformation pipeline is present.
+fn gc_models_dir(
+    cfg: Option<&rocky_core::config::RockyConfig>,
+    config_path: &Path,
+) -> std::path::PathBuf {
+    let project_root = config_path.parent().unwrap_or(Path::new(""));
+    let glob = cfg.and_then(|c| {
+        c.pipelines.values().find_map(|p| match p {
+            rocky_core::config::PipelineConfig::Transformation(t) => Some(t.models.clone()),
+            _ => None,
+        })
+    });
+    let base = glob
+        .as_deref()
+        .and_then(|g| g.split(&['*', '?', '['][..]).next())
+        .filter(|b| !b.is_empty())
+        .unwrap_or("models");
+    project_root.join(base.trim_end_matches('/'))
+}
+
 /// Apply a `PlanKind::Gc` plan — evict its derivable artifacts, each behind a
 /// durable tombstone.
 ///
@@ -1233,18 +1260,35 @@ pub(crate) async fn run_gc_apply_in(
     // Policy can only tighten the gate: a `deny agent gc {…}` rule hard-refuses
     // even a reviewed plan. Any `require_review` is already satisfied by the
     // marker the always-on gate demands.
+    //
+    // Fail-closed pre-check: gc eviction runs entirely against the state store
+    // and object store, so a config-load ERROR would otherwise silently
+    // unenforce a possibly-configured `[policy]` block. Bail instead. A
+    // genuinely-missing config file keeps the NotConfigured posture.
+    let loaded_cfg = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(cfg) => Some(cfg),
+        Err(rocky_core::config::ConfigError::FileNotFound { .. }) => None,
+        Err(e) => {
+            return Err(anyhow::anyhow!(e).context(format!(
+                "refusing to apply gc plan '{plan_id}': {} failed to load, so any configured \
+                 [policy] rules cannot be enforced (fail-closed). Fix the config and re-run \
+                 `rocky apply {plan_id}`.",
+                config_path.display()
+            )));
+        }
+    };
     let touched: BTreeMap<String, PolicyCapability> = plan
         .evictions
         .iter()
         .map(|e| (e.model_name.clone(), PolicyCapability::Gc))
         .collect();
-    let models_dir = Path::new("models");
+    let models_dir = gc_models_dir(loaded_cfg.as_ref(), config_path);
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
         plan_record.resolved_principal(),
         &touched,
-        models_dir,
+        &models_dir,
         state_path,
     );
     if let PolicyGate::Deny {
@@ -1329,6 +1373,50 @@ mod tests {
     const HA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HB: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const HC: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    /// 🔴 FIX 9 regression: the gc apply seam threads the models directory
+    /// from the loaded config into the policy evaluator instead of a hardcoded
+    /// `models` — mirroring how the backfill seam threads `run_plan.models_dir`.
+    /// A project whose transformation pipeline sets `models = "custom/**"` must
+    /// resolve to `<project>/custom`, not `<project>/models` (which would
+    /// compile the wrong directory and misread the models the `[policy]` scope
+    /// matches on).
+    #[test]
+    fn gc_models_dir_reads_the_transformation_glob() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "custom_models/**"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+"#,
+        )
+        .unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let resolved = super::gc_models_dir(Some(&cfg), &config_path);
+        assert_eq!(resolved, dir.path().join("custom_models"));
+    }
+
+    /// Absent a config (or a transformation pipeline) the gc models dir falls
+    /// back to `<project>/models`.
+    #[test]
+    fn gc_models_dir_falls_back_to_models() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        assert_eq!(
+            super::gc_models_dir(None, &config_path),
+            dir.path().join("models")
+        );
+    }
 
     fn model(name: &str) -> ReplayCheckModelOutput {
         ReplayCheckModelOutput {

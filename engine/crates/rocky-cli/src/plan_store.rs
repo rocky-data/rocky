@@ -249,22 +249,35 @@ impl EmbeddedCapabilities {
     /// The `(model, capability)` set the policy plane evaluates for a plan
     /// covering `planned_models`.
     ///
-    /// - Diff available at propose time → the embedded per-changed-model
-    ///   classification (unchanged models are absent and are not gated).
+    /// - Diff available at propose time with changes → the embedded
+    ///   per-changed-model classification (unchanged models are absent and are
+    ///   not gated as schema changes).
+    /// - Diff available with **zero** changes but a non-empty model set →
+    ///   every planned model under the bare `apply` verb. The plan changes no
+    ///   schemas, but applying it still *executes* every planned model, so the
+    ///   execution itself stays governed — a `deny agent apply { any = true }`
+    ///   rule (or an active agent freeze) must fire even for a no-change plan.
     /// - Diff unavailable (skipped, or a legacy plan with no embed) → **every**
     ///   planned model, classified `schema_change.breaking` (fail closed).
+    /// - No planned models at all → empty (a genuine no-op executes nothing
+    ///   and is not gated).
     ///
     /// The apply-time enforcement and the propose-time MCP gate share this so
     /// the two evaluate the identical touched set for the same plan.
     pub fn touched(&self, planned_models: &[String]) -> BTreeMap<String, PolicyCapability> {
-        if self.diff_available {
-            self.changed.clone()
-        } else {
-            planned_models
+        if !self.diff_available {
+            return planned_models
                 .iter()
                 .map(|m| (m.clone(), PolicyCapability::SchemaChangeBreaking))
-                .collect()
+                .collect();
         }
+        if self.changed.is_empty() {
+            return planned_models
+                .iter()
+                .map(|m| (m.clone(), PolicyCapability::Apply))
+                .collect();
+        }
+        self.changed.clone()
     }
 }
 
@@ -771,6 +784,43 @@ mod tests {
         Ok(())
     }
 
+    /// 🔴 FIX 2 regression: a `Promote` plan's *default* principal is `Human`
+    /// (`default_principal_for_kind`), so a bare `write_plan(Promote)` stamps
+    /// `Human` — which is why an agent-authored promote used to escape
+    /// `deny agent promote` rules and agent freezes. The fix threads the
+    /// resolved CLI principal through `write_plan_with_principal`, which must
+    /// override that default to `Agent`.
+    #[test]
+    fn promote_plan_principal_default_is_human_but_can_be_stamped_agent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = serde_json::json!({"branch_name": "b", "targets": []});
+
+        // Default (the bug): a bare write stamps Human.
+        let human_id = write_plan(dir.path(), PlanKind::Promote, &payload)?;
+        assert_eq!(
+            read_plan(dir.path(), &human_id)?.resolved_principal(),
+            PolicyPrincipal::Human,
+            "the Promote default principal is Human"
+        );
+
+        // The fix: an agent-invoked promote stamps Agent so agent-scoped rules
+        // and freezes bind.
+        let agent_id = write_plan_with_principal(
+            dir.path(),
+            PlanKind::Promote,
+            &payload,
+            PolicyPrincipal::Agent,
+        )?;
+        assert_eq!(
+            read_plan(dir.path(), &agent_id)?.resolved_principal(),
+            PolicyPrincipal::Agent,
+            "an agent promote must stamp Agent, not fall to the Human default"
+        );
+        // Principal rides outside the hash → the two plans share the plan_id.
+        assert_eq!(human_id, agent_id, "principal must not perturb the plan_id");
+        Ok(())
+    }
+
     #[test]
     fn plan_kind_display() {
         assert_eq!(PlanKind::Compact.to_string(), "compact");
@@ -933,6 +983,62 @@ mod tests {
         assert_eq!(plan.principal, Some(PolicyPrincipal::Agent));
         assert_eq!(plan.embedded_capabilities(), caps);
         Ok(())
+    }
+
+    /// 🔴 FIX 3 regression: a no-change plan (`diff_available = true`, empty
+    /// `changed`) that still names planned models must synthesize a touched set
+    /// under the bare `apply` verb — the plan executes those models, so its
+    /// execution stays governed. Pre-fix `touched()` returned an EMPTY map
+    /// here, which the apply seam short-circuited to `Allow`, letting a
+    /// no-change agent plan execute past a `deny agent apply` rule or a freeze.
+    #[test]
+    fn no_change_plan_touches_planned_models_under_apply() {
+        let caps = EmbeddedCapabilities {
+            diff_available: true,
+            changed: BTreeMap::new(),
+        };
+        let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
+        assert_eq!(
+            touched.get("stg_orders"),
+            Some(&PolicyCapability::Apply),
+            "a no-change plan must still gate each planned model under `apply`"
+        );
+        assert_eq!(touched.get("fct_sales"), Some(&PolicyCapability::Apply));
+        assert_eq!(touched.len(), 2);
+    }
+
+    /// A genuine no-op — no planned models at all — stays empty (nothing to
+    /// execute, nothing to gate).
+    #[test]
+    fn no_planned_models_touches_nothing() {
+        let caps = EmbeddedCapabilities {
+            diff_available: true,
+            changed: BTreeMap::new(),
+        };
+        assert!(caps.touched(&[]).is_empty());
+    }
+
+    /// A diff-available plan WITH changes still uses the per-model
+    /// classification, unchanged (the FIX 3 synthesis only covers the
+    /// zero-change case).
+    #[test]
+    fn changed_plan_uses_embedded_classification() {
+        let mut changed = BTreeMap::new();
+        changed.insert(
+            "stg_orders".to_string(),
+            PolicyCapability::SchemaChangeAdditive,
+        );
+        let caps = EmbeddedCapabilities {
+            diff_available: true,
+            changed,
+        };
+        let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
+        assert_eq!(
+            touched.get("stg_orders"),
+            Some(&PolicyCapability::SchemaChangeAdditive)
+        );
+        // fct_sales is unchanged → absent (not gated as a schema change).
+        assert!(!touched.contains_key("fct_sales"));
     }
 
     /// A plan with no embed yields the fail-closed default:

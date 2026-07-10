@@ -2815,6 +2815,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             PolicySubcommand::Test {} => rocky_cli::commands::run_policy_test(&cli.config, json),
             PolicySubcommand::Freeze { principal, scope } => {
                 rocky_cli::commands::run_policy_freeze(
+                    &cli.config,
                     &state_path,
                     principal.map(Into::into),
                     scope,
@@ -2824,6 +2825,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             }
             PolicySubcommand::Unfreeze { principal, scope } => {
                 rocky_cli::commands::run_policy_freeze(
+                    &cli.config,
                     &state_path,
                     principal.map(Into::into),
                     scope,
@@ -2986,6 +2988,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     promote_pipeline.as_deref(),
                     allow_breaking,
                     &state_path,
+                    resolve_cli_principal(cli.principal)?,
                     json,
                 )
                 .await

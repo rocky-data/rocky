@@ -4101,8 +4101,11 @@ pub async fn run(
     // is no rollback substrate on a plain warehouse target, so a failed
     // verification is halt-only: the migration stands until a human reverts it.
     // A no-op when nothing was auto-applied (default-off runs never hit it).
-    let verify_after_result =
-        super::drift_governance::finalize_drift_verify_after(state_store.as_ref(), &run_id);
+    let verify_after_result = super::drift_governance::finalize_drift_verify_after(
+        state_store.as_ref(),
+        &run_id,
+        rocky_cfg.policy.as_ref(),
+    );
 
     // Fire the `on_budget_breach` hook for each recorded breach so
     // shell hooks / webhooks configured via `[hook.on_budget_breach]`

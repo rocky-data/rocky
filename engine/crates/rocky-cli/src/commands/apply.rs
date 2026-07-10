@@ -445,7 +445,11 @@ fn model_attributes(models_dir: &Path) -> BTreeMap<String, ModelAttributes> {
 /// `touched` maps each governed model to the capability that was reviewed at
 /// propose time (the embedded classification, or `schema_change.breaking` when
 /// the classification was unavailable / fail-closed). An empty map means the
-/// plan changes nothing → `Allow`.
+/// plan executes **no models** — a genuine no-op → `Allow`. A no-change plan
+/// that still executes models is NOT empty: `EmbeddedCapabilities::touched`
+/// synthesizes a bare-`apply` entry per planned model, so its execution stays
+/// governed (do not pass an empty map for an executing plan or the gate is
+/// bypassed).
 pub fn evaluate_apply_policy(
     config_path: &Path,
     plan_id: &str,
@@ -465,25 +469,47 @@ pub fn evaluate_apply_policy(
         Err(_) => return PolicyGate::NotConfigured,
     };
 
+    // An empty touched set means the plan executes no models (a genuine
+    // no-op). A no-change-but-executing plan is never empty here — see the
+    // touched-set synthesis in `EmbeddedCapabilities::touched`.
     if touched.is_empty() {
         return PolicyGate::Allow;
     }
 
     let attrs_map = model_attributes(models_dir);
-    // Best-effort ledger handle. A failure to open state (e.g. a locked or
-    // forward-incompatible store) must not fail the apply — the decision is
-    // computed regardless; only the audit write is skipped.
-    let ledger = StateStore::open(state_path).ok();
 
     // Snapshot the decision ledger *before* this apply writes any rows, so the
     // dynamic breakers (autonomy-budget burn, active freezes) reflect only
-    // prior history. An unreadable ledger yields an empty snapshot → no dynamic
-    // degradation (the static decision still gates).
+    // prior history. The snapshot is taken through `open_read_only` FIRST:
+    // readers skip the advisory write lock (see rocky-core/tests/state_lock.rs),
+    // so a concurrent run holding the writer lock cannot blind the
+    // freeze/budget projection. The reader handle is dropped before the write
+    // handle below is opened — redb forbids two live handles on one file
+    // within a process.
     let now = chrono::Utc::now();
-    let prior_decisions: Vec<PolicyDecisionRecord> = ledger
-        .as_ref()
-        .and_then(|s| s.list_policy_decisions().ok())
-        .unwrap_or_default();
+    let prior_snapshot: Option<Vec<PolicyDecisionRecord>> = StateStore::open_read_only(state_path)
+        .ok()
+        .and_then(|reader| reader.list_policy_decisions().ok());
+
+    // Best-effort ledger handle for the decision-row writes. A failure to open
+    // for writing (e.g. a concurrent writer's advisory lock) must not fail the
+    // apply — the decision is computed regardless; only the audit write is
+    // skipped.
+    let ledger = StateStore::open(state_path).ok();
+
+    // Rare fallback: the read-only open lost a transient redb open race but a
+    // write handle succeeded — snapshot through it rather than reading nothing.
+    let prior_snapshot =
+        prior_snapshot.or_else(|| ledger.as_ref().and_then(|s| s.list_policy_decisions().ok()));
+
+    // Fail-closed floor: when the snapshot is genuinely unreadable (both opens
+    // failed — a corrupt or forward-incompatible store), an AGENT's `allow`
+    // cannot be trusted, because an active freeze or exhausted budget would be
+    // invisible. Degrade it to `require_review` below instead of proceeding on
+    // an empty snapshot. Humans are never gated in v0, so the floor does not
+    // apply to them.
+    let snapshot_unreadable = prior_snapshot.is_none();
+    let prior_decisions: Vec<PolicyDecisionRecord> = prior_snapshot.unwrap_or_default();
 
     let mut worst: Option<PolicyGate> = None;
     for (model, capability) in touched {
@@ -506,7 +532,7 @@ pub fn evaluate_apply_policy(
         // (freeze → deny; exhausted budget → require_review). The post-step
         // never widens the base and never changes the winning rule.
         let decision = policy::evaluate(&policy, principal, *capability, attrs);
-        let (effect, degradation) = policy::autonomy_degradation(
+        let (mut effect, degradation) = policy::autonomy_degradation(
             decision.effect,
             decision.matched_rule,
             &policy,
@@ -519,6 +545,16 @@ pub fn evaluate_apply_policy(
         if let Some(suffix) = degradation.reason_suffix() {
             reason.push_str("; ");
             reason.push_str(&suffix);
+        }
+        if snapshot_unreadable
+            && principal == PolicyPrincipal::Agent
+            && effect == PolicyEffect::Allow
+        {
+            effect = PolicyEffect::RequireReview;
+            reason.push_str(
+                "; policy ledger unreadable — freeze/budget state unverifiable, allow degraded \
+                 to require_review (fail-closed)",
+            );
         }
 
         if let Some(store) = &ledger {
@@ -572,6 +608,35 @@ pub fn evaluate_apply_policy(
     worst.unwrap_or(PolicyGate::Allow)
 }
 
+/// Fail-closed config probe for apply seams whose execution path does not
+/// itself require a loadable config (gc, backfill).
+///
+/// [`evaluate_apply_policy`] maps *any* config-load error to
+/// [`PolicyGate::NotConfigured`] — correct for the run path, which re-loads
+/// and surfaces the error itself before mutating anything. The gc and
+/// backfill applies have no such backstop: a malformed `rocky.toml` (which
+/// may carry the very `[policy]` block with the deny/freeze rules) would
+/// silently unenforce the policy plane while the apply still executes. This
+/// probe bails on a load **error** while keeping a genuinely-missing config
+/// file permitted (no file ⇒ no `[policy]` block to enforce ⇒ the
+/// NotConfigured posture is honest).
+pub(crate) fn bail_on_config_load_error(
+    config_path: &Path,
+    plan_kind: &str,
+    plan_id: &str,
+) -> Result<()> {
+    match rocky_core::config::load_rocky_config(config_path) {
+        Ok(_) => Ok(()),
+        Err(rocky_core::config::ConfigError::FileNotFound { .. }) => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context(format!(
+            "refusing to apply {plan_kind} plan '{plan_id}': {} failed to load, so any \
+             configured [policy] rules cannot be enforced (fail-closed). Fix the config and \
+             re-run `rocky apply {plan_id}`.",
+            config_path.display()
+        ))),
+    }
+}
+
 /// Restrictiveness rank for aggregating per-model [`PolicyGate`]s.
 fn gate_rank(gate: &PolicyGate) -> u8 {
     match gate {
@@ -603,14 +668,34 @@ fn touched_models_for_run(
 /// The `promote` verb — not a `schema_change.*` refinement — is used so a
 /// `deny agent promote {…}` rule governs promotions while an `apply`-scoped
 /// rule does not accidentally fire on a promote (the refinements are shared
-/// between the two verbs). An empty result (no captured findings) means the
-/// promote changes nothing the plane needs to gate.
+/// between the two verbs).
+///
+/// Fail-closed on two fronts (mirroring the run path's posture):
+///
+/// - **Findings absent or empty while the plan carries SQL targets** — the
+///   promote will still `CREATE OR REPLACE` every target, so the mutation set
+///   is unclassified, not empty. Every plan target is gated under `promote`
+///   rather than resolving to an ungated `Allow`.
+/// - **Target→name mapping unavailable** (the project fails to compile at
+///   apply time, or a changed target vanished from the compiled project) —
+///   the changed target is gated under its target name instead of being
+///   silently dropped from the touched set. A bare-named evaluation still
+///   meets `any`-scoped rules and the default agent posture.
+///
+/// Only a plan with no findings **and** no targets — a promote that executes
+/// nothing — yields an empty set.
 fn touched_models_for_promote(
     promote: &PromotePlan,
     models_dir: &Path,
 ) -> BTreeMap<String, PolicyCapability> {
     let Some(findings) = promote.breaking_changes.as_ref().filter(|f| !f.is_empty()) else {
-        return BTreeMap::new();
+        // No captured findings, but the plan still executes SQL against these
+        // targets — gate the execution set instead of failing open.
+        return promote
+            .targets
+            .iter()
+            .map(|t| (t.target.clone(), PolicyCapability::Promote))
+            .collect();
     };
     let changed_targets: BTreeSet<String> = findings
         .iter()
@@ -619,10 +704,11 @@ fn touched_models_for_promote(
     let target_to_name = compile_target_to_name(models_dir);
     changed_targets
         .into_iter()
-        .filter_map(|t| {
-            target_to_name
-                .get(&t)
-                .map(|n| (n.clone(), PolicyCapability::Promote))
+        .map(|t| {
+            // Fail-closed: an unmapped target stays in the touched set under
+            // its target name rather than being dropped.
+            let name = target_to_name.get(&t).cloned().unwrap_or(t);
+            (name, PolicyCapability::Promote)
         })
         .collect()
 }
@@ -1016,6 +1102,10 @@ async fn run_apply_backfill_plan(
 
     // Policy can only tighten the gate: a `deny` hard-refuses even a reviewed
     // backfill. The marker above already satisfies any policy `require_review`.
+    // Fail-closed pre-check: the backfill execution path does not itself need
+    // the config to have loaded, so a config-load ERROR must bail here rather
+    // than silently unenforcing a possibly-configured `[policy]` block.
+    bail_on_config_load_error(config_path, "backfill", plan_id)?;
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
     let touched = touched_models_for_run(&plan, &run_plan);
     let gate = evaluate_apply_policy(
@@ -1886,6 +1976,30 @@ auto_create_schemas = true
         Ok(())
     }
 
+    /// Record an active agent freeze on `scope` into the state store at
+    /// `state_path`, exactly as `rocky policy freeze --principal agent` does.
+    fn seed_agent_freeze(state_path: &Path, scope: &str) -> anyhow::Result<()> {
+        let store = StateStore::open(state_path)?;
+        let now = chrono::Utc::now();
+        store.record_policy_decision(&PolicyDecisionRecord {
+            timestamp: now,
+            plan_id: format!(
+                "{}agent:{}",
+                rocky_core::policy::FREEZE_PLAN_PREFIX,
+                now.to_rfc3339()
+            ),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: scope.to_string(),
+            effect: PolicyEffect::Deny,
+            rule_id: None,
+            reason: "policy freeze: agent actions frozen to deny".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        })?;
+        Ok(())
+    }
+
     fn write_config(dir: &Path, policy_rules: &str) -> anyhow::Result<std::path::PathBuf> {
         let toml = format!(
             r#"
@@ -1966,6 +2080,47 @@ effect = "deny"
         Ok(())
     }
 
+    /// 🔴 FIX 6 regression: a config-load ERROR must fail closed at the
+    /// gc/backfill apply seams. `evaluate_apply_policy` maps any load error to
+    /// `NotConfigured` (correct only for the run path, which re-surfaces the
+    /// error itself); the gc/backfill applies execute without needing the
+    /// config, so a malformed `rocky.toml` — which may carry the very
+    /// `[policy]` deny/freeze rules — would silently unenforce them.
+    #[test]
+    fn config_load_error_bails_fail_closed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Malformed TOML → a load ERROR (not FileNotFound).
+        let bad = dir.path().join("rocky.toml");
+        std::fs::write(&bad, "this is = = not valid toml [[[")?;
+        let err = super::bail_on_config_load_error(&bad, "backfill", "plan_x").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be enforced"),
+            "a malformed config must fail closed: {err}"
+        );
+        Ok(())
+    }
+
+    /// A genuinely-missing config file is NOT an error — no file means no
+    /// `[policy]` block to enforce, so the NotConfigured posture is honest.
+    #[test]
+    fn missing_config_is_permitted_at_gc_backfill_seams() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.toml");
+        assert!(super::bail_on_config_load_error(&missing, "gc", "plan_x").is_ok());
+    }
+
+    /// A well-formed config (with or without `[policy]`) loads cleanly → no bail.
+    #[test]
+    fn valid_config_passes_the_fail_closed_probe() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("rocky.toml"), NO_POLICY_TOML)?;
+        assert!(
+            super::bail_on_config_load_error(&dir.path().join("rocky.toml"), "gc", "plan_x")
+                .is_ok()
+        );
+        Ok(())
+    }
+
     #[test]
     fn evaluate_apply_policy_not_configured_without_block() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1984,10 +2139,27 @@ effect = "deny"
         Ok(())
     }
 
+    /// An empty `touched` map means the plan executes NO models — a genuine
+    /// no-op — so it allows. (Under FIX 3, a no-change plan that still executes
+    /// models no longer produces an empty `touched`: `EmbeddedCapabilities::
+    /// touched` synthesizes an `apply`-capability entry per planned model. So
+    /// reaching `evaluate_apply_policy` with an empty map now specifically
+    /// means "nothing to execute", which is the only remaining Allow case.)
     #[test]
-    fn evaluate_apply_policy_empty_touched_allows() -> anyhow::Result<()> {
+    fn evaluate_apply_policy_empty_touched_is_a_noop_allow() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let config = write_config(dir.path(), "")?;
+        // A deny-all agent rule is present; an EMPTY touched set must still
+        // allow because there is nothing to execute.
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "deny"
+"#,
+        )?;
         let gate = super::evaluate_apply_policy(
             &config,
             "plan_x",
@@ -1999,8 +2171,227 @@ effect = "deny"
         assert_eq!(
             gate,
             PolicyGate::Allow,
-            "no changed models ⇒ nothing to gate"
+            "an empty touched set executes nothing ⇒ nothing to gate"
         );
+        Ok(())
+    }
+
+    /// 🔴 FIX 3 regression: a no-change plan that still executes models is
+    /// gated by a `deny agent apply` rule. Pre-fix `touched()` returned an
+    /// empty map for a no-change plan, and `evaluate_apply_policy`
+    /// short-circuited to `Allow` — so the plan executed every model past the
+    /// deny. Post-fix `touched()` synthesizes an `apply` entry per planned
+    /// model, so the deny fires.
+    #[test]
+    fn no_change_plan_gated_by_deny_agent_apply() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "deny"
+"#,
+        )?;
+        // A no-change plan: diff available, zero changed models, but planned
+        // models exist → touched under the bare `apply` verb.
+        let caps = crate::plan_store::EmbeddedCapabilities {
+            diff_available: true,
+            changed: BTreeMap::new(),
+        };
+        let touched = caps.touched(&["m".to_string()]);
+        assert!(!touched.is_empty(), "FIX 3 must synthesize a touched set");
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &touched,
+            &dir.path().join("models"),
+            &dir.path().join("state.redb"),
+        );
+        assert!(
+            matches!(gate, PolicyGate::Deny { .. }),
+            "a no-change agent plan that executes models must hit the deny, got {gate:?}"
+        );
+        Ok(())
+    }
+
+    /// 🔴 FIX 3 + FIX 8 regression: an active agent freeze blocks a no-change
+    /// plan's apply. Requires both the synthesized touched set (FIX 3) and the
+    /// ledger snapshot actually reading the freeze (FIX 8).
+    #[test]
+    fn no_change_plan_blocked_by_active_agent_freeze() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Empty [policy] block: no rules, so absent a freeze an agent apply
+        // falls to default_agent_effect (require_review). The freeze forces deny.
+        let config = write_config(dir.path(), "")?;
+        let state = dir.path().join("state.redb");
+        seed_agent_freeze(&state, "any")?;
+
+        let caps = crate::plan_store::EmbeddedCapabilities {
+            diff_available: true,
+            changed: BTreeMap::new(),
+        };
+        let touched = caps.touched(&["m".to_string()]);
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &touched,
+            &dir.path().join("models"),
+            &state,
+        );
+        assert!(
+            matches!(gate, PolicyGate::Deny { .. }),
+            "an active agent freeze must force a no-change plan's apply to deny, got {gate:?}"
+        );
+        Ok(())
+    }
+
+    /// A human no-change plan with no policy rules still applies (humans are
+    /// ungated in v0) — the FIX 3 synthesis must not gate a human.
+    #[test]
+    fn human_no_change_plan_without_rules_applies() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(dir.path(), "")?;
+        let caps = crate::plan_store::EmbeddedCapabilities {
+            diff_available: true,
+            changed: BTreeMap::new(),
+        };
+        let touched = caps.touched(&["m".to_string()]);
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Human,
+            &touched,
+            &dir.path().join("models"),
+            &dir.path().join("state.redb"),
+        );
+        assert_eq!(gate, PolicyGate::Allow, "a human is never gated in v0");
+        Ok(())
+    }
+
+    /// 🔴 FIX 8 regression (read-only snapshot ignores the write lock): a
+    /// freeze recorded in the ledger must still gate an apply while another
+    /// process holds the advisory WRITE lock. Pre-fix the snapshot was taken
+    /// with `StateStore::open` (a write open) which fails under the held lock,
+    /// leaving an empty snapshot → the freeze was invisible → the apply
+    /// proceeded (require_review, not deny). Post-fix the snapshot is taken via
+    /// `open_read_only`, which ignores the advisory lock.
+    #[test]
+    fn snapshot_sees_freeze_while_write_lock_held_elsewhere() -> anyhow::Result<()> {
+        use fs4::FileExt;
+
+        let dir = tempfile::tempdir()?;
+        let config = write_config(dir.path(), "")?; // empty [policy]: agent → require_review
+        let state = dir.path().join("state.redb");
+        seed_agent_freeze(&state, "any")?;
+
+        // Simulate a concurrent writer: hold the advisory lock on the .lock
+        // file directly (no redb handle), exactly as a second `rocky run` on
+        // another process would (see rocky-core/tests/state_lock.rs).
+        let lock_path = state.with_extension("redb.lock");
+        let external_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        FileExt::try_lock(&external_lock).expect("external write lock should be acquired");
+
+        let touched = {
+            let mut m = BTreeMap::new();
+            m.insert("m".to_string(), PolicyCapability::Apply);
+            m
+        };
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &touched,
+            &dir.path().join("models"),
+            &state,
+        );
+        FileExt::unlock(&external_lock).ok();
+        assert!(
+            matches!(gate, PolicyGate::Deny { .. }),
+            "the freeze must be visible through the read-only snapshot despite the held write \
+             lock, got {gate:?}"
+        );
+        Ok(())
+    }
+
+    /// 🔴 FIX 8 regression (fail-closed on a genuinely unreadable store): when
+    /// BOTH opens fail (a corrupt / forward-incompatible store) an AGENT's
+    /// otherwise-`allow` decision degrades to `require_review` — a possibly
+    /// active freeze or exhausted budget must never be silently invisible.
+    /// Pre-fix an unreadable store yielded an empty snapshot and the `allow`
+    /// stood unmodified.
+    #[test]
+    fn unreadable_store_degrades_agent_allow_to_require_review() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // A rule that would otherwise grant the agent an outright allow.
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+"#,
+        )?;
+        // Make the state path a DIRECTORY so both `open` and `open_read_only`
+        // fail deterministically (redb cannot create a file where a directory
+        // exists) — a genuinely unreadable store.
+        let state = dir.path().join("state.redb");
+        std::fs::create_dir(&state)?;
+
+        let touched = {
+            let mut m = BTreeMap::new();
+            m.insert("m".to_string(), PolicyCapability::Apply);
+            m
+        };
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &touched,
+            &dir.path().join("models"),
+            &state,
+        );
+        assert!(
+            matches!(gate, PolicyGate::RequireReview { .. }),
+            "an unreadable ledger must fail closed for an agent (allow → require_review), got \
+             {gate:?}"
+        );
+        Ok(())
+    }
+
+    /// The fail-closed floor does NOT apply to a human: an unreadable store
+    /// leaves a human's ungated apply untouched (humans are never gated in v0).
+    #[test]
+    fn unreadable_store_does_not_gate_human() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(dir.path(), "")?;
+        let state = dir.path().join("state.redb");
+        std::fs::create_dir(&state)?;
+        let touched = {
+            let mut m = BTreeMap::new();
+            m.insert("m".to_string(), PolicyCapability::Apply);
+            m
+        };
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Human,
+            &touched,
+            &dir.path().join("models"),
+            &state,
+        );
+        assert_eq!(gate, PolicyGate::Allow, "a human is never gated in v0");
         Ok(())
     }
 
@@ -2017,6 +2408,95 @@ effect = "deny"
             touched.get("schema.orders"),
             Some(&PolicyCapability::SchemaChangeBreaking)
         );
+    }
+
+    /// 🔴 FIX 5 regression: a promote plan with SQL targets but NO captured
+    /// breaking-change findings must still gate every target under `promote`.
+    /// Pre-fix an absent/empty `breaking_changes` returned an empty touched set
+    /// → `Allow` → the promote's `CREATE OR REPLACE` executed ungated.
+    #[test]
+    fn promote_without_findings_gates_its_targets() {
+        let promote = crate::output::PromotePlan {
+            branch_name: "fix".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "abc".to_string(),
+            branch_state_hash: "h".to_string(),
+            approvals_used: vec![],
+            approvals_rejected: vec![],
+            breaking_changes: None,
+            allow_breaking: false,
+            targets: vec![crate::output::PromoteTargetPlan {
+                target: "cat.prod.orders".to_string(),
+                source: "cat.branch.orders".to_string(),
+                statement: "CREATE OR REPLACE TABLE ...".to_string(),
+            }],
+            plan_audit: vec![],
+            created_at: chrono::Utc::now(),
+        };
+        // Empty models_dir → nothing compiles; the fail-closed path must still
+        // gate the plan's SQL target.
+        let touched = super::touched_models_for_promote(&promote, Path::new("/nonexistent"));
+        assert_eq!(
+            touched.get("cat.prod.orders"),
+            Some(&PolicyCapability::Promote),
+            "a findings-less promote must gate each SQL target under `promote`, got {touched:?}"
+        );
+    }
+
+    /// 🔴 FIX 5 regression: when the target→name mapping is unavailable (the
+    /// project fails to compile at apply time), a changed target must stay in
+    /// the touched set under its target name — not be silently dropped.
+    #[test]
+    fn promote_with_unmappable_target_keeps_it_fail_closed() {
+        use rocky_core::breaking_change::{BreakingChange, BreakingFinding, BreakingSeverity};
+        let promote = crate::output::PromotePlan {
+            branch_name: "fix".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "abc".to_string(),
+            branch_state_hash: "h".to_string(),
+            approvals_used: vec![],
+            approvals_rejected: vec![],
+            breaking_changes: Some(vec![BreakingFinding {
+                change: BreakingChange::ColumnDropped {
+                    model: "cat.prod.orders".to_string(),
+                    column: "amount".to_string(),
+                    data_type: "INT".to_string(),
+                },
+                severity: BreakingSeverity::Breaking,
+            }]),
+            allow_breaking: true,
+            targets: vec![],
+            plan_audit: vec![],
+            created_at: chrono::Utc::now(),
+        };
+        // No compilable project → target_to_name is empty → the fail-closed
+        // path keeps the changed target under its own name.
+        let touched = super::touched_models_for_promote(&promote, Path::new("/nonexistent"));
+        assert_eq!(
+            touched.get("cat.prod.orders"),
+            Some(&PolicyCapability::Promote),
+            "an unmappable changed target must be gated under its target name, got {touched:?}"
+        );
+    }
+
+    /// A promote that executes NOTHING (no findings, no targets) stays empty —
+    /// nothing to gate.
+    #[test]
+    fn promote_with_no_targets_and_no_findings_is_empty() {
+        let promote = crate::output::PromotePlan {
+            branch_name: "fix".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "abc".to_string(),
+            branch_state_hash: "h".to_string(),
+            approvals_used: vec![],
+            approvals_rejected: vec![],
+            breaking_changes: None,
+            allow_breaking: false,
+            targets: vec![],
+            plan_audit: vec![],
+            created_at: chrono::Utc::now(),
+        };
+        assert!(super::touched_models_for_promote(&promote, Path::new("/nonexistent")).is_empty());
     }
 
     #[test]

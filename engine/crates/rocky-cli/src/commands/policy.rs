@@ -164,24 +164,45 @@ pub fn run_policy_test(config_path: &Path, json: bool) -> Result<()> {
 
     let mut results = Vec::with_capacity(policy.tests.len());
     for test in &policy.tests {
-        // Build the evaluator's input from the scenario — the same
+        // Reconcile `layer` ↔ `tags["layer"]` symmetrically. At a live
+        // enforcement seam a model's `layer` attribute IS its `layer` tag, so
+        // the evaluator sees the two in lockstep. A scenario that sets only one
+        // must therefore back-fill the other, or a rule scoped on the *other*
+        // spelling would mispredict:
+        //   - `layer = "gold"` alone must match a `scope.tags = { layer = "gold" }`
+        //     rule (back-fill the tag).
+        //   - `tags = { layer = "gold" }` alone must match a `scope.layer = "gold"`
+        //     rule (back-fill the attribute — this was already handled).
+        // A scenario that sets BOTH to different values is contradictory (no
+        // live model can present that) and is rejected at load with a clear
+        // error rather than silently picking one.
+        let mut tags = test.tags.clone();
+        let layer = match (test.layer.as_deref(), tags.get("layer").cloned()) {
+            (Some(explicit), Some(tag)) if explicit != tag => {
+                bail!(
+                    "policy test '{}' is inconsistent: layer = \"{explicit}\" but \
+                     tags.layer = \"{tag}\". At a live seam a model's layer IS its `layer` tag, \
+                     so these cannot differ — set one, or make them equal.",
+                    test.name
+                );
+            }
+            (Some(explicit), _) => {
+                // Back-fill the tag so a `scope.tags = { layer = ... }` rule matches.
+                tags.entry("layer".to_string())
+                    .or_insert_with(|| explicit.to_string());
+                Some(explicit.to_string())
+            }
+            (None, Some(tag)) => Some(tag),
+            (None, None) => None,
+        };
+        // Build the evaluator's input from the reconciled scenario — the same
         // `ModelAttributes` a real enforcement seam constructs, with no compile
-        // step. Every field is taken as written except `layer`, which mirrors
-        // the seam's tag-derivation (see below).
+        // step.
         let attrs = ModelAttributes {
             name: test.model.clone(),
-            tags: test.tags.clone(),
+            tags,
             classifications: test.classifications.iter().cloned().collect(),
-            // Mirror how a real seam builds `layer`: `rocky policy check` reads
-            // it from the model's `layer` tag. An explicit `layer` field still
-            // wins (it lets a scenario model a hypothetical), but when omitted
-            // we derive it from `tags["layer"]` so a `tags = { layer = ... }`
-            // scenario matches a `scope.layer` rule exactly as it would in
-            // production — otherwise the scenario would mispredict a live apply.
-            layer: test
-                .layer
-                .clone()
-                .or_else(|| test.tags.get("layer").cloned()),
+            layer,
             contracted: test.contracted,
             downstreams: test.downstreams,
             reachable_downstreams: test.reachable_downstreams,
@@ -252,6 +273,14 @@ fn render_test_text(out: &PolicyTestOutput) {
         }
     }
     println!("  {} passed, {} failed", out.passed, out.failed);
+    // Same static-vs-dynamic divergence note `rocky policy check` prints:
+    // scenarios evaluate the STATIC `[policy]` config, but a live enforcement
+    // seam additionally projects the ledger (active freezes, autonomy-budget
+    // burn), which can only tighten a scenario's resolved effect.
+    println!(
+        "  note: scenarios evaluate the static [policy] config; live seams (apply/promote) also \
+         project active freezes and autonomy-budget burn, which can only tighten these effects"
+    );
 }
 
 /// Render the decision as a compact human-readable block.
@@ -313,6 +342,7 @@ fn serde_plain<T: serde::Serialize>(value: &T) -> String {
 /// None` freezes every model (`any`). The inverse (`lift = true`) records an
 /// unfreeze that supersedes a matching freeze — the normal way to lift one.
 pub fn run_policy_freeze(
+    config_path: &Path,
     state_path: &Path,
     principal: Option<PolicyPrincipal>,
     scope: Option<String>,
@@ -326,6 +356,16 @@ pub fn run_policy_freeze(
         Some(p) => vec![p],
         None => vec![PolicyPrincipal::Agent, PolicyPrincipal::Human],
     };
+
+    // A freeze recorded with no `[policy]` block is INERT: every enforcement
+    // seam short-circuits to `NotConfigured` before it reads the ledger, so the
+    // freeze binds nothing. Recording it is still useful (it takes effect the
+    // moment a `[policy]` block is added), so this is a loud warning — stderr +
+    // an output note — not an error; the exit code stays 0.
+    let notes = freeze_enforcement_notes(config_path, lift);
+    for note in &notes {
+        eprintln!("warning: {note}");
+    }
 
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
@@ -391,6 +431,7 @@ pub fn run_policy_freeze(
         scope,
         recorded_at: now.to_rfc3339(),
         entries,
+        notes,
     };
 
     if json {
@@ -399,6 +440,31 @@ pub fn run_policy_freeze(
         render_freeze_text(&output);
     }
     Ok(())
+}
+
+/// Build the enforcement-status notes for a `freeze` / `unfreeze` against
+/// `config_path`.
+///
+/// Returns a single "recorded but NOT enforced" warning exactly when the
+/// project has no enforceable `[policy]` block (missing block, missing config,
+/// or a config that fails to load) — the case where the freeze binds nothing
+/// at any seam until a `[policy]` block is added. Empty when the freeze is
+/// enforceable.
+fn freeze_enforcement_notes(config_path: &Path, lift: bool) -> Vec<String> {
+    let policy_configured = matches!(
+        rocky_core::config::load_rocky_config(config_path),
+        Ok(cfg) if cfg.policy.is_some()
+    );
+    if policy_configured {
+        return Vec::new();
+    }
+    let verb = if lift { "unfreeze" } else { "freeze" };
+    vec![format!(
+        "{verb} recorded but NOT enforced: no [policy] block configured in {}. \
+         Every enforcement seam short-circuits before reading the ledger until a [policy] \
+         block exists; the freeze takes effect the moment one is added.",
+        config_path.display()
+    )]
 }
 
 fn render_freeze_text(out: &PolicyFreezeOutput) {
@@ -424,6 +490,9 @@ fn render_freeze_text(out: &PolicyFreezeOutput) {
              (same --principal/--scope) or a policy-change PR"
         );
     }
+    for note in &out.notes {
+        println!("  ! {note}");
+    }
 }
 
 #[cfg(test)]
@@ -440,6 +509,21 @@ mod tests {
         fs::write(&path, body).unwrap();
         (dir, path)
     }
+
+    /// A config with an adapter + pipeline but NO `[policy]` block — the shape
+    /// the freeze-inert warning fires on.
+    const NO_POLICY_BODY: &str = r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+"#;
 
     const POLICY: &str = r#"
 [policy]
@@ -649,6 +733,128 @@ expect = \"deny\"
         let (_dir, path) = config_with("");
         let err = run_policy_test(&path, true).unwrap_err();
         assert!(err.to_string().contains("no [policy] block"));
+    }
+
+    /// 🔴 FIX 4 regression: a freeze recorded against a config with NO
+    /// `[policy]` block is inert at every seam, so the command must surface a
+    /// loud "recorded but NOT enforced" note. Pre-fix `freeze`/`unfreeze`
+    /// succeeded silently with no signal the freeze binds nothing.
+    #[test]
+    fn freeze_without_policy_block_is_flagged_inert() {
+        let (_dir, path) = config_with(NO_POLICY_BODY);
+        let notes = freeze_enforcement_notes(&path, false);
+        assert_eq!(notes.len(), 1, "a freeze with no [policy] block must warn");
+        assert!(
+            notes[0].contains("recorded but NOT enforced"),
+            "note must say the freeze is not enforced: {}",
+            notes[0]
+        );
+        // Unfreeze carries the same warning with its own verb.
+        let unfreeze_notes = freeze_enforcement_notes(&path, true);
+        assert!(unfreeze_notes[0].contains("unfreeze recorded but NOT enforced"));
+    }
+
+    /// A missing config file is treated as "no [policy] block" — the freeze
+    /// still records (elsewhere) but is flagged inert.
+    #[test]
+    fn freeze_with_missing_config_is_flagged_inert() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("does-not-exist.toml");
+        assert_eq!(freeze_enforcement_notes(&path, false).len(), 1);
+    }
+
+    /// With a `[policy]` block present, a freeze is enforceable → no note.
+    #[test]
+    fn freeze_with_policy_block_has_no_note() {
+        let (_dir, path) = config_with(POLICY);
+        assert!(
+            freeze_enforcement_notes(&path, false).is_empty(),
+            "an enforceable freeze must carry no inert-warning note"
+        );
+    }
+
+    /// End-to-end: `run_policy_freeze` records the freeze AND returns Ok even
+    /// with no `[policy]` block (recording stays useful; exit 0), and the freeze
+    /// row lands in the ledger.
+    #[test]
+    fn run_policy_freeze_records_and_succeeds_without_policy_block() {
+        let (dir, path) = config_with(NO_POLICY_BODY);
+        let state = dir.path().join("state.redb");
+        run_policy_freeze(
+            &path,
+            &state,
+            Some(PolicyPrincipal::Agent),
+            None,
+            false,
+            true,
+        )
+        .expect("freeze must record and exit 0 even with no [policy] block");
+        let store = StateStore::open(&state).unwrap();
+        let freezes = policy::active_freezes(&store.list_policy_decisions().unwrap());
+        assert_eq!(
+            freezes.len(),
+            1,
+            "the freeze must be recorded in the ledger"
+        );
+        assert_eq!(freezes[0].principal, PolicyPrincipal::Agent);
+    }
+
+    /// 🔴 FIX 7 regression: a scenario that sets an explicit `layer` (and no
+    /// `tags.layer`) must match a rule scoped `tags = { layer = ... }`. At a
+    /// live seam `attrs.tags["layer"]` and `attrs.layer` are the same value, so
+    /// the scenario must back-fill the tag. Pre-fix the explicit `layer` did
+    /// NOT populate `tags["layer"]`, so the tag-scoped rule missed, the
+    /// scenario fell to the default posture, and this assertion failed.
+    #[test]
+    fn explicit_layer_backfills_the_layer_tag_for_tag_scoped_rules() {
+        let body = "
+[policy]
+version = 1
+default_agent_effect = \"deny\"
+
+[[policy.rules]]
+principal = \"agent\"
+capability = \"apply\"
+scope = { tags = { layer = \"gold\" } }
+effect = \"allow\"
+
+[[policy.tests]]
+name = \"explicit layer matches a tags.layer rule\"
+principal = \"agent\"
+capability = \"apply\"
+model = \"fct_revenue\"
+layer = \"gold\"
+expect = \"allow\"
+";
+        let (_dir, path) = config_with(body);
+        run_policy_test(&path, true)
+            .expect("an explicit layer must back-fill tags.layer and match the tag-scoped rule");
+    }
+
+    /// 🔴 FIX 7 regression: a scenario that sets BOTH `layer` and
+    /// `tags.layer` to *different* values is contradictory (no live model can
+    /// present that) and must fail the scenario load with a clear error rather
+    /// than silently picking one.
+    #[test]
+    fn inconsistent_layer_and_tag_layer_is_rejected() {
+        let body = format!(
+            "{POLICY}
+[[policy.tests]]
+name = \"contradictory layer\"
+principal = \"agent\"
+capability = \"apply\"
+model = \"fct_revenue\"
+layer = \"gold\"
+tags = {{ layer = \"silver\" }}
+expect = \"allow\"
+"
+        );
+        let (_dir, path) = config_with(&body);
+        let err = run_policy_test(&path, true).unwrap_err();
+        assert!(
+            err.to_string().contains("inconsistent"),
+            "must reject the contradictory layer/tag pair: {err}"
+        );
     }
 
     #[test]
