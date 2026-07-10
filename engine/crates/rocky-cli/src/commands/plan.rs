@@ -970,15 +970,20 @@ pub fn compute_embedded_capabilities(
         return EmbeddedCapabilities::default(); // fail-closed
     }
 
+    // Load the config once — reused for cached source schemas AND the
+    // env-resolved config identity bound into the execution fingerprint.
+    let loaded_cfg = rocky_core::config::load_rocky_config(config_path).ok();
+    let config_identity = loaded_cfg
+        .as_ref()
+        .map(crate::commands::apply::config_policy_identity)
+        .unwrap_or_default();
+
     // Seed both compiles with cached source schemas so types are real (mirrors
     // `rocky review`). Degrade to empty on any failure — a poorer classification
     // only ever fails *closed* (more models look breaking), never open.
-    let source_schemas = match (
-        state_path,
-        rocky_core::config::load_rocky_config(config_path),
-    ) {
-        (Some(sp), Ok(cfg)) => {
-            let schema_cfg = cfg.cache.schemas.with_ttl_override(None);
+    let source_schemas = match (state_path, loaded_cfg.as_ref()) {
+        (Some(sp), Some(cfg)) => {
+            let schema_cfg = cfg.cache.schemas.clone().with_ttl_override(None);
             crate::source_schemas::load_cached_source_schemas(&schema_cfg, sp)
         }
         _ => std::collections::HashMap::new(),
@@ -995,9 +1000,25 @@ pub fn compute_embedded_capabilities(
             Err(_) => return EmbeddedCapabilities::default(),
         }
     };
+    // Bind the compiled-IR fingerprint the gate authorizes so apply can refuse a
+    // models/config change between planning and execution (TOCTOU), checked at
+    // the single execution choke-point. Computed from the head compile that a
+    // clean apply will reproduce.
+    let models_fingerprint =
+        crate::commands::apply::execution_ir_fingerprint(&head.project.models, &config_identity);
+
     let base = match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
         Ok(r) => r,
-        Err(_) => return EmbeddedCapabilities::default(),
+        // The head compiled and was fingerprinted; a missing base only costs the
+        // per-model classification (fail-closed to breaking). Keep the
+        // fingerprint so the TOCTOU gate still binds.
+        Err(_) => {
+            return EmbeddedCapabilities {
+                diff_available: false,
+                changed: std::collections::BTreeMap::new(),
+                models_fingerprint,
+            };
+        }
     };
 
     let base_ir = super::ci_diff::project_ir_from_compile(&base);
@@ -1024,9 +1045,7 @@ pub fn compute_embedded_capabilities(
     EmbeddedCapabilities {
         diff_available: true,
         changed,
-        // Bind the content the gate authorized so apply can reject a
-        // models-dir change between planning and execution (TOCTOU).
-        models_fingerprint: None,
+        models_fingerprint,
     }
 }
 

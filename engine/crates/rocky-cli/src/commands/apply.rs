@@ -267,7 +267,7 @@ async fn run_apply_run_plan(
 /// Build the [`GovernedRunContext`] for a two-step apply — `Some` only for an
 /// AGENT principal (a human apply is ungated in v0 and stays byte-identical).
 fn governed_run_context<'a>(
-    _plan: &PersistedPlan,
+    plan: &PersistedPlan,
     principal: PolicyPrincipal,
     plan_id: &'a str,
     root: &'a Path,
@@ -281,6 +281,7 @@ fn governed_run_context<'a>(
         plan_id,
         root,
         config_path,
+        expected_ir_fingerprint: plan.embedded_capabilities().models_fingerprint,
     })
 }
 
@@ -950,6 +951,113 @@ fn touched_models_for_promote(
         .collect()
 }
 
+/// Canonical, process-stable fingerprint of the **compiled-IR projection** that
+/// authorization is computed over — the sound close for the gate/execute
+/// TOCTOU.
+///
+/// For each model in the compiled set, hashes a canonical projection =
+/// `serde_json::to_value(&ModelConfig)` (which normalises any nested map to
+/// sorted-key order — serde_json's `Map` is a `BTreeMap` without the
+/// `preserve_order` feature, so this is process-stable across two runs) plus the
+/// compiled SQL, assembled **name-sorted** in a `BTreeMap`. Combined with the
+/// env-resolved, secret-free config identity ([`config_policy_identity`]), which
+/// catches an adapter/target swap with identical model bytes.
+///
+/// It hashes the **IR**, never file/dir bytes — so it EXCLUDES the state file,
+/// locks, namespaced state, caches, and every runtime artifact. (The round-3
+/// file-hash attempt hashed `models_dir`, which contains `.rocky-state.redb` —
+/// self-invalidating, refuse-everything. This is the fix.)
+///
+/// `None` only when a model config fails to serialize (never expected in
+/// practice); the governed check treats `None` as a refusal (fail-closed).
+pub(crate) fn execution_ir_fingerprint(
+    models: &[rocky_core::models::Model],
+    config_identity: &str,
+) -> Option<String> {
+    let mut projection: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for m in models {
+        // `to_value` normalises any nested HashMap to sorted-key order.
+        let config = serde_json::to_value(&m.config).ok()?;
+        projection.insert(
+            m.config.name.clone(),
+            serde_json::json!({ "config": config, "sql": m.sql }),
+        );
+    }
+    // Re-through `to_value` so the whole tree is canonical (sorted keys).
+    let root = serde_json::to_value(&projection).ok()?;
+    let bytes = serde_json::to_vec(&root).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&bytes);
+    hasher.update(b"\x00cfg\x00");
+    hasher.update(config_identity.as_bytes());
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// The env-resolved, **secret-free** config identity relevant to authorization:
+/// each adapter's `type` (catches an adapter-type swap under the same name) and
+/// each pipeline's target adapter (catches a default-adapter swap) — resolved
+/// from the loaded config, which already substituted `${VAR}`. Excludes hosts,
+/// tokens, paths, and all connection secrets so a rotated credential never
+/// causes a spurious mismatch.
+pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> String {
+    let adapters: BTreeMap<&str, &str> = cfg
+        .adapters
+        .iter()
+        .map(|(name, a)| (name.as_str(), a.adapter_type.as_str()))
+        .collect();
+    let pipelines: BTreeMap<&str, String> = cfg
+        .pipelines
+        .iter()
+        .map(|(name, p)| {
+            (
+                name.as_str(),
+                format!("{}:{}", p.pipeline_type_str(), p.target_adapter()),
+            )
+        })
+        .collect();
+    serde_json::json!({ "adapters": adapters, "pipelines": pipelines }).to_string()
+}
+
+/// The TOCTOU check threaded to the single execution choke-point
+/// ([`commands::run::execute_models`]). Carries the plan-authorized IR
+/// fingerprint plus the execute-time config identity so the choke-point can
+/// recompute [`execution_ir_fingerprint`] over the exact compiled set about to
+/// execute and REFUSE (fail-closed) on any mismatch — checked == executed.
+#[derive(Clone)]
+pub struct ExecFingerprintGate {
+    /// The IR fingerprint the plan authorized (from `EmbeddedCapabilities`).
+    /// `None` only for a genuinely-legacy plan (no bound fingerprint) → skip.
+    pub expected: Option<String>,
+    /// The config identity computed from the execute-time config.
+    pub config_identity: String,
+    /// The plan id, for the refusal message.
+    pub plan_id: String,
+}
+
+impl ExecFingerprintGate {
+    /// Fail-closed: recompute the IR fingerprint over the exact compiled set
+    /// about to execute and bail on mismatch. A legacy plan (no bound
+    /// fingerprint) is allowed through; a fingerprint-production failure over
+    /// the live set is a refusal.
+    pub(crate) fn verify(&self, models: &[rocky_core::models::Model]) -> Result<()> {
+        let Some(expected) = self.expected.as_deref() else {
+            return Ok(()); // legacy plan — no bound fingerprint
+        };
+        let actual = execution_ir_fingerprint(models, &self.config_identity);
+        if actual.as_deref() != Some(expected) {
+            bail!(
+                "refusing to execute plan '{}': the models/config changed since the plan was \
+                 authorized and reviewed (compiled-IR fingerprint mismatch). A model's logic or \
+                 config, or the resolved target/adapter, differs from what was gated — so the \
+                 recorded authorization no longer covers what would execute. Re-plan with \
+                 `rocky plan` and (if AI-authored) re-review before applying.",
+                self.plan_id
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Governance context threaded into `commands::run::run` for a two-step agent
 /// apply. When present (`Some`), `run` performs the fail-closed **replication
 /// gate** at the point of execution: it evaluates the agent-policy plane over
@@ -978,6 +1086,25 @@ pub struct GovernedRunContext<'a> {
     pub root: &'a Path,
     /// The config the policy block loads from.
     pub config_path: &'a Path,
+    /// The plan-authorized compiled-IR fingerprint (from `EmbeddedCapabilities`)
+    /// — checked at the execution choke-point to close the gate/execute TOCTOU.
+    /// `None` only for a genuinely-legacy plan.
+    pub expected_ir_fingerprint: Option<String>,
+}
+
+impl GovernedRunContext<'_> {
+    /// Build the execution-choke-point TOCTOU gate for this apply, pairing the
+    /// plan-authorized fingerprint with the execute-time config identity.
+    pub(crate) fn exec_fingerprint_gate(
+        &self,
+        cfg: &rocky_core::config::RockyConfig,
+    ) -> ExecFingerprintGate {
+        ExecFingerprintGate {
+            expected: self.expected_ir_fingerprint.clone(),
+            config_identity: config_policy_identity(cfg),
+            plan_id: self.plan_id.to_string(),
+        }
+    }
 }
 
 impl GovernedRunContext<'_> {
@@ -1517,12 +1644,28 @@ async fn run_apply_backfill_plan(
         parallel: run_plan.parallel,
     };
 
+    // Governed-apply TOCTOU gate (E) for the backfill path — an agent backfill
+    // apply refuses if the compiled IR / config changed since the plan.
+    let backfill_cfg = rocky_core::config::load_rocky_config(config_path).ok();
+    let governed = governed_run_context(
+        &plan,
+        plan.enforcement_principal(runtime_principal),
+        plan_id,
+        root,
+        config_path,
+    );
+    let exec_fp_gate = match (governed.as_ref(), backfill_cfg.as_ref()) {
+        (Some(ctx), Some(cfg)) => Some(ctx.exec_fingerprint_gate(cfg)),
+        _ => None,
+    };
+
     crate::commands::run::execute_backfill_set(
         config_path,
         state_path,
         models_dir,
         &set,
         &partition_opts,
+        exec_fp_gate.as_ref(),
         output_json,
     )
     .await
@@ -3272,6 +3415,51 @@ auto_create_schemas = true
         );
     }
 
+    /// 🔴 E config dimension: `config_policy_identity` changes on an
+    /// adapter-type swap (identical model bytes), and that change flows into the
+    /// fingerprint — so a rocky.toml adapter/target change between plan and
+    /// apply refuses. Secrets (host/token) are NOT in the identity, so a rotated
+    /// credential does not spuriously refuse.
+    #[test]
+    fn config_identity_tracks_adapter_swap_not_secrets() {
+        fn cfg(body: &str) -> rocky_core::config::RockyConfig {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("rocky.toml");
+            std::fs::write(&p, body).unwrap();
+            rocky_core::config::load_rocky_config(&p).unwrap()
+        }
+        let duck = cfg(
+            "[adapter]\ntype = \"duckdb\"\npath = \"a.duckdb\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        );
+        let duck_rotated = cfg(
+            "[adapter]\ntype = \"duckdb\"\npath = \"b.duckdb\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        );
+        let snow = cfg(
+            "[adapter]\ntype = \"snowflake\"\naccount = \"x\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        );
+
+        let id_duck = super::config_policy_identity(&duck);
+        // A different path (a connection secret/detail) must NOT change the identity.
+        assert_eq!(
+            id_duck,
+            super::config_policy_identity(&duck_rotated),
+            "a connection detail (path) must not change the identity — no spurious refuse"
+        );
+        // An adapter-type swap MUST change it.
+        assert_ne!(
+            id_duck,
+            super::config_policy_identity(&snow),
+            "an adapter-type swap must change the config identity"
+        );
+        // And that flows into the fingerprint (same models, different identity).
+        let models: Vec<rocky_core::models::Model> = Vec::new();
+        assert_ne!(
+            super::execution_ir_fingerprint(&models, &id_duck),
+            super::execution_ir_fingerprint(&models, &super::config_policy_identity(&snow)),
+            "the config identity must change the execution fingerprint"
+        );
+    }
+
     /// 🔴 D regression: the discovered replication target set is gated. An
     /// agent replication under `deny agent apply { any }` must be refused before
     /// any table materializes. Pre-fix the replication set was never
@@ -3296,6 +3484,7 @@ effect = "deny"
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config,
+            expected_ir_fingerprint: None,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         let err = ctx
@@ -3338,6 +3527,7 @@ effect = "allow"
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config,
+            expected_ir_fingerprint: None,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
 
@@ -3382,6 +3572,7 @@ effect = "allow"
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &dir.path().join("rocky.toml"),
+            expected_ir_fingerprint: None,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         ctx.gate_replication_targets(&targets, &ledger)

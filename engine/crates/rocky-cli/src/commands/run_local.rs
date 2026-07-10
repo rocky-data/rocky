@@ -68,6 +68,8 @@ pub async fn run_transformation(
     // `@var()` markers in this pipeline's model SQL at compile time (both the
     // execution compile and the governance reconcile compile below).
     run_vars: &rocky_core::run_vars::RunVars,
+    // Governed-apply TOCTOU gate (E) — `Some` for an agent transformation apply.
+    exec_fp_gate: Option<&super::apply::ExecFingerprintGate>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -125,6 +127,7 @@ pub async fn run_transformation(
             run_vars,
             rocky_cfg.resilience.clone(),
             super::resilience::retry_policy_allows(rocky_cfg),
+            exec_fp_gate,
         )
         .await;
 
