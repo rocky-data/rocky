@@ -9,7 +9,10 @@
 //! can correlate per-node status, timing, and errors.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tracing::info;
@@ -17,9 +20,83 @@ use tracing::info;
 use rocky_core::dag_executor::{DagExecutor, NodeDispatcher, NodeFuture, NodeStatus};
 use rocky_core::unified_dag::{self, NodeId, NodeKind};
 
+use super::run::SkipRunOptions;
 use crate::output::{DagRunNodeOutput, DagRunOutput, print_json};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Runs one pipeline sub-run: `(config_path, state_path, pipeline_name,
+/// skip_opts) -> Result<(), String>`.
+///
+/// Injected into [`CliDispatcher`] so the escape-hatch flags flow to a single,
+/// observable seam. Production wraps [`super::run::run`] with the DAG sub-run's
+/// fixed arguments ([`default_sub_runner`]); tests substitute a recorder that
+/// captures the exact [`SkipRunOptions`] the dispatch passes — so reverting the
+/// dispatch to `SkipRunOptions::default()` is caught.
+type SubRunner = Arc<
+    dyn Fn(
+            PathBuf,
+            PathBuf,
+            String,
+            SkipRunOptions,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The production [`SubRunner`]: drives one pipeline through [`super::run::run`]
+/// with the DAG sub-run's fixed arguments (no `--model`/`--defer`/`--var`,
+/// config-derived TTL, no idempotency key). Only `config`, `state`, `pipeline`,
+/// and `skip_opts` vary per node.
+fn default_sub_runner() -> SubRunner {
+    Arc::new(
+        |config_path: PathBuf, state_path: PathBuf, pipeline_name: String, skip_opts| {
+            Box::pin(async move {
+                let partition_opts = super::PartitionRunOptions {
+                    partition: None,
+                    from: None,
+                    to: None,
+                    latest: false,
+                    missing: false,
+                    lookback: None,
+                    parallel: 1,
+                };
+                super::run::run(
+                    &config_path,
+                    None,
+                    Some(&pipeline_name),
+                    &state_path,
+                    None,
+                    false, // json — sub-runs print to stdout if not silenced
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                    &partition_opts,
+                    None,
+                    // DAG sub-runs inherit config-derived TTL.
+                    None,
+                    // DAG sub-runs do not accept `--idempotency-key`.
+                    None,
+                    // DAG sub-runs inherit no `--env`.
+                    None,
+                    // DAG sub-runs build full pipelines (no `--model` selection).
+                    &super::run::DeferOptions::default(),
+                    // The build-escape-hatch overlay (`--force-rebuild` /
+                    // `--no-reuse`) threaded from the outer `rocky run --dag`.
+                    &skip_opts,
+                    // The unified-DAG driver does not surface `--var`.
+                    &rocky_core::run_vars::RunVars::new(),
+                    // No run_id override — DAG sub-runs mint their own ids.
+                    None,
+                )
+                .await
+                .map_err(|e| e.to_string())
+            })
+        },
+    )
+}
 
 /// Execute `rocky run --dag`: run every pipeline in dependency order.
 ///
@@ -103,6 +180,7 @@ pub async fn run_with_dag(
         seeds_dir,
         node_pipelines,
         skip_opts: *skip_opts,
+        sub_runner: default_sub_runner(),
     };
     let executor = DagExecutor::new(dispatcher);
     let result = executor
@@ -190,6 +268,9 @@ struct CliDispatcher {
     /// from the outer `run_with_dag` so each sub-run honors it. `Copy`, so the
     /// per-node closure captures a value (no borrow escaping the dispatcher).
     skip_opts: super::run::SkipRunOptions,
+    /// The injected sub-run driver. Production is [`default_sub_runner`]; tests
+    /// substitute a recorder to observe the `skip_opts` each sub-run receives.
+    sub_runner: SubRunner,
 }
 
 impl NodeDispatcher for CliDispatcher {
@@ -197,6 +278,7 @@ impl NodeDispatcher for CliDispatcher {
         let config_path = self.config_path.clone();
         let state_path = self.state_path.clone();
         let skip_opts = self.skip_opts;
+        let sub_runner = self.sub_runner.clone();
         let label = label.to_string();
         match kind {
             NodeKind::Test => {
@@ -242,73 +324,15 @@ impl NodeDispatcher for CliDispatcher {
                         }));
                     }
                 };
+                // Drive the sub-run through the injected [`SubRunner`] against
+                // the canonical state path the caller resolved, threading the
+                // build-escape-hatch `skip_opts` (`--force-rebuild` /
+                // `--no-reuse`) so they are honored per sub-run rather than
+                // dropped at the DAG boundary. Passing anything other than
+                // `skip_opts` here reintroduces the silent-drop bug, which the
+                // `sub_runner` recorder test catches.
                 Some(Box::pin(async move {
-                    let partition_opts = super::PartitionRunOptions {
-                        partition: None,
-                        from: None,
-                        to: None,
-                        latest: false,
-                        missing: false,
-                        lookback: None,
-                        parallel: 1,
-                    };
-                    // Drive each sub-run against the canonical state path the
-                    // caller resolved (honoring `--state-path` /
-                    // `--state-namespace` / the `<models>/.rocky-state.redb`
-                    // default), so the unified-DAG path shares the project's
-                    // state with every other `rocky run`.
-                    super::run::run(
-                        &config_path,
-                        None,
-                        Some(&pipeline_name),
-                        &state_path,
-                        None,
-                        false, // json — sub-runs print to stdout if not silenced
-                        None,
-                        false,
-                        None,
-                        false,
-                        None,
-                        &partition_opts,
-                        None,
-                        // DAG sub-runs inherit config-derived TTL. Threading
-                        // the outer `--cache-ttl` through a unified-DAG
-                        // orchestration layer would complicate the sub-run
-                        // contract without clear signal; defer unless a
-                        // concrete use case shows up.
-                        None,
-                        // DAG sub-runs do not accept `--idempotency-key`; the
-                        // caller stamps dedup on the outer DAG driver, and
-                        // cascading the key into every pipeline sub-run would
-                        // cause every sibling to short-circuit on a single
-                        // stamp.
-                        None,
-                        // DAG sub-runs inherit no `--env`; the outer DAG
-                        // driver is pipeline-agnostic and the per-pipeline
-                        // governance reconcile picks up the resolved mask on
-                        // its own call path. Passing `None` preserves the
-                        // pre-1.16 workspace-default resolution for DAG runs.
-                        None,
-                        // DAG sub-runs build full pipelines (no `--model`
-                        // selection), so `--defer` would be inert anyway.
-                        &super::run::DeferOptions::default(),
-                        // Build-escape-hatch overlay threaded from the outer
-                        // `rocky run --dag` invocation: `--force-rebuild` /
-                        // `--no-reuse` must reach each sub-run (they force a
-                        // build and disable content-addressed reuse +
-                        // column-skip). `--skip-unchanged` is not surfaced on
-                        // the DAG path, so it stays OFF via `SkipRunOptions`'s
-                        // own default for that field.
-                        &skip_opts,
-                        // The unified-DAG driver does not surface `--var`; pass an
-                        // empty set so `@var()` models would compile-error rather
-                        // than silently resolve under a DAG run.
-                        &rocky_core::run_vars::RunVars::new(),
-                        // No run_id override — DAG sub-runs mint their own ids.
-                        None,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())
+                    (sub_runner)(config_path, state_path, pipeline_name, skip_opts).await
                 }))
             }
         }
@@ -318,42 +342,73 @@ impl NodeDispatcher for CliDispatcher {
 #[cfg(test)]
 mod skip_opts_threading_tests {
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use rocky_core::dag_executor::NodeDispatcher;
+    use rocky_core::unified_dag::{NodeId, NodeKind};
 
     use super::super::run::SkipRunOptions;
-    use super::CliDispatcher;
+    use super::{CliDispatcher, SubRunner};
 
     /// 🔴 DEFECT 3 regression: `rocky run --dag --force-rebuild` / `--no-reuse`
-    /// must reach each sub-run. Pre-fix, `run_with_dag` had no `skip_opts` and
-    /// the sub-run dispatch passed `SkipRunOptions::default()`, silently
-    /// dropping the escape hatches (a column-skip-eligible content-addressed
-    /// model would still skip under `--dag --force-rebuild`).
+    /// must reach each sub-run. Pre-fix, `run_with_dag` passed
+    /// `SkipRunOptions::default()` to every sub-run, silently dropping the
+    /// escape hatches (a column-skip-eligible content-addressed model would
+    /// still skip under `--dag --force-rebuild`).
     ///
-    /// This pins that the flags are threaded onto the [`CliDispatcher`] every
-    /// sub-run reads — the smallest creds-free seam (the behavioral proof needs
-    /// a content-addressed/s3 model, exercised by the live sandbox). The field
-    /// did not exist pre-fix, so this fails to compile against the old code.
-    #[test]
-    fn dispatcher_threads_build_escape_hatch_flags() {
+    /// Non-vacuous: a recording [`SubRunner`] captures the EXACT `SkipRunOptions`
+    /// the pipeline dispatch passes. Reverting the dispatch call argument to
+    /// `SkipRunOptions::default()` makes the recorded value `default()` and
+    /// fails the assertion. (The behavioral end-to-end proof — a
+    /// content-addressed model not skipping — needs s3 and is exercised by the
+    /// live sandbox.)
+    #[tokio::test]
+    async fn dispatch_passes_the_threaded_skip_opts_to_each_sub_run() {
+        let recorded: Arc<Mutex<Vec<SkipRunOptions>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        // A recorder sub-runner: capture the skip_opts and return Ok without
+        // running a real pipeline.
+        let recorder: SubRunner = Arc::new(move |_config, _state, _pipeline, skip_opts| {
+            let sink = sink.clone();
+            Box::pin(async move {
+                sink.lock().unwrap().push(skip_opts);
+                Ok(())
+            })
+        });
+
         let skip_opts = SkipRunOptions {
             skip_unchanged: false,
             force_rebuild: true,
             no_reuse: true,
             no_prune: false,
         };
+        let mut node_pipelines = HashMap::new();
+        let node_id = NodeId::new("transformation", "dim_orders");
+        node_pipelines.insert(node_id.clone(), "analytics".to_string());
         let dispatcher = CliDispatcher {
             config_path: std::path::PathBuf::from("rocky.toml"),
             state_path: std::path::PathBuf::from(".rocky-state.redb"),
             seeds_dir: std::path::PathBuf::from("seeds"),
-            node_pipelines: HashMap::new(),
+            node_pipelines,
             skip_opts,
+            sub_runner: recorder,
         };
+
+        // Drive a real pipeline-node dispatch through the production path.
+        let fut = dispatcher
+            .dispatch(&node_id, NodeKind::Transformation, "dim_orders")
+            .expect("a pipeline node dispatches a future");
+        fut.await.expect("recorder sub-runner returns Ok");
+
+        let got = recorded.lock().unwrap();
+        assert_eq!(got.len(), 1, "exactly one sub-run was dispatched");
         assert!(
-            dispatcher.skip_opts.force_rebuild,
-            "--force-rebuild must be carried to each DAG sub-run, not dropped"
+            got[0].force_rebuild,
+            "--force-rebuild must reach the sub-run, not be dropped to default()"
         );
         assert!(
-            dispatcher.skip_opts.no_reuse,
-            "--no-reuse must be carried to each DAG sub-run, not dropped"
+            got[0].no_reuse,
+            "--no-reuse must reach the sub-run, not be dropped to default()"
         );
     }
 }

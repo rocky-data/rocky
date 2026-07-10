@@ -32,8 +32,8 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use object_store::ObjectStore;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use rocky_iceberg::uniform_writer::{
-    PathLiveness, Result as UfResult, SqlClient, UniformWriter, UniformWriterConfig,
-    UniformWriterError,
+    RemovalHoldReason, RemovalProof, Result as UfResult, SqlClient, UniformWriter,
+    UniformWriterConfig, UniformWriterError,
 };
 use rocky_ir::{MaterializationStrategy, ModelIr, RockyType, TypedColumn};
 use tracing::{debug, info, warn};
@@ -107,34 +107,76 @@ pub(crate) fn build_object_store(storage_prefix: &str) -> Result<Arc<dyn ObjectS
     Ok(Arc::new(store))
 }
 
-/// Resolve the three-state Delta-log liveness of a content-addressed
-/// artifact's file, given its table's `storage_prefix` and the artifact's
-/// full object `file_path`.
+/// Resolve `(key_prefix, table_relative_path)` for an artifact `file_path`
+/// against its table's `storage_prefix`, binding the file to *this* table.
 ///
-/// Builds the s3 object store + a metadata-only [`UniformWriter`] rooted at
-/// the table prefix (the same construction `execute_content_addressed_model`
-/// uses) and asks the table's `_delta_log` whether the file is a live `add`,
-/// a `remove`d file, or absent. The `add.path` is the file's basename
-/// (`<hash>.parquet`), relative to the table prefix.
+/// Fails closed with a [`RemovalHoldReason`] (never a plausible-but-wrong
+/// success) when:
+/// - `storage_prefix` is not a parseable `s3://bucket/key` URL;
+/// - `file_path` is an `s3://` URL whose bucket differs from `storage_prefix`'s;
+/// - the resolved bucket-relative key does not live **under** the table's key
+///   prefix at a path boundary (the finding-1 membership check that stops a
+///   wrong/spoofed prefix from reading another table's log).
 ///
-/// This is the manifest-truth liveness `rocky gc` consults **before** deleting
-/// an artifact's bytes: the append-only UniForm writer never emits `remove`,
-/// so multiple file versions can be live at once and only the log is
-/// authoritative. Reachable only where object-store credentials are present
-/// (content-addressed storage is s3-only); creds-free, it errors and the
-/// caller holds.
-///
-/// # Errors
-///
-/// Propagates object-store / Delta-log read failures so the caller can treat
-/// the doubt as fail-closed (hold, never delete).
-pub(crate) async fn artifact_delta_liveness(
+/// The table-relative path preserves nested/partition components (it is the key
+/// with the prefix stripped, **not** the basename), so `region=eu/H.parquet`
+/// and `H.parquet` never collide.
+pub(crate) fn table_relative_add_path(
     storage_prefix: &str,
     file_path: &str,
-) -> Result<PathLiveness> {
-    let store = build_object_store(storage_prefix)?;
-    let (_bucket, key_prefix) = parse_s3_url(storage_prefix)?;
-    // catalog/schema/table are unused by the liveness read (it only consults
+) -> std::result::Result<(String, String), RemovalHoldReason> {
+    let Ok((bucket, key_prefix)) = parse_s3_url(storage_prefix) else {
+        return Err(RemovalHoldReason::PrefixMismatch);
+    };
+    let key_prefix = key_prefix.trim_end_matches('/').to_string();
+
+    // Normalize the artifact path to a bucket-relative key. Production records a
+    // bucket-relative key; tests/other callers may pass an `s3://` URL.
+    let key: String = if let Some(rest) = file_path.strip_prefix("s3://") {
+        // `bucket/key…` — the bucket must match the table's.
+        let (fb, fkey) = rest.split_once('/').unwrap_or((rest, ""));
+        if fb != bucket {
+            return Err(RemovalHoldReason::PrefixMismatch);
+        }
+        fkey.to_string()
+    } else {
+        file_path.trim_start_matches('/').to_string()
+    };
+
+    // Membership at a path boundary: the key must equal `<prefix>/<relative>`.
+    let expected = format!("{key_prefix}/");
+    let Some(relative) = key.strip_prefix(&expected) else {
+        return Err(RemovalHoldReason::PrefixMismatch);
+    };
+    if relative.is_empty() {
+        return Err(RemovalHoldReason::PrefixMismatch);
+    }
+    Ok((key_prefix, relative.to_string()))
+}
+
+/// The **strict removal proof** for a content-addressed artifact, over an
+/// injected object `store` — the single production decision path both the real
+/// `rocky gc` oracle and its tests run through.
+///
+/// Resolves the table-relative path with [`table_relative_add_path`] (binding
+/// the file to its own table, finding 1), builds a metadata-only
+/// [`UniformWriter`] rooted at the table prefix, and delegates to
+/// [`UniformWriter::proven_removed`], which returns
+/// [`RemovalProof::ProvenRemoved`] **only** on an affirmatively-validated log
+/// (finding 2) and holds on every anomaly. `expected_add_version` is the
+/// artifact's recorded Delta `commit_version`, requiring the file's own `add`
+/// at that version.
+pub(crate) async fn removal_proof_given_store(
+    store: Arc<dyn ObjectStore>,
+    storage_prefix: &str,
+    file_path: &str,
+    expected_add_version: u64,
+) -> RemovalProof {
+    let (key_prefix, table_relative) = match table_relative_add_path(storage_prefix, file_path) {
+        Ok(pair) => pair,
+        Err(reason) => return RemovalProof::Held(reason),
+    };
+    // catalog/schema/table are unused by the log read (it only consults
     // `config.prefix` + the store), so placeholders are fine here.
     let writer = UniformWriter::new(
         UniformWriterConfig {
@@ -147,11 +189,9 @@ pub(crate) async fn artifact_delta_liveness(
         store,
         Arc::new(NoOpSqlClient),
     );
-    let add_file_path = file_path.rsplit('/').next().unwrap_or(file_path);
     writer
-        .add_path_liveness(add_file_path)
+        .proven_removed(&table_relative, expected_add_version)
         .await
-        .with_context(|| format!("failed to read Delta-log liveness for {file_path}"))
 }
 
 /// Convert a `QueryResult` plus the model's `typed_columns` into an Arrow

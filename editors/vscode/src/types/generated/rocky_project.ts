@@ -957,13 +957,13 @@ export interface ProjectFreshnessConfig {
 /**
  * `[gc]` — storage-reclamation settings for `rocky gc` and its review-gated `rocky apply <gc-plan>`.
  *
- * The default posture keeps eviction **ledger-only**: an approved apply writes the durable tombstone and retires the artifact's ledger row (the eviction of record), while the physical object-store byte-delete stays disarmed. Deleting bytes is irreversible in a way the ledger eviction is not, so it is a separate, explicit opt-in rather than something ambient credentials switch on.
+ * Eviction is **ledger-only**: an approved apply writes the durable tombstone and retires the artifact's ledger row (the eviction of record, always restorable from the recorded recipe). Physical byte-deletion is not performed — reclaiming bytes safely requires a protocol-aware VACUUM (retention windows + TOCTOU-safe deletion), which is future work.
  */
 export interface GcConfig {
   /**
-   * Arm the physical object-store byte-delete on `rocky apply <gc-plan>`.
+   * Reserved for a future protocol-aware VACUUM.
    *
-   * `false` (the default): evicted artifacts are tombstoned and retired from the ledger, but their bytes are left in place as safe orphans — even when object-store credentials are present in the environment. `true`: after the tombstone + ledger retirement commit, a best-effort object-store delete reclaims the bytes (still requires reachable credentials; content-addressed storage is s3-only, and a failed delete leaves a safe orphan, never a dangling reference).
+   * `false` (the default): `rocky apply <gc-plan>` tombstones + retires the ledger row and leaves the bytes in place. `true` is currently a **hard error** at apply time — physical reclamation of content-addressed bytes requires a protocol-aware VACUUM (Delta tombstone-retention windows + TOCTOU-safe deletion against concurrent re-adds) that is not yet implemented, so the flag fails loudly rather than silently deleting or silently no-op'ing.
    */
   physical_delete?: boolean;
 }

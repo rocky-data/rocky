@@ -863,171 +863,90 @@ fn print_plan_table(output: &GcPlanOutput) {
 
 /// The manifest-truth reclaimability verdict for a candidate artifact.
 enum ReclaimVerdict {
-    /// The candidate's file is a proven `remove` in its table's Delta log — its
-    /// bytes are safe to reclaim.
+    /// The candidate's file is **affirmatively proven removed** in its own
+    /// table's Delta log (an external compaction/VACUUM retired it) — the
+    /// ledger row may be tombstoned + retired.
     Reclaimable,
-    /// The candidate is held: still a live `add`, absent from the readable log
-    /// (possibly checkpoint-truncated), the target could not be resolved, or
-    /// the log could not be read. Carries the operator-facing reason.
+    /// The candidate is held: not provably removed, wrong/unresolvable table,
+    /// or the log could not be validated. Carries the operator-facing reason.
     Held(String),
 }
 
-/// Decides whether a content-addressed artifact's **bytes** are safe to
-/// reclaim, by reading the manifest truth of its table's Delta log.
+/// Decides whether a content-addressed artifact may be **tombstoned + retired**
+/// from the ledger, by reading the manifest truth of its own table's Delta log.
 ///
-/// This is the load-bearing safety gate that closes the append-only data-loss
-/// hole: the UniForm writer only ever appends `add` actions and **never**
-/// emits `remove`, so two builds `H1→H2` leave BOTH files referenced by the
-/// live snapshot. No ledger/hash heuristic can tell which files a live table
-/// still points at — only the `_delta_log` can. So an artifact is reclaimable
-/// **iff** its file is a proven `remove` there (an external compaction/VACUUM
-/// retired it); every other state — still a live `add`, absent/truncated, or
-/// unverifiable — holds (fail-closed).
+/// The append-only UniForm writer emits `add` actions and **never** `remove`,
+/// so multiple file versions are live at once and no ledger/hash heuristic can
+/// tell which files a live table still references — only the `_delta_log` can.
+/// An artifact is reclaimable **iff** the strict [`RemovalProof`] affirms it was
+/// `remove`d in its own table (bound to that table by prefix membership + its
+/// own `add` at its recorded commit version). Every other state — still live,
+/// absent/checkpoint-truncated, malformed, wrong prefix, unverifiable — holds
+/// (fail-closed).
 ///
-/// The abstraction keeps the eviction path testable creds-free (tests inject a
-/// deterministic oracle) while the real Delta-log read stays a single,
-/// reviewable implementation on the credentialed s3 path.
+/// Physical byte-deletion is deliberately **not** performed here (it needs a
+/// protocol-aware VACUUM: retention windows + TOCTOU-safe deletion); the
+/// tombstone + retired ledger row is the eviction of record. The oracle still
+/// gates the tombstone so a wrong tombstone can never mislead restore/reuse.
+///
+/// Injectable so tests exercise the SAME decision path over an in-memory store.
 #[async_trait]
 trait LivenessOracle: Send + Sync {
     /// `storage_prefix` is the candidate table's root; `file_path` is the
-    /// artifact's full object path (its basename is the Delta `add.path`).
-    async fn reclaim_verdict(&self, storage_prefix: &str, file_path: &str) -> ReclaimVerdict;
+    /// artifact's object path; `commit_version` is its recorded Delta version.
+    async fn reclaim_verdict(
+        &self,
+        storage_prefix: &str,
+        file_path: &str,
+        commit_version: u64,
+    ) -> ReclaimVerdict;
 }
 
-/// Production oracle: reads the candidate's own table's `_delta_log` via the
-/// content-addressed writer's manifest reader ([`PathLiveness`]).
+/// Production oracle: builds the s3 object store for the candidate's own table
+/// and runs the shared [`removal_proof_given_store`] decision path.
 ///
-/// Because it is scoped to the candidate's own `storage_prefix` and file path,
-/// two same-named models in different catalogs never cross-contaminate — each
-/// is checked against its own table's log. Reachable only with object-store
-/// credentials (content-addressed storage is s3-only); creds-free it errors and
-/// the candidate is held.
+/// Reachable only with object-store credentials (content-addressed storage is
+/// s3-only); creds-free the store build/read fails and the candidate is held.
 struct ManifestLivenessOracle;
 
 #[async_trait]
 impl LivenessOracle for ManifestLivenessOracle {
-    async fn reclaim_verdict(&self, storage_prefix: &str, file_path: &str) -> ReclaimVerdict {
-        use rocky_iceberg::uniform_writer::PathLiveness;
-        match super::run_content_addressed::artifact_delta_liveness(storage_prefix, file_path).await
-        {
-            Ok(PathLiveness::Removed) => ReclaimVerdict::Reclaimable,
-            Ok(PathLiveness::Live) => ReclaimVerdict::Held(
-                "the file is still a live `add` in the table's Delta log (append-only writer \
-                 keeps older versions live) — HELD"
-                    .to_string(),
-            ),
-            Ok(PathLiveness::Absent) => ReclaimVerdict::Held(
-                "the file is not referenced by the readable Delta log — cannot prove it was \
-                 removed (a checkpoint may still carry its `add`); HELD (fail-closed)"
-                    .to_string(),
-            ),
-            Err(e) => ReclaimVerdict::Held(format!(
-                "could not read the Delta log to verify removal: {e}; HELD (fail-closed)"
-            )),
-        }
-    }
-}
-
-/// Outcome of a best-effort physical reclamation of an evicted artifact's
-/// bytes through the object-store adapter.
-enum PhysicalReclaim {
-    /// The bytes were deleted from the object store.
-    Deleted,
-    /// The physical delete was intentionally not attempted (no reachable object
-    /// store / credentials on this adapter). The byte is a safe leaked orphan.
-    Deferred(String),
-    /// The physical delete was attempted and failed. The byte remains; the
-    /// tombstone stands, so it is a safe leaked orphan a later sweep reclaims.
-    Failed(String),
-}
-
-/// Physically reclaims an evicted artifact's bytes.
-///
-/// The abstraction is what makes the eviction path testable creds-free (tests
-/// inject a recording evictor) while the real object-store delete stays a
-/// single, reviewable implementation.
-#[async_trait]
-trait ArtifactEvictor: Send + Sync {
-    async fn evict_bytes(&self, file_path: &str) -> PhysicalReclaim;
-}
-
-/// Deletes evicted bytes through the `object_store` S3 adapter.
-///
-/// Content-addressed storage is s3-only (`AmazonS3Builder::from_env`), so this
-/// is the production reclamation path. The delete itself is exercised only
-/// against a live bucket — it is **code-reviewed here, driven on the sandbox**,
-/// never against the creds-free playground (which writes no CAS artifacts).
-struct ObjectStoreEvictor;
-
-#[async_trait]
-impl ArtifactEvictor for ObjectStoreEvictor {
-    async fn evict_bytes(&self, file_path: &str) -> PhysicalReclaim {
-        use object_store::ObjectStoreExt;
-
-        let store = match super::run_content_addressed::build_object_store(file_path) {
+    async fn reclaim_verdict(
+        &self,
+        storage_prefix: &str,
+        file_path: &str,
+        commit_version: u64,
+    ) -> ReclaimVerdict {
+        let store = match super::run_content_addressed::build_object_store(storage_prefix) {
             Ok(s) => s,
-            Err(e) => return PhysicalReclaim::Failed(format!("could not build object store: {e}")),
+            Err(e) => {
+                return ReclaimVerdict::Held(format!(
+                    "could not reach the object store to verify removal: {e}; HELD (fail-closed)"
+                ));
+            }
         };
-        let Some(key) = s3_object_key(file_path) else {
-            return PhysicalReclaim::Failed(format!(
-                "could not derive an object key from '{file_path}'"
-            ));
-        };
-        match store.delete(&object_store::path::Path::from(key)).await {
-            Ok(()) => PhysicalReclaim::Deleted,
-            Err(e) => PhysicalReclaim::Failed(format!("object-store delete failed: {e}")),
-        }
+        map_removal_proof(
+            &super::run_content_addressed::removal_proof_given_store(
+                store,
+                storage_prefix,
+                file_path,
+                commit_version,
+            )
+            .await,
+        )
     }
 }
 
-/// Records every eviction as deferred without touching an object store — the
-/// creds-free / non-s3 posture. The ledger eviction (tombstone + row retire)
-/// still stands; the byte is a safe leaked orphan a later sweep can reclaim.
-struct DeferredEvictor {
-    reason: String,
-}
-
-#[async_trait]
-impl ArtifactEvictor for DeferredEvictor {
-    async fn evict_bytes(&self, _file_path: &str) -> PhysicalReclaim {
-        PhysicalReclaim::Deferred(self.reason.clone())
-    }
-}
-
-/// Parse the bucket-relative object key out of an `s3://bucket/key…` URL.
-fn s3_object_key(url: &str) -> Option<String> {
-    let parsed = url::Url::parse(url).ok()?;
-    Some(parsed.path().trim_start_matches('/').to_string())
-}
-
-/// Select the physical evictor for this apply.
-///
-/// Physical byte-deletion is an **explicit opt-in** (`[gc] physical_delete =
-/// true`): ambient AWS credentials are present on essentially every
-/// content-addressed deployment, so gating on them alone armed irreversible
-/// deletion by default. The `ObjectStoreEvictor` (the real s3 delete) is chosen
-/// only when the flag is set AND credentials are reachable; otherwise the
-/// physical delete is deferred and the tombstone + retired ledger row remain
-/// the eviction of record. The deferral reason names the missing precondition.
-fn choose_evictor(physical_delete: bool) -> Box<dyn ArtifactEvictor> {
-    if !physical_delete {
-        return Box::new(DeferredEvictor {
-            reason: "physical byte-deletion is disabled — set `[gc] physical_delete = true` to \
-                     arm it (the tombstone + retired ledger row are the eviction of record)"
-                .to_string(),
-        });
-    }
-    let has_creds = std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-        && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok();
-    if has_creds {
-        Box::new(ObjectStoreEvictor)
-    } else {
-        Box::new(DeferredEvictor {
-            reason: "`[gc] physical_delete` is armed but no reachable object store — \
-                     content-addressed deletion is s3-only and no AWS credentials were found in \
-                     the environment"
-                .to_string(),
-        })
+/// Map a strict [`RemovalProof`] to the gc [`ReclaimVerdict`]: only an
+/// affirmative `ProvenRemoved` reclaims; every hold reason is surfaced.
+fn map_removal_proof(proof: &rocky_iceberg::uniform_writer::RemovalProof) -> ReclaimVerdict {
+    use rocky_iceberg::uniform_writer::RemovalProof;
+    match proof {
+        RemovalProof::ProvenRemoved => ReclaimVerdict::Reclaimable,
+        RemovalProof::Held(reason) => ReclaimVerdict::Held(format!(
+            "not provably removed from the table's Delta log ({}); HELD (fail-closed)",
+            reason.as_str()
+        )),
     }
 }
 
@@ -1037,15 +956,19 @@ fn gc_apply_notes() -> Vec<String> {
         "Refcounts see Rocky-ledger references only. Multi-ref safety on the UniForm path \
          (branch / env / downstream-deferred-read pointers) is code-reviewed, not driven here."
             .to_string(),
-        "Liveness is manifest-truth: an artifact is reclaimed only when its file is a proven \
-         `remove` in its table's Delta log. The append-only writer never removes on its own, so \
-         a still-referenced file (including an older version) is HELD — only an external \
-         compaction/VACUUM makes a file reclaimable. Unverifiable liveness (no creds, truncated \
-         log) also holds (fail-closed)."
+        "Liveness is manifest-truth: an artifact is tombstoned + retired only when its file is \
+         AFFIRMATIVELY PROVEN removed in its own table's Delta log (bound by prefix membership + \
+         its own `add` at its recorded commit version). The append-only writer never removes on \
+         its own, so a still-referenced file (including an older version) is HELD — only an \
+         external compaction/VACUUM makes a file reclaimable. Any anomaly (checkpoint, version \
+         gap, malformed commit, unsupported protocol, wrong prefix, unverifiable log) holds \
+         (fail-closed)."
             .to_string(),
-        "Physical byte-deletion is opt-in via `[gc] physical_delete = true` (and is s3-only, \
-         driven only against a live bucket). By default it is disabled: the byte-delete is \
-         deferred and the durable tombstone + retired ledger row are the eviction of record."
+        "The eviction of record is the durable tombstone + retired ledger row (always restorable \
+         from the recorded recipe). Physical byte-deletion is NOT performed: reclaiming bytes \
+         safely requires a protocol-aware VACUUM (Delta tombstone-retention windows plus \
+         TOCTOU-safe deletion against concurrent re-adds), which is future work. Setting `[gc] \
+         physical_delete = true` is a hard error until then."
             .to_string(),
         "Restore (evict → rebuild → bit-exact) is a later phase and is not exercised here — an \
          evicted artifact's tombstone captures the recipe to rebuild it, but the roundtrip is \
@@ -1056,13 +979,13 @@ fn gc_apply_notes() -> Vec<String> {
 
 /// The eviction engine: re-derive eligibility against the live ledger, then for
 /// each planned artifact that is **still derivable, an exact identity match, AND
-/// provably retired from its table's Delta log** write its tombstone and retire
-/// its ledger row atomically before a best-effort physical delete.
+/// affirmatively proven removed from its own table's Delta log** write its
+/// tombstone and retire its ledger row atomically. No bytes are deleted — the
+/// tombstone + retired ledger row is the eviction of record.
 ///
-/// Pure over its inputs (`store`, `evictor`, `oracle`, `now`) so tests drive it
-/// directly with a seeded store, a recording evictor, and a deterministic
-/// liveness oracle. The review + policy gates live in [`run_gc_apply_in`] and
-/// run *before* this is called.
+/// Pure over its inputs (`store`, `oracle`, `now`) so tests drive it directly
+/// with a seeded store and a deterministic liveness oracle. The review + policy
+/// gates live in [`run_gc_apply_in`] and run *before* this is called.
 ///
 /// **Apply re-derives; it does not trust the plan.** The reviewed plan_id
 /// approves a *proposal*, but the persisted rows carry a `blake3_hash` that
@@ -1074,20 +997,19 @@ fn gc_apply_notes() -> Vec<String> {
 /// 2. resolves the exact live row the plan row names, and refuses unless the
 ///    live row's hash equals the planned hash;
 /// 3. re-derives derivability *now* AND consults the [`LivenessOracle`] for
-///    manifest truth — evicting only when the candidate's file is a proven
-///    `remove` in its own table's Delta log (the append-only writer keeps older
-///    versions live, so a ledger/hash heuristic cannot authorize a delete);
-/// 4. builds the tombstone from the LIVE candidate, never the plan payload, so
-///    the tombstone records the exact bytes deleted;
+///    manifest truth — tombstoning only when the candidate's file is
+///    affirmatively proven removed in its own table's Delta log (the
+///    append-only writer keeps older versions live, so a ledger/hash heuristic
+///    cannot authorize a retirement);
+/// 4. builds the tombstone from the LIVE candidate, never the plan payload;
 /// 5. relies on [`StateStore::evict_artifact`]'s in-transaction hash check as a
 ///    final guard against a race.
 ///
 /// Any plan row that fails to match a current derivable candidate, or whose file
-/// is not provably removed, is refused/held — nothing is deleted. The hash is
+/// is not provably removed, is refused/held — nothing is retired. The hash is
 /// the eviction identity, never the `(run, model)` pair.
 async fn execute_gc_apply(
     store: &StateStore,
-    evictor: &dyn ArtifactEvictor,
     oracle: &dyn LivenessOracle,
     plan_id: &str,
     plan: &GcPlan,
@@ -1169,7 +1091,11 @@ async fn execute_gc_apply(
                 let verdict = match cand.storage_prefix.as_deref() {
                     Some(prefix) => {
                         oracle
-                            .reclaim_verdict(prefix, &cand.artifact.file_path)
+                            .reclaim_verdict(
+                                prefix,
+                                &cand.artifact.file_path,
+                                cand.artifact.commit_version,
+                            )
                             .await
                     }
                     None => ReclaimVerdict::Held(
@@ -1249,39 +1175,22 @@ async fn execute_gc_apply(
                     EvictOutcome::Evicted => {}
                 }
 
-                // Physical reclamation happens LAST and is best-effort — a
-                // failure here leaves a safe leaked orphan, never a dangling
-                // reference (the row is already gone, the tombstone stands).
-                let (physical_reclaimed, physical_status) =
-                    match evictor.evict_bytes(&cand.artifact.file_path).await {
-                        PhysicalReclaim::Deleted => (true, "deleted".to_string()),
-                        PhysicalReclaim::Deferred(m) => (false, format!("deferred: {m}")),
-                        PhysicalReclaim::Failed(m) => (false, format!("failed: {m}")),
-                    };
-                if physical_reclaimed {
-                    // Flip the custody flag now the bytes are actually gone so a
-                    // later sweep skips them. Best-effort — a failed update just
-                    // means a redundant future re-check.
-                    let mut updated = tombstone.clone();
-                    updated.physical_reclaimed = true;
-                    if let Err(e) = store.record_tombstone(&updated) {
-                        warn!(
-                            target: "rocky::gc",
-                            error = %e,
-                            hash = %cand.artifact.blake3_hash,
-                            "evicted bytes but failed to update the tombstone's reclaimed flag"
-                        );
-                    }
-                }
-
+                // No physical byte-delete: the tombstone + retired ledger row is
+                // the eviction of record. Safe reclamation of the bytes requires
+                // a protocol-aware VACUUM (retention windows + TOCTOU-safe
+                // deletion), which is future work — `physical_reclaimed` stays
+                // false by construction.
                 evicted.push(GcEvictedOutput {
                     model_name: cand.artifact.model_name.clone(),
                     run_id: cand.artifact.run_id.clone(),
                     blake3_hash: cand.artifact.blake3_hash.clone(),
                     size_bytes: cand.artifact.size_bytes,
                     tombstone_recorded: true,
-                    physical_reclaimed,
-                    physical_status,
+                    physical_reclaimed: false,
+                    physical_status: "not attempted — physical reclamation is future \
+                                      protocol-aware VACUUM work; the tombstone + retired ledger \
+                                      row is the eviction of record"
+                        .to_string(),
                 });
             }
             other => {
@@ -1444,17 +1353,28 @@ async fn run_gc_apply_in_with(
         );
     }
 
-    let store = StateStore::open(state_path)
-        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    // Physical byte-deletion is opt-in via `[gc] physical_delete`. An
-    // unreadable/absent config leaves it disabled (the safe default), so a
-    // missing `rocky.toml` never silently arms deletion.
+    // Physical byte-deletion is not implemented: reclaiming bytes safely needs
+    // a protocol-aware VACUUM (Delta tombstone-retention windows + TOCTOU-safe
+    // deletion against concurrent re-adds). `[gc] physical_delete = true` is a
+    // hard error until then rather than a silent no-op, so an operator who
+    // expects bytes to be deleted is told plainly they will not be. An
+    // unreadable/absent config leaves it disabled (the safe default).
     let physical_delete = load_rocky_config(config_path)
         .map(|cfg| cfg.gc.physical_delete)
         .unwrap_or(false);
-    let evictor = choose_evictor(physical_delete);
-    let output =
-        execute_gc_apply(&store, evictor.as_ref(), oracle, plan_id, &plan, Utc::now()).await?;
+    if physical_delete {
+        bail!(
+            "`[gc] physical_delete = true` is not supported: physical reclamation of \
+             content-addressed bytes requires a protocol-aware VACUUM (Delta tombstone-retention \
+             windows + TOCTOU-safe deletion), which is not yet implemented. Unset `[gc] \
+             physical_delete` — the durable tombstone + retired ledger row is the eviction of \
+             record (always restorable from the recorded recipe)."
+        );
+    }
+
+    let store = StateStore::open(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    let output = execute_gc_apply(&store, oracle, plan_id, &plan, Utc::now()).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -1476,11 +1396,11 @@ fn print_apply_table(output: &GcApplyOutput) {
     println!();
     for e in &output.evicted {
         println!(
-            "  EVICTED       {}  {} bytes  {}  (tombstone written; physical: {})",
+            "  EVICTED       {}  {} bytes  {}  (tombstoned + ledger row retired; bytes retained \
+             for a future protocol-aware VACUUM)",
             e.model_name,
             e.size_bytes,
             e.blake3_hash.get(..12).unwrap_or(&e.blake3_hash),
-            e.physical_status,
         );
     }
     for r in &output.refused {
@@ -1832,6 +1752,46 @@ mod tests {
             .unwrap();
     }
 
+    /// Seed a content-addressed artifact whose `file_path` lives **under** its
+    /// table's `storage_prefix` (`s3://b/tgt/raw/<table>/<hash>.parquet`) and
+    /// whose recorded Delta `commit_version` is `commit_version` — the shape the
+    /// hardened manifest oracle checks (prefix membership + own-add-at-version).
+    /// Pairs with [`InMemoryLivenessOracle::seed_table`], whose bootstrap sits at
+    /// v0 so the artifact's own `add` lands at v1+.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_ca(
+        store: &StateStore,
+        run_id: &str,
+        table: &str,
+        out_hash: &str,
+        size: u64,
+        written: DateTime<Utc>,
+        commit_version: u64,
+    ) {
+        let ir = ca_ir(table, "SELECT 1 AS id");
+        let file_path = format!("s3://b/tgt/raw/{table}/{out_hash}.parquet");
+        let outputs = vec![OutputArtifact {
+            blake3_hash: out_hash.to_string(),
+            file_path: file_path.clone(),
+        }];
+        let (entry, prov) = build_records(&ir, run_id, &[], &outputs, written).unwrap();
+        store
+            .record_reuse_spine(std::slice::from_ref(&entry), std::slice::from_ref(&prov))
+            .unwrap();
+        store
+            .record_artifact(&ArtifactRecord {
+                blake3_hash: out_hash.to_string(),
+                run_id: run_id.to_string(),
+                model_name: table.to_string(),
+                file_path,
+                commit_version,
+                size_bytes: size,
+                written_at: written,
+            })
+            .unwrap();
+        record_run(store, run_id, table);
+    }
+
     #[test]
     fn empty_ledger_reports_nothing() {
         let dir = TempDir::new().unwrap();
@@ -1943,56 +1903,16 @@ mod tests {
         assert!(!unref.passed);
     }
 
-    // -- plan + apply (tombstone / evict / refuse) ------------------------
-
-    /// A test evictor that records the paths it was asked to reclaim and
-    /// returns a fixed outcome — lets the eviction engine run creds-free while
-    /// asserting the physical-delete wiring and the tombstone-before-delete
-    /// invariant.
-    struct TestEvictor {
-        calls: std::sync::Mutex<Vec<String>>,
-        outcome: TestOutcome,
-    }
-
-    #[derive(Clone, Copy)]
-    enum TestOutcome {
-        Deleted,
-        Deferred,
-        Failed,
-    }
-
-    impl TestEvictor {
-        fn new(outcome: TestOutcome) -> Self {
-            Self {
-                calls: std::sync::Mutex::new(Vec::new()),
-                outcome,
-            }
-        }
-        fn calls(&self) -> Vec<String> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait]
-    impl ArtifactEvictor for TestEvictor {
-        async fn evict_bytes(&self, file_path: &str) -> PhysicalReclaim {
-            self.calls.lock().unwrap().push(file_path.to_string());
-            match self.outcome {
-                TestOutcome::Deleted => PhysicalReclaim::Deleted,
-                TestOutcome::Deferred => PhysicalReclaim::Deferred("test-defer".to_string()),
-                TestOutcome::Failed => PhysicalReclaim::Failed("test-fail".to_string()),
-            }
-        }
-    }
+    // -- plan + apply (tombstone / retire / refuse) -----------------------
 
     fn plan_from_store(store: &StateStore, now: DateTime<Utc>, min_age_days: i64) -> GcPlan {
         let cands = gather_eviction_candidates(store, None, now, min_age_days).unwrap();
         build_gc_plan(&cands, min_age_days).expect("expected at least one derivable candidate")
     }
 
-    /// A deterministic liveness oracle for the eviction-path tests — returns a
-    /// fixed verdict without reading any Delta log. `reclaimable()` lets the
-    /// existing evict tests reach the eviction; `held()` proves a hold.
+    /// A deterministic liveness oracle for the tombstone-path tests — returns a
+    /// fixed verdict without reading any Delta log. `reclaimable()` lets a test
+    /// reach the tombstone regardless of manifest state.
     struct FixedLivenessOracle {
         reclaimable: bool,
     }
@@ -2005,7 +1925,7 @@ mod tests {
 
     #[async_trait]
     impl LivenessOracle for FixedLivenessOracle {
-        async fn reclaim_verdict(&self, _storage_prefix: &str, _file_path: &str) -> ReclaimVerdict {
+        async fn reclaim_verdict(&self, _sp: &str, _fp: &str, _cv: u64) -> ReclaimVerdict {
             if self.reclaimable {
                 ReclaimVerdict::Reclaimable
             } else {
@@ -2014,22 +1934,25 @@ mod tests {
         }
     }
 
-    /// A liveness oracle backed by **real** in-memory Delta logs, keyed by
-    /// `storage_prefix`, exercising the production
-    /// [`UniformWriter::add_path_liveness`] manifest reader end-to-end. Each
-    /// candidate is checked against its own table's log (by storage_prefix), so
-    /// this drives both the append-only append-only-liveness fix and the
-    /// per-table scoping that dissolves same-name collisions.
-    struct InMemoryLivenessOracle {
-        tables: HashMap<String, (std::sync::Arc<object_store::memory::InMemory>, String)>,
-    }
+    /// A minimal-but-valid Delta bootstrap commit (v0): a commitInfo, a
+    /// liveness-neutral protocol (writer features the strict proof accepts), and
+    /// a metaData. The target's `add`/`remove` commits follow at v1+.
+    const BOOTSTRAP_V0: &str = concat!(
+        r#"{"commitInfo":{}}"#,
+        "\n",
+        r#"{"protocol":{"minReaderVersion":2,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping","icebergCompatV2","invariants","appendOnly"]}}"#,
+        "\n",
+        r#"{"metaData":{"id":"t"}}"#,
+    );
 
-    struct NoopSql;
-    #[async_trait]
-    impl rocky_iceberg::uniform_writer::SqlClient for NoopSql {
-        async fn execute(&self, _sql: &str) -> rocky_iceberg::uniform_writer::Result<()> {
-            Ok(())
-        }
+    /// A liveness oracle backed by **real** in-memory Delta logs, keyed by
+    /// `storage_prefix`, that runs the SAME production decision path the real
+    /// [`ManifestLivenessOracle`] runs — [`removal_proof_given_store`] +
+    /// [`map_removal_proof`] — differing only in the injected object store. So
+    /// membership, table-relative resolution, and the strict scan are all under
+    /// test, not a re-implementation.
+    struct InMemoryLivenessOracle {
+        tables: HashMap<String, std::sync::Arc<object_store::memory::InMemory>>,
     }
 
     impl InMemoryLivenessOracle {
@@ -2039,65 +1962,52 @@ mod tests {
             }
         }
 
-        /// Register an in-memory table log at `storage_prefix` with the given
-        /// commit lines (each a JSONL body like `{"add":{"path":"h.parquet"}}`
-        /// or `{"remove":{"path":"h.parquet"}}`), one commit per version.
-        async fn seed_table(&mut self, storage_prefix: &str, key_prefix: &str, commits: &[&str]) {
+        /// Seed the table at `storage_prefix` with a v0 bootstrap followed by
+        /// `post_commits` at v1, v2, … (each a JSONL body). The log key prefix
+        /// is derived from `storage_prefix` exactly as production does.
+        async fn seed_table(&mut self, storage_prefix: &str, post_commits: &[&str]) {
             use object_store::path::Path as ObjPath;
             use object_store::{ObjectStoreExt, PutPayload};
+            let key_prefix = storage_prefix
+                .strip_prefix("s3://")
+                .and_then(|r| r.split_once('/'))
+                .map(|(_, k)| k)
+                .expect("storage_prefix is s3://bucket/key");
             let store = std::sync::Arc::new(object_store::memory::InMemory::new());
-            for (v, body) in commits.iter().enumerate() {
+            let mut bodies = vec![BOOTSTRAP_V0];
+            bodies.extend_from_slice(post_commits);
+            for (v, body) in bodies.iter().enumerate() {
                 let path = ObjPath::from(format!("{key_prefix}/_delta_log/{v:020}.json"));
                 store
                     .put(&path, PutPayload::from(format!("{body}\n").into_bytes()))
                     .await
                     .unwrap();
             }
-            self.tables
-                .insert(storage_prefix.to_string(), (store, key_prefix.to_string()));
+            self.tables.insert(storage_prefix.to_string(), store);
         }
     }
 
     #[async_trait]
     impl LivenessOracle for InMemoryLivenessOracle {
-        async fn reclaim_verdict(&self, storage_prefix: &str, file_path: &str) -> ReclaimVerdict {
-            use rocky_iceberg::uniform_writer::{PathLiveness, UniformWriter, UniformWriterConfig};
-            let Some((store, key_prefix)) = self.tables.get(storage_prefix) else {
+        async fn reclaim_verdict(
+            &self,
+            storage_prefix: &str,
+            file_path: &str,
+            commit_version: u64,
+        ) -> ReclaimVerdict {
+            let Some(store) = self.tables.get(storage_prefix) else {
                 return ReclaimVerdict::Held(format!("no seeded table log for {storage_prefix}"));
             };
-            let writer = UniformWriter::new(
-                UniformWriterConfig {
-                    catalog: String::new(),
-                    schema: String::new(),
-                    table: String::new(),
-                    prefix: key_prefix.clone(),
-                    engine_info: "test".to_string(),
-                },
-                store.clone(),
-                std::sync::Arc::new(NoopSql),
-            );
-            let add_file_path = file_path.rsplit('/').next().unwrap_or(file_path);
-            match writer.add_path_liveness(add_file_path).await {
-                Ok(PathLiveness::Removed) => ReclaimVerdict::Reclaimable,
-                Ok(PathLiveness::Live) => ReclaimVerdict::Held("live".to_string()),
-                Ok(PathLiveness::Absent) => ReclaimVerdict::Held("absent".to_string()),
-                Err(e) => ReclaimVerdict::Held(format!("read error: {e}")),
-            }
+            map_removal_proof(
+                &super::super::run_content_addressed::removal_proof_given_store(
+                    store.clone(),
+                    storage_prefix,
+                    file_path,
+                    commit_version,
+                )
+                .await,
+            )
         }
-    }
-
-    // The env-mutating evictor tests serialise via a module-local mutex.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// SAFETY: runs under `ENV_LOCK`, which serialises every env-mutating test
-    /// in this module. `set_var`/`remove_var` are unsafe from the 2024 edition
-    /// (they race concurrent reads); the lock closes that hole for our tests,
-    /// and the blast radius is a test-only evictor choice.
-    fn set_env(key: &str, value: &str) {
-        unsafe { std::env::set_var(key, value) };
-    }
-    fn remove_env(key: &str) {
-        unsafe { std::env::remove_var(key) };
     }
 
     #[test]
@@ -2138,25 +2048,6 @@ mod tests {
         assert_eq!(plan.total_bytes, 500);
     }
 
-    /// The bucket-relative object key derivation is the only real logic on the
-    /// code-reviewed-not-driven physical-delete path, and restore-roundtrip is
-    /// held, so nothing else guards it: a regression here would delete the wrong
-    /// key. Lock the parse against the storage-prefix shape the writer emits.
-    #[test]
-    fn s3_object_key_strips_scheme_bucket_and_leading_slash() {
-        assert_eq!(
-            s3_object_key("s3://bucket/tgt/raw/orders/x.parquet").as_deref(),
-            Some("tgt/raw/orders/x.parquet")
-        );
-        assert_eq!(
-            s3_object_key("s3://b/x.parquet").as_deref(),
-            Some("x.parquet")
-        );
-        // A non-URL yields no key (the evictor then reports a failure rather
-        // than deleting anything).
-        assert!(s3_object_key("not a url").is_none());
-    }
-
     #[tokio::test]
     async fn apply_evicts_still_derivable_artifact_with_tombstone() {
         let dir = TempDir::new().unwrap();
@@ -2168,10 +2059,8 @@ mod tests {
         let plan = plan_from_store(&store, now, 7);
         assert_eq!(plan.evictions.len(), 1);
 
-        let evictor = TestEvictor::new(TestOutcome::Deferred);
         let out = execute_gc_apply(
             &store,
-            &evictor,
             &FixedLivenessOracle::reclaimable(),
             "plan-x",
             &plan,
@@ -2192,10 +2081,11 @@ mod tests {
         assert_eq!(tombs[0].blake3_hash, HA);
         assert_eq!(tombs[0].run_id, "r1");
         assert_eq!(tombs[0].recipe_hash.as_deref(), Some("recipe-abc"));
-        assert!(!tombs[0].physical_reclaimed, "deferred physical delete");
-        assert!(out.evicted[0].physical_status.contains("deferred"));
-        // The physical evictor was invoked with the artifact's path (wiring).
-        assert_eq!(evictor.calls(), vec![format!("s3://b/{HA}.parquet")]);
+        // No bytes are deleted — the tombstone + retired row is the eviction of
+        // record; `physical_reclaimed` is false by construction.
+        assert!(!tombs[0].physical_reclaimed);
+        assert!(!out.evicted[0].physical_reclaimed);
+        assert!(out.evicted[0].physical_status.contains("not attempted"));
     }
 
     /// 🔴 The core soundness surface: an artifact derivable at plan time whose
@@ -2218,10 +2108,8 @@ mod tests {
         seed(&store, "r2", "orders", "SELECT 1 AS id", &[], HC, 500, old);
         assert_eq!(store.refcount_for_hash(HC).unwrap(), 2);
 
-        let evictor = TestEvictor::new(TestOutcome::Deferred);
         let out = execute_gc_apply(
             &store,
-            &evictor,
             &FixedLivenessOracle::reclaimable(),
             "plan-x",
             &plan,
@@ -2243,10 +2131,9 @@ mod tests {
                 .any(|c| c.check == "unreferenced"),
             "the refusal cites the failed unreferenced check"
         );
-        // No tombstone, both rows intact, the physical evictor never fired.
+        // No tombstone, both rows intact.
         assert!(store.list_tombstones().unwrap().is_empty());
         assert_eq!(store.refcount_for_hash(HC).unwrap(), 2);
-        assert!(evictor.calls().is_empty());
     }
 
     /// 🔴 facet 1, end-to-end over a seeded ledger: a `(run, model)` whose
@@ -2342,10 +2229,8 @@ mod tests {
             }],
         };
 
-        let evictor = TestEvictor::new(TestOutcome::Deferred);
         let out = execute_gc_apply(
             &store,
-            &evictor,
             &FixedLivenessOracle::reclaimable(),
             "crafted",
             &crafted,
@@ -2363,11 +2248,10 @@ mod tests {
             "got: {}",
             out.refused[0].reason
         );
-        // Both rows intact, no tombstone, the physical evictor never fired.
+        // Both rows intact, no tombstone.
         assert!(store.list_tombstones().unwrap().is_empty());
         assert_eq!(store.refcount_for_hash(HA).unwrap(), 1);
         assert_eq!(store.refcount_for_hash(HB).unwrap(), 1);
-        assert!(evictor.calls().is_empty());
     }
 
     #[tokio::test]
@@ -2380,10 +2264,8 @@ mod tests {
         let now = Utc::now();
         let plan = plan_from_store(&store, now, 7);
 
-        let evictor = TestEvictor::new(TestOutcome::Deferred);
         let first = execute_gc_apply(
             &store,
-            &evictor,
             &FixedLivenessOracle::reclaimable(),
             "plan-x",
             &plan,
@@ -2396,7 +2278,6 @@ mod tests {
         // Re-applying the same plan is a clean no-op — the row is already gone.
         let second = execute_gc_apply(
             &store,
-            &evictor,
             &FixedLivenessOracle::reclaimable(),
             "plan-x",
             &plan,
@@ -2411,12 +2292,12 @@ mod tests {
         assert_eq!(store.list_tombstones().unwrap().len(), 1);
     }
 
-    /// Tombstone-before-delete: even when the physical object-store delete
-    /// FAILS, the tombstone stands and the ledger row is retired. The eviction
-    /// of record is the atomic tombstone + row-retirement; the byte delete is
-    /// best-effort and its failure leaves only a safe leaked orphan.
+    /// The eviction of record is the tombstone + retired ledger row — NO bytes
+    /// are ever deleted. `physical_reclaimed` is false and no physical status
+    /// other than "not attempted" is ever produced (physical reclamation is
+    /// future protocol-aware VACUUM work).
     #[tokio::test]
-    async fn apply_evicts_even_when_physical_delete_fails() {
+    async fn apply_never_deletes_bytes_only_tombstones_and_retires() {
         let dir = TempDir::new().unwrap();
         let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
         let old = Utc::now() - Duration::days(30);
@@ -2425,10 +2306,8 @@ mod tests {
         let now = Utc::now();
         let plan = plan_from_store(&store, now, 7);
 
-        let evictor = TestEvictor::new(TestOutcome::Failed);
         let out = execute_gc_apply(
             &store,
-            &evictor,
             &FixedLivenessOracle::reclaimable(),
             "plan-x",
             &plan,
@@ -2438,40 +2317,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(out.evicted_count, 1);
-        assert!(out.evicted[0].physical_status.contains("failed"));
         assert!(!out.evicted[0].physical_reclaimed);
-        // The tombstone + retirement stand despite the failed byte delete.
+        assert!(out.evicted[0].physical_status.contains("not attempted"));
+        // The tombstone + retirement are the eviction of record.
         assert_eq!(store.refcount_for_hash(HA).unwrap(), 0);
         let tombs = store.list_tombstones().unwrap();
         assert_eq!(tombs.len(), 1);
         assert!(!tombs[0].physical_reclaimed);
-    }
-
-    #[tokio::test]
-    async fn apply_flips_reclaimed_flag_when_physical_delete_succeeds() {
-        let dir = TempDir::new().unwrap();
-        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
-        let old = Utc::now() - Duration::days(30);
-        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
-        record_run(&store, "r1", "orders");
-        let now = Utc::now();
-        let plan = plan_from_store(&store, now, 7);
-
-        let evictor = TestEvictor::new(TestOutcome::Deleted);
-        let out = execute_gc_apply(
-            &store,
-            &evictor,
-            &FixedLivenessOracle::reclaimable(),
-            "plan-x",
-            &plan,
-            now,
-        )
-        .await
-        .unwrap();
-
-        assert!(out.evicted[0].physical_reclaimed);
-        assert_eq!(out.evicted[0].physical_status, "deleted");
-        assert!(store.list_tombstones().unwrap()[0].physical_reclaimed);
     }
 
     /// The apply entrypoint is unconditionally review-gated — no marker, no
@@ -2540,12 +2392,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
         let old = Utc::now() - Duration::days(30);
-        // Two builds of the SAME table `orders`: older file HA, newer file HB.
-        // Both old, refcount 1, replayable, strong-provenance ⇒ derivable.
-        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
-        record_run(&store, "r1", "orders");
-        seed(&store, "r2", "orders", "SELECT 1 AS id", &[], HB, 600, old);
-        record_run(&store, "r2", "orders");
+        // Two builds of the SAME table `orders`: older file HA (add at v1),
+        // newer file HB (add at v2). Both old, refcount 1, replayable,
+        // strong-provenance ⇒ derivable. The append-only log removes neither.
+        seed_ca(&store, "r1", "orders", HA, 500, old, 1);
+        seed_ca(&store, "r2", "orders", HB, 600, old, 2);
         let now = Utc::now();
         let cands = gather_eviction_candidates(&store, None, now, 7).unwrap();
         assert!(
@@ -2555,12 +2406,11 @@ mod tests {
         let plan = build_gc_plan(&cands, 7).expect("both derivable");
         assert_eq!(plan.evictions.len(), 2);
 
-        // Manifest reality: the Delta log ADDS both HA and HB, removes neither.
+        // Manifest reality: v0 bootstrap, v1 add(HA), v2 add(HB), no remove.
         let mut oracle = InMemoryLivenessOracle::new();
         oracle
             .seed_table(
                 "s3://b/tgt/raw/orders",
-                "tgt/raw/orders",
                 &[
                     &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
                     &format!(r#"{{"add":{{"path":"{HB}.parquet"}}}}"#),
@@ -2568,8 +2418,7 @@ mod tests {
             )
             .await;
 
-        let evictor = TestEvictor::new(TestOutcome::Deferred);
-        let out = execute_gc_apply(&store, &evictor, &oracle, "plan-x", &plan, now)
+        let out = execute_gc_apply(&store, &oracle, "plan-x", &plan, now)
             .await
             .unwrap();
         assert_eq!(
@@ -2584,17 +2433,15 @@ mod tests {
             "each refusal cites the Delta-log liveness gate"
         );
         assert!(store.list_tombstones().unwrap().is_empty());
-        assert!(evictor.calls().is_empty(), "no byte-delete attempted");
         assert_eq!(store.refcount_for_hash(HA).unwrap(), 1);
         assert_eq!(store.refcount_for_hash(HB).unwrap(), 1);
 
-        // Non-vacuity: once an external compaction `remove`s HA, HA is
+        // Non-vacuity: once an external compaction `remove`s HA (v3), HA is
         // reclaimable while the still-`add`ed HB stays held.
         let mut oracle2 = InMemoryLivenessOracle::new();
         oracle2
             .seed_table(
                 "s3://b/tgt/raw/orders",
-                "tgt/raw/orders",
                 &[
                     &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
                     &format!(r#"{{"add":{{"path":"{HB}.parquet"}}}}"#),
@@ -2602,8 +2449,7 @@ mod tests {
                 ],
             )
             .await;
-        let evictor2 = TestEvictor::new(TestOutcome::Deferred);
-        let out2 = execute_gc_apply(&store, &evictor2, &oracle2, "plan-x", &plan, now)
+        let out2 = execute_gc_apply(&store, &oracle2, "plan-x", &plan, now)
             .await
             .unwrap();
         assert_eq!(
@@ -2620,7 +2466,8 @@ mod tests {
 
     /// Seed a content-addressed `orders` model in a specific `catalog` (its own
     /// target/table + storage_prefix), so two same-named models can coexist in
-    /// the ledger on DIFFERENT tables — the DEFECT 2 collision setup.
+    /// the ledger on DIFFERENT tables — the DEFECT 2 collision setup. Its file
+    /// lives under its own storage_prefix and its `add` is at v1.
     fn seed_orders_in(
         store: &StateStore,
         run_id: &str,
@@ -2653,9 +2500,10 @@ mod tests {
             data_type: RockyType::Int64,
             nullable: false,
         }];
+        let file_path = format!("s3://b/{catalog}/raw/orders/{out_hash}.parquet");
         let outputs = vec![OutputArtifact {
             blake3_hash: out_hash.to_string(),
-            file_path: format!("s3://b/{out_hash}.parquet"),
+            file_path: file_path.clone(),
         }];
         let (entry, prov) = build_records(&ir, run_id, &[], &outputs, written).unwrap();
         store
@@ -2666,8 +2514,8 @@ mod tests {
                 blake3_hash: out_hash.to_string(),
                 run_id: run_id.to_string(),
                 model_name: "orders".to_string(),
-                file_path: format!("s3://b/{out_hash}.parquet"),
-                commit_version: 0,
+                file_path,
+                commit_version: 1,
                 size_bytes: 500,
                 written_at: written,
             })
@@ -2699,19 +2547,18 @@ mod tests {
         let plan = build_gc_plan(&cands, 7).expect("both derivable");
         assert_eq!(plan.evictions.len(), 2);
 
-        // A's file is LIVE in table A; B's file was REMOVED in table B.
+        // A's file is LIVE in table A (add v1); B's file was REMOVED in table B
+        // (add v1, remove v2).
         let mut oracle = InMemoryLivenessOracle::new();
         oracle
             .seed_table(
                 "s3://b/ca/raw/orders",
-                "ca/raw/orders",
                 &[&format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#)],
             )
             .await;
         oracle
             .seed_table(
                 "s3://b/cb/raw/orders",
-                "cb/raw/orders",
                 &[
                     &format!(r#"{{"add":{{"path":"{HB}.parquet"}}}}"#),
                     &format!(r#"{{"remove":{{"path":"{HB}.parquet"}}}}"#),
@@ -2719,8 +2566,7 @@ mod tests {
             )
             .await;
 
-        let evictor = TestEvictor::new(TestOutcome::Deferred);
-        let out = execute_gc_apply(&store, &evictor, &oracle, "plan-x", &plan, now)
+        let out = execute_gc_apply(&store, &oracle, "plan-x", &plan, now)
             .await
             .unwrap();
         // Each judged by its OWN table: A held (live), B reclaimed (removed).
@@ -2731,41 +2577,134 @@ mod tests {
         assert!(out.refused[0].reason.contains("liveness gate"));
     }
 
-    /// FIX 5 regression: physical byte-deletion is an explicit opt-in. The
-    /// default (`physical_delete = false`) selects the `DeferredEvictor` **even
-    /// with AWS credentials present**; armed-without-creds also defers.
+    /// 🔴 FINDING 1 (wrong/spoofed prefix). Even when the *other* table's log
+    /// shows a same-basename file `remove`d, a candidate whose `storage_prefix`
+    /// does not contain its `file_path` is HELD — the oracle refuses to read a
+    /// different table's log to authorize a retirement.
     #[tokio::test]
-    async fn choose_evictor_makes_physical_delete_opt_in() {
-        let deferred_default = {
-            let _g = ENV_LOCK.lock().unwrap();
-            set_env("AWS_ACCESS_KEY_ID", "test-key");
-            set_env("AWS_SECRET_ACCESS_KEY", "test-secret");
-            let ev = choose_evictor(false);
-            remove_env("AWS_ACCESS_KEY_ID");
-            remove_env("AWS_SECRET_ACCESS_KEY");
-            ev
-        };
-        match deferred_default.evict_bytes("s3://b/x.parquet").await {
-            PhysicalReclaim::Deferred(reason) => assert!(
-                reason.contains("physical_delete"),
-                "default deferral must name the opt-in flag; got: {reason}"
-            ),
-            _ => panic!("default (physical_delete=false) must defer even with creds"),
-        }
+    async fn wrong_prefix_holds_even_if_another_table_removed_a_same_name_file() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        // The candidate genuinely belongs to `tgt/raw/orders` (add v1, live).
+        seed_ca(&store, "r1", "orders", HA, 500, old, 1);
+        let now = Utc::now();
+        let plan = plan_from_store(&store, now, 7);
+        assert_eq!(plan.evictions.len(), 1);
 
-        let deferred_armed = {
-            let _g = ENV_LOCK.lock().unwrap();
-            remove_env("AWS_ACCESS_KEY_ID");
-            remove_env("AWS_SECRET_ACCESS_KEY");
-            choose_evictor(true)
-        };
-        match deferred_armed.evict_bytes("s3://b/x.parquet").await {
-            PhysicalReclaim::Deferred(reason) => assert!(
-                reason.contains("armed") && reason.contains("credentials"),
-                "armed-without-creds deferral must name the missing precondition; got: {reason}"
+        // The oracle is only seeded for a DIFFERENT table whose log removed a
+        // same-basename file — but the candidate's own storage_prefix
+        // (`s3://b/tgt/raw/orders`) has no seeded log, so membership + lookup
+        // must hold. (Belt-and-suspenders: even if it resolved, the file_path
+        // is not under the other prefix.)
+        let mut oracle = InMemoryLivenessOracle::new();
+        oracle
+            .seed_table(
+                "s3://b/other/raw/orders",
+                &[
+                    &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
+                    &format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#),
+                ],
+            )
+            .await;
+
+        let out = execute_gc_apply(&store, &oracle, "plan-x", &plan, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.evicted_count, 0,
+            "a candidate must be judged only by its own table"
+        );
+        assert_eq!(out.refused_count, 1);
+        assert!(store.list_tombstones().unwrap().is_empty());
+
+        // Directly assert the membership guard: a file_path outside the
+        // storage_prefix resolves to a hold, never a table-relative path.
+        assert!(matches!(
+            super::super::run_content_addressed::table_relative_add_path(
+                "s3://b/tgt/raw/orders",
+                "s3://b/OTHER/raw/orders/deadbeef.parquet",
             ),
-            _ => panic!("armed-without-creds must defer"),
-        }
+            Err(rocky_iceberg::uniform_writer::RemovalHoldReason::PrefixMismatch)
+        ));
+    }
+
+    /// 🔴 FINDING 2 (malformed / anomalous log). A stale `remove` (v1) followed
+    /// by a malformed later commit (v2) must NOT be read as a proof of removal —
+    /// the strict scan holds on the malformed commit rather than trusting the
+    /// earlier `remove`. Also covers a version gap.
+    #[tokio::test]
+    async fn malformed_or_gapped_log_holds() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        seed_ca(&store, "r1", "orders", HA, 500, old, 1);
+        let now = Utc::now();
+        let plan = plan_from_store(&store, now, 7);
+
+        // v0 bootstrap, v1 add+remove(HA), v2 a malformed (non-JSON) commit.
+        // Without the malformed-commit guard, the highest *readable* reference
+        // (the v1 remove) would wrongly authorize eviction.
+        let mut oracle = InMemoryLivenessOracle::new();
+        oracle
+            .seed_table(
+                "s3://b/tgt/raw/orders",
+                &[
+                    &format!(
+                        r#"{{"add":{{"path":"{HA}.parquet"}}}}
+{{"remove":{{"path":"{HA}.parquet"}}}}"#
+                    ),
+                    "this is not json",
+                ],
+            )
+            .await;
+        let out = execute_gc_apply(&store, &oracle, "plan-x", &plan, now)
+            .await
+            .unwrap();
+        assert_eq!(out.evicted_count, 0, "a malformed later commit must hold");
+        assert_eq!(out.refused_count, 1);
+        assert!(store.list_tombstones().unwrap().is_empty());
+    }
+
+    /// 🔴 FINDINGS 3+4: physical byte-deletion is not implemented. `[gc]
+    /// physical_delete = true` is a **hard error** at apply time (fail loud) —
+    /// never a silent delete or silent no-op — and nothing is retired.
+    #[tokio::test]
+    async fn physical_delete_true_is_a_hard_error_and_deletes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let plan_id = {
+            let store = StateStore::open(&state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(dir.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+        // Approve the plan so the review gate passes and we reach the config
+        // check (proving the error is the physical_delete gate, not review).
+        let marker = crate::commands::apply::review_marker_path(dir.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(&config, "[gc]\nphysical_delete = true\n").unwrap();
+
+        let err = run_gc_apply_in(dir.path(), &config, &plan_id, &state_path, true)
+            .await
+            .expect_err("physical_delete = true must be a hard error");
+        assert!(
+            err.to_string().contains("not supported")
+                && err.to_string().contains("physical_delete"),
+            "got: {err}"
+        );
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(
+            store.list_tombstones().unwrap().is_empty(),
+            "nothing is retired when physical_delete errors"
+        );
+        assert_eq!(store.refcount_for_hash(HA).unwrap(), 1);
     }
 
     /// Seed a realistic multi-candidate ledger to the redb path in

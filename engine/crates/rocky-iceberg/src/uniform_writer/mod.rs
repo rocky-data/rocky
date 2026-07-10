@@ -94,6 +94,80 @@ pub enum PathLiveness {
     Absent,
 }
 
+/// The verdict of the **strict removal proof** — the gate a byte-deleting or
+/// tombstoning reclamation path must pass before retiring an artifact.
+///
+/// Unlike [`PathLiveness`] (a best-effort liveness read whose `false`/`Absent`
+/// is deliberately conservative for the reuse gate), this is an *affirmative
+/// proof*: [`Self::ProvenRemoved`] is assembled through a single narrow path
+/// that validates the whole `_delta_log` tail, and **every** unhandled or
+/// anomalous condition falls to [`Self::Held`]. A future/unknown Delta action,
+/// a checkpoint, a version gap, a malformed commit, or a protocol feature that
+/// changes file liveness (deletion vectors) can therefore never authorize a
+/// reclamation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemovalProof {
+    /// Affirmatively proven removed: the target's own `add` is present in a
+    /// clean, checkpoint-free, contiguous commit history and the
+    /// highest-versioned commit referencing it is a `remove`. Safe to reclaim.
+    ProvenRemoved,
+    /// Not proven removed — HOLD (never reclaim). Carries a stable reason.
+    Held(RemovalHoldReason),
+}
+
+/// Why a [`RemovalProof`] could not affirm removal — a stable, exhaustive set
+/// of hold reasons for logging and operator messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalHoldReason {
+    /// The candidate file is not under the target table's key prefix (or the
+    /// bucket/prefix could not be resolved) — it may belong to another table.
+    PrefixMismatch,
+    /// The `_delta_log` carries a checkpoint (`_last_checkpoint` /
+    /// `*.checkpoint*.parquet`); the readable JSON tail alone cannot prove the
+    /// file is not re-added inside the checkpoint.
+    CheckpointPresent,
+    /// The `<20-digit>.json` commit versions are not a contiguous run from 0.
+    VersionGap,
+    /// The `_delta_log` has two commits at the same version.
+    DuplicateVersion,
+    /// A commit body did not parse, a line was not a JSON object, an `add`/
+    /// `remove` lacked a string `path`, or a commit carried an unrecognized
+    /// action key.
+    MalformedCommit,
+    /// A `protocol` action declared a feature that changes file liveness
+    /// semantics (e.g. deletion vectors) or an unrecognized writer feature.
+    UnsupportedProtocol,
+    /// The `_delta_log` has no readable JSON commits.
+    NoCommits,
+    /// The target's own `add` (at its recorded commit version) does not appear
+    /// in this table's log — it was never added here.
+    NeverAddedHere,
+    /// The highest-versioned commit referencing the file is an `add`, not a
+    /// `remove` — the file is still live.
+    StillLive,
+    /// An object-store / log read failed — the proof could not be assembled.
+    ReadError,
+}
+
+impl RemovalHoldReason {
+    /// Stable lowercase token for logs / operator messages.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemovalHoldReason::PrefixMismatch => "prefix_mismatch",
+            RemovalHoldReason::CheckpointPresent => "checkpoint_present",
+            RemovalHoldReason::VersionGap => "version_gap",
+            RemovalHoldReason::DuplicateVersion => "duplicate_version",
+            RemovalHoldReason::MalformedCommit => "malformed_commit",
+            RemovalHoldReason::UnsupportedProtocol => "unsupported_protocol",
+            RemovalHoldReason::NoCommits => "no_commits",
+            RemovalHoldReason::NeverAddedHere => "never_added_here",
+            RemovalHoldReason::StillLive => "still_live",
+            RemovalHoldReason::ReadError => "read_error",
+        }
+    }
+}
+
 /// Snapshot of a Delta UniForm table's state as observed by `discover()`.
 ///
 /// `physical` and `field_id` are keyed by the logical column name and
@@ -651,6 +725,26 @@ impl UniformWriter {
     pub async fn add_path_liveness(&self, add_file_path: &str) -> Result<PathLiveness> {
         let prefix = self.config.prefix.trim_end_matches('/').to_string();
         discover::add_path_liveness(&*self.store, &prefix, add_file_path).await
+    }
+
+    /// The **strict removal proof** for `add_file_path` (the table-relative
+    /// Delta path, nested components preserved) whose `add` is recorded at
+    /// `expected_add_version`.
+    ///
+    /// Returns [`RemovalProof::ProvenRemoved`] **only** when the whole readable
+    /// commit history validates and affirmatively proves removal (see
+    /// [`RemovalProof`]); every anomaly or unverifiable condition — including an
+    /// object-store read failure — yields [`RemovalProof::Held`]. This is the
+    /// gate a reclamation path (tombstone / future VACUUM) must pass; unlike
+    /// [`Self::add_path_liveness`] it can never fall through to a
+    /// reclaim-authorizing verdict.
+    pub async fn proven_removed(
+        &self,
+        add_file_path: &str,
+        expected_add_version: u64,
+    ) -> RemovalProof {
+        let prefix = self.config.prefix.trim_end_matches('/').to_string();
+        discover::proven_removed(&*self.store, &prefix, add_file_path, expected_add_version).await
     }
 
     /// Shared write pipeline used by both unpartitioned and partitioned

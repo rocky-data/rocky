@@ -692,6 +692,192 @@ pub(super) async fn add_path_liveness<S: ObjectStore + ?Sized>(
     Ok(super::PathLiveness::Absent)
 }
 
+/// Writer features that do not change *file* liveness semantics, so their
+/// presence does not by itself void a removal proof. Anything outside this set
+/// (notably `deletionVectors`, which lets a file stay logically present after
+/// a metadata-only change) forces a hold.
+const LIVENESS_NEUTRAL_WRITER_FEATURES: &[&str] = &[
+    "appendOnly",
+    "invariants",
+    "columnMapping",
+    "icebergCompatV2",
+    "timestampNtz",
+    "generatedColumns",
+    "checkConstraints",
+    "domainMetadata",
+];
+
+/// Top-level Delta action keys this proof recognizes. Any other key in a
+/// commit line means the proof cannot reason about the commit → hold.
+const KNOWN_ACTION_KEYS: &[&str] = &[
+    "commitInfo",
+    "metaData",
+    "protocol",
+    "txn",
+    "domainMetadata",
+    "add",
+    "remove",
+    "cdc",
+];
+
+/// The **strict removal proof** — see [`super::RemovalProof`].
+///
+/// Affirmative by construction: it returns [`RemovalProof::Held`] on every
+/// anomaly and only reaches [`RemovalProof::ProvenRemoved`] after validating
+/// the entire readable history. Concretely it holds unless ALL hold:
+///
+/// - no checkpoint marker in `_delta_log` (`_last_checkpoint` /
+///   `*.checkpoint*.parquet`) — a truncated log can't prove non-re-add;
+/// - the `<20-digit>.json` versions are a contiguous run from 0, no duplicates;
+/// - every commit body parses, every line is a JSON object whose sole key is a
+///   recognized action, every `add`/`remove` has a string `path`, and no
+///   `protocol` declares a liveness-affecting/unknown writer feature;
+/// - the target's own `add` appears **at** `expected_add_version` (the finding-1
+///   own-add-in-this-table binding);
+/// - the highest-versioned commit referencing the target is a `remove`.
+///
+/// Any object-store / parse failure yields [`RemovalHoldReason::ReadError`] /
+/// [`RemovalHoldReason::MalformedCommit`] — never a proof.
+pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
+    store: &S,
+    prefix: &str,
+    add_file_path: &str,
+    expected_add_version: u64,
+) -> super::RemovalProof {
+    use super::{RemovalHoldReason as R, RemovalProof};
+    use futures::TryStreamExt;
+
+    let held = |r: R| RemovalProof::Held(r);
+    let log_prefix = Path::from(format!("{prefix}/_delta_log"));
+
+    // 1. List the log, separating JSON commits from checkpoint markers.
+    let mut versions: Vec<(u64, Path)> = Vec::new();
+    let mut stream = store.list(Some(&log_prefix));
+    loop {
+        match stream.try_next().await {
+            Ok(Some(meta)) => {
+                let key = meta.location.to_string();
+                let Some((_, last)) = key.rsplit_once('/') else {
+                    continue;
+                };
+                // A checkpoint (or the `_last_checkpoint` pointer) means the
+                // JSON tail is not the whole history — hold.
+                if last == "_last_checkpoint" || last.contains(".checkpoint") {
+                    return held(R::CheckpointPresent);
+                }
+                if let Some(stem) = last.strip_suffix(".json")
+                    && stem.len() == 20
+                    && let Ok(v) = stem.parse::<u64>()
+                {
+                    versions.push((v, meta.location));
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return held(R::ReadError),
+        }
+    }
+    if versions.is_empty() {
+        return held(R::NoCommits);
+    }
+
+    // 2. Contiguous from 0, no duplicates.
+    versions.sort_by_key(|(v, _)| *v);
+    for (i, (v, _)) in versions.iter().enumerate() {
+        let expected = i as u64;
+        if *v == expected {
+            continue;
+        }
+        // A repeat of the previous version is a duplicate; anything else is a gap.
+        if i > 0 && *v == versions[i - 1].0 {
+            return held(R::DuplicateVersion);
+        }
+        return held(R::VersionGap);
+    }
+
+    // 3. Scan ascending; validate every commit; track references to the target.
+    let mut own_add_at_expected = false;
+    let mut highest_ref: Option<(u64, bool)> = None; // (version, is_remove)
+    for (version, path) in &versions {
+        let body = match store.get(path).await {
+            Ok(r) => match r.bytes().await {
+                Ok(b) => b,
+                Err(_) => return held(R::ReadError),
+            },
+            Err(_) => return held(R::ReadError),
+        };
+        let text = match std::str::from_utf8(&body) {
+            Ok(t) => t,
+            Err(_) => return held(R::MalformedCommit),
+        };
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                return held(R::MalformedCommit);
+            };
+            let Some(obj) = value.as_object() else {
+                return held(R::MalformedCommit);
+            };
+            for (key, action) in obj {
+                if !KNOWN_ACTION_KEYS.contains(&key.as_str()) {
+                    return held(R::MalformedCommit);
+                }
+                match key.as_str() {
+                    "protocol" => {
+                        if !protocol_is_liveness_neutral(action) {
+                            return held(R::UnsupportedProtocol);
+                        }
+                    }
+                    "add" | "remove" => {
+                        let Some(p) = action.get("path").and_then(|v| v.as_str()) else {
+                            return held(R::MalformedCommit);
+                        };
+                        if p == add_file_path {
+                            let is_remove = key == "remove";
+                            if !is_remove && *version == expected_add_version {
+                                own_add_at_expected = true;
+                            }
+                            match highest_ref {
+                                Some((hv, _)) if hv > *version => {}
+                                _ => highest_ref = Some((*version, is_remove)),
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 4. Affirmative proof: own add at its recorded version, and the highest
+    //    reference to the file is a remove.
+    if !own_add_at_expected {
+        return held(R::NeverAddedHere);
+    }
+    match highest_ref {
+        Some((_, true)) => RemovalProof::ProvenRemoved,
+        _ => held(R::StillLive),
+    }
+}
+
+/// A `protocol` action is liveness-neutral when it declares no reader/writer
+/// feature outside [`LIVENESS_NEUTRAL_WRITER_FEATURES`] — in particular no
+/// `deletionVectors`. Absent feature lists are neutral (a plain protocol row).
+fn protocol_is_liveness_neutral(protocol: &serde_json::Value) -> bool {
+    for field in ["readerFeatures", "writerFeatures"] {
+        if let Some(feats) = protocol.get(field).and_then(|v| v.as_array()) {
+            for f in feats {
+                match f.as_str() {
+                    Some(name) if LIVENESS_NEUTRAL_WRITER_FEATURES.contains(&name) => {}
+                    _ => return false,
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Scan `_delta_log/` for the highest `<20-digit>.json` and return that + 1.
 pub(super) async fn next_commit_version<S: ObjectStore + ?Sized>(
     store: &S,
