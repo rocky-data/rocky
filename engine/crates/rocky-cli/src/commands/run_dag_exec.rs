@@ -29,7 +29,16 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// per-pipeline sub-run is driven through `run()` against this same path, so
 /// the unified-DAG path shares the project's canonical state with every other
 /// `rocky run` invocation — it must never invent its own `.rocky_state` file.
-pub async fn run_with_dag(config_path: &Path, state_path: &Path, json: bool) -> Result<()> {
+pub async fn run_with_dag(
+    config_path: &Path,
+    state_path: &Path,
+    json: bool,
+    // Build-escape-hatch overlay (`--force-rebuild` / `--no-reuse`). Threaded
+    // into every sub-run so `rocky run --dag --force-rebuild` actually forces a
+    // build (and `--no-reuse` disables content-addressed reuse + column-skip)
+    // instead of being silently dropped at the DAG boundary.
+    skip_opts: &super::run::SkipRunOptions,
+) -> Result<()> {
     // Under `-o json` the orchestrator contract is that stdout is exactly one
     // JSON document (the `DagRunOutput` below). Sub-runs are dispatched with
     // `json = false` so they don't each emit their own JSON payload, which
@@ -93,6 +102,7 @@ pub async fn run_with_dag(config_path: &Path, state_path: &Path, json: bool) -> 
         state_path: state_path.to_path_buf(),
         seeds_dir,
         node_pipelines,
+        skip_opts: *skip_opts,
     };
     let executor = DagExecutor::new(dispatcher);
     let result = executor
@@ -176,12 +186,17 @@ struct CliDispatcher {
     /// Maps each pipeline-bound node to its owning pipeline name. Seed and
     /// source-marker nodes carry no entry (their `pipeline` is `None`).
     node_pipelines: HashMap<NodeId, String>,
+    /// The `--force-rebuild` / `--no-reuse` build-escape-hatch overlay, threaded
+    /// from the outer `run_with_dag` so each sub-run honors it. `Copy`, so the
+    /// per-node closure captures a value (no borrow escaping the dispatcher).
+    skip_opts: super::run::SkipRunOptions,
 }
 
 impl NodeDispatcher for CliDispatcher {
     fn dispatch(&self, id: &NodeId, kind: NodeKind, label: &str) -> Option<NodeFuture> {
         let config_path = self.config_path.clone();
         let state_path = self.state_path.clone();
+        let skip_opts = self.skip_opts;
         let label = label.to_string();
         match kind {
             NodeKind::Test => {
@@ -277,10 +292,14 @@ impl NodeDispatcher for CliDispatcher {
                         // DAG sub-runs build full pipelines (no `--model`
                         // selection), so `--defer` would be inert anyway.
                         &super::run::DeferOptions::default(),
-                        // The unified-DAG driver does not surface the skip gate
-                        // (full-pipeline sub-runs); default OFF keeps sub-run
-                        // behavior unchanged.
-                        &super::run::SkipRunOptions::default(),
+                        // Build-escape-hatch overlay threaded from the outer
+                        // `rocky run --dag` invocation: `--force-rebuild` /
+                        // `--no-reuse` must reach each sub-run (they force a
+                        // build and disable content-addressed reuse +
+                        // column-skip). `--skip-unchanged` is not surfaced on
+                        // the DAG path, so it stays OFF via `SkipRunOptions`'s
+                        // own default for that field.
+                        &skip_opts,
                         // The unified-DAG driver does not surface `--var`; pass an
                         // empty set so `@var()` models would compile-error rather
                         // than silently resolve under a DAG run.
@@ -293,6 +312,49 @@ impl NodeDispatcher for CliDispatcher {
                 }))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod skip_opts_threading_tests {
+    use std::collections::HashMap;
+
+    use super::super::run::SkipRunOptions;
+    use super::CliDispatcher;
+
+    /// 🔴 DEFECT 3 regression: `rocky run --dag --force-rebuild` / `--no-reuse`
+    /// must reach each sub-run. Pre-fix, `run_with_dag` had no `skip_opts` and
+    /// the sub-run dispatch passed `SkipRunOptions::default()`, silently
+    /// dropping the escape hatches (a column-skip-eligible content-addressed
+    /// model would still skip under `--dag --force-rebuild`).
+    ///
+    /// This pins that the flags are threaded onto the [`CliDispatcher`] every
+    /// sub-run reads — the smallest creds-free seam (the behavioral proof needs
+    /// a content-addressed/s3 model, exercised by the live sandbox). The field
+    /// did not exist pre-fix, so this fails to compile against the old code.
+    #[test]
+    fn dispatcher_threads_build_escape_hatch_flags() {
+        let skip_opts = SkipRunOptions {
+            skip_unchanged: false,
+            force_rebuild: true,
+            no_reuse: true,
+            no_prune: false,
+        };
+        let dispatcher = CliDispatcher {
+            config_path: std::path::PathBuf::from("rocky.toml"),
+            state_path: std::path::PathBuf::from(".rocky-state.redb"),
+            seeds_dir: std::path::PathBuf::from("seeds"),
+            node_pipelines: HashMap::new(),
+            skip_opts,
+        };
+        assert!(
+            dispatcher.skip_opts.force_rebuild,
+            "--force-rebuild must be carried to each DAG sub-run, not dropped"
+        );
+        assert!(
+            dispatcher.skip_opts.no_reuse,
+            "--no-reuse must be carried to each DAG sub-run, not dropped"
+        );
     }
 }
 
@@ -377,9 +439,14 @@ mod tests {
 
         let config_path = root.join("rocky.toml");
         let state_path = root.join(".rocky-state.redb");
-        run_with_dag(&config_path, &state_path, false)
-            .await
-            .expect("run --dag should succeed");
+        run_with_dag(
+            &config_path,
+            &state_path,
+            false,
+            &crate::commands::run::SkipRunOptions::default(),
+        )
+        .await
+        .expect("run --dag should succeed");
 
         // Open the resulting database and assert all three conditions.
         let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();

@@ -57,7 +57,7 @@
 //! object-store delete ([`ObjectStoreEvictor`]) is s3-only and is
 //! **code-reviewed here, driven on the sandbox** — creds-free it defers.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -288,107 +288,6 @@ fn check_age_threshold(
     }
 }
 
-/// The resolved identity of a model's **current output** — the live table
-/// head the warehouse's Delta log still references.
-///
-/// Resolved ledger-only from the newest *successful* [`ModelExecution`] for the
-/// model (a column-skip records no execution, so this cleanly anchors on the
-/// last real build) joined to that run's recorded output hash(es).
-enum LiveHead {
-    /// The model's newest successful build produced exactly this output hash.
-    Resolved(String),
-    /// The head could not be pinned to a single hash — no successful build in
-    /// the retained history, no recorded output, or an ambiguous multi-hash
-    /// output. Every candidate for the model is then held (fail-closed): a
-    /// candidate we cannot prove is *not* the live head must not be evicted.
-    Unresolved(String),
-}
-
-/// Check 7 — not the model's current (live) output.
-///
-/// A content-addressed model that is **column-skip-stable** never re-records
-/// its artifact, so its ledger refcount stays frozen at 1 forever — passing
-/// check 4 while the row is the model's *live table head*, still referenced by
-/// the Delta log. Evicting it retires (and, once physical deletion is armed,
-/// deletes) the file the current table points at, and a subsequent run
-/// column-skips instead of rebuilding — silent data loss. So a candidate whose
-/// hash is the model's current output is **ineligible**; only a *superseded*
-/// older artifact (the head resolves to a different hash) is reclaimable. Fails
-/// closed when the head can't be resolved.
-fn check_not_live_head(artifact_hash: &str, live_head: &LiveHead) -> GcCheckOutput {
-    let (passed, detail) = match live_head {
-        LiveHead::Resolved(head) if head == artifact_hash => (
-            false,
-            "this artifact is the model's current output (the live table head the Delta log still \
-             references) — evicting it would retire bytes the live table points at, and a \
-             column-skip-stable model would not rebuild them"
-                .to_string(),
-        ),
-        LiveHead::Resolved(head) => (
-            true,
-            format!(
-                "superseded by the model's current output ({}…) — a reclaimable older version, \
-                 not the live table head",
-                head.get(..12).unwrap_or(head)
-            ),
-        ),
-        LiveHead::Unresolved(reason) => (
-            false,
-            format!("cannot prove this is not the model's live head: {reason} (fail-closed)"),
-        ),
-    };
-    GcCheckOutput {
-        check: "not_live_head".to_string(),
-        passed,
-        detail,
-    }
-}
-
-/// Resolve a model's [`LiveHead`] from the ledger, ordering runs newest-first.
-///
-/// `runs_newest_first` is the retained run history (already sorted by
-/// `started_at` descending); `artifacts_by_run_model` indexes every ledger row
-/// by its producing `(run_id, model)` pair. The anchor is the newest run with a
-/// **successful** execution of the model; its output hash is the union of that
-/// run's artifact-ledger rows and its provenance `output_blake3`. A single hash
-/// resolves the head; empty, ambiguous, or no-successful-build all fail closed.
-fn resolve_live_head(
-    store: &StateStore,
-    model_name: &str,
-    runs_newest_first: &[RunRecord],
-    artifacts_by_run_model: &HashMap<(String, String), BTreeSet<String>>,
-) -> LiveHead {
-    let anchor_run_id = runs_newest_first.iter().find_map(|run| {
-        run.models_executed
-            .iter()
-            .any(|m| m.model_name == model_name && m.status == "success")
-            .then(|| run.run_id.clone())
-    });
-    let Some(anchor_run_id) = anchor_run_id else {
-        return LiveHead::Unresolved(
-            "no successful build recorded for this model in the retained run history".to_string(),
-        );
-    };
-
-    let mut hashes: BTreeSet<String> = BTreeSet::new();
-    if let Some(hs) = artifacts_by_run_model.get(&(anchor_run_id.clone(), model_name.to_string())) {
-        hashes.extend(hs.iter().cloned());
-    }
-    if let Ok(Some(prov)) = store.get_provenance(&anchor_run_id, model_name) {
-        hashes.extend(prov.output_blake3);
-    }
-
-    match hashes.len() {
-        0 => LiveHead::Unresolved(
-            "the newest successful build recorded no output artifact".to_string(),
-        ),
-        1 => LiveHead::Resolved(hashes.into_iter().next().expect("checked len == 1")),
-        n => LiveHead::Unresolved(format!(
-            "the newest successful build resolves to {n} distinct output hashes — ambiguous"
-        )),
-    }
-}
-
 /// Estimate the cost to rebuild an artifact via replay.
 ///
 /// A replay re-runs the recorded recipe, so the recorded build's duration and
@@ -426,10 +325,6 @@ fn build_rebuild_cost(
 /// hash-binding check ([`check_recipe_produces_output`]) so the derivable
 /// verdict is bound to *this artifact's* content hash, never inherited from a
 /// sibling output of the same recipe.
-///
-/// `live_head` is the model's resolved current output ([`LiveHead`]) — required
-/// for [`check_not_live_head`] so a column-skip-stable model's frozen-refcount
-/// live table head is never proposed for eviction.
 #[allow(clippy::too_many_arguments)]
 fn build_candidate(
     artifact: &ArtifactRecord,
@@ -437,7 +332,6 @@ fn build_candidate(
     class: &ReplayCheckModelOutput,
     exec: Option<&ModelExecution>,
     prov: Option<&ProvenanceRecord>,
-    live_head: &LiveHead,
     now: DateTime<Utc>,
     min_age_days: i64,
     adapter: Option<&AdapterCost>,
@@ -449,7 +343,6 @@ fn build_candidate(
         check_unreferenced(refcount),
         check_policy_allows(),
         check_age_threshold(artifact.written_at, now, min_age_days),
-        check_not_live_head(&artifact.blake3_hash, live_head),
     ];
     let derivable = checks.iter().all(|c| c.passed);
 
@@ -472,6 +365,12 @@ fn build_candidate(
 /// numbers. These are the honesty guardrails the plan mandates.
 fn report_notes(min_age_days: i64) -> Vec<String> {
     vec![
+        "`derivable` means rebuildable from the recorded recipe — NOT that the file is safe to \
+         delete. `rocky apply` reclaims an artifact only when its file is a proven `remove` in \
+         its table's Delta log; the append-only writer keeps older versions live, so a derivable \
+         file still referenced by the live table is held (only an external compaction/VACUUM \
+         makes it reclaimable)."
+            .to_string(),
         "Scope: refcounts see Rocky-managed references only. A warehouse-side reference Rocky \
          never recorded (a BI extract, a notebook SELECT INTO) is invisible here."
             .to_string(),
@@ -505,6 +404,28 @@ struct EvictionCandidate {
     input_proof_class: Option<String>,
     env_hash: Option<String>,
     hash_scheme: Option<String>,
+    /// The producing model's content-addressed `storage_prefix` (its table
+    /// root), parsed from the provenance's canonical `ModelIr`. The apply-time
+    /// manifest-truth liveness gate needs it to read *this* table's Delta log
+    /// (scoped to the candidate's own target — never a same-named model in
+    /// another catalog). `None` when the provenance is missing or its IR is not
+    /// a content-addressed model ⇒ liveness is unverifiable ⇒ the eviction is
+    /// held (fail-closed).
+    storage_prefix: Option<String>,
+}
+
+/// Extract a content-addressed model's `storage_prefix` (table root) from a
+/// provenance record's canonical `ModelIr`. `None` for a missing provenance, an
+/// unparseable IR, or a non-content-addressed materialization.
+fn storage_prefix_from_provenance(prov: Option<&ProvenanceRecord>) -> Option<String> {
+    let prov = prov?;
+    let ir: rocky_ir::ModelIr = serde_json::from_str(&prov.model_ir_canonical_json).ok()?;
+    match ir.materialization {
+        rocky_ir::MaterializationStrategy::ContentAddressed { storage_prefix, .. } => {
+            Some(storage_prefix)
+        }
+        _ => None,
+    }
 }
 
 /// Assemble the derivability verdict for every distinct content hash in the
@@ -526,31 +447,16 @@ fn gather_eviction_candidates(
 
     // Group by content hash — each distinct hash is one physical artifact.
     // Representative row = the most recent producer (deterministic tie-break
-    // on run|model) so the reported model/run is stable across scans. The
-    // `(run, model) → {hash}` index is the live-head resolver's input (which
-    // run produced which output bytes), built from the same read.
+    // on run|model) so the reported model/run is stable across scans.
     let mut by_hash: HashMap<String, Vec<ArtifactRecord>> = HashMap::new();
-    let mut artifacts_by_run_model: HashMap<(String, String), BTreeSet<String>> = HashMap::new();
     for artifact in artifacts {
-        artifacts_by_run_model
-            .entry((artifact.run_id.clone(), artifact.model_name.clone()))
-            .or_default()
-            .insert(artifact.blake3_hash.clone());
         by_hash
             .entry(artifact.blake3_hash.clone())
             .or_default()
             .push(artifact);
     }
 
-    // Retained run history, newest-first, read once for the live-head anchor.
-    let runs_newest_first = store
-        .list_runs(100)
-        .context("failed to read the run history")?;
-
     let mut run_cache: HashMap<String, Option<RunRecord>> = HashMap::new();
-    // Per-model live-head resolution, cached so a model with many artifacts
-    // resolves its current output once.
-    let mut live_head_cache: HashMap<String, LiveHead> = HashMap::new();
     let mut out: Vec<EvictionCandidate> = Vec::with_capacity(by_hash.len());
 
     for (hash, mut rows) in by_hash {
@@ -587,26 +493,12 @@ fn gather_eviction_candidates(
                 .find(|m| m.model_name == representative.model_name)
         });
 
-        // Resolve the model's live table head (cached per model) so a
-        // column-skip-stable model's frozen-refcount head is never evicted.
-        if !live_head_cache.contains_key(&representative.model_name) {
-            let head = resolve_live_head(
-                store,
-                &representative.model_name,
-                &runs_newest_first,
-                &artifacts_by_run_model,
-            );
-            live_head_cache.insert(representative.model_name.clone(), head);
-        }
-        let live_head = &live_head_cache[&representative.model_name];
-
         let output = build_candidate(
             &representative,
             refcount,
             &class,
             exec,
             prov.as_ref(),
-            live_head,
             now,
             min_age_days,
             adapter,
@@ -623,6 +515,8 @@ fn gather_eviction_candidates(
             })
             .unwrap_or((None, None, None, None, None));
 
+        let storage_prefix = storage_prefix_from_provenance(prov.as_ref());
+
         out.push(EvictionCandidate {
             artifact: representative,
             output,
@@ -631,6 +525,7 @@ fn gather_eviction_candidates(
             input_proof_class,
             env_hash,
             hash_scheme,
+            storage_prefix,
         });
     }
 
@@ -814,9 +709,17 @@ pub fn run_gc_derivable(
 /// Operator caveats surfaced on a `gc` plan and its apply.
 fn gc_plan_notes() -> Vec<String> {
     vec![
-        "This plan lists only artifacts proved derivable at plan time. `rocky apply` \
-         re-verifies each against the live ledger before evicting — a reference that \
-         appears between plan and apply refuses the eviction (fail-closed)."
+        "This plan lists artifacts proved *derivable* (rebuildable from the recorded recipe) at \
+         plan time. Derivable is NOT the same as reclaimable: `rocky apply` additionally requires \
+         each file to be a proven `remove` in its table's Delta log before deleting it. The \
+         append-only writer never removes on its own, so a file still referenced by the live \
+         table (including an older version) is HELD — only an external compaction/VACUUM makes it \
+         reclaimable. Expect apply to reclaim fewer artifacts than this plan lists (and none on a \
+         creds-free run, where liveness cannot be verified)."
+            .to_string(),
+        "`rocky apply` re-verifies each artifact against the live ledger AND its table's Delta \
+         log before evicting — a reference or liveness change between plan and apply holds the \
+         eviction (fail-closed)."
             .to_string(),
         "Every eviction writes a durable tombstone (recipe triple + restore pointer) BEFORE \
          the ledger row is retired, so an evicted cache entry is always restorable."
@@ -958,6 +861,73 @@ fn print_plan_table(output: &GcPlanOutput) {
 // Apply — `rocky apply <gc-plan>`: tombstone + evict + physical reclaim
 // ===========================================================================
 
+/// The manifest-truth reclaimability verdict for a candidate artifact.
+enum ReclaimVerdict {
+    /// The candidate's file is a proven `remove` in its table's Delta log — its
+    /// bytes are safe to reclaim.
+    Reclaimable,
+    /// The candidate is held: still a live `add`, absent from the readable log
+    /// (possibly checkpoint-truncated), the target could not be resolved, or
+    /// the log could not be read. Carries the operator-facing reason.
+    Held(String),
+}
+
+/// Decides whether a content-addressed artifact's **bytes** are safe to
+/// reclaim, by reading the manifest truth of its table's Delta log.
+///
+/// This is the load-bearing safety gate that closes the append-only data-loss
+/// hole: the UniForm writer only ever appends `add` actions and **never**
+/// emits `remove`, so two builds `H1→H2` leave BOTH files referenced by the
+/// live snapshot. No ledger/hash heuristic can tell which files a live table
+/// still points at — only the `_delta_log` can. So an artifact is reclaimable
+/// **iff** its file is a proven `remove` there (an external compaction/VACUUM
+/// retired it); every other state — still a live `add`, absent/truncated, or
+/// unverifiable — holds (fail-closed).
+///
+/// The abstraction keeps the eviction path testable creds-free (tests inject a
+/// deterministic oracle) while the real Delta-log read stays a single,
+/// reviewable implementation on the credentialed s3 path.
+#[async_trait]
+trait LivenessOracle: Send + Sync {
+    /// `storage_prefix` is the candidate table's root; `file_path` is the
+    /// artifact's full object path (its basename is the Delta `add.path`).
+    async fn reclaim_verdict(&self, storage_prefix: &str, file_path: &str) -> ReclaimVerdict;
+}
+
+/// Production oracle: reads the candidate's own table's `_delta_log` via the
+/// content-addressed writer's manifest reader ([`PathLiveness`]).
+///
+/// Because it is scoped to the candidate's own `storage_prefix` and file path,
+/// two same-named models in different catalogs never cross-contaminate — each
+/// is checked against its own table's log. Reachable only with object-store
+/// credentials (content-addressed storage is s3-only); creds-free it errors and
+/// the candidate is held.
+struct ManifestLivenessOracle;
+
+#[async_trait]
+impl LivenessOracle for ManifestLivenessOracle {
+    async fn reclaim_verdict(&self, storage_prefix: &str, file_path: &str) -> ReclaimVerdict {
+        use rocky_iceberg::uniform_writer::PathLiveness;
+        match super::run_content_addressed::artifact_delta_liveness(storage_prefix, file_path).await
+        {
+            Ok(PathLiveness::Removed) => ReclaimVerdict::Reclaimable,
+            Ok(PathLiveness::Live) => ReclaimVerdict::Held(
+                "the file is still a live `add` in the table's Delta log (append-only writer \
+                 keeps older versions live) — HELD"
+                    .to_string(),
+            ),
+            Ok(PathLiveness::Absent) => ReclaimVerdict::Held(
+                "the file is not referenced by the readable Delta log — cannot prove it was \
+                 removed (a checkpoint may still carry its `add`); HELD (fail-closed)"
+                    .to_string(),
+            ),
+            Err(e) => ReclaimVerdict::Held(format!(
+                "could not read the Delta log to verify removal: {e}; HELD (fail-closed)"
+            )),
+        }
+    }
+}
+
 /// Outcome of a best-effort physical reclamation of an evicted artifact's
 /// bytes through the object-store adapter.
 enum PhysicalReclaim {
@@ -1038,8 +1008,7 @@ fn s3_object_key(url: &str) -> Option<String> {
 /// deletion by default. The `ObjectStoreEvictor` (the real s3 delete) is chosen
 /// only when the flag is set AND credentials are reachable; otherwise the
 /// physical delete is deferred and the tombstone + retired ledger row remain
-/// the eviction of record (a safe, restorable posture). The deferral reason
-/// names the missing precondition so an operator knows which lever to pull.
+/// the eviction of record. The deferral reason names the missing precondition.
 fn choose_evictor(physical_delete: bool) -> Box<dyn ArtifactEvictor> {
     if !physical_delete {
         return Box::new(DeferredEvictor {
@@ -1068,9 +1037,11 @@ fn gc_apply_notes() -> Vec<String> {
         "Refcounts see Rocky-ledger references only. Multi-ref safety on the UniForm path \
          (branch / env / downstream-deferred-read pointers) is code-reviewed, not driven here."
             .to_string(),
-        "A model's current output (its live table head) is never proposed for eviction — only \
-         a superseded older artifact is reclaimable, so a column-skip-stable model's frozen \
-         refcount can't route its live bytes into a plan."
+        "Liveness is manifest-truth: an artifact is reclaimed only when its file is a proven \
+         `remove` in its table's Delta log. The append-only writer never removes on its own, so \
+         a still-referenced file (including an older version) is HELD — only an external \
+         compaction/VACUUM makes a file reclaimable. Unverifiable liveness (no creds, truncated \
+         log) also holds (fail-closed)."
             .to_string(),
         "Physical byte-deletion is opt-in via `[gc] physical_delete = true` (and is s3-only, \
          driven only against a live bucket). By default it is disabled: the byte-delete is \
@@ -1084,13 +1055,14 @@ fn gc_apply_notes() -> Vec<String> {
 }
 
 /// The eviction engine: re-derive eligibility against the live ledger, then for
-/// each planned artifact that is **still derivable AND an exact identity match**
-/// write its tombstone and retire its ledger row atomically before a
-/// best-effort physical delete.
+/// each planned artifact that is **still derivable, an exact identity match, AND
+/// provably retired from its table's Delta log** write its tombstone and retire
+/// its ledger row atomically before a best-effort physical delete.
 ///
-/// Pure over its inputs (`store`, `evictor`, `now`) so tests drive it directly
-/// with a seeded store and a recording evictor. The review + policy gates live
-/// in [`run_gc_apply_in`] and run *before* this is called.
+/// Pure over its inputs (`store`, `evictor`, `oracle`, `now`) so tests drive it
+/// directly with a seeded store, a recording evictor, and a deterministic
+/// liveness oracle. The review + policy gates live in [`run_gc_apply_in`] and
+/// run *before* this is called.
 ///
 /// **Apply re-derives; it does not trust the plan.** The reviewed plan_id
 /// approves a *proposal*, but the persisted rows carry a `blake3_hash` that
@@ -1101,18 +1073,22 @@ fn gc_apply_notes() -> Vec<String> {
 ///    candidates by their FULL identity `(run, model, file_path, blake3_hash)`;
 /// 2. resolves the exact live row the plan row names, and refuses unless the
 ///    live row's hash equals the planned hash;
-/// 3. evicts only when a freshly-derived candidate matches that full identity
-///    and is derivable *now* — building the tombstone from the LIVE candidate,
-///    never the plan payload, so the tombstone records the exact bytes deleted;
-/// 4. relies on [`StateStore::evict_artifact`]'s in-transaction hash check as a
+/// 3. re-derives derivability *now* AND consults the [`LivenessOracle`] for
+///    manifest truth — evicting only when the candidate's file is a proven
+///    `remove` in its own table's Delta log (the append-only writer keeps older
+///    versions live, so a ledger/hash heuristic cannot authorize a delete);
+/// 4. builds the tombstone from the LIVE candidate, never the plan payload, so
+///    the tombstone records the exact bytes deleted;
+/// 5. relies on [`StateStore::evict_artifact`]'s in-transaction hash check as a
 ///    final guard against a race.
 ///
-/// Any plan row that fails to match a current derivable candidate is refused —
-/// nothing is deleted. The hash is the eviction identity, never the `(run,
-/// model)` pair.
+/// Any plan row that fails to match a current derivable candidate, or whose file
+/// is not provably removed, is refused/held — nothing is deleted. The hash is
+/// the eviction identity, never the `(run, model)` pair.
 async fn execute_gc_apply(
     store: &StateStore,
     evictor: &dyn ArtifactEvictor,
+    oracle: &dyn LivenessOracle,
     plan_id: &str,
     plan: &GcPlan,
     now: DateTime<Utc>,
@@ -1183,6 +1159,37 @@ async fn execute_gc_apply(
         );
         match by_key.get(&key).copied() {
             Some(cand) if cand.output.derivable => {
+                // Manifest-truth liveness gate (authoritative). The append-only
+                // UniForm writer never emits `remove`, so an older content-hash
+                // file can stay live in the current snapshot alongside a newer
+                // one — no ledger/hash heuristic can tell. Read THIS table's
+                // Delta log and evict only a file that is a proven `remove`;
+                // still-live, absent/truncated, or unverifiable (incl.
+                // creds-free) all HOLD.
+                let verdict = match cand.storage_prefix.as_deref() {
+                    Some(prefix) => {
+                        oracle
+                            .reclaim_verdict(prefix, &cand.artifact.file_path)
+                            .await
+                    }
+                    None => ReclaimVerdict::Held(
+                        "no content-addressed storage_prefix resolved from provenance — cannot \
+                         verify the file was removed from the table; HELD (fail-closed)"
+                            .to_string(),
+                    ),
+                };
+                if let ReclaimVerdict::Held(reason) = verdict {
+                    refused.push(GcRefusedOutput {
+                        model_name: cand.artifact.model_name.clone(),
+                        run_id: cand.artifact.run_id.clone(),
+                        blake3_hash: cand.artifact.blake3_hash.clone(),
+                        size_bytes: cand.artifact.size_bytes,
+                        reason: format!("held by the Delta-log liveness gate: {reason}"),
+                        failed_checks: Vec::new(),
+                    });
+                    continue;
+                }
+
                 // Tombstone built from the LIVE candidate (authoritative identity
                 // + recipe triple), so it records the bytes actually evicted.
                 let tombstone = TombstoneRecord {
@@ -1356,6 +1363,31 @@ pub(crate) async fn run_gc_apply_in(
     state_path: &Path,
     json: bool,
 ) -> Result<()> {
+    // The authoritative manifest-truth liveness oracle. Split out so tests can
+    // exercise the review/policy gate + eviction wiring with a deterministic
+    // oracle (creds-free the real one holds everything, which is correct but
+    // untestable at this seam).
+    run_gc_apply_in_with(
+        root,
+        config_path,
+        plan_id,
+        state_path,
+        json,
+        &ManifestLivenessOracle,
+    )
+    .await
+}
+
+/// [`run_gc_apply_in`] with an injectable [`LivenessOracle`] — the real path
+/// passes [`ManifestLivenessOracle`]; tests pass a deterministic oracle.
+async fn run_gc_apply_in_with(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    json: bool,
+    oracle: &dyn LivenessOracle,
+) -> Result<()> {
     let plan_record =
         read_plan(root, plan_id).with_context(|| format!("failed to read gc plan '{plan_id}'"))?;
 
@@ -1421,7 +1453,8 @@ pub(crate) async fn run_gc_apply_in(
         .map(|cfg| cfg.gc.physical_delete)
         .unwrap_or(false);
     let evictor = choose_evictor(physical_delete);
-    let output = execute_gc_apply(&store, evictor.as_ref(), plan_id, &plan, Utc::now()).await?;
+    let output =
+        execute_gc_apply(&store, evictor.as_ref(), oracle, plan_id, &plan, Utc::now()).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -1602,19 +1635,9 @@ mod tests {
         let now = Utc::now();
         let art = artifact(HA, "orders", "r1", 100, now - Duration::days(30));
         let prov = prov_for(&art);
-        let c = build_candidate(
-            &art,
-            1,
-            &model("orders"),
-            None,
-            Some(&prov),
-            &superseded_head(),
-            now,
-            7,
-            None,
-        );
+        let c = build_candidate(&art, 1, &model("orders"), None, Some(&prov), now, 7, None);
         assert!(c.derivable);
-        assert_eq!(c.checks.len(), 7);
+        assert_eq!(c.checks.len(), 6);
         assert!(c.checks.iter().all(|k| k.passed));
     }
 
@@ -1623,70 +1646,10 @@ mod tests {
         let now = Utc::now();
         let art = artifact(HA, "orders", "r1", 100, now - Duration::days(30));
         let prov = prov_for(&art);
-        let c = build_candidate(
-            &art,
-            2,
-            &model("orders"),
-            None,
-            Some(&prov),
-            &superseded_head(),
-            now,
-            7,
-            None,
-        );
+        let c = build_candidate(&art, 2, &model("orders"), None, Some(&prov), now, 7, None);
         assert!(!c.derivable);
         let unref = c.checks.iter().find(|k| k.check == "unreferenced").unwrap();
         assert!(!unref.passed);
-    }
-
-    #[test]
-    fn candidate_not_derivable_when_it_is_the_live_head() {
-        // The live-head guard in isolation: an artifact whose hash IS the
-        // model's current output fails `not_live_head` (fail-closed on the
-        // frozen-refcount head), while a superseded hash passes it.
-        let now = Utc::now();
-        let art = artifact(HA, "orders", "r1", 100, now - Duration::days(30));
-        let prov = prov_for(&art);
-
-        // Head resolves to HA (this exact artifact) ⇒ held.
-        let head = build_candidate(
-            &art,
-            1,
-            &model("orders"),
-            None,
-            Some(&prov),
-            &LiveHead::Resolved(HA.to_string()),
-            now,
-            7,
-            None,
-        );
-        assert!(
-            !head.derivable,
-            "the live table head must never be derivable"
-        );
-        let live = head
-            .checks
-            .iter()
-            .find(|k| k.check == "not_live_head")
-            .unwrap();
-        assert!(!live.passed);
-        assert!(live.detail.contains("live table head"));
-        // Every other check still passes — the report shows exactly why.
-        assert_eq!(head.checks.iter().filter(|k| k.passed).count(), 6);
-
-        // Head unresolvable (no successful build in history) ⇒ also held.
-        let unresolved = build_candidate(
-            &art,
-            1,
-            &model("orders"),
-            None,
-            Some(&prov),
-            &LiveHead::Unresolved("no history".to_string()),
-            now,
-            7,
-            None,
-        );
-        assert!(!unresolved.derivable, "an unresolvable head fails closed");
     }
 
     #[test]
@@ -1700,17 +1663,7 @@ mod tests {
         // Provenance records a DIFFERENT output (HA@its path), not HB.
         let good = artifact(HA, "orders", "r1", 100, now - Duration::days(30));
         let prov = prov_for(&good);
-        let c = build_candidate(
-            &bad,
-            1,
-            &model("orders"),
-            None,
-            Some(&prov),
-            &superseded_head(),
-            now,
-            7,
-            None,
-        );
+        let c = build_candidate(&bad, 1, &model("orders"), None, Some(&prov), now, 7, None);
         assert!(!c.derivable, "H_BAD must not inherit H_GOOD's derivability");
         let bind = c
             .checks
@@ -1718,8 +1671,8 @@ mod tests {
             .find(|k| k.check == "recipe_produces_output")
             .unwrap();
         assert!(!bind.passed);
-        // The other six checks still pass — the report shows exactly why it's held.
-        assert_eq!(c.checks.iter().filter(|k| k.passed).count(), 6);
+        // The other five checks still pass — the report shows exactly why it's held.
+        assert_eq!(c.checks.iter().filter(|k| k.passed).count(), 5);
     }
 
     #[test]
@@ -1737,17 +1690,7 @@ mod tests {
         };
 
         // A member hash is derivable via membership alone.
-        let c = build_candidate(
-            &art,
-            1,
-            &model("orders"),
-            None,
-            Some(&prov),
-            &superseded_head(),
-            now,
-            7,
-            None,
-        );
+        let c = build_candidate(&art, 1, &model("orders"), None, Some(&prov), now, 7, None);
         assert!(
             c.derivable,
             "a member hash must be derivable via membership"
@@ -1763,17 +1706,7 @@ mod tests {
         // A different-hash artifact against the same no-path provenance is refused
         // — it must NOT inherit derivability just because paths were absent.
         let bad = artifact(HB, "orders", "r1", 100, now - Duration::days(30));
-        let c_bad = build_candidate(
-            &bad,
-            1,
-            &model("orders"),
-            None,
-            Some(&prov),
-            &superseded_head(),
-            now,
-            7,
-            None,
-        );
+        let c_bad = build_candidate(&bad, 1, &model("orders"), None, Some(&prov), now, 7, None);
         assert!(
             !c_bad.derivable,
             "a non-member hash must be refused even when provenance records no paths"
@@ -1854,50 +1787,8 @@ mod tests {
             .unwrap();
     }
 
-    /// A distinct, stable "current head" hash for `model`, different from the
-    /// single-letter-repeat artifact hashes the tests seed — so a
-    /// `record_superseding_head` build never collides with the artifact under
-    /// test.
-    fn head_hash(model: &str) -> String {
-        format!("HEAD-{model}")
-    }
-
-    /// A [`LiveHead`] that is NOT the candidate under test — the pure
-    /// `build_candidate` tests use it so the `not_live_head` check passes and
-    /// only the check being exercised decides derivability. The sentinel hash
-    /// (`f`×64) never collides with `HA`/`HB`/`HC`.
-    fn superseded_head() -> LiveHead {
-        LiveHead::Resolved("f".repeat(64))
-    }
-
     fn record_run(store: &StateStore, run_id: &str, model: &str) {
-        record_run_at(store, run_id, model, Utc::now());
-    }
-
-    /// Record a NEWER successful build of `model` producing a distinct head
-    /// hash ([`head_hash`]) — provenance + run only, **no** artifact-ledger row
-    /// — so any older artifact of the same model resolves as *superseded* (its
-    /// hash ≠ the live head) and becomes evictable. Written far in the future so
-    /// it reliably sorts newest for the live-head anchor; recording no artifact
-    /// keeps the ledger focused on the one hash under test (`artifact_count` /
-    /// `managed_bytes` are unaffected).
-    fn record_superseding_head(store: &StateStore, model: &str) {
-        let head = head_hash(model);
-        let run_id = format!("{model}-head");
-        let ir = ca_ir(model, "SELECT 1 AS id");
-        let outputs = vec![OutputArtifact {
-            blake3_hash: head.clone(),
-            file_path: format!("s3://b/{head}.parquet"),
-        }];
-        let (entry, prov) = build_records(&ir, &run_id, &[], &outputs, Utc::now()).unwrap();
-        store
-            .record_reuse_spine(std::slice::from_ref(&entry), std::slice::from_ref(&prov))
-            .unwrap();
-        record_run_at(store, &run_id, model, Utc::now() + Duration::days(365));
-    }
-
-    fn record_run_at(store: &StateStore, run_id: &str, model: &str, started_at: DateTime<Utc>) {
-        let now = started_at;
+        let now = Utc::now();
         let exec = ModelExecution {
             model_name: model.to_string(),
             started_at: now,
@@ -1959,8 +1850,6 @@ mod tests {
         let old = Utc::now() - Duration::days(30);
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
-        // Supersede HA so it is a reclaimable older version, not the live head.
-        record_superseding_head(&store, "orders");
 
         let report = gather_report(&store, None, Utc::now(), 7).unwrap();
         assert_eq!(report.artifact_count, 1);
@@ -2101,6 +1990,116 @@ mod tests {
         build_gc_plan(&cands, min_age_days).expect("expected at least one derivable candidate")
     }
 
+    /// A deterministic liveness oracle for the eviction-path tests — returns a
+    /// fixed verdict without reading any Delta log. `reclaimable()` lets the
+    /// existing evict tests reach the eviction; `held()` proves a hold.
+    struct FixedLivenessOracle {
+        reclaimable: bool,
+    }
+
+    impl FixedLivenessOracle {
+        fn reclaimable() -> Self {
+            Self { reclaimable: true }
+        }
+    }
+
+    #[async_trait]
+    impl LivenessOracle for FixedLivenessOracle {
+        async fn reclaim_verdict(&self, _storage_prefix: &str, _file_path: &str) -> ReclaimVerdict {
+            if self.reclaimable {
+                ReclaimVerdict::Reclaimable
+            } else {
+                ReclaimVerdict::Held("test-held".to_string())
+            }
+        }
+    }
+
+    /// A liveness oracle backed by **real** in-memory Delta logs, keyed by
+    /// `storage_prefix`, exercising the production
+    /// [`UniformWriter::add_path_liveness`] manifest reader end-to-end. Each
+    /// candidate is checked against its own table's log (by storage_prefix), so
+    /// this drives both the append-only append-only-liveness fix and the
+    /// per-table scoping that dissolves same-name collisions.
+    struct InMemoryLivenessOracle {
+        tables: HashMap<String, (std::sync::Arc<object_store::memory::InMemory>, String)>,
+    }
+
+    struct NoopSql;
+    #[async_trait]
+    impl rocky_iceberg::uniform_writer::SqlClient for NoopSql {
+        async fn execute(&self, _sql: &str) -> rocky_iceberg::uniform_writer::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl InMemoryLivenessOracle {
+        fn new() -> Self {
+            Self {
+                tables: HashMap::new(),
+            }
+        }
+
+        /// Register an in-memory table log at `storage_prefix` with the given
+        /// commit lines (each a JSONL body like `{"add":{"path":"h.parquet"}}`
+        /// or `{"remove":{"path":"h.parquet"}}`), one commit per version.
+        async fn seed_table(&mut self, storage_prefix: &str, key_prefix: &str, commits: &[&str]) {
+            use object_store::path::Path as ObjPath;
+            use object_store::{ObjectStoreExt, PutPayload};
+            let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+            for (v, body) in commits.iter().enumerate() {
+                let path = ObjPath::from(format!("{key_prefix}/_delta_log/{v:020}.json"));
+                store
+                    .put(&path, PutPayload::from(format!("{body}\n").into_bytes()))
+                    .await
+                    .unwrap();
+            }
+            self.tables
+                .insert(storage_prefix.to_string(), (store, key_prefix.to_string()));
+        }
+    }
+
+    #[async_trait]
+    impl LivenessOracle for InMemoryLivenessOracle {
+        async fn reclaim_verdict(&self, storage_prefix: &str, file_path: &str) -> ReclaimVerdict {
+            use rocky_iceberg::uniform_writer::{PathLiveness, UniformWriter, UniformWriterConfig};
+            let Some((store, key_prefix)) = self.tables.get(storage_prefix) else {
+                return ReclaimVerdict::Held(format!("no seeded table log for {storage_prefix}"));
+            };
+            let writer = UniformWriter::new(
+                UniformWriterConfig {
+                    catalog: String::new(),
+                    schema: String::new(),
+                    table: String::new(),
+                    prefix: key_prefix.clone(),
+                    engine_info: "test".to_string(),
+                },
+                store.clone(),
+                std::sync::Arc::new(NoopSql),
+            );
+            let add_file_path = file_path.rsplit('/').next().unwrap_or(file_path);
+            match writer.add_path_liveness(add_file_path).await {
+                Ok(PathLiveness::Removed) => ReclaimVerdict::Reclaimable,
+                Ok(PathLiveness::Live) => ReclaimVerdict::Held("live".to_string()),
+                Ok(PathLiveness::Absent) => ReclaimVerdict::Held("absent".to_string()),
+                Err(e) => ReclaimVerdict::Held(format!("read error: {e}")),
+            }
+        }
+    }
+
+    // The env-mutating evictor tests serialise via a module-local mutex.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// SAFETY: runs under `ENV_LOCK`, which serialises every env-mutating test
+    /// in this module. `set_var`/`remove_var` are unsafe from the 2024 edition
+    /// (they race concurrent reads); the lock closes that hole for our tests,
+    /// and the blast radius is a test-only evictor choice.
+    fn set_env(key: &str, value: &str) {
+        unsafe { std::env::set_var(key, value) };
+    }
+    fn remove_env(key: &str) {
+        unsafe { std::env::remove_var(key) };
+    }
+
     #[test]
     fn build_gc_plan_returns_none_on_empty_ledger() {
         let dir = TempDir::new().unwrap();
@@ -2117,10 +2116,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
         let old = Utc::now() - Duration::days(30);
-        // Derivable (superseded older version, not the live head).
+        // Derivable.
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
-        record_superseding_head(&store, "orders");
         // Nondeterministic — never derivable, must be excluded from the plan.
         seed(
             &store,
@@ -2166,16 +2164,21 @@ mod tests {
         let old = Utc::now() - Duration::days(30);
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
-        // Supersede HA so it is a reclaimable older version, not the live head.
-        record_superseding_head(&store, "orders");
         let now = Utc::now();
         let plan = plan_from_store(&store, now, 7);
         assert_eq!(plan.evictions.len(), 1);
 
         let evictor = TestEvictor::new(TestOutcome::Deferred);
-        let out = execute_gc_apply(&store, &evictor, "plan-x", &plan, now)
-            .await
-            .unwrap();
+        let out = execute_gc_apply(
+            &store,
+            &evictor,
+            &FixedLivenessOracle::reclaimable(),
+            "plan-x",
+            &plan,
+            now,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(out.evicted_count, 1);
         assert_eq!(out.refused_count, 0);
@@ -2206,10 +2209,6 @@ mod tests {
         let old = Utc::now() - Duration::days(30);
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HC, 500, old);
         record_run(&store, "r1", "orders");
-        // Supersede HC so it is derivable at plan time (a superseded older
-        // version) — the refusal below is driven by the second reference, not
-        // the live-head guard.
-        record_superseding_head(&store, "orders");
         let now = Utc::now();
         // Plan captures the artifact while it is derivable (refcount 1).
         let plan = plan_from_store(&store, now, 7);
@@ -2220,9 +2219,16 @@ mod tests {
         assert_eq!(store.refcount_for_hash(HC).unwrap(), 2);
 
         let evictor = TestEvictor::new(TestOutcome::Deferred);
-        let out = execute_gc_apply(&store, &evictor, "plan-x", &plan, now)
-            .await
-            .unwrap();
+        let out = execute_gc_apply(
+            &store,
+            &evictor,
+            &FixedLivenessOracle::reclaimable(),
+            "plan-x",
+            &plan,
+            now,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             out.evicted_count, 0,
@@ -2256,9 +2262,6 @@ mod tests {
         // Provenance + artifact for the GOOD output HA.
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
-        // Supersede orders with a later head so HA (and the stray HB) are not
-        // the live head — isolating the recipe-produces-output check under test.
-        record_superseding_head(&store, "orders");
         // A stray artifact row at HB for the SAME (run, model) — provenance does
         // NOT record HB.
         store
@@ -2340,9 +2343,16 @@ mod tests {
         };
 
         let evictor = TestEvictor::new(TestOutcome::Deferred);
-        let out = execute_gc_apply(&store, &evictor, "crafted", &crafted, Utc::now())
-            .await
-            .unwrap();
+        let out = execute_gc_apply(
+            &store,
+            &evictor,
+            &FixedLivenessOracle::reclaimable(),
+            "crafted",
+            &crafted,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(out.evicted_count, 0, "a crafted plan must delete nothing");
         assert_eq!(out.refused_count, 1);
@@ -2367,20 +2377,33 @@ mod tests {
         let old = Utc::now() - Duration::days(30);
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
-        record_superseding_head(&store, "orders");
         let now = Utc::now();
         let plan = plan_from_store(&store, now, 7);
 
         let evictor = TestEvictor::new(TestOutcome::Deferred);
-        let first = execute_gc_apply(&store, &evictor, "plan-x", &plan, now)
-            .await
-            .unwrap();
+        let first = execute_gc_apply(
+            &store,
+            &evictor,
+            &FixedLivenessOracle::reclaimable(),
+            "plan-x",
+            &plan,
+            now,
+        )
+        .await
+        .unwrap();
         assert_eq!(first.evicted_count, 1);
 
         // Re-applying the same plan is a clean no-op — the row is already gone.
-        let second = execute_gc_apply(&store, &evictor, "plan-x", &plan, now)
-            .await
-            .unwrap();
+        let second = execute_gc_apply(
+            &store,
+            &evictor,
+            &FixedLivenessOracle::reclaimable(),
+            "plan-x",
+            &plan,
+            now,
+        )
+        .await
+        .unwrap();
         assert_eq!(second.evicted_count, 0);
         assert_eq!(second.refused_count, 0);
         assert_eq!(second.already_evicted, vec![HA.to_string()]);
@@ -2399,14 +2422,20 @@ mod tests {
         let old = Utc::now() - Duration::days(30);
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
-        record_superseding_head(&store, "orders");
         let now = Utc::now();
         let plan = plan_from_store(&store, now, 7);
 
         let evictor = TestEvictor::new(TestOutcome::Failed);
-        let out = execute_gc_apply(&store, &evictor, "plan-x", &plan, now)
-            .await
-            .unwrap();
+        let out = execute_gc_apply(
+            &store,
+            &evictor,
+            &FixedLivenessOracle::reclaimable(),
+            "plan-x",
+            &plan,
+            now,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(out.evicted_count, 1);
         assert!(out.evicted[0].physical_status.contains("failed"));
@@ -2425,14 +2454,20 @@ mod tests {
         let old = Utc::now() - Duration::days(30);
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
-        record_superseding_head(&store, "orders");
         let now = Utc::now();
         let plan = plan_from_store(&store, now, 7);
 
         let evictor = TestEvictor::new(TestOutcome::Deleted);
-        let out = execute_gc_apply(&store, &evictor, "plan-x", &plan, now)
-            .await
-            .unwrap();
+        let out = execute_gc_apply(
+            &store,
+            &evictor,
+            &FixedLivenessOracle::reclaimable(),
+            "plan-x",
+            &plan,
+            now,
+        )
+        .await
+        .unwrap();
 
         assert!(out.evicted[0].physical_reclaimed);
         assert_eq!(out.evicted[0].physical_status, "deleted");
@@ -2451,7 +2486,6 @@ mod tests {
             let old = Utc::now() - Duration::days(30);
             seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
             record_run(&store, "r1", "orders");
-            record_superseding_head(&store, "orders");
             let plan = plan_from_store(&store, Utc::now(), 7);
             write_plan_with_principal(dir.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
                 .unwrap()
@@ -2461,8 +2495,14 @@ mod tests {
         // the unconditional review marker, not policy.
         let config = dir.path().join("nonexistent.toml");
 
+        // Drive the injectable variant with a Reclaimable oracle so the
+        // review/policy gate + eviction wiring are exercised without a live
+        // Delta log (the real `ManifestLivenessOracle` would hold everything
+        // creds-free — correct, but it would mask the review-gate assertion).
+        let oracle = FixedLivenessOracle::reclaimable();
+
         // No marker → refuse.
-        let err = run_gc_apply_in(dir.path(), &config, &plan_id, &state_path, true)
+        let err = run_gc_apply_in_with(dir.path(), &config, &plan_id, &state_path, true, &oracle)
             .await
             .expect_err("apply must refuse an unreviewed gc plan");
         assert!(err.to_string().contains("not been reviewed"), "got: {err}");
@@ -2478,7 +2518,7 @@ mod tests {
         let marker = crate::commands::apply::review_marker_path(dir.path(), &plan_id);
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, "{}").unwrap();
-        run_gc_apply_in(dir.path(), &config, &plan_id, &state_path, true)
+        run_gc_apply_in_with(dir.path(), &config, &plan_id, &state_path, true, &oracle)
             .await
             .unwrap();
 
@@ -2487,114 +2527,217 @@ mod tests {
         assert_eq!(store.refcount_for_hash(HA).unwrap(), 0);
     }
 
-    /// 🔴 The live-head guard end-to-end: a model with two real builds — an
-    /// OLD one (`HA`) and a NEWER current one (`HB`) — must hold the newer
-    /// build (the live table head the Delta log references) out of every
-    /// eviction plan while allowing the superseded older build to be
-    /// reclaimed. This is exactly the frozen-refcount trap: `HB` has refcount
-    /// 1 (a column-skip-stable model never re-records it), so without the
-    /// live-head check it would pass all six original checks and gc would
-    /// propose evicting the live head. Non-vacuous: pre-fix, BOTH `HA` and
-    /// `HB` are derivable and the plan carries the live head.
-    #[test]
-    fn live_head_is_held_while_superseded_artifact_is_evictable() {
+    /// 🔴 DEFECT 1 (append-only data loss). The UniForm/Delta writer is
+    /// append-only — it emits `add` actions, never `remove` — so two builds of
+    /// a table leave BOTH files referenced by the live snapshot. A ledger/hash
+    /// heuristic that calls the older file "superseded" would let gc delete
+    /// bytes the live table still points at. The manifest-truth gate reads the
+    /// Delta log and HOLDs every still-`add`ed file; only an externally-`remove`d
+    /// file is reclaimable. Non-vacuous: both files are ledger-derivable, and
+    /// pre-gate the plan would have evicted the "older" live file.
+    #[tokio::test]
+    async fn append_only_live_files_are_held_only_removed_is_reclaimable() {
         let dir = TempDir::new().unwrap();
         let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
         let old = Utc::now() - Duration::days(30);
-        // Old build HA (run r1), then a newer current build HB (run r2). Both
-        // are genuine ledger artifacts + successful executions; r2 is newer, so
-        // HB is the live head and HA is superseded.
+        // Two builds of the SAME table `orders`: older file HA, newer file HB.
+        // Both old, refcount 1, replayable, strong-provenance ⇒ derivable.
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
-        record_run_at(&store, "r1", "orders", old);
-        seed(
-            &store,
-            "r2",
-            "orders",
-            "SELECT 1 AS id",
-            &[],
-            HB,
-            600,
-            old + Duration::hours(1),
-        );
-        record_run_at(&store, "r2", "orders", old + Duration::hours(1));
-
-        let cands = gather_eviction_candidates(&store, None, Utc::now(), 7).unwrap();
-
-        // HB — the model's current output — is HELD: not_live_head fails.
-        let hb = cands
-            .iter()
-            .find(|c| c.artifact.blake3_hash == HB)
-            .expect("HB candidate present");
+        record_run(&store, "r1", "orders");
+        seed(&store, "r2", "orders", "SELECT 1 AS id", &[], HB, 600, old);
+        record_run(&store, "r2", "orders");
+        let now = Utc::now();
+        let cands = gather_eviction_candidates(&store, None, now, 7).unwrap();
         assert!(
-            !hb.output.derivable,
-            "the live table head must never be derivable"
+            cands.iter().all(|c| c.output.derivable),
+            "both are ledger-derivable (the pre-gate state that made the bug reachable)"
         );
-        let hb_head = hb
-            .output
-            .checks
-            .iter()
-            .find(|k| k.check == "not_live_head")
+        let plan = build_gc_plan(&cands, 7).expect("both derivable");
+        assert_eq!(plan.evictions.len(), 2);
+
+        // Manifest reality: the Delta log ADDS both HA and HB, removes neither.
+        let mut oracle = InMemoryLivenessOracle::new();
+        oracle
+            .seed_table(
+                "s3://b/tgt/raw/orders",
+                "tgt/raw/orders",
+                &[
+                    &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
+                    &format!(r#"{{"add":{{"path":"{HB}.parquet"}}}}"#),
+                ],
+            )
+            .await;
+
+        let evictor = TestEvictor::new(TestOutcome::Deferred);
+        let out = execute_gc_apply(&store, &evictor, &oracle, "plan-x", &plan, now)
+            .await
             .unwrap();
-        assert!(!hb_head.passed);
-        assert!(hb_head.detail.contains("live table head"));
-
-        // HA — a superseded older version — IS reclaimable: every check passes.
-        let ha = cands
-            .iter()
-            .find(|c| c.artifact.blake3_hash == HA)
-            .expect("HA candidate present");
-        assert!(
-            ha.output.derivable,
-            "a superseded older artifact is reclaimable"
+        assert_eq!(
+            out.evicted_count, 0,
+            "append-only live files (incl. the older version) must never be evicted"
         );
+        assert_eq!(out.refused_count, 2);
         assert!(
-            ha.output
-                .checks
+            out.refused
                 .iter()
-                .find(|k| k.check == "not_live_head")
-                .unwrap()
-                .passed
+                .all(|r| r.reason.contains("liveness gate")),
+            "each refusal cites the Delta-log liveness gate"
         );
+        assert!(store.list_tombstones().unwrap().is_empty());
+        assert!(evictor.calls().is_empty(), "no byte-delete attempted");
+        assert_eq!(store.refcount_for_hash(HA).unwrap(), 1);
+        assert_eq!(store.refcount_for_hash(HB).unwrap(), 1);
 
-        // The plan carries ONLY the superseded HA — never the live head HB.
-        let plan = build_gc_plan(&cands, 7).expect("HA is derivable");
-        assert_eq!(plan.evictions.len(), 1);
-        assert_eq!(plan.evictions[0].blake3_hash, HA);
+        // Non-vacuity: once an external compaction `remove`s HA, HA is
+        // reclaimable while the still-`add`ed HB stays held.
+        let mut oracle2 = InMemoryLivenessOracle::new();
+        oracle2
+            .seed_table(
+                "s3://b/tgt/raw/orders",
+                "tgt/raw/orders",
+                &[
+                    &format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#),
+                    &format!(r#"{{"add":{{"path":"{HB}.parquet"}}}}"#),
+                    &format!(r#"{{"remove":{{"path":"{HA}.parquet"}}}}"#),
+                ],
+            )
+            .await;
+        let evictor2 = TestEvictor::new(TestOutcome::Deferred);
+        let out2 = execute_gc_apply(&store, &evictor2, &oracle2, "plan-x", &plan, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            out2.evicted_count, 1,
+            "a provably-removed file is reclaimable"
+        );
+        assert_eq!(out2.evicted[0].blake3_hash, HA);
+        assert_eq!(
+            out2.refused_count, 1,
+            "the still-live newer file stays held"
+        );
+        assert_eq!(out2.refused[0].blake3_hash, HB);
     }
 
-    // The evictor-selection tests mutate process-global AWS env vars, which
-    // `cargo test` runs in parallel by default, so serialise via a module-local
-    // mutex — each test takes the lock before touching env vars.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// SAFETY: runs under `ENV_LOCK`, which serialises every env-mutating test
-    /// in this module. `std::env::set_var`/`remove_var` are unsafe from the
-    /// 2024 edition because they race concurrent reads; the lock closes that
-    /// hole for our tests, and the blast radius is a test-only evictor choice.
-    fn set_env(key: &str, value: &str) {
-        unsafe { std::env::set_var(key, value) };
+    /// Seed a content-addressed `orders` model in a specific `catalog` (its own
+    /// target/table + storage_prefix), so two same-named models can coexist in
+    /// the ledger on DIFFERENT tables — the DEFECT 2 collision setup.
+    fn seed_orders_in(
+        store: &StateStore,
+        run_id: &str,
+        catalog: &str,
+        out_hash: &str,
+        written: DateTime<Utc>,
+    ) {
+        let mut ir = ModelIr::transformation(
+            TargetRef {
+                catalog: catalog.into(),
+                schema: "raw".into(),
+                table: "orders".into(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: format!("s3://b/{catalog}/raw/orders"),
+                partition_columns: vec![],
+            },
+            vec![],
+            "SELECT 1 AS id".to_string(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        ir.typed_columns = vec![TypedColumn {
+            name: "id".into(),
+            data_type: RockyType::Int64,
+            nullable: false,
+        }];
+        let outputs = vec![OutputArtifact {
+            blake3_hash: out_hash.to_string(),
+            file_path: format!("s3://b/{out_hash}.parquet"),
+        }];
+        let (entry, prov) = build_records(&ir, run_id, &[], &outputs, written).unwrap();
+        store
+            .record_reuse_spine(std::slice::from_ref(&entry), std::slice::from_ref(&prov))
+            .unwrap();
+        store
+            .record_artifact(&ArtifactRecord {
+                blake3_hash: out_hash.to_string(),
+                run_id: run_id.to_string(),
+                model_name: "orders".to_string(),
+                file_path: format!("s3://b/{out_hash}.parquet"),
+                commit_version: 0,
+                size_bytes: 500,
+                written_at: written,
+            })
+            .unwrap();
+        record_run(store, run_id, "orders");
     }
-    fn remove_env(key: &str) {
-        unsafe { std::env::remove_var(key) };
+
+    /// 🔴 DEFECT 2 (bare-name collision). Two DISTINCT models both named
+    /// `orders` in different catalogs must each be judged against their OWN
+    /// table's Delta log — never cross-contaminated by the same-named sibling.
+    /// The manifest gate is scoped by the candidate's own provenance
+    /// storage_prefix, so model A's live head is held while model B's removed
+    /// file is reclaimed, proving no collision.
+    #[tokio::test]
+    async fn same_named_models_are_scoped_per_table_no_collision() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        seed_orders_in(&store, "rA", "ca", HA, old); // table ca.raw.orders, file HA
+        seed_orders_in(&store, "rB", "cb", HB, old); // table cb.raw.orders, file HB
+        let now = Utc::now();
+        let cands = gather_eviction_candidates(&store, None, now, 7).unwrap();
+        assert_eq!(cands.len(), 2);
+        // Each candidate resolved its own target's storage_prefix.
+        let a = cands.iter().find(|c| c.artifact.blake3_hash == HA).unwrap();
+        let b = cands.iter().find(|c| c.artifact.blake3_hash == HB).unwrap();
+        assert_eq!(a.storage_prefix.as_deref(), Some("s3://b/ca/raw/orders"));
+        assert_eq!(b.storage_prefix.as_deref(), Some("s3://b/cb/raw/orders"));
+        let plan = build_gc_plan(&cands, 7).expect("both derivable");
+        assert_eq!(plan.evictions.len(), 2);
+
+        // A's file is LIVE in table A; B's file was REMOVED in table B.
+        let mut oracle = InMemoryLivenessOracle::new();
+        oracle
+            .seed_table(
+                "s3://b/ca/raw/orders",
+                "ca/raw/orders",
+                &[&format!(r#"{{"add":{{"path":"{HA}.parquet"}}}}"#)],
+            )
+            .await;
+        oracle
+            .seed_table(
+                "s3://b/cb/raw/orders",
+                "cb/raw/orders",
+                &[
+                    &format!(r#"{{"add":{{"path":"{HB}.parquet"}}}}"#),
+                    &format!(r#"{{"remove":{{"path":"{HB}.parquet"}}}}"#),
+                ],
+            )
+            .await;
+
+        let evictor = TestEvictor::new(TestOutcome::Deferred);
+        let out = execute_gc_apply(&store, &evictor, &oracle, "plan-x", &plan, now)
+            .await
+            .unwrap();
+        // Each judged by its OWN table: A held (live), B reclaimed (removed).
+        assert_eq!(out.evicted_count, 1);
+        assert_eq!(out.evicted[0].blake3_hash, HB);
+        assert_eq!(out.refused_count, 1);
+        assert_eq!(out.refused[0].blake3_hash, HA);
+        assert!(out.refused[0].reason.contains("liveness gate"));
     }
 
-    /// FIX-cluster regression: physical byte-deletion is an explicit opt-in.
-    /// The default (`physical_delete = false`) selects the `DeferredEvictor`
-    /// **even when AWS credentials are present** — the exact ambient-creds
-    /// arming this fix closes — and the armed-but-creds-less path also defers,
-    /// naming the missing precondition. Only `physical_delete = true` + creds
-    /// selects the real `ObjectStoreEvictor` (the code-reviewed s3 path, not
-    /// driven creds-free).
+    /// FIX 5 regression: physical byte-deletion is an explicit opt-in. The
+    /// default (`physical_delete = false`) selects the `DeferredEvictor` **even
+    /// with AWS credentials present**; armed-without-creds also defers.
     #[tokio::test]
     async fn choose_evictor_makes_physical_delete_opt_in() {
-        // Build each evictor under the env lock — `choose_evictor` reads env
-        // synchronously and captures its deferral reason at construction — then
-        // drop the lock before awaiting, so the `MutexGuard` is never held
-        // across an `.await` (a `DeferredEvictor`'s outcome is fixed, so no env
-        // state is read across the await).
         let deferred_default = {
             let _g = ENV_LOCK.lock().unwrap();
-            // Default OFF, credentials PRESENT ⇒ still deferred (the regression).
             set_env("AWS_ACCESS_KEY_ID", "test-key");
             set_env("AWS_SECRET_ACCESS_KEY", "test-secret");
             let ev = choose_evictor(false);
@@ -2607,16 +2750,11 @@ mod tests {
                 reason.contains("physical_delete"),
                 "default deferral must name the opt-in flag; got: {reason}"
             ),
-            other => panic!(
-                "default (physical_delete=false) must defer even with creds; got a non-deferred \
-                 outcome: {}",
-                matches_label(&other)
-            ),
+            _ => panic!("default (physical_delete=false) must defer even with creds"),
         }
 
         let deferred_armed = {
             let _g = ENV_LOCK.lock().unwrap();
-            // Armed, but credentials ABSENT ⇒ deferred, naming the missing creds.
             remove_env("AWS_ACCESS_KEY_ID");
             remove_env("AWS_SECRET_ACCESS_KEY");
             choose_evictor(true)
@@ -2626,20 +2764,7 @@ mod tests {
                 reason.contains("armed") && reason.contains("credentials"),
                 "armed-without-creds deferral must name the missing precondition; got: {reason}"
             ),
-            other => panic!(
-                "armed-without-creds must defer; got: {}",
-                matches_label(&other)
-            ),
-        }
-    }
-
-    /// Test-only label for a [`PhysicalReclaim`] so a panic message can name the
-    /// unexpected non-deferred outcome without matching in the assert.
-    fn matches_label(r: &PhysicalReclaim) -> &'static str {
-        match r {
-            PhysicalReclaim::Deleted => "Deleted",
-            PhysicalReclaim::Deferred(_) => "Deferred",
-            PhysicalReclaim::Failed(_) => "Failed",
+            _ => panic!("armed-without-creds must defer"),
         }
     }
 

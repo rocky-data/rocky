@@ -32,7 +32,8 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use object_store::ObjectStore;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use rocky_iceberg::uniform_writer::{
-    Result as UfResult, SqlClient, UniformWriter, UniformWriterConfig, UniformWriterError,
+    PathLiveness, Result as UfResult, SqlClient, UniformWriter, UniformWriterConfig,
+    UniformWriterError,
 };
 use rocky_ir::{MaterializationStrategy, ModelIr, RockyType, TypedColumn};
 use tracing::{debug, info, warn};
@@ -104,6 +105,53 @@ pub(crate) fn build_object_store(storage_prefix: &str) -> Result<Arc<dyn ObjectS
         .build()
         .with_context(|| format!("failed to build S3 store for {storage_prefix:?}"))?;
     Ok(Arc::new(store))
+}
+
+/// Resolve the three-state Delta-log liveness of a content-addressed
+/// artifact's file, given its table's `storage_prefix` and the artifact's
+/// full object `file_path`.
+///
+/// Builds the s3 object store + a metadata-only [`UniformWriter`] rooted at
+/// the table prefix (the same construction `execute_content_addressed_model`
+/// uses) and asks the table's `_delta_log` whether the file is a live `add`,
+/// a `remove`d file, or absent. The `add.path` is the file's basename
+/// (`<hash>.parquet`), relative to the table prefix.
+///
+/// This is the manifest-truth liveness `rocky gc` consults **before** deleting
+/// an artifact's bytes: the append-only UniForm writer never emits `remove`,
+/// so multiple file versions can be live at once and only the log is
+/// authoritative. Reachable only where object-store credentials are present
+/// (content-addressed storage is s3-only); creds-free, it errors and the
+/// caller holds.
+///
+/// # Errors
+///
+/// Propagates object-store / Delta-log read failures so the caller can treat
+/// the doubt as fail-closed (hold, never delete).
+pub(crate) async fn artifact_delta_liveness(
+    storage_prefix: &str,
+    file_path: &str,
+) -> Result<PathLiveness> {
+    let store = build_object_store(storage_prefix)?;
+    let (_bucket, key_prefix) = parse_s3_url(storage_prefix)?;
+    // catalog/schema/table are unused by the liveness read (it only consults
+    // `config.prefix` + the store), so placeholders are fine here.
+    let writer = UniformWriter::new(
+        UniformWriterConfig {
+            catalog: String::new(),
+            schema: String::new(),
+            table: String::new(),
+            prefix: key_prefix,
+            engine_info: format!("rocky-cli/{}", env!("CARGO_PKG_VERSION")),
+        },
+        store,
+        Arc::new(NoOpSqlClient),
+    );
+    let add_file_path = file_path.rsplit('/').next().unwrap_or(file_path);
+    writer
+        .add_path_liveness(add_file_path)
+        .await
+        .with_context(|| format!("failed to read Delta-log liveness for {file_path}"))
 }
 
 /// Convert a `QueryResult` plus the model's `typed_columns` into an Arrow

@@ -69,6 +69,31 @@ impl UniformWriterConfig {
     }
 }
 
+/// The liveness state of a content-addressed file's path in a table's
+/// `_delta_log`, resolved from the **highest-versioned** commit that
+/// references it (a later `remove` supersedes an earlier `add`).
+///
+/// The three states carry distinct trust for a *deletion* decision, where
+/// [`Self::Absent`] must never be conflated with [`Self::Removed`]: the log
+/// reader consults only the `<20-digit>.json` commit tail, so a
+/// checkpoint-truncated table returns `Absent` for a file whose `add` still
+/// lives inside a checkpoint parquet. Deleting on `Absent` would therefore
+/// delete a live file. A reclamation gate must evict **only** on
+/// [`Self::Removed`] and hold on `Absent`/`Live`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathLiveness {
+    /// The highest commit referencing the path added it and no later commit
+    /// removed it — the file is live in the current snapshot.
+    Live,
+    /// The highest commit referencing the path `remove`d it (a
+    /// compaction/VACUUM retired it) — the file is provably not live.
+    Removed,
+    /// No `<20-digit>.json` commit references the path at all — it was never
+    /// added to *this* table, or its `add` was truncated behind a checkpoint.
+    /// **Not** a proof of removal.
+    Absent,
+}
+
 /// Snapshot of a Delta UniForm table's state as observed by `discover()`.
 ///
 /// `physical` and `field_id` are keyed by the logical column name and
@@ -601,6 +626,31 @@ impl UniformWriter {
     pub async fn add_path_is_live(&self, add_file_path: &str) -> Result<bool> {
         let prefix = self.config.prefix.trim_end_matches('/').to_string();
         discover::add_path_is_live(&*self.store, &prefix, add_file_path).await
+    }
+
+    /// The three-state liveness of `add_file_path` in this table's
+    /// `_delta_log` — [`PathLiveness::Live`], [`PathLiveness::Removed`], or
+    /// [`PathLiveness::Absent`].
+    ///
+    /// The trust-preserving companion to [`Self::add_path_is_live`] (which
+    /// folds `Removed` and `Absent` into a single `false`, safe for the reuse
+    /// gate's BUILD-on-doubt but **unsafe** for a delete gate). A reclamation
+    /// path that physically removes bytes must distinguish provably-`Removed`
+    /// (safe to reclaim) from `Absent` (unprovable — a checkpoint may still
+    /// reference the file) and evict only on the former. See [`PathLiveness`].
+    ///
+    /// `add_file_path` is the path relative to the table prefix
+    /// (`<hash>.parquet`).
+    ///
+    /// # Errors
+    ///
+    /// [`UniformWriterError::ObjectStore`] when the `_delta_log` listing or a
+    /// commit GET fails; [`UniformWriterError::DeltaLog`] when a commit body
+    /// cannot be parsed. Any error is a "cannot verify" the caller must treat
+    /// as fail-closed (hold, never delete).
+    pub async fn add_path_liveness(&self, add_file_path: &str) -> Result<PathLiveness> {
+        let prefix = self.config.prefix.trim_end_matches('/').to_string();
+        discover::add_path_liveness(&*self.store, &prefix, add_file_path).await
     }
 
     /// Shared write pipeline used by both unpartitioned and partitioned
@@ -1630,6 +1680,55 @@ mod tests {
                 .await
                 .unwrap(),
             "a path no commit references is not live in this table"
+        );
+    }
+
+    /// The three-state reader distinguishes the two cases `add_path_is_live`
+    /// folds into `false` — the distinction the gc delete gate depends on
+    /// (evict only on `Removed`, hold on `Absent`). A still-added file is
+    /// `Live`, a `remove`d one is `Removed`, and an unreferenced one is
+    /// `Absent` (NOT `Removed`).
+    #[tokio::test]
+    async fn add_path_liveness_separates_removed_from_absent() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        seed_bootstrap(&store, "tbl").await;
+        let writer = make_unpartitioned_writer(store.clone() as Arc<dyn ObjectStore>, "tbl");
+        let r = writer.write_batch(make_batch(4)).await.unwrap();
+        let add_file = r.file_path.split('/').next_back().unwrap().to_string();
+
+        assert_eq!(
+            writer.add_path_liveness(&add_file).await.unwrap(),
+            PathLiveness::Live,
+            "a just-added file is Live"
+        );
+        assert_eq!(
+            writer
+                .add_path_liveness("never-added.parquet")
+                .await
+                .unwrap(),
+            PathLiveness::Absent,
+            "a path no commit references is Absent — NOT Removed (the delete gate must hold)"
+        );
+
+        // Land a `remove` of the added file → Removed (the only reclaimable
+        // state).
+        let remove_body = format!(
+            "{{\"commitInfo\":{{\"operation\":\"VACUUM END\"}}}}\n\
+             {{\"remove\":{{\"path\":\"{add_file}\",\"dataChange\":false}}}}\n"
+        );
+        store
+            .put(
+                &object_store::path::Path::from(
+                    "tbl/_delta_log/00000000000000000002.json".to_string(),
+                ),
+                PutPayload::from(Bytes::from(remove_body)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            writer.add_path_liveness(&add_file).await.unwrap(),
+            PathLiveness::Removed,
+            "a removed file is Removed"
         );
     }
 }

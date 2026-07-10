@@ -634,6 +634,34 @@ pub(super) async fn add_path_is_live<S: ObjectStore + ?Sized>(
     prefix: &str,
     add_file_path: &str,
 ) -> Result<bool> {
+    // Reuse's BUILD-on-doubt polarity: only a provably-`Live` file is reusable;
+    // `Removed` and `Absent` both fall to `false` (a missed reuse, never a
+    // wrong one). A *delete* gate must NOT use this — see [`add_path_liveness`].
+    Ok(matches!(
+        add_path_liveness(store, prefix, add_file_path).await?,
+        super::PathLiveness::Live
+    ))
+}
+
+/// Three-state liveness of `add_file_path` in the table at `prefix`.
+///
+/// Scans every `_delta_log/<20-digit>.json` commit and takes the reference
+/// from the **highest-versioned** commit that mentions the path: an `add`
+/// there ⇒ [`PathLiveness::Live`], a `remove` ⇒ [`PathLiveness::Removed`], and
+/// a path no commit references ⇒ [`PathLiveness::Absent`]. See
+/// [`PathLiveness`](super::PathLiveness) for why the delete gate must not
+/// conflate `Absent` with `Removed`.
+///
+/// # Errors
+///
+/// [`UniformWriterError::ObjectStore`] on a listing/GET failure;
+/// [`UniformWriterError::DeltaLog`] on a malformed commit — the caller treats
+/// either as fail-closed.
+pub(super) async fn add_path_liveness<S: ObjectStore + ?Sized>(
+    store: &S,
+    prefix: &str,
+    add_file_path: &str,
+) -> Result<super::PathLiveness> {
     use futures::TryStreamExt;
     let log_prefix = Path::from(format!("{prefix}/_delta_log"));
     let mut versions: Vec<(u64, Path)> = Vec::new();
@@ -654,13 +682,14 @@ pub(super) async fn add_path_is_live<S: ObjectStore + ?Sized>(
     for (_version, path) in versions {
         let body = store.get(&path).await?.bytes().await?;
         match commit_jsonl_reference_for_path(&body, add_file_path)? {
-            PathReference::Added => return Ok(true),
-            PathReference::Removed => return Ok(false),
+            PathReference::Added => return Ok(super::PathLiveness::Live),
+            PathReference::Removed => return Ok(super::PathLiveness::Removed),
             PathReference::Absent => {}
         }
     }
-    // No commit references the path at all — not live in this table.
-    Ok(false)
+    // No `<20-digit>.json` commit references the path — absent, NOT provably
+    // removed (a checkpoint may still carry its `add`).
+    Ok(super::PathLiveness::Absent)
 }
 
 /// Scan `_delta_log/` for the highest `<20-digit>.json` and return that + 1.
