@@ -146,8 +146,6 @@
     }
   },
   "required": [
-    "alerts",
-    "column_trend",
     "command",
     "count",
     "model",

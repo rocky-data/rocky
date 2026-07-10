@@ -188,7 +188,9 @@ export class PreviewDiffModelNode extends vscode.TreeItem {
   ) {
     super(model.model_name, vscode.TreeItemCollapsibleState.None);
 
-    const { added_columns, removed_columns, type_changes } = model.structural;
+    const { type_changes } = model.structural;
+    const added_columns = model.structural.added_columns ?? [];
+    const removed_columns = model.structural.removed_columns ?? [];
     const hasAdded = added_columns.length > 0;
     const hasRemoved = removed_columns.length > 0;
     const hasTypeChanges = (type_changes?.length ?? 0) > 0;
@@ -491,7 +493,9 @@ function buildCostModelTooltip(delta: PreviewModelCostDelta): string {
 function buildDiffModelTooltip(model: PreviewModelDiff): string {
   const lines: string[] = [];
   lines.push(`Model: ${model.model_name}`);
-  const { added_columns, removed_columns, type_changes } = model.structural;
+  const { type_changes } = model.structural;
+  const added_columns = model.structural.added_columns ?? [];
+  const removed_columns = model.structural.removed_columns ?? [];
   if (added_columns.length > 0) {
     lines.push(`Added columns: ${added_columns.join(", ")}`);
   }
@@ -510,7 +514,9 @@ function formatModelDiffMarkdown(model: PreviewModelDiff): string {
   const lines: string[] = [];
   lines.push(`# Diff: ${model.model_name}`);
   lines.push("");
-  const { added_columns, removed_columns, type_changes } = model.structural;
+  const { type_changes } = model.structural;
+  const added_columns = model.structural.added_columns ?? [];
+  const removed_columns = model.structural.removed_columns ?? [];
   if (
     added_columns.length === 0 &&
     removed_columns.length === 0 &&
@@ -551,10 +557,11 @@ function formatModelDiffMarkdown(model: PreviewModelDiff): string {
           "> ⚠ Coverage warning: changes outside the sampling window may not be reflected.",
         );
       }
-      if (s.samples.length > 0) {
+      const samples = s.samples ?? [];
+      if (samples.length > 0) {
         lines.push("");
         lines.push("### Samples");
-        for (const sample of s.samples) {
+        for (const sample of samples) {
           lines.push(`**Row (pk=${sample.primary_key})**`);
           for (const change of sample.changes) {
             lines.push(

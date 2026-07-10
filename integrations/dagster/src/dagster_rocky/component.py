@@ -2885,19 +2885,18 @@ def _log_run_diagnostics(
     context: dg.AssetExecutionContext,
     result: RunResult,
 ) -> None:
-    """Log run-level errors and contract violations.
+    """Log run-level errors.
 
     Drift and anomalies are NOT logged here — they're emitted as
     structured Dagster events (``AssetObservation`` and ``AssetCheckResult``
     respectively) by :func:`_emit_results`. Logging them here too would
-    duplicate the signal in the Dagster UI.
+    duplicate the signal in the Dagster UI. (There is no run-level
+    ``contracts`` block on the wire — ``rocky run`` surfaces contract
+    outcomes through ``check_results``, not a top-level ``contracts`` field —
+    so the previously-dead contract-violation log was removed.)
     """
     for err in result.errors:
         context.log.error(f"Table failed: {err.error}")
-
-    if result.contracts is not None and not result.contracts.passed:
-        for violation in result.contracts.violations:
-            context.log.error(f"Contract violation: {violation.column} — {violation.message}")
 
 
 def _emit_results(

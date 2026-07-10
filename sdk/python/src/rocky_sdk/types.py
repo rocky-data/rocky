@@ -127,6 +127,9 @@ class DiscoverResult(BaseModel):
     #: ``report_new_sources``; empty otherwise. The first-ever discover of a
     #: pipeline establishes the baseline and reports none.
     new_sources: list[str] = []
+    #: Count of source schemas served from the discovery cache this run.
+    #: ``None`` for older binaries that don't emit it.
+    schemas_cached: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +208,27 @@ class MaterializationInfo(BaseModel):
     #: the model's strategy is ``time_interval``. ``None`` for unpartitioned
     #: strategies (``full_refresh``, ``incremental``, ``merge``).
     partition: PartitionInfo | None = None
+    #: Wall-clock timestamp at which the engine began executing this model.
+    #: Present on the wire; ``None`` for older binaries that don't emit it.
+    started_at: datetime | None = None
+    #: Classified-retry attempt trail — one entry per try. Empty (and omitted
+    #: on the wire) for a clean first-try success. Without this declared,
+    #: Pydantic's ``extra="ignore"`` would drop it silently.
+    attempts: list[AttemptRecord] = Field(default_factory=list)
+    #: Observed dollar cost of this materialization. ``None`` for unbilled
+    #: warehouses (DuckDB) or when the adapter didn't report the inputs.
+    cost_usd: float | None = None
+    #: Adapter-reported billing-relevant bytes figure. ``None`` when the
+    #: adapter doesn't surface one.
+    bytes_scanned: int | None = None
+    #: Adapter-reported bytes-written figure. ``None`` on every adapter today.
+    bytes_written: int | None = None
+    #: Tenant this materialization is attributed to (from the discover-time
+    #: ``{tenant}`` schema-pattern component). ``None`` for non-tenant patterns.
+    tenant: str | None = None
+    #: Warehouse-side job identifiers for the SQL statements rocky issued.
+    #: Empty for adapters without a job concept (DuckDB).
+    job_ids: list[str] = Field(default_factory=list)
 
 
 class CheckResult(BaseModel):
@@ -233,6 +257,14 @@ class CheckResult(BaseModel):
     # Custom check fields
     query: str | None = None
     result_value: int | None = None
+    # Assertion (unit-test) check fields — the ``TestType`` discriminant plus
+    # the failing-row count. ``kind`` is snake_case (e.g. ``"not_null"``).
+    kind: str | None = None
+    failing_rows: int | None = None
+    # Cross-source-overlap check fields.
+    contributing_tables: list[str] | None = None
+    overlap_count: int | None = None
+    sample: list[str] | None = None
 
 
 class TableCheckResult(BaseModel):
@@ -354,6 +386,15 @@ class ExecutionSummary(BaseModel):
     concurrency: int
     tables_processed: int
     tables_failed: int
+    #: Whether adaptive concurrency (AIMD throttle) was enabled for this run.
+    #: ``None`` for older binaries that don't emit the field.
+    adaptive_concurrency: bool | None = None
+    #: Concurrency the AIMD throttle settled on by end of run. ``None`` when
+    #: adaptive concurrency was disabled or not reported.
+    final_concurrency: int | None = None
+    #: Count of rate-limit signals the throttle detected. ``None`` when not
+    #: reported.
+    rate_limits_detected: int | None = None
 
 
 class MetricsSnapshot(BaseModel):
@@ -404,13 +445,52 @@ class ContainedModel(BaseModel):
 class RunResult(BaseModel):
     version: str
     command: str
+    #: Whole-run status (``"Success"`` / ``"PartialFailure"`` / ``"Failure"`` /
+    #: ``"SkippedIdempotent"`` / ``"SkippedInFlight"``). Present on the wire;
+    #: ``None`` for older binaries that keyed pass/fail off counts alone.
+    status: str | None = None
     filter: str
     duration_ms: int
     tables_copied: int
     tables_failed: int = 0
+    #: Tables short-circuited via the idempotency key. Defaults to 0.
+    tables_skipped: int = 0
     materializations: list[MaterializationInfo]
     check_results: list[TableCheckResult]
     errors: list[TableError] = []
+    #: ``True`` when the run was cancelled by SIGINT (Ctrl-C). Always emitted
+    #: on the wire; defaults to ``False`` for older binaries.
+    interrupted: bool = False
+    #: ``True`` when the run executed in shadow mode (targets rewritten).
+    shadow: bool = False
+    #: Per-model build/skip/reuse decision + reason. Empty (and omitted on the
+    #: wire) for a default run; populated under ``--skip-unchanged`` / ``[reuse]``.
+    model_decisions: list[ModelDecisionOutput] = Field(default_factory=list)
+    #: Row-quarantine outcomes — one entry per table the quality pipeline
+    #: quarantined. Empty for runs that didn't use ``[checks.quarantine]``.
+    quarantine: list[QuarantineOutput] = Field(default_factory=list)
+    #: Aggregate cost attribution across every materialization in this run.
+    #: ``None`` for DuckDB-only pipelines or when nothing produced a cost number.
+    cost_summary: RunCostSummary | None = None
+    #: Budget breaches detected at end of run. Empty when no ``[budget]`` block
+    #: is configured or all limits were respected.
+    budget_breaches: list[BudgetBreachOutput] = Field(default_factory=list)
+    #: Soft warnings from the per-table override resolver — one entry per
+    #: ``[[table_overrides]]`` rule that matched nothing. Empty when no
+    #: overrides are declared.
+    override_warnings: list[OverrideWarningOutput] = Field(default_factory=list)
+    #: The ``--idempotency-key`` value this run was invoked with, echoed back.
+    #: ``None`` for runs that didn't pass the flag.
+    idempotency_key: str | None = None
+    #: Prior/in-flight run whose idempotency key deflected this call. Populated
+    #: only when ``status`` is ``skipped_idempotent`` / ``skipped_in_flight``.
+    skipped_by_run_id: str | None = None
+    #: Pipeline type that was executed (e.g. ``"replication"``). ``None`` for
+    #: older binaries that don't emit it.
+    pipeline_type: str | None = None
+    #: Run id this run resumed from, when invoked with ``--resume``. ``None``
+    #: for a fresh run.
+    resumed_from: str | None = None
     #: Models withheld this run because an upstream failed (or was itself
     #: withheld) and ``[resilience] contain_failures`` continued the disjoint
     #: subgraphs — the blast radius of the failures in :attr:`errors`. Empty
@@ -430,7 +510,6 @@ class RunResult(BaseModel):
     metrics: MetricsSnapshot | None = None
     permissions: PermissionInfo
     drift: DriftInfo
-    contracts: ContractResult | None = None
     anomalies: list[AnomalyResult] = []
     #: Per-model partition execution summaries, populated only when the
     #: run touched one or more ``time_interval`` models. Empty for runs
@@ -495,27 +574,27 @@ class PlanResult(BaseModel):
     created_at: datetime | None = None
     models: list[str] = []
     execution_layers: list[list[str]] = []
+    #: Semantic change-impact verdict from the typed-IR breaking-change
+    #: classifier, surfaced as decision support at plan time. Present only when
+    #: ``--semantic`` ran with a usable baseline. Kept as a loose ``dict`` — the
+    #: nested shape lives on the generated ``PlanOutput.breaking_verdict``.
+    breaking_verdict: dict | None = None
+    #: Budget diagnostics raised at plan time. Empty when no ``[budget]`` block
+    #: is configured.
+    budget_diagnostics: list[Diagnostic] = []
+    #: ``True`` when at least one ``budget_diagnostics`` entry is error-level.
+    has_budget_errors: bool = False
 
 
-class ApplyOutput(BaseModel):
-    """Output of ``rocky apply <plan-id>`` (Cluster 3 B Phase 2).
-
-    Envelope wrapping the inner apply result with a top-level ``plan_id``
-    so consumers can correlate the apply result back to the plan without
-    parsing the inner ``result`` payload.
-
-    ``result`` is a raw ``dict`` — its shape depends on ``plan_kind``:
-    - ``"compact"`` → ``CompactApplyOutput``
-    - ``"archive"`` → ``ArchiveApplyOutput``
-    - ``"run"``     → ``RunResult``
-    """
-
-    version: str
-    command: str
-    plan_id: str
-    plan_kind: str
-    success: bool
-    result: Any
+# ``rocky apply <plan-id>`` does NOT emit a wrapping envelope. The engine never
+# constructs the old ``{plan_id, plan_kind, success, result}`` shape — each plan
+# kind's apply path prints its OWN output: run-shaped kinds (run / replication /
+# ai_authored / backfill) print a ``RunOutput`` with ``command:"run"``; ``gc``
+# prints ``GcApplyOutput`` with ``command:"apply"``; compact / archive / promote
+# print their own outputs. ``RockyClient.apply()`` dispatches by that actual
+# ``command`` / shape (see ``rocky_sdk.client._parse_apply``). The dead
+# ``ApplyOutput`` shadow that used to live here was removed — it never once
+# validated a real engine payload.
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +612,12 @@ class StateResult(BaseModel):
     version: str
     command: str
     watermarks: list[WatermarkEntry]
+    #: State-schema version this binary supports. Lets an orchestrator startup
+    #: hook decide deploy compatibility structurally.
+    schema_version_supported: int | None = None
+    #: State-schema version currently on disk, or ``None`` when the store has
+    #: no persisted version yet.
+    schema_version_on_disk: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +681,18 @@ class ModelDetail(BaseModel):
     strategy: dict[str, object]
     target: dict[str, str]
     freshness: ModelFreshnessConfig | None = None
+    #: Names of models this model directly depends on. Empty when the model
+    #: has no upstream dependencies.
+    depends_on: list[str] = Field(default_factory=list)
+    #: Source of the model's data contract (e.g. sidecar path), or ``None``.
+    contract_source: str | None = None
+    #: Heuristic cost estimate from DAG-aware cardinality propagation. Kept as
+    #: a loose ``dict`` — the nested shape lives on the generated
+    #: ``ModelDetail.cost_hint``. ``None`` when not computed.
+    cost_hint: dict | None = None
+    #: Hint that a ``full_refresh`` model could benefit from incremental
+    #: materialization. Loose ``dict``; ``None`` when not applicable.
+    incrementality_hint: dict | None = None
     #: Model-level governance tags — the model's own ``[tags]`` block merged
     #: over any config-group ``[tags]`` baseline (sidecar > group). Free-form
     #: ``{key: value}`` strings describing the model as a whole (``domain``,
@@ -614,6 +711,12 @@ class CompileResult(BaseModel):
     diagnostics: list[Diagnostic]
     has_errors: bool
     models_detail: list[ModelDetail] = []
+    #: Per-phase compile timings. Loose ``dict`` — the nested shape lives on
+    #: the generated ``CompileOutput.compile_timings``.
+    compile_timings: dict | None = None
+    #: Expanded SQL per model after macro substitution. Populated only when
+    #: ``--expand-macros`` is passed; ``{}`` otherwise.
+    expanded_sql: dict[str, str] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -672,6 +775,10 @@ class ModelLineageResult(BaseModel):
     upstream: list[str]
     downstream: list[str]
     edges: list[LineageEdge]
+    #: Per-node metadata for the lineage graph (one entry per referenced
+    #: model). Loose ``dict`` entries — the nested shape lives on the generated
+    #: ``LineageOutput.nodes``. Empty when the engine doesn't emit node metadata.
+    nodes: list[dict] = Field(default_factory=list)
 
 
 class ColumnLineageResult(BaseModel):
@@ -682,6 +789,12 @@ class ColumnLineageResult(BaseModel):
     model: str
     column: str
     trace: list[LineageEdge]
+    #: Trace direction (``"upstream"`` / ``"downstream"``). ``None`` for older
+    #: binaries that don't emit it.
+    direction: str | None = None
+    #: Downstream consumers of the traced column. Empty when tracing upstream
+    #: or when the column has no downstream consumers.
+    downstream_consumers: list[QualifiedColumn] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +879,9 @@ class MetricsResult(BaseModel):
     alerts: list[dict] | None = None
     column: str | None = None
     column_trend: list[dict] | None = None
+    #: Human-readable status message (e.g. "no snapshots yet"). ``None`` when
+    #: the command has data to report.
+    message: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +909,11 @@ class OptimizeResult(BaseModel):
     command: str
     recommendations: list[MaterializationCost]
     total_models_analyzed: int
+    #: Human-readable status message (e.g. "no models to analyze"). ``None``
+    #: when recommendations are present.
+    message: str | None = None
+    #: Advisory note on incrementality opportunities. ``None`` when not emitted.
+    incrementality_note: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -810,25 +931,20 @@ class AiResult(BaseModel):
     name: str
     source: str
     attempts: int
+    #: Path the generated model body was written to, when ``--save`` was used.
+    #: ``None`` for a dry run.
+    body_path: str | None = None
+    #: Path the intent sidecar was written to, when ``--save`` was used.
+    #: ``None`` for a dry run.
+    sidecar_path: str | None = None
 
 
-class AiSyncProposal(BaseModel):
-    """A proposed model update from ai-sync."""
-
-    model: str
-    intent: str
-    current_source: str
-    proposed_source: str
-    diff: str
-    upstream_changes: list[dict] = []
-
-
-class AiSyncResult(BaseModel):
-    """Output of ``rocky ai-sync``."""
-
-    version: str
-    command: str
-    proposals: list[AiSyncProposal] = []
+# ``AiSyncProposal`` / ``AiSyncResult`` were hand-written shadows. The proposal
+# shadow required a phantom ``current_source`` the engine has never put on the
+# wire (the real ``AiSyncProposal`` is ``{model, intent, diff, proposed_source}``),
+# so ``ai_sync`` raised whenever the proposals list was non-empty — the
+# empty-list happy path masked it. Both are now soft-swapped to the generated
+# ``AiSyncOutput`` / ``AiSyncProposal`` in the bridge block below.
 
 
 class AiExplanation(BaseModel):
@@ -894,6 +1010,20 @@ class ValidateMigrationResult(BaseModel):
     version: str
     command: str
     validations: list[ModelValidation] = []
+    #: Name of the dbt project that was validated. ``None`` when not reported.
+    project_name: str | None = None
+    #: dbt version detected in the source project. ``None`` when not reported.
+    dbt_version: str | None = None
+    #: Count of models successfully imported. Defaults to 0.
+    models_imported: int = 0
+    #: Count of models that failed to import. Defaults to 0.
+    models_failed: int = 0
+    #: Total tests across imported models. Defaults to 0.
+    total_tests: int = 0
+    #: Total contracts generated across imported models. Defaults to 0.
+    total_contracts: int = 0
+    #: Total warnings raised across imported models. Defaults to 0.
+    total_warnings: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -901,28 +1031,14 @@ class ValidateMigrationResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class AdapterTestResult(BaseModel):
-    """A single conformance test result."""
-
-    name: str
-    category: str
-    status: str
-    message: str | None = None
-    duration_ms: int | None = None
-
-
-class ConformanceResult(BaseModel):
-    """Output of ``rocky test-adapter``."""
-
-    version: str
-    command: str
-    adapter: str
-    sdk_version: str
-    tests_run: int
-    tests_passed: int
-    tests_failed: int
-    tests_skipped: int
-    results: list[AdapterTestResult] = []
+# ``ConformanceResult`` / ``AdapterTestResult`` were hand-written shadows. The
+# ``ConformanceResult`` shadow required ``version`` / ``command`` that the real
+# ``rocky test-adapter`` payload does NOT carry, so ``test_adapter()`` raised on
+# ANY real output. Both are now soft-swapped to the generated
+# ``TestAdapterOutput`` / ``TestAdapterTestResult`` in the bridge block below.
+# ``test-adapter`` has no ``command`` key on the wire, so there is no
+# ``parse_rocky_output`` dispatch entry for it (the payload can't be routed by
+# command) — it's reachable only via the typed ``RockyClient.test_adapter()``.
 
 
 # ---------------------------------------------------------------------------
@@ -943,6 +1059,9 @@ class HealthCheck(BaseModel):
     status: HealthStatus
     message: str
     duration_ms: int
+    #: Structured ``[key, value]`` detail rows for this check. Empty when the
+    #: check reports no structured detail.
+    details: list[list[str]] = Field(default_factory=list)
 
 
 class DoctorResult(BaseModel):
@@ -1045,37 +1164,15 @@ class StateHealthResult(BaseModel):
 # ---------------------------------------------------------------------------
 # Drift output
 # ---------------------------------------------------------------------------
-
-
-class DriftedColumn(BaseModel):
-    """A column whose type differs between source and target."""
-
-    name: str
-    source_type: str
-    target_type: str
-
-
-class DriftActionKind(StrEnum):
-    drop_and_recreate = "DropAndRecreate"
-    alter_column_types = "AlterColumnTypes"
-    ignore = "Ignore"
-
-
-class DriftTableResult(BaseModel):
-    """Drift detection result for a single table."""
-
-    table: str
-    drifted_columns: list[DriftedColumn]
-    action: DriftActionKind
-
-
-class DriftDetectResult(BaseModel):
-    """Output of ``rocky drift --detect``."""
-
-    command: str
-    tables_checked: int
-    tables_drifted: int
-    results: list[DriftTableResult]
+#
+# There is no ``rocky drift`` subcommand — the binary rejects it. Drift
+# detection happens INSIDE ``rocky run`` / ``rocky plan`` and is surfaced on
+# ``RunResult.drift`` (a :class:`DriftInfo`). The hand-written
+# ``DriftDetectResult`` / ``DriftTableResult`` / ``DriftedColumn`` /
+# ``DriftActionKind`` shadows (and their ``"drift"`` dispatch entry) were
+# removed — the engine never emitted a ``{command:"drift", ...}`` payload for
+# them to parse. The generated ``drift_schema`` types stay (inert) for the
+# ``DriftOutput`` shape referenced by other outputs.
 
 
 # ---------------------------------------------------------------------------
@@ -1100,6 +1197,7 @@ from .types_generated import (  # noqa: E402, F401
     AiExplainOutput,
     AiGenerateOutput,
     AiSyncOutput,
+    AiSyncProposal,
     AiTestOutput,
     AnomalyOutput,
     ApprovalArtifact,
@@ -1151,6 +1249,7 @@ from .types_generated import (  # noqa: E402, F401
     ErrorEnvelope,
     FailedSourceOutput,
     FreshnessConfigOutput,
+    GcApplyOutput,
     HistoryOutput,
     JobStatus,
     LineageColumnChange,
@@ -1208,8 +1307,23 @@ from .types_generated import (  # noqa: E402, F401
     TableCheckOutput,
     TableErrorOutput,
     TableOutput,
+    TestAdapterOutput,
+    TestAdapterTestResult,
     TestFailure,
     TestOutput,
+)
+
+# Run-output nested types used to backfill the hand-written run models so the
+# runtime dispatch target (``RunResult`` / ``MaterializationInfo``) stops
+# silently dropping wire fields. Imported from the submodule because these
+# nested types are not part of the curated ``types_generated`` barrel.
+from .types_generated.run_schema import (  # noqa: E402, F401
+    AttemptRecord,
+    BudgetBreachOutput,
+    ModelDecisionOutput,
+    OverrideWarningOutput,
+    QuarantineOutput,
+    RunCostSummary,
 )
 
 # Python-flavored bridge aliases for the DAG output types.
@@ -1218,13 +1332,29 @@ DagNode = DagNodeOutput
 DagEdge = DagEdgeOutput
 
 # Soft-swap aliases — the hand-written ``HistoryResult`` /
-# ``ModelHistoryResult`` / ``OptimizeResult`` above diverged from what the
-# Rust CLI emits (they mirrored state-store shapes instead). Empty arrays
-# masked the drift until `rocky run` started persisting run records. The
-# generated types are the source of truth; keep the Result names as
-# exports so external consumers don't break.
+# ``ModelHistoryResult`` above diverged from what the Rust CLI emits (they
+# mirrored state-store shapes instead). Empty arrays masked the drift until
+# `rocky run` started persisting run records. The generated types are the
+# source of truth; keep the Result names as exports so external consumers
+# don't break. (``OptimizeResult`` is NOT swapped — it stays a hand-written
+# model above, now backfilled with the ``message`` / ``incrementality_note``
+# fields the wire carries.)
 HistoryResult = HistoryOutput
 ModelHistoryResult = ModelHistoryOutput
+
+# ``ConformanceResult`` / ``AdapterTestResult`` soft-swap — the hand-written
+# ``ConformanceResult`` required ``version`` / ``command`` the real
+# ``rocky test-adapter`` payload never carries, so the client raised on ANY
+# real output. The generated ``TestAdapterOutput`` / ``TestAdapterTestResult``
+# are the source of truth; keep the legacy names as aliases.
+ConformanceResult = TestAdapterOutput
+AdapterTestResult = TestAdapterTestResult
+
+# ``AiSyncResult`` / ``AiSyncProposal`` soft-swap — the hand-written proposal
+# required a phantom ``current_source`` never on the wire, so ``ai_sync``
+# raised whenever proposals were non-empty. The generated ``AiSyncOutput`` /
+# ``AiSyncProposal`` are the source of truth; keep the legacy names as aliases.
+AiSyncResult = AiSyncOutput
 
 # ``TestResult`` / ``CiResult`` had the same drift: both declared
 # ``failures: list[list[str]]`` (positional tuples), but the engine serializes
@@ -1267,7 +1397,6 @@ RockyOutput = (
     DiscoverResult
     | RunResult
     | PlanResult
-    | ApplyOutput
     | StateResult
     | ClearSchemaCacheOutput
     | CompileResult
@@ -1291,8 +1420,8 @@ RockyOutput = (
     | ValidateMigrationResult
     | ConformanceResult
     | DoctorResult
-    | DriftDetectResult
     | DagResult
+    | GcApplyOutput
     | ComplianceOutput
     | RetentionStatusOutput
     | CatalogOutput
@@ -1311,7 +1440,6 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "discover": DiscoverResult,
     "run": RunResult,
     "plan": PlanResult,
-    "apply": ApplyOutput,
     "state": StateResult,
     "state-clear-schema-cache": ClearSchemaCacheOutput,
     "compile": CompileResult,
@@ -1329,10 +1457,14 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "ai_test": AiTestResult,
     "ai_contract": AiContractOutput,
     "validate-migration": ValidateMigrationResult,
-    "test-adapter": ConformanceResult,
     "doctor": DoctorResult,
-    "drift": DriftDetectResult,
     "dag": DagResult,
+    # ``rocky apply`` on a gc plan prints ``{command:"apply", ...}`` with gc
+    # markers (``evicted`` / ``refused``). Run-shaped apply prints
+    # ``command:"run"`` (→ ``RunResult``); compact / archive / promote apply
+    # print their own commands, already routed above. ``RockyClient.apply()``
+    # additionally disambiguates by shape.
+    "apply": GcApplyOutput,
     "compliance": ComplianceOutput,
     "retention-status": RetentionStatusOutput,
     "catalog": CatalogOutput,

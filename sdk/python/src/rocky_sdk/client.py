@@ -52,12 +52,13 @@ from rocky_sdk.types import (
     AiResult,
     AiSyncResult,
     AiTestResult,
-    ApplyOutput,
     ApproveOutput,
+    ArchiveApplyOutput,
     BranchPromoteOutput,
     CatalogOutput,
     CiResult,
     ColumnLineageResult,
+    CompactApplyOutput,
     CompileResult,
     ComplianceOutput,
     ConformanceResult,
@@ -65,6 +66,7 @@ from rocky_sdk.types import (
     DagResult,
     DiscoverResult,
     DoctorResult,
+    GcApplyOutput,
     HistoryResult,
     MetricsResult,
     ModelHistoryResult,
@@ -77,6 +79,13 @@ from rocky_sdk.types import (
     StateResult,
     TestResult,
     ValidateMigrationResult,
+)
+
+# Return type of :meth:`RockyClient.apply`. ``rocky apply <plan-id>`` does not
+# emit a wrapping envelope — each plan kind prints its own output, so the parsed
+# result is a discriminated union over those shapes. See :func:`_parse_apply`.
+ApplyResult = (
+    RunResult | GcApplyOutput | CompactApplyOutput | ArchiveApplyOutput | BranchPromoteOutput
 )
 
 # Default subprocess timeout for any single Rocky CLI invocation. One hour is
@@ -162,6 +171,62 @@ def _parse_run_or_apply(output: str, *, command: str) -> RunResult:
         return _parse_rocky_json(json.dumps(inner), RunResult, command=command)
 
     return _parse_rocky_json(output, RunResult, command=command)
+
+
+def _parse_apply(output: str) -> ApplyResult:
+    """Parse ``rocky apply <plan-id>`` stdout by its actual ``command`` / shape.
+
+    ``rocky apply`` never emits a wrapping envelope. The apply path for each plan
+    kind prints its own output, discriminated by the top-level ``command`` field:
+
+    * ``"run"`` — run / replication / ai_authored / backfill plans →
+      :class:`RunResult`.
+    * ``"compact apply"`` → :class:`CompactApplyOutput`.
+    * ``"archive apply"`` → :class:`ArchiveApplyOutput`.
+    * ``"branch promote"`` → :class:`BranchPromoteOutput`.
+    * ``"apply"`` with gc markers (``evicted`` / ``refused``) →
+      :class:`GcApplyOutput`.
+
+    Anything else raises :class:`RockyOutputParseError` naming the received
+    ``command`` so a schema change surfaces loudly instead of silently
+    mis-parsing.
+    """
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RockyOutputParseError(
+            "apply", stdout=output or "", parse_error=str(exc), kind="json"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise RockyOutputParseError(
+            "apply",
+            stdout=output or "",
+            parse_error=f"apply output is not a JSON object: {payload!r}",
+            kind="validation",
+        )
+
+    command = payload.get("command", "")
+    if command == "run":
+        return _parse_rocky_json(output, RunResult, command="apply")
+    if command == "compact apply":
+        return _parse_rocky_json(output, CompactApplyOutput, command="apply")
+    if command == "archive apply":
+        return _parse_rocky_json(output, ArchiveApplyOutput, command="apply")
+    if command == "branch promote":
+        return _parse_rocky_json(output, BranchPromoteOutput, command="apply")
+    if command == "apply" and ("evicted" in payload or "refused" in payload):
+        return _parse_rocky_json(output, GcApplyOutput, command="apply")
+
+    raise RockyOutputParseError(
+        "apply",
+        stdout=output or "",
+        parse_error=(
+            f"unrecognized apply output (command={command!r}); expected one of "
+            "'run' / 'compact apply' / 'archive apply' / 'branch promote' / gc apply"
+        ),
+        kind="validation",
+    )
 
 
 def _validate_governance_override(override: dict | None) -> None:
@@ -720,17 +785,17 @@ class RockyClient:
             args.extend(["--env", env])
         return _parse_rocky_json(self.run_cli(args), PlanResult, command="plan")
 
-    def apply(self, plan_id: str) -> ApplyOutput:
-        """Run ``rocky apply <plan-id>`` and return the parsed envelope.
+    def apply(self, plan_id: str) -> ApplyResult:
+        """Run ``rocky apply <plan-id>`` and return the parsed result.
 
-        Reads ``.rocky/plans/<plan_id>.json`` and dispatches by kind (run /
-        replication / compact / archive / promote).
+        Reads ``.rocky/plans/<plan_id>.json`` and dispatches by kind. Each plan
+        kind's apply path prints its OWN output (there is no wrapping envelope),
+        so the return type is a discriminated union: run / replication /
+        ai_authored / backfill plans yield a :class:`RunResult`; a ``gc`` plan
+        yields a :class:`GcApplyOutput`; compact / archive / promote plans yield
+        their respective outputs. See :func:`_parse_apply`.
         """
-        return _parse_rocky_json(
-            self.run_cli(["apply", plan_id], allow_partial=True),
-            ApplyOutput,
-            command="apply",
-        )
+        return _parse_apply(self.run_cli(["apply", plan_id], allow_partial=True))
 
     def run(
         self,

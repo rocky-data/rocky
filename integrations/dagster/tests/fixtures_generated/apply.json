@@ -1,35 +1,77 @@
 {
   "version": "0.0.0-SENTINEL",
-  "command": "apply",
-  "plan_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "plan_kind": "run",
-  "success": true,
-  "result": {
-    "version": "0.0.0-SENTINEL",
-    "command": "run",
-    "status": "success",
-    "filter": "",
-    "duration_ms": 0,
-    "tables_copied": 0,
+  "command": "run",
+  "status": "Success",
+  "pipeline_type": "replication",
+  "filter": "source=orders",
+  "duration_ms": 0,
+  "tables_copied": 1,
+  "tables_failed": 0,
+  "materializations": [
+    {
+      "asset_key": [
+        "duckdb",
+        "orders",
+        "orders"
+      ],
+      "rows_copied": null,
+      "duration_ms": 0,
+      "started_at": "2000-01-01T00:00:00Z",
+      "metadata": {
+        "strategy": "full_refresh",
+        "watermark": "2000-01-01T00:00:00Z",
+        "target_table_full_name": "playground.staging__orders.orders"
+      },
+      "cost_usd": 0.0
+    }
+  ],
+  "check_results": [],
+  "execution": {
+    "concurrency": 4,
+    "tables_processed": 1,
+    "tables_failed": 0
+  },
+  "metrics": {
+    "tables_processed": 1,
     "tables_failed": 0,
-    "materializations": [],
-    "check_results": [],
-    "execution": {
-      "layers": 0,
-      "models": 0,
-      "total_duration_ms": 0
-    },
-    "metrics": null,
-    "permissions": {
-      "grants_applied": 0,
-      "grants_skipped": 0,
-      "grants_failed": 0
-    },
-    "drift": {
-      "tables_checked": 0,
-      "tables_drifted": 0,
-      "actions": []
-    },
-    "interrupted": false
+    "error_rate_pct": 0.0,
+    "statements_executed": 0,
+    "retries_attempted": 0,
+    "retries_succeeded": 0,
+    "anomalies_detected": 0,
+    "table_duration_p50_ms": 0,
+    "table_duration_p95_ms": 0,
+    "table_duration_max_ms": 0,
+    "query_duration_p50_ms": 0,
+    "query_duration_p95_ms": 0,
+    "query_duration_max_ms": 0
+  },
+  "permissions": {
+    "grants_added": 0,
+    "grants_revoked": 0,
+    "catalogs_created": 0,
+    "schemas_created": 1
+  },
+  "drift": {
+    "tables_checked": 1,
+    "tables_drifted": 0,
+    "actions_taken": []
+  },
+  "interrupted": false,
+  "cost_summary": {
+    "total_cost_usd": 0.0,
+    "total_duration_ms": 0,
+    "per_model": [
+      {
+        "asset_key": [
+          "duckdb",
+          "orders",
+          "orders"
+        ],
+        "duration_ms": 0,
+        "cost_usd": 0.0
+      }
+    ],
+    "adapter_type": "duckdb"
   }
 }

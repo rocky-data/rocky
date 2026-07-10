@@ -44,7 +44,6 @@
         }
       },
       "required": [
-        "changed_columns",
         "model_name",
         "reason"
       ],

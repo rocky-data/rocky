@@ -64,7 +64,7 @@ export interface PreviewSampledRowDiff {
   /**
    * Up to `--max-samples` (default 5) representative changed rows for human review. Pure noise when sampling found no change.
    */
-  samples: PreviewRowSample[];
+  samples?: PreviewRowSample[];
   [k: string]: unknown;
 }
 /**
@@ -146,19 +146,19 @@ export interface PreviewBisectionRowDiff {
   /**
    * Up to `--max-samples` (default 5) representative changed rows surfaced from the leaves. Bisection samples only carry the primary key — column-level diffs are not retained on the kernel's leaf record. Empty when no rows differ.
    */
-  samples: PreviewRowSample[];
+  samples?: PreviewRowSample[];
   [k: string]: unknown;
 }
 /**
  * Column-level structural diff. Mirrors the shape produced by `rocky ci-diff` at the column granularity.
  */
 export interface PreviewStructuralDiff {
-  added_columns: string[];
-  removed_columns: string[];
+  added_columns?: string[];
+  removed_columns?: string[];
   /**
    * One entry per column whose type changed. Each carries `name`, `from`, `to`.
    */
-  type_changes: PreviewColumnTypeChange[];
+  type_changes?: PreviewColumnTypeChange[];
   [k: string]: unknown;
 }
 /**

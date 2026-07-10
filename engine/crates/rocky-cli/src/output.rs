@@ -246,7 +246,7 @@ pub struct RunOutput {
     /// `execution.tables_failed`, which counts only execution-phase (copy /
     /// runtime) failures and excludes models excluded before execution.
     pub tables_failed: usize,
-    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub tables_skipped: usize,
     /// Tables that the discovery adapter reported as enabled but that do not
     /// exist in the source warehouse (e.g. Fivetran has them configured but
@@ -258,7 +258,7 @@ pub struct RunOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resumed_from: Option<String>,
     /// True when running in shadow mode (targets rewritten).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shadow: bool,
     pub materializations: Vec<MaterializationOutput>,
     /// Per-model build/skip/reuse decision + reason, surfaced for
@@ -279,11 +279,11 @@ pub struct RunOutput {
     /// Row-quarantine outcomes — one entry per table the quality
     /// pipeline quarantined. Empty for runs that did not use
     /// `[pipeline.x.checks.quarantine]`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quarantine: Vec<QuarantineOutput>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anomalies: Vec<AnomalyOutput>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<TableErrorOutput>,
     pub execution: ExecutionSummary,
     pub metrics: Option<MetricsSnapshot>,
@@ -292,7 +292,7 @@ pub struct RunOutput {
     /// Per-model partition execution summaries, present only when the run
     /// touched one or more `time_interval` models. Empty for runs that
     /// didn't execute any partitioned models.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partition_summaries: Vec<PartitionSummary>,
     /// `true` when the run was cancelled by a SIGINT (Ctrl-C). Surfaced so
     /// orchestrators can distinguish "user interrupted" from "run failed".
@@ -456,7 +456,7 @@ pub struct ExecutionSummary {
     /// not this `execution.tables_failed`.
     pub tables_failed: usize,
     /// Whether adaptive concurrency (AIMD throttle) was enabled for this run.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub adaptive_concurrency: bool,
     /// Final concurrency level at end of run (may differ from initial if
     /// adaptive concurrency adjusted it). Only present when adaptive
@@ -1309,7 +1309,7 @@ pub struct PartitionInfo {
     pub key: String,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub batched_with: Vec<String>,
 }
 
@@ -1327,7 +1327,7 @@ pub struct PartitionSummary {
     /// Partitions that were already `Computed` in the state store and
     /// skipped by the runtime (currently always 0; reserved for the
     /// `--missing` change-detection optimization).
-    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub partitions_skipped: usize,
 }
 
@@ -1357,11 +1357,11 @@ pub struct QuarantineOutput {
     /// Fully-qualified `catalog.schema.table` name of the `__valid`
     /// output table. Empty for `mode = "tag"` (source is rewritten in
     /// place).
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub valid_table: String,
     /// Fully-qualified name of the `__quarantine` output table. Empty
     /// for `mode = "drop"` (failing rows discarded) and `mode = "tag"`.
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub quarantine_table: String,
     /// Number of rows in the `__valid` output, when the adapter can
     /// report it.
@@ -2393,11 +2393,11 @@ pub struct MetricsOutput {
     pub model: String,
     pub snapshots: Vec<MetricsSnapshotEntry>,
     pub count: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alerts: Vec<MetricsAlert>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub column: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_trend: Vec<ColumnTrendPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -8321,7 +8321,7 @@ pub struct PreviewPrunedModel {
     pub reason: String,
     /// Columns the diff reports as changed on this model. Only
     /// populated when `reason = "changed"`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_columns: Vec<String>,
 }
 
@@ -8438,7 +8438,7 @@ pub struct PreviewBisectionRowDiff {
     /// surfaced from the leaves. Bisection samples only carry the
     /// primary key — column-level diffs are not retained on the
     /// kernel's leaf record. Empty when no rows differ.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<PreviewRowSample>,
 }
 
@@ -8499,13 +8499,13 @@ impl BisectionStatsOutput {
 /// `rocky ci-diff` at the column granularity.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PreviewStructuralDiff {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub added_columns: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_columns: Vec<String>,
     /// One entry per column whose type changed. Each carries `name`,
     /// `from`, `to`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_changes: Vec<PreviewColumnTypeChange>,
 }
 
@@ -8525,7 +8525,7 @@ pub struct PreviewSampledRowDiff {
     pub rows_changed: u64,
     /// Up to `--max-samples` (default 5) representative changed rows
     /// for human review. Pure noise when sampling found no change.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<PreviewRowSample>,
 }
 

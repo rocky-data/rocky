@@ -30,7 +30,6 @@ from pathlib import Path
 import pytest
 
 from dagster_rocky.types import (
-    ApplyOutput,
     CiResult,
     ColumnLineageResult,
     CompileResult,
@@ -38,6 +37,7 @@ from dagster_rocky.types import (
     DagResult,
     DiscoverResult,
     DoctorResult,
+    GcApplyOutput,
     HistoryResult,
     MetricsResult,
     ModelHistoryResult,
@@ -62,7 +62,10 @@ EXPECTED_TYPES: dict[str, type] = {
     "discover": DiscoverResult,
     "run": RunResult,
     "plan": PlanResult,
-    "apply": ApplyOutput,
+    # ``rocky apply`` prints the plan-kind's own output: a run / replication
+    # plan prints ``command:"run"`` (→ RunResult, keyed above), a ``gc`` plan
+    # prints ``command:"apply"`` with gc markers (→ GcApplyOutput).
+    "apply": GcApplyOutput,
     "state": StateResult,
     "compile": CompileResult,
     "test": TestResult,

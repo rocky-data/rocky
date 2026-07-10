@@ -365,37 +365,34 @@ PLAN_WITH_RUN_SPINE: dict[str, Any] = {
     "execution_layers": [["db.schema.users"], ["db.schema.orders"]],
 }
 
-# Apply output — wraps a run result with the plan_id envelope.
+# Apply output — ``rocky apply`` emits NO wrapping envelope. A ``gc`` plan's
+# apply prints ``command:"apply"`` with gc markers (``evicted`` / ``refused``),
+# which ``parse_rocky_output`` routes to the generated ``GcApplyOutput``.
+# Run-shaped plans (run / replication / ai_authored / backfill) print a bare
+# ``RunOutput`` with ``command:"run"`` instead — covered by the live
+# ``fixtures_generated/apply.json`` capture and the SDK client tests.
 APPLY: dict[str, Any] = {
     "version": "0.1.0",
     "command": "apply",
     "plan_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "plan_kind": "run",
-    "success": True,
-    "result": {
-        "version": "0.1.0",
-        "command": "run",
-        "status": "success",
-        "filter": "client=acme",
-        "duration_ms": 1234,
-        "tables_copied": 2,
-        "tables_failed": 0,
-        "materializations": [],
-        "check_results": [],
-        "execution": {"layers": 1, "models": 2, "total_duration_ms": 1234},
-        "metrics": None,
-        "permissions": {
-            "grants_applied": 0,
-            "grants_skipped": 0,
-            "grants_failed": 0,
+    "evicted": [
+        {
+            "model_name": "stale_model",
+            "run_id": "run-2026-01-01-000000-001",
+            "blake3_hash": "deadbeefcafef00d",
+            "size_bytes": 4096,
+            "physical_reclaimed": True,
+            "physical_status": "reclaimed",
+            "tombstone_recorded": True,
         },
-        "drift": {
-            "tables_checked": 0,
-            "tables_drifted": 0,
-            "actions": [],
-        },
-        "interrupted": False,
-    },
+    ],
+    "refused": [],
+    "already_evicted": [],
+    "bytes_evicted": 4096,
+    "bytes_refused": 0,
+    "evicted_count": 1,
+    "refused_count": 0,
+    "notes": ["physical reclamation is object-store-only"],
 }
 
 # ---------------------------------------------------------------------------
@@ -692,30 +689,6 @@ DOCTOR: dict[str, Any] = {
         "Consider using 'tiered' state backend for distributed execution",
     ],
 }
-
-# ---------------------------------------------------------------------------
-# drift — one drifted column with type change, drop_and_recreate action
-# ---------------------------------------------------------------------------
-
-DRIFT: dict[str, Any] = {
-    "command": "drift",
-    "tables_checked": 3,
-    "tables_drifted": 1,
-    "results": [
-        {
-            "table": "acme_warehouse.staging__us_west__shopify.payments",
-            "drifted_columns": [
-                {
-                    "name": "status",
-                    "source_type": "STRING",
-                    "target_type": "INT",
-                },
-            ],
-            "action": "DropAndRecreate",
-        },
-    ],
-}
-
 
 # ---------------------------------------------------------------------------
 # compliance — governance Wave B rollup

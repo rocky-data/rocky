@@ -6736,7 +6736,6 @@
           }
         },
         "required": [
-          "adaptive_concurrency",
           "concurrency",
           "tables_failed",
           "tables_processed"
@@ -9988,8 +9987,6 @@
           }
         },
         "required": [
-          "alerts",
-          "column_trend",
           "command",
           "count",
           "model",
@@ -10853,7 +10850,6 @@
           }
         },
         "required": [
-          "batched_with",
           "end",
           "key",
           "start"
@@ -10912,7 +10908,6 @@
           "model",
           "partitions_failed",
           "partitions_planned",
-          "partitions_skipped",
           "partitions_succeeded"
         ],
         "type": "object"
@@ -12217,8 +12212,7 @@
         "required": [
           "rows_added",
           "rows_changed",
-          "rows_removed",
-          "samples"
+          "rows_removed"
         ],
         "type": "object"
       },
@@ -12710,7 +12704,6 @@
           }
         },
         "required": [
-          "changed_columns",
           "model_name",
           "reason"
         ],
@@ -12865,8 +12858,7 @@
         "required": [
           "rows_added",
           "rows_changed",
-          "rows_removed",
-          "samples"
+          "rows_removed"
         ],
         "type": "object"
       },
@@ -12920,11 +12912,6 @@
             "type": "array"
           }
         },
-        "required": [
-          "added_columns",
-          "removed_columns",
-          "type_changes"
-        ],
         "type": "object"
       },
       "ProfileColumnStats": {
@@ -13779,9 +13766,7 @@
         "required": [
           "asset_key",
           "mode",
-          "ok",
-          "quarantine_table",
-          "valid_table"
+          "ok"
         ],
         "type": "object"
       },
@@ -15744,24 +15729,18 @@
           }
         },
         "required": [
-          "anomalies",
           "check_results",
           "command",
           "drift",
           "duration_ms",
-          "errors",
           "execution",
           "filter",
           "interrupted",
           "materializations",
-          "partition_summaries",
           "permissions",
-          "quarantine",
-          "shadow",
           "status",
           "tables_copied",
           "tables_failed",
-          "tables_skipped",
           "version"
         ],
         "type": "object"

@@ -6,6 +6,7 @@ mocked at ``rocky_sdk.client.subprocess``.
 from __future__ import annotations
 
 import io
+import json
 import signal
 from unittest.mock import MagicMock, patch
 
@@ -16,6 +17,7 @@ from rocky_sdk.exceptions import (
     RockyBinaryNotFoundError,
     RockyCommandError,
     RockyGovernanceError,
+    RockyOutputParseError,
     RockyPartialFailure,
     RockyServerError,
     RockyTimeoutError,
@@ -362,3 +364,203 @@ def test_http_error_raises_server_error():
         pytest.raises(RockyServerError),
     ):
         client.compile()
+
+
+# --------------------------------------------------------------------------- #
+# apply() — dispatch by real wire shape (there is NO wrapping envelope)
+# --------------------------------------------------------------------------- #
+
+# A run-shaped ``rocky apply`` output — what a run / replication / ai_authored /
+# backfill plan prints. Note ``command == "run"``, NOT ``"apply"``, and NO
+# ``{plan_id, plan_kind, success, result}`` envelope: the old ``ApplyOutput``
+# shadow required exactly that envelope and so never validated a real payload.
+_RUN_APPLY_JSON = json.dumps(
+    {
+        "version": "1.63.0",
+        "command": "run",
+        "status": "Success",
+        "filter": "source=orders",
+        "duration_ms": 42,
+        "tables_copied": 1,
+        "tables_failed": 0,
+        "tables_skipped": 0,
+        "materializations": [
+            {
+                "asset_key": ["db", "s", "orders"],
+                "rows_copied": 10,
+                "duration_ms": 5,
+                "metadata": {"strategy": "full_refresh"},
+                "started_at": "2026-01-01T00:00:00Z",
+                "attempts": [{"attempt": 1, "outcome": "success", "duration_ms": 5}],
+                "cost_usd": 0.0,
+                "job_ids": [],
+            }
+        ],
+        "check_results": [],
+        "errors": [],
+        "interrupted": False,
+        "shadow": False,
+        "permissions": {
+            "grants_added": 0,
+            "grants_revoked": 0,
+            "catalogs_created": 0,
+            "schemas_created": 0,
+        },
+        "drift": {"tables_checked": 1, "tables_drifted": 0, "actions_taken": []},
+        "execution": {
+            "concurrency": 1,
+            "tables_processed": 1,
+            "tables_failed": 0,
+            "adaptive_concurrency": False,
+        },
+    }
+)
+
+# A ``gc`` plan's apply output — ``command == "apply"`` WITH gc markers.
+_GC_APPLY_JSON = json.dumps(
+    {
+        "version": "1.63.0",
+        "command": "apply",
+        "plan_id": "a" * 64,
+        "evicted": [
+            {
+                "model_name": "stale_model",
+                "run_id": "run-1",
+                "blake3_hash": "deadbeef",
+                "size_bytes": 2048,
+                "physical_reclaimed": True,
+                "physical_status": "reclaimed",
+                "tombstone_recorded": True,
+            }
+        ],
+        "refused": [],
+        "already_evicted": [],
+        "bytes_evicted": 2048,
+        "bytes_refused": 0,
+        "evicted_count": 1,
+        "refused_count": 0,
+        "notes": ["physical reclamation is object-store-only"],
+    }
+)
+
+
+def _run_apply(client: RockyClient, stdout: str):
+    proc = _fake_popen(stdout=stdout, returncode=0)
+    with patch("rocky_sdk.client.subprocess.Popen", return_value=proc):
+        return client.apply("a" * 64)
+
+
+def test_apply_run_shaped_plan_returns_run_result():
+    """A run / replication plan apply prints a bare ``RunOutput`` (command="run").
+    ``apply()`` must parse it as a populated ``RunResult`` — the backfilled
+    ``status`` / ``tables_skipped`` / per-materialization ``attempts`` survive."""
+    from rocky_sdk.types import RunResult
+
+    result = _run_apply(_client(), _RUN_APPLY_JSON)
+    assert isinstance(result, RunResult)
+    assert result.command == "run"
+    assert result.status == "Success"
+    assert result.tables_copied == 1
+    assert result.materializations[0].attempts[0].attempt == 1
+    assert result.materializations[0].started_at is not None
+
+
+def test_apply_gc_plan_returns_gc_apply_output():
+    """A ``gc`` plan apply prints ``command:"apply"`` with gc markers →
+    ``GcApplyOutput`` (populated evicted list, not the empty happy path)."""
+    from rocky_sdk.types import GcApplyOutput
+
+    result = _run_apply(_client(), _GC_APPLY_JSON)
+    assert isinstance(result, GcApplyOutput)
+    assert result.evicted_count == 1
+    assert result.evicted[0].model_name == "stale_model"
+    assert result.bytes_evicted == 2048
+
+
+def test_apply_unknown_shape_raises_named_parse_error():
+    """An unrecognized apply shape raises a clear parse error naming the
+    received command instead of silently mis-parsing."""
+    result_json = json.dumps({"version": "1", "command": "totally-new-apply-kind"})
+    proc = _fake_popen(stdout=result_json, returncode=0)
+    with (
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        pytest.raises(RockyOutputParseError) as excinfo,
+    ):
+        _client().apply("a" * 64)
+    assert "totally-new-apply-kind" in excinfo.value.parse_error
+
+
+# --------------------------------------------------------------------------- #
+# test_adapter() — the ConformanceResult shadow raised on ANY real output
+# --------------------------------------------------------------------------- #
+
+
+def test_test_adapter_parses_real_conformance_payload():
+    """``rocky test-adapter`` output carries NO ``version`` / ``command`` keys,
+    so the old hand-written ``ConformanceResult`` (which required them) raised on
+    every real payload. The generated ``TestAdapterOutput`` alias parses it —
+    tested with a POPULATED results list, not the empty happy path."""
+    payload = json.dumps(
+        {
+            "adapter": "duckdb",
+            "sdk_version": "0.6.0",
+            "tests_run": 2,
+            "tests_passed": 1,
+            "tests_failed": 1,
+            "tests_skipped": 0,
+            "results": [
+                {
+                    "name": "connection",
+                    "category": "connection",
+                    "status": "passed",
+                    "duration_ms": 3,
+                },
+                {
+                    "name": "types",
+                    "category": "types",
+                    "status": "failed",
+                    "message": "unsupported type",
+                    "duration_ms": 5,
+                },
+            ],
+        }
+    )
+    proc = _fake_popen(stdout=payload, returncode=0)
+    with patch("rocky_sdk.client.subprocess.Popen", return_value=proc):
+        result = _client().test_adapter(adapter="duckdb")
+    assert result.adapter == "duckdb"
+    assert result.tests_failed == 1
+    assert result.results[1].status == "failed"
+    assert result.results[1].message == "unsupported type"
+
+
+# --------------------------------------------------------------------------- #
+# ai_sync() — the AiSyncProposal shadow required a phantom ``current_source``
+# --------------------------------------------------------------------------- #
+
+
+def test_ai_sync_parses_populated_proposals_without_phantom_field():
+    """A real ``AiSyncProposal`` is ``{model, intent, diff, proposed_source}`` —
+    no ``current_source``. The old shadow required ``current_source``, so
+    ``ai_sync`` raised whenever the proposals list was non-empty (the empty-list
+    happy path masked it). Tested with a POPULATED proposal."""
+    payload = json.dumps(
+        {
+            "version": "1.63.0",
+            "command": "ai_sync",
+            "proposals": [
+                {
+                    "model": "revenue",
+                    "intent": "add tax column",
+                    "diff": "@@ +tax",
+                    "proposed_source": "SELECT *, tax FROM raw",
+                }
+            ],
+        }
+    )
+    proc = _fake_popen(stdout=payload, returncode=0)
+    with patch("rocky_sdk.client.subprocess.Popen", return_value=proc):
+        result = _client().ai_sync()
+    assert len(result.proposals) == 1
+    assert result.proposals[0].model == "revenue"
+    assert result.proposals[0].proposed_source == "SELECT *, tax FROM raw"
