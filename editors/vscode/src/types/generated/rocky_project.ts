@@ -423,6 +423,10 @@ export interface RockyConfig {
    */
   freshness?: ProjectFreshnessConfig;
   /**
+   * `[gc]` — storage-reclamation settings for `rocky gc` / `rocky apply <gc-plan>`. Default: physical byte-deletion stays disarmed; an applied eviction is recorded as tombstone + retired ledger row only. See [`GcConfig`].
+   */
+  gc?: GcConfig;
+  /**
    * Shell hooks configuration.
    */
   hook?: HooksConfig;
@@ -949,6 +953,19 @@ export interface ProjectFreshnessConfig {
    * Default timestamp column used to evaluate freshness at runtime. Inherited by per-model freshness blocks that don't specify their own `time_column`.
    */
   time_column?: string | null;
+}
+/**
+ * `[gc]` — storage-reclamation settings for `rocky gc` and its review-gated `rocky apply <gc-plan>`.
+ *
+ * The default posture keeps eviction **ledger-only**: an approved apply writes the durable tombstone and retires the artifact's ledger row (the eviction of record), while the physical object-store byte-delete stays disarmed. Deleting bytes is irreversible in a way the ledger eviction is not, so it is a separate, explicit opt-in rather than something ambient credentials switch on.
+ */
+export interface GcConfig {
+  /**
+   * Arm the physical object-store byte-delete on `rocky apply <gc-plan>`.
+   *
+   * `false` (the default): evicted artifacts are tombstoned and retired from the ledger, but their bytes are left in place as safe orphans — even when object-store credentials are present in the environment. `true`: after the tombstone + ledger retirement commit, a best-effort object-store delete reclaims the bytes (still requires reachable credentials; content-addressed storage is s3-only, and a failed delete leaves a safe orphan, never a dangling reference).
+   */
+  physical_delete?: boolean;
 }
 /**
  * The `[hook]` section from rocky.toml.

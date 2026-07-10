@@ -40,6 +40,11 @@ pub async fn run_transformation(
     // / `[run] skip_unchanged` is set). Passed straight through to
     // `execute_models`.
     skip_gate: super::run::SkipGateConfig,
+    // Whether `--no-reuse` was passed. The documented escape hatch that
+    // forces every content-addressed model to BUILD for this invocation:
+    // it disables both the point-to reuse decision and the column-level
+    // skip, even when `[reuse]` opts in via config.
+    no_reuse: bool,
     // Canonical state path resolved once by `main.rs` (`--state-path` /
     // `--state-namespace` / the global `<models>/.rocky-state.redb`
     // default) — the SAME path the replication path opens. The
@@ -119,9 +124,13 @@ pub async fn run_transformation(
             // run_local has no `--model` selection; defer is a no-op here.
             &super::run::DeferOptions::default(),
             skip_gate,
-            rocky_cfg.reuse.enabled,
-            // Content-addressed column-level skip (its own `[reuse]` sub-key).
-            rocky_cfg.reuse.column_level,
+            // Reuse is active iff `[reuse]` is enabled AND `--no-reuse` was
+            // not passed (clause 1 of the fail-closed decision) — same
+            // resolution as the replication / model-only entry points.
+            rocky_cfg.reuse.enabled && !no_reuse,
+            // Content-addressed column-level skip (its own `[reuse]`
+            // sub-key), likewise disabled by the `--no-reuse` escape hatch.
+            rocky_cfg.reuse.column_level && !no_reuse,
             run_vars,
             rocky_cfg.resilience.clone(),
             super::resilience::retry_policy_allows(rocky_cfg),

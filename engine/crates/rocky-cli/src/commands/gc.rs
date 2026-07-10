@@ -57,7 +57,7 @@
 //! object-store delete ([`ObjectStoreEvictor`]) is s3-only and is
 //! **code-reviewed here, driven on the sandbox** — creds-free it defers.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -288,6 +288,107 @@ fn check_age_threshold(
     }
 }
 
+/// The resolved identity of a model's **current output** — the live table
+/// head the warehouse's Delta log still references.
+///
+/// Resolved ledger-only from the newest *successful* [`ModelExecution`] for the
+/// model (a column-skip records no execution, so this cleanly anchors on the
+/// last real build) joined to that run's recorded output hash(es).
+enum LiveHead {
+    /// The model's newest successful build produced exactly this output hash.
+    Resolved(String),
+    /// The head could not be pinned to a single hash — no successful build in
+    /// the retained history, no recorded output, or an ambiguous multi-hash
+    /// output. Every candidate for the model is then held (fail-closed): a
+    /// candidate we cannot prove is *not* the live head must not be evicted.
+    Unresolved(String),
+}
+
+/// Check 7 — not the model's current (live) output.
+///
+/// A content-addressed model that is **column-skip-stable** never re-records
+/// its artifact, so its ledger refcount stays frozen at 1 forever — passing
+/// check 4 while the row is the model's *live table head*, still referenced by
+/// the Delta log. Evicting it retires (and, once physical deletion is armed,
+/// deletes) the file the current table points at, and a subsequent run
+/// column-skips instead of rebuilding — silent data loss. So a candidate whose
+/// hash is the model's current output is **ineligible**; only a *superseded*
+/// older artifact (the head resolves to a different hash) is reclaimable. Fails
+/// closed when the head can't be resolved.
+fn check_not_live_head(artifact_hash: &str, live_head: &LiveHead) -> GcCheckOutput {
+    let (passed, detail) = match live_head {
+        LiveHead::Resolved(head) if head == artifact_hash => (
+            false,
+            "this artifact is the model's current output (the live table head the Delta log still \
+             references) — evicting it would retire bytes the live table points at, and a \
+             column-skip-stable model would not rebuild them"
+                .to_string(),
+        ),
+        LiveHead::Resolved(head) => (
+            true,
+            format!(
+                "superseded by the model's current output ({}…) — a reclaimable older version, \
+                 not the live table head",
+                head.get(..12).unwrap_or(head)
+            ),
+        ),
+        LiveHead::Unresolved(reason) => (
+            false,
+            format!("cannot prove this is not the model's live head: {reason} (fail-closed)"),
+        ),
+    };
+    GcCheckOutput {
+        check: "not_live_head".to_string(),
+        passed,
+        detail,
+    }
+}
+
+/// Resolve a model's [`LiveHead`] from the ledger, ordering runs newest-first.
+///
+/// `runs_newest_first` is the retained run history (already sorted by
+/// `started_at` descending); `artifacts_by_run_model` indexes every ledger row
+/// by its producing `(run_id, model)` pair. The anchor is the newest run with a
+/// **successful** execution of the model; its output hash is the union of that
+/// run's artifact-ledger rows and its provenance `output_blake3`. A single hash
+/// resolves the head; empty, ambiguous, or no-successful-build all fail closed.
+fn resolve_live_head(
+    store: &StateStore,
+    model_name: &str,
+    runs_newest_first: &[RunRecord],
+    artifacts_by_run_model: &HashMap<(String, String), BTreeSet<String>>,
+) -> LiveHead {
+    let anchor_run_id = runs_newest_first.iter().find_map(|run| {
+        run.models_executed
+            .iter()
+            .any(|m| m.model_name == model_name && m.status == "success")
+            .then(|| run.run_id.clone())
+    });
+    let Some(anchor_run_id) = anchor_run_id else {
+        return LiveHead::Unresolved(
+            "no successful build recorded for this model in the retained run history".to_string(),
+        );
+    };
+
+    let mut hashes: BTreeSet<String> = BTreeSet::new();
+    if let Some(hs) = artifacts_by_run_model.get(&(anchor_run_id.clone(), model_name.to_string())) {
+        hashes.extend(hs.iter().cloned());
+    }
+    if let Ok(Some(prov)) = store.get_provenance(&anchor_run_id, model_name) {
+        hashes.extend(prov.output_blake3);
+    }
+
+    match hashes.len() {
+        0 => LiveHead::Unresolved(
+            "the newest successful build recorded no output artifact".to_string(),
+        ),
+        1 => LiveHead::Resolved(hashes.into_iter().next().expect("checked len == 1")),
+        n => LiveHead::Unresolved(format!(
+            "the newest successful build resolves to {n} distinct output hashes — ambiguous"
+        )),
+    }
+}
+
 /// Estimate the cost to rebuild an artifact via replay.
 ///
 /// A replay re-runs the recorded recipe, so the recorded build's duration and
@@ -325,6 +426,10 @@ fn build_rebuild_cost(
 /// hash-binding check ([`check_recipe_produces_output`]) so the derivable
 /// verdict is bound to *this artifact's* content hash, never inherited from a
 /// sibling output of the same recipe.
+///
+/// `live_head` is the model's resolved current output ([`LiveHead`]) — required
+/// for [`check_not_live_head`] so a column-skip-stable model's frozen-refcount
+/// live table head is never proposed for eviction.
 #[allow(clippy::too_many_arguments)]
 fn build_candidate(
     artifact: &ArtifactRecord,
@@ -332,6 +437,7 @@ fn build_candidate(
     class: &ReplayCheckModelOutput,
     exec: Option<&ModelExecution>,
     prov: Option<&ProvenanceRecord>,
+    live_head: &LiveHead,
     now: DateTime<Utc>,
     min_age_days: i64,
     adapter: Option<&AdapterCost>,
@@ -343,6 +449,7 @@ fn build_candidate(
         check_unreferenced(refcount),
         check_policy_allows(),
         check_age_threshold(artifact.written_at, now, min_age_days),
+        check_not_live_head(&artifact.blake3_hash, live_head),
     ];
     let derivable = checks.iter().all(|c| c.passed);
 
@@ -419,16 +526,31 @@ fn gather_eviction_candidates(
 
     // Group by content hash — each distinct hash is one physical artifact.
     // Representative row = the most recent producer (deterministic tie-break
-    // on run|model) so the reported model/run is stable across scans.
+    // on run|model) so the reported model/run is stable across scans. The
+    // `(run, model) → {hash}` index is the live-head resolver's input (which
+    // run produced which output bytes), built from the same read.
     let mut by_hash: HashMap<String, Vec<ArtifactRecord>> = HashMap::new();
+    let mut artifacts_by_run_model: HashMap<(String, String), BTreeSet<String>> = HashMap::new();
     for artifact in artifacts {
+        artifacts_by_run_model
+            .entry((artifact.run_id.clone(), artifact.model_name.clone()))
+            .or_default()
+            .insert(artifact.blake3_hash.clone());
         by_hash
             .entry(artifact.blake3_hash.clone())
             .or_default()
             .push(artifact);
     }
 
+    // Retained run history, newest-first, read once for the live-head anchor.
+    let runs_newest_first = store
+        .list_runs(100)
+        .context("failed to read the run history")?;
+
     let mut run_cache: HashMap<String, Option<RunRecord>> = HashMap::new();
+    // Per-model live-head resolution, cached so a model with many artifacts
+    // resolves its current output once.
+    let mut live_head_cache: HashMap<String, LiveHead> = HashMap::new();
     let mut out: Vec<EvictionCandidate> = Vec::with_capacity(by_hash.len());
 
     for (hash, mut rows) in by_hash {
@@ -465,12 +587,26 @@ fn gather_eviction_candidates(
                 .find(|m| m.model_name == representative.model_name)
         });
 
+        // Resolve the model's live table head (cached per model) so a
+        // column-skip-stable model's frozen-refcount head is never evicted.
+        if !live_head_cache.contains_key(&representative.model_name) {
+            let head = resolve_live_head(
+                store,
+                &representative.model_name,
+                &runs_newest_first,
+                &artifacts_by_run_model,
+            );
+            live_head_cache.insert(representative.model_name.clone(), head);
+        }
+        let live_head = &live_head_cache[&representative.model_name];
+
         let output = build_candidate(
             &representative,
             refcount,
             &class,
             exec,
             prov.as_ref(),
+            live_head,
             now,
             min_age_days,
             adapter,
@@ -896,20 +1032,31 @@ fn s3_object_key(url: &str) -> Option<String> {
 
 /// Select the physical evictor for this apply.
 ///
-/// Content-addressed deletion is s3-only, so an `ObjectStoreEvictor` is chosen
-/// only when AWS credentials are present in the environment; otherwise the
-/// physical delete is deferred (no reachable object store). Gating on creds
-/// keeps the creds-free real-CLI drive fast and honest — it defers rather than
-/// stalling on an unreachable-bucket retry.
-fn choose_evictor() -> Box<dyn ArtifactEvictor> {
+/// Physical byte-deletion is an **explicit opt-in** (`[gc] physical_delete =
+/// true`): ambient AWS credentials are present on essentially every
+/// content-addressed deployment, so gating on them alone armed irreversible
+/// deletion by default. The `ObjectStoreEvictor` (the real s3 delete) is chosen
+/// only when the flag is set AND credentials are reachable; otherwise the
+/// physical delete is deferred and the tombstone + retired ledger row remain
+/// the eviction of record (a safe, restorable posture). The deferral reason
+/// names the missing precondition so an operator knows which lever to pull.
+fn choose_evictor(physical_delete: bool) -> Box<dyn ArtifactEvictor> {
+    if !physical_delete {
+        return Box::new(DeferredEvictor {
+            reason: "physical byte-deletion is disabled — set `[gc] physical_delete = true` to \
+                     arm it (the tombstone + retired ledger row are the eviction of record)"
+                .to_string(),
+        });
+    }
     let has_creds = std::env::var("AWS_ACCESS_KEY_ID").is_ok()
         && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok();
     if has_creds {
         Box::new(ObjectStoreEvictor)
     } else {
         Box::new(DeferredEvictor {
-            reason: "no reachable object store — content-addressed deletion is s3-only and no \
-                     AWS credentials were found in the environment"
+            reason: "`[gc] physical_delete` is armed but no reachable object store — \
+                     content-addressed deletion is s3-only and no AWS credentials were found in \
+                     the environment"
                 .to_string(),
         })
     }
@@ -921,9 +1068,13 @@ fn gc_apply_notes() -> Vec<String> {
         "Refcounts see Rocky-ledger references only. Multi-ref safety on the UniForm path \
          (branch / env / downstream-deferred-read pointers) is code-reviewed, not driven here."
             .to_string(),
-        "Physical object-store deletion is s3-only and is driven only against a live bucket; \
-         on the creds-free path the byte-delete is deferred and the tombstone + retired ledger \
-         row are the eviction of record."
+        "A model's current output (its live table head) is never proposed for eviction — only \
+         a superseded older artifact is reclaimable, so a column-skip-stable model's frozen \
+         refcount can't route its live bytes into a plan."
+            .to_string(),
+        "Physical byte-deletion is opt-in via `[gc] physical_delete = true` (and is s3-only, \
+         driven only against a live bucket). By default it is disabled: the byte-delete is \
+         deferred and the durable tombstone + retired ledger row are the eviction of record."
             .to_string(),
         "Restore (evict → rebuild → bit-exact) is a later phase and is not exercised here — an \
          evicted artifact's tombstone captures the recipe to rebuild it, but the roundtrip is \
@@ -1263,7 +1414,13 @@ pub(crate) async fn run_gc_apply_in(
 
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    let evictor = choose_evictor();
+    // Physical byte-deletion is opt-in via `[gc] physical_delete`. An
+    // unreadable/absent config leaves it disabled (the safe default), so a
+    // missing `rocky.toml` never silently arms deletion.
+    let physical_delete = load_rocky_config(config_path)
+        .map(|cfg| cfg.gc.physical_delete)
+        .unwrap_or(false);
+    let evictor = choose_evictor(physical_delete);
     let output = execute_gc_apply(&store, evictor.as_ref(), plan_id, &plan, Utc::now()).await?;
 
     if json {
@@ -1445,9 +1602,19 @@ mod tests {
         let now = Utc::now();
         let art = artifact(HA, "orders", "r1", 100, now - Duration::days(30));
         let prov = prov_for(&art);
-        let c = build_candidate(&art, 1, &model("orders"), None, Some(&prov), now, 7, None);
+        let c = build_candidate(
+            &art,
+            1,
+            &model("orders"),
+            None,
+            Some(&prov),
+            &superseded_head(),
+            now,
+            7,
+            None,
+        );
         assert!(c.derivable);
-        assert_eq!(c.checks.len(), 6);
+        assert_eq!(c.checks.len(), 7);
         assert!(c.checks.iter().all(|k| k.passed));
     }
 
@@ -1456,10 +1623,70 @@ mod tests {
         let now = Utc::now();
         let art = artifact(HA, "orders", "r1", 100, now - Duration::days(30));
         let prov = prov_for(&art);
-        let c = build_candidate(&art, 2, &model("orders"), None, Some(&prov), now, 7, None);
+        let c = build_candidate(
+            &art,
+            2,
+            &model("orders"),
+            None,
+            Some(&prov),
+            &superseded_head(),
+            now,
+            7,
+            None,
+        );
         assert!(!c.derivable);
         let unref = c.checks.iter().find(|k| k.check == "unreferenced").unwrap();
         assert!(!unref.passed);
+    }
+
+    #[test]
+    fn candidate_not_derivable_when_it_is_the_live_head() {
+        // The live-head guard in isolation: an artifact whose hash IS the
+        // model's current output fails `not_live_head` (fail-closed on the
+        // frozen-refcount head), while a superseded hash passes it.
+        let now = Utc::now();
+        let art = artifact(HA, "orders", "r1", 100, now - Duration::days(30));
+        let prov = prov_for(&art);
+
+        // Head resolves to HA (this exact artifact) ⇒ held.
+        let head = build_candidate(
+            &art,
+            1,
+            &model("orders"),
+            None,
+            Some(&prov),
+            &LiveHead::Resolved(HA.to_string()),
+            now,
+            7,
+            None,
+        );
+        assert!(
+            !head.derivable,
+            "the live table head must never be derivable"
+        );
+        let live = head
+            .checks
+            .iter()
+            .find(|k| k.check == "not_live_head")
+            .unwrap();
+        assert!(!live.passed);
+        assert!(live.detail.contains("live table head"));
+        // Every other check still passes — the report shows exactly why.
+        assert_eq!(head.checks.iter().filter(|k| k.passed).count(), 6);
+
+        // Head unresolvable (no successful build in history) ⇒ also held.
+        let unresolved = build_candidate(
+            &art,
+            1,
+            &model("orders"),
+            None,
+            Some(&prov),
+            &LiveHead::Unresolved("no history".to_string()),
+            now,
+            7,
+            None,
+        );
+        assert!(!unresolved.derivable, "an unresolvable head fails closed");
     }
 
     #[test]
@@ -1473,7 +1700,17 @@ mod tests {
         // Provenance records a DIFFERENT output (HA@its path), not HB.
         let good = artifact(HA, "orders", "r1", 100, now - Duration::days(30));
         let prov = prov_for(&good);
-        let c = build_candidate(&bad, 1, &model("orders"), None, Some(&prov), now, 7, None);
+        let c = build_candidate(
+            &bad,
+            1,
+            &model("orders"),
+            None,
+            Some(&prov),
+            &superseded_head(),
+            now,
+            7,
+            None,
+        );
         assert!(!c.derivable, "H_BAD must not inherit H_GOOD's derivability");
         let bind = c
             .checks
@@ -1481,8 +1718,8 @@ mod tests {
             .find(|k| k.check == "recipe_produces_output")
             .unwrap();
         assert!(!bind.passed);
-        // The other five checks still pass — the report shows exactly why it's held.
-        assert_eq!(c.checks.iter().filter(|k| k.passed).count(), 5);
+        // The other six checks still pass — the report shows exactly why it's held.
+        assert_eq!(c.checks.iter().filter(|k| k.passed).count(), 6);
     }
 
     #[test]
@@ -1500,7 +1737,17 @@ mod tests {
         };
 
         // A member hash is derivable via membership alone.
-        let c = build_candidate(&art, 1, &model("orders"), None, Some(&prov), now, 7, None);
+        let c = build_candidate(
+            &art,
+            1,
+            &model("orders"),
+            None,
+            Some(&prov),
+            &superseded_head(),
+            now,
+            7,
+            None,
+        );
         assert!(
             c.derivable,
             "a member hash must be derivable via membership"
@@ -1516,7 +1763,17 @@ mod tests {
         // A different-hash artifact against the same no-path provenance is refused
         // — it must NOT inherit derivability just because paths were absent.
         let bad = artifact(HB, "orders", "r1", 100, now - Duration::days(30));
-        let c_bad = build_candidate(&bad, 1, &model("orders"), None, Some(&prov), now, 7, None);
+        let c_bad = build_candidate(
+            &bad,
+            1,
+            &model("orders"),
+            None,
+            Some(&prov),
+            &superseded_head(),
+            now,
+            7,
+            None,
+        );
         assert!(
             !c_bad.derivable,
             "a non-member hash must be refused even when provenance records no paths"
@@ -1597,8 +1854,50 @@ mod tests {
             .unwrap();
     }
 
+    /// A distinct, stable "current head" hash for `model`, different from the
+    /// single-letter-repeat artifact hashes the tests seed — so a
+    /// `record_superseding_head` build never collides with the artifact under
+    /// test.
+    fn head_hash(model: &str) -> String {
+        format!("HEAD-{model}")
+    }
+
+    /// A [`LiveHead`] that is NOT the candidate under test — the pure
+    /// `build_candidate` tests use it so the `not_live_head` check passes and
+    /// only the check being exercised decides derivability. The sentinel hash
+    /// (`f`×64) never collides with `HA`/`HB`/`HC`.
+    fn superseded_head() -> LiveHead {
+        LiveHead::Resolved("f".repeat(64))
+    }
+
     fn record_run(store: &StateStore, run_id: &str, model: &str) {
-        let now = Utc::now();
+        record_run_at(store, run_id, model, Utc::now());
+    }
+
+    /// Record a NEWER successful build of `model` producing a distinct head
+    /// hash ([`head_hash`]) — provenance + run only, **no** artifact-ledger row
+    /// — so any older artifact of the same model resolves as *superseded* (its
+    /// hash ≠ the live head) and becomes evictable. Written far in the future so
+    /// it reliably sorts newest for the live-head anchor; recording no artifact
+    /// keeps the ledger focused on the one hash under test (`artifact_count` /
+    /// `managed_bytes` are unaffected).
+    fn record_superseding_head(store: &StateStore, model: &str) {
+        let head = head_hash(model);
+        let run_id = format!("{model}-head");
+        let ir = ca_ir(model, "SELECT 1 AS id");
+        let outputs = vec![OutputArtifact {
+            blake3_hash: head.clone(),
+            file_path: format!("s3://b/{head}.parquet"),
+        }];
+        let (entry, prov) = build_records(&ir, &run_id, &[], &outputs, Utc::now()).unwrap();
+        store
+            .record_reuse_spine(std::slice::from_ref(&entry), std::slice::from_ref(&prov))
+            .unwrap();
+        record_run_at(store, &run_id, model, Utc::now() + Duration::days(365));
+    }
+
+    fn record_run_at(store: &StateStore, run_id: &str, model: &str, started_at: DateTime<Utc>) {
+        let now = started_at;
         let exec = ModelExecution {
             model_name: model.to_string(),
             started_at: now,
@@ -1660,6 +1959,8 @@ mod tests {
         let old = Utc::now() - Duration::days(30);
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
+        // Supersede HA so it is a reclaimable older version, not the live head.
+        record_superseding_head(&store, "orders");
 
         let report = gather_report(&store, None, Utc::now(), 7).unwrap();
         assert_eq!(report.artifact_count, 1);
@@ -1816,9 +2117,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
         let old = Utc::now() - Duration::days(30);
-        // Derivable.
+        // Derivable (superseded older version, not the live head).
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
+        record_superseding_head(&store, "orders");
         // Nondeterministic — never derivable, must be excluded from the plan.
         seed(
             &store,
@@ -1864,6 +2166,8 @@ mod tests {
         let old = Utc::now() - Duration::days(30);
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
+        // Supersede HA so it is a reclaimable older version, not the live head.
+        record_superseding_head(&store, "orders");
         let now = Utc::now();
         let plan = plan_from_store(&store, now, 7);
         assert_eq!(plan.evictions.len(), 1);
@@ -1902,6 +2206,10 @@ mod tests {
         let old = Utc::now() - Duration::days(30);
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HC, 500, old);
         record_run(&store, "r1", "orders");
+        // Supersede HC so it is derivable at plan time (a superseded older
+        // version) — the refusal below is driven by the second reference, not
+        // the live-head guard.
+        record_superseding_head(&store, "orders");
         let now = Utc::now();
         // Plan captures the artifact while it is derivable (refcount 1).
         let plan = plan_from_store(&store, now, 7);
@@ -1948,6 +2256,9 @@ mod tests {
         // Provenance + artifact for the GOOD output HA.
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
+        // Supersede orders with a later head so HA (and the stray HB) are not
+        // the live head — isolating the recipe-produces-output check under test.
+        record_superseding_head(&store, "orders");
         // A stray artifact row at HB for the SAME (run, model) — provenance does
         // NOT record HB.
         store
@@ -2056,6 +2367,7 @@ mod tests {
         let old = Utc::now() - Duration::days(30);
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
+        record_superseding_head(&store, "orders");
         let now = Utc::now();
         let plan = plan_from_store(&store, now, 7);
 
@@ -2087,6 +2399,7 @@ mod tests {
         let old = Utc::now() - Duration::days(30);
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
+        record_superseding_head(&store, "orders");
         let now = Utc::now();
         let plan = plan_from_store(&store, now, 7);
 
@@ -2112,6 +2425,7 @@ mod tests {
         let old = Utc::now() - Duration::days(30);
         seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
         record_run(&store, "r1", "orders");
+        record_superseding_head(&store, "orders");
         let now = Utc::now();
         let plan = plan_from_store(&store, now, 7);
 
@@ -2137,6 +2451,7 @@ mod tests {
             let old = Utc::now() - Duration::days(30);
             seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
             record_run(&store, "r1", "orders");
+            record_superseding_head(&store, "orders");
             let plan = plan_from_store(&store, Utc::now(), 7);
             write_plan_with_principal(dir.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
                 .unwrap()
@@ -2170,6 +2485,162 @@ mod tests {
         let store = StateStore::open(&state_path).unwrap();
         assert_eq!(store.list_tombstones().unwrap().len(), 1);
         assert_eq!(store.refcount_for_hash(HA).unwrap(), 0);
+    }
+
+    /// 🔴 The live-head guard end-to-end: a model with two real builds — an
+    /// OLD one (`HA`) and a NEWER current one (`HB`) — must hold the newer
+    /// build (the live table head the Delta log references) out of every
+    /// eviction plan while allowing the superseded older build to be
+    /// reclaimed. This is exactly the frozen-refcount trap: `HB` has refcount
+    /// 1 (a column-skip-stable model never re-records it), so without the
+    /// live-head check it would pass all six original checks and gc would
+    /// propose evicting the live head. Non-vacuous: pre-fix, BOTH `HA` and
+    /// `HB` are derivable and the plan carries the live head.
+    #[test]
+    fn live_head_is_held_while_superseded_artifact_is_evictable() {
+        let dir = TempDir::new().unwrap();
+        let store = StateStore::open(&dir.path().join("s.redb")).unwrap();
+        let old = Utc::now() - Duration::days(30);
+        // Old build HA (run r1), then a newer current build HB (run r2). Both
+        // are genuine ledger artifacts + successful executions; r2 is newer, so
+        // HB is the live head and HA is superseded.
+        seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+        record_run_at(&store, "r1", "orders", old);
+        seed(
+            &store,
+            "r2",
+            "orders",
+            "SELECT 1 AS id",
+            &[],
+            HB,
+            600,
+            old + Duration::hours(1),
+        );
+        record_run_at(&store, "r2", "orders", old + Duration::hours(1));
+
+        let cands = gather_eviction_candidates(&store, None, Utc::now(), 7).unwrap();
+
+        // HB — the model's current output — is HELD: not_live_head fails.
+        let hb = cands
+            .iter()
+            .find(|c| c.artifact.blake3_hash == HB)
+            .expect("HB candidate present");
+        assert!(
+            !hb.output.derivable,
+            "the live table head must never be derivable"
+        );
+        let hb_head = hb
+            .output
+            .checks
+            .iter()
+            .find(|k| k.check == "not_live_head")
+            .unwrap();
+        assert!(!hb_head.passed);
+        assert!(hb_head.detail.contains("live table head"));
+
+        // HA — a superseded older version — IS reclaimable: every check passes.
+        let ha = cands
+            .iter()
+            .find(|c| c.artifact.blake3_hash == HA)
+            .expect("HA candidate present");
+        assert!(
+            ha.output.derivable,
+            "a superseded older artifact is reclaimable"
+        );
+        assert!(
+            ha.output
+                .checks
+                .iter()
+                .find(|k| k.check == "not_live_head")
+                .unwrap()
+                .passed
+        );
+
+        // The plan carries ONLY the superseded HA — never the live head HB.
+        let plan = build_gc_plan(&cands, 7).expect("HA is derivable");
+        assert_eq!(plan.evictions.len(), 1);
+        assert_eq!(plan.evictions[0].blake3_hash, HA);
+    }
+
+    // The evictor-selection tests mutate process-global AWS env vars, which
+    // `cargo test` runs in parallel by default, so serialise via a module-local
+    // mutex — each test takes the lock before touching env vars.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// SAFETY: runs under `ENV_LOCK`, which serialises every env-mutating test
+    /// in this module. `std::env::set_var`/`remove_var` are unsafe from the
+    /// 2024 edition because they race concurrent reads; the lock closes that
+    /// hole for our tests, and the blast radius is a test-only evictor choice.
+    fn set_env(key: &str, value: &str) {
+        unsafe { std::env::set_var(key, value) };
+    }
+    fn remove_env(key: &str) {
+        unsafe { std::env::remove_var(key) };
+    }
+
+    /// FIX-cluster regression: physical byte-deletion is an explicit opt-in.
+    /// The default (`physical_delete = false`) selects the `DeferredEvictor`
+    /// **even when AWS credentials are present** — the exact ambient-creds
+    /// arming this fix closes — and the armed-but-creds-less path also defers,
+    /// naming the missing precondition. Only `physical_delete = true` + creds
+    /// selects the real `ObjectStoreEvictor` (the code-reviewed s3 path, not
+    /// driven creds-free).
+    #[tokio::test]
+    async fn choose_evictor_makes_physical_delete_opt_in() {
+        // Build each evictor under the env lock — `choose_evictor` reads env
+        // synchronously and captures its deferral reason at construction — then
+        // drop the lock before awaiting, so the `MutexGuard` is never held
+        // across an `.await` (a `DeferredEvictor`'s outcome is fixed, so no env
+        // state is read across the await).
+        let deferred_default = {
+            let _g = ENV_LOCK.lock().unwrap();
+            // Default OFF, credentials PRESENT ⇒ still deferred (the regression).
+            set_env("AWS_ACCESS_KEY_ID", "test-key");
+            set_env("AWS_SECRET_ACCESS_KEY", "test-secret");
+            let ev = choose_evictor(false);
+            remove_env("AWS_ACCESS_KEY_ID");
+            remove_env("AWS_SECRET_ACCESS_KEY");
+            ev
+        };
+        match deferred_default.evict_bytes("s3://b/x.parquet").await {
+            PhysicalReclaim::Deferred(reason) => assert!(
+                reason.contains("physical_delete"),
+                "default deferral must name the opt-in flag; got: {reason}"
+            ),
+            other => panic!(
+                "default (physical_delete=false) must defer even with creds; got a non-deferred \
+                 outcome: {}",
+                matches_label(&other)
+            ),
+        }
+
+        let deferred_armed = {
+            let _g = ENV_LOCK.lock().unwrap();
+            // Armed, but credentials ABSENT ⇒ deferred, naming the missing creds.
+            remove_env("AWS_ACCESS_KEY_ID");
+            remove_env("AWS_SECRET_ACCESS_KEY");
+            choose_evictor(true)
+        };
+        match deferred_armed.evict_bytes("s3://b/x.parquet").await {
+            PhysicalReclaim::Deferred(reason) => assert!(
+                reason.contains("armed") && reason.contains("credentials"),
+                "armed-without-creds deferral must name the missing precondition; got: {reason}"
+            ),
+            other => panic!(
+                "armed-without-creds must defer; got: {}",
+                matches_label(&other)
+            ),
+        }
+    }
+
+    /// Test-only label for a [`PhysicalReclaim`] so a panic message can name the
+    /// unexpected non-deferred outcome without matching in the assert.
+    fn matches_label(r: &PhysicalReclaim) -> &'static str {
+        match r {
+            PhysicalReclaim::Deleted => "Deleted",
+            PhysicalReclaim::Deferred(_) => "Deferred",
+            PhysicalReclaim::Failed(_) => "Failed",
+        }
     }
 
     /// Seed a realistic multi-candidate ledger to the redb path in

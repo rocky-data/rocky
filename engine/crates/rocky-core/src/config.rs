@@ -2531,6 +2531,13 @@ pub struct RockyConfig {
     #[serde(default)]
     pub reuse: ReuseConfig,
 
+    /// `[gc]` — storage-reclamation settings for `rocky gc` / `rocky apply
+    /// <gc-plan>`. Default: physical byte-deletion stays disarmed; an applied
+    /// eviction is recorded as tombstone + retired ledger row only. See
+    /// [`GcConfig`].
+    #[serde(default)]
+    pub gc: GcConfig,
+
     /// Agent-authority policy plane (explain-mode in v0). Declares, per
     /// `(principal, capability, scope)`, whether an action is allowed,
     /// requires human review, or is denied. Absent `[policy]` block ⇒ no
@@ -2645,6 +2652,31 @@ impl Default for ReuseConfig {
             column_level: default_reuse_column_level(),
         }
     }
+}
+
+/// `[gc]` — storage-reclamation settings for `rocky gc` and its
+/// review-gated `rocky apply <gc-plan>`.
+///
+/// The default posture keeps eviction **ledger-only**: an approved apply
+/// writes the durable tombstone and retires the artifact's ledger row (the
+/// eviction of record), while the physical object-store byte-delete stays
+/// disarmed. Deleting bytes is irreversible in a way the ledger eviction is
+/// not, so it is a separate, explicit opt-in rather than something ambient
+/// credentials switch on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GcConfig {
+    /// Arm the physical object-store byte-delete on `rocky apply <gc-plan>`.
+    ///
+    /// `false` (the default): evicted artifacts are tombstoned and retired
+    /// from the ledger, but their bytes are left in place as safe orphans —
+    /// even when object-store credentials are present in the environment.
+    /// `true`: after the tombstone + ledger retirement commit, a best-effort
+    /// object-store delete reclaims the bytes (still requires reachable
+    /// credentials; content-addressed storage is s3-only, and a failed delete
+    /// leaves a safe orphan, never a dangling reference).
+    #[serde(default)]
+    pub physical_delete: bool,
 }
 
 /// Who is attempting an action.
@@ -5749,6 +5781,30 @@ pin = "*"
         );
         let on: ReuseConfig = toml::from_str("column_level = true").unwrap();
         assert!(on.column_level);
+    }
+
+    #[test]
+    fn gc_physical_delete_defaults_off_via_both_paths() {
+        // `[gc]` block absent entirely ⇒ `GcConfig::default()`.
+        let d = GcConfig::default();
+        assert!(!d.physical_delete, "physical_delete defaults OFF");
+
+        // The whole parent config with no `[gc]` block resolves the same.
+        let parent: RockyConfig = toml::from_str("").unwrap();
+        assert!(!parent.gc.physical_delete);
+
+        // `[gc]` present but `physical_delete` omitted ⇒ serde field default.
+        let present: GcConfig = toml::from_str("").unwrap();
+        assert!(!present.physical_delete);
+
+        // Explicit opt-in is honored — proves the default is real, not a
+        // hardcoded value (non-vacuous: fails if the flag were ignored).
+        let armed: RockyConfig = toml::from_str("[gc]\nphysical_delete = true").unwrap();
+        assert!(armed.gc.physical_delete);
+
+        // Unknown keys under `[gc]` are rejected (deny_unknown_fields), so a
+        // typo can never silently arm or disarm deletion.
+        assert!(toml::from_str::<GcConfig>("physical_deletes = true").is_err());
     }
 
     #[test]

@@ -410,6 +410,7 @@ mod tests {
             imports: Default::default(),
             run: Default::default(),
             reuse: Default::default(),
+            gc: Default::default(),
             policy: None,
             resilience: ResilienceConfig {
                 auto_apply_additive_drift: true,

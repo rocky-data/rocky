@@ -637,6 +637,24 @@ class FivetranStampedeConfig(BaseModel):
     """
 
 
+class GcConfig(BaseModel):
+    """
+    `[gc]` — storage-reclamation settings for `rocky gc` and its review-gated `rocky apply <gc-plan>`.
+
+    The default posture keeps eviction **ledger-only**: an approved apply writes the durable tombstone and retires the artifact's ledger row (the eviction of record), while the physical object-store byte-delete stays disarmed. Deleting bytes is irreversible in a way the ledger eviction is not, so it is a separate, explicit opt-in rather than something ambient credentials switch on.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    physical_delete: bool | None = False
+    """
+    Arm the physical object-store byte-delete on `rocky apply <gc-plan>`.
+
+    `false` (the default): evicted artifacts are tombstoned and retired from the ledger, but their bytes are left in place as safe orphans — even when object-store credentials are present in the environment. `true`: after the tombstone + ledger retirement commit, a best-effort object-store delete reclaims the bytes (still requires reachable credentials; content-addressed storage is s3-only, and a failed delete leaves a safe orphan, never a dangling reference).
+    """
+
+
 class GrantConfig(BaseModel):
     """
     A permission grant to apply to catalogs or schemas.
@@ -3623,6 +3641,10 @@ class RockyConfig(BaseModel):
     ```toml [freshness] expected_lag_seconds = 3600 time_column = "updated_at" severity = "warning" ```
 
     Inheritance is field-by-field: a per-model `[freshness]` table always wins for the fields it sets; absent fields fall through to the project-level default. Models with no per-model `[freshness]` at all inherit the project default when it carries an `expected_lag_seconds` value (the required field).
+    """
+    gc: GcConfig | None = Field({"physical_delete": False}, validate_default=True)
+    """
+    `[gc]` — storage-reclamation settings for `rocky gc` / `rocky apply <gc-plan>`. Default: physical byte-deletion stays disarmed; an applied eviction is recorded as tombstone + retired ledger row only. See [`GcConfig`].
     """
     hook: HooksConfig | None = Field({"webhooks": {}}, validate_default=True)
     """
