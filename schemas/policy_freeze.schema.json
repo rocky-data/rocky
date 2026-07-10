@@ -1,0 +1,130 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "PolicyEffect": {
+      "description": "The verdict a policy rule (or the default posture) yields.\n\nOrdered by restrictiveness for incomparable-rule tie-breaking: `Deny` is a hard override (handled separately), and among non-deny verdicts `RequireReview` is more restrictive than `Allow`.",
+      "oneOf": [
+        {
+          "description": "Permit the action outright.",
+          "enum": [
+            "allow"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Permit only after human review. The safe default posture.",
+          "enum": [
+            "require_review"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Refuse the action. A hard override — no `allow` overturns it.",
+          "enum": [
+            "deny"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyFreezeEntry": {
+      "description": "One principal's freeze/unfreeze record inside a [`PolicyFreezeOutput`].",
+      "properties": {
+        "decision_ref": {
+          "description": "Composite ledger key citation (`\"{timestamp}|{plan_id}|{scope}\"`).",
+          "type": "string"
+        },
+        "effect": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PolicyEffect"
+            }
+          ],
+          "description": "The recorded effect (`deny` for a freeze, `allow` for an unfreeze)."
+        },
+        "plan_id": {
+          "description": "The freeze decision's `plan_id`.",
+          "type": "string"
+        },
+        "principal": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PolicyPrincipal"
+            }
+          ],
+          "description": "The principal whose actions were frozen/unfrozen."
+        },
+        "reason": {
+          "description": "Human-readable description of the freeze/unfreeze.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "decision_ref",
+        "effect",
+        "plan_id",
+        "principal",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "PolicyPrincipal": {
+      "description": "Who is attempting an action.\n\n`agent` is a non-human caller (an AI harness authoring, applying, or remediating). `human` is a person. In v0 the principal is supplied explicitly (`rocky policy check --principal …`); auto-detection is a later phase.",
+      "oneOf": [
+        {
+          "description": "A person.",
+          "enum": [
+            "human"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A non-human caller (AI agent / automation).",
+          "enum": [
+            "agent"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "JSON output for `rocky policy freeze` / `rocky policy unfreeze` — the kill switch.\n\nA freeze records a decision entry per matched principal into the existing policy-decision ledger; at the enforcement seam an active freeze forces `deny`. `unfreeze` records a superseding entry that lifts it. No config file is rewritten and no new table is created.",
+  "properties": {
+    "command": {
+      "description": "`policy_freeze` or `policy_unfreeze`.",
+      "type": "string"
+    },
+    "entries": {
+      "description": "One entry per affected principal.",
+      "items": {
+        "$ref": "#/definitions/PolicyFreezeEntry"
+      },
+      "type": "array"
+    },
+    "lifted": {
+      "description": "`true` when this call lifted a freeze rather than establishing one.",
+      "type": "boolean"
+    },
+    "recorded_at": {
+      "description": "RFC 3339 wall clock when the freeze/unfreeze was recorded.",
+      "type": "string"
+    },
+    "scope": {
+      "description": "The scope selector the freeze targets (`any`, `layer=…`, `tag=…`, …).",
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "entries",
+    "lifted",
+    "recorded_at",
+    "scope",
+    "version"
+  ],
+  "title": "PolicyFreezeOutput",
+  "type": "object"
+}

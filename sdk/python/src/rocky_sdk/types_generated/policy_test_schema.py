@@ -104,7 +104,7 @@ class PolicyEffect(StrEnum):
     allow = "allow"
 
 
-class PolicyEffect15(StrEnum):
+class PolicyEffect19(StrEnum):
     """
     Permit only after human review. The safe default posture.
     """
@@ -112,7 +112,7 @@ class PolicyEffect15(StrEnum):
     require_review = "require_review"
 
 
-class PolicyEffect16(StrEnum):
+class PolicyEffect20(StrEnum):
     """
     Refuse the action. A hard override — no `allow` overturns it.
     """
@@ -128,7 +128,7 @@ class PolicyPrincipal(StrEnum):
     human = "human"
 
 
-class PolicyPrincipal11(StrEnum):
+class PolicyPrincipal13(StrEnum):
     """
     A non-human caller (AI agent / automation).
     """
@@ -141,7 +141,7 @@ class PolicyTestResult(BaseModel):
     The outcome of one `[[policy.tests]]` scenario.
     """
 
-    actual: PolicyEffect | PolicyEffect15 | PolicyEffect16
+    actual: PolicyEffect | PolicyEffect19 | PolicyEffect20
     """
     The effect the evaluator actually resolved.
     """
@@ -161,7 +161,7 @@ class PolicyTestResult(BaseModel):
     """
     The capability that was checked.
     """
-    expected: PolicyEffect | PolicyEffect15 | PolicyEffect16
+    expected: PolicyEffect | PolicyEffect19 | PolicyEffect20
     """
     The effect the scenario expected.
     """
@@ -181,7 +181,7 @@ class PolicyTestResult(BaseModel):
     """
     `true` when the resolved effect equalled `expected`.
     """
-    principal: PolicyPrincipal | PolicyPrincipal11
+    principal: PolicyPrincipal | PolicyPrincipal13
     """
     The principal that was checked.
     """

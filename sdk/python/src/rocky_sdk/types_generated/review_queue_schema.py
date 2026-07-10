@@ -104,7 +104,7 @@ class PolicyPrincipal(StrEnum):
     human = "human"
 
 
-class PolicyPrincipal14(StrEnum):
+class PolicyPrincipal16(StrEnum):
     """
     A non-human caller (AI agent / automation).
     """
@@ -157,7 +157,7 @@ class ReviewQueueEntry(BaseModel):
     """
     The plan whose approval clears this escalation.
     """
-    principal: PolicyPrincipal | PolicyPrincipal14
+    principal: PolicyPrincipal | PolicyPrincipal16
     """
     Who authored the change (`human` / `agent`).
     """

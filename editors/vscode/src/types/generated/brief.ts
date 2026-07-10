@@ -55,6 +55,10 @@ export interface BriefOutput {
    * Agent- and human-authored policy decisions in the window, grouped by principal and effect.
    */
   agent_activity: BriefAgentActivitySection;
+  /**
+   * Autonomy-budget degradations and active policy freezes — the dynamic tightening currently in force across the estate.
+   */
+  autonomy: BriefAutonomySection;
   command: string;
   /**
    * Cost and budget burn across the window's runs.
@@ -159,6 +163,65 @@ export interface BriefDecisionEntry {
    * RFC 3339 timestamp when the decision was recorded.
    */
   timestamp: string;
+  [k: string]: unknown;
+}
+/**
+ * Autonomy section — rules whose autonomy budget is currently exhausted (degraded to `require_review`) and policy freezes in force.
+ *
+ * This is a *current-state* projection over the whole decision ledger — each budget uses its own configured window, independent of the digest's `--since`. It fails closed: `unavailable` when the ledger or config can't be read, `no_data` when nothing is degraded or frozen.
+ */
+export interface BriefAutonomySection {
+  /**
+   * Policy freezes currently in force.
+   */
+  active_freezes: BriefActiveFreeze[];
+  availability: SectionAvailability;
+  /**
+   * Rules whose budget is exhausted right now — each auto-degraded to `require_review` until its failures age out of the window.
+   */
+  degraded_rules: BriefDegradedRule[];
+  note?: string | null;
+  [k: string]: unknown;
+}
+/**
+ * An active policy freeze inside [`BriefAutonomySection`].
+ */
+export interface BriefActiveFreeze {
+  /**
+   * RFC 3339 wall clock when the freeze was recorded — the citation.
+   */
+  frozen_at: string;
+  /**
+   * The freeze decision's `plan_id`.
+   */
+  plan_id: string;
+  principal: PolicyPrincipal;
+  /**
+   * The scope selector the freeze targets.
+   */
+  scope: string;
+  [k: string]: unknown;
+}
+/**
+ * A budget-exhausted (degraded) rule inside [`BriefAutonomySection`].
+ */
+export interface BriefDegradedRule {
+  /**
+   * Verify-after failures counted in the window.
+   */
+  failures: number;
+  /**
+   * The rule's configured failure ceiling.
+   */
+  limit: number;
+  /**
+   * Index of the degraded `[[policy.rules]]` entry.
+   */
+  rule_id: number;
+  /**
+   * The rule's configured window (`7d`, `24h`, …).
+   */
+  window: string;
   [k: string]: unknown;
 }
 /**

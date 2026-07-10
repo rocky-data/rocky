@@ -472,6 +472,16 @@ pub fn evaluate_apply_policy(
     // computed regardless; only the audit write is skipped.
     let ledger = StateStore::open(state_path).ok();
 
+    // Snapshot the decision ledger *before* this apply writes any rows, so the
+    // dynamic breakers (autonomy-budget burn, active freezes) reflect only
+    // prior history. An unreadable ledger yields an empty snapshot → no dynamic
+    // degradation (the static decision still gates).
+    let now = chrono::Utc::now();
+    let prior_decisions: Vec<PolicyDecisionRecord> = ledger
+        .as_ref()
+        .and_then(|s| s.list_policy_decisions().ok())
+        .unwrap_or_default();
+
     let mut worst: Option<PolicyGate> = None;
     for (model, capability) in touched {
         let owned;
@@ -489,18 +499,35 @@ pub fn evaluate_apply_policy(
             }
         };
 
+        // Static base decision, then the dynamic ledger-aware tightening
+        // (freeze → deny; exhausted budget → require_review). The post-step
+        // never widens the base and never changes the winning rule.
         let decision = policy::evaluate(&policy, principal, *capability, attrs);
+        let (effect, degradation) = policy::autonomy_degradation(
+            decision.effect,
+            decision.matched_rule,
+            &policy,
+            principal,
+            attrs,
+            &prior_decisions,
+            now,
+        );
+        let mut reason = decision.reason;
+        if let Some(suffix) = degradation.reason_suffix() {
+            reason.push_str("; ");
+            reason.push_str(&suffix);
+        }
 
         if let Some(store) = &ledger {
             let record = PolicyDecisionRecord {
-                timestamp: chrono::Utc::now(),
+                timestamp: now,
                 plan_id: plan_id.to_string(),
                 principal,
                 capability: *capability,
                 model: model.clone(),
-                effect: decision.effect,
+                effect,
                 rule_id: decision.matched_rule,
-                reason: decision.reason.clone(),
+                reason: reason.clone(),
                 // A plain evaluation row carries no verify_after; the
                 // post-apply verification writes its own custody row.
                 verify_after: Vec::new(),
@@ -514,17 +541,17 @@ pub fn evaluate_apply_policy(
             }
         }
 
-        let gate = match decision.effect {
+        let gate = match effect {
             PolicyEffect::Allow => PolicyGate::Allow,
             PolicyEffect::RequireReview => PolicyGate::RequireReview {
                 model: model.clone(),
                 rule_id: decision.matched_rule,
-                reason: decision.reason,
+                reason,
             },
             PolicyEffect::Deny => PolicyGate::Deny {
                 model: model.clone(),
                 rule_id: decision.matched_rule,
-                reason: decision.reason,
+                reason,
             },
         };
         // Keep the most-restrictive gate: deny > require_review > allow.

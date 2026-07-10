@@ -310,6 +310,18 @@ pub enum ConfigError {
          `contracted`, `layer`, …)"
     )]
     PolicyScopeEmpty { rule_index: usize },
+
+    #[error(
+        "[policy] rules[{rule_index}] autonomy_budget.window = {window:?} is not a valid \
+         duration — use a `<N>d` / `<N>h` span (e.g. \"7d\", \"24h\")"
+    )]
+    PolicyBudgetInvalidWindow { rule_index: usize, window: String },
+
+    #[error(
+        "[policy] rules[{rule_index}] autonomy_budget.failures = 0 is invalid — a budget must \
+         allow at least one failure before it degrades the rule (use `failures = 1` or higher)"
+    )]
+    PolicyBudgetZeroFailures { rule_index: usize },
 }
 
 /// Concurrency strategy for table processing.
@@ -2782,6 +2794,55 @@ impl PolicyScope {
     }
 }
 
+/// An autonomy budget on a policy rule — the SRE error-budget move applied to
+/// agent authority.
+///
+/// A rule that carries `autonomy_budget = { failures = 3, window = "7d" }`
+/// tolerates at most `failures - 1` post-apply verification failures inside a
+/// rolling `window`. The moment the count reaches `failures`, the budget is
+/// exhausted and the rule **automatically degrades to `require_review`** at
+/// enforcement time (an `allow` can no longer stand un-reviewed). This is a
+/// one-directional breaker: it only ever tightens the rule, never widens it.
+/// Widening autonomy remains a deliberate human act on scorecard evidence.
+///
+/// The failure count is a *projection over the existing decision ledger* — it
+/// is never a persisted counter, so recovery is automatic: once the failing
+/// applies age out of the window the count falls below the limit and the rule
+/// returns to its authored effect. The rule is never made more permissive than
+/// the effect the author wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AutonomyBudget {
+    /// Verify-after failures within `window` that exhaust the budget. The
+    /// `failures`-th failure trips the breaker (must be `>= 1`).
+    pub failures: u64,
+    /// Rolling window over which failures are counted, as a `<N>d` / `<N>h`
+    /// duration (e.g. `"7d"`, `"24h"`). Failures older than this do not count.
+    pub window: String,
+}
+
+/// Parse a `<N>d` / `<N>h` budget/window duration string into a [`Duration`].
+///
+/// Accepts a positive integer followed by a `d` (days) or `h` (hours) unit,
+/// case-insensitive — `"7d"`, `"24h"`, `"30D"`. Returns `None` for anything
+/// malformed or out of `chrono`'s representable range, so callers can fail
+/// closed (a budget whose window will not parse never degrades a rule, and
+/// config validation rejects it up front).
+pub fn parse_window_duration(raw: &str) -> Option<chrono::Duration> {
+    let raw = raw.trim();
+    let unit = raw.chars().next_back()?;
+    let digits = &raw[..raw.len() - unit.len_utf8()];
+    let n: i64 = digits.parse().ok()?;
+    if n <= 0 {
+        return None;
+    }
+    match unit {
+        'd' | 'D' => chrono::Duration::try_days(n),
+        'h' | 'H' => chrono::Duration::try_hours(n),
+        _ => None,
+    }
+}
+
 /// One `[[policy.rules]]` entry: `(principal, capability, scope) → effect`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -2806,11 +2867,16 @@ pub struct PolicyRule {
     /// reverts it. Empty ⇒ no post-apply gate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verify_after: Vec<String>,
-    /// Optional v1 conditional refinements not yet promoted to typed fields
-    /// (`budget`, `window`). **Parsed and ignored** — captured as opaque JSON
-    /// so a config authored against a later version still loads.
+    /// Optional v1 conditional refinements not yet promoted to typed fields.
+    /// **Parsed and ignored** — captured as opaque JSON so a config authored
+    /// against a later version still loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<serde_json::Value>,
+    /// Optional autonomy budget: a rolling failure ceiling that degrades this
+    /// rule to `require_review` when its verify-after failures exhaust it. See
+    /// [`AutonomyBudget`]. Absent ⇒ the rule's effect is never budget-degraded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomy_budget: Option<AutonomyBudget>,
 }
 
 /// One `[[policy.tests]]` scenario: a self-contained assertion over the
@@ -2928,6 +2994,17 @@ pub fn validate_policy(config: &RockyConfig) -> Vec<ConfigError> {
         }
         if !rule.scope.any && !has_real {
             errors.push(ConfigError::PolicyScopeEmpty { rule_index: idx });
+        }
+        if let Some(budget) = &rule.autonomy_budget {
+            if budget.failures == 0 {
+                errors.push(ConfigError::PolicyBudgetZeroFailures { rule_index: idx });
+            }
+            if parse_window_duration(&budget.window).is_none() {
+                errors.push(ConfigError::PolicyBudgetInvalidWindow {
+                    rule_index: idx,
+                    window: budget.window.clone(),
+                });
+            }
         }
     }
     errors
@@ -6057,6 +6134,116 @@ effect = "allow"
 "#,
         );
         assert!(cfg.policy.unwrap().rules[0].verify_after.is_empty());
+    }
+
+    #[test]
+    fn policy_rule_parses_autonomy_budget() {
+        // `autonomy_budget` is a first-class typed field: it parses under
+        // `deny_unknown_fields` and validates clean.
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "schema_change.additive"
+scope = { layer = "bronze" }
+effect = "allow"
+verify_after = ["row_count_drift"]
+autonomy_budget = { failures = 3, window = "7d" }
+"#,
+        );
+        assert!(validate_policy(&cfg).is_empty());
+        let budget = cfg.policy.unwrap().rules[0]
+            .autonomy_budget
+            .clone()
+            .unwrap();
+        assert_eq!(budget.failures, 3);
+        assert_eq!(budget.window, "7d");
+    }
+
+    #[test]
+    fn policy_rule_without_autonomy_budget_defaults_none() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+"#,
+        );
+        assert!(cfg.policy.unwrap().rules[0].autonomy_budget.is_none());
+    }
+
+    #[test]
+    fn policy_budget_zero_failures_rejected() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+autonomy_budget = { failures = 0, window = "7d" }
+"#,
+        );
+        let errors = validate_policy(&cfg);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::PolicyBudgetZeroFailures { rule_index: 0 }]
+            ),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn policy_budget_invalid_window_rejected() {
+        let cfg = parse(
+            r#"
+[policy]
+version = 1
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+autonomy_budget = { failures = 2, window = "banana" }
+"#,
+        );
+        let errors = validate_policy(&cfg);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ConfigError::PolicyBudgetInvalidWindow { rule_index: 0, window }] if window == "banana"
+            ),
+            "got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn parse_window_duration_units_and_rejections() {
+        assert_eq!(parse_window_duration("7d"), chrono::Duration::try_days(7));
+        assert_eq!(
+            parse_window_duration("24h"),
+            chrono::Duration::try_hours(24)
+        );
+        assert_eq!(parse_window_duration("30D"), chrono::Duration::try_days(30));
+        assert!(parse_window_duration("0d").is_none());
+        assert!(parse_window_duration("-1d").is_none());
+        assert!(parse_window_duration("7").is_none());
+        assert!(parse_window_duration("7w").is_none());
+        assert!(parse_window_duration("").is_none());
+        assert!(parse_window_duration("d").is_none());
     }
 
     #[test]

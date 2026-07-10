@@ -6591,6 +6591,43 @@ pub struct PolicyTestResult {
     pub reason: String,
 }
 
+/// JSON output for `rocky policy freeze` / `rocky policy unfreeze` — the kill
+/// switch.
+///
+/// A freeze records a decision entry per matched principal into the existing
+/// policy-decision ledger; at the enforcement seam an active freeze forces
+/// `deny`. `unfreeze` records a superseding entry that lifts it. No config file
+/// is rewritten and no new table is created.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyFreezeOutput {
+    pub version: String,
+    /// `policy_freeze` or `policy_unfreeze`.
+    pub command: String,
+    /// `true` when this call lifted a freeze rather than establishing one.
+    pub lifted: bool,
+    /// The scope selector the freeze targets (`any`, `layer=…`, `tag=…`, …).
+    pub scope: String,
+    /// RFC 3339 wall clock when the freeze/unfreeze was recorded.
+    pub recorded_at: String,
+    /// One entry per affected principal.
+    pub entries: Vec<PolicyFreezeEntry>,
+}
+
+/// One principal's freeze/unfreeze record inside a [`PolicyFreezeOutput`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PolicyFreezeEntry {
+    /// The principal whose actions were frozen/unfrozen.
+    pub principal: rocky_core::config::PolicyPrincipal,
+    /// The recorded effect (`deny` for a freeze, `allow` for an unfreeze).
+    pub effect: rocky_core::config::PolicyEffect,
+    /// Composite ledger key citation (`"{timestamp}|{plan_id}|{scope}"`).
+    pub decision_ref: String,
+    /// The freeze decision's `plan_id`.
+    pub plan_id: String,
+    /// Human-readable description of the freeze/unfreeze.
+    pub reason: String,
+}
+
 /// JSON output for `rocky audit` — the agent-policy decision ledger.
 ///
 /// Lists every policy decision recorded at a mutating enforcement seam
@@ -6983,6 +7020,53 @@ pub struct BriefOutput {
     pub quality: BriefQualitySection,
     /// Cost and budget burn across the window's runs.
     pub cost: BriefCostSection,
+    /// Autonomy-budget degradations and active policy freezes — the dynamic
+    /// tightening currently in force across the estate.
+    pub autonomy: BriefAutonomySection,
+}
+
+/// Autonomy section — rules whose autonomy budget is currently exhausted
+/// (degraded to `require_review`) and policy freezes in force.
+///
+/// This is a *current-state* projection over the whole decision ledger — each
+/// budget uses its own configured window, independent of the digest's
+/// `--since`. It fails closed: `unavailable` when the ledger or config can't be
+/// read, `no_data` when nothing is degraded or frozen.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefAutonomySection {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Rules whose budget is exhausted right now — each auto-degraded to
+    /// `require_review` until its failures age out of the window.
+    pub degraded_rules: Vec<BriefDegradedRule>,
+    /// Policy freezes currently in force.
+    pub active_freezes: Vec<BriefActiveFreeze>,
+}
+
+/// A budget-exhausted (degraded) rule inside [`BriefAutonomySection`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefDegradedRule {
+    /// Index of the degraded `[[policy.rules]]` entry.
+    pub rule_id: usize,
+    /// Verify-after failures counted in the window.
+    pub failures: u64,
+    /// The rule's configured failure ceiling.
+    pub limit: u64,
+    /// The rule's configured window (`7d`, `24h`, …).
+    pub window: String,
+}
+
+/// An active policy freeze inside [`BriefAutonomySection`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefActiveFreeze {
+    pub principal: rocky_core::config::PolicyPrincipal,
+    /// The scope selector the freeze targets.
+    pub scope: String,
+    /// RFC 3339 wall clock when the freeze was recorded — the citation.
+    pub frozen_at: String,
+    /// The freeze decision's `plan_id`.
+    pub plan_id: String,
 }
 
 /// Agent-activity section — the policy-decision ledger rolled up by principal.
