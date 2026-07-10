@@ -1230,6 +1230,7 @@ pub(crate) async fn run_gc_apply_in(
     config_path: &Path,
     plan_id: &str,
     state_path: &Path,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
     json: bool,
 ) -> Result<()> {
     let plan_record =
@@ -1286,7 +1287,7 @@ pub(crate) async fn run_gc_apply_in(
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
-        plan_record.resolved_principal(),
+        plan_record.enforcement_principal(runtime_principal),
         &touched,
         &models_dir,
         state_path,
@@ -2235,9 +2236,16 @@ auto_create_schemas = true
         let config = dir.path().join("nonexistent.toml");
 
         // No marker → refuse.
-        let err = run_gc_apply_in(dir.path(), &config, &plan_id, &state_path, true)
-            .await
-            .expect_err("apply must refuse an unreviewed gc plan");
+        let err = run_gc_apply_in(
+            dir.path(),
+            &config,
+            &plan_id,
+            &state_path,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .expect_err("apply must refuse an unreviewed gc plan");
         assert!(err.to_string().contains("not been reviewed"), "got: {err}");
         {
             let store = StateStore::open(&state_path).unwrap();
@@ -2251,9 +2259,16 @@ auto_create_schemas = true
         let marker = crate::commands::apply::review_marker_path(dir.path(), &plan_id);
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, "{}").unwrap();
-        run_gc_apply_in(dir.path(), &config, &plan_id, &state_path, true)
-            .await
-            .unwrap();
+        run_gc_apply_in(
+            dir.path(),
+            &config,
+            &plan_id,
+            &state_path,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .unwrap();
 
         let store = StateStore::open(&state_path).unwrap();
         assert_eq!(store.list_tombstones().unwrap().len(), 1);

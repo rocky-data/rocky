@@ -68,19 +68,35 @@ pub async fn run_apply(
     config_path: &Path,
     plan_id: &str,
     state_path: &Path,
+    runtime_principal: PolicyPrincipal,
     output_json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    run_apply_in(&cwd, config_path, plan_id, state_path, output_json).await
+    run_apply_in(
+        &cwd,
+        config_path,
+        plan_id,
+        state_path,
+        runtime_principal,
+        output_json,
+    )
+    .await
 }
 
 /// Inner implementation — takes an explicit `root` for the plans directory so
 /// tests can pass a temp dir without touching the process-global cwd.
+///
+/// `runtime_principal` is the apply-time identity (`ROCKY_PRINCIPAL` resolved by
+/// the CLI) — the enforcement source. Each per-kind seam combines it
+/// most-restrictively with the plan's kind-forced principal (see
+/// [`PersistedPlan::enforcement_principal`]); the plan's stored `principal`
+/// field is never trusted for a gate decision.
 pub(crate) async fn run_apply_in(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
     state_path: &Path,
+    runtime_principal: PolicyPrincipal,
     output_json: bool,
 ) -> Result<()> {
     let plan =
@@ -97,22 +113,70 @@ pub(crate) async fn run_apply_in(
             run_archive_apply_in(root, config_path, plan_id, output_json).await
         }
         PlanKind::Run => {
-            run_apply_run_plan(root, config_path, plan_id, state_path, output_json).await
+            run_apply_run_plan(
+                root,
+                config_path,
+                plan_id,
+                state_path,
+                runtime_principal,
+                output_json,
+            )
+            .await
         }
         PlanKind::Replication => {
-            run_apply_replication_plan(root, config_path, plan_id, state_path, output_json).await
+            run_apply_replication_plan(
+                root,
+                config_path,
+                plan_id,
+                state_path,
+                runtime_principal,
+                output_json,
+            )
+            .await
         }
         PlanKind::Promote => {
-            run_apply_promote_plan(root, config_path, plan_id, state_path, output_json).await
+            run_apply_promote_plan(
+                root,
+                config_path,
+                plan_id,
+                state_path,
+                runtime_principal,
+                output_json,
+            )
+            .await
         }
         PlanKind::AiAuthored => {
-            run_apply_ai_authored_plan(root, config_path, plan_id, state_path, output_json).await
+            run_apply_ai_authored_plan(
+                root,
+                config_path,
+                plan_id,
+                state_path,
+                runtime_principal,
+                output_json,
+            )
+            .await
         }
         PlanKind::Backfill => {
-            run_apply_backfill_plan(root, config_path, plan_id, state_path, output_json).await
+            run_apply_backfill_plan(
+                root,
+                config_path,
+                plan_id,
+                state_path,
+                runtime_principal,
+                output_json,
+            )
+            .await
         }
         PlanKind::Gc => {
-            super::gc::run_gc_apply_in(root, config_path, plan_id, state_path, output_json).await
+            super::gc::run_gc_apply_in(
+                root,
+                config_path,
+                plan_id,
+                state_path,
+                runtime_principal,
+                output_json,
+            )
+            .await
         }
     }
 }
@@ -131,6 +195,7 @@ async fn run_apply_run_plan(
     config_path: &Path,
     plan_id: &str,
     state_path: &Path,
+    runtime_principal: PolicyPrincipal,
     output_json: bool,
 ) -> Result<()> {
     let plan =
@@ -148,17 +213,16 @@ async fn run_apply_run_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize run plan payload")?;
 
-    // policy seam 2: an agent-authored `Run` plan (`rocky plan --principal agent`,
-    // or `ROCKY_PRINCIPAL=agent`) is gated exactly like an AiAuthored plan when
-    // a `[policy]` block is configured. Absent `[policy]` this is a no-op —
-    // `Run` was never gated — so behaviour is byte-identical to today. A
-    // human-authored plan resolves to `allow` (humans are never gated in v0).
+    // policy seam 2: an agent running `rocky apply` (`ROCKY_PRINCIPAL=agent`) is
+    // gated as agent; a human applier resolves to human (humans are ungated in
+    // v0). Enforcement uses the apply-time runtime principal, not the plan's
+    // stored (tamperable) field. Absent `[policy]` this is a no-op.
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
     let executable = run_executable_models(models_dir, &run_plan);
     let touched = touched_models_for_run(&plan, &executable);
-    let principal = plan.resolved_principal();
+    let principal = plan.enforcement_principal(runtime_principal);
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
@@ -203,7 +267,7 @@ async fn run_apply_run_plan(
 /// Build the [`GovernedRunContext`] for a two-step apply — `Some` only for an
 /// AGENT principal (a human apply is ungated in v0 and stays byte-identical).
 fn governed_run_context<'a>(
-    plan: &PersistedPlan,
+    _plan: &PersistedPlan,
     principal: PolicyPrincipal,
     plan_id: &'a str,
     root: &'a Path,
@@ -217,7 +281,6 @@ fn governed_run_context<'a>(
         plan_id,
         root,
         config_path,
-        expected_models_fingerprint: plan.embedded_capabilities().models_fingerprint,
     })
 }
 
@@ -304,18 +367,16 @@ async fn execute_run_plan(
     // unification land separately. This preserves the parity-with-`rocky run`
     // shape for the alias-deprecation path.
     if run_plan.dag {
-        // The DAG runner does not thread the governance context, so enforce the
-        // TOCTOU models-drift reject here before dispatching (fail-closed). The
-        // replication gate is best-effort covered by the models-drift bind for
-        // the dag path; a fuller dag-path gate lands with the dag/flag
-        // unification.
-        if let Some(ctx) = governed_ctx {
-            let mdir = run_plan
-                .models_dir
-                .as_deref()
-                .map(Path::new)
-                .unwrap_or_else(|| Path::new("models"));
-            ctx.reject_on_models_drift(mdir)?;
+        // Fail-closed (D): the DAG runner dispatches sub-runs with NO governance
+        // context, so a governed (agent) DAG apply would execute every pipeline
+        // — including replication — UNGATED. Refuse loudly rather than run
+        // ungated until DAG sub-runs thread the governance context.
+        if governed_ctx.is_some() {
+            bail!(
+                "refusing to apply plan '{plan_id}' as an agent: a `--dag` apply is not yet \
+                 policy-gated (its sub-runs execute ungated). Re-plan without `--dag`, or have a \
+                 human apply it."
+            );
         }
         return crate::commands::run_with_dag(config_path, state_path, output_json)
             .await
@@ -889,73 +950,26 @@ fn touched_models_for_promote(
         .collect()
 }
 
-/// Content fingerprint of every file under `models_dir` — a blake3 digest over
-/// the sorted `(relative_path, bytes)` of each file.
-///
-/// Compile-config-independent (it hashes file bytes, not a compiled result), so
-/// the plan-time and execution-time fingerprints match exactly when the model
-/// files are unchanged. Any edit to a model's SQL/TOML, a new model file, or a
-/// deleted one changes the digest. `None` when the directory does not exist or
-/// cannot be walked (the caller then falls back to the pre-fingerprint gate).
-pub(crate) fn models_dir_fingerprint(models_dir: &Path) -> Option<String> {
-    if !models_dir.exists() {
-        return None;
-    }
-    // Depth-first collect every file's (relative path, bytes). A read error on
-    // any file yields `None` so the caller fails safe rather than hashing a
-    // partial view.
-    fn collect(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Option<()> {
-        let mut children: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-            .ok()?
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.path())
-            .collect();
-        children.sort();
-        for path in children {
-            if path.is_dir() {
-                collect(&path, base, out)?;
-            } else if path.is_file() {
-                let rel = path
-                    .strip_prefix(base)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .into_owned();
-                let bytes = std::fs::read(&path).ok()?;
-                out.push((rel, bytes));
-            }
-        }
-        Some(())
-    }
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-    collect(models_dir, models_dir, &mut entries)?;
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut hasher = blake3::Hasher::new();
-    for (rel, bytes) in &entries {
-        hasher.update(rel.as_bytes());
-        hasher.update(&[0u8]);
-        hasher.update(&(bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-    }
-    Some(hasher.finalize().to_hex().to_string())
-}
-
 /// Governance context threaded into `commands::run::run` for a two-step agent
-/// apply. When present (`Some`), `run` performs two extra fail-closed checks at
-/// the point of execution that a plan-time / apply-time gate cannot:
+/// apply. When present (`Some`), `run` performs the fail-closed **replication
+/// gate** at the point of execution: it evaluates the agent-policy plane over
+/// the concrete post-discovery replication target set (which the
+/// transformation-only apply gate never sees) and refuses a denied / unreviewed
+/// agent replication before any table is materialized.
 ///
-/// 1. **TOCTOU reject** — re-fingerprints the models dir and refuses to execute
-///    when it differs from `expected_models_fingerprint` (the content the plan
-///    authorized), so no model runs under authorization computed against
-///    different content.
-/// 2. **Replication gate** — evaluates the agent-policy plane over the concrete
-///    post-discovery replication target set (which the transformation-only
-///    apply gate never sees) and refuses a denied / unreviewed agent
-///    replication.
+/// `None` for bare `rocky run`, the DAG runner, inline execution, and every
+/// human apply (ungated in v0) → the gate does not run and behaviour is
+/// byte-identical.
 ///
-/// `None` for bare `rocky run`, the DAG runner, and inline execution → neither
-/// check runs and behaviour is byte-identical.
+/// NB: the gate/execute TOCTOU (a model's content changing between the
+/// plan-time authorization and execution) is NOT closed here — the round-3
+/// file-hash attempt was unsound (it hashed the state file under `models_dir`,
+/// self-invalidating). The sound fix (fingerprint the compiled IR projection at
+/// the single execution compile in `execute_models`) is a separate change; see
+/// the PR body.
 pub struct GovernedRunContext<'a> {
-    /// The plan's authoring principal (an agent plan evaluates as agent).
+    /// The enforcement principal for this apply (see
+    /// [`PersistedPlan::enforcement_principal`]).
     pub principal: PolicyPrincipal,
     /// The plan id the decision rows are recorded against, and the review
     /// marker the replication gate consults.
@@ -964,33 +978,9 @@ pub struct GovernedRunContext<'a> {
     pub root: &'a Path,
     /// The config the policy block loads from.
     pub config_path: &'a Path,
-    /// The models-dir content fingerprint the plan authorized (`None` on a
-    /// legacy plan → the TOCTOU reject is skipped).
-    pub expected_models_fingerprint: Option<String>,
 }
 
 impl GovernedRunContext<'_> {
-    /// Fail-closed TOCTOU reject: bail when the models dir the run is about to
-    /// execute no longer matches the fingerprint the plan authorized. A `None`
-    /// expected fingerprint (legacy plan) skips the check.
-    pub(crate) fn reject_on_models_drift(&self, models_dir: &Path) -> Result<()> {
-        let Some(expected) = self.expected_models_fingerprint.as_deref() else {
-            return Ok(());
-        };
-        let current = models_dir_fingerprint(models_dir);
-        if current.as_deref() != Some(expected) {
-            bail!(
-                "refusing to execute plan '{}': the models directory changed since the plan was \
-                 authorized and reviewed (content fingerprint mismatch). A model may have changed \
-                 (e.g. additive → breaking) or a new model added between planning and applying, so \
-                 the recorded authorization no longer covers what would execute. Re-plan with \
-                 `rocky plan` and (if AI-authored) re-review before applying.",
-                self.plan_id
-            );
-        }
-        Ok(())
-    }
-
     /// Fail-closed replication gate: evaluate the agent-policy plane over the
     /// concrete discovered replication target names and enforce the verdict
     /// before any replication SQL runs. A `NotConfigured` plane (no `[policy]`)
@@ -1351,6 +1341,7 @@ async fn run_apply_ai_authored_plan(
     config_path: &Path,
     plan_id: &str,
     state_path: &Path,
+    runtime_principal: PolicyPrincipal,
     output_json: bool,
 ) -> Result<()> {
     let plan = read_plan(root, plan_id)
@@ -1377,7 +1368,7 @@ async fn run_apply_ai_authored_plan(
     // `--model` selection), not the plan's informational `models` list.
     let executable = run_executable_models(models_dir, &run_plan);
     let touched = touched_models_for_run(&plan, &executable);
-    let principal = plan.resolved_principal();
+    let principal = plan.enforcement_principal(runtime_principal);
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
@@ -1448,6 +1439,7 @@ async fn run_apply_backfill_plan(
     config_path: &Path,
     plan_id: &str,
     state_path: &Path,
+    runtime_principal: PolicyPrincipal,
     output_json: bool,
 ) -> Result<()> {
     let plan = read_plan(root, plan_id)
@@ -1489,7 +1481,7 @@ async fn run_apply_backfill_plan(
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
-        plan.resolved_principal(),
+        plan.enforcement_principal(runtime_principal),
         &touched,
         models_dir,
         state_path,
@@ -1552,6 +1544,7 @@ async fn run_apply_replication_plan(
     config_path: &Path,
     plan_id: &str,
     state_path: &Path,
+    runtime_principal: PolicyPrincipal,
     output_json: bool,
 ) -> Result<()> {
     let plan = read_plan(root, plan_id)
@@ -1657,8 +1650,13 @@ async fn run_apply_replication_plan(
     // set inside `run` before any table is materialized (D). A pure replication
     // plan carries no models, so the fingerprint is absent and the TOCTOU reject
     // is a no-op.
-    let governed =
-        governed_run_context(&plan, plan.resolved_principal(), plan_id, root, config_path);
+    let governed = governed_run_context(
+        &plan,
+        plan.enforcement_principal(runtime_principal),
+        plan_id,
+        root,
+        config_path,
+    );
 
     crate::commands::run::run(
         config_path,
@@ -1942,6 +1940,7 @@ async fn run_apply_promote_plan(
     config_path: &Path,
     plan_id: &str,
     state_path: &Path,
+    runtime_principal: PolicyPrincipal,
     output_json: bool,
 ) -> Result<()> {
     use crate::output::print_json;
@@ -1965,7 +1964,7 @@ async fn run_apply_promote_plan(
         root,
         config_path,
         plan_id,
-        plan.resolved_principal(),
+        plan.enforcement_principal(runtime_principal),
         &promote_plan,
         state_path,
     )?;
@@ -2228,6 +2227,7 @@ mod tests {
             std::path::Path::new("rocky.toml"),
             &plan_id,
             std::path::Path::new("models/.rocky-state.redb"),
+            PolicyPrincipal::Human,
             true,
         )
         .await
@@ -2280,35 +2280,20 @@ models = "models/**"
 auto_create_schemas = true
 "#;
 
-    /// Rewrite a just-written plan file to look like a genuinely *legacy* plan:
-    /// strip the `principal` field (as if written before the policy plane) AND
-    /// recompute the `plan_id` the way the old binary did — over
-    /// `{kind, payload}` with **no** principal — so the integrity check still
-    /// passes. The file is renamed to the recomputed legacy id, which is
-    /// returned. (Since the principal is now part of the digest, simply
-    /// deleting the field would invalidate the id — that is exactly the tamper
-    /// protection under test elsewhere.)
-    fn strip_principal_from_plan(root: &Path, plan_id: &str) -> anyhow::Result<String> {
-        let plans = root.join(".rocky").join("plans");
-        let path = plans.join(format!("{plan_id}.json"));
+    /// Rewrite a just-written plan file to look like a *legacy* plan: strip the
+    /// `principal` field (as if written before the policy plane). The `plan_id`
+    /// is unchanged because `principal` rides outside the digest, so the
+    /// integrity check still passes on read.
+    fn strip_principal_from_plan(root: &Path, plan_id: &str) -> anyhow::Result<()> {
+        let path = root
+            .join(".rocky")
+            .join("plans")
+            .join(format!("{plan_id}.json"));
         let raw = std::fs::read_to_string(&path)?;
         let mut v: serde_json::Value = serde_json::from_str(&raw)?;
-        let obj = v.as_object_mut().unwrap();
-        obj.remove("principal");
-        let kind: crate::plan_store::PlanKind =
-            serde_json::from_value(obj.get("kind").unwrap().clone())?;
-        let payload = obj.get("payload").unwrap().clone();
-        let legacy_id = crate::plan_store::compute_plan_id(&kind, None, &payload);
-        obj.insert(
-            "plan_id".to_string(),
-            serde_json::Value::String(legacy_id.clone()),
-        );
-        std::fs::remove_file(&path)?;
-        std::fs::write(
-            plans.join(format!("{legacy_id}.json")),
-            serde_json::to_vec_pretty(&v)?,
-        )?;
-        Ok(legacy_id)
+        v.as_object_mut().unwrap().remove("principal");
+        std::fs::write(&path, serde_json::to_vec_pretty(&v)?)?;
+        Ok(())
     }
 
     /// 🔴 THE load-bearing regression: a legacy `ai_authored` plan file with NO
@@ -2345,9 +2330,7 @@ auto_create_schemas = true
         rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
         rp.models = vec!["orders".to_string()];
         let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
-        // Turn it into a genuinely-legacy (unstamped) plan with a valid legacy
-        // id — the returned id is the one apply must be invoked with.
-        let plan_id = strip_principal_from_plan(dir.path(), &plan_id)?;
+        strip_principal_from_plan(dir.path(), &plan_id)?;
 
         let state = dir.path().join("state.redb");
         let err = super::run_apply_ai_authored_plan(
@@ -2355,6 +2338,7 @@ auto_create_schemas = true
             &dir.path().join("rocky.toml"),
             &plan_id,
             &state,
+            PolicyPrincipal::Human,
             true,
         )
         .await
@@ -2386,6 +2370,7 @@ auto_create_schemas = true
             &dir.path().join("rocky.toml"),
             &plan_id,
             &state,
+            PolicyPrincipal::Human,
             true,
         )
         .await
@@ -3287,88 +3272,6 @@ auto_create_schemas = true
         );
     }
 
-    /// `models_dir_fingerprint` is stable for unchanged files and changes when
-    /// any model file changes or a new one is added.
-    #[test]
-    fn models_dir_fingerprint_tracks_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        write_min_model(&models_dir, "orders");
-        let fp1 = super::models_dir_fingerprint(&models_dir).expect("fingerprint");
-        // Stable across re-reads of the same content.
-        assert_eq!(
-            fp1,
-            super::models_dir_fingerprint(&models_dir).unwrap(),
-            "unchanged files must fingerprint identically"
-        );
-        // A new model changes it.
-        write_min_model(&models_dir, "customers");
-        assert_ne!(
-            fp1,
-            super::models_dir_fingerprint(&models_dir).unwrap(),
-            "adding a model must change the fingerprint"
-        );
-        // Editing a model's SQL changes it.
-        std::fs::write(models_dir.join("orders.sql"), "SELECT 2 AS id").unwrap();
-        let fp3 = super::models_dir_fingerprint(&models_dir).unwrap();
-        write_min_model(&models_dir, "customers"); // no-op rewrite
-        assert_eq!(fp3, super::models_dir_fingerprint(&models_dir).unwrap());
-    }
-
-    /// 🔴 E regression (TOCTOU): a model changed between plan authoring and
-    /// execution must be REFUSED. `GovernedRunContext::reject_on_models_drift`
-    /// is the in-run check `run()` calls before executing. Pre-fix there was no
-    /// such check and the changed content executed under the stale
-    /// authorization.
-    #[test]
-    fn toctou_reject_fires_when_models_change_after_planning() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        write_min_model(&models_dir, "orders");
-        let config = dir.path().join("rocky.toml");
-        // The fingerprint the plan authorized.
-        let expected = super::models_dir_fingerprint(&models_dir);
-        let ctx = super::GovernedRunContext {
-            principal: PolicyPrincipal::Agent,
-            plan_id: "plan_x",
-            root: dir.path(),
-            config_path: &config,
-            expected_models_fingerprint: expected,
-        };
-        // Unchanged → proceeds.
-        ctx.reject_on_models_drift(&models_dir)
-            .expect("unchanged models must not be rejected");
-
-        // A model changes additive→breaking (rewrite the SQL) → REJECT.
-        std::fs::write(models_dir.join("orders.sql"), "SELECT 1 AS id, 2 AS extra").unwrap();
-        let err = ctx
-            .reject_on_models_drift(&models_dir)
-            .expect_err("a models-dir change must be rejected (TOCTOU)");
-        assert!(
-            err.to_string().contains("fingerprint mismatch"),
-            "reject must cite the fingerprint mismatch, got: {err}"
-        );
-    }
-
-    /// A legacy plan (no bound fingerprint) skips the TOCTOU reject.
-    #[test]
-    fn toctou_reject_is_skipped_without_a_bound_fingerprint() {
-        let dir = tempfile::tempdir().unwrap();
-        let models_dir = dir.path().join("models");
-        write_min_model(&models_dir, "orders");
-        let config = dir.path().join("rocky.toml");
-        let ctx = super::GovernedRunContext {
-            principal: PolicyPrincipal::Agent,
-            plan_id: "plan_x",
-            root: dir.path(),
-            config_path: &config,
-            expected_models_fingerprint: None,
-        };
-        std::fs::write(models_dir.join("orders.sql"), "SELECT 999 AS id").unwrap();
-        ctx.reject_on_models_drift(&models_dir)
-            .expect("no bound fingerprint ⇒ no reject (legacy plan)");
-    }
-
     /// 🔴 D regression: the discovered replication target set is gated. An
     /// agent replication under `deny agent apply { any }` must be refused before
     /// any table materializes. Pre-fix the replication set was never
@@ -3393,7 +3296,6 @@ effect = "deny"
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config,
-            expected_models_fingerprint: None,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         let err = ctx
@@ -3436,7 +3338,6 @@ effect = "allow"
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &config,
-            expected_models_fingerprint: None,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
 
@@ -3481,11 +3382,45 @@ effect = "allow"
             plan_id: "plan_x",
             root: dir.path(),
             config_path: &dir.path().join("rocky.toml"),
-            expected_models_fingerprint: None,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         ctx.gate_replication_targets(&targets, &ledger)
             .expect("no [policy] block ⇒ replication gate is a no-op");
+        Ok(())
+    }
+
+    /// 🔴 D (DAG) regression: a governed (agent) `--dag` apply is REFUSED,
+    /// because the DAG runner dispatches sub-runs with no governance context and
+    /// would execute (incl. replication) ungated. Pre-fix an agent dag apply ran
+    /// every pipeline unpoliced. A human dag apply is unaffected (governed_ctx
+    /// is None for a human).
+    #[tokio::test]
+    async fn governed_dag_apply_is_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // No `[policy]` block → the apply gate is NotConfigured (passes); the
+        // refusal is the DAG-governed guard, not a policy deny.
+        std::fs::write(dir.path().join("rocky.toml"), NO_POLICY_TOML)?;
+        let mut rp = minimal_run_plan();
+        rp.dag = true;
+        let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
+        let state = dir.path().join("state.redb");
+
+        // Applied by an AGENT (runtime principal) → governed_ctx is Some → dag
+        // apply is refused before dispatching.
+        let err = super::run_apply_run_plan(
+            dir.path(),
+            &dir.path().join("rocky.toml"),
+            &plan_id,
+            &state,
+            PolicyPrincipal::Agent,
+            true,
+        )
+        .await
+        .expect_err("an agent --dag apply must be refused");
+        assert!(
+            err.to_string().contains("not yet policy-gated"),
+            "must refuse the governed dag apply, got: {err}"
+        );
         Ok(())
     }
 

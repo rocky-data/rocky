@@ -2756,7 +2756,20 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     let result: Result<()> = match cli.command {
         Command::Init { path, template } => rocky_cli::commands::init(&path, Some(&template)),
         Command::Apply { plan_id } => {
-            rocky_cli::commands::run_apply(&cli.config, &plan_id, &state_path, json).await
+            // The enforcement principal is the apply-time runtime identity
+            // (`--principal` / `ROCKY_PRINCIPAL`), NOT the plan's stored field:
+            // an agent running `rocky apply` is gated as agent regardless of the
+            // (tamperable) plan file. Combined most-restrictively with the
+            // plan's kind-forced principal inside each seam.
+            let runtime_principal = resolve_cli_principal(cli.principal)?;
+            rocky_cli::commands::run_apply(
+                &cli.config,
+                &plan_id,
+                &state_path,
+                runtime_principal,
+                json,
+            )
+            .await
         }
         Command::Review {
             plan_id,

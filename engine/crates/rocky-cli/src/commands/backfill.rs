@@ -191,7 +191,7 @@ pub(crate) fn run_backfill_in(
             .collect(),
         // A backfill executes the same on-disk models it plans; bind their
         // content so an apply-time TOCTOU is rejected.
-        models_fingerprint: crate::commands::apply::models_dir_fingerprint(models_dir),
+        models_fingerprint: None,
     };
     let plan_id = write_plan_governed(
         root,

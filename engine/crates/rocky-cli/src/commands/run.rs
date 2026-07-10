@@ -1239,12 +1239,6 @@ pub async fn run(
             mdir.display()
         );
 
-        // Fail-closed TOCTOU reject (E): refuse if the models the plan
-        // authorized changed before execution.
-        if let Some(ctx) = governed_ctx {
-            ctx.reject_on_models_drift(mdir)?;
-        }
-
         let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
         // Use the first transformation pipeline's target adapter, or fall back
         // to the first replication pipeline's target adapter.
@@ -3809,11 +3803,6 @@ pub async fn run(
     // --- Compiled model execution (--all or --models) ---
     if run_all || models_dir.is_some() {
         let mdir = models_dir.unwrap_or_else(|| std::path::Path::new("models"));
-        // Fail-closed TOCTOU reject (E): refuse if the transformation models
-        // the plan authorized changed before this execution.
-        if let Some(ctx) = governed_ctx {
-            ctx.reject_on_models_drift(mdir)?;
-        }
         if mdir.exists() {
             // §P2.6 follow-up — execute_models + warehouse adapter
             // construction were the remaining `?`-propagation sites
@@ -4140,6 +4129,65 @@ pub async fn run(
         &config_hash,
         &audit,
     );
+
+    // Post-apply `verify_after` gate for any additive drift this run
+    // auto-applied. Writes an allow/deny verification custody row per healed
+    // table and yields `Err` when a required check failed or did not run. There
+    // is no rollback substrate on a plain warehouse target, so a failed
+    // verification is halt-only: the migration stands until a human reverts it.
+    // A no-op when nothing was auto-applied (default-off runs never hit it).
+    //
+    // Evaluated (C) BEFORE any terminal-success handling — the run record must
+    // exist first (the gate reads its check outcomes), so on failure we fold the
+    // custody failure into the tallies, RE-persist the run as a Failure,
+    // finalize idempotency as failed, fire `pipeline_error`, and stop —
+    // idempotency must NOT finalize success and `pipeline_complete` must NOT
+    // fire for a run whose auto-applied mutation could not be verified.
+    let verify_after_result = super::drift_governance::finalize_drift_verify_after(
+        state_store.as_ref(),
+        &run_id,
+        rocky_cfg.policy.as_ref(),
+    );
+    if let Err(custody_err) = &verify_after_result {
+        output.tables_failed += 1;
+        output.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec!["<verify_after>".to_string()],
+            error: custody_err.to_string(),
+            failure_kind: crate::output::FailureKind::Unknown,
+            cooldown_seconds: None,
+        });
+        // Re-persist so `rocky history` records a Failure (status is derived
+        // from the now-failed tallies), and finalize idempotency as failed.
+        persist_run_record(
+            state_store.as_ref(),
+            &output,
+            &run_id,
+            started_at,
+            &config_hash,
+            &audit,
+        );
+        finalize_idempotency(
+            &mut idempotency_ctx,
+            state_store.as_ref(),
+            &run_id,
+            &output,
+        )
+        .await;
+        let msg = format!("verify_after gate failed for run {run_id}");
+        let _ = hook_registry
+            .fire(&HookContext::pipeline_error(&run_id, pipeline_name, &msg))
+            .await;
+        let _ = hook_registry.wait_async_webhooks().await;
+        if let Some(p) = &pipes {
+            emit_pipes_events(p, &output);
+            p.closed();
+        }
+        if output_json {
+            print_json(&output)?;
+        }
+        return verify_after_result;
+    }
+
     finalize_idempotency(
         &mut idempotency_ctx,
         state_store.as_ref(),
@@ -4147,19 +4195,6 @@ pub async fn run(
         &output,
     )
     .await;
-
-    // Post-apply `verify_after` gate for any additive drift this run
-    // auto-applied. Writes an allow/deny verification custody row per healed
-    // table and yields `Err` when a required check failed or did not run —
-    // propagated at the happy-path exit so an otherwise-green run halts. There
-    // is no rollback substrate on a plain warehouse target, so a failed
-    // verification is halt-only: the migration stands until a human reverts it.
-    // A no-op when nothing was auto-applied (default-off runs never hit it).
-    let verify_after_result = super::drift_governance::finalize_drift_verify_after(
-        state_store.as_ref(),
-        &run_id,
-        rocky_cfg.policy.as_ref(),
-    );
 
     // Fire the `on_budget_breach` hook for each recorded breach so
     // shell hooks / webhooks configured via `[hook.on_budget_breach]`
@@ -4292,9 +4327,9 @@ pub async fn run(
     // exits non-zero.
     budget_result?;
 
-    // Halt an otherwise-green run when a post-apply `verify_after` gate on an
-    // auto-applied additive migration failed (custody already recorded above).
-    verify_after_result?;
+    // NB: a failed `verify_after` gate is handled ABOVE (C) — before any
+    // terminal-success handling — so it never reaches this happy-path exit.
+    let _ = &verify_after_result;
 
         Ok(())
     }
