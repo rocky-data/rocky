@@ -128,12 +128,30 @@ impl SqlDialect for BigQueryDialect {
     }
 
     fn describe_table_sql(&self, table_ref: &str) -> String {
-        // BigQuery doesn't have DESCRIBE; use INFORMATION_SCHEMA
-        format!(
-            "SELECT column_name, data_type, is_nullable \
-             FROM `INFORMATION_SCHEMA`.`COLUMNS` \
-             WHERE table_name = '{table_ref}'"
-        )
+        // BigQuery doesn't have DESCRIBE; use INFORMATION_SCHEMA.COLUMNS.
+        // The view lives per-dataset (a bare `INFORMATION_SCHEMA.COLUMNS`
+        // doesn't resolve) and its `table_name` column holds the bare table
+        // name. `table_ref` arrives as this dialect's own `format_table_ref`
+        // output (`` `project`.`dataset`.`table` ``, every segment validated,
+        // so none contains a dot or backtick) — split it back apart.
+        let parts: Vec<&str> = table_ref.split('.').map(|p| p.trim_matches('`')).collect();
+        match parts.as_slice() {
+            [project, dataset, table] => format!(
+                "SELECT column_name, data_type, is_nullable \
+                 FROM `{project}`.`{dataset}`.INFORMATION_SCHEMA.COLUMNS \
+                 WHERE table_name = '{table}'"
+            ),
+            [dataset, table] => format!(
+                "SELECT column_name, data_type, is_nullable \
+                 FROM `{dataset}`.INFORMATION_SCHEMA.COLUMNS \
+                 WHERE table_name = '{table}'"
+            ),
+            _ => format!(
+                "SELECT column_name, data_type, is_nullable \
+                 FROM INFORMATION_SCHEMA.COLUMNS \
+                 WHERE table_name = '{table_ref}'"
+            ),
+        }
     }
 
     fn drop_table_sql(&self, table_ref: &str) -> String {
@@ -572,6 +590,35 @@ mod tests {
         assert_eq!(
             d.tablesample_clause(10).unwrap(),
             "TABLESAMPLE SYSTEM (10 PERCENT)"
+        );
+    }
+
+    #[test]
+    fn describe_table_sql_qualifies_information_schema_by_dataset() {
+        // BigQuery's INFORMATION_SCHEMA.COLUMNS is per-dataset and its
+        // `table_name` column holds the bare table name — a bare
+        // `INFORMATION_SCHEMA.COLUMNS` view doesn't resolve, and matching
+        // against the full quoted ref returns zero rows.
+        let d = BigQueryDialect;
+        let table_ref = d
+            .format_table_ref("my-project", "analytics", "orders")
+            .unwrap();
+        assert_eq!(
+            d.describe_table_sql(&table_ref),
+            "SELECT column_name, data_type, is_nullable \
+             FROM `my-project`.`analytics`.INFORMATION_SCHEMA.COLUMNS \
+             WHERE table_name = 'orders'"
+        );
+    }
+
+    #[test]
+    fn describe_table_sql_handles_dataset_qualified_ref() {
+        let d = BigQueryDialect;
+        assert_eq!(
+            d.describe_table_sql("`analytics`.`orders`"),
+            "SELECT column_name, data_type, is_nullable \
+             FROM `analytics`.INFORMATION_SCHEMA.COLUMNS \
+             WHERE table_name = 'orders'"
         );
     }
 

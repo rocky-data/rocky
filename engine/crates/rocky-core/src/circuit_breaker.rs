@@ -335,13 +335,26 @@ mod tests {
     }
 
     #[test]
-    fn test_half_open_after_timeout() {
-        // Threshold 2 so the counter-reset post-recovery is observable:
-        // one follow-up failure should NOT re-trip.
-        let cb = CircuitBreaker::with_recovery_timeout(2, Duration::from_millis(30));
+    fn test_stays_open_before_recovery_timeout() {
+        // Generous timeout: the assert runs immediately after tripping, and
+        // a short (e.g. 30ms) window flakes on a loaded CI runner — any
+        // scheduling stall between the trip and the check crosses it and
+        // the breaker legitimately reaches HalfOpen.
+        let cb = CircuitBreaker::with_recovery_timeout(2, Duration::from_secs(60));
         cb.record_failure("boom 1");
         assert_eq!(cb.record_failure("boom 2"), TransitionOutcome::Tripped);
         assert!(cb.check().is_err(), "still Open before timeout");
+    }
+
+    #[test]
+    fn test_half_open_after_timeout() {
+        // Threshold 2 so the counter-reset post-recovery is observable:
+        // one follow-up failure should NOT re-trip. (The pre-timeout Open
+        // assertion lives in `test_stays_open_before_recovery_timeout` —
+        // with a 30ms window it would race the wall clock here.)
+        let cb = CircuitBreaker::with_recovery_timeout(2, Duration::from_millis(30));
+        cb.record_failure("boom 1");
+        assert_eq!(cb.record_failure("boom 2"), TransitionOutcome::Tripped);
 
         std::thread::sleep(Duration::from_millis(40));
         assert!(cb.check().is_ok(), "HalfOpen should let trial through");
