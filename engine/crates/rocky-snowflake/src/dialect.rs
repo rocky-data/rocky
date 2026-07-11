@@ -153,6 +153,10 @@ impl SqlDialect for SnowflakeSqlDialect {
 
         for mc in metadata {
             validation::validate_identifier(&mc.name).map_err(AdapterError::new)?;
+            // Validate `data_type` before interpolating it raw into the CAST
+            // (same guard as `alter_column_type_sql`) — a metadata `type` from
+            // a hostile config must not break out of the cast expression.
+            rocky_core::sql_gen::validate_sql_type(&mc.data_type).map_err(AdapterError::new)?;
             // Snowflake uses :: for casting: value::TYPE. Quote the output
             // alias so the materialized metadata column is stored
             // lowercase-preserving, consistent with the quoted column path

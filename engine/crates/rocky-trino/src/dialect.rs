@@ -99,10 +99,19 @@ impl SqlDialect for TrinoDialect {
         if metadata.is_empty() {
             return Ok(base);
         }
-        let meta_cols: Vec<String> = metadata
-            .iter()
-            .map(|m| format!("CAST({} AS {}) AS {}", m.value, m.data_type, m.name))
-            .collect();
+        // `name` and `data_type` are both interpolated raw into the CAST — the
+        // other dialects validate them and this one did not, so a metadata
+        // block from a hostile config could inject here. Validate both (the
+        // trusted `value` expression is intentionally left as-is).
+        let mut meta_cols: Vec<String> = Vec::with_capacity(metadata.len());
+        for m in metadata {
+            validation::validate_identifier(&m.name).map_err(AdapterError::new)?;
+            rocky_core::sql_gen::validate_sql_type(&m.data_type).map_err(AdapterError::new)?;
+            meta_cols.push(format!(
+                "CAST({} AS {}) AS {}",
+                m.value, m.data_type, m.name
+            ));
+        }
         Ok(format!("{base}, {}", meta_cols.join(", ")))
     }
 
@@ -284,6 +293,25 @@ mod tests {
         }];
         let sql = d.select_clause(&ColumnSelection::All, &meta).unwrap();
         assert!(sql.contains("CAST(NULL AS VARCHAR) AS _loaded_by"));
+    }
+
+    #[test]
+    fn select_clause_rejects_injection_in_metadata_type_and_name() {
+        let d = TrinoDialect::new();
+        // A hostile `data_type` that tries to break out of the CAST.
+        let bad_type = vec![MetadataColumn {
+            name: "_loaded_by".to_string(),
+            data_type: "VARCHAR) AS x, (SELECT secret FROM creds) AS leak --".to_string(),
+            value: "NULL".to_string(),
+        }];
+        assert!(d.select_clause(&ColumnSelection::All, &bad_type).is_err());
+        // A hostile alias `name`.
+        let bad_name = vec![MetadataColumn {
+            name: "x, (SELECT 1) AS y".to_string(),
+            data_type: "VARCHAR".to_string(),
+            value: "NULL".to_string(),
+        }];
+        assert!(d.select_clause(&ColumnSelection::All, &bad_name).is_err());
     }
 
     #[test]

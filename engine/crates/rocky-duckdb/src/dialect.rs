@@ -139,6 +139,10 @@ impl SqlDialect for DuckDbSqlDialect {
 
         for mc in metadata {
             validation::validate_identifier(&mc.name).map_err(AdapterError::new)?;
+            // Validate `data_type` before interpolating it raw into the CAST
+            // (same guard as the drift path) — a metadata `type` from a
+            // hostile config must not break out of the cast expression.
+            rocky_core::sql_gen::validate_sql_type(&mc.data_type).map_err(AdapterError::new)?;
             write!(
                 sql,
                 ", CAST({} AS {}) AS {}",

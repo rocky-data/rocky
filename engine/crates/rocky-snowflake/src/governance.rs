@@ -248,8 +248,12 @@ fn format_set_tags_sql(
         .iter()
         .map(|(k, v)| {
             validation::validate_identifier(k).map_err(AdapterError::new)?;
-            // Escape single quotes in tag values.
-            let escaped = v.replace('\'', "''");
+            // Snowflake string literals honor backslash escapes by default, so
+            // doubling quotes alone is bypassable: a leading `\` escapes the
+            // first quote of a `''` pair, letting the second close the literal.
+            // Escape backslashes FIRST (so we don't double-escape the ones we
+            // add), then single quotes — closing the quote-doubling bypass.
+            let escaped = v.replace('\\', "\\\\").replace('\'', "''");
             Ok(format!("{k} = '{escaped}'"))
         })
         .collect::<AdapterResult<Vec<_>>>()?;
@@ -462,6 +466,20 @@ mod tests {
         assert_eq!(
             sql,
             "ALTER DATABASE my_database SET TAG managed_by = 'rocky'"
+        );
+    }
+
+    #[test]
+    fn test_set_tags_escapes_backslash_before_quote() {
+        // Snowflake honors backslash escapes, so `\'` would otherwise let a
+        // doubled `''` be split and the literal terminated early. Escaping
+        // backslashes first neutralizes the bypass: `\` → `\\`, `'` → `''`.
+        let mut tags = BTreeMap::new();
+        tags.insert("note".into(), "\\'; DROP TABLE x; --".into());
+        let sql = format_set_tags_sql(&TagTarget::Catalog("db".into()), &tags).unwrap();
+        assert_eq!(
+            sql,
+            "ALTER DATABASE db SET TAG note = '\\\\''; DROP TABLE x; --'"
         );
     }
 

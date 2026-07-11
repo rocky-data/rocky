@@ -103,10 +103,18 @@ impl SqlDialect for BigQueryDialect {
             return Ok(base);
         }
 
-        let meta_cols: Vec<String> = metadata
-            .iter()
-            .map(|m| format!("CAST({} AS {}) AS {}", m.value, m.data_type, m.name))
-            .collect();
+        // `name` and `data_type` are interpolated raw into the CAST — validate
+        // both (same guards used elsewhere) so a metadata block from a hostile
+        // config can't inject; the trusted `value` expression is left as-is.
+        let mut meta_cols: Vec<String> = Vec::with_capacity(metadata.len());
+        for m in metadata {
+            validation::validate_identifier(&m.name).map_err(AdapterError::new)?;
+            rocky_core::sql_gen::validate_sql_type(&m.data_type).map_err(AdapterError::new)?;
+            meta_cols.push(format!(
+                "CAST({} AS {}) AS {}",
+                m.value, m.data_type, m.name
+            ));
+        }
 
         Ok(format!("{base}, {}", meta_cols.join(", ")))
     }
