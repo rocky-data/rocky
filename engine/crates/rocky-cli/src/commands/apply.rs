@@ -1158,9 +1158,11 @@ pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> S
 ///   role reconcile applies (finding #2: a `SELECT → MANAGE` permission edit
 ///   changes this); `None` when the graph is malformed (deterministic on both
 ///   sides);
-/// - the `[cache.schemas]` selection policy — an agent-controlled on-disk toggle
-///   that changes whether apply resolves concrete `typed_columns` vs `Unknown`
-///   (finding #4a).
+/// - the `[cache.schemas]` **selection toggle** (`enabled`) — an agent-controlled
+///   on-disk switch that changes whether apply resolves concrete `typed_columns`
+///   vs `Unknown` (finding #4a). Only the boolean toggle is bound, NOT the whole
+///   struct: `ttl` can be env-var-templated, which would re-introduce the #5
+///   cross-process false-refuse; `enabled` is a closed boolean.
 ///
 /// Advisory `[classifications]` is **excluded by design** (finding #5): it drives
 /// no warehouse action (W004-only) and its env-var-templated `allow_unmasked`
@@ -1179,7 +1181,7 @@ pub(crate) fn governance_policy_identity(
     serde_json::to_value(serde_json::json!({
         "mask": mask,
         "roles": roles,
-        "cache_schemas": cfg.cache.schemas,
+        "cache_schemas_enabled": cfg.cache.schemas.enabled,
     }))
     .map(|v| v.to_string())
     .unwrap_or_default()
