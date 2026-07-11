@@ -170,6 +170,31 @@ def test_verify_version_accepts_dev_suffix_at_or_above_floor():
     assert client._version_checked is True
 
 
+def test_verify_version_accepts_two_component_version_at_floor():
+    """A short "X.Y" version compares as "X.Y.0", not below it."""
+    client = RockyClient(binary_path="rocky")
+    completed = MagicMock(stdout="rocky 1.34\n")
+    with (
+        patch("rocky_sdk.client.shutil.which", return_value="/bin/rocky"),
+        patch("rocky_sdk.client.subprocess.run", return_value=completed),
+    ):
+        client._verify_engine_version()  # no raise
+    assert client._version_checked is True
+
+
+def test_verify_version_enforces_despite_trailing_build_metadata():
+    """ "rocky 1.2.0 (abc123)" must still be gated, not silently skipped."""
+    client = RockyClient(binary_path="rocky")
+    completed = MagicMock(stdout="rocky 1.2.0 (abc123)\n")
+    with (
+        patch("rocky_sdk.client.shutil.which", return_value="/bin/rocky"),
+        patch("rocky_sdk.client.subprocess.run", return_value=completed),
+        pytest.raises(RockyVersionError) as exc,
+    ):
+        client._verify_engine_version()
+    assert exc.value.min_version == "1.34.0"
+
+
 def test_verify_version_missing_binary():
     client = RockyClient(binary_path="rocky")
     with (

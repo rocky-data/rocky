@@ -365,15 +365,23 @@ class RockyClient:
             self._version_checked = True
             return
 
-        # Strip pre-release / build suffix so dev builds (``1.17.4-dev``,
+        # First whitespace-delimited token is the version — trailing build
+        # metadata like "1.34.0 (abc123)" must not defeat the gate. Then
+        # strip pre-release / build suffix so dev builds (``1.17.4-dev``,
         # ``1.17.4+sha.abc``) gate against the matching release.
-        core_version = version_str.split("-", 1)[0].split("+", 1)[0]
+        core_version = version_str.split()[0].split("-", 1)[0].split("+", 1)[0]
         try:
             detected = tuple(int(p) for p in core_version.split(".")[:3])
             required = tuple(int(p) for p in MIN_ROCKY_VERSION.split(".")[:3])
         except ValueError:
             self._version_checked = True
             return
+
+        # Pad both sides to three components so a short version ("1.34")
+        # compares as its semver equivalent ("1.34.0") — tuple comparison
+        # would otherwise sort (1, 34) below (1, 34, 0) and reject it.
+        detected += (0,) * (3 - len(detected))
+        required += (0,) * (3 - len(required))
 
         if detected < required:
             raise RockyVersionError(version_str, MIN_ROCKY_VERSION, binary)
