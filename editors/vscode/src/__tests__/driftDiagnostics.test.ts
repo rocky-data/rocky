@@ -292,9 +292,14 @@ describe("diagnostic mapping", () => {
     openCallback!(mockDoc);
 
     // Wait for the async refreshDiagnostics to complete.
-    await vi.waitFor(() => {
-      expect(mockDiagnosticCollection.set).toHaveBeenCalled();
-    });
+    // 2s timeout: the open/save path is debounced 500ms, so the default
+    // 1s poll deadline leaves only 2× headroom and races a CI stall.
+    await vi.waitFor(
+      () => {
+        expect(mockDiagnosticCollection.set).toHaveBeenCalled();
+      },
+      { timeout: 2000 },
+    );
 
     const [uri, diags] = mockDiagnosticCollection.set.mock.calls[0];
     expect(uri.fsPath).toBe("/project/models/my_model.sql");
@@ -373,9 +378,13 @@ describe("diagnostic mapping", () => {
 
     openCallback!(mockDoc);
 
-    await vi.waitFor(() => {
-      expect(mockDiagnosticCollection.delete).toHaveBeenCalledWith(mockDoc.uri);
-    });
+    // 2s timeout: the debounced 500ms refresh races the default 1s poll.
+    await vi.waitFor(
+      () => {
+        expect(mockDiagnosticCollection.delete).toHaveBeenCalledWith(mockDoc.uri);
+      },
+      { timeout: 2000 },
+    );
   });
 
   it("filters diagnostics to the current model only", async () => {
@@ -433,9 +442,14 @@ describe("diagnostic mapping", () => {
 
     openCallback!(mockDoc);
 
-    await vi.waitFor(() => {
-      expect(mockDiagnosticCollection.set).toHaveBeenCalled();
-    });
+    // 2s timeout: the open/save path is debounced 500ms, so the default
+    // 1s poll deadline leaves only 2× headroom and races a CI stall.
+    await vi.waitFor(
+      () => {
+        expect(mockDiagnosticCollection.set).toHaveBeenCalled();
+      },
+      { timeout: 2000 },
+    );
 
     const [, diags] = mockDiagnosticCollection.set.mock.calls[0];
     expect(diags).toHaveLength(1);

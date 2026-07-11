@@ -85,7 +85,9 @@ async fn circuit_cooldown_transitions_to_half_open() {
         .unwrap();
     assert_eq!(cb.state("acct").await.unwrap(), CircuitState::Open);
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Sleep 4× the cooldown (safe direction — extra slowness only makes the
+    // HalfOpen transition more certain), not the borderline 2× that flakes.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(cb.state("acct").await.unwrap(), CircuitState::HalfOpen);
 }
 
@@ -107,7 +109,13 @@ async fn circuit_half_open_success_closes_breaker() {
 }
 
 #[tokio::test]
-async fn circuit_half_open_failure_reopens_with_extended_cooldown() {
+async fn circuit_reopens_immediately_on_half_open_failure() {
+    // The "a HalfOpen failure returns to Open" invariant, tested without
+    // a wall-clock window: assert Open right after the re-trip (elapsed is
+    // microseconds, so no cooldown edge can be crossed by a slow runner).
+    // The paired "reopens with an EXTENDED cooldown" timing is verified by
+    // `circuit_half_open_failure_extends_cooldown` below with generous
+    // margins, and precisely by the breaker's own unit tests.
     let cb = InMemoryCircuit::new(CircuitConfig {
         failure_threshold: 1,
         cooldown: Duration::from_millis(40),
@@ -117,22 +125,46 @@ async fn circuit_half_open_failure_reopens_with_extended_cooldown() {
     cb.record_failure("acct", FailureKind::Remote)
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    tokio::time::sleep(Duration::from_millis(120)).await; // 3× cooldown — safe direction
     assert_eq!(cb.state("acct").await.unwrap(), CircuitState::HalfOpen);
 
-    // A failure in HalfOpen pushes back to Open with extended
-    // cooldown (40ms → 80ms).
+    cb.record_failure("acct", FailureKind::Remote)
+        .await
+        .unwrap();
+    assert_eq!(cb.state("acct").await.unwrap(), CircuitState::Open);
+}
+
+#[tokio::test]
+async fn circuit_half_open_failure_extends_cooldown() {
+    // Prove the cooldown genuinely lengthens after a HalfOpen failure.
+    // Scaled to whole seconds so the one unavoidable two-sided assertion
+    // ("still Open past the ORIGINAL cooldown but before the EXTENDED one")
+    // carries ~1s of slack on both edges instead of tens of ms.
+    let cb = InMemoryCircuit::new(CircuitConfig {
+        failure_threshold: 1,
+        cooldown: Duration::from_secs(1),
+        cooldown_max: Duration::from_secs(10),
+        ..CircuitConfig::default()
+    });
+    cb.record_failure("acct", FailureKind::Remote)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await; // past 1s cooldown
+    assert_eq!(cb.state("acct").await.unwrap(), CircuitState::HalfOpen);
+
+    // Re-trip in HalfOpen → cooldown extends 1s → 2s.
     cb.record_failure("acct", FailureKind::Remote)
         .await
         .unwrap();
     assert_eq!(cb.state("acct").await.unwrap(), CircuitState::Open);
 
-    // After the original 40ms it must NOT yet be HalfOpen.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // At 1.5s (well past the original 1s, well before the extended 2s) it
+    // must still be Open — this is what proves the cooldown extended.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(cb.state("acct").await.unwrap(), CircuitState::Open);
 
-    // After 80ms total it should be HalfOpen again.
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    // Past the full 2s it returns to HalfOpen.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     assert_eq!(cb.state("acct").await.unwrap(), CircuitState::HalfOpen);
 }
 
@@ -144,13 +176,16 @@ async fn circuit_cooldown_caps_at_cooldown_max() {
         cooldown_max: Duration::from_millis(50),
         ..CircuitConfig::default()
     });
-    // Drive multiple half-open → open transitions; the cooldown
-    // doubles each time but must not exceed cooldown_max.
+    // Drive multiple half-open → open transitions; the cooldown doubles
+    // each time but must not exceed cooldown_max (50ms). Sleep 200ms each
+    // round — comfortably past the capped 50ms cooldown (safe direction) —
+    // and assert Open only immediately after each re-trip (microseconds
+    // elapsed, no window to race).
     cb.record_failure("acct", FailureKind::Remote)
         .await
         .unwrap();
     for _ in 0..6 {
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(cb.state("acct").await.unwrap(), CircuitState::HalfOpen);
         cb.record_failure("acct", FailureKind::Remote)
             .await
