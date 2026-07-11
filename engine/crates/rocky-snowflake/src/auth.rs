@@ -310,8 +310,10 @@ impl Auth {
                 use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey};
                 use sha2::{Digest, Sha256};
 
-                // Read PEM private key
-                let pem_str = std::fs::read_to_string(private_key_path)
+                // Read PEM private key (async so the read doesn't block the
+                // tokio worker on a slow/networked key path during a refresh).
+                let pem_str = tokio::fs::read_to_string(private_key_path)
+                    .await
                     .map_err(|e| AuthError::KeyPairIo(e.to_string()))?;
 
                 // Parse RSA private key from PKCS#8 PEM

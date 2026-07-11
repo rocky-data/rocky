@@ -504,8 +504,10 @@ impl DatabricksLoaderAdapter {
             .map_err(|e| AdapterError::msg(e.to_string()))?;
 
         // Read the local file before uploading so a read error fails fast,
-        // before we've created anything to clean up on the volume.
-        let contents = std::fs::read(local_path).map_err(|e| {
+        // before we've created anything to clean up on the volume. Use the
+        // async fs API so a large staging file (or a slow/networked disk)
+        // doesn't block the tokio worker while it's read into memory.
+        let contents = tokio::fs::read(local_path).await.map_err(|e| {
             AdapterError::msg(format!(
                 "failed to read local file '{}': {e}",
                 local_path.display()

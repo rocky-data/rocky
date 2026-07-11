@@ -568,7 +568,7 @@ impl RockyLsp {
         let models_dir = self.models_dir.read().await;
         let dir = models_dir.as_ref()?;
         let toml_path = std::path::PathBuf::from(dir).parent()?.join("rocky.toml");
-        let text = std::fs::read_to_string(&toml_path).ok()?;
+        let text = tokio::fs::read_to_string(&toml_path).await.ok()?;
         let uri = Url::from_file_path(&toml_path).ok()?;
         Some((uri, text))
     }
@@ -584,7 +584,9 @@ impl RockyLsp {
         model_file_path: &str,
     ) -> Option<(tower_lsp::lsp_types::Url, String)> {
         let sidecar_path = std::path::Path::new(model_file_path).with_extension("toml");
-        let text = std::fs::read_to_string(&sidecar_path).unwrap_or_default();
+        let text = tokio::fs::read_to_string(&sidecar_path)
+            .await
+            .unwrap_or_default();
         let uri = Url::from_file_path(&sidecar_path).ok()?;
         Some((uri, text))
     }

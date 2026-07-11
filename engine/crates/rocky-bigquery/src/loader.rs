@@ -301,8 +301,6 @@ impl LoaderAdapter for BigQueryLoaderAdapter {
                 }
 
                 let delim = options.csv_delimiter as u8;
-                let reader = CsvBatchReader::with_delimiter(local_path, options.batch_size, delim)
-                    .map_err(|e| AdapterError::msg(format!("failed to open CSV: {e}")))?;
 
                 // Read all batches up front with the caller's delimiter
                 // (re-reading via the comma-only `read_csv_batches` would
@@ -310,11 +308,24 @@ impl LoaderAdapter for BigQueryLoaderAdapter {
                 // this INSERT path is dev-scale by design (see module docs),
                 // and type inference needs the rows anyway. The same batches
                 // then drive the INSERT loop, so the file is read exactly
-                // once.
-                let column_names = reader.column_names().to_vec();
-                let batches: Vec<RowBatch> = reader
-                    .collect::<Result<_, _>>()
-                    .map_err(|e| AdapterError::msg(format!("failed to read CSV batch: {e}")))?;
+                // once. Both the file read and the CSV parse are synchronous
+                // and CPU-bound, so run them on the blocking pool rather than
+                // stalling the tokio worker across the whole file.
+                let read_path = local_path.to_path_buf();
+                let batch_size = options.batch_size;
+                let (column_names, batches): (Vec<String>, Vec<RowBatch>) =
+                    tokio::task::spawn_blocking(move || {
+                        let reader = CsvBatchReader::with_delimiter(&read_path, batch_size, delim)
+                            .map_err(|e| AdapterError::msg(format!("failed to open CSV: {e}")))?;
+                        let column_names = reader.column_names().to_vec();
+                        let batches: Vec<RowBatch> =
+                            reader.collect::<Result<_, _>>().map_err(|e| {
+                                AdapterError::msg(format!("failed to read CSV batch: {e}"))
+                            })?;
+                        Ok::<_, AdapterError>((column_names, batches))
+                    })
+                    .await
+                    .map_err(|e| AdapterError::msg(format!("CSV read task failed: {e}")))??;
 
                 // If create_table is requested, infer column TYPES from the
                 // sampled rows and create the table with those types (mapped
