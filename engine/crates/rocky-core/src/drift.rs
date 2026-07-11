@@ -9,7 +9,8 @@ use rocky_ir::{ColumnInfo, DriftAction, DriftResult, DriftedColumn, GracePeriodC
 
 /// Compares source and target column types to detect schema drift.
 ///
-/// Three categories surface from a single pass over the source columns:
+/// Two categories surface from a single pass over the source columns
+/// (column drops are detected separately by [`detect_column_drops`]):
 ///
 /// - **Type mismatches** on an existing column populate `drifted_columns`
 ///   and drive the [`DriftAction`] (`AlterColumnTypes` when every change
