@@ -90,6 +90,8 @@ fn default_sub_runner() -> SubRunner {
                     &rocky_core::run_vars::RunVars::new(),
                     // No run_id override — DAG sub-runs mint their own ids.
                     None,
+                    // DAG sub-runs are not governed two-step applies — no gate.
+                    None,
                 )
                 .await
                 .map_err(|e| e.to_string())

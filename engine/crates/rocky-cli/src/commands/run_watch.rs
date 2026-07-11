@@ -290,6 +290,8 @@ async fn iter_once(
         &rocky_core::run_vars::RunVars::new(),
         // `--watch` mints the usual timestamp run_id per iteration.
         None,
+        // `--watch` is a dev loop, never a governed two-step apply — no gate.
+        None,
     )
     .await;
     let elapsed_ms = started.elapsed().as_millis();

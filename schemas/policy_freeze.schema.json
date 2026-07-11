@@ -105,6 +105,13 @@
       "description": "`true` when this call lifted a freeze rather than establishing one.",
       "type": "boolean"
     },
+    "notes": {
+      "description": "Advisory notes about enforcement status — e.g. a warning that the freeze was recorded but is inert because the project has no `[policy]` block. Empty when the freeze is enforceable.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "recorded_at": {
       "description": "RFC 3339 wall clock when the freeze/unfreeze was recorded.",
       "type": "string"

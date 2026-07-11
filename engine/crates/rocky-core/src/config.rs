@@ -2822,8 +2822,12 @@ pub struct PolicyScope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer: Option<String>,
 
-    /// Blast-radius guard: maximum downstream count. **Parse-only in v0**
-    /// — accepted and validated but not yet evaluated by the matcher.
+    /// Blast-radius guard: maximum transitive downstream count. Enforced as a
+    /// **post-match ceiling on `allow`**, not a scope predicate: the rule
+    /// still matches, and when its effect is `allow` and the target's
+    /// transitive downstream reachability exceeds the ceiling — or cannot be
+    /// computed — the effect degrades to `require_review` (fail-closed).
+    /// `deny` / `require_review` rules are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_downstreams: Option<u64>,
 }

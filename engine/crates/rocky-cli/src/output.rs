@@ -6617,6 +6617,11 @@ pub struct PolicyFreezeOutput {
     pub recorded_at: String,
     /// One entry per affected principal.
     pub entries: Vec<PolicyFreezeEntry>,
+    /// Advisory notes about enforcement status — e.g. a warning that the
+    /// freeze was recorded but is inert because the project has no `[policy]`
+    /// block. Empty when the freeze is enforceable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// One principal's freeze/unfreeze record inside a [`PolicyFreezeOutput`].

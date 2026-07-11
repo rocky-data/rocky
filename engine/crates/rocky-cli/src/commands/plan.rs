@@ -10,7 +10,9 @@ use rocky_core::traits::SqlDialect;
 use rocky_ir::*;
 
 use crate::output::*;
-use crate::plan_store::{EmbeddedCapabilities, PlanKind, write_plan, write_plan_governed};
+use crate::plan_store::{
+    EmbeddedCapabilities, PlanKind, write_plan, write_plan_governed, write_plan_with_principal,
+};
 use crate::registry;
 
 use super::run::PartitionRunOptions;
@@ -934,7 +936,7 @@ fn build_and_persist_run_plan(
     // capabilities that were reviewed.
     let principal = run_options.principal.unwrap_or(PolicyPrincipal::Human);
     let capabilities =
-        compute_embedded_capabilities(config_path, models_dir, base_ref, Some(state_path));
+        compute_embedded_capabilities(config_path, models_dir, base_ref, Some(state_path), env);
     let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
         .context("failed to write run plan")?;
 
@@ -960,22 +962,49 @@ pub fn compute_embedded_capabilities(
     models_dir: &Path,
     base_ref: &str,
     state_path: Option<&Path>,
+    env: Option<&str>,
 ) -> EmbeddedCapabilities {
+    use crate::plan_store::CURRENT_FINGERPRINT_VERSION;
     use rocky_compiler::compile::{self, CompilerConfig};
 
+    // Load the config first — reused for cached source schemas AND the routing
+    // config identity. Every path below stamps `fingerprint_version` so a NEW
+    // plan whose fingerprint could not be produced is distinguishable from a
+    // genuinely-legacy plan at apply time (finding #7).
+    let loaded_cfg = rocky_core::config::load_rocky_config(config_path).ok();
+    let config_identity = loaded_cfg
+        .as_ref()
+        .map(crate::commands::apply::config_policy_identity);
+    // The env-resolved governance identity (mask / roles / cache-selection),
+    // bound into the fingerprint so a post-plan governance change refuses. `env`
+    // is the plan's `--env`, so apply refuses if applied against a different env.
+    let governance_identity = loaded_cfg
+        .as_ref()
+        .map(|cfg| crate::commands::apply::governance_policy_identity(cfg, env))
+        .unwrap_or_default();
+
+    // A plan whose fingerprint could not be produced (broken/absent models dir):
+    // stamped as a NEW plan with NO fingerprint → the governed apply REFUSES.
+    let failed = |config_identity: Option<String>| EmbeddedCapabilities {
+        diff_available: false,
+        changed: std::collections::BTreeMap::new(),
+        models_fingerprint: None,
+        config_identity,
+        fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+    };
+
     if !models_dir.is_dir() {
-        return EmbeddedCapabilities::default(); // fail-closed
+        return failed(config_identity); // fail-closed
     }
+
+    let identity = config_identity.clone().unwrap_or_default();
 
     // Seed both compiles with cached source schemas so types are real (mirrors
     // `rocky review`). Degrade to empty on any failure — a poorer classification
     // only ever fails *closed* (more models look breaking), never open.
-    let source_schemas = match (
-        state_path,
-        rocky_core::config::load_rocky_config(config_path),
-    ) {
-        (Some(sp), Ok(cfg)) => {
-            let schema_cfg = cfg.cache.schemas.with_ttl_override(None);
+    let source_schemas = match (state_path, loaded_cfg.as_ref()) {
+        (Some(sp), Some(cfg)) => {
+            let schema_cfg = cfg.cache.schemas.clone().with_ttl_override(None);
             crate::source_schemas::load_cached_source_schemas(&schema_cfg, sp)
         }
         _ => std::collections::HashMap::new(),
@@ -989,12 +1018,41 @@ pub fn compute_embedded_capabilities(
         };
         match compile::compile(&config) {
             Ok(r) => r,
-            Err(_) => return EmbeddedCapabilities::default(),
+            Err(_) => return failed(config_identity),
         }
     };
+    // Bind the compiled-IR fingerprint the gate authorizes so apply can refuse a
+    // models/config change between planning and execution (TOCTOU), checked at
+    // the single execution choke-point. Computed from the head compile that a
+    // clean apply will reproduce. The seeding-independent extras (surrogate-key
+    // sidecars #1, contract presence/contents #3) are folded in so a post-plan
+    // swap of either is refused even though `config`+`sql` are byte-identical —
+    // built from the SAME `models_dir` the apply choke-point re-reads.
+    let extras = crate::commands::apply::ExecutionExtras::build(
+        &rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap_or_default(),
+        &head.project.models,
+    );
+    let models_fingerprint = crate::commands::apply::execution_ir_fingerprint(
+        &head.project.models,
+        &identity,
+        &governance_identity,
+        &extras,
+    );
+
     let base = match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
         Ok(r) => r,
-        Err(_) => return EmbeddedCapabilities::default(),
+        // The head compiled and was fingerprinted; a missing base only costs the
+        // per-model classification (fail-closed to breaking). Keep the
+        // fingerprint so the TOCTOU gate still binds.
+        Err(_) => {
+            return EmbeddedCapabilities {
+                diff_available: false,
+                changed: std::collections::BTreeMap::new(),
+                models_fingerprint,
+                config_identity,
+                fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+            };
+        }
     };
 
     let base_ir = super::ci_diff::project_ir_from_compile(&base);
@@ -1021,6 +1079,9 @@ pub fn compute_embedded_capabilities(
     EmbeddedCapabilities {
         diff_available: true,
         changed,
+        models_fingerprint,
+        config_identity,
+        fingerprint_version: CURRENT_FINGERPRINT_VERSION,
     }
 }
 
@@ -1660,6 +1721,7 @@ pub async fn plan_promote(
     pipeline_name: Option<&str>,
     allow_breaking: bool,
     state_path: &Path,
+    principal: PolicyPrincipal,
     output_json: bool,
 ) -> Result<()> {
     let result = build_promote_plan_inner(
@@ -1672,6 +1734,7 @@ pub async fn plan_promote(
         pipeline_name,
         allow_breaking,
         state_path,
+        principal,
     )
     .await?;
 
@@ -1730,6 +1793,12 @@ pub(crate) async fn build_promote_plan_inner(
     pipeline_name: Option<&str>,
     allow_breaking: bool,
     state_path: &Path,
+    // The resolved CLI authoring principal, stamped onto the persisted plan so
+    // a later `rocky apply` evaluates the promote against the identity that
+    // authored it. A human-invoked promote stays `human` (ungated in v0); an
+    // agent-invoked one (`--principal agent` / `ROCKY_PRINCIPAL=agent`) is
+    // gated by `deny agent promote {…}` rules and agent freezes.
+    principal: PolicyPrincipal,
 ) -> Result<PromotePlanResult> {
     use crate::commands::branch::{
         APPROVAL_SKIP_ENV, approver_identity_pub, compute_branch_state_hash_pub,
@@ -1881,7 +1950,7 @@ pub(crate) async fn build_promote_plan_inner(
         created_at,
     };
 
-    let plan_id = write_plan(root, PlanKind::Promote, &promote_plan)
+    let plan_id = write_plan_with_principal(root, PlanKind::Promote, &promote_plan, principal)
         .context("failed to write promote plan")?;
 
     let mut plan_output = PlanOutput::new(filter.unwrap_or("").to_string());
