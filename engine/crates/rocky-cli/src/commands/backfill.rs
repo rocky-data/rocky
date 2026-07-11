@@ -225,10 +225,12 @@ pub(crate) fn run_backfill_in(
         .as_ref()
         .map(crate::commands::apply::governance_policy_identity)
         .unwrap_or_default();
-    let resolved_mask = backfill_cfg
-        .as_ref()
-        .map(|cfg| cfg.resolve_mask_for_env(None))
-        .unwrap_or_default();
+    // Finding #4: a backfill is selection-scoped (`model_set`) and reconciles
+    // ONLY tags, never masks (run.rs `execute_backfill_set` → tags), so the mask
+    // is NOT bound — matching the apply choke-point, which sees `model_set` and
+    // skips the mask. An empty map ⇒ empty `effective_masks`.
+    let resolved_mask: std::collections::BTreeMap<String, rocky_ir::MaskStrategy> =
+        std::collections::BTreeMap::new();
     // Capture the REVIEWED source-schema snapshot (finding #2b) the same way
     // `compile_project` seeded the compile above (cache, `ttl_override(None)`),
     // so apply replays these exact schemas → `typed_columns` cannot drift.

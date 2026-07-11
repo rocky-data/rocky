@@ -3887,6 +3887,16 @@ pub async fn run(
                 Ok(())
             }
             .await;
+            // ‼️ Governance runs ONLY when execution completed cleanly (finding
+            // #1 — critical). ANY `execute_models` error — a fingerprint mismatch
+            // (the reviewed set changed), a routing swap, or a model failure —
+            // means the gated set did not fully execute, so reconciling
+            // masks/classifications/retention/tags/role GRANTs now would push
+            // UNREVIEWED governance to the warehouse *despite the gate detecting
+            // the change*. On error we record the failure and SKIP all post-model
+            // governance below, falling through to the failure payload + non-zero
+            // exit.
+            let exec_ok = exec_result.is_ok();
             if let Err(e) = exec_result {
                 // Record the runtime model failure as a table error and fall
                 // through to the terminal emit instead of returning raw `Err`.
@@ -3920,8 +3930,11 @@ pub async fn run(
             // `resolve_mask_for_env` so `[mask.<env>]` overrides win over
             // the workspace `[mask]` defaults. `None` preserves the
             // pre-1.16 behavior of resolving defaults only.
-            let governance_compile = rocky_compiler::compile::compile(
-                &rocky_compiler::compile::CompilerConfig {
+            // `exec_ok.then(...)` (finding #1): a failed execution skips even the
+            // governance compile — no reconcile is attempted when the gated set
+            // did not fully execute.
+            let governance_compile = exec_ok.then(|| {
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
                     models_dir: mdir.to_path_buf(),
                     contracts_dir: None,
                     source_schemas: std::collections::HashMap::new(),
@@ -3939,9 +3952,9 @@ pub async fn run(
                     // variable as missing (or leave placeholders in the SQL
                     // the masking/tag reconcile inspects).
                     run_vars: run_vars.clone(),
-                },
-            );
-            if let Ok(gov_compile) = governance_compile {
+                })
+            });
+            if let Some(Ok(gov_compile)) = governance_compile {
                 let tag_to_strategy = rocky_cfg.resolve_mask_for_env(env);
                 for model in &gov_compile.project.models {
                     let table_ref = TableRef {
@@ -4058,8 +4071,11 @@ pub async fn run(
             // vary per env because dev/prod sensitivity differs. The
             // caller's `--env` therefore does NOT flow into
             // `reconcile_role_graph`.
-            match rocky_cfg.role_graph() {
-                Ok(resolved) if !resolved.is_empty() => {
+            // `exec_ok.then(...)` (finding #1): skip role-graph reconciliation
+            // entirely on a failed execution — a fingerprint mismatch or model
+            // failure must not push an unreviewed GRANT set.
+            match exec_ok.then(|| rocky_cfg.role_graph()) {
+                Some(Ok(resolved)) if !resolved.is_empty() => {
                     // Borrow the `BTreeSet<String>` as `&[&str]` for the
                     // trait call — keeps `managed_catalogs` alive and
                     // lets the adapter iterate without cloning.
@@ -4077,11 +4093,14 @@ pub async fn run(
                         );
                     }
                 }
-                Ok(_) => {
+                Some(Ok(_)) => {
                     // No `[role.*]` block — nothing to reconcile.
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     warn!(error = %e, "role graph flatten failed; skipping role reconcile");
+                }
+                None => {
+                    // Execution did not complete cleanly — governance skipped.
                 }
             }
         }
@@ -5219,14 +5238,28 @@ pub(crate) async fn execute_models(
     if let Some(gate) = exec_fp_gate {
         // Fold the seeding-independent on-disk extras the compiled IR omits —
         // the OWNED surrogate map (#1), contract presence/contents (#3), and the
-        // EFFECTIVE mask for the executed set (finding C) — into the recomputed
-        // fingerprint so a post-plan swap of any refuses here. `models_dir` is the
-        // SAME directory the plan fingerprinted; `resolved_mask` is the plan-env
-        // mask the gate carries.
+        // EFFECTIVE mask (finding C) — into the recomputed fingerprint so a
+        // post-plan swap of any refuses here. `models_dir` is the SAME directory
+        // the plan fingerprinted.
+        //
+        // Finding #4: the mask is bound ONLY on the full `--all` path, where every
+        // model executes AND the post-model masking reconcile runs. On a
+        // selection-scoped path (`--model` / backfill `model_set`) masking is NOT
+        // reconciled (only tags), and only a subset executes — so binding a mask
+        // used by an *unselected* model would falsely refuse. Both plan and apply
+        // gate the mask on the SAME predicate (no model filter / no model_set),
+        // so the fingerprint stays symmetric.
+        let scoped = model_name_filter.is_some() || model_set.is_some();
+        let empty_mask = std::collections::BTreeMap::new();
+        let mask_for_extras = if scoped {
+            &empty_mask
+        } else {
+            &gate.resolved_mask
+        };
         let extras = crate::commands::apply::ExecutionExtras::build(
             &surrogate_keys,
             &compile_result.project.models,
-            &gate.resolved_mask,
+            mask_for_extras,
         );
         gate.verify(&compile_result.project.models, &extras)?;
     }
@@ -12211,9 +12244,11 @@ merge_keys = ["id"]
             "main",
             None,
             None,
+            true, // full run — bind masks (finding #4)
         );
         // Apply side: the choke-point's routing + governance identity are the
-        // loaded config's, resolved for the same (None) env.
+        // loaded config's, resolved for the same (None) env. A full run (no model
+        // filter) binds the mask, matching the plan side.
         let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
         let identity = crate::commands::apply::config_policy_identity(&cfg);
         let gov = crate::commands::apply::governance_policy_identity(&cfg);

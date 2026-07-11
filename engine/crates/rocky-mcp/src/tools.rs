@@ -2342,6 +2342,9 @@ impl RockyMcpServer {
             "main",
             Some(&state_path),
             None, // MCP propose has no `--env`; governance identity binds defaults
+            // Bind masks only for a full-project propose (finding #4): a
+            // model-scoped propose runs no masking reconcile at apply.
+            params.0.model.is_none(),
         );
 
         // Consult the agent-policy plane before persisting — the same per-model
