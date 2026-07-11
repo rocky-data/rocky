@@ -963,19 +963,33 @@ pub fn compute_embedded_capabilities(
     base_ref: &str,
     state_path: Option<&Path>,
 ) -> EmbeddedCapabilities {
+    use crate::plan_store::CURRENT_FINGERPRINT_VERSION;
     use rocky_compiler::compile::{self, CompilerConfig};
 
-    if !models_dir.is_dir() {
-        return EmbeddedCapabilities::default(); // fail-closed
-    }
-
-    // Load the config once — reused for cached source schemas AND the
-    // env-resolved config identity bound into the execution fingerprint.
+    // Load the config first — reused for cached source schemas AND the routing
+    // config identity. Every path below stamps `fingerprint_version` so a NEW
+    // plan whose fingerprint could not be produced is distinguishable from a
+    // genuinely-legacy plan at apply time (finding #7).
     let loaded_cfg = rocky_core::config::load_rocky_config(config_path).ok();
     let config_identity = loaded_cfg
         .as_ref()
-        .map(crate::commands::apply::config_policy_identity)
-        .unwrap_or_default();
+        .map(crate::commands::apply::config_policy_identity);
+
+    // A plan whose fingerprint could not be produced (broken/absent models dir):
+    // stamped as a NEW plan with NO fingerprint → the governed apply REFUSES.
+    let failed = |config_identity: Option<String>| EmbeddedCapabilities {
+        diff_available: false,
+        changed: std::collections::BTreeMap::new(),
+        models_fingerprint: None,
+        config_identity,
+        fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+    };
+
+    if !models_dir.is_dir() {
+        return failed(config_identity); // fail-closed
+    }
+
+    let identity = config_identity.clone().unwrap_or_default();
 
     // Seed both compiles with cached source schemas so types are real (mirrors
     // `rocky review`). Degrade to empty on any failure — a poorer classification
@@ -996,15 +1010,22 @@ pub fn compute_embedded_capabilities(
         };
         match compile::compile(&config) {
             Ok(r) => r,
-            Err(_) => return EmbeddedCapabilities::default(),
+            Err(_) => return failed(config_identity),
         }
     };
     // Bind the compiled-IR fingerprint the gate authorizes so apply can refuse a
     // models/config change between planning and execution (TOCTOU), checked at
     // the single execution choke-point. Computed from the head compile that a
-    // clean apply will reproduce.
+    // clean apply will reproduce. The seeding-independent extras (surrogate-key
+    // sidecars #1, contract presence/contents #3) are folded in so a post-plan
+    // swap of either is refused even though `config`+`sql` are byte-identical —
+    // built from the SAME `models_dir` the apply choke-point re-reads.
+    let extras = crate::commands::apply::ExecutionExtras::build(
+        &rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap_or_default(),
+        &head.project.models,
+    );
     let models_fingerprint =
-        crate::commands::apply::execution_ir_fingerprint(&head.project.models, &config_identity);
+        crate::commands::apply::execution_ir_fingerprint(&head.project.models, &identity, &extras);
 
     let base = match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
         Ok(r) => r,
@@ -1016,6 +1037,8 @@ pub fn compute_embedded_capabilities(
                 diff_available: false,
                 changed: std::collections::BTreeMap::new(),
                 models_fingerprint,
+                config_identity,
+                fingerprint_version: CURRENT_FINGERPRINT_VERSION,
             };
         }
     };
@@ -1045,6 +1068,8 @@ pub fn compute_embedded_capabilities(
         diff_available: true,
         changed,
         models_fingerprint,
+        config_identity,
+        fingerprint_version: CURRENT_FINGERPRINT_VERSION,
     }
 }
 
