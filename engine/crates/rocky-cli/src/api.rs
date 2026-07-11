@@ -1403,6 +1403,25 @@ mod tests {
         assert_eq!(api, reference, "GET /dag must match `rocky dag`");
     }
 
+    /// GET `url`, retrying while the endpoint returns a *documented-retryable*
+    /// `503 engine_busy`. The three state-backed read routes open the redb
+    /// store read-only, and redb takes an unconditional `flock` on open; the
+    /// store's open-retry budget is only ~250ms (tuned for the LSP-vs-CLI
+    /// keystroke race), which a loaded CI runner can exhaust — so the handler
+    /// correctly returns the retryable 503 rather than blocking forever. Real
+    /// embedders back off and retry on that 503; the parity assertion should
+    /// too, instead of demanding 200 on the first request.
+    async fn get_retrying_on_busy(url: &str) -> reqwest::Response {
+        for _ in 0..40 {
+            let resp = reqwest::get(url).await.unwrap();
+            if resp.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                return resp;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("{url} still returning 503 engine_busy after ~2s of retries");
+    }
+
     #[tokio::test]
     async fn parity_runs_history_metrics_on_empty_state() {
         // A hermetic, empty state store. Both the API and the CLI core resolve
@@ -1418,7 +1437,7 @@ mod tests {
         let base = spawn_router(state).await;
 
         // /runs
-        let resp = reqwest::get(format!("{base}/api/v1/runs")).await.unwrap();
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/runs")).await;
         assert_eq!(resp.status(), 200);
         assert_eq!(
             resp.text().await.unwrap(),
@@ -1426,9 +1445,7 @@ mod tests {
         );
 
         // /models/{name}/history
-        let resp = reqwest::get(format!("{base}/api/v1/models/some_model/history"))
-            .await
-            .unwrap();
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/models/some_model/history")).await;
         assert_eq!(resp.status(), 200);
         assert_eq!(
             resp.text().await.unwrap(),
@@ -1438,9 +1455,7 @@ mod tests {
         );
 
         // /models/{name}/metrics
-        let resp = reqwest::get(format!("{base}/api/v1/models/some_model/metrics"))
-            .await
-            .unwrap();
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/models/some_model/metrics")).await;
         assert_eq!(resp.status(), 200);
         assert_eq!(
             resp.text().await.unwrap(),
