@@ -637,6 +637,24 @@ class FivetranStampedeConfig(BaseModel):
     """
 
 
+class GcConfig(BaseModel):
+    """
+    `[gc]` — storage-reclamation settings for `rocky gc` and its review-gated `rocky apply <gc-plan>`.
+
+    Eviction is **ledger-only**: an approved apply writes the durable tombstone and retires the artifact's ledger row (the eviction of record, always restorable from the recorded recipe). Physical byte-deletion is not performed — reclaiming bytes safely requires a protocol-aware VACUUM (retention windows + TOCTOU-safe deletion), which is future work.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    physical_delete: bool | None = False
+    """
+    Reserved for a future protocol-aware VACUUM.
+
+    `false` (the default): `rocky apply <gc-plan>` tombstones + retires the ledger row and leaves the bytes in place. `true` is currently a **hard error** at apply time — physical reclamation of content-addressed bytes requires a protocol-aware VACUUM (Delta tombstone-retention windows + TOCTOU-safe deletion against concurrent re-adds) that is not yet implemented, so the flag fails loudly rather than silently deleting or silently no-op'ing.
+    """
+
+
 class GrantConfig(BaseModel):
     """
     A permission grant to apply to catalogs or schemas.
@@ -3623,6 +3641,10 @@ class RockyConfig(BaseModel):
     ```toml [freshness] expected_lag_seconds = 3600 time_column = "updated_at" severity = "warning" ```
 
     Inheritance is field-by-field: a per-model `[freshness]` table always wins for the fields it sets; absent fields fall through to the project-level default. Models with no per-model `[freshness]` at all inherit the project default when it carries an `expected_lag_seconds` value (the required field).
+    """
+    gc: GcConfig | None = Field({"physical_delete": False}, validate_default=True)
+    """
+    `[gc]` — storage-reclamation settings for `rocky gc` / `rocky apply <gc-plan>`. Default: physical byte-deletion stays disarmed; an applied eviction is recorded as tombstone + retired ledger row only. See [`GcConfig`].
     """
     hook: HooksConfig | None = Field({"webhooks": {}}, validate_default=True)
     """

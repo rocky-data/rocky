@@ -423,6 +423,10 @@ export interface RockyConfig {
    */
   freshness?: ProjectFreshnessConfig;
   /**
+   * `[gc]` — storage-reclamation settings for `rocky gc` / `rocky apply <gc-plan>`. Default: physical byte-deletion stays disarmed; an applied eviction is recorded as tombstone + retired ledger row only. See [`GcConfig`].
+   */
+  gc?: GcConfig;
+  /**
    * Shell hooks configuration.
    */
   hook?: HooksConfig;
@@ -949,6 +953,19 @@ export interface ProjectFreshnessConfig {
    * Default timestamp column used to evaluate freshness at runtime. Inherited by per-model freshness blocks that don't specify their own `time_column`.
    */
   time_column?: string | null;
+}
+/**
+ * `[gc]` — storage-reclamation settings for `rocky gc` and its review-gated `rocky apply <gc-plan>`.
+ *
+ * Eviction is **ledger-only**: an approved apply writes the durable tombstone and retires the artifact's ledger row (the eviction of record, always restorable from the recorded recipe). Physical byte-deletion is not performed — reclaiming bytes safely requires a protocol-aware VACUUM (retention windows + TOCTOU-safe deletion), which is future work.
+ */
+export interface GcConfig {
+  /**
+   * Reserved for a future protocol-aware VACUUM.
+   *
+   * `false` (the default): `rocky apply <gc-plan>` tombstones + retires the ledger row and leaves the bytes in place. `true` is currently a **hard error** at apply time — physical reclamation of content-addressed bytes requires a protocol-aware VACUUM (Delta tombstone-retention windows + TOCTOU-safe deletion against concurrent re-adds) that is not yet implemented, so the flag fails loudly rather than silently deleting or silently no-op'ing.
+   */
+  physical_delete?: boolean;
 }
 /**
  * The `[hook]` section from rocky.toml.

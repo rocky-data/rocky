@@ -401,13 +401,16 @@ pub struct SkipRunOptions {
     /// (the two are OR-ed at the gate).
     pub skip_unchanged: bool,
     /// Whether `--force-rebuild` was passed. When `true`, every selected
-    /// model builds unconditionally — the gate's escape hatch. Takes
-    /// precedence over `skip_unchanged` and over any config.
+    /// model builds unconditionally — the escape hatch for the plain skip
+    /// gate AND the content-addressed column-level skip. Takes precedence
+    /// over `skip_unchanged`, over `[reuse] column_level`, and over any
+    /// config.
     pub force_rebuild: bool,
     /// Whether `--no-reuse` was passed. When `true`, the content-addressed
-    /// reuse decision is disabled for this invocation even if `[reuse]` is
+    /// reuse surface is disabled for this invocation even if `[reuse]` is
     /// enabled in config — clause 1 of the fail-closed gate. The escape
-    /// hatch that forces every content-addressed model to BUILD.
+    /// hatch that forces every content-addressed model to BUILD: both the
+    /// point-to reuse decision and the `[reuse] column_level` skip are off.
     pub no_reuse: bool,
     /// Whether `--no-prune` was passed. Forces a full replication pass for
     /// this invocation, disabling `[pipeline] prune_unchanged` skip-unchanged
@@ -1302,8 +1305,11 @@ pub async fn run(
             // point-to decision and the spine population it would feed.
             rocky_cfg.reuse.enabled && !skip_opts.no_reuse,
             // Content-addressed column-level skip — its own `[reuse]` sub-key,
-            // orthogonal to the point-to switch above and to `--no-reuse`.
-            rocky_cfg.reuse.column_level,
+            // orthogonal to the point-to switch above but also disabled by
+            // `--no-reuse`: the flag is the documented "force every
+            // content-addressed model to BUILD" escape hatch, and a column
+            // skip is a content-addressed non-build.
+            rocky_cfg.reuse.column_level && !skip_opts.no_reuse,
             run_vars,
             rocky_cfg.resilience.clone(),
             super::resilience::retry_policy_allows(&rocky_cfg),
@@ -1460,6 +1466,11 @@ pub async fn run(
                 partition_opts,
                 &schema_cache_cfg,
                 skip_gate,
+                // `--no-reuse` — the force-BUILD escape hatch for the
+                // content-addressed surface (point-to reuse AND the
+                // column-level skip), threaded so the transformation-pipeline
+                // path honors it exactly like the other entry points.
+                skip_opts.no_reuse,
                 // Canonical state path resolved once by `main.rs`
                 // (`--state-path` / `--state-namespace` / the global
                 // default) — the same path the replication path opens. The
@@ -3792,8 +3803,10 @@ pub async fn run(
                     // was not passed (clause 1 of the fail-closed decision).
                     rocky_cfg.reuse.enabled && !skip_opts.no_reuse,
                     // Content-addressed column-level skip — its own `[reuse]`
-                    // sub-key, orthogonal to the point-to switch and `--no-reuse`.
-                    rocky_cfg.reuse.column_level,
+                    // sub-key, orthogonal to the point-to switch but also
+                    // disabled by `--no-reuse` (the documented force-BUILD
+                    // escape hatch covers this non-build outcome too).
+                    rocky_cfg.reuse.column_level && !skip_opts.no_reuse,
                     run_vars,
                     rocky_cfg.resilience.clone(),
                     super::resilience::retry_policy_allows(&rocky_cfg),
@@ -4699,6 +4712,21 @@ fn record_contained_cause(
     containment.poison(model_name);
 }
 
+/// Resolve the `(reuse_enabled, column_level_enabled)` gates a supervised
+/// backfill hands to [`execute_models`].
+///
+/// Point-to reuse follows `[reuse].enabled` unchanged — a point-to still
+/// writes a fresh commit whose bytes are proven identical, which satisfies a
+/// rebuild order. The content-addressed **column-level skip is always
+/// disabled**: a backfill is an explicit, reviewed rebuild order for its
+/// planned closure, so "consumed columns look unchanged" is never a reason to
+/// leave a planned model untouched — without this, a stable model inside the
+/// closure would be silently column-skipped and the operator's rebuild would
+/// quietly not happen.
+fn backfill_reuse_gates(cfg: &rocky_core::config::RockyConfig) -> (bool, bool) {
+    (cfg.reuse.enabled, false)
+}
+
 /// Execute a supervised backfill over an explicit set of transformation
 /// models — the two-step `rocky apply <backfill-plan>` execution path.
 ///
@@ -4775,6 +4803,9 @@ pub(crate) async fn execute_backfill_set(
     // `[run]` config alone; it stays inert unless the operator enabled it.
     let skip_gate = SkipGateConfig::resolve(&SkipRunOptions::default(), &rocky_cfg.run, false);
     let run_vars = rocky_core::run_vars::RunVars::new();
+    // A backfill is an explicit rebuild order: point-to reuse may still
+    // satisfy it byte-identically, but the column-level skip never may.
+    let (reuse_enabled, column_level_enabled) = backfill_reuse_gates(&rocky_cfg);
 
     let exec_result = execute_models(
         models_dir,
@@ -4793,8 +4824,8 @@ pub(crate) async fn execute_backfill_set(
         false,
         &DeferOptions::default(),
         skip_gate,
-        rocky_cfg.reuse.enabled,
-        rocky_cfg.reuse.column_level,
+        reuse_enabled,
+        column_level_enabled,
         &run_vars,
         rocky_cfg.resilience.clone(),
         super::resilience::retry_policy_allows(&rocky_cfg),
@@ -4905,13 +4936,17 @@ pub(crate) async fn execute_models(
     // populated AND an eligible model whose inputs match a prior strong run
     // points-to that run's parquet instead of executing its SQL.
     reuse_enabled: bool,
-    // `[reuse] column_level` (default-ON). When `true`, an unpartitioned
-    // content-addressed model whose logic, environment, and every
-    // provably-consumed upstream column are unchanged since its last successful
-    // build is column-skipped (SQL not run, prior output authoritative). When
-    // `false` (the default) no column-level comparison runs and the path is
-    // byte- and cost-identical. Fail-closed to build on any doubt; content-
-    // addressed path only.
+    // `[reuse] column_level` (default-ON), pre-gated by the caller: the run
+    // entry points fold `--no-reuse` into this flag and the supervised
+    // backfill passes `false` outright (an explicit rebuild order), while
+    // `--force-rebuild` is enforced inside via `skip_gate.force_rebuild`.
+    // When `true`, an unpartitioned content-addressed model whose logic,
+    // environment, and every provably-consumed upstream column are unchanged
+    // since its last successful build — and whose prior output artifact is
+    // still live in the ledger — is column-skipped (SQL not run, prior output
+    // authoritative). When `false` no column-level comparison runs and the
+    // path is byte- and cost-identical. Fail-closed to build on any doubt;
+    // content-addressed path only.
     column_level_enabled: bool,
     // Per-run variables (`rocky run --var name=value`). Threaded into the
     // compile config so `@var(name)` placeholders in model SQL resolve to the
@@ -5623,38 +5658,46 @@ pub(crate) async fn execute_models(
             let model_name: &str = model_name.as_str();
 
             // Content-addressed column-level skip, default-ON behind
-            // `[reuse] column_level`. Evaluated before the Built record and the
-            // reuse/build dispatch so a proven skip records `Skipped` and never
-            // runs the SQL. Content-addressed + unpartitioned only; any doubt
-            // builds. This is the content-addressed surface's third outcome —
-            // the plain skip gate never adjudicates a content-addressed model,
-            // so the two surfaces do not double-decide. The outer guard keeps
-            // the default path allocation-free (no `to_model_ir` when the flag
-            // is off).
+            // `[reuse] column_level` (the caller has already folded the
+            // `--no-reuse` escape hatch and the backfill rebuild-order into
+            // `column_level_enabled`; `--force-rebuild` is enforced here via
+            // the resolved skip gate). Evaluated before the Built record and
+            // the reuse/build dispatch so a proven skip records `Skipped` and
+            // never runs the SQL. Content-addressed + unpartitioned only; any
+            // doubt builds. This is the content-addressed surface's third
+            // outcome — the plain skip gate never adjudicates a
+            // content-addressed model, so the two surfaces do not
+            // double-decide. The outer guard keeps the disabled path
+            // allocation-free (no `to_model_ir` when the flag is off).
             if column_level_enabled
+                && !skip_gate.force_rebuild
                 && matches!(
                     model.config.strategy,
                     rocky_core::models::StrategyConfig::ContentAddressed { .. }
                 )
             {
                 let model_ir = model.to_model_ir();
-                if let ColumnSkipOutcome::Skip(prior_output_hashes) =
-                    try_content_addressed_column_skip(
-                        column_level_enabled,
-                        model_name,
-                        &model_ir,
-                        warehouse.dialect().name(),
-                        state_store,
-                        &baseline_target_by_model,
-                        &built_output_hashes,
-                    )
-                {
+                if let ColumnSkipOutcome::Skip {
+                    prior_output_column_hashes,
+                    prior_blake3,
+                } = try_content_addressed_column_skip(
+                    column_level_enabled,
+                    skip_gate.force_rebuild,
+                    model_name,
+                    &model_ir,
+                    warehouse.dialect().name(),
+                    state_store,
+                    &baseline_target_by_model,
+                    &built_output_hashes,
+                ) {
                     // Record `Skipped` so a downstream in a later layer treats
                     // this model as an unchanged input (its output equals its
                     // last build). Surface the decision, bump the skipped
-                    // counter, and propagate the prior output hashes so a later
+                    // counter, and propagate the prior outputs (producer column
+                    // hashes + the live artifact's blake3) so a later
                     // content-addressed consumer sees this upstream's current
-                    // output == its prior (design Fork 2).
+                    // output == its prior AND can still resolve it to a STRONG
+                    // content identity (design Fork 2).
                     gate.record(model_name, super::skip_gate::Verdict::Skipped);
                     output.tables_skipped += 1;
                     output
@@ -5664,13 +5707,18 @@ pub(crate) async fn execute_models(
                             decision: crate::output::ModelDecision::Skip,
                             reason: super::column_skip::SKIP_MESSAGE.to_string(),
                         });
-                    if let Some(hashes) = prior_output_hashes {
-                        let target_full = format!(
-                            "{}.{}.{}",
-                            model_ir.target.catalog, model_ir.target.schema, model_ir.target.table,
-                        );
-                        built_output_hashes.insert(target_full, hashes);
-                    }
+                    let target_full = format!(
+                        "{}.{}.{}",
+                        model_ir.target.catalog, model_ir.target.schema, model_ir.target.table,
+                    );
+                    propagate_skip_outputs(
+                        target_full,
+                        prior_output_column_hashes,
+                        prior_blake3,
+                        reuse_enabled,
+                        &mut built_output_hashes,
+                        &mut reuse_outputs,
+                    );
                     info!(
                         model = model_name,
                         "column-skip: consumed columns unchanged since last build — \
@@ -6356,13 +6404,119 @@ enum ColumnSkipOutcome {
     Build,
     /// Column-skip: the model's output is provably unchanged since its last
     /// successful build, so its SQL is not run and no new commit is written.
-    /// Carries the prior build's output-column hashes (if any) to propagate
-    /// into `built_output_hashes` so a later content-addressed consumer sees
-    /// this upstream's current output == its prior (a skipped upstream's output
-    /// equals its last build by construction — design Fork 2). `None` when the
-    /// prior build recorded no output hashes (a point-to reuse / partitioned
-    /// prior) — later consumers then safely rebuild against it.
-    Skip(Option<Vec<rocky_core::state::ColumnHash>>),
+    Skip {
+        /// The prior build's output-column hashes (if any), propagated into
+        /// `built_output_hashes` so a later content-addressed consumer sees
+        /// this upstream's current output == its prior (a skipped upstream's
+        /// output equals its last build by construction — design Fork 2).
+        /// `None` when the prior build recorded no output hashes (a point-to
+        /// reuse / partitioned prior) — later consumers then safely rebuild.
+        prior_output_column_hashes: Option<Vec<rocky_core::state::ColumnHash>>,
+        /// The prior build's artifact content hash, proven LIVE by the
+        /// liveness gate (a row still exists in the artifact ledger and no
+        /// tombstone names it). Propagated into `reuse_outputs` so a
+        /// downstream content-addressed consumer can still resolve this
+        /// skipped upstream to a STRONG content identity — without it a
+        /// skipped upstream would leave every downstream unindexable
+        /// (`input_hash = None` ⇒ a clause-3 BUILD on every run).
+        prior_blake3: String,
+    },
+}
+
+/// The newest recorded execution of `model_name`, paired with its owning
+/// run id.
+///
+/// Same source data and ordering as [`StateStore::get_model_history`] (the
+/// last 100 runs, newest-first by run `started_at`; the first execution found
+/// wins) — re-derived here so the run id survives, because the column-skip
+/// liveness gate needs `(run_id, model)` to resolve the prior build's
+/// artifact rows. `None` when no execution is recorded in the retained window
+/// or the history read fails; the caller fails closed to a build either way.
+fn latest_execution_with_run_id(
+    store: &StateStore,
+    model_name: &str,
+) -> Option<(String, rocky_core::state::ModelExecution)> {
+    let runs = store.list_runs(100).ok()?;
+    runs.into_iter().find_map(|run| {
+        let exec = run
+            .models_executed
+            .into_iter()
+            .find(|m| m.model_name == model_name)?;
+        Some((run.run_id, exec))
+    })
+}
+
+/// Resolve the prior build's output artifact and prove it is still **live**.
+///
+/// A column-skip keeps the prior output authoritative, so that output's bytes
+/// must still be custody-clean in the content-addressed ledger: `rocky gc`
+/// eviction retires the artifact's ledger row and writes a tombstone, and
+/// skipping on top of an evicted artifact would report `Skipped`/success
+/// while the table's underlying file is retired (or physically deleted once
+/// deletion is armed). Ledger-only and fail-closed; returns the single live
+/// hash on success, or a build reason (for the decline log) when:
+///
+/// - the ledger cannot be read, or the prior `(run, model)` resolves to **no**
+///   output hash (a pre-ledger build, or a failed best-effort
+///   `record_artifact`) — liveness is unprovable;
+/// - it resolves to **more than one** distinct hash — ambiguous identity;
+/// - the hash has **no live artifact-ledger row** — evicted / retired;
+/// - **any tombstone names the hash** — `rocky gc` evicted these bytes (a
+///   tombstone predating an identical re-record also refuses the skip;
+///   conservative, and a build is always safe).
+fn resolve_live_prior_artifact(
+    store: &StateStore,
+    prior_run_id: &str,
+    model_name: &str,
+) -> Result<String, String> {
+    // Union the prior execution's artifact-ledger rows with its provenance
+    // outputs (recorded only under `[reuse]`): either source alone can name
+    // the prior output, and after an eviction the artifact row is gone while
+    // the provenance survives — exactly the case that must fail this gate.
+    let mut hashes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    match store.list_all_artifacts() {
+        Ok(all) => hashes.extend(
+            all.into_iter()
+                .filter(|a| a.run_id == prior_run_id && a.model_name == model_name)
+                .map(|a| a.blake3_hash),
+        ),
+        Err(e) => return Err(format!("artifact ledger unreadable: {e}")),
+    }
+    match store.get_provenance(prior_run_id, model_name) {
+        Ok(Some(prov)) => hashes.extend(prov.output_blake3),
+        Ok(None) => {}
+        Err(e) => return Err(format!("provenance unreadable: {e}")),
+    }
+
+    if hashes.is_empty() {
+        return Err(format!(
+            "prior build (run {prior_run_id}) recorded no output artifact — liveness unprovable"
+        ));
+    }
+    if hashes.len() > 1 {
+        return Err(format!(
+            "prior build (run {prior_run_id}) resolves to {} distinct output hashes — ambiguous",
+            hashes.len()
+        ));
+    }
+    let hash = hashes.into_iter().next().expect("checked non-empty");
+
+    match store.list_artifacts_by_hash(&hash) {
+        Ok(rows) if rows.is_empty() => {
+            return Err(format!(
+                "prior output {hash} has no live artifact-ledger row — evicted or retired"
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => return Err(format!("artifact ledger unreadable: {e}")),
+    }
+    match store.list_tombstones() {
+        Ok(tombs) if tombs.iter().any(|t| t.blake3_hash == hash) => {
+            Err(format!("prior output {hash} is tombstoned by `rocky gc`"))
+        }
+        Ok(_) => Ok(hash),
+        Err(e) => Err(format!("tombstone ledger unreadable: {e}")),
+    }
 }
 
 /// The **content-addressed column-level skip** pre-check (design Fork 3, the
@@ -6370,16 +6524,22 @@ enum ColumnSkipOutcome {
 ///
 /// Gathers the pre-resolved inputs and delegates the trust-critical decision to
 /// the pure [`super::column_skip::decide_column_skip`]. Content-addressed +
-/// unpartitioned only, behind `[reuse] column_level`; fail-closed to
+/// unpartitioned only, behind `[reuse] column_level` (the caller has already
+/// folded `--no-reuse` and the backfill rebuild-order into that flag);
+/// `--force-rebuild` wins unconditionally. Fail-closed to
 /// [`ColumnSkipOutcome::Build`] on any doubt — a missing state store, no prior
 /// success, a changed recipe/env, a non-deterministic model, an un-enumerable
-/// consumed set, or any moved/absent consumed-column hash.
+/// consumed set, any moved/absent consumed-column hash, or a prior output
+/// artifact that is no longer live in the ledger (evicted / tombstoned by
+/// `rocky gc` — see [`resolve_live_prior_artifact`]).
 ///
 /// This is evaluated by the caller *before* the content-addressed reuse/build
 /// dispatch, so the plain skip gate (which never adjudicates a content-addressed
 /// model) and this surface do not double-decide.
+#[allow(clippy::too_many_arguments)]
 fn try_content_addressed_column_skip(
     column_level_enabled: bool,
+    force_rebuild: bool,
     model_name: &str,
     model_ir: &ModelIr,
     adapter_name: &str,
@@ -6389,7 +6549,9 @@ fn try_content_addressed_column_skip(
 ) -> ColumnSkipOutcome {
     use super::column_skip::{ColumnSkipInputs, ColumnSkipVerdict, decide_column_skip};
 
-    if !column_level_enabled {
+    // `--force-rebuild` is the documented unconditional build escape hatch —
+    // it outranks the config default and even a provably-clean skip.
+    if !column_level_enabled || force_rebuild {
         return ColumnSkipOutcome::Build;
     }
     // Content-addressed + unpartitioned only. A partitioned model records no
@@ -6407,15 +6569,12 @@ fn try_content_addressed_column_skip(
 
     // A prior *successful* build is the comparison baseline. Mirror the plain
     // gate: the single latest execution, which must itself be a success (a more
-    // recent failure forces a rebuild).
+    // recent failure forces a rebuild). The owning run id rides along so the
+    // liveness gate below can resolve the prior build's artifact rows.
     let Some(store) = state_store else {
         return ColumnSkipOutcome::Build;
     };
-    let prior = match store.get_model_history(model_name, 1) {
-        Ok(mut history) => history.pop(),
-        Err(_) => return ColumnSkipOutcome::Build,
-    };
-    let Some(prior) = prior else {
+    let Some((prior_run_id, prior)) = latest_execution_with_run_id(store, model_name) else {
         return ColumnSkipOutcome::Build;
     };
     if prior.status != "success" {
@@ -6444,7 +6603,28 @@ fn try_content_addressed_column_skip(
     };
 
     match decide_column_skip(&inputs) {
-        ColumnSkipVerdict::Skip => ColumnSkipOutcome::Skip(prior.output_column_hashes.clone()),
+        ColumnSkipVerdict::Skip => {
+            // Liveness gate: every clause held, but a skip is only sound while
+            // the prior output's bytes are still custody-clean. `rocky gc` can
+            // have evicted (tombstoned + retired) the prior artifact since the
+            // last build — skipping would then mask a retired table head as a
+            // healthy success. Any doubt builds.
+            match resolve_live_prior_artifact(store, &prior_run_id, model_name) {
+                Ok(prior_blake3) => ColumnSkipOutcome::Skip {
+                    prior_output_column_hashes: prior.output_column_hashes.clone(),
+                    prior_blake3,
+                },
+                Err(reason) => {
+                    debug!(
+                        model = model_name,
+                        reason = "prior_output_not_live",
+                        detail = reason.as_str(),
+                        "column-skip: declined (building)"
+                    );
+                    ColumnSkipOutcome::Build
+                }
+            }
+        }
         ColumnSkipVerdict::Build(reason) => {
             debug!(
                 model = model_name,
@@ -6454,6 +6634,38 @@ fn try_content_addressed_column_skip(
             );
             ColumnSkipOutcome::Build
         }
+    }
+}
+
+/// Propagate a column-skipped model's **prior** outputs into this run's
+/// in-memory composition maps, exactly as a build of identical bytes would
+/// have:
+///
+/// - the prior producer column hashes into `built_output_hashes` (when the
+///   prior build recorded them), so a later content-addressed consumer's
+///   baseline sees this upstream's current output == its prior;
+/// - under `[reuse]`, the prior artifact's blake3 into `reuse_outputs`, so a
+///   downstream's read of this skipped model still resolves to a STRONG
+///   content identity. Without this, a skipped enumerable upstream left every
+///   downstream consumer unresolvable — `input_hash = None`, a guaranteed
+///   clause-3 BUILD each run, no input-index entry, and no provenance record.
+///
+/// The hash is safe to publish: the liveness gate
+/// ([`resolve_live_prior_artifact`]) already proved it names a live,
+/// un-tombstoned artifact — a skip only happens with that proof in hand.
+fn propagate_skip_outputs(
+    target_full: String,
+    prior_output_column_hashes: Option<Vec<rocky_core::state::ColumnHash>>,
+    prior_blake3: String,
+    reuse_enabled: bool,
+    built_output_hashes: &mut std::collections::HashMap<String, Vec<rocky_core::state::ColumnHash>>,
+    reuse_outputs: &mut std::collections::HashMap<String, String>,
+) {
+    if let Some(hashes) = prior_output_column_hashes {
+        built_output_hashes.insert(target_full.clone(), hashes);
+    }
+    if reuse_enabled {
+        reuse_outputs.insert(target_full, prior_blake3);
     }
 }
 
@@ -14615,12 +14827,28 @@ merge_keys = ["id"]
             check_outcomes: Vec::new(),
         };
         store.record_run(&run).unwrap();
+        // The prior build's LIVE artifact — the ledger row the liveness gate
+        // resolves ("run-1" + "fct" → this blake3). Without it, a would-skip
+        // fails closed to a build (covered by the sibling liveness tests).
+        store
+            .record_artifact(&rocky_core::state::ArtifactRecord {
+                blake3_hash: "F1HASH".to_string(),
+                run_id: "run-1".to_string(),
+                model_name: "fct".to_string(),
+                file_path: "s3://bucket/fct/F1HASH.parquet".to_string(),
+                commit_version: 0,
+                size_bytes: 100,
+                written_at: now,
+            })
+            .unwrap();
 
         // (a) Consumed column unchanged ⇒ SKIP, propagating the prior OUTPUT
         // hashes for downstreams (design Fork 2 — a skipped upstream's output
-        // equals its last build).
+        // equals its last build) plus the prior artifact's live blake3 (so a
+        // downstream can still resolve this upstream to a STRONG identity).
         match try_content_addressed_column_skip(
             true,
+            false,
             "fct",
             &model_ir,
             adapter,
@@ -14628,11 +14856,20 @@ merge_keys = ["id"]
             &target_by_model,
             &built,
         ) {
-            ColumnSkipOutcome::Skip(propagated) => assert_eq!(
-                propagated,
-                Some(vec![ch("amount", "H_FCT_OUT")]),
-                "a column-skip propagates the prior build's OUTPUT hashes"
-            ),
+            ColumnSkipOutcome::Skip {
+                prior_output_column_hashes,
+                prior_blake3,
+            } => {
+                assert_eq!(
+                    prior_output_column_hashes,
+                    Some(vec![ch("amount", "H_FCT_OUT")]),
+                    "a column-skip propagates the prior build's OUTPUT hashes"
+                );
+                assert_eq!(
+                    prior_blake3, "F1HASH",
+                    "a column-skip carries the prior build's live artifact hash"
+                );
+            }
             ColumnSkipOutcome::Build => panic!("consumed columns unchanged must column-skip"),
         }
 
@@ -14644,6 +14881,7 @@ merge_keys = ["id"]
             matches!(
                 try_content_addressed_column_skip(
                     true,
+                    false,
                     "fct",
                     &model_ir,
                     adapter,
@@ -14660,6 +14898,7 @@ merge_keys = ["id"]
         assert!(matches!(
             try_content_addressed_column_skip(
                 false,
+                false,
                 "fct",
                 &model_ir,
                 adapter,
@@ -14669,6 +14908,281 @@ merge_keys = ["id"]
             ),
             ColumnSkipOutcome::Build
         ));
+
+        // (d) `--force-rebuild` outranks a provably-clean skip: identical
+        // inputs to the SKIP case above, but the escape hatch is set ⇒ BUILD.
+        // Non-vacuous: (a) proved this exact setup would otherwise skip.
+        assert!(
+            matches!(
+                try_content_addressed_column_skip(
+                    true,
+                    true,
+                    "fct",
+                    &model_ir,
+                    adapter,
+                    Some(&store),
+                    &target_by_model,
+                    &built,
+                ),
+                ColumnSkipOutcome::Build
+            ),
+            "--force-rebuild must force a build even when every skip clause holds"
+        );
+    }
+
+    /// FIX-cluster regression: the column-level skip **fails closed on a
+    /// non-live prior output**. A skip keeps the prior artifact authoritative,
+    /// so once `rocky gc` evicts it (tombstone + retired ledger row) — or when
+    /// no artifact was ever recorded, or a tombstone names its hash — the gate
+    /// must BUILD, never report a healthy `Skipped` over retired bytes.
+    #[test]
+    fn column_skip_fails_closed_on_evicted_or_tombstoned_prior_output() {
+        use rocky_ir::{GovernanceConfig, TargetRef};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        let mut model_ir = ModelIr::transformation(
+            TargetRef {
+                catalog: "cat".into(),
+                schema: "sch".into(),
+                table: "fct".into(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: "s3://bucket/fct".into(),
+                partition_columns: vec![],
+            },
+            vec![],
+            "SELECT amount FROM u".into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        model_ir.name = std::sync::Arc::from("fct");
+        let adapter = "duckdb";
+        let identity = crate::output::recipe_identity_internal(&model_ir, adapter);
+
+        let target_by_model = build_reuse_target_by_model([("u", &target_cfg("cat", "sch", "u"))]);
+        let mut built = std::collections::HashMap::new();
+        built.insert("cat.sch.u".to_string(), vec![ch("amount", "H_AMOUNT")]);
+        let prior_baseline =
+            compute_consumer_baseline(&model_ir.sql, &target_by_model, &built).unwrap();
+        let now = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let run = rocky_core::state::RunRecord {
+            run_id: "run-1".to_string(),
+            started_at: now,
+            finished_at: now,
+            status: rocky_core::state::RunStatus::Success,
+            models_executed: vec![rocky_core::state::ModelExecution {
+                model_name: "fct".to_string(),
+                started_at: now,
+                finished_at: now,
+                duration_ms: 0,
+                rows_affected: None,
+                status: "success".to_string(),
+                sql_hash: String::new(),
+                skip_hash: None,
+                upstream_freshness: Some(prior_baseline),
+                bytes_scanned: None,
+                bytes_written: None,
+                tenant: None,
+                recipe_hash: Some(identity.recipe_hash.clone()),
+                input_hash: None,
+                input_proof_class: None,
+                env_hash: Some(identity.env_hash.clone()),
+                hash_scheme: Some(identity.hash_scheme.clone()),
+                output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
+                attempts: Vec::new(),
+            }],
+            trigger: rocky_core::state::RunTrigger::Manual,
+            config_hash: "cfg".to_string(),
+            triggering_identity: None,
+            session_source: rocky_core::state::SessionSource::Cli,
+            git_commit: None,
+            git_branch: None,
+            idempotency_key: None,
+            target_catalog: None,
+            hostname: "test".to_string(),
+            rocky_version: "test".to_string(),
+            check_outcomes: Vec::new(),
+        };
+        store.record_run(&run).unwrap();
+
+        let gate = |store: &StateStore| {
+            try_content_addressed_column_skip(
+                true,
+                false,
+                "fct",
+                &model_ir,
+                adapter,
+                Some(store),
+                &target_by_model,
+                &built,
+            )
+        };
+
+        // (a) Every decision clause holds, but the prior build recorded NO
+        // artifact — liveness is unprovable ⇒ BUILD (fail-closed).
+        assert!(
+            matches!(gate(&store), ColumnSkipOutcome::Build),
+            "an unresolvable prior artifact must fail closed to a build"
+        );
+
+        // (b) Record the artifact ⇒ the same setup now genuinely SKIPS
+        // (non-vacuity for the eviction case below).
+        let file_path = "s3://bucket/fct/F1HASH.parquet".to_string();
+        let artifact = rocky_core::state::ArtifactRecord {
+            blake3_hash: "F1HASH".to_string(),
+            run_id: "run-1".to_string(),
+            model_name: "fct".to_string(),
+            file_path: file_path.clone(),
+            commit_version: 0,
+            size_bytes: 100,
+            written_at: now,
+        };
+        store.record_artifact(&artifact).unwrap();
+        assert!(
+            matches!(gate(&store), ColumnSkipOutcome::Skip { .. }),
+            "with a live prior artifact the clean setup must skip"
+        );
+
+        // (c) `rocky gc` evicts the artifact (tombstone + retired row, the
+        // production `evict_artifact` path) ⇒ BUILD.
+        let tombstone = rocky_core::state::TombstoneRecord {
+            blake3_hash: "F1HASH".to_string(),
+            run_id: "run-1".to_string(),
+            model_name: "fct".to_string(),
+            file_path: file_path.clone(),
+            size_bytes: 100,
+            commit_version: 0,
+            recipe_hash: None,
+            input_hash: None,
+            input_proof_class: None,
+            env_hash: None,
+            hash_scheme: None,
+            evicted_at: chrono::Utc::now(),
+            plan_id: "plan-test".to_string(),
+            physical_reclaimed: false,
+            observed_delta_version: None,
+        };
+        let outcome = store
+            .evict_artifact(&tombstone, "run-1", "fct", &file_path)
+            .unwrap();
+        assert!(matches!(outcome, rocky_core::state::EvictOutcome::Evicted));
+        assert!(
+            matches!(gate(&store), ColumnSkipOutcome::Build),
+            "an evicted (tombstoned + retired) prior output must force a build"
+        );
+
+        // (d) Tombstone-only: re-record the artifact row so the ledger is live
+        // again, but the tombstone still names the hash ⇒ BUILD (a tombstone
+        // is a custody event; even a stale one refuses the skip).
+        store.record_artifact(&artifact).unwrap();
+        assert!(
+            matches!(gate(&store), ColumnSkipOutcome::Build),
+            "a tombstoned hash must refuse the skip even with a live ledger row"
+        );
+    }
+
+    /// FIX-cluster regression: a supervised backfill NEVER column-skips its
+    /// planned models. `backfill_reuse_gates` is the single seam
+    /// `execute_backfill_set` resolves its `execute_models` gates through, so
+    /// pinning it (against a config that opts IN) pins the backfill behavior:
+    /// point-to reuse follows config, the column-level skip is always off.
+    #[test]
+    fn backfill_gates_disable_column_skip_even_when_config_opts_in() {
+        let cfg: rocky_core::config::RockyConfig =
+            toml::from_str("[reuse]\nenabled = true\ncolumn_level = true").unwrap();
+        assert!(cfg.reuse.column_level, "premise: config opts in");
+        let (reuse_enabled, column_level_enabled) = backfill_reuse_gates(&cfg);
+        assert!(reuse_enabled, "point-to reuse follows `[reuse].enabled`");
+        assert!(
+            !column_level_enabled,
+            "a backfill is an explicit rebuild order — never column-skipped"
+        );
+
+        // And the config default (column_level ON) is likewise overridden.
+        let default_cfg: rocky_core::config::RockyConfig = toml::from_str("").unwrap();
+        assert!(default_cfg.reuse.column_level, "premise: default-ON");
+        assert!(!backfill_reuse_gates(&default_cfg).1);
+    }
+
+    /// FIX-cluster regression: a column-skipped model publishes its PRIOR
+    /// outputs to both in-run composition maps — the producer column hashes
+    /// into `built_output_hashes` and (under `[reuse]`) the prior artifact's
+    /// blake3 into `reuse_outputs`. Without the latter, a downstream
+    /// content-addressed consumer of a skipped upstream recomputes
+    /// `input_hash = None` and clause-3 BUILDs every run, unindexed.
+    #[test]
+    fn skip_path_publishes_prior_outputs_for_downstream_composition() {
+        let mut built_output_hashes = std::collections::HashMap::new();
+        let mut reuse_outputs = std::collections::HashMap::new();
+
+        propagate_skip_outputs(
+            "cat.sch.u".to_string(),
+            Some(vec![ch("amount", "H_U_OUT")]),
+            "U1HASH".to_string(),
+            true,
+            &mut built_output_hashes,
+            &mut reuse_outputs,
+        );
+        assert_eq!(
+            built_output_hashes.get("cat.sch.u"),
+            Some(&vec![ch("amount", "H_U_OUT")]),
+            "producer column hashes propagate for the consumer baseline"
+        );
+        assert_eq!(
+            reuse_outputs.get("cat.sch.u"),
+            Some(&"U1HASH".to_string()),
+            "the prior artifact's blake3 propagates for STRONG upstream resolution"
+        );
+
+        // The downstream payoff (the actual regression): a downstream that
+        // reads this skipped upstream resolves it to a STRONG content identity
+        // ONLY because the prior hash was published into `reuse_outputs`.
+        // Without it the read is unresolved, which forces a clause-3 BUILD each
+        // run and leaves the model unindexed / without a ProvenanceRecord.
+        let target_by_model = build_reuse_target_by_model([("u", &target_cfg("cat", "sch", "u"))]);
+        assert!(
+            resolve_read_set_content_upstreams(
+                "SELECT amount FROM u",
+                &target_by_model,
+                &reuse_outputs
+            )
+            .is_some(),
+            "a skipped-but-published upstream lets a downstream resolve a STRONG upstream"
+        );
+        assert!(
+            resolve_read_set_content_upstreams(
+                "SELECT amount FROM u",
+                &target_by_model,
+                &std::collections::HashMap::new()
+            )
+            .is_none(),
+            "without the published hash the downstream read is unresolved (clause-3 BUILD)"
+        );
+
+        // Reuse off ⇒ the artifact hash is NOT published (the spine is never
+        // populated on that path), but producer column hashes still are.
+        let mut boh2 = std::collections::HashMap::new();
+        let mut ro2 = std::collections::HashMap::new();
+        propagate_skip_outputs(
+            "cat.sch.u".to_string(),
+            None,
+            "U1HASH".to_string(),
+            false,
+            &mut boh2,
+            &mut ro2,
+        );
+        assert!(
+            boh2.is_empty(),
+            "no prior column hashes ⇒ nothing published"
+        );
+        assert!(ro2.is_empty(), "reuse off ⇒ no reuse_outputs entry");
     }
 
     /// Full-stack soak + regression proof for the content-addressed
@@ -15446,10 +15960,24 @@ merge_keys = ["id"]
                 check_outcomes: Vec::new(),
             };
             store.record_run(&run).unwrap();
+            // The prior build's LIVE artifact row — the liveness gate resolves
+            // ("run-1", "fct") to this hash before permitting a skip.
+            store
+                .record_artifact(&rocky_core::state::ArtifactRecord {
+                    blake3_hash: "FCT1HASH".to_string(),
+                    run_id: "run-1".to_string(),
+                    model_name: "fct".to_string(),
+                    file_path: "s3://bucket/fct/FCT1HASH.parquet".to_string(),
+                    commit_version: 0,
+                    size_bytes: 100,
+                    written_at: now,
+                })
+                .unwrap();
 
             // Unchanged consumed column ⇒ SKIP, propagating fct's output hashes.
             match try_content_addressed_column_skip(
                 true,
+                false,
                 "fct",
                 &d_ir,
                 adapter,
@@ -15457,11 +15985,17 @@ merge_keys = ["id"]
                 &tbm,
                 &built_v1,
             ) {
-                ColumnSkipOutcome::Skip(propagated) => assert_eq!(
-                    propagated,
-                    Some(fct_out),
-                    "a column-skip propagates the prior build's real output hashes"
-                ),
+                ColumnSkipOutcome::Skip {
+                    prior_output_column_hashes,
+                    prior_blake3,
+                } => {
+                    assert_eq!(
+                        prior_output_column_hashes,
+                        Some(fct_out),
+                        "a column-skip propagates the prior build's real output hashes"
+                    );
+                    assert_eq!(prior_blake3, "FCT1HASH");
+                }
                 ColumnSkipOutcome::Build => panic!("unchanged consumed column must skip"),
             }
 
@@ -15472,6 +16006,7 @@ merge_keys = ["id"]
                 matches!(
                     try_content_addressed_column_skip(
                         true,
+                        false,
                         "fct",
                         &d_ir,
                         adapter,
@@ -15725,6 +16260,20 @@ merge_keys = ["id"]
                     check_outcomes: Vec::new(),
                 })
                 .unwrap();
+            // The prior live_d build's LIVE artifact-ledger row — the liveness
+            // gate resolves it before permitting a skip (the prior output must
+            // still be live, not gc-evicted / tombstoned).
+            store
+                .record_artifact(&rocky_core::state::ArtifactRecord {
+                    blake3_hash: "live-d-prior".to_string(),
+                    run_id: "run-live-1".to_string(),
+                    model_name: "live_d".to_string(),
+                    file_path: "s3://bucket/live_d/prior.parquet".to_string(),
+                    commit_version: 0,
+                    size_bytes: 1,
+                    written_at: now,
+                })
+                .unwrap();
 
             // U build v2 (THE TRAP): the consumed `id` column moves (id_c →
             // id_c_moved). The live writer's per-column hash for `id` must move
@@ -15741,6 +16290,7 @@ merge_keys = ["id"]
                 matches!(
                     try_content_addressed_column_skip(
                         true,
+                        false,
                         "live_d",
                         &d_ir,
                         adapter,
@@ -15767,6 +16317,7 @@ merge_keys = ["id"]
                 matches!(
                     try_content_addressed_column_skip(
                         true,
+                        false,
                         "live_d",
                         &d_ir,
                         adapter,
@@ -15774,7 +16325,7 @@ merge_keys = ["id"]
                         &tbm,
                         &built_v3,
                     ),
-                    ColumnSkipOutcome::Skip(_)
+                    ColumnSkipOutcome::Skip { .. }
                 ),
                 "an unchanged consumed `id` column (only non-consumed `name` churned) must skip"
             );

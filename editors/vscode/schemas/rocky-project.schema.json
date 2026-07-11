@@ -1276,6 +1276,18 @@
       ],
       "type": "object"
     },
+    "GcConfig": {
+      "additionalProperties": false,
+      "description": "`[gc]` — storage-reclamation settings for `rocky gc` and its review-gated `rocky apply <gc-plan>`.\n\nEviction is **ledger-only**: an approved apply writes the durable tombstone and retires the artifact's ledger row (the eviction of record, always restorable from the recorded recipe). Physical byte-deletion is not performed — reclaiming bytes safely requires a protocol-aware VACUUM (retention windows + TOCTOU-safe deletion), which is future work.",
+      "properties": {
+        "physical_delete": {
+          "default": false,
+          "description": "Reserved for a future protocol-aware VACUUM.\n\n`false` (the default): `rocky apply <gc-plan>` tombstones + retires the ledger row and leaves the bytes in place. `true` is currently a **hard error** at apply time — physical reclamation of content-addressed bytes requires a protocol-aware VACUUM (Delta tombstone-retention windows + TOCTOU-safe deletion against concurrent re-adds) that is not yet implemented, so the flag fails loudly rather than silently deleting or silently no-op'ing.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "GovernanceConfig": {
       "additionalProperties": false,
       "description": "Governance settings: auto-creation of catalogs/schemas, tags, isolation, and grants.",
@@ -4325,6 +4337,17 @@
       ],
       "default": {},
       "description": "Project-level freshness defaults inherited by per-model [`crate::models::ModelFreshnessConfig`] declarations that omit individual fields. See [`ProjectFreshnessConfig`] for the TOML shape:\n\n```toml [freshness] expected_lag_seconds = 3600 time_column = \"updated_at\" severity = \"warning\" ```\n\nInheritance is field-by-field: a per-model `[freshness]` table always wins for the fields it sets; absent fields fall through to the project-level default. Models with no per-model `[freshness]` at all inherit the project default when it carries an `expected_lag_seconds` value (the required field)."
+    },
+    "gc": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/GcConfig"
+        }
+      ],
+      "default": {
+        "physical_delete": false
+      },
+      "description": "`[gc]` — storage-reclamation settings for `rocky gc` / `rocky apply <gc-plan>`. Default: physical byte-deletion stays disarmed; an applied eviction is recorded as tombstone + retired ledger row only. See [`GcConfig`]."
     },
     "hook": {
       "allOf": [
