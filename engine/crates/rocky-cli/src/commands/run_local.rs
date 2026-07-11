@@ -576,23 +576,46 @@ pub(crate) async fn run_custom_checks(
         let severity = custom.severity;
         match warehouse.execute_query(&sql).await {
             Ok(result) => {
-                let result_value =
-                    cell_as_u64(result.rows.first().and_then(|r| r.first())).unwrap_or(0);
-                // Delegate to the single canonical custom-check evaluator so the
-                // wired path and `checks::check_custom` can't drift on the pass
-                // condition again. `threshold` is the MAX allowed failing-row
-                // count, so the check passes iff `result_value <= threshold`
-                // (with the default `threshold = 0`, a violation-counting check
-                // passes only when it finds zero rows). `check_custom` defaults
-                // severity to Error; restore the check's configured severity.
-                let mut check = rocky_core::checks::check_custom(
-                    &custom.name,
-                    &sql,
-                    result_value,
-                    custom.threshold,
-                );
-                check.severity = severity;
-                results.push(check);
+                // `cell_as_u64` returns `None` on an absent/unparseable cell
+                // *specifically* so a parse failure isn't read as a real 0.
+                // With the default `threshold = 0` a violation-counting check
+                // passes iff `result_value <= 0`, so defaulting `None` to 0
+                // would report a never-evaluated check as green. Treat an
+                // unparseable count as a check failure instead.
+                match cell_as_u64(result.rows.first().and_then(|r| r.first())) {
+                    Some(result_value) => {
+                        // Delegate to the single canonical custom-check evaluator so
+                        // the wired path and `checks::check_custom` can't drift on the
+                        // pass condition again. `threshold` is the MAX allowed
+                        // failing-row count, so the check passes iff
+                        // `result_value <= threshold`. `check_custom` defaults
+                        // severity to Error; restore the check's configured severity.
+                        let mut check = rocky_core::checks::check_custom(
+                            &custom.name,
+                            &sql,
+                            result_value,
+                            custom.threshold,
+                        );
+                        check.severity = severity;
+                        results.push(check);
+                    }
+                    None => {
+                        warn!(
+                            check = custom.name.as_str(),
+                            "custom check returned no parseable count; failing the check"
+                        );
+                        results.push(CheckResult {
+                            name: custom.name.clone(),
+                            passed: false,
+                            severity,
+                            details: CheckDetails::Custom {
+                                query: sql,
+                                result_value: 0,
+                                threshold: custom.threshold,
+                            },
+                        });
+                    }
+                }
             }
             Err(e) => {
                 warn!(error = %e, check = custom.name.as_str(), "custom check query failed");
@@ -1515,5 +1538,47 @@ auto_create_schemas = true
             "the persisted run status must be Failure, got {:?}",
             runs[0].status
         );
+    }
+
+    #[tokio::test]
+    async fn custom_check_with_unparseable_count_fails_closed() {
+        // A custom check whose query succeeds but returns a non-numeric cell
+        // must FAIL, not silently pass. Previously the count defaulted to 0
+        // and `0 <= threshold(0)` reported the never-evaluated check green.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("checks.duckdb");
+        {
+            let a = DuckDbWarehouseAdapter::open(&db).expect("open");
+            a.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            a.execute_statement("CREATE TABLE main.t AS SELECT 1 AS id")
+                .await
+                .unwrap();
+        }
+        let warehouse = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+
+        let unparseable = rocky_core::config::CustomCheckConfig {
+            name: "bad_count".to_string(),
+            // Succeeds, but the single cell is a string cell_as_u64 can't parse.
+            sql: "SELECT 'not-a-number'".to_string(),
+            threshold: 0,
+            severity: rocky_core::tests::TestSeverity::Error,
+        };
+        let good = rocky_core::config::CustomCheckConfig {
+            name: "zero_violations".to_string(),
+            sql: "SELECT 0".to_string(),
+            threshold: 0,
+            severity: rocky_core::tests::TestSeverity::Error,
+        };
+
+        let results = super::run_custom_checks(&warehouse, "main.t", &[unparseable, good]).await;
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            !results[0].passed,
+            "an unparseable count must fail the check, not pass on a defaulted 0"
+        );
+        assert!(results[1].passed, "a genuine 0 <= threshold still passes");
     }
 }

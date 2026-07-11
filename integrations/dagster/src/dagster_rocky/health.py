@@ -310,16 +310,21 @@ def _last_run_from_history(rocky: RockyResource) -> tuple[str | None, datetime |
     if not runs:
         return None, None
 
-    # The CLI returns runs newest-first; take the first entry.
-    first = runs[0]
-    wire_status = str(getattr(first, "status", "") or "")
-    normalised = _RUN_STATUS_NORMALISE.get(wire_status.strip().lower(), "failure")
-    started_at = getattr(first, "started_at", None)
-    # Guard against the rare case where a (legacy) shape lacks ``runs``
-    # or ``started_at`` — treat as "unknown" rather than synthesising.
-    if started_at is None:
-        return normalised, None
-    return normalised, started_at
+    # The CLI returns runs newest-first. Skip idempotency-deflected runs
+    # (``SkippedIdempotent`` / ``SkippedInFlight``): those never executed, so
+    # they carry no real outcome — reporting one as the "last run status"
+    # would flag a healthy pipeline (a run short-circuited because a prior run
+    # already succeeded) as ``failure``. Report the most recent run that
+    # actually ran; if every recent run was skipped, treat it as "unknown".
+    for run in runs:
+        wire_status = str(getattr(run, "status", "") or "").strip().lower()
+        if wire_status.startswith("skipped"):
+            continue
+        normalised = _RUN_STATUS_NORMALISE.get(wire_status, "failure")
+        started_at = getattr(run, "started_at", None)
+        return normalised, started_at
+
+    return None, None
 
 
 def _run_state_rw_probe(rocky: RockyResource) -> tuple[ProbeOutcome, int | None, str | None]:
