@@ -43,7 +43,7 @@ export type PolicyPrincipal = "human" | "agent";
 /**
  * What `rocky audit --for <selector>` resolved its selector to.
  *
- * The selector is resolved in priority order: a 64-char hex string with a plan file on disk is a [`AuditSubjectKind::Plan`]; a string matching a `run_id` in the run ledger is a [`AuditSubjectKind::Run`]; anything else is treated as a [`AuditSubjectKind::Model`] name.
+ * The selector is resolved in priority order: a 64-char hex string with a plan file on disk is a [`AuditSubjectKind::Plan`]; a string matching a `run_id` in the run ledger is a [`AuditSubjectKind::Run`]; a string the decision ledger keys rows by is likewise a [`AuditSubjectKind::Plan`] (the plan file may be gone, or the id may be a decision-only custody key that never had one); anything else is treated as a [`AuditSubjectKind::Model`] name.
  */
 export type AuditSubjectKind = "model" | "run" | "plan";
 

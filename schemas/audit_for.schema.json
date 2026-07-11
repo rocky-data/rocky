@@ -319,7 +319,7 @@
       "type": "object"
     },
     "AuditSubjectKind": {
-      "description": "What `rocky audit --for <selector>` resolved its selector to.\n\nThe selector is resolved in priority order: a 64-char hex string with a plan file on disk is a [`AuditSubjectKind::Plan`]; a string matching a `run_id` in the run ledger is a [`AuditSubjectKind::Run`]; anything else is treated as a [`AuditSubjectKind::Model`] name.",
+      "description": "What `rocky audit --for <selector>` resolved its selector to.\n\nThe selector is resolved in priority order: a 64-char hex string with a plan file on disk is a [`AuditSubjectKind::Plan`]; a string matching a `run_id` in the run ledger is a [`AuditSubjectKind::Run`]; a string the decision ledger keys rows by is likewise a [`AuditSubjectKind::Plan`] (the plan file may be gone, or the id may be a decision-only custody key that never had one); anything else is treated as a [`AuditSubjectKind::Model`] name.",
       "oneOf": [
         {
           "description": "A model / table name — the primary custody-chain entry point.",
@@ -336,7 +336,7 @@
           "type": "string"
         },
         {
-          "description": "A `plan_id` (64-char blake3 hex) with a plan file on disk.",
+          "description": "A `plan_id` — a 64-char blake3 hex with a plan file on disk, or any id the decision ledger keys rows by (including decision-only custody ids like `freeze:…` / `draft:…` / `autoapply:…`, which never had a plan file).",
           "enum": [
             "plan"
           ],

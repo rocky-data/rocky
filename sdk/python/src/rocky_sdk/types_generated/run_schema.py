@@ -150,7 +150,7 @@ class ExecutionSummary(BaseModel):
     """
     tables_failed: conint(ge=0)
     """
-    Tables that failed during the **execution phase** — copy or runtime failures while materializing. This does **not** include models excluded before execution started (for example, a model that failed to compile); those are counted only in the top-level `RunOutput.tables_failed`. For overall run pass/fail, read the top-level `tables_failed` / `status`, not this `execution.tables_failed`.
+    Source tables whose **copy failed** on the replication path (the `table_errors` count). Transformation-model runtime failures — including contained-cause failures — are reported in `errors` and the top-level `RunOutput.tables_failed`, not here; transformation-only runs leave the whole `execution` block unpopulated. For overall run pass/fail, read the top-level `tables_failed` / `status`, never this field.
     """
     tables_processed: conint(ge=0)
 

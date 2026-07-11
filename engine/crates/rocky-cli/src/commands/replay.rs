@@ -659,24 +659,18 @@ async fn replay_execute_model(
             rows: Some(rows),
             reasons: Vec::new(),
         }
-    } else if let Some(undefined) = hash_comparison_undefined(store, run_id, &recorded) {
-        // The digests describe different encodings/engine versions — an
-        // honest non-verdict, not a claimed reproducibility gap.
-        ReplayExecuteModelOutput {
-            model_name: model_name.to_string(),
-            verdict: "non_replayable".to_string(),
-            nondeterministic: check.nondeterministic,
-            recorded_hash: Some(recorded),
-            computed_hash: Some(computed),
-            rows: Some(rows),
-            reasons: vec![undefined],
-        }
     } else {
         let mut reasons = vec![format!(
             "re-executed output blake3 {} != recorded {}",
             short_hash(&computed),
             short_hash(&recorded)
         )];
+        if let Some(caveat) = encoding_skew_caveat(store, &recorded) {
+            reasons.push(caveat);
+        }
+        if let Some(caveat) = version_skew_caveat(store, run_id) {
+            reasons.push(caveat);
+        }
         if check.nondeterministic {
             reasons.push(
                 "expected: the recipe contains a nondeterministic construct \
@@ -701,44 +695,16 @@ async fn replay_execute_model(
 // re-execution
 // ---------------------------------------------------------------------------
 
-/// A recorded output hash whose provenance makes offline byte-comparison
-/// undefined — the honest reason, or `None` when the comparison is
-/// meaningful. Two proven-incomparable shapes:
-///
-/// - **cross-version recording**: parquet byte-identity is only pinned for
-///   the SAME engine version over the same inputs (parquet-rs upgrades
-///   legitimately change file bytes), so a hash recorded under another
-///   `rocky_version` cannot adjudicate determinism;
-/// - **live-writer recording**: an artifact row pointing at object storage
-///   means the recorded parquet was encoded with the live table's physical
-///   column mapping (`col-<uuid>` names read from its `_delta_log`), which
-///   the offline replay's deterministic logical mapping never reproduces —
-///   the recorded and re-derived digests describe different encodings of
-///   the same rows.
-///
-/// A verify hitting either shape is reported `non_replayable` with the
-/// reason, never `diverged` — `diverged` is reserved for a meaningful
-/// comparison that failed (the schema tells consumers to read it as a real
-/// reproducibility gap). A matching hash is still `bit_exact`: byte
-/// equality is meaningful regardless.
-fn hash_comparison_undefined(
-    store: &StateStore,
-    run_id: &str,
-    recorded_hash: &str,
-) -> Option<String> {
-    let current = env!("CARGO_PKG_VERSION");
-    if let Ok(Some(run)) = store.get_run(run_id)
-        && !run.rocky_version.is_empty()
-        && run.rocky_version != "<pre-audit>"
-        && run.rocky_version != current
-    {
-        return Some(format!(
-            "recorded under rocky {}, replaying under rocky {current} — parquet byte-identity \
-             is only pinned within one engine version, so this mismatch does not evidence \
-             nondeterminism; re-record on the current version to re-baseline",
-            run.rocky_version
-        ));
-    }
+/// A `diverged` caveat when the recorded hash's artifact row points at
+/// object storage: a live UniForm write encodes parquet with the table's
+/// physical column mapping (`col-<uuid>` names read from its `_delta_log`),
+/// which the offline replay's deterministic logical mapping does not
+/// reproduce — so the mismatch may be an encoding difference over identical
+/// rows rather than a reproducibility gap. The provenance does not record
+/// the encoding identity, so this is disclosed as ambiguity on `diverged`
+/// (a matching hash is still `bit_exact`: byte equality is meaningful
+/// regardless of how the recording was encoded).
+fn encoding_skew_caveat(store: &StateStore, recorded_hash: &str) -> Option<String> {
     let live_writer_artifact = store
         .list_artifacts_by_hash(recorded_hash)
         .ok()
@@ -748,13 +714,39 @@ fn hash_comparison_undefined(
         })
         .unwrap_or(false);
     live_writer_artifact.then(|| {
-        "the recorded hash was written by the live UniForm writer (its artifact row points at \
-         object storage): that parquet is encoded with the table's physical column mapping, \
-         which the offline replay's deterministic logical mapping cannot reproduce — byte \
-         comparison is undefined for this recording (the warehouse-path replay is a later \
-         phase)"
+        "caveat: the recorded hash's artifact lives on object storage, where the live UniForm \
+         writer encodes parquet with the table's physical column mapping — a mapping the \
+         offline replay's deterministic encoding does not reproduce — so this mismatch may be \
+         encoding skew over identical rows rather than a reproducibility gap (the \
+         warehouse-path replay is a later phase)"
             .to_string()
     })
+}
+
+/// A `diverged` caveat when the recording came from a DIFFERENT engine
+/// version: parquet byte-identity is only pinned for the same version over
+/// the same inputs (a parquet-rs upgrade legitimately changes file bytes),
+/// so a cross-version mismatch is ambiguous — it may be encoding drift, not
+/// nondeterminism. Ambiguity stays `diverged` (unlike the provably-undefined
+/// live-writer shape) but the reason must say so.
+fn version_skew_caveat(store: &StateStore, run_id: &str) -> Option<String> {
+    let current = env!("CARGO_PKG_VERSION");
+    match store.get_run(run_id) {
+        Ok(Some(run))
+            if !run.rocky_version.is_empty()
+                && run.rocky_version != "<pre-audit>"
+                && run.rocky_version != current =>
+        {
+            Some(format!(
+                "caveat: recorded under rocky {}, replayed under rocky {current} — parquet \
+                 byte-identity is only pinned within one engine version, so this mismatch may \
+                 be encoding drift rather than nondeterminism; re-record on the current version \
+                 to re-baseline",
+                run.rocky_version
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Fully-qualified `catalog.schema.table` identity of a model's output.
@@ -1188,22 +1180,18 @@ async fn replay_execute_dag_node(
             rows: Some(rows),
             reasons: Vec::new(),
         }
-    } else if let Some(undefined) = hash_comparison_undefined(store, run_id, &recorded) {
-        ReplayExecuteModelOutput {
-            model_name: cand.model_name.clone(),
-            verdict: "non_replayable".to_string(),
-            nondeterministic: cand.nondeterministic,
-            recorded_hash: Some(recorded),
-            computed_hash: Some(computed),
-            rows: Some(rows),
-            reasons: vec![undefined],
-        }
     } else {
         let mut reasons = vec![format!(
             "re-executed output blake3 {} != recorded {}",
             short_hash(&computed),
             short_hash(&recorded)
         )];
+        if let Some(caveat) = encoding_skew_caveat(store, &recorded) {
+            reasons.push(caveat);
+        }
+        if let Some(caveat) = version_skew_caveat(store, run_id) {
+            reasons.push(caveat);
+        }
         if cand.nondeterministic {
             reasons.push(
                 "expected: the recipe contains a nondeterministic construct \
