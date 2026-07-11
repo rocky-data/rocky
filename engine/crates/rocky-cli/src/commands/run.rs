@@ -1295,6 +1295,10 @@ pub async fn run(
             output.idempotency_key = Some(ctx.key.clone());
         }
 
+        // Finding #1: baseline the failure count so a SOFT model failure (compile
+        // error / contained runtime failure that still returns `Ok`) skips
+        // governance below, not just a hard `Err`.
+        let failures_before = output.tables_failed;
         let exec_result = execute_models(
             mdir,
             warehouse.as_ref(),
@@ -1325,6 +1329,8 @@ pub async fn run(
             rocky_cfg.resilience.clone(),
             super::resilience::retry_policy_allows(&rocky_cfg),
             exec_fp_gate.as_ref(),
+            // Finding #4: the `--model` path reconciles no masks.
+            false,
         )
         .await;
 
@@ -1341,7 +1347,10 @@ pub async fn run(
         // a runtime failure. The terminal-status exit contract is honoured by
         // `run_status_exit_result` below.
         match exec_result {
-            Ok(()) => {
+            // Finding #1: only when the model phase is CLEAN (no new failures) —
+            // a soft compile/runtime failure returns `Ok(())`, so `Ok` alone is
+            // not enough to authorize governance/manifest writes.
+            Ok(()) if output.tables_failed == failures_before => {
                 // Per-model `[governance.tags]` apply (scoped to the built
                 // model). The model-only path is one of the entry points the
                 // SDK / Dagster drive; without this its tags were silently
@@ -1362,6 +1371,10 @@ pub async fn run(
                 // recomputes it.
                 write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
             }
+            // Finding #1: a SOFT model failure (`Ok(())` but a new failure was
+            // recorded) — skip governance/manifest, fall through to the failure
+            // payload.
+            Ok(()) => {}
             Err(e) => {
                 output.tables_failed += 1;
                 output.errors.push(crate::output::TableErrorOutput {
@@ -3839,10 +3852,19 @@ pub async fn run(
             ))
             .await;
     }
+    // Finding #1: whether the compiled-model phase completed cleanly, hoisted so
+    // the recipe-manifest write (outside the model block below) can also skip on
+    // a failed model phase. `true` when no models run (nothing to fail).
+    let mut model_phase_clean = true;
     // --- Compiled model execution (--all or --models) ---
     if run_all || models_dir.is_some() {
         let mdir = models_dir.unwrap_or_else(|| std::path::Path::new("models"));
         if mdir.exists() {
+            // Finding #1: capture the failure count BEFORE the model phase so the
+            // governance guard below can detect a SOFT failure (a compile error
+            // recorded into `output`, or a contained runtime failure) that still
+            // returns `Ok(())` — not just a hard `Err`.
+            let failures_before = output.tables_failed;
             // §P2.6 follow-up — execute_models + warehouse adapter
             // construction were the remaining `?`-propagation sites
             // where a pipeline error could surface without firing
@@ -3882,21 +3904,25 @@ pub async fn run(
                     rocky_cfg.resilience.clone(),
                     super::resilience::retry_policy_allows(&rocky_cfg),
                     exec_fp_gate.as_ref(),
+                    // Finding #4: THE mask-reconciling path — bind the mask.
+                    true,
                 )
                 .await?;
                 Ok(())
             }
             .await;
-            // ‼️ Governance runs ONLY when execution completed cleanly (finding
-            // #1 — critical). ANY `execute_models` error — a fingerprint mismatch
-            // (the reviewed set changed), a routing swap, or a model failure —
-            // means the gated set did not fully execute, so reconciling
-            // masks/classifications/retention/tags/role GRANTs now would push
-            // UNREVIEWED governance to the warehouse *despite the gate detecting
-            // the change*. On error we record the failure and SKIP all post-model
-            // governance below, falling through to the failure payload + non-zero
-            // exit.
-            let exec_ok = exec_result.is_ok();
+            // ‼️ Governance runs ONLY when the model phase completed cleanly
+            // (finding #1 — critical). "Clean" is `Ok(())` AND no NEW failures:
+            // a hard error (fingerprint mismatch, routing swap) OR a SOFT failure
+            // (a compile error recorded into `output`, or a contained runtime
+            // failure under `contain_failures`) means the gated set did not fully
+            // execute, so reconciling masks/classifications/retention/tags/role
+            // GRANTs — or writing the recipe manifest — would push UNREVIEWED
+            // governance to the warehouse *despite the gate detecting the change*.
+            // On any failure we record it and SKIP all post-model governance
+            // below, falling through to the failure payload + non-zero exit.
+            let exec_ok = exec_result.is_ok() && output.tables_failed == failures_before;
+            model_phase_clean = exec_ok;
             if let Err(e) = exec_result {
                 // Record the runtime model failure as a table error and fall
                 // through to the terminal emit instead of returning raw `Err`.
@@ -4176,7 +4202,13 @@ pub async fn run(
     // This single hook, keyed off `output.materializations`, covers every
     // replication / transformation / time-interval model built by this
     // pipeline path. Best-effort — never flips the run's exit code.
-    write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
+    //
+    // Finding #1: the recipe manifest IS a governance attestation, so it is
+    // skipped on a failed model phase (a fingerprint mismatch or a soft failure)
+    // — the same halt the masking/role reconcile obeys above.
+    if model_phase_clean {
+        write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
+    }
 
     // Persist the RunRecord so `rocky history`, `rocky replay`,
     // `rocky trace`, and `rocky cost` have real data to read.
@@ -4968,6 +5000,8 @@ pub(crate) async fn execute_backfill_set(
     // satisfy it byte-identically, but the column-level skip never may.
     let (reuse_enabled, column_level_enabled) = backfill_reuse_gates(rocky_cfg);
 
+    // Finding #1: baseline failures so a soft model failure skips governance.
+    let failures_before = output.tables_failed;
     let exec_result = execute_models(
         models_dir,
         warehouse.as_ref(),
@@ -4991,11 +5025,14 @@ pub(crate) async fn execute_backfill_set(
         rocky_cfg.resilience.clone(),
         super::resilience::retry_policy_allows(rocky_cfg),
         exec_fp_gate,
+        // Finding #4: a backfill reconciles only tags, not masks.
+        false,
     )
     .await;
 
     match exec_result {
-        Ok(()) => {
+        // Finding #1: only when the model phase is CLEAN (no new soft failures).
+        Ok(()) if output.tables_failed == failures_before => {
             // Re-apply each rebuilt model's `[governance.tags]`, scoped to the
             // closure so unrelated models are untouched.
             let governance_adapter = adapter_registry.governance_adapter(&target_adapter_name);
@@ -5011,6 +5048,8 @@ pub(crate) async fn execute_backfill_set(
             }
             write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
         }
+        // Soft model failure — skip governance/manifest, fall through.
+        Ok(()) => {}
         Err(e) => {
             output.tables_failed += 1;
             output.errors.push(crate::output::TableErrorOutput {
@@ -5132,6 +5171,13 @@ pub(crate) async fn execute_models(
     // EXACT set about to execute and refuses (fail-closed) on mismatch —
     // checked == executed. `None` for bare `rocky run` and human applies.
     exec_fp_gate: Option<&crate::commands::apply::ExecFingerprintGate>,
+    // Finding #4: `true` ONLY at the full replication `--all` call site, the sole
+    // path that reconciles masks post-model. On every other path (model-only,
+    // backfill, the transformation route) masking is NOT reconciled, so the mask
+    // must NOT enter the TOCTOU fingerprint — otherwise a mask change on a model
+    // that path never masks would falsely refuse. The plan side computes the same
+    // value from the resolved pipeline type, keeping the fingerprint symmetric.
+    reconciles_masks: bool,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -5254,19 +5300,18 @@ pub(crate) async fn execute_models(
         // post-plan swap of any refuses here. `models_dir` is the SAME directory
         // the plan fingerprinted.
         //
-        // Finding #4: the mask is bound ONLY on the full `--all` path, where every
-        // model executes AND the post-model masking reconcile runs. On a
-        // selection-scoped path (`--model` / backfill `model_set`) masking is NOT
-        // reconciled (only tags), and only a subset executes — so binding a mask
-        // used by an *unselected* model would falsely refuse. Both plan and apply
-        // gate the mask on the SAME predicate (no model filter / no model_set),
-        // so the fingerprint stays symmetric.
-        let scoped = model_name_filter.is_some() || model_set.is_some();
+        // Finding #4: bind the mask into the fingerprint ONLY on the path that
+        // actually reconciles masks (the full replication `--all` route,
+        // `reconciles_masks == true`). Every other path — model-only, backfill,
+        // the transformation route (run_local) — reconciles no masks, so binding
+        // one would falsely refuse a mask change it never applies. The plan side
+        // computes `reconciles_masks` from the same resolved pipeline type, so the
+        // fingerprint is symmetric.
         let empty_mask = std::collections::BTreeMap::new();
-        let mask_for_extras = if scoped {
-            &empty_mask
-        } else {
+        let mask_for_extras = if reconciles_masks {
             &gate.resolved_mask
+        } else {
+            &empty_mask
         };
         let extras = crate::commands::apply::ExecutionExtras::build(
             &surrogate_keys,
@@ -11745,6 +11790,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             None, // exec_fp_gate (test)
+            false,
         )
         .await;
         (output, result)
@@ -11819,6 +11865,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             Some(&gate),
+            false,
         )
         .await;
         ok.expect("KILL-CHECK: an unchanged governed apply must NOT refuse");
@@ -11854,6 +11901,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             Some(&gate),
+            false,
         )
         .await
         .expect_err("KILL-CHECK: a changed model must be REFUSED at the choke-point");
@@ -11940,6 +11988,7 @@ merge_keys = ["id"]
         run_id: &str,
         expected_fp: &str,
         resolved_mask: &std::collections::BTreeMap<String, rocky_ir::MaskStrategy>,
+        reconciles_masks: bool,
     ) -> Result<()> {
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
         let gate = crate::commands::apply::ExecFingerprintGate {
@@ -11974,6 +12023,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             Some(&gate),
+            reconciles_masks,
         )
         .await
     }
@@ -12008,6 +12058,7 @@ merge_keys = ["id"]
             "sk-ok",
             &fp,
             &std::collections::BTreeMap::new(),
+            false,
         )
         .await
         .expect("KILL-CHECK: unchanged surrogate apply must NOT refuse");
@@ -12020,6 +12071,7 @@ merge_keys = ["id"]
             "sk-changed",
             &fp,
             &std::collections::BTreeMap::new(),
+            false,
         )
         .await
         .expect_err("KILL-CHECK: a surrogate-key change must be REFUSED (#1)");
@@ -12055,6 +12107,7 @@ merge_keys = ["id"]
             "contract-ok",
             &fp,
             &std::collections::BTreeMap::new(),
+            false,
         )
         .await
         .expect("KILL-CHECK: unchanged contract apply must NOT refuse");
@@ -12073,6 +12126,7 @@ merge_keys = ["id"]
             "contract-edited",
             &fp,
             &std::collections::BTreeMap::new(),
+            false,
         )
         .await
         .expect_err("KILL-CHECK: a same-presence contract CONTENT edit must be REFUSED (#3)");
@@ -12089,6 +12143,7 @@ merge_keys = ["id"]
             "contract-removed",
             &fp,
             &std::collections::BTreeMap::new(),
+            false,
         )
         .await
         .expect_err("KILL-CHECK: a removed contract must be REFUSED (#3)");
@@ -12122,7 +12177,7 @@ merge_keys = ["id"]
         let hash_mask = std::collections::BTreeMap::from([("pii".to_string(), MaskStrategy::Hash)]);
         // Baseline fp binds the EFFECTIVE mask {pii→hash}.
         let fp = exec_choke_fingerprint(&models, "cfg", "", &hash_mask);
-        governed_apply(&models, &db, "mask-ok", &fp, &hash_mask)
+        governed_apply(&models, &db, "mask-ok", &fp, &hash_mask, true)
             .await
             .expect("unchanged effective mask must NOT refuse");
 
@@ -12130,14 +12185,14 @@ merge_keys = ["id"]
         // mask unchanged → must NOT refuse.
         let mut with_unused = hash_mask.clone();
         with_unused.insert("other".to_string(), MaskStrategy::Redact);
-        governed_apply(&models, &db, "mask-unused", &fp, &with_unused)
+        governed_apply(&models, &db, "mask-unused", &fp, &with_unused, true)
             .await
             .expect("KILL-CHECK: an UNUSED mask entry must NOT refuse (C)");
 
         // A USED mask change (`pii` hash→redact) → effective mask changes → REFUSE.
         let redact_mask =
             std::collections::BTreeMap::from([("pii".to_string(), MaskStrategy::Redact)]);
-        let err = governed_apply(&models, &db, "mask-changed", &fp, &redact_mask)
+        let err = governed_apply(&models, &db, "mask-changed", &fp, &redact_mask, true)
             .await
             .expect_err("KILL-CHECK: a USED mask change must be REFUSED (C)");
         assert!(
@@ -12206,6 +12261,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             Some(&gate),
+            false,
         )
         .await
         .expect("the non-empty-snapshot seed branch must run, not panic");
@@ -12290,6 +12346,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             Some(&gate),
+            false,
         )
         .await
         .expect(
@@ -12343,6 +12400,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             Some(&gate),
+            false,
         )
         .await
         .expect_err("KILL-CHECK: a required plan with no reviewed snapshot must REFUSE (#2)");
@@ -12395,15 +12453,18 @@ merge_keys = ["id"]
             "main",
             None,
             None,
-            true, // full run — bind masks (finding #4)
+            None, // pipeline_name → default resolution (finding #4)
+            true, // full run (no `--model`)
         );
         // Apply side: the choke-point's routing + governance identity are the
-        // loaded config's, resolved for the same (None) env. A full run (no model
-        // filter) binds the mask, matching the plan side.
+        // loaded config's, resolved for the same (None) env. The POC pipeline is
+        // a TRANSFORMATION pipeline (→ `run_local`), which reconciles no masks, so
+        // the mask is omitted on BOTH sides (empty) — matching `bind_masks=false`.
         let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
         let identity = crate::commands::apply::config_policy_identity(&cfg);
         let gov = crate::commands::apply::governance_policy_identity(&cfg);
-        let resolved_mask = cfg.resolve_mask_for_env(None);
+        let resolved_mask: std::collections::BTreeMap<String, rocky_ir::MaskStrategy> =
+            std::collections::BTreeMap::new();
         let apply_fp = exec_choke_fingerprint(&models, &identity, &gov, &resolved_mask);
 
         assert_eq!(
@@ -12450,6 +12511,7 @@ merge_keys = ["id"]
             resilience,
             true,
             None, // exec_fp_gate (test)
+            false,
         )
         .await;
         (output, result)
@@ -12492,6 +12554,7 @@ merge_keys = ["id"]
             resilience,
             true,
             None, // exec_fp_gate (test)
+            false,
         )
         .await;
         (output, result)
@@ -12540,6 +12603,7 @@ merge_keys = ["id"]
             resilience,
             true,
             None, // exec_fp_gate (test)
+            false,
         )
         .await;
         (output, result)
@@ -13561,6 +13625,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             None, // exec_fp_gate (test)
+            false,
         )
         .await
         .expect("run with --var should succeed");
@@ -13667,6 +13732,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             None, // exec_fp_gate (test)
+            false,
         )
         .await
         .expect("deferred run must succeed");
@@ -13788,6 +13854,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             None, // exec_fp_gate (test)
+            false,
         )
         .await;
 
@@ -14070,6 +14137,7 @@ merge_keys = ["id"]
                 rocky_core::config::ResilienceConfig::default(),
                 true,
                 None, // exec_fp_gate (test)
+                false,
             )
             .await
             .expect("backfill run must succeed on serial DuckDB under --parallel");
@@ -14195,6 +14263,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             None, // exec_fp_gate (test)
+            false,
         )
         .await
         .expect("gate run must succeed");
@@ -15168,6 +15237,7 @@ merge_keys = ["id"]
                 rocky_core::config::ResilienceConfig::default(),
                 true,
                 None, // exec_fp_gate (test)
+                false,
             )
             .await
             .unwrap();

@@ -110,6 +110,8 @@ pub async fn run_transformation(
         let store = StateStore::open(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
+        // Finding #1: baseline failures so a soft model failure skips governance.
+        let failures_before = output.tables_failed;
         let exec_result = super::run::execute_models(
             &models_dir,
             warehouse_adapter.as_ref(),
@@ -137,11 +139,15 @@ pub async fn run_transformation(
             rocky_cfg.resilience.clone(),
             super::resilience::retry_policy_allows(rocky_cfg),
             exec_fp_gate,
+            // Finding #4: the transformation route reconciles no masks.
+            false,
         )
         .await;
 
         match exec_result {
-            Ok(()) => {
+            // Finding #1: only when the model phase is CLEAN (no new soft
+            // failures) — a soft failure returns `Ok(())`.
+            Ok(()) if output.tables_failed == failures_before => {
                 // --- Governance: per-model `[governance.tags]` ---
                 //
                 // After every model materializes, apply each model's
@@ -159,6 +165,8 @@ pub async fn run_transformation(
                 )
                 .await;
             }
+            // Soft model failure — skip governance, fall through.
+            Ok(()) => {}
             Err(e) => {
                 // A runtime model failure (warehouse rejected the SQL, an
                 // unresolved upstream, ...) surfaces here as `Err`. Record it

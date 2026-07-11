@@ -951,14 +951,16 @@ fn build_and_persist_run_plan(
     // evaluates the plan against the identity that authored it and the exact
     // capabilities that were reviewed.
     let principal = run_options.principal.unwrap_or(PolicyPrincipal::Human);
-    // Bind masks only for a full run (finding #4): a `--model`-scoped plan runs
-    // no masking reconcile, so its fingerprint must omit the mask.
+    // Finding #4: `compute_embedded_capabilities` binds the mask only when the
+    // apply reaches the mask-reconciling path (a full run of a Replication
+    // pipeline), resolving the pipeline the same way `run()` does.
     let capabilities = compute_embedded_capabilities(
         config_path,
         models_dir,
         base_ref,
         Some(state_path),
         env,
+        pipeline,
         run_options.model.is_none(),
     );
     let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
@@ -987,12 +989,15 @@ pub fn compute_embedded_capabilities(
     base_ref: &str,
     state_path: Option<&Path>,
     env: Option<&str>,
-    // Finding #4: `true` only for a full `--all` run, which executes every model
-    // AND reconciles masks. A model-scoped plan (`--model`) runs no masking, so
-    // its fingerprint must NOT bind the mask (an unselected model's mask change
-    // would falsely refuse). The apply choke-point gates on the SAME predicate
-    // (no model filter / no model_set), keeping the fingerprint symmetric.
-    bind_masks: bool,
+    // Finding #4: the plan's pipeline name + whether it is a full (`--model`-less)
+    // run. The mask enters the fingerprint iff the apply will reach the
+    // mask-reconciling path — a full run of a REPLICATION pipeline. This is
+    // computed here with the SAME `registry::resolve_pipeline(cfg, pipeline_name)`
+    // that `commands::run::run` uses at apply, so `reconciles_masks` matches by
+    // construction; a Transformation / Quality / Snapshot pipeline (→ `run_local`,
+    // no masks) or a `--model` run omits the mask on both sides.
+    pipeline_name: Option<&str>,
+    model_is_none: bool,
 ) -> EmbeddedCapabilities {
     use crate::plan_store::CURRENT_FINGERPRINT_VERSION;
     use rocky_compiler::compile::{self, CompilerConfig};
@@ -1011,10 +1016,23 @@ pub fn compute_embedded_capabilities(
         .as_ref()
         .map(crate::commands::apply::governance_policy_identity)
         .unwrap_or_default();
+    // Finding #4: bind the mask iff the apply reaches the mask-reconciling path —
+    // a full run of a REPLICATION pipeline. Resolved with the same
+    // `resolve_pipeline` `run()` uses → symmetric with the apply-side
+    // `reconciles_masks`. Any resolution failure ⇒ do not bind (fail-safe: omit
+    // rather than risk an asymmetric refuse).
+    let bind_masks = model_is_none
+        && loaded_cfg
+            .as_ref()
+            .and_then(|cfg| {
+                crate::registry::resolve_pipeline(cfg, pipeline_name)
+                    .ok()
+                    .map(|(_, p)| matches!(p, rocky_core::config::PipelineConfig::Replication(_)))
+            })
+            .unwrap_or(false);
     // The env-resolved mask (finding C): the extras restrict it to the executed
     // models' classification tags. `env` is the plan's `--env`, so apply resolves
-    // the same masks the reviewed env will apply. Bound ONLY on a full run
-    // (finding #4) — empty on a model-scoped plan, matching the apply choke-point.
+    // the same masks the reviewed env will apply.
     let resolved_mask = if bind_masks {
         loaded_cfg
             .as_ref()

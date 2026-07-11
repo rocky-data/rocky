@@ -285,11 +285,40 @@ fn governed_run_context<'a>(
         expected_ir_fingerprint: embedded.models_fingerprint,
         expected_config_identity: embedded.config_identity,
         // A `fingerprint_version >= 1` plan is a NEW plan this binary wrote and
-        // MUST carry a fingerprint; version 0 is genuinely legacy (skip).
-        require_fingerprint: embedded.fingerprint_version
-            >= crate::plan_store::CURRENT_FINGERPRINT_VERSION,
+        // MUST carry the exec fingerprint + routing identity; version 0 is
+        // genuinely legacy (skip). This is DELIBERATELY `>= 1`, NOT
+        // `>= CURRENT_FINGERPRINT_VERSION`: gating on CURRENT (now 2) would make
+        // v1 plans stop requiring the fingerprint/routing identity — a regression
+        // (finding #2). The v2-only source-snapshot requirement is a SEPARATE
+        // preflight (`preflight_snapshot`), not folded into this flag.
+        require_fingerprint: embedded.fingerprint_version >= 1,
         reviewed_source_schemas: embedded.reviewed_source_schemas,
     })
+}
+
+/// Fail-closed preflight (finding #2) for a MODEL-EXECUTING governed apply: it
+/// must carry the v2 reviewed source-schema snapshot (`Some`, even empty), run
+/// **before any warehouse mutation** (before replication discovery/DDL). A v1
+/// model-executing plan's fingerprint hashes only config+SQL — not
+/// `typed_columns` — so typing from the live cache at apply is a TOCTOU; force a
+/// re-plan at v2 that captures the snapshot. A v2 plan whose snapshot could not
+/// be captured (`None`) is a production failure → refuse. Genuinely-legacy v0
+/// plans (`require_fingerprint == false`) and human applies (no context) are
+/// exempt. Pure-replication (no-model) plans never call this.
+fn preflight_snapshot(governed_ctx: Option<&GovernedRunContext<'_>>, plan_id: &str) -> Result<()> {
+    if let Some(ctx) = governed_ctx
+        && ctx.require_fingerprint
+        && ctx.reviewed_source_schemas.is_none()
+    {
+        bail!(
+            "refusing to apply governed plan '{plan_id}': it executes models but carries no \
+             reviewed source-schema snapshot (a v1 plan, or a v2 plan whose snapshot could not be \
+             captured), so `typed_columns` would be typed from the live cache at apply — a TOCTOU \
+             the fingerprint does not cover. Re-plan with `rocky plan` (which captures the snapshot \
+             at fingerprint v2) before applying."
+        );
+    }
+    Ok(())
 }
 
 /// Execute a deserialized [`RunPlan`] against the warehouse.
@@ -318,6 +347,12 @@ async fn execute_run_plan(
     // post-discovery replication gate. `None` for a human apply.
     governed_ctx: Option<&GovernedRunContext<'_>>,
 ) -> Result<()> {
+    // ‼️ Finding #2: preflight the reviewed source-schema snapshot BEFORE any
+    // warehouse mutation — this path executes models (and, for a replication
+    // pipeline, does replication discovery/DDL first), so a v1/missing-snapshot
+    // plan must be refused here rather than after the first statement runs.
+    preflight_snapshot(governed_ctx, plan_id)?;
+
     // Build partition options from the persisted flags.
     let partition_opts = crate::commands::run::PartitionRunOptions {
         partition: run_plan.partition.clone(),
@@ -1958,6 +1993,9 @@ async fn run_apply_backfill_plan(
         root,
         config_path,
     );
+    // ‼️ Finding #2: a backfill executes models — preflight the reviewed
+    // source-schema snapshot before any warehouse mutation.
+    preflight_snapshot(governed.as_ref(), plan_id)?;
     let exec_fp_gate = match (governed.as_ref(), backfill_cfg.as_ref()) {
         (Some(ctx), Some(cfg)) => {
             // Fail-closed (#4/#5): verify the routing identity before executing.
