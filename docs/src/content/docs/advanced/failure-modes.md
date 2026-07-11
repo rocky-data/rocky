@@ -7,7 +7,7 @@ sidebar:
 
 When a Rocky pipeline misbehaves, the symptom you see (a stack trace, a stuck run, a wrong number) almost always falls into one of nine categories. This page lists them with the **detection signal** (what Rocky surfaces in the CLI / JSON output / dagster fixture) and a **recovery playbook** (the canonical sequence of steps to get back to green).
 
-For symptom-first lookup ("I got error X, what do I do?"), see [Troubleshooting](./troubleshooting). This page is the inverse: start from the category, end at the action.
+For symptom-first lookup ("I got error X, what do I do?"), see [Troubleshooting](/advanced/troubleshooting/). This page is the inverse: start from the category, end at the action.
 
 ## Quick taxonomy
 
@@ -49,7 +49,7 @@ The categories are **independent**: a single pipeline can hit several at once, a
 
 A `rocky apply` against a project with compile errors aborts before any warehouse work, so fix red diagnostics before debugging runtime symptoms.
 
-**Per-model compile failure during a run.** The whole-project abort above is the common case. A model that compiles in isolation but fails to compile when its turn comes during a run (for example after an upstream change shifts a type) is now contained at the table boundary rather than passed over: it's counted in `tables_failed`, gets an `errors[*]` entry with [`failure_kind: "compile-error"`](./per-table-error-containment#failure_kind-taxonomy) carrying the diagnostic, and the run exits non-zero (status `Failure`, or `PartialFailure` when other models succeeded). Earlier engine versions skipped the model and still reported the run as a success.
+**Per-model compile failure during a run.** The whole-project abort above is the common case. A model that compiles in isolation but fails to compile when its turn comes during a run (for example after an upstream change shifts a type) is now contained at the table boundary rather than passed over: it's counted in `tables_failed`, gets an `errors[*]` entry with [`failure_kind: "compile-error"`](/advanced/per-table-error-containment/#failure_kind-taxonomy) carrying the diagnostic, and the run exits non-zero (status `Failure`, or `PartialFailure` when other models succeeded). Earlier engine versions skipped the model and still reported the run as a success.
 
 ---
 
@@ -126,7 +126,7 @@ Schema drift is the only category where the runtime takes a corrective action *a
 
 **Definition.** A warehouse call (compile-passing, contract-passing, drift-handled) failed at execution time. Network errors, auth errors, quota errors, statement timeouts, and deadlocks: anything that originates inside the adapter rather than the engine.
 
-**Detection signal.** Non-zero `rocky apply` exit code, an entry on `RunOutput.errors[*]` per failed table (with a typed [`failure_kind`](./per-table-error-containment#failure_kind-taxonomy) discriminator the orchestrator can branch on), plus a transient/rate-limit classification on the underlying error. Other tables in the same run continue; see [Per-table error containment](./per-table-error-containment).
+**Detection signal.** Non-zero `rocky apply` exit code, an entry on `RunOutput.errors[*]` per failed table (with a typed [`failure_kind`](/advanced/per-table-error-containment/#failure_kind-taxonomy) discriminator the orchestrator can branch on), plus a transient/rate-limit classification on the underlying error. Other tables in the same run continue; see [Per-table error containment](/advanced/per-table-error-containment/).
 
 The dispatched adapter classifies its own failures:
 
@@ -267,8 +267,8 @@ Permissions and masking apply *after* materialisation succeeded, so a governance
 
 ## See also
 
-- [Per-table error containment](./per-table-error-containment): how the run path isolates failures at the table boundary and how to consume the `failure_kind` discriminator
-- [Troubleshooting](./troubleshooting): symptom-first lookup ("I got error X")
+- [Per-table error containment](/advanced/per-table-error-containment/): how the run path isolates failures at the table boundary and how to consume the `failure_kind` discriminator
+- [Troubleshooting](/advanced/troubleshooting/): symptom-first lookup ("I got error X")
 - [`rocky doctor`](../../reference/cli#doctor): aggregate health check across config, state, adapters, pipelines
 - [`rocky plan --resume-latest`](../../reference/cli#run): resume a failed run from its checkpoint (canonical, auditable form; the single-step `rocky run --resume-latest` alias does the same in one invocation)
 - [Schema drift](../../concepts/schema-drift): graduated drift handling deep dive

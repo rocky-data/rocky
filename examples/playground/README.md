@@ -54,7 +54,7 @@ DSL syntax, materialization basics, playground baseline, the trust-arc 1 storage
 | [02-null-safe-operators](pocs/00-foundations/02-null-safe-operators) | `!=` lowering to `IS DISTINCT FROM` — side-by-side `.rocky` vs `.sql` |
 | [03-date-literals-and-match](pocs/00-foundations/03-date-literals-and-match) | `@2025-01-01` date literals and `match { ... }` pattern matching |
 | [04-window-functions](pocs/00-foundations/04-window-functions) | DSL window syntax with partition + sort + frame |
-| [05-generic-adapter-exercise](pocs/00-foundations/05-generic-adapter-exercise) | Generic adapter exercise — building custom adapters via the process protocol |
+| [05-generic-adapter-exercise](pocs/00-foundations/05-generic-adapter-exercise) | Full generic adapter surface against DuckDB — validate, list, doctor, seed, discover, plan, compile, test in one credential-free flow |
 | [06-branches-replay-lineage](pocs/00-foundations/06-branches-replay-lineage) | **Trust arc 1** — `rocky branch create/list/show`, `rocky run --branch`, `rocky replay`, `rocky lineage --downstream` |
 | [07-config-layering](pocs/00-foundations/07-config-layering) | Three-layer config: `rocky.toml` + `_defaults.toml` + per-model sidecar, with env-var substitution at every layer |
 | [08-branch-approve-promote](pocs/00-foundations/08-branch-approve-promote) | **Trust arc 1** — `[branch.approval] required = true` gates `rocky branch promote`; `rocky branch approve` writes a content-addressed signed artifact bound to the branch state hash |
@@ -135,6 +135,7 @@ Unity Catalog grants, schema patterns, workspace isolation, tagging, classificat
 | [08-cross-team-contracts](pocs/04-governance/08-cross-team-contracts) | Consumer imports a producer's published IR snapshot via `[imports.<name>]`; `rocky compile` fails with E030 when the producer drops a column the consumer reads (E033 on pin mismatch) | none |
 | [09-model-tags-inheritance](pocs/04-governance/09-model-tags-inheritance) | A config-group `[tags]` baseline inherited by members and overridden per-key by a model's own `[tags]`, surfaced on `rocky compile --output json` as `models_detail[].tags` | none |
 | [10-recipe-provenance](pocs/04-governance/10-recipe-provenance) | Every materialization records a recipe-identity triple (`recipe_hash`, `input_hash`, `env_hash`); `rocky history --recipe <hash>` returns every execution of that exact program — the "what produced this?" audit one-liner, honest about `heuristic` vs `strong` input proof | none |
+| [11-agent-policy](pocs/04-governance/11-agent-policy) | `[policy]` block enforced at apply time under an agent principal — a denied change is refused before it touches the warehouse, and every decision lands in a ledger queryable via `rocky audit` | none |
 
 ### 05 — Orchestration (11 POCs · DuckDB / docker)
 

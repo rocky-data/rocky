@@ -972,7 +972,7 @@ on_breach = "error"
 
 All three limits are independent and composed with all-OR: any single dimension breach trips the `budget_breach` event (and, with `on_breach = "error"`, fails the run). They evaluate once per run against observed totals; per-model budgets are a follow-up. Subscribe to `on_budget_breach` under `[hook.*]` to route breaches into a notification system.
 
-Each [`BudgetBreachOutput`](./json-output) carries a `limit_type` tag (`"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"`) so consumers can branch on the breached dimension without string-matching the human message.
+Each [`BudgetBreachOutput`](/reference/json-output/) carries a `limit_type` tag (`"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"`) so consumers can branch on the breached dimension without string-matching the human message.
 
 ---
 

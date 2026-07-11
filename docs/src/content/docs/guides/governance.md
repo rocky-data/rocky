@@ -312,7 +312,7 @@ After the DAG completes successfully, `rocky apply` iterates each model's `[clas
 
 On Databricks, Rocky uses Unity Catalog column tags plus `CREATE MASK` / `SET MASKING POLICY`, with **one statement per column** -- UC rejects multi-column masking DDL in a single statement. BigQuery, Snowflake, and DuckDB silently no-op until adapter-specific coverage lands.
 
-See the [configuration reference](../reference/configuration.md) for the full schema of the `[mask]` and `[classifications]` blocks.
+See the [configuration reference](/reference/configuration/) for the full schema of the `[mask]` and `[classifications]` blocks.
 
 ## 5. Compliance Rollup (Pillar 3 of 5)
 
@@ -577,7 +577,7 @@ This means you can deploy Rocky across multiple catalogs and discover all manage
 
 ## 10. Config Groups and Enforcement
 
-A config group is one definition that a fan-out of models opts into by name (`group = "<name>"` in the sidecar). It supplies shared routing (`schema_template`) and a shared `strategy`, so a set of models route and materialize the same way without repeating the config. The full reference lives in [the model format guide](../reference/model-format.md#config-groups); this section covers the governance angle.
+A config group is one definition that a fan-out of models opts into by name (`group = "<name>"` in the sidecar). It supplies shared routing (`schema_template`) and a shared `strategy`, so a set of models route and materialize the same way without repeating the config. The full reference lives in [the model format guide](/reference/model-format/#config-groups); this section covers the governance angle.
 
 ### Enforced config groups
 

@@ -77,7 +77,7 @@ By default, the component stores its state on the local filesystem. The `defs_st
 - **Fast reloads** -- Assets are visible in the Dagster UI instantly on code location reload, with no API calls.
 - **Resilience** -- If an external API is temporarily unavailable, the cached state ensures assets remain visible.
 - **Scalability** -- Works well with large numbers of sources and tables without adding latency to code location startup.
-- **Auditable plan artifacts** -- Materializations dispatched through `RockyResource.run_streaming()` inherit the plan-then-apply chain automatically, writing `.rocky/plans/<plan-id>.json` per materialization. See [observability](./observability/#plan-artifact-per-materialization).
+- **Auditable plan artifacts** -- Materializations dispatched through `RockyResource.run_streaming()` inherit the plan-then-apply chain automatically, writing `.rocky/plans/<plan-id>.json` per materialization. See [observability](/dagster/observability/#plan-artifact-per-materialization).
 
 ## DAG mode
 

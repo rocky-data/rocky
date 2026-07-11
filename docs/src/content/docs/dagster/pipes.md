@@ -63,7 +63,7 @@ result = rocky.run_streaming(
 The first positional argument is the Dagster execution context (an
 `AssetExecutionContext` from a `@multi_asset` or an `OpExecutionContext`
 from a `@op`). All the partition selection flags from the
-[partitions guide](./partitions.md) work identically.
+[partitions guide](/dagster/partitions/) work identically.
 
 ## Automatic wiring in `RockyComponent`
 
