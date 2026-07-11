@@ -11668,6 +11668,61 @@ merge_keys = ["id"]
         );
     }
 
+    /// 🔴 KILL-CHECK (unchanged plan→apply does NOT refuse, with the new
+    /// inputs): the REAL plan-side `compute_embedded_capabilities` must produce
+    /// the SAME fingerprint the apply-side choke-point recomputes, for a project
+    /// carrying BOTH a `[[surrogate_key]]` block AND a `.contract.toml`. This is
+    /// the guard against the historical refuse-everything: the plan and apply
+    /// build the extras through *different* code (`unwrap_or_default()` vs
+    /// `context(...)?`), and this pins that they agree — folding #1/#3/#6 in
+    /// without a spurious refuse on an unchanged apply.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn plan_and_apply_fingerprints_agree_with_extras() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n\n\
+             [mask]\npii = \"hash\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"orders\"\n\n[[surrogate_key]]\nname = \"sk\"\ncolumns = [\"id\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("orders.contract.toml"),
+            "[[columns]]\nname = \"id\"\n",
+        )
+        .unwrap();
+
+        // Plan side: the real capability-embed path stamps `models_fingerprint`.
+        let caps = crate::commands::plan::compute_embedded_capabilities(
+            &config_path,
+            &models,
+            "main",
+            None,
+        );
+        // Apply side: the choke-point's config identity is the loaded config's.
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let identity = crate::commands::apply::config_policy_identity(&cfg);
+        let apply_fp = exec_choke_fingerprint(&models, &identity);
+
+        assert_eq!(
+            caps.models_fingerprint.as_deref(),
+            Some(apply_fp.as_str()),
+            "plan-side and apply-side fingerprints must AGREE for an unchanged \
+             project with a surrogate key + contract (no spurious refuse)"
+        );
+    }
+
     /// Drive `execute_models` serially (DuckDB) with `[resilience]
     /// contain_failures = true` — the failure-containment path under test.
     async fn run_models_with_containment(
