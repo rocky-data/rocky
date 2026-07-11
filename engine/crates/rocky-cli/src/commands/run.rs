@@ -3921,7 +3921,7 @@ pub async fn run(
             // governance to the warehouse *despite the gate detecting the change*.
             // On any failure we record it and SKIP all post-model governance
             // below, falling through to the failure payload + non-zero exit.
-            let exec_ok = exec_result.is_ok() && output.tables_failed == failures_before;
+            let exec_ok = model_phase_ok(&exec_result, failures_before, output.tables_failed);
             model_phase_clean = exec_ok;
             if let Err(e) = exec_result {
                 // Record the runtime model failure as a table error and fall
@@ -4857,6 +4857,27 @@ fn apply_defer_rewrite(
     }
 
     Ok(())
+}
+
+/// The model phase completed cleanly: `execute_models` returned `Ok(())` AND it
+/// recorded NO new table failures (`failures_after == failures_before`).
+///
+/// Finding #1 (critical): post-model governance — masking/classification/retention
+/// reconcile, role-graph GRANT emission, and the recipe-manifest write — is gated
+/// on this. A hard error (fingerprint mismatch, routing swap) OR a SOFT failure (a
+/// compile error recorded into `output`, or a contained runtime failure under
+/// `[resilience] contain_failures`, both of which return `Ok(())` yet BUMP
+/// `tables_failed`) means the gated set did not fully execute, so reconciling
+/// governance would push an UNREVIEWED change to the warehouse despite the gate
+/// having detected it. This holds for BOTH a governed agent apply and a bare
+/// `rocky run` (governance is skipped on a partial failure either way). It is the
+/// exact condition the run-path evaluates at the replication `--all` site.
+pub(crate) fn model_phase_ok(
+    exec_result: &anyhow::Result<()>,
+    failures_before: usize,
+    failures_after: usize,
+) -> bool {
+    exec_result.is_ok() && failures_after == failures_before
 }
 
 /// Record a model's runtime failure as a *contained cause*: bump the failure
@@ -12453,8 +12474,7 @@ merge_keys = ["id"]
             "main",
             None,
             None,
-            None, // pipeline_name → default resolution (finding #4)
-            true, // full run (no `--model`)
+            false, // transformation pipeline → mask NOT bound (finding #4)
         );
         // Apply side: the choke-point's routing + governance identity are the
         // loaded config's, resolved for the same (None) env. The POC pipeline is
@@ -12515,8 +12535,7 @@ merge_keys = ["id"]
             "main",
             None,
             None,
-            Some("p"),
-            true,
+            true, // replication full run → mask BOUND (finding #4)
         );
         // Apply side: `reconciles_masks = true` binds `gate.resolved_mask`, which
         // the choke-point restricts to the executed models' tags — mirror that.
@@ -12539,8 +12558,7 @@ merge_keys = ["id"]
             "main",
             None,
             None,
-            Some("p"),
-            true,
+            true, // replication full run → mask BOUND (finding #4)
         );
         assert_ne!(
             caps.models_fingerprint, caps_redact.models_fingerprint,
@@ -12805,6 +12823,63 @@ merge_keys = ["id"]
         assert!(
             table_exists(&verify, "dep_of_good").await,
             "the healthy downstream must exist"
+        );
+    }
+
+    /// 🔴 Finding #1 regression (soft-failure governance/manifest skip): the
+    /// run-path gates ALL post-model governance — masking/classification/retention
+    /// reconcile, role-graph GRANT emission, and the recipe-manifest write — on
+    /// [`super::model_phase_ok`]. A CONTAINED runtime failure (`[resilience]
+    /// contain_failures = true`) returns `Ok(())` yet bumps `tables_failed`, so the
+    /// gate must read FALSE and skip governance for the partially-executed set —
+    /// otherwise an unreviewed change the gate detected is pushed to the warehouse
+    /// anyway. This holds for BOTH a governed agent apply and a bare `rocky run`
+    /// (the gate is not conditioned on the principal — the "bare-run partial-failure
+    /// governance-skip" case). Asserted at the predicate level over a REAL
+    /// contained-failure output because the DuckDB governance adapter is a Noop, so
+    /// there is no observable warehouse governance side effect to inspect creds-free.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn soft_failure_skips_post_model_governance() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+
+        // (soft-fail) A contained runtime failure: `Ok(())` + one recorded failure.
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_containment_dag(&models_dir);
+        let db = tmp.path().join("soft.duckdb");
+        let (out, result) = run_models_with_containment(&models_dir, &db).await;
+        assert!(
+            result.is_ok(),
+            "containment returns Ok — the failure is recorded, not thrown: {result:?}"
+        );
+        assert_eq!(
+            out.tables_failed, 1,
+            "the contained run recorded one failure"
+        );
+        assert!(
+            !super::model_phase_ok(&result, 0, out.tables_failed),
+            "a soft (contained) failure must gate post-model governance + manifest OFF"
+        );
+
+        // (clean, discriminating) An all-healthy run: `Ok(())` + zero failures →
+        // the SAME gate reads TRUE, so governance + manifest run as before. Without
+        // this the assertion above would also pass if the predicate were `false`
+        // unconditionally — this proves it discriminates on the failure.
+        let clean_dir = tmp.path().join("clean");
+        std::fs::create_dir(&clean_dir).expect("mkdir clean");
+        write_model_with_target(&clean_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        let clean_db = tmp.path().join("clean.duckdb");
+        let (clean_out, clean_result) =
+            run_models_against_duckdb(&clean_dir, &clean_db, false, 1).await;
+        assert!(
+            clean_result.is_ok(),
+            "a clean run returns Ok: {clean_result:?}"
+        );
+        assert_eq!(clean_out.tables_failed, 0, "no failures on the clean run");
+        assert!(
+            super::model_phase_ok(&clean_result, 0, clean_out.tables_failed),
+            "a clean model phase must ENABLE governance + manifest (discriminator)"
         );
     }
 

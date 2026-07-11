@@ -2342,12 +2342,11 @@ impl RockyMcpServer {
             "main",
             Some(&state_path),
             None, // MCP propose has no `--env`; governance identity binds defaults
-            // Finding #4: MCP propose persists no pipeline name (apply resolves the
-            // default), so pass `None` — `compute_embedded_capabilities` binds the
-            // mask only if that default pipeline is a Replication pipeline reached
-            // by a full run, matching the apply choke-point.
-            None,
-            params.0.model.is_none(),
+            // Finding #4: `build_ai_run_plan` persists `run_all=false, models_dir=
+            // None`, so the apply never reaches the mask-reconciling model leg
+            // (replication needs `run_all||models_dir`; transformation runs no
+            // masks). The mask is therefore never bound — `false` on both sides.
+            false,
         );
 
         // Consult the agent-policy plane before persisting — the same per-model

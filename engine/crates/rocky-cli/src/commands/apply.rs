@@ -219,8 +219,17 @@ async fn run_apply_run_plan(
     // stored (tamperable) field. Absent `[policy]` this is a no-op.
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
-    // `--model` selection), not the plan's informational `models` list.
-    let executable = run_executable_models(models_dir, &run_plan);
+    // `--model` selection), not the plan's informational `models` list. Finding
+    // #1: a replication-only plan runs NO models, so it gates none (fail-safe: a
+    // config that will not load is NOT treated as replication-only → strict).
+    let executable = if rocky_core::config::load_rocky_config(config_path)
+        .map(|cfg| is_replication_only(&cfg, &run_plan))
+        .unwrap_or(false)
+    {
+        Vec::new()
+    } else {
+        run_executable_models(models_dir, &run_plan)
+    };
     let touched = touched_models_for_run(&plan, &executable);
     let principal = plan.enforcement_principal(runtime_principal);
     let gate = evaluate_apply_policy(
@@ -296,6 +305,54 @@ fn governed_run_context<'a>(
     })
 }
 
+/// The resolved pipeline is a **Replication** pipeline. Any resolution failure ⇒
+/// `false` — the fail-safe for both consumers: the mask omits (harmless, apply
+/// never checks the gate on a non-reaching path), and the execution-shape
+/// carve-outs below default to STRICT (a non-replication plan is never
+/// replication-only, so it keeps full policy gating + the snapshot requirement).
+/// Uses the SAME `registry::resolve_pipeline` `commands::run::run` uses at apply.
+pub(crate) fn pipeline_is_replication(
+    cfg: &rocky_core::config::RockyConfig,
+    pipeline_name: Option<&str>,
+) -> bool {
+    crate::registry::resolve_pipeline(cfg, pipeline_name)
+        .map(|(_, p)| matches!(p, rocky_core::config::PipelineConfig::Replication(_)))
+        .unwrap_or(false)
+}
+
+/// A governed `Run` plan that, at apply, executes NO compiled models — a
+/// Replication pipeline with no `--all`, no `--models`, and no `--model` (its
+/// model leg at `run.rs`'s `run_all || models_dir.is_some()` is never entered,
+/// and it is not the `--model` path). Finding #1 (regression): such a plan must
+/// NOT preflight the snapshot and must NOT bind policy over models it never runs.
+///
+/// A **safe carve-out** (not a positive "executes models"): a resolution failure
+/// or any non-Replication pipeline (Transformation runs models via `run_local`
+/// unconditionally) is NOT replication-only ⇒ stays strict (snapshot required +
+/// full policy gating). So a wrong answer can only ever OVER-gate (fail-closed),
+/// never under-gate.
+///
+/// This carve-out **cannot become a policy bypass**, even against a config swapped
+/// to replication-only between plan and apply. Skipping the *model* policy gate is
+/// harmless because the models never execute on this path; and the replication
+/// mutation the plan *does* run is independently fail-closed at `run.rs`'s governed
+/// replication gate, which fires BEFORE any warehouse statement:
+/// [`verify_routing_identity`] refuses when the fresh config's routing identity ≠
+/// the plan's authorized `config_identity` (so a transformation→replication swap is
+/// caught), and [`gate_replication_targets`] re-evaluates the policy plane over the
+/// concrete discovered targets. Reading the pipeline type from a fresh
+/// `load_rocky_config` at apply is therefore safe in BOTH directions: a won't-load
+/// config → strict, and a swapped-to-replication config → caught by routing
+/// identity. The only inert case is a genuinely-legacy v0 plan (no identity,
+/// `!require_fingerprint`) — the pre-existing legacy exemption this carve-out does
+/// not widen.
+fn is_replication_only(cfg: &rocky_core::config::RockyConfig, run_plan: &RunPlan) -> bool {
+    pipeline_is_replication(cfg, run_plan.pipeline.as_deref())
+        && !run_plan.run_all
+        && run_plan.models_dir.is_none()
+        && run_plan.model.is_none()
+}
+
 /// Fail-closed preflight (finding #2) for a MODEL-EXECUTING governed apply: it
 /// must carry the v2 reviewed source-schema snapshot (`Some`, even empty), run
 /// **before any warehouse mutation** (before replication discovery/DDL). A v1
@@ -304,9 +361,15 @@ fn governed_run_context<'a>(
 /// re-plan at v2 that captures the snapshot. A v2 plan whose snapshot could not
 /// be captured (`None`) is a production failure → refuse. Genuinely-legacy v0
 /// plans (`require_fingerprint == false`) and human applies (no context) are
-/// exempt. Pure-replication (no-model) plans never call this.
-fn preflight_snapshot(governed_ctx: Option<&GovernedRunContext<'_>>, plan_id: &str) -> Result<()> {
-    if let Some(ctx) = governed_ctx
+/// exempt. `executes_models == false` (a replication-only plan) is exempt — it
+/// runs no models, so there is no typed-columns TOCTOU to close (finding #1).
+fn preflight_snapshot(
+    governed_ctx: Option<&GovernedRunContext<'_>>,
+    plan_id: &str,
+    executes_models: bool,
+) -> Result<()> {
+    if executes_models
+        && let Some(ctx) = governed_ctx
         && ctx.require_fingerprint
         && ctx.reviewed_source_schemas.is_none()
     {
@@ -347,11 +410,16 @@ async fn execute_run_plan(
     // post-discovery replication gate. `None` for a human apply.
     governed_ctx: Option<&GovernedRunContext<'_>>,
 ) -> Result<()> {
-    // ‼️ Finding #2: preflight the reviewed source-schema snapshot BEFORE any
+    // ‼️ Finding #2/#1: preflight the reviewed source-schema snapshot BEFORE any
     // warehouse mutation — this path executes models (and, for a replication
     // pipeline, does replication discovery/DDL first), so a v1/missing-snapshot
-    // plan must be refused here rather than after the first statement runs.
-    preflight_snapshot(governed_ctx, plan_id)?;
+    // plan must be refused here rather than after the first statement runs. A
+    // replication-only plan (no `--all`/`--models`/`--model`) executes NO models
+    // → exempt (fail-safe: a config that will not load stays strict).
+    let executes_models = rocky_core::config::load_rocky_config(config_path)
+        .map(|cfg| !is_replication_only(&cfg, &run_plan))
+        .unwrap_or(true);
+    preflight_snapshot(governed_ctx, plan_id, executes_models)?;
 
     // Build partition options from the persisted flags.
     let partition_opts = crate::commands::run::PartitionRunOptions {
@@ -433,6 +501,44 @@ async fn execute_run_plan(
         )
         .await
         .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"));
+    }
+
+    // ‼️ Finding #2 (missing-dir): a governed non-dag apply whose plan REVIEWED a
+    // non-empty model set, but whose models directory no longer compiles to any
+    // model (deleted / renamed / broken since the plan), must FAIL CLOSED here —
+    // otherwise the executor's model leg silently skips (`if mdir.exists()`) or
+    // returns a successful no-op, the execution fingerprint is never recomputed,
+    // and apply reports SUCCESS without executing the planned models. Recompile the
+    // exact dir at the seam, BEFORE any warehouse statement (`run()` below is the
+    // first mutation; the `partition_opts`/`shadow_config` setup above is read-only).
+    // Placed AFTER the `--dag` guard so a governed dag apply keeps its categorical
+    // refusal (that path never reaches here).
+    //
+    // Scoped to `!run_plan.models.is_empty()` so a legitimate run of a replication
+    // pipeline with `--all` and NO silver `models/` (a valid pure-replication run
+    // whose reviewed model set is empty) is NOT failed. Human applies and
+    // replication-only plans are exempt (not governed / no model execution).
+    if governed_ctx.is_some() && executes_models && !run_plan.models.is_empty() {
+        let mdir = models_dir_path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("models"));
+        let compiles_to_models =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir: mdir.clone(),
+                ..Default::default()
+            })
+            .map(|r| !r.project.models.is_empty())
+            .unwrap_or(false);
+        if !compiles_to_models {
+            bail!(
+                "refusing to apply governed plan '{plan_id}': its reviewed models directory '{}' no \
+                 longer compiles to any model (deleted, renamed, or broken since the plan), so the \
+                 {} planned model(s) cannot be executed or re-fingerprinted — apply would otherwise \
+                 skip them and report success. Re-plan with `rocky plan` before applying.",
+                mdir.display(),
+                run_plan.models.len()
+            );
+        }
     }
 
     // Capture stdout from the run command — `run` writes JSON directly.
@@ -1814,8 +1920,17 @@ async fn run_apply_ai_authored_plan(
     // constructed and the pre-policy-plane marker gate remains — byte-identical to today.
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
-    // `--model` selection), not the plan's informational `models` list.
-    let executable = run_executable_models(models_dir, &run_plan);
+    // `--model` selection), not the plan's informational `models` list. Finding
+    // #1: a replication-only plan runs NO models, so it gates none (fail-safe: a
+    // config that will not load is NOT treated as replication-only → strict).
+    let executable = if rocky_core::config::load_rocky_config(config_path)
+        .map(|cfg| is_replication_only(&cfg, &run_plan))
+        .unwrap_or(false)
+    {
+        Vec::new()
+    } else {
+        run_executable_models(models_dir, &run_plan)
+    };
     let touched = touched_models_for_run(&plan, &executable);
     let principal = plan.enforcement_principal(runtime_principal);
     let gate = evaluate_apply_policy(
@@ -1993,9 +2108,9 @@ async fn run_apply_backfill_plan(
         root,
         config_path,
     );
-    // ‼️ Finding #2: a backfill executes models — preflight the reviewed
-    // source-schema snapshot before any warehouse mutation.
-    preflight_snapshot(governed.as_ref(), plan_id)?;
+    // ‼️ Finding #2: a backfill ALWAYS executes models (its `model_set`) —
+    // preflight the reviewed source-schema snapshot before any warehouse mutation.
+    preflight_snapshot(governed.as_ref(), plan_id, true)?;
     let exec_fp_gate = match (governed.as_ref(), backfill_cfg.as_ref()) {
         (Some(ctx), Some(cfg)) => {
             // Fail-closed (#4/#5): verify the routing identity before executing.
@@ -4083,6 +4198,67 @@ auto_create_schemas = true
     /// plan or a v2 capture failure — is REFUSED (re-plan at v2); a `Some`
     /// (authoritative even empty) plan proceeds; a genuinely-legacy (v0) plan and
     /// a human apply are exempt.
+    /// 🔴 #1 (execution-shape carve-out): `is_replication_only` — the SAFE
+    /// negative that gates the snapshot preflight + policy selection — must be
+    /// `true` ONLY for a replication pipeline with no `--all`/`--models`/`--model`.
+    /// The **non-negotiable under-gate guard**: a TRANSFORMATION pipeline is NEVER
+    /// replication-only (it runs models via `run_local`), so it stays STRICT (full
+    /// policy gating + snapshot required) — the carve-out cannot become a policy
+    /// bypass. A resolution failure is also strict (`false`).
+    #[test]
+    fn is_replication_only_is_a_safe_carve_out() {
+        fn cfg(pipeline_type: &str) -> rocky_core::config::RockyConfig {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("rocky.toml");
+            // A replication target carries `catalog_template`/`schema_template`; a
+            // transformation target does not — so the two pipeline kinds need
+            // structurally different TOML.
+            let body = if pipeline_type == "replication" {
+                "[pipeline.p]\ntype = \"replication\"\nstrategy = \"full_refresh\"\n\n[pipeline.p.source.schema_pattern]\nprefix = \"raw__\"\nseparator = \"__\"\ncomponents = [\"source\"]\n\n[pipeline.p.target]\nadapter = \"default\"\ncatalog_template = \"c\"\nschema_template = \"s__{source}\"\n"
+            } else {
+                "[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n"
+            };
+            std::fs::write(
+                &p,
+                format!("[adapter]\ntype = \"duckdb\"\npath = \"a.duckdb\"\n\n{body}"),
+            )
+            .unwrap();
+            rocky_core::config::load_rocky_config(&p).unwrap()
+        }
+        let plan = |run_all: bool, models_dir: Option<&str>, model: Option<&str>| {
+            let mut rp = minimal_run_plan();
+            rp.pipeline = Some("p".to_string());
+            rp.run_all = run_all;
+            rp.models_dir = models_dir.map(str::to_string);
+            rp.model = model.map(str::to_string);
+            rp
+        };
+        // Replication + no flags → replication-only (carve out preflight + policy).
+        assert!(super::is_replication_only(
+            &cfg("replication"),
+            &plan(false, None, None)
+        ));
+        // TRANSFORMATION + no flags → NOT replication-only → STRICT (the under-gate
+        // guard: a transformation plan keeps full policy gating + snapshot).
+        assert!(!super::is_replication_only(
+            &cfg("transformation"),
+            &plan(false, None, None)
+        ));
+        // Replication + any execution flag → NOT replication-only (it runs models).
+        assert!(!super::is_replication_only(
+            &cfg("replication"),
+            &plan(true, None, None)
+        ));
+        assert!(!super::is_replication_only(
+            &cfg("replication"),
+            &plan(false, Some("m"), None)
+        ));
+        assert!(!super::is_replication_only(
+            &cfg("replication"),
+            &plan(false, None, Some("a"))
+        ));
+    }
+
     #[test]
     fn preflight_snapshot_semantics() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -4100,10 +4276,11 @@ auto_create_schemas = true
             require_fingerprint: require,
             reviewed_source_schemas: snapshot,
         };
+        // MODEL-EXECUTING (executes_models = true):
         // v1 / v2-capture-failure (require, None) → REFUSE.
         let v1 = mk(true, None);
-        let err = super::preflight_snapshot(Some(&v1), "p")
-            .expect_err("a required plan with no snapshot must refuse (#2)");
+        let err = super::preflight_snapshot(Some(&v1), "p", true)
+            .expect_err("a required model-executing plan with no snapshot must refuse (#2)");
         assert!(
             err.to_string()
                 .contains("no reviewed source-schema snapshot"),
@@ -4111,11 +4288,21 @@ auto_create_schemas = true
         );
         // v2 (require, Some authoritative even empty) → OK.
         let v2 = mk(true, Some(std::collections::BTreeMap::new()));
-        super::preflight_snapshot(Some(&v2), "p").expect("a v2 plan with a snapshot proceeds");
+        super::preflight_snapshot(Some(&v2), "p", true)
+            .expect("a v2 plan with a snapshot proceeds");
         // Genuinely-legacy v0 (not required) → exempt.
-        super::preflight_snapshot(Some(&mk(false, None)), "p").expect("a legacy v0 plan is exempt");
+        super::preflight_snapshot(Some(&mk(false, None)), "p", true)
+            .expect("a legacy v0 plan is exempt");
         // Human apply (no governed context) → exempt.
-        super::preflight_snapshot(None, "p").expect("a human apply is exempt");
+        super::preflight_snapshot(None, "p", true).expect("a human apply is exempt");
+        // 🔴 #1 regression: a REPLICATION-ONLY plan (executes_models = false)
+        // executes no models → NOT refused, for BOTH a v1/require plan with a
+        // missing snapshot AND a v2 plan carrying one. The snapshot requirement
+        // only ever applies to a model-executing plan.
+        super::preflight_snapshot(Some(&v1), "p", false)
+            .expect("a v1 replication-only (no-model) plan must NOT be refused (#1)");
+        super::preflight_snapshot(Some(&v2), "p", false)
+            .expect("a v2 replication-only (no-model) plan must NOT be refused (#1)");
         Ok(())
     }
 
@@ -4279,6 +4466,50 @@ effect = "allow"
         assert!(
             err.to_string().contains("not yet policy-gated"),
             "must refuse the governed dag apply, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// ‼️ Finding #2 (missing-dir): a governed (agent) apply whose plan reviewed a
+    /// NON-EMPTY model set, but whose models directory no longer compiles to any
+    /// model (deleted / renamed / broken since the plan), must FAIL CLOSED at the
+    /// apply seam — BEFORE any warehouse statement — rather than silently skipping
+    /// the planned models (the executor's `if mdir.exists()` leg / a transformation
+    /// no-op) and reporting SUCCESS without recomputing the execution fingerprint.
+    /// A v0 plan is used so the snapshot preflight is exempt and this isolates the
+    /// missing-dir seam. Neuter the seam (delete the `bail!` at execute_run_plan)
+    /// and this apply returns `Ok` — the silent-success the fix closes.
+    #[tokio::test]
+    async fn governed_apply_refuses_a_deleted_reviewed_models_dir() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("rocky.toml"), NO_POLICY_TOML)?;
+        // The plan reviewed a real, compilable models dir …
+        let models_dir = dir.path().join("silver");
+        write_min_model(&models_dir, "orders");
+        let mut rp = minimal_run_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        rp.models = vec!["s.orders".to_string()]; // a non-empty reviewed set
+        let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
+        let state = dir.path().join("state.redb");
+
+        // … then the dir is DELETED after the plan was authorized (post-preflight
+        // drift). The seam recompiles the exact dir and finds nothing.
+        std::fs::remove_dir_all(&models_dir)?;
+
+        let err = super::run_apply_run_plan(
+            dir.path(),
+            &dir.path().join("rocky.toml"),
+            &plan_id,
+            &state,
+            PolicyPrincipal::Agent,
+            true,
+        )
+        .await
+        .expect_err("a governed apply of a deleted reviewed models dir must fail closed");
+        assert!(
+            err.to_string().contains("no longer compiles to any model"),
+            "must refuse at the missing-dir seam, got: {err}"
         );
         Ok(())
     }
