@@ -1716,7 +1716,11 @@ pub async fn run(
                     })
                 })
             })
-            .flat_map(|conn| conn.tables.iter().map(|t| t.name.clone()))
+            .flat_map(|conn| {
+                conn.tables
+                    .iter()
+                    .flat_map(|t| shadow_gate_target_names(&t.name, shadow_config))
+            })
             .collect();
         ctx.gate_replication_targets(&replication_targets, &state_store)?;
     }
@@ -5135,7 +5139,18 @@ pub(crate) async fn execute_models(
     // mismatch, so no model runs under authorization computed against different
     // content. `None` (bare run / human apply / legacy plan) is a no-op.
     if let Some(gate) = exec_fp_gate {
-        gate.verify(&compile_result.project.models)?;
+        // Fold the seeding-independent on-disk extras the compiled IR omits —
+        // surrogate-key sidecars (#1) and contract presence/contents (#3) — into
+        // the recomputed fingerprint so a post-plan swap of either refuses here.
+        // Loaded on the governed path only, so bare `rocky run` is byte-
+        // identical. `models_dir` is the SAME directory the plan fingerprinted.
+        let surrogate_keys = rocky_core::models::load_surrogate_keys_from_dir(models_dir)
+            .context("invalid surrogate_key configuration")?;
+        let extras = crate::commands::apply::ExecutionExtras::build(
+            &surrogate_keys,
+            &compile_result.project.models,
+        );
+        gate.verify(&compile_result.project.models, &extras)?;
     }
 
     // Per-model compile errors are first-class run failures, not silent
@@ -6879,6 +6894,29 @@ pub(crate) fn governance_tag_target(
 /// (`content_addressed`, `time_interval`) that the serial loop handles
 /// inline. Only plain models are eligible for intra-layer concurrent
 /// execution via [`execute_one_plain_model`].
+/// The replication target names the agent-policy gate must evaluate for one
+/// discovered table (#8): always the logical name, plus the resolved **physical**
+/// name execution writes under suffix-shadow mode. `run` resolves the suffixed
+/// physical name (`<table><suffix>`) for the `TableTask` it materializes, so a
+/// policy rule denying the shadow physical name must be evaluated against it —
+/// gating the logical name alone would let a denied shadow write through.
+///
+/// The `schema_override` shadow variant keeps the bare table name (only its
+/// schema changes), which the name-matched policy plane does not scope — a
+/// flagged residual, not closed here.
+fn shadow_gate_target_names(
+    table_name: &str,
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+) -> Vec<String> {
+    let mut names = vec![table_name.to_string()];
+    if let Some(sc) = shadow_config
+        && sc.schema_override.is_none()
+    {
+        names.push(format!("{}{}", table_name, sc.suffix));
+    }
+    names
+}
+
 pub(crate) fn is_plain_strategy(model: &rocky_core::models::Model) -> bool {
     !matches!(
         model.config.strategy,
@@ -11361,7 +11399,6 @@ merge_keys = ["id"]
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn e_toctou_kill_check_real_duckdb() {
-        use rocky_compiler::compile::{self, CompilerConfig};
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
         let dir = tempfile::tempdir().unwrap();
@@ -11369,21 +11406,11 @@ merge_keys = ["id"]
         std::fs::create_dir(&models).unwrap();
         write_model_with_target(&models, "orders", "SELECT 1 AS id", "main", "orders");
 
-        let cc = CompilerConfig {
-            models_dir: models.clone(),
-            ..Default::default()
-        };
-        // (1) process-stability across two independent compiles.
-        let fp1 = crate::commands::apply::execution_ir_fingerprint(
-            &compile::compile(&cc).unwrap().project.models,
-            "cfg",
-        )
-        .unwrap();
-        let fp2 = crate::commands::apply::execution_ir_fingerprint(
-            &compile::compile(&cc).unwrap().project.models,
-            "cfg",
-        )
-        .unwrap();
+        // (1) process-stability across two independent compiles — computed the
+        // exact way `execute_models` recomputes at the choke-point (compile +
+        // surrogate/contract extras), so the two must agree.
+        let fp1 = exec_choke_fingerprint(&models, "cfg");
+        let fp2 = exec_choke_fingerprint(&models, "cfg");
         assert_eq!(
             fp1, fp2,
             "same bytes must fingerprint identically (stability)"
@@ -11460,6 +11487,181 @@ merge_keys = ["id"]
         )
         .await
         .expect_err("KILL-CHECK: a changed model must be REFUSED at the choke-point");
+        assert!(
+            err.to_string().contains("fingerprint mismatch"),
+            "must refuse with a fingerprint mismatch, got: {err}"
+        );
+    }
+
+    /// 🔴 #8 (shadow physical-name gating): the replication policy gate must see
+    /// the RESOLVED physical name suffix-shadow execution writes, not only the
+    /// logical name. Fails on producer revert (gating logical-only) because the
+    /// suffixed name would be absent from the gated set.
+    #[test]
+    fn shadow_gate_target_names_includes_physical_shadow_name() {
+        use rocky_core::shadow::ShadowConfig;
+        // No shadow → logical name only.
+        assert_eq!(
+            super::shadow_gate_target_names("orders", None),
+            vec!["orders".to_string()]
+        );
+        // Suffix-shadow → BOTH logical and the physical `<table><suffix>` that
+        // `TableTask` materializes must be gated.
+        let suffixed = ShadowConfig {
+            suffix: "_shadow".to_string(),
+            schema_override: None,
+            cleanup_after: true,
+        };
+        assert_eq!(
+            super::shadow_gate_target_names("orders", Some(&suffixed)),
+            vec!["orders".to_string(), "orders_shadow".to_string()],
+            "suffix-shadow must gate the resolved physical name (#8)"
+        );
+        // schema-override shadow keeps the bare name (flagged residual: schema
+        // differs, name-matched policy does not scope it).
+        let schema_override = ShadowConfig {
+            suffix: "_shadow".to_string(),
+            schema_override: Some("_rocky_shadow".to_string()),
+            cleanup_after: true,
+        };
+        assert_eq!(
+            super::shadow_gate_target_names("orders", Some(&schema_override)),
+            vec!["orders".to_string()]
+        );
+    }
+
+    /// Recompute the execution fingerprint EXACTLY the way the `execute_models`
+    /// choke-point does — compile + surrogate-key + contract extras — so a
+    /// gate built with this value does not spuriously refuse an unchanged apply.
+    #[cfg(feature = "duckdb")]
+    fn exec_choke_fingerprint(models_dir: &std::path::Path, config_identity: &str) -> String {
+        use rocky_compiler::compile::{self, CompilerConfig};
+        let cc = CompilerConfig {
+            models_dir: models_dir.to_path_buf(),
+            ..Default::default()
+        };
+        let result = compile::compile(&cc).unwrap();
+        let sk = rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap();
+        let extras = crate::commands::apply::ExecutionExtras::build(&sk, &result.project.models);
+        crate::commands::apply::execution_ir_fingerprint(
+            &result.project.models,
+            config_identity,
+            &extras,
+        )
+        .unwrap()
+    }
+
+    /// Run one governed `execute_models` apply under a fixed gate and return the
+    /// `Result` — the shared driver for the extras kill-checks below.
+    #[cfg(feature = "duckdb")]
+    async fn governed_apply(
+        models_dir: &std::path::Path,
+        db: &std::path::Path,
+        run_id: &str,
+        expected_fp: &str,
+    ) -> Result<()> {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        let gate = crate::commands::apply::ExecFingerprintGate {
+            expected: Some(expected_fp.to_string()),
+            config_identity: "cfg".to_string(),
+            plan_id: "p".to_string(),
+            require: true,
+        };
+        let adapter = DuckDbWarehouseAdapter::open(db).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::execute_models(
+            models_dir,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &PartitionRunOptions::default(),
+            run_id,
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            true,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            true,
+            Some(&gate),
+        )
+        .await
+    }
+
+    /// 🔴 #1 KILL-CHECK (real DuckDB): a `[[surrogate_key]]` sidecar change after
+    /// plan REFUSES — even though the `.sql` and every `ModelConfig` field are
+    /// byte-identical (surrogate specs live outside `ModelConfig`, loaded
+    /// separately). Fails on producer revert: without the surrogate extras in the
+    /// fingerprint, the key-only change would not move it and the apply would
+    /// proceed under stale authorization.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn surrogate_key_change_refuses_kill_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        let sidecar = |cols: &str| {
+            format!(
+                "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"orders\"\n\n[[surrogate_key]]\nname = \"sk\"\ncolumns = [{cols}]\n"
+            )
+        };
+        std::fs::write(models.join("orders.toml"), sidecar("\"id\"")).unwrap();
+
+        let db = dir.path().join("wh.duckdb");
+        // Plan-time fingerprint binds the surrogate spec (columns = [id]).
+        let fp = exec_choke_fingerprint(&models, "cfg");
+        // (2) unchanged apply → no refuse.
+        governed_apply(&models, &db, "sk-ok", &fp)
+            .await
+            .expect("KILL-CHECK: unchanged surrogate apply must NOT refuse");
+
+        // (3) change ONLY the surrogate columns — ModelConfig + SQL unchanged.
+        std::fs::write(models.join("orders.toml"), sidecar("\"id\", \"id\"")).unwrap();
+        let err = governed_apply(&models, &db, "sk-changed", &fp)
+            .await
+            .expect_err("KILL-CHECK: a surrogate-key change must be REFUSED (#1)");
+        assert!(
+            err.to_string().contains("fingerprint mismatch"),
+            "must refuse with a fingerprint mismatch, got: {err}"
+        );
+    }
+
+    /// 🔴 #3 KILL-CHECK (real DuckDB): a `.contract.toml` change/removal after
+    /// plan REFUSES — contract presence + contents live on `Model.contract_path`,
+    /// outside `ModelConfig`, yet presence is authorization-relevant and contents
+    /// constrain the output. Fails on producer revert: without the contract
+    /// extras, the contract edit would not move the fingerprint.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn contract_change_refuses_kill_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        write_model_with_target(&models, "orders", "SELECT 1 AS id", "main", "orders");
+        std::fs::write(
+            models.join("orders.contract.toml"),
+            "[[columns]]\nname = \"id\"\n",
+        )
+        .unwrap();
+
+        let db = dir.path().join("wh.duckdb");
+        let fp = exec_choke_fingerprint(&models, "cfg");
+        governed_apply(&models, &db, "contract-ok", &fp)
+            .await
+            .expect("KILL-CHECK: unchanged contract apply must NOT refuse");
+
+        // Remove the contract — presence flips, ModelConfig + SQL unchanged.
+        std::fs::remove_file(models.join("orders.contract.toml")).unwrap();
+        let err = governed_apply(&models, &db, "contract-removed", &fp)
+            .await
+            .expect_err("KILL-CHECK: a removed contract must be REFUSED (#3)");
         assert!(
             err.to_string().contains("fingerprint mismatch"),
             "must refuse with a fingerprint mismatch, got: {err}"

@@ -191,6 +191,14 @@ pub(crate) fn run_backfill_in(
         .as_ref()
         .map(crate::commands::apply::config_policy_identity);
     let identity = config_identity.clone().unwrap_or_default();
+    // Fold the seeding-independent extras (surrogate-key sidecars #1, contract
+    // presence/contents #3) into the bound fingerprint so the apply-time TOCTOU
+    // gate rejects a post-plan swap of either, built from the SAME `models_dir`
+    // the apply choke-point re-reads.
+    let extras = crate::commands::apply::ExecutionExtras::build(
+        &rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap_or_default(),
+        &compiled.project.models,
+    );
     let capabilities = EmbeddedCapabilities {
         diff_available: true,
         changed: ordered
@@ -200,6 +208,7 @@ pub(crate) fn run_backfill_in(
         models_fingerprint: crate::commands::apply::execution_ir_fingerprint(
             &compiled.project.models,
             &identity,
+            &extras,
         ),
         config_identity,
         fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,

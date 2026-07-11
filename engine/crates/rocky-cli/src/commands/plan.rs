@@ -1017,9 +1017,16 @@ pub fn compute_embedded_capabilities(
     // Bind the compiled-IR fingerprint the gate authorizes so apply can refuse a
     // models/config change between planning and execution (TOCTOU), checked at
     // the single execution choke-point. Computed from the head compile that a
-    // clean apply will reproduce.
+    // clean apply will reproduce. The seeding-independent extras (surrogate-key
+    // sidecars #1, contract presence/contents #3) are folded in so a post-plan
+    // swap of either is refused even though `config`+`sql` are byte-identical —
+    // built from the SAME `models_dir` the apply choke-point re-reads.
+    let extras = crate::commands::apply::ExecutionExtras::build(
+        &rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap_or_default(),
+        &head.project.models,
+    );
     let models_fingerprint =
-        crate::commands::apply::execution_ir_fingerprint(&head.project.models, &identity);
+        crate::commands::apply::execution_ir_fingerprint(&head.project.models, &identity, &extras);
 
     let base = match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
         Ok(r) => r,

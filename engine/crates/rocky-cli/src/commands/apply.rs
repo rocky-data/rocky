@@ -976,9 +976,16 @@ fn touched_models_for_promote(
 ///
 /// `None` only when a model config fails to serialize (never expected in
 /// practice); the governed check treats `None` as a refusal (fail-closed).
+///
+/// `extras` folds in the **seeding-independent** on-disk content the compiled IR
+/// alone does not carry — surrogate-key sidecars (#1) and contract
+/// presence/contents (#3) — so a `[[surrogate_key]]` or `.contract.toml` change
+/// between plan and apply moves the fingerprint even though `config` + `sql` are
+/// byte-identical. See [`ExecutionExtras`].
 pub(crate) fn execution_ir_fingerprint(
     models: &[rocky_core::models::Model],
     config_identity: &str,
+    extras: &ExecutionExtras,
 ) -> Option<String> {
     let mut projection: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     for m in models {
@@ -992,16 +999,91 @@ pub(crate) fn execution_ir_fingerprint(
     // Re-through `to_value` so the whole tree is canonical (sorted keys).
     let root = serde_json::to_value(&projection).ok()?;
     let bytes = serde_json::to_vec(&root).ok()?;
+    // Canonical (sorted-key) serialization of the extras — `ExecutionExtras` is
+    // built from `BTreeMap`s, so this is process-stable. Fail-closed: a
+    // serialization failure returns `None` (→ refusal), never a partial hash.
+    let extras_bytes = serde_json::to_vec(extras).ok()?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(&bytes);
     hasher.update(b"\x00cfg\x00");
     hasher.update(config_identity.as_bytes());
+    hasher.update(b"\x00extras\x00");
+    hasher.update(&extras_bytes);
     Some(hasher.finalize().to_hex().to_string())
 }
 
-/// The env-resolved, **routing** config identity that authorization depends on —
-/// the physical destination and adapter/target shape, with connection
-/// **credentials excluded** (finding #4).
+/// The seeding-**independent** on-disk execution inputs the compiled `ModelIr`
+/// does not carry, folded into the execution fingerprint so a post-plan swap of
+/// either is refused at the choke-point. Both inputs are derived purely from
+/// files under `models_dir` (never from the source-warehouse schema), so plan
+/// and apply compute them identically for an unchanged project — which is why
+/// they are safe to fingerprint without risking a false-refuse on a source
+/// schema drift (that class is finding #2, deferred).
+///
+/// - **Surrogate keys (#1).** `[[surrogate_key]]` sidecar blocks are loaded by
+///   [`load_surrogate_keys_from_dir`](rocky_core::models::load_surrogate_keys_from_dir),
+///   NOT by the compiler, so they are absent from `ModelConfig` and invisible to
+///   the config+SQL projection. A model that gains/changes a surrogate key wraps
+///   its SELECT at materialization time — a different physical write.
+/// - **Contracts (#3).** `contract_path` lives on `Model`, outside
+///   `ModelConfig`, so contract presence and contents are unfingerprinted — yet
+///   contract PRESENCE is authorization-relevant (the `contracted` policy
+///   attribute) and its contents constrain the model's output. Keyed by model
+///   name; the value is a content hash. An absent key means "no contract", so
+///   adding or removing a contract moves the fingerprint.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub(crate) struct ExecutionExtras {
+    /// Per-model surrogate-key specs, name-sorted for stability.
+    surrogate_keys: BTreeMap<String, Vec<rocky_core::models::SurrogateKeySpec>>,
+    /// Per-model contract content hash (blake3 hex of the raw `.contract.toml`
+    /// bytes). Absent key ⇒ no contract. Hashes CONTENTS, never the path (the
+    /// path is machine/tempdir-specific and would cause cross-machine
+    /// false-refuse).
+    contracts: BTreeMap<String, String>,
+}
+
+impl ExecutionExtras {
+    /// Assemble the extras from the already-loaded surrogate-key map plus the
+    /// compiled models (for their `contract_path`s). Called identically at plan
+    /// time and at the apply choke-point over the same `models_dir`.
+    pub(crate) fn build(
+        surrogate_keys: &std::collections::HashMap<
+            String,
+            Vec<rocky_core::models::SurrogateKeySpec>,
+        >,
+        models: &[rocky_core::models::Model],
+    ) -> Self {
+        let surrogate_keys: BTreeMap<String, Vec<rocky_core::models::SurrogateKeySpec>> =
+            surrogate_keys
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        let mut contracts = BTreeMap::new();
+        for m in models {
+            if let Some(path) = &m.contract_path {
+                // Hash the CONTENTS. A read failure at apply that succeeded at
+                // plan yields a distinct stable sentinel → the fingerprint moves
+                // → refuse (fail-closed); it only silently matches when the
+                // contract is unreadable at both sites (a degenerate case the
+                // compile would already have rejected).
+                let hash = match std::fs::read(path) {
+                    Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+                    Err(_) => "<unreadable-contract>".to_string(),
+                };
+                contracts.insert(m.config.name.clone(), hash);
+            }
+        }
+        Self {
+            surrogate_keys,
+            contracts,
+        }
+    }
+}
+
+/// The env-resolved, **routing + governance-policy** config identity that
+/// authorization depends on — the physical destination and adapter/target
+/// shape, plus the workspace governance policy, with connection **credentials
+/// excluded** (finding #4).
 ///
 /// Each adapter and pipeline is serialized in full via `serde_json::to_value`
 /// (sorted keys — serde_json has no `preserve_order`). Every credential field is
@@ -1010,11 +1092,17 @@ pub(crate) fn execution_ir_fingerprint(
 /// construction** while every routing field — `host`, `account`, `database`,
 /// `project_id`, `location`, `warehouse`, `path`, `http_path`, the target
 /// `catalog_template` / `schema_template`, the target adapter, and per-pipeline
-/// governance — is captured. So swapping `path = a.duckdb → b.duckdb` (a
-/// different physical DB), swapping the adapter type, or changing a target
-/// template / governance tag CHANGES the identity (→ refuse), while rotating a
-/// credential does NOT (→ no spurious refuse). New secret fields are
-/// auto-redacted; new routing fields are auto-included.
+/// governance — is captured. Additionally the **workspace governance policy** —
+/// the top-level `[mask]` tag→strategy mapping and `[classifications]` — is
+/// folded in (finding #6): these drive which masking / classification the
+/// governance reconcile applies to the warehouse, yet they live outside
+/// `ModelConfig` and the per-pipeline block, so a post-plan `[mask]` swap would
+/// otherwise change the applied governance invisibly. So swapping
+/// `path = a.duckdb → b.duckdb` (a different physical DB), swapping the adapter
+/// type, changing a target template, or changing a mask/classification policy
+/// CHANGES the identity (→ refuse), while rotating a credential does NOT (→ no
+/// spurious refuse). New secret fields are auto-redacted; new routing/governance
+/// fields are auto-included.
 pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> String {
     let adapters: BTreeMap<&str, serde_json::Value> = cfg
         .adapters
@@ -1036,10 +1124,22 @@ pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> S
             )
         })
         .collect();
+    // Workspace governance policy (finding #6): env-invariant raw `[mask]` +
+    // `[classifications]`. Folding the raw (all-env) map is fail-closed — a
+    // change to any env's mask refuses — and needs no `env` threading. Both are
+    // credential-free.
+    let governance = serde_json::json!({
+        "mask": cfg.mask,
+        "classifications": cfg.classifications,
+    });
     // Canonicalize (sorted keys) via `to_value`, then a stable string.
-    serde_json::to_value(serde_json::json!({ "adapters": adapters, "pipelines": pipelines }))
-        .map(|v| v.to_string())
-        .unwrap_or_default()
+    serde_json::to_value(serde_json::json!({
+        "adapters": adapters,
+        "pipelines": pipelines,
+        "governance": governance,
+    }))
+    .map(|v| v.to_string())
+    .unwrap_or_default()
 }
 
 /// The TOCTOU check threaded to the single execution choke-point
@@ -1069,7 +1169,11 @@ impl ExecFingerprintGate {
     /// fingerprint AND `!require`) is allowed through; a NEW plan whose
     /// fingerprint is missing (`require && expected.is_none()`) is REFUSED
     /// (production failure, #7); and a live mismatch is refused.
-    pub(crate) fn verify(&self, models: &[rocky_core::models::Model]) -> Result<()> {
+    pub(crate) fn verify(
+        &self,
+        models: &[rocky_core::models::Model],
+        extras: &ExecutionExtras,
+    ) -> Result<()> {
         let Some(expected) = self.expected.as_deref() else {
             if self.require {
                 bail!(
@@ -1082,7 +1186,7 @@ impl ExecFingerprintGate {
             }
             return Ok(()); // genuinely-legacy plan — no bound fingerprint
         };
-        let actual = execution_ir_fingerprint(models, &self.config_identity);
+        let actual = execution_ir_fingerprint(models, &self.config_identity, extras);
         if actual.as_deref() != Some(expected) {
             bail!(
                 "refusing to execute plan '{}': the models/config changed since the plan was \
@@ -3566,10 +3670,25 @@ auto_create_schemas = true
             "[adapter]\ntype = \"snowflake\"\naccount = \"x\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
         ));
         let models: Vec<rocky_core::models::Model> = Vec::new();
+        let extras = super::ExecutionExtras::default();
         assert_ne!(
-            super::execution_ir_fingerprint(&models, &id_a),
-            super::execution_ir_fingerprint(&models, &snow),
+            super::execution_ir_fingerprint(&models, &id_a, &extras),
+            super::execution_ir_fingerprint(&models, &snow, &extras),
             "the routing identity must change the execution fingerprint"
+        );
+
+        // 🔴 #6 (governance policy): a `[mask]` change MUST move the identity
+        // (the governance reconcile would apply a different masking strategy),
+        // while it stays credential-free.
+        let masked = |strategy: &str| {
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"a.duckdb\"\n\n[mask]\npii = \"{strategy}\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n"
+            )
+        };
+        assert_ne!(
+            super::config_policy_identity(&cfg(&masked("hash"))),
+            super::config_policy_identity(&cfg(&masked("redact"))),
+            "a [mask] strategy change must change the governance-policy identity (#6)"
         );
     }
 
@@ -3579,7 +3698,8 @@ auto_create_schemas = true
     #[test]
     fn exec_fingerprint_gate_fail_closed_semantics() {
         let m: Vec<rocky_core::models::Model> = Vec::new();
-        let expected = super::execution_ir_fingerprint(&m, "c").unwrap();
+        let extras = super::ExecutionExtras::default();
+        let expected = super::execution_ir_fingerprint(&m, "c", &extras).unwrap();
         // Genuinely-legacy (no fingerprint, not required) → allowed.
         super::ExecFingerprintGate {
             expected: None,
@@ -3587,7 +3707,7 @@ auto_create_schemas = true
             plan_id: "p".to_string(),
             require: false,
         }
-        .verify(&m)
+        .verify(&m, &extras)
         .expect("a legacy plan without a fingerprint is allowed through");
         // NEW plan whose fingerprint could not be produced (required) → REFUSE.
         let err = super::ExecFingerprintGate {
@@ -3596,7 +3716,7 @@ auto_create_schemas = true
             plan_id: "p".to_string(),
             require: true,
         }
-        .verify(&m)
+        .verify(&m, &extras)
         .expect_err("a governed plan with no fingerprint must refuse (#7)");
         assert!(err.to_string().contains("could not be produced"), "{err}");
         // Matching → ok; live mismatch → refuse.
@@ -3606,7 +3726,7 @@ auto_create_schemas = true
             plan_id: "p".to_string(),
             require: true,
         }
-        .verify(&m)
+        .verify(&m, &extras)
         .expect("a matching fingerprint applies");
         assert!(
             super::ExecFingerprintGate {
@@ -3615,7 +3735,7 @@ auto_create_schemas = true
                 plan_id: "p".to_string(),
                 require: true,
             }
-            .verify(&m)
+            .verify(&m, &extras)
             .is_err(),
             "a config-identity change must refuse"
         );
