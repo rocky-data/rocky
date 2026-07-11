@@ -12475,6 +12475,79 @@ merge_keys = ["id"]
         );
     }
 
+    /// 🔴 #4 (the `bind_masks=true` path): for a REPLICATION pipeline (which
+    /// reaches the mask-reconciling `--all` route at apply), the plan-side
+    /// `compute_embedded_capabilities` must BIND the effective mask and AGREE with
+    /// the apply-side choke-point that also binds it (`reconciles_masks=true`).
+    /// This exercises the one production path where the plan side binds — the
+    /// exact cross-path the `scoped` proxy got wrong. Also asserts the mask is
+    /// actually bound (a mask change moves the plan fingerprint).
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn plan_and_apply_agree_replication_binds_mask() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        let cfg_toml = |mask: &str| {
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n\n[mask]\npii = \"{mask}\"\n\n\
+                 [pipeline.p]\ntype = \"replication\"\nstrategy = \"full_refresh\"\n\n\
+                 [pipeline.p.source.schema_pattern]\nprefix = \"raw__\"\nseparator = \"__\"\ncomponents = [\"source\"]\n\n\
+                 [pipeline.p.target]\nadapter = \"default\"\ncatalog_template = \"c\"\nschema_template = \"s__{{source}}\"\n"
+            )
+        };
+        std::fs::write(&config_path, cfg_toml("hash")).unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        // The model classifies `id` as `pii`, so the `[mask] pii` resolves onto it
+        // → the effective mask is NON-empty when bound.
+        std::fs::write(
+            models.join("orders.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"orders\"\n\n[classification]\nid = \"pii\"\n",
+        )
+        .unwrap();
+
+        // Plan side: a full run (`model_is_none = true`) of the REPLICATION
+        // pipeline "p" → `bind_masks = true` → the mask is bound.
+        let caps = crate::commands::plan::compute_embedded_capabilities(
+            &config_path,
+            &models,
+            "main",
+            None,
+            None,
+            Some("p"),
+            true,
+        );
+        // Apply side: `reconciles_masks = true` binds `gate.resolved_mask`, which
+        // the choke-point restricts to the executed models' tags — mirror that.
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let identity = crate::commands::apply::config_policy_identity(&cfg);
+        let gov = crate::commands::apply::governance_policy_identity(&cfg);
+        let resolved_mask = cfg.resolve_mask_for_env(None);
+        let apply_fp = exec_choke_fingerprint(&models, &identity, &gov, &resolved_mask);
+        assert_eq!(
+            caps.models_fingerprint.as_deref(),
+            Some(apply_fp.as_str()),
+            "replication plan↔apply must AGREE with the mask BOUND on both sides (#4)"
+        );
+
+        // The mask IS bound: changing `[mask] pii` moves the plan fingerprint.
+        std::fs::write(&config_path, cfg_toml("redact")).unwrap();
+        let caps_redact = crate::commands::plan::compute_embedded_capabilities(
+            &config_path,
+            &models,
+            "main",
+            None,
+            None,
+            Some("p"),
+            true,
+        );
+        assert_ne!(
+            caps.models_fingerprint, caps_redact.models_fingerprint,
+            "a used [mask] change must move the replication plan fingerprint (#4/C bound)"
+        );
+    }
+
     /// Drive `execute_models` serially (DuckDB) with `[resilience]
     /// contain_failures = true` — the failure-containment path under test.
     async fn run_models_with_containment(
