@@ -982,21 +982,24 @@ enum Command {
         skip_unchanged: bool,
 
         /// Force every selected model to build, bypassing the
-        /// `--skip-unchanged` gate entirely. The escape hatch when you want
-        /// a guaranteed rebuild (e.g. after a non-logic change the IR hash
-        /// can't see, like a UDF redefinition or a session-setting change).
+        /// `--skip-unchanged` gate AND the content-addressed column-level
+        /// skip entirely. The escape hatch when you want a guaranteed rebuild
+        /// (e.g. after a non-logic change the IR hash can't see, like a UDF
+        /// redefinition or a session-setting change).
         #[arg(long)]
         force_rebuild: bool,
 
-        /// Disable the content-addressed reuse decision for this invocation,
-        /// even when `[reuse]` is enabled in config.
+        /// Disable content-addressed reuse for this invocation, even when
+        /// `[reuse]` is enabled in config.
         ///
         /// When `[reuse]` is on, a content-addressed model whose declared
         /// inputs byte-for-byte match a prior strong run may point a new Delta
         /// commit at that run's already-written parquet instead of executing
         /// its SQL — a fail-closed decision that BUILDs on any doubt. This
-        /// flag is the escape hatch that forces every model to BUILD,
-        /// parallel to `--force-rebuild` for `--skip-unchanged`. Default OFF.
+        /// flag is the escape hatch that forces every content-addressed model
+        /// to BUILD, parallel to `--force-rebuild` for `--skip-unchanged`: it
+        /// disables both the point-to reuse decision and the `[reuse]
+        /// column_level` skip. Default OFF.
         #[arg(long)]
         no_reuse: bool,
 
@@ -3141,7 +3144,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 )
                 .await
             } else if dag {
-                let run_future = rocky_cli::commands::run_with_dag(&cli.config, &state_path, json);
+                let run_future =
+                    rocky_cli::commands::run_with_dag(&cli.config, &state_path, json, &skip_opts);
                 tokio::select! {
                     result = run_future => result,
                     _ = shutdown_signal() => {

@@ -379,9 +379,18 @@ async fn execute_run_plan(
                  human apply it."
             );
         }
-        return crate::commands::run_with_dag(config_path, state_path, output_json)
-            .await
-            .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"));
+        // A stored run plan predates the build-escape-hatch flags (they were
+        // never captured into the plan), so the DAG replay uses defaults —
+        // `--force-rebuild` / `--no-reuse` are not part of a persisted plan's
+        // contract.
+        return crate::commands::run_with_dag(
+            config_path,
+            state_path,
+            output_json,
+            &crate::commands::run::SkipRunOptions::default(),
+        )
+        .await
+        .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"));
     }
 
     // Capture stdout from the run command — `run` writes JSON directly.

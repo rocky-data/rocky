@@ -743,6 +743,7 @@ mod tests {
             imports: Default::default(),
             run: Default::default(),
             reuse: Default::default(),
+            gc: Default::default(),
             policy: None,
             resilience: Default::default(),
         };
@@ -842,6 +843,7 @@ mod tests {
             imports: Default::default(),
             run: Default::default(),
             reuse: Default::default(),
+            gc: Default::default(),
             policy: None,
             resilience: Default::default(),
         };
@@ -943,6 +945,7 @@ mod tests {
             imports: Default::default(),
             run: Default::default(),
             reuse: Default::default(),
+            gc: Default::default(),
             policy: None,
             resilience: Default::default(),
         };
