@@ -951,8 +951,29 @@ fn build_and_persist_run_plan(
     // evaluates the plan against the identity that authored it and the exact
     // capabilities that were reviewed.
     let principal = run_options.principal.unwrap_or(PolicyPrincipal::Human);
-    let capabilities =
-        compute_embedded_capabilities(config_path, models_dir, base_ref, Some(state_path), env);
+    // Finding #4: bind the mask iff the apply reaches the mask-reconciling path —
+    // a Replication pipeline whose model leg runs (`--all` / `--models`) on a full
+    // (`--model`-less) run. Resolved with the SAME `resolve_pipeline` `run()` uses,
+    // and the SAME `run_all || models_dir` predicate `run.rs` gates the model leg
+    // with, so it matches the apply-side literal `reconciles_masks`. A resolution
+    // failure ⇒ `false` (fail-safe: apply that doesn't reach the leg never checks
+    // the gate, so a wrong-`true` is harmless; a wrong-`false` would false-refuse).
+    let bind_masks = rocky_core::config::load_rocky_config(config_path)
+        .ok()
+        .map(|cfg| {
+            crate::commands::apply::pipeline_is_replication(&cfg, pipeline)
+                && (run_options.all || run_options.models_dir.is_some())
+                && run_options.model.is_none()
+        })
+        .unwrap_or(false);
+    let capabilities = compute_embedded_capabilities(
+        config_path,
+        models_dir,
+        base_ref,
+        Some(state_path),
+        env,
+        bind_masks,
+    );
     let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
         .context("failed to write run plan")?;
 
@@ -979,6 +1000,15 @@ pub fn compute_embedded_capabilities(
     base_ref: &str,
     state_path: Option<&Path>,
     env: Option<&str>,
+    // Finding #4: whether the mask enters the fingerprint — `true` iff the apply
+    // reaches the mask-reconciling path (a full run of a REPLICATION pipeline that
+    // hits the model leg). The CALLER computes this from the resolved pipeline +
+    // the persisted `run_all`/`models_dir`/`model` flags, with the SAME
+    // `resolve_pipeline` the apply uses, so it matches the apply-side literal
+    // `reconciles_masks` by construction. `false` is the fail-safe (apply that
+    // does not reach the mask leg never checks the gate, so a wrong-`true` is
+    // harmless; a wrong-`false` would false-refuse).
+    bind_masks: bool,
 ) -> EmbeddedCapabilities {
     use crate::plan_store::CURRENT_FINGERPRINT_VERSION;
     use rocky_compiler::compile::{self, CompilerConfig};
@@ -991,13 +1021,23 @@ pub fn compute_embedded_capabilities(
     let config_identity = loaded_cfg
         .as_ref()
         .map(crate::commands::apply::config_policy_identity);
-    // The env-resolved governance identity (mask / roles / cache-selection),
-    // bound into the fingerprint so a post-plan governance change refuses. `env`
-    // is the plan's `--env`, so apply refuses if applied against a different env.
+    // The model-independent governance identity (roles / cache-selection), bound
+    // into the fingerprint so a post-plan governance change refuses.
     let governance_identity = loaded_cfg
         .as_ref()
-        .map(|cfg| crate::commands::apply::governance_policy_identity(cfg, env))
+        .map(crate::commands::apply::governance_policy_identity)
         .unwrap_or_default();
+    // The env-resolved mask (finding C): the extras restrict it to the executed
+    // models' classification tags. `env` is the plan's `--env`, so apply resolves
+    // the same masks the reviewed env will apply.
+    let resolved_mask = if bind_masks {
+        loaded_cfg
+            .as_ref()
+            .map(|cfg| cfg.resolve_mask_for_env(env))
+            .unwrap_or_default()
+    } else {
+        std::collections::BTreeMap::new()
+    };
 
     // A plan whose fingerprint could not be produced (broken/absent models dir):
     // stamped as a NEW plan with NO fingerprint → the governed apply REFUSES.
@@ -1007,6 +1047,8 @@ pub fn compute_embedded_capabilities(
         models_fingerprint: None,
         config_identity,
         fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+        // No fingerprint ⇒ apply refuses regardless; the snapshot is moot (`None`).
+        reviewed_source_schemas: None,
     };
 
     if !models_dir.is_dir() {
@@ -1037,6 +1079,19 @@ pub fn compute_embedded_capabilities(
             Err(_) => return failed(config_identity),
         }
     };
+    // Capture the REVIEWED source-schema snapshot (finding #2) — the exact
+    // schemas the head compile typed against. `Some` is AUTHORITATIVE even when
+    // empty (a cold-cache plan captures `Some(empty)`, and apply must type from
+    // that, never a later-warmed live cache). Apply seeds its compile from this
+    // via the plan payload. Name-sorted (BTreeMap) for a stable `plan_id` digest.
+    let reviewed_source_schemas: Option<
+        std::collections::BTreeMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    > = Some(
+        source_schemas
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    );
     // Bind the compiled-IR fingerprint the gate authorizes so apply can refuse a
     // models/config change between planning and execution (TOCTOU), checked at
     // the single execution choke-point. Computed from the head compile that a
@@ -1047,6 +1102,7 @@ pub fn compute_embedded_capabilities(
     let extras = crate::commands::apply::ExecutionExtras::build(
         &rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap_or_default(),
         &head.project.models,
+        &resolved_mask,
     );
     let models_fingerprint = crate::commands::apply::execution_ir_fingerprint(
         &head.project.models,
@@ -1067,6 +1123,7 @@ pub fn compute_embedded_capabilities(
                 models_fingerprint,
                 config_identity,
                 fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+                reviewed_source_schemas,
             };
         }
     };
@@ -1098,6 +1155,7 @@ pub fn compute_embedded_capabilities(
         models_fingerprint,
         config_identity,
         fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+        reviewed_source_schemas,
     }
 }
 
