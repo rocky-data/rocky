@@ -297,13 +297,17 @@ pub fn verify_artifacts(manifest: &Manifest, artifacts_dir: &Path) -> Vec<Artifa
 }
 
 fn check_one_artifact(output: &OutputHash, artifacts_dir: &Path) -> ArtifactCheck {
+    // Resolution is confined to `artifacts_dir`: the manifest's recorded
+    // `path` contributes only its basename. Honoring the recorded path
+    // verbatim (absolute, or relative to the verifier's cwd) would let a
+    // check pass against a file OUTSIDE the directory being verified — a
+    // manifest is untrusted input, and "the bytes under --artifacts-dir
+    // match" is the question being asked.
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(path) = output.path.as_ref() {
-        // A bare/relative path may already point at the file.
-        candidates.push(PathBuf::from(path));
-        if let Some(name) = Path::new(path).file_name() {
-            candidates.push(artifacts_dir.join(name));
-        }
+    if let Some(path) = output.path.as_ref()
+        && let Some(name) = Path::new(path).file_name()
+    {
+        candidates.push(artifacts_dir.join(name));
     }
     candidates.push(artifacts_dir.join(&output.hash));
     candidates.push(artifacts_dir.join(format!("{}.parquet", output.hash)));
@@ -447,6 +451,64 @@ mod tests {
         m["manifest_version"] = serde_json::json!("0.2");
         let errs = validate_schema(&m).unwrap();
         assert!(!errs.is_empty(), "an unknown manifest_version must fail");
+    }
+
+    #[test]
+    fn artifact_check_never_resolves_outside_artifacts_dir() {
+        // A manifest's recorded `path` is untrusted: an absolute path to an
+        // intact copy elsewhere on the machine must NOT satisfy the check
+        // when the copy under --artifacts-dir was tampered with.
+        let outside = tempfile::TempDir::new().unwrap();
+        let intact = outside.path().join("orders.parquet");
+        std::fs::write(&intact, b"intact bytes").unwrap();
+        let hash = blake3::hash(b"intact bytes").to_hex().to_string();
+
+        let artifacts = tempfile::TempDir::new().unwrap();
+        std::fs::write(artifacts.path().join("orders.parquet"), b"TAMPERED").unwrap();
+
+        let output = OutputHash {
+            hash,
+            path: Some(intact.display().to_string()),
+        };
+        let check = check_one_artifact(&output, artifacts.path());
+        assert!(
+            !check.matched,
+            "a tampered in-dir artifact must fail even when the recorded \
+             absolute path points at an intact out-of-dir copy: {check:?}"
+        );
+        let resolved = check.file.expect("the in-dir candidate must resolve");
+        assert!(
+            resolved.starts_with(artifacts.path()),
+            "resolution must stay inside --artifacts-dir, got {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn artifact_check_resolves_basename_and_hash_forms_in_dir() {
+        let artifacts = tempfile::TempDir::new().unwrap();
+        let bytes = b"the artifact bytes";
+        let hash = blake3::hash(bytes).to_hex().to_string();
+
+        // Basename of the recorded path, under artifacts_dir.
+        std::fs::write(artifacts.path().join("orders.parquet"), bytes).unwrap();
+        let by_name = check_one_artifact(
+            &OutputHash {
+                hash: hash.clone(),
+                path: Some("/produced/on/another/host/orders.parquet".into()),
+            },
+            artifacts.path(),
+        );
+        assert!(by_name.matched, "basename-in-dir must verify: {by_name:?}");
+
+        // Content-addressed <hash>.parquet naming, no recorded path at all.
+        std::fs::remove_file(artifacts.path().join("orders.parquet")).unwrap();
+        std::fs::write(artifacts.path().join(format!("{hash}.parquet")), bytes).unwrap();
+        let by_hash = check_one_artifact(&OutputHash { hash, path: None }, artifacts.path());
+        assert!(
+            by_hash.matched,
+            "hash-named artifact must verify: {by_hash:?}"
+        );
     }
 
     #[test]

@@ -448,12 +448,12 @@ fn is_zero(v: &usize) -> bool {
 pub struct ExecutionSummary {
     pub concurrency: usize,
     pub tables_processed: usize,
-    /// Tables that failed during the **execution phase** — copy or runtime
-    /// failures while materializing. This does **not** include models excluded
-    /// before execution started (for example, a model that failed to compile);
-    /// those are counted only in the top-level `RunOutput.tables_failed`. For
-    /// overall run pass/fail, read the top-level `tables_failed` / `status`,
-    /// not this `execution.tables_failed`.
+    /// Source tables whose **copy failed** on the replication path (the
+    /// `table_errors` count). Transformation-model runtime failures — including
+    /// contained-cause failures — are reported in `errors` and the top-level
+    /// `RunOutput.tables_failed`, not here; transformation-only runs leave the
+    /// whole `execution` block unpopulated. For overall run pass/fail, read
+    /// the top-level `tables_failed` / `status`, never this field.
     pub tables_failed: usize,
     /// Whether adaptive concurrency (AIMD throttle) was enabled for this run.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -3452,6 +3452,14 @@ pub struct BackfillOutput {
     pub review_command: String,
     /// The exact command that executes the plan once reviewed.
     pub apply_command: String,
+    /// Composition warnings the reviewer must weigh before approving. Today:
+    /// `incremental` / `microbatch` closure members, whose transformation
+    /// re-run is a bare `INSERT INTO … <model SQL>` — depending on the model's
+    /// own filtering it appends duplicate rows or loads nothing, rather than
+    /// rebuilding a window. Empty (and omitted from JSON) when the closure
+    /// carries no such member.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// Human-readable one-line summary.
     pub message: String,
 }
@@ -6678,8 +6686,11 @@ pub struct AuditDecisionEntry {
 ///
 /// The selector is resolved in priority order: a 64-char hex string with a
 /// plan file on disk is a [`AuditSubjectKind::Plan`]; a string matching a
-/// `run_id` in the run ledger is a [`AuditSubjectKind::Run`]; anything else is
-/// treated as a [`AuditSubjectKind::Model`] name.
+/// `run_id` in the run ledger is a [`AuditSubjectKind::Run`]; a string the
+/// decision ledger keys rows by is likewise a [`AuditSubjectKind::Plan`]
+/// (the plan file may be gone, or the id may be a decision-only custody key
+/// that never had one); anything else is treated as a
+/// [`AuditSubjectKind::Model`] name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditSubjectKind {
@@ -6687,7 +6698,10 @@ pub enum AuditSubjectKind {
     Model,
     /// A `run_id` from the run ledger.
     Run,
-    /// A `plan_id` (64-char blake3 hex) with a plan file on disk.
+    /// A `plan_id` — a 64-char blake3 hex with a plan file on disk, or any
+    /// id the decision ledger keys rows by (including decision-only custody
+    /// ids like `freeze:…` / `draft:…` / `autoapply:…`, which never had a
+    /// plan file).
     Plan,
 }
 
