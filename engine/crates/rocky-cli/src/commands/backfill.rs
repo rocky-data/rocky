@@ -155,7 +155,7 @@ pub(crate) fn run_backfill_in(
         .iter()
         .map(|n| (n.name.as_str(), n.depends_on.as_slice()))
         .collect();
-    let layers = order_closure(&closure, &dep_by_model)?;
+    let layers = order_closure(&closure, &dep_by_model, &physical_reader_edges(&compiled))?;
     let ordered: Vec<String> = layers.iter().flatten().cloned().collect();
 
     // 5. Partition scope: which closure models are partitioned, and the window.
@@ -178,6 +178,30 @@ pub(crate) fn run_backfill_in(
     } else {
         None
     };
+
+    // Reviewer-facing composition warnings. An `incremental` / `microbatch`
+    // closure member cannot actually be rebuilt by re-running it: its
+    // transformation SQL-gen is a bare `INSERT INTO … <model SQL>` (no
+    // watermark or window literal threaded in), so a re-run either appends
+    // every selected row again or — if the model self-filters against its own
+    // target — inserts nothing. The reviewer must know the approved "rebuild"
+    // does not repair those members' historical rows.
+    let warnings: Vec<String> = ordered
+        .iter()
+        .filter_map(|name| {
+            let strategy = &compiled.project.model(name)?.config.strategy;
+            let label = match strategy {
+                StrategyConfig::Incremental { .. } => "incremental",
+                StrategyConfig::Microbatch { .. } => "microbatch",
+                _ => return None,
+            };
+            Some(format!(
+                "'{name}' is {label}: its re-run is an unguarded INSERT of the model's SELECT \
+                 (append/no-op, not a windowed rebuild) — repair its history via a full-refresh \
+                 variant or a manual window, then re-run"
+            ))
+        })
+        .collect();
 
     // 6. Cost estimate from historical observations (offline).
     let cost_estimate = estimate_cost(&ordered, store.as_ref(), config_path);
@@ -237,6 +261,7 @@ pub(crate) fn run_backfill_in(
         cost_estimate,
         review_command: format!("rocky review {plan_id} --approve"),
         apply_command: format!("rocky apply {plan_id}"),
+        warnings,
         message: message.clone(),
     };
 
@@ -313,8 +338,88 @@ fn compute_closure(
                 closure.extend(transitive);
             }
         }
+        extend_with_physical_readers(&mut closure, compiled);
     }
     closure
+}
+
+/// `(reader, producers-it-physically-reads)` for every model whose read set
+/// is provably enumerable — the `physical ∪ bare` half of the containment
+/// plane's edge set, resolved against the produced-target index. Ref-declared
+/// dependencies are NOT included (the semantic graph already carries them).
+fn physical_reader_edges(compiled: &CompileResult) -> Vec<(String, Vec<String>)> {
+    use crate::commands::containment::{ProducerIndex, ReadResolution};
+
+    let producers = ProducerIndex::build(compiled.project.models.iter().map(|m| {
+        (
+            m.config.name.as_str(),
+            m.config.target.catalog.as_str(),
+            m.config.target.schema.as_str(),
+            m.config.target.table.as_str(),
+        )
+    }));
+
+    compiled
+        .project
+        .models
+        .iter()
+        .filter_map(|m| {
+            if !rocky_sql::lineage_complete::lineage_is_provably_complete(&m.sql) {
+                return None;
+            }
+            let lineage = rocky_sql::lineage::extract_lineage(&m.sql).ok()?;
+            let mut read_producers: Vec<String> = Vec::new();
+            for read in lineage.source_tables {
+                let read = read.name.to_lowercase();
+                if let ReadResolution::Edges(edge_producers) = producers.resolve(&read) {
+                    for producer in edge_producers {
+                        if producer != m.config.name {
+                            read_producers.push(producer);
+                        }
+                    }
+                }
+            }
+            (!read_producers.is_empty()).then(|| (m.config.name.clone(), read_producers))
+        })
+        .collect()
+}
+
+/// Fold **physical-name consumers** into the closure, to a fixpoint.
+///
+/// The semantic graph carries only `ref()` edges — a raw-SQL model reading a
+/// closure member's *target table by physical name* (`marts.orders_current`)
+/// has no graph edge, yet it consumed exactly the stale output this recovery
+/// exists to repair, and the runtime containment plane models that edge
+/// (`ref ∪ physical ∪ bare`). Resolve every model's enumerable reads against
+/// the produced-target index ([`ProducerIndex`], the same machinery
+/// containment uses) and pull matching readers — plus THEIR `ref()`
+/// downstream — into the closure until nothing new is added.
+///
+/// Scope mirrors containment's documented guarantee: readers whose read sets
+/// cannot be fully enumerated (CTEs, sub-queries — `lineage_is_provably_
+/// complete` rejects them) are best-effort out; declare the dependency with
+/// `ref()` for the hard guarantee.
+fn extend_with_physical_readers(closure: &mut BTreeSet<String>, compiled: &CompileResult) {
+    let physical_edges = physical_reader_edges(compiled);
+
+    loop {
+        let mut grew = false;
+        for (reader, read_producers) in &physical_edges {
+            if closure.contains(reader) {
+                continue;
+            }
+            if read_producers.iter().any(|p| closure.contains(p)) {
+                closure.insert(reader.clone());
+                if let Some((_, transitive)) = blast_radius_of(compiled, reader) {
+                    closure.extend(transitive);
+                }
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
 }
 
 /// Topologically order a closure using only its intra-closure dependencies.
@@ -326,11 +431,19 @@ fn compute_closure(
 fn order_closure(
     closure: &BTreeSet<String>,
     dep_by_model: &HashMap<&str, &[String]>,
+    physical_edges: &[(String, Vec<String>)],
 ) -> Result<Vec<Vec<String>>> {
+    // Physical/bare reads impose the same ordering constraint as `ref()`
+    // edges within the closure: a reader rebuilt before its producer would
+    // consume the exact stale rows this recovery repairs.
+    let phys_by_reader: HashMap<&str, &Vec<String>> = physical_edges
+        .iter()
+        .map(|(reader, producers)| (reader.as_str(), producers))
+        .collect();
     let nodes: Vec<DagNode> = closure
         .iter()
         .map(|m| {
-            let depends_on = dep_by_model
+            let mut depends_on: Vec<String> = dep_by_model
                 .get(m.as_str())
                 .copied()
                 .unwrap_or(&[])
@@ -338,6 +451,13 @@ fn order_closure(
                 .filter(|d| closure.contains(*d))
                 .cloned()
                 .collect();
+            if let Some(producers) = phys_by_reader.get(m.as_str()) {
+                for producer in producers.iter() {
+                    if closure.contains(producer) && !depends_on.contains(producer) {
+                        depends_on.push(producer.clone());
+                    }
+                }
+            }
             DagNode {
                 name: m.clone(),
                 depends_on,
@@ -499,6 +619,9 @@ fn print_table(out: &BackfillOutput) {
             scope.models.join(", ")
         );
     }
+    for w in &out.warnings {
+        println!("  ⚠ {w}");
+    }
     match out.cost_estimate.total_cost_usd {
         Some(c) => println!(
             "  est. cost: ${c:.6} (estimate, {})",
@@ -527,6 +650,73 @@ mod tests {
             .collect()
     }
 
+    /// FIX: the recovery closure folds PHYSICAL-name consumers in. A raw-SQL
+    /// reader of a seed's target table has no `ref()` edge — the semantic
+    /// graph alone leaves it out and the approved recovery leaves it stale —
+    /// but the runtime containment plane models exactly that edge, so the
+    /// closure must too. Its own `ref()` downstream rides along, and the plan
+    /// layers order the reader strictly after its producer.
+    #[test]
+    fn closure_includes_physical_readers_of_seed_targets() {
+        use rocky_compiler::compile::{self, CompilerConfig};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let write = |name: &str, sql: &str, table: &str| {
+            std::fs::write(dir.path().join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                dir.path().join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{table}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        write("a", "SELECT 1 AS id", "a_tbl");
+        // Physical 2-part read of a's target — no ref edge to `a`.
+        write("d", "SELECT id FROM s.a_tbl", "d_tbl");
+        // Ref-declared downstream of the physical reader.
+        write("e", "SELECT id FROM d", "e_tbl");
+
+        let config = CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let compiled = compile::compile(&config).unwrap();
+
+        let closure = compute_closure(&["a".to_string()], &compiled, true);
+        assert!(closure.contains("a"));
+        assert!(
+            closure.contains("d"),
+            "the physical reader of a's target must join the closure: {closure:?}"
+        );
+        assert!(
+            closure.contains("e"),
+            "the physical reader's ref() downstream rides along: {closure:?}"
+        );
+
+        // And the plan layers order the reader strictly after its producer.
+        let dep_by_model: HashMap<&str, &[String]> = compiled
+            .project
+            .dag_nodes
+            .iter()
+            .map(|n| (n.name.as_str(), n.depends_on.as_slice()))
+            .collect();
+        let layers =
+            order_closure(&closure, &dep_by_model, &physical_reader_edges(&compiled)).unwrap();
+        let layer_of = |name: &str| {
+            layers
+                .iter()
+                .position(|l| l.iter().any(|m| m == name))
+                .unwrap_or_else(|| panic!("{name} missing from layers {layers:?}"))
+        };
+        assert!(
+            layer_of("a") < layer_of("d"),
+            "physical reader must be layered after its producer: {layers:?}"
+        );
+        assert!(layer_of("d") < layer_of("e"));
+    }
+
     /// Ordering is dependency-first and drops out-of-closure upstreams.
     #[test]
     fn order_closure_is_dependency_first_within_the_set() {
@@ -540,7 +730,7 @@ mod tests {
             .collect();
         let closure: BTreeSet<String> = ["b", "c", "d"].iter().map(ToString::to_string).collect();
 
-        let layers = order_closure(&closure, &dep_by_model).unwrap();
+        let layers = order_closure(&closure, &dep_by_model, &[]).unwrap();
         let flat: Vec<String> = layers.iter().flatten().cloned().collect();
         assert_eq!(flat, vec!["b", "c", "d"]);
         // `a` is never scheduled — it is a healthy upstream, not part of the
@@ -559,7 +749,7 @@ mod tests {
             .collect();
         let closure: BTreeSet<String> = ["x", "y", "z"].iter().map(ToString::to_string).collect();
 
-        let layers = order_closure(&closure, &dep_by_model).unwrap();
+        let layers = order_closure(&closure, &dep_by_model, &[]).unwrap();
         assert_eq!(layers.len(), 2, "two topological layers");
         assert!(layers[0].contains(&"x".to_string()));
         assert!(layers[0].contains(&"y".to_string()));

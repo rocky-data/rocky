@@ -471,11 +471,15 @@ enum Command {
         /// contained/quarantined window a partial failure left behind.
         #[arg(long, conflicts_with = "model")]
         from_last_run: bool,
-        /// Partition-window lower bound applied to partitioned models.
-        #[arg(long)]
+        /// Partition-window lower bound applied to partitioned models. Both
+        /// bounds are required together (mirroring `rocky run --from/--to`):
+        /// a lone bound would be recorded into the reviewed plan as a range
+        /// but execute as "latest partition only", silently shrinking the
+        /// approved scope.
+        #[arg(long, requires = "to")]
         from: Option<String>,
         /// Partition-window upper bound applied to partitioned models.
-        #[arg(long)]
+        #[arg(long, requires = "from")]
         to: Option<String>,
         /// Rebuild only the named/seed models, not their downstream closure.
         #[arg(long)]
