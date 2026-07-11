@@ -214,25 +214,44 @@ pub(crate) fn run_backfill_in(
     // A backfill executes the same on-disk models it plans; bind their
     // compiled-IR fingerprint + routing identity so the apply-time TOCTOU gate
     // rejects a change.
-    let config_identity = rocky_core::config::load_rocky_config(config_path)
-        .ok()
+    let backfill_cfg = rocky_core::config::load_rocky_config(config_path).ok();
+    let config_identity = backfill_cfg
         .as_ref()
         .map(crate::commands::apply::config_policy_identity);
     let identity = config_identity.clone().unwrap_or_default();
-    // A backfill runs with no `--env`, so the governance identity resolves the
-    // env-default mask (+ roles + cache-selection).
-    let governance_identity = rocky_core::config::load_rocky_config(config_path)
-        .ok()
+    // A backfill runs with no `--env`, so the governance identity + mask resolve
+    // the env defaults (roles + cache-selection are env-invariant).
+    let governance_identity = backfill_cfg
         .as_ref()
-        .map(|cfg| crate::commands::apply::governance_policy_identity(cfg, None))
+        .map(crate::commands::apply::governance_policy_identity)
         .unwrap_or_default();
+    let resolved_mask = backfill_cfg
+        .as_ref()
+        .map(|cfg| cfg.resolve_mask_for_env(None))
+        .unwrap_or_default();
+    // Capture the REVIEWED source-schema snapshot (finding #2b) the same way
+    // `compile_project` seeded the compile above (cache, `ttl_override(None)`),
+    // so apply replays these exact schemas → `typed_columns` cannot drift.
+    let reviewed_source_schemas: std::collections::BTreeMap<
+        String,
+        Vec<rocky_compiler::types::TypedColumn>,
+    > = backfill_cfg
+        .as_ref()
+        .map(|cfg| {
+            let schema_cfg = cfg.cache.schemas.clone().with_ttl_override(None);
+            crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     // Fold the seeding-independent extras (surrogate-key sidecars #1, contract
-    // presence/contents #3) into the bound fingerprint so the apply-time TOCTOU
-    // gate rejects a post-plan swap of either, built from the SAME `models_dir`
-    // the apply choke-point re-reads.
+    // presence/contents #3, effective mask C) into the bound fingerprint so the
+    // apply-time TOCTOU gate rejects a post-plan swap of any, built from the SAME
+    // `models_dir` the apply choke-point re-reads.
     let extras = crate::commands::apply::ExecutionExtras::build(
         &rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap_or_default(),
         &compiled.project.models,
+        &resolved_mask,
     );
     let capabilities = EmbeddedCapabilities {
         diff_available: true,
@@ -248,6 +267,7 @@ pub(crate) fn run_backfill_in(
         ),
         config_identity,
         fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
+        reviewed_source_schemas,
     };
     let plan_id = write_plan_governed(
         root,

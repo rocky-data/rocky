@@ -288,6 +288,7 @@ fn governed_run_context<'a>(
         // MUST carry a fingerprint; version 0 is genuinely legacy (skip).
         require_fingerprint: embedded.fingerprint_version
             >= crate::plan_store::CURRENT_FINGERPRINT_VERSION,
+        reviewed_source_schemas: embedded.reviewed_source_schemas,
     })
 }
 
@@ -1043,6 +1044,13 @@ pub(crate) fn execution_ir_fingerprint(
 ///   attribute) and its contents constrain the model's output. Keyed by model
 ///   name; the value is a content hash. An absent key means "no contract", so
 ///   adding or removing a contract moves the fingerprint.
+/// - **Effective masking plan (finding C).** The masking reconcile applies a
+///   strategy to a column only when the column's classification tag (in
+///   `ModelConfig`, already hashed) resolves under the active env. Binding the
+///   WHOLE `[mask]` map over-binds: an *unused* mask entry would move the
+///   fingerprint. Here we bind only the resolution for tags actually declared on
+///   the executed models — so an unused mask entry does NOT refuse, a used one
+///   does. Computed at the choke-point because it depends on the executed set.
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub(crate) struct ExecutionExtras {
     /// Per-model surrogate-key specs, name-sorted for stability.
@@ -1052,18 +1060,25 @@ pub(crate) struct ExecutionExtras {
     /// path is machine/tempdir-specific and would cause cross-machine
     /// false-refuse).
     contracts: BTreeMap<String, String>,
+    /// The EFFECTIVE masking resolution (finding C): `tag → strategy` restricted
+    /// to classification tags actually declared on the executed models. Only the
+    /// resolution is bound here — the model `(col → tag)` classification is
+    /// already in the config projection.
+    effective_masks: BTreeMap<String, rocky_ir::MaskStrategy>,
 }
 
 impl ExecutionExtras {
-    /// Assemble the extras from the already-loaded surrogate-key map plus the
-    /// compiled models (for their `contract_path`s). Called identically at plan
-    /// time and at the apply choke-point over the same `models_dir`.
+    /// Assemble the extras from the already-loaded surrogate-key map, the
+    /// compiled models (for `contract_path`s + classification tags), and the
+    /// env-resolved mask map. Called identically at plan time and at the apply
+    /// choke-point over the same `models_dir` / resolved mask.
     pub(crate) fn build(
         surrogate_keys: &std::collections::HashMap<
             String,
             Vec<rocky_core::models::SurrogateKeySpec>,
         >,
         models: &[rocky_core::models::Model],
+        resolved_mask: &BTreeMap<String, rocky_ir::MaskStrategy>,
     ) -> Self {
         let surrogate_keys: BTreeMap<String, Vec<rocky_core::models::SurrogateKeySpec>> =
             surrogate_keys
@@ -1071,6 +1086,7 @@ impl ExecutionExtras {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
         let mut contracts = BTreeMap::new();
+        let mut effective_masks = BTreeMap::new();
         for m in models {
             if let Some(path) = &m.contract_path {
                 // Hash the CONTENTS. A read failure at apply that succeeded at
@@ -1084,10 +1100,17 @@ impl ExecutionExtras {
                 };
                 contracts.insert(m.config.name.clone(), hash);
             }
+            // Only the resolution for tags this model actually classifies with.
+            for tag in m.config.classification.values() {
+                if let Some(strategy) = resolved_mask.get(tag) {
+                    effective_masks.insert(tag.clone(), *strategy);
+                }
+            }
         }
         Self {
             surrogate_keys,
             contracts,
+            effective_masks,
         }
     }
 }
@@ -1143,44 +1166,49 @@ pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> S
         .unwrap_or_default()
 }
 
-/// The env-resolved **governance** identity — the mutation-driving workspace
-/// governance the reviewed plan authorized. Hashed into the execution
-/// fingerprint **only** (never the routing gate), so a post-plan change to what
-/// the governance reconcile would apply is refused, while it cannot cause a
-/// routing false-refuse.
+/// The **model-independent governance** identity — the env-invariant,
+/// mutation-driving workspace governance the reviewed plan authorized. Hashed
+/// into the execution fingerprint **only** (never the routing gate), so a
+/// post-plan change to what the governance reconcile would apply is refused,
+/// while it cannot cause a routing false-refuse.
 ///
-/// Binds exactly the fields that **drive a warehouse mutation**:
-/// - `resolve_mask_for_env(env)` — the tag→strategy map the masking reconcile
-///   applies, resolved for the plan's persisted `--env` (so `[mask.<env>]`
-///   overlays are captured for the env that will actually run, and an unrelated
-///   env's mask does not over-bind);
-/// - the **flattened** role graph (`role_graph()`) — the resolved GRANT set the
-///   role reconcile applies (finding #2: a `SELECT → MANAGE` permission edit
-///   changes this); `None` when the graph is malformed (deterministic on both
-///   sides);
+/// Binds exactly the fields that **drive a warehouse mutation** and are
+/// model-independent:
+/// - the role graph's **effective GRANT set** — each role's *sorted flattened
+///   permissions* only (finding #2 + D). `inherits_from` is deliberately
+///   dropped: the adapter derives GRANTs solely from `flattened_permissions`
+///   (inherits is logging-only), so reordering semantically-equivalent
+///   `inherits` must NOT refuse. `None`/empty when the graph is malformed
+///   (deterministic on both sides).
 /// - the `[cache.schemas]` **selection toggle** (`enabled`) — an agent-controlled
 ///   on-disk switch that changes whether apply resolves concrete `typed_columns`
 ///   vs `Unknown` (finding #4a). Only the boolean toggle is bound, NOT the whole
 ///   struct: `ttl` can be env-var-templated, which would re-introduce the #5
 ///   cross-process false-refuse; `enabled` is a closed boolean.
 ///
+/// The **mask** is NOT bound here — it is model-DEPENDENT (only the resolution
+/// for tags declared on the executed models drives a mutation), so it lives in
+/// [`ExecutionExtras::effective_masks`], computed at the choke-point (finding C).
 /// Advisory `[classifications]` is **excluded by design** (finding #5): it drives
 /// no warehouse action (W004-only) and its env-var-templated `allow_unmasked`
-/// values would differ across processes → a false-refuse. Mask *values* are a
-/// closed vocabulary (`hash`/`redact`/`partial`/`none`), so the resolved map
-/// carries no cross-process templating variance.
-pub(crate) fn governance_policy_identity(
-    cfg: &rocky_core::config::RockyConfig,
-    env: Option<&str>,
-) -> String {
-    let mask = cfg.resolve_mask_for_env(env);
-    // Deterministic on both sides: a malformed graph serializes to `null` at
-    // plan and apply alike (same cfg), so it does not false-refuse; a valid→
-    // malformed edit moves the identity → refuse.
-    let roles = cfg.role_graph().ok();
+/// values would differ across processes → a false-refuse.
+pub(crate) fn governance_policy_identity(cfg: &rocky_core::config::RockyConfig) -> String {
+    // Project each role to its SORTED flattened permissions only (D): the GRANT
+    // set the adapter actually applies. `flattened_permissions` is Ord-sorted by
+    // construction; `role_graph()` is name-keyed (BTreeMap) → deterministic. A
+    // malformed graph → empty map on both sides (no false-refuse); an effective-
+    // permission change (SELECT→MANAGE) moves the identity → refuse.
+    let role_perms: BTreeMap<String, Vec<rocky_ir::Permission>> = cfg
+        .role_graph()
+        .map(|roles| {
+            roles
+                .into_iter()
+                .map(|(name, r)| (name, r.flattened_permissions))
+                .collect()
+        })
+        .unwrap_or_default();
     serde_json::to_value(serde_json::json!({
-        "mask": mask,
-        "roles": roles,
+        "roles": role_perms,
         "cache_schemas_enabled": cfg.cache.schemas.enabled,
     }))
     .map(|v| v.to_string())
@@ -1200,9 +1228,20 @@ pub struct ExecFingerprintGate {
     pub expected: Option<String>,
     /// The routing config identity computed from the execute-time config.
     pub config_identity: String,
-    /// The env-resolved governance identity computed from the execute-time
-    /// config + the plan's persisted `--env` (mask / roles / cache-selection).
+    /// The model-independent governance identity computed from the execute-time
+    /// config (roles / cache-selection).
     pub governance_identity: String,
+    /// The env-resolved mask map (`resolve_mask_for_env(plan-env)`). The
+    /// choke-point restricts it to the executed models' classification tags when
+    /// building [`ExecutionExtras`] (finding C — an unused mask entry must not
+    /// refuse). Carried here because `execute_models` has no `env`/`cfg`.
+    pub resolved_mask: BTreeMap<String, rocky_ir::MaskStrategy>,
+    /// The plan-authorized REVIEWED source-schema snapshot (finding #2b). When
+    /// non-empty, the choke-point seeds its compile's `source_schemas` from this
+    /// so `typed_columns` (→ the MERGE column list) replay the reviewed schema,
+    /// not a drifted live/cache read. Carried here because `execute_models` has
+    /// no plan handle.
+    pub reviewed_source_schemas: BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
     /// The plan id, for the refusal message.
     pub plan_id: String,
     /// `true` when the plan is a NEW (`fingerprint_version >= 1`) governed plan
@@ -1292,6 +1331,13 @@ pub struct GovernedRunContext<'a> {
     /// that MUST carry a fingerprint/identity: a missing one is a production
     /// failure and REFUSES (finding #7), not a legacy skip.
     pub require_fingerprint: bool,
+    /// The plan-authorized REVIEWED source-schema snapshot (finding #2b). Apply
+    /// seeds its compile's `source_schemas` from this instead of a live/cache
+    /// read, so a post-plan source-schema drift cannot change `typed_columns` →
+    /// the executed MERGE column list stays what was reviewed. Empty ⇒ apply
+    /// uses its live cache load.
+    pub reviewed_source_schemas:
+        std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
 }
 
 impl GovernedRunContext<'_> {
@@ -1308,7 +1354,9 @@ impl GovernedRunContext<'_> {
         ExecFingerprintGate {
             expected: self.expected_ir_fingerprint.clone(),
             config_identity: config_policy_identity(cfg),
-            governance_identity: governance_policy_identity(cfg, env),
+            governance_identity: governance_policy_identity(cfg),
+            resolved_mask: cfg.resolve_mask_for_env(env),
+            reviewed_source_schemas: self.reviewed_source_schemas.clone(),
             plan_id: self.plan_id.to_string(),
             require: self.require_fingerprint,
         }
@@ -1929,8 +1977,22 @@ async fn run_apply_backfill_plan(
         _ => None,
     };
 
+    // Execute-from-owned (finding B): hand the SAME verified `backfill_cfg`
+    // instance `verify_routing_identity` checked to `execute_backfill_set`,
+    // rather than have it reload — a timed `rocky.toml` swap between the gate and
+    // a reload would otherwise pick a different, unverified destination. A config
+    // that will not load cannot be executed against; bail (mirrors the old
+    // internal load error).
+    let rocky_cfg = backfill_cfg.with_context(|| {
+        format!(
+            "failed to load config from {} (required for backfill)",
+            config_path.display()
+        )
+    })?;
+
     crate::commands::run::execute_backfill_set(
         config_path,
+        &rocky_cfg,
         state_path,
         models_dir,
         &set,
@@ -3023,6 +3085,7 @@ effect = "deny"
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
         };
         let touched = caps.touched(&["m".to_string()]);
         assert!(!touched.is_empty(), "FIX 3 must synthesize a touched set");
@@ -3059,6 +3122,7 @@ effect = "deny"
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
         };
         let touched = caps.touched(&["m".to_string()]);
         let gate = super::evaluate_apply_policy(
@@ -3088,6 +3152,7 @@ effect = "deny"
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
         };
         let touched = caps.touched(&["m".to_string()]);
         let gate = super::evaluate_apply_policy(
@@ -3274,6 +3339,7 @@ effect = "allow"
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
         };
         // Both models execute; only stg_x changed.
         let touched = caps.touched(&["stg_x".to_string(), "prod_critical".to_string()]);
@@ -3783,14 +3849,16 @@ auto_create_schemas = true
             std::fs::write(&p, body).unwrap();
             rocky_core::config::load_rocky_config(&p).unwrap()
         }
-        let gid = |c: &rocky_core::config::RockyConfig| super::governance_policy_identity(c, None);
+        let gid = |c: &rocky_core::config::RockyConfig| super::governance_policy_identity(c);
         let base = "[adapter]\ntype = \"duckdb\"\npath = \"a.duckdb\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n";
 
-        // #6 mask strategy change → identity moves (drives a masking mutation).
-        assert_ne!(
+        // The mask is NOT in the governance identity anymore (it is model-
+        // dependent → `ExecutionExtras::effective_masks`, finding C). A `[mask]`
+        // change must NOT move the model-independent governance identity.
+        assert_eq!(
             gid(&cfg(&format!("{base}\n[mask]\npii = \"hash\"\n"))),
             gid(&cfg(&format!("{base}\n[mask]\npii = \"redact\"\n"))),
-            "a [mask] strategy change must move the governance identity (#6)"
+            "the mask must not be in the model-independent governance identity (C)"
         );
 
         // #2 role permission change (SELECT → MANAGE) → identity moves.
@@ -3799,6 +3867,23 @@ auto_create_schemas = true
             gid(&cfg(&role("SELECT"))),
             gid(&cfg(&role("MANAGE"))),
             "a role permission change must move the governance identity (#2)"
+        );
+
+        // 🔴 D (over-binding roles): reordering `inherits` that yields the SAME
+        // flattened permissions must NOT move the identity (GRANTs depend only on
+        // the flattened set; inherits is logging-only).
+        let two_parents = format!(
+            "{base}\n[role.a]\npermissions = [\"SELECT\"]\n\n[role.b]\npermissions = [\"MODIFY\"]\n\n[role.c]\ninherits = [{}]\n",
+            "\"a\", \"b\""
+        );
+        let reordered = format!(
+            "{base}\n[role.a]\npermissions = [\"SELECT\"]\n\n[role.b]\npermissions = [\"MODIFY\"]\n\n[role.c]\ninherits = [{}]\n",
+            "\"b\", \"a\""
+        );
+        assert_eq!(
+            gid(&cfg(&two_parents)),
+            gid(&cfg(&reordered)),
+            "reordering equivalent inherits must NOT move the governance identity (D)"
         );
 
         // #4a [cache.schemas] toggle → identity moves (changes whether apply
@@ -3843,6 +3928,8 @@ auto_create_schemas = true
             expected: None,
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
+            resolved_mask: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
             plan_id: "p".to_string(),
             require: false,
         }
@@ -3853,6 +3940,8 @@ auto_create_schemas = true
             expected: None,
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
+            resolved_mask: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
             plan_id: "p".to_string(),
             require: true,
         }
@@ -3864,6 +3953,8 @@ auto_create_schemas = true
             expected: Some(expected.clone()),
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
+            resolved_mask: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
             plan_id: "p".to_string(),
             require: true,
         }
@@ -3874,6 +3965,8 @@ auto_create_schemas = true
                 expected: Some(expected.clone()),
                 config_identity: "DIFFERENT".to_string(),
                 governance_identity: "g".to_string(),
+                resolved_mask: std::collections::BTreeMap::new(),
+                reviewed_source_schemas: std::collections::BTreeMap::new(),
                 plan_id: "p".to_string(),
                 require: true,
             }
@@ -3887,6 +3980,8 @@ auto_create_schemas = true
                 expected: Some(expected),
                 config_identity: "c".to_string(),
                 governance_identity: "DIFFERENT".to_string(),
+                resolved_mask: std::collections::BTreeMap::new(),
+                reviewed_source_schemas: std::collections::BTreeMap::new(),
                 plan_id: "p".to_string(),
                 require: true,
             }
@@ -3923,6 +4018,7 @@ auto_create_schemas = true
             expected_ir_fingerprint: None,
             expected_config_identity: expected,
             require_fingerprint: require,
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
         };
         let authorized = super::config_policy_identity(&cfg_a);
         // Unchanged routing → proceeds.
@@ -3970,6 +4066,7 @@ effect = "deny"
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         let err = ctx
@@ -4015,6 +4112,7 @@ effect = "allow"
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
 
@@ -4062,6 +4160,7 @@ effect = "allow"
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         ctx.gate_replication_targets(&targets, &ledger)

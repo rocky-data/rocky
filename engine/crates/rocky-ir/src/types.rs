@@ -60,7 +60,7 @@ pub struct StructField {
 }
 
 /// A column with its inferred type and nullability.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypedColumn {
     pub name: std::string::String,
     pub data_type: RockyType,

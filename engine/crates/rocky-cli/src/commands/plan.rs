@@ -991,12 +991,18 @@ pub fn compute_embedded_capabilities(
     let config_identity = loaded_cfg
         .as_ref()
         .map(crate::commands::apply::config_policy_identity);
-    // The env-resolved governance identity (mask / roles / cache-selection),
-    // bound into the fingerprint so a post-plan governance change refuses. `env`
-    // is the plan's `--env`, so apply refuses if applied against a different env.
+    // The model-independent governance identity (roles / cache-selection), bound
+    // into the fingerprint so a post-plan governance change refuses.
     let governance_identity = loaded_cfg
         .as_ref()
-        .map(|cfg| crate::commands::apply::governance_policy_identity(cfg, env))
+        .map(crate::commands::apply::governance_policy_identity)
+        .unwrap_or_default();
+    // The env-resolved mask (finding C): the extras restrict it to the executed
+    // models' classification tags. `env` is the plan's `--env`, so apply resolves
+    // the same masks the reviewed env will apply.
+    let resolved_mask = loaded_cfg
+        .as_ref()
+        .map(|cfg| cfg.resolve_mask_for_env(env))
         .unwrap_or_default();
 
     // A plan whose fingerprint could not be produced (broken/absent models dir):
@@ -1007,6 +1013,8 @@ pub fn compute_embedded_capabilities(
         models_fingerprint: None,
         config_identity,
         fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+        // No fingerprint ⇒ apply refuses regardless; the snapshot is moot.
+        reviewed_source_schemas: std::collections::BTreeMap::new(),
     };
 
     if !models_dir.is_dir() {
@@ -1037,6 +1045,17 @@ pub fn compute_embedded_capabilities(
             Err(_) => return failed(config_identity),
         }
     };
+    // Capture the REVIEWED source-schema snapshot (finding #2b) — the exact
+    // schemas the head compile typed against. Apply seeds its compile from this
+    // (via the plan payload) so `typed_columns` replay the reviewed schema, not a
+    // drifted live read. Name-sorted (BTreeMap) for a stable `plan_id` digest.
+    let reviewed_source_schemas: std::collections::BTreeMap<
+        String,
+        Vec<rocky_compiler::types::TypedColumn>,
+    > = source_schemas
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     // Bind the compiled-IR fingerprint the gate authorizes so apply can refuse a
     // models/config change between planning and execution (TOCTOU), checked at
     // the single execution choke-point. Computed from the head compile that a
@@ -1047,6 +1066,7 @@ pub fn compute_embedded_capabilities(
     let extras = crate::commands::apply::ExecutionExtras::build(
         &rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap_or_default(),
         &head.project.models,
+        &resolved_mask,
     );
     let models_fingerprint = crate::commands::apply::execution_ir_fingerprint(
         &head.project.models,
@@ -1067,6 +1087,7 @@ pub fn compute_embedded_capabilities(
                 models_fingerprint,
                 config_identity,
                 fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+                reviewed_source_schemas,
             };
         }
     };
@@ -1098,6 +1119,7 @@ pub fn compute_embedded_capabilities(
         models_fingerprint,
         config_identity,
         fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+        reviewed_source_schemas,
     }
 }
 

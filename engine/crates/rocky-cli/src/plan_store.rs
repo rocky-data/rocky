@@ -240,6 +240,17 @@ pub struct EmbeddedCapabilities {
     /// FAILURE and the governed apply REFUSES (finding #7 — legacy vs failure).
     #[serde(default)]
     pub fingerprint_version: u32,
+    /// The REVIEWED source-schema snapshot (finding #2b) — the per-source typed
+    /// columns the plan-time compile resolved. Apply seeds its compile's
+    /// `source_schemas` from THIS snapshot instead of a live/cache read, so a
+    /// post-plan source-schema drift (or a `[cache.schemas]` toggle / ttl change)
+    /// cannot change the executed `typed_columns` → the MERGE column list the
+    /// warehouse receives is exactly what was reviewed. Empty ⇒ apply falls back
+    /// to its live cache load (legacy plans, replication-only, or a creds-free
+    /// plan with no cached schemas). Bound into the `plan_id` (tamper-evident);
+    /// keyed by source table, name-sorted for a stable digest.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reviewed_source_schemas: BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
 }
 
 /// The fingerprint feature version this binary stamps onto every plan it writes.
@@ -650,6 +661,65 @@ mod tests {
         assert_eq!(plan.kind, PlanKind::Compact);
         assert_eq!(plan.payload["model"], json!("mydb.myschema.orders"));
         assert_eq!(plan.payload["statement_count"], json!(2));
+        Ok(())
+    }
+
+    /// 🔴 #2b round-trip: a governed plan whose embedded `reviewed_source_schemas`
+    /// is NON-EMPTY must survive `read_plan`'s integrity re-hash. The load path
+    /// recomputes the `plan_id` from the parsed payload and REFUSES a mismatch
+    /// (plan_store integrity check), so a non-canonical snapshot round-trip would
+    /// be a refuse-everything for every governed apply that captured schemas. The
+    /// snapshot is serde-canonical (name-sorted `BTreeMap`, `TypedColumn` has no
+    /// floats), so a successful read proves stability. The creds-free playground
+    /// POC captures an EMPTY snapshot (skip-serialized), so this synthesises a
+    /// non-empty one directly.
+    #[test]
+    fn governed_plan_with_source_schema_snapshot_round_trips() -> anyhow::Result<()> {
+        use rocky_ir::RockyType;
+        use rocky_ir::types::TypedColumn;
+
+        let dir = tempfile::tempdir()?;
+        let payload = DummyPayload {
+            model: "cat.sc.m",
+            statement_count: 1,
+        };
+        let caps = EmbeddedCapabilities {
+            diff_available: true,
+            changed: BTreeMap::new(),
+            models_fingerprint: Some("fp".to_string()),
+            config_identity: Some("cfg".to_string()),
+            fingerprint_version: CURRENT_FINGERPRINT_VERSION,
+            reviewed_source_schemas: BTreeMap::from([(
+                "main.src".to_string(),
+                vec![
+                    TypedColumn {
+                        name: "id".to_string(),
+                        data_type: RockyType::Int64,
+                        nullable: false,
+                    },
+                    TypedColumn {
+                        name: "amt".to_string(),
+                        data_type: RockyType::Decimal {
+                            precision: 10,
+                            scale: 2,
+                        },
+                        nullable: true,
+                    },
+                ],
+            )]),
+        };
+        let plan_id = write_plan_governed(
+            dir.path(),
+            PlanKind::Run,
+            &payload,
+            PolicyPrincipal::Agent,
+            caps.clone(),
+        )?;
+        // A successful read proves the non-empty snapshot re-hashes to the same
+        // `plan_id` (no refuse) and survives the round-trip intact.
+        let plan = read_plan(dir.path(), &plan_id)?;
+        assert_eq!(plan.plan_id, plan_id);
+        assert_eq!(plan.embedded_capabilities(), caps);
         Ok(())
     }
 
@@ -1147,6 +1217,7 @@ mod tests {
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
         };
         let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
         assert_eq!(
@@ -1168,6 +1239,7 @@ mod tests {
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
         };
         assert!(caps.touched(&[]).is_empty());
     }
@@ -1191,6 +1263,7 @@ mod tests {
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
         };
         let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
         assert_eq!(
@@ -1219,6 +1292,7 @@ mod tests {
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
         };
         // Only `orders` executes; the change to the non-executing `customers`
         // is absent from the touched set.

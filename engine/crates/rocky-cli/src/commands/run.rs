@@ -4862,8 +4862,16 @@ fn backfill_reuse_gates(cfg: &rocky_core::config::RockyConfig) -> (bool, bool) {
 ///
 /// It never rewrites SQL — a backfill re-runs existing recipes over a scoped
 /// window; the "what to fix" question is out of scope by construction.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_backfill_set(
     config_path: &Path,
+    // The VERIFIED, already-loaded config (execute-from-owned, finding B). The
+    // caller (`apply`) loaded this instance and ran `verify_routing_identity`
+    // against it BEFORE building the gate, so the adapter/destination selected
+    // below is the one authorization was checked against — no internal reload
+    // that a timed `rocky.toml` swap could point at a different, unverified
+    // destination while the gate held the old identity.
+    rocky_cfg: &rocky_core::config::RockyConfig,
     state_path: &Path,
     models_dir: &Path,
     model_set: &std::collections::BTreeSet<String>,
@@ -4881,16 +4889,13 @@ pub(crate) async fn execute_backfill_set(
     let run_id = format!("run-{}", started_at.format("%Y%m%d-%H%M%S-%3f"));
     let config_hash = crate::output::config_fingerprint(config_path);
 
-    let rocky_cfg = rocky_core::config::load_rocky_config(config_path)
-        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
-
     anyhow::ensure!(
         models_dir.exists(),
         "models directory '{}' not found (required for backfill)",
         models_dir.display()
     );
 
-    let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
+    let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
     // Mirror the `--model` path: the first transformation pipeline's target
     // adapter, falling back to the first replication pipeline's.
     let target_adapter_name = rocky_cfg
@@ -4942,7 +4947,7 @@ pub(crate) async fn execute_backfill_set(
     let run_vars = rocky_core::run_vars::RunVars::new();
     // A backfill is an explicit rebuild order: point-to reuse may still
     // satisfy it byte-identically, but the column-level skip never may.
-    let (reuse_enabled, column_level_enabled) = backfill_reuse_gates(&rocky_cfg);
+    let (reuse_enabled, column_level_enabled) = backfill_reuse_gates(rocky_cfg);
 
     let exec_result = execute_models(
         models_dir,
@@ -4965,7 +4970,7 @@ pub(crate) async fn execute_backfill_set(
         column_level_enabled,
         &run_vars,
         rocky_cfg.resilience.clone(),
-        super::resilience::retry_policy_allows(&rocky_cfg),
+        super::resilience::retry_policy_allows(rocky_cfg),
         exec_fp_gate,
     )
     .await;
@@ -4979,7 +4984,7 @@ pub(crate) async fn execute_backfill_set(
                 apply_model_governance_tags(
                     models_dir,
                     governance_adapter.as_ref(),
-                    &rocky_cfg,
+                    rocky_cfg,
                     &run_vars,
                     Some(model.as_str()),
                 )
@@ -5127,12 +5132,27 @@ pub(crate) async fn execute_models(
         breaker: retry_breaker.as_ref(),
     };
 
-    // Load the persisted schema cache directly from the live
-    // `StateStore` — no round-trip through
-    // `crate::source_schemas::load_cached_source_schemas`, because that
-    // helper opens a read-only handle and we already hold a write-capable
-    // one here. Degrades silently when the cache is cold or disabled.
-    let source_schemas = if schema_cache_config.enabled {
+    // Source schemas for the typecheck that resolves `typed_columns` (→ the
+    // MERGE column list). A governed apply whose plan carries a REVIEWED
+    // source-schema snapshot (finding #2b) SEEDS from that snapshot, so a
+    // post-plan source-schema drift, cache refresh, or `[cache.schemas]` toggle
+    // cannot change the executed columns — apply types against exactly what was
+    // reviewed. `execute-from-owned`, like surrogate keys (#1). Every other path
+    // (bare `rocky run`, human apply, a plan with no captured snapshot) falls
+    // through to the live cache load below — byte-identical to before.
+    let reviewed_snapshot = exec_fp_gate
+        .map(|g| &g.reviewed_source_schemas)
+        .filter(|s| !s.is_empty());
+    let source_schemas = if let Some(snapshot) = reviewed_snapshot {
+        snapshot
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<std::collections::HashMap<_, _>>()
+    } else if schema_cache_config.enabled {
+        // Load the persisted schema cache directly from the live `StateStore` —
+        // no round-trip through `crate::source_schemas::load_cached_source_schemas`,
+        // because that helper opens a read-only handle and we already hold a
+        // write-capable one here. Degrades silently when the cache is cold.
         match state_store {
             Some(store) => rocky_compiler::schema_cache::load_source_schemas_from_cache(
                 store,
@@ -5198,12 +5218,15 @@ pub(crate) async fn execute_models(
     // content. `None` (bare run / human apply / legacy plan) is a no-op.
     if let Some(gate) = exec_fp_gate {
         // Fold the seeding-independent on-disk extras the compiled IR omits —
-        // the OWNED surrogate map (#1) and contract presence/contents (#3) — into
-        // the recomputed fingerprint so a post-plan swap of either refuses here.
-        // `models_dir` is the SAME directory the plan fingerprinted.
+        // the OWNED surrogate map (#1), contract presence/contents (#3), and the
+        // EFFECTIVE mask for the executed set (finding C) — into the recomputed
+        // fingerprint so a post-plan swap of any refuses here. `models_dir` is the
+        // SAME directory the plan fingerprinted; `resolved_mask` is the plan-env
+        // mask the gate carries.
         let extras = crate::commands::apply::ExecutionExtras::build(
             &surrogate_keys,
             &compile_result.project.models,
+            &gate.resolved_mask,
         );
         gate.verify(&compile_result.project.models, &extras)?;
     }
@@ -11704,8 +11727,9 @@ merge_keys = ["id"]
         // (1) process-stability across two independent compiles — computed the
         // exact way `execute_models` recomputes at the choke-point (compile +
         // surrogate/contract extras), so the two must agree.
-        let fp1 = exec_choke_fingerprint(&models, "cfg", "");
-        let fp2 = exec_choke_fingerprint(&models, "cfg", "");
+        let no_mask = std::collections::BTreeMap::new();
+        let fp1 = exec_choke_fingerprint(&models, "cfg", "", &no_mask);
+        let fp2 = exec_choke_fingerprint(&models, "cfg", "", &no_mask);
         assert_eq!(
             fp1, fp2,
             "same bytes must fingerprint identically (stability)"
@@ -11719,6 +11743,8 @@ merge_keys = ["id"]
             expected: Some(fp1.clone()),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
+            resolved_mask: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
             plan_id: "p".to_string(),
             require: true,
         };
@@ -11834,6 +11860,7 @@ merge_keys = ["id"]
         models_dir: &std::path::Path,
         config_identity: &str,
         governance_identity: &str,
+        resolved_mask: &std::collections::BTreeMap<String, rocky_ir::MaskStrategy>,
     ) -> String {
         use rocky_compiler::compile::{self, CompilerConfig};
         let cc = CompilerConfig {
@@ -11842,7 +11869,11 @@ merge_keys = ["id"]
         };
         let result = compile::compile(&cc).unwrap();
         let sk = rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap();
-        let extras = crate::commands::apply::ExecutionExtras::build(&sk, &result.project.models);
+        let extras = crate::commands::apply::ExecutionExtras::build(
+            &sk,
+            &result.project.models,
+            resolved_mask,
+        );
         crate::commands::apply::execution_ir_fingerprint(
             &result.project.models,
             config_identity,
@@ -11860,12 +11891,15 @@ merge_keys = ["id"]
         db: &std::path::Path,
         run_id: &str,
         expected_fp: &str,
+        resolved_mask: &std::collections::BTreeMap<String, rocky_ir::MaskStrategy>,
     ) -> Result<()> {
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
         let gate = crate::commands::apply::ExecFingerprintGate {
             expected: Some(expected_fp.to_string()),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
+            resolved_mask: resolved_mask.clone(),
+            reviewed_source_schemas: std::collections::BTreeMap::new(),
             plan_id: "p".to_string(),
             require: true,
         };
@@ -11918,17 +11952,29 @@ merge_keys = ["id"]
 
         let db = dir.path().join("wh.duckdb");
         // Plan-time fingerprint binds the surrogate spec (columns = [id]).
-        let fp = exec_choke_fingerprint(&models, "cfg", "");
+        let fp = exec_choke_fingerprint(&models, "cfg", "", &std::collections::BTreeMap::new());
         // (2) unchanged apply → no refuse.
-        governed_apply(&models, &db, "sk-ok", &fp)
-            .await
-            .expect("KILL-CHECK: unchanged surrogate apply must NOT refuse");
+        governed_apply(
+            &models,
+            &db,
+            "sk-ok",
+            &fp,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .expect("KILL-CHECK: unchanged surrogate apply must NOT refuse");
 
         // (3) change ONLY the surrogate columns — ModelConfig + SQL unchanged.
         std::fs::write(models.join("orders.toml"), sidecar("\"id\", \"id\"")).unwrap();
-        let err = governed_apply(&models, &db, "sk-changed", &fp)
-            .await
-            .expect_err("KILL-CHECK: a surrogate-key change must be REFUSED (#1)");
+        let err = governed_apply(
+            &models,
+            &db,
+            "sk-changed",
+            &fp,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .expect_err("KILL-CHECK: a surrogate-key change must be REFUSED (#1)");
         assert!(
             err.to_string().contains("fingerprint mismatch"),
             "must refuse with a fingerprint mismatch, got: {err}"
@@ -11954,10 +12000,16 @@ merge_keys = ["id"]
         .unwrap();
 
         let db = dir.path().join("wh.duckdb");
-        let fp = exec_choke_fingerprint(&models, "cfg", "");
-        governed_apply(&models, &db, "contract-ok", &fp)
-            .await
-            .expect("KILL-CHECK: unchanged contract apply must NOT refuse");
+        let fp = exec_choke_fingerprint(&models, "cfg", "", &std::collections::BTreeMap::new());
+        governed_apply(
+            &models,
+            &db,
+            "contract-ok",
+            &fp,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .expect("KILL-CHECK: unchanged contract apply must NOT refuse");
 
         // SAME-PRESENCE CONTENT EDIT — the contract file still exists (presence
         // unchanged) but its CONTENTS change. This is the case a presence-only
@@ -11967,9 +12019,15 @@ merge_keys = ["id"]
             "[[columns]]\nname = \"id\"\ntype = \"Int64\"\n",
         )
         .unwrap();
-        let err = governed_apply(&models, &db, "contract-edited", &fp)
-            .await
-            .expect_err("KILL-CHECK: a same-presence contract CONTENT edit must be REFUSED (#3)");
+        let err = governed_apply(
+            &models,
+            &db,
+            "contract-edited",
+            &fp,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .expect_err("KILL-CHECK: a same-presence contract CONTENT edit must be REFUSED (#3)");
         assert!(
             err.to_string().contains("fingerprint mismatch"),
             "must refuse with a fingerprint mismatch, got: {err}"
@@ -11977,9 +12035,63 @@ merge_keys = ["id"]
 
         // Remove the contract — presence flips, ModelConfig + SQL unchanged.
         std::fs::remove_file(models.join("orders.contract.toml")).unwrap();
-        let err = governed_apply(&models, &db, "contract-removed", &fp)
+        let err = governed_apply(
+            &models,
+            &db,
+            "contract-removed",
+            &fp,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .expect_err("KILL-CHECK: a removed contract must be REFUSED (#3)");
+        assert!(
+            err.to_string().contains("fingerprint mismatch"),
+            "must refuse with a fingerprint mismatch, got: {err}"
+        );
+    }
+
+    /// 🔴 C KILL-CHECK (real DuckDB, effective mask): an UNUSED `[mask]` entry (a
+    /// tag no executed model classifies with) must NOT refuse; a change to a mask
+    /// that DOES resolve onto an executed model's classified column must refuse.
+    /// Fails on producer revert (binding the whole mask map): the unused-entry
+    /// case would then move the fingerprint and refuse.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn effective_mask_kill_check() {
+        use rocky_ir::MaskStrategy;
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        // The model classifies `id` as `pii`, so a `pii` mask resolves onto it.
+        std::fs::write(
+            models.join("orders.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"orders\"\n\n[classification]\nid = \"pii\"\n",
+        )
+        .unwrap();
+        let db = dir.path().join("wh.duckdb");
+
+        let hash_mask = std::collections::BTreeMap::from([("pii".to_string(), MaskStrategy::Hash)]);
+        // Baseline fp binds the EFFECTIVE mask {pii→hash}.
+        let fp = exec_choke_fingerprint(&models, "cfg", "", &hash_mask);
+        governed_apply(&models, &db, "mask-ok", &fp, &hash_mask)
             .await
-            .expect_err("KILL-CHECK: a removed contract must be REFUSED (#3)");
+            .expect("unchanged effective mask must NOT refuse");
+
+        // An UNUSED entry (`other`, which no model classifies with) → effective
+        // mask unchanged → must NOT refuse.
+        let mut with_unused = hash_mask.clone();
+        with_unused.insert("other".to_string(), MaskStrategy::Redact);
+        governed_apply(&models, &db, "mask-unused", &fp, &with_unused)
+            .await
+            .expect("KILL-CHECK: an UNUSED mask entry must NOT refuse (C)");
+
+        // A USED mask change (`pii` hash→redact) → effective mask changes → REFUSE.
+        let redact_mask =
+            std::collections::BTreeMap::from([("pii".to_string(), MaskStrategy::Redact)]);
+        let err = governed_apply(&models, &db, "mask-changed", &fp, &redact_mask)
+            .await
+            .expect_err("KILL-CHECK: a USED mask change must be REFUSED (C)");
         assert!(
             err.to_string().contains("fingerprint mismatch"),
             "must refuse with a fingerprint mismatch, got: {err}"
@@ -12034,8 +12146,9 @@ merge_keys = ["id"]
         // loaded config's, resolved for the same (None) env.
         let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
         let identity = crate::commands::apply::config_policy_identity(&cfg);
-        let gov = crate::commands::apply::governance_policy_identity(&cfg, None);
-        let apply_fp = exec_choke_fingerprint(&models, &identity, &gov);
+        let gov = crate::commands::apply::governance_policy_identity(&cfg);
+        let resolved_mask = cfg.resolve_mask_for_env(None);
+        let apply_fp = exec_choke_fingerprint(&models, &identity, &gov, &resolved_mask);
 
         assert_eq!(
             caps.models_fingerprint.as_deref(),
