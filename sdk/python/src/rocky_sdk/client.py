@@ -362,6 +362,14 @@ class RockyClient:
         # ``rocky --version`` outputs "rocky X.Y.Z" or just "X.Y.Z".
         version_str = result.stdout.strip().removeprefix("rocky ").strip()
         if not version_str:
+            # Fail open (don't block the real command) but make it visible —
+            # a silently-skipped gate is how an incompatible binary slips
+            # through and surfaces later as a confusing parse error.
+            self._logger.warning(
+                "rocky --version produced no parseable version; skipping the "
+                "minimum-version (%s) check",
+                MIN_ROCKY_VERSION,
+            )
             self._version_checked = True
             return
 
@@ -374,6 +382,11 @@ class RockyClient:
             detected = tuple(int(p) for p in core_version.split(".")[:3])
             required = tuple(int(p) for p in MIN_ROCKY_VERSION.split(".")[:3])
         except ValueError:
+            self._logger.warning(
+                "could not parse rocky version %r; skipping the minimum-version (%s) check",
+                version_str,
+                MIN_ROCKY_VERSION,
+            )
             self._version_checked = True
             return
 
@@ -1218,11 +1231,20 @@ class RockyClient:
         return _parse_rocky_json(self.run_cli(args), ConformanceResult, command="conformance")
 
     def doctor(self, *, check: str | None = None) -> DoctorResult:
-        """Run ``rocky doctor`` and return the parsed health-check results."""
+        """Run ``rocky doctor`` and return the parsed health-check results.
+
+        ``rocky doctor`` exits 3 when any check is critical, but still prints
+        the full JSON report. ``allow_partial=True`` returns that JSON instead
+        of raising, so a critical check surfaces as a parsed ``DoctorResult``
+        (with the critical check inside it) rather than a ``RockyPartialFailure``
+        — callers triage severity from the result, not from the exit code.
+        """
         args = ["doctor"]
         if check is not None:
             args.extend(["--check", check])
-        return _parse_rocky_json(self.run_cli(args), DoctorResult, command="doctor")
+        return _parse_rocky_json(
+            self.run_cli(args, allow_partial=True), DoctorResult, command="doctor"
+        )
 
     def compliance(self, *, env: str | None = None) -> ComplianceOutput:
         """Run ``rocky compliance`` and return the governance rollup."""

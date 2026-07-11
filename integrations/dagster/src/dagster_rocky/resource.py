@@ -676,16 +676,21 @@ class RockyResource(dg.ConfigurableResource):
         warn_failures: list[str] = []
         for check in report.checks:
             status = check.status.value if hasattr(check.status, "value") else str(check.status)
-            if status.lower() != "critical":
-                if status.lower() == "warning":
-                    log.warning(f"rocky doctor [{check.name}]: {check.message}")
+            status_l = status.lower()
+            if status_l == "healthy":
+                continue
+            if status_l == "warning":
+                log.warning(f"rocky doctor [{check.name}]: {check.message}")
                 continue
 
+            # `critical` and any status we don't recognise (a future severity
+            # above `warning`) are treated as gate-worthy — a strict-doctor gate
+            # must fail closed on an unknown-but-severe status, not skip it.
             if self._is_strict_check(check.name):
                 strict_failures.append(f"{check.name}: {check.message}")
             else:
                 warn_failures.append(f"{check.name}: {check.message}")
-                log.warning(f"rocky doctor [{check.name}] critical (non-strict): {check.message}")
+                log.warning(f"rocky doctor [{check.name}] {status_l} (non-strict): {check.message}")
 
         if strict_failures:
             raise dg.Failure(
