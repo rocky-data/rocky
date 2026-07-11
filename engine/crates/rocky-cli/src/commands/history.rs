@@ -89,13 +89,29 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
     }
 }
 
+/// The longest prefix of `s` that is at most `max_bytes` long and ends on a
+/// char boundary. Raw byte slicing (`&s[..n]`) panics mid-codepoint, and none
+/// of the strings sliced for display here are guaranteed ASCII: `--recipe` is
+/// an arbitrary CLI argument and model names/hashes can arrive via state sync
+/// from another writer.
+fn prefix_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Truncate a text-table cell to `max` bytes, appending `…` when cut, so
 /// long model names don't break the fixed-column recipe-history layout.
 fn truncate_cell(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max.saturating_sub(1)])
+        format!("{}…", prefix_on_char_boundary(s, max.saturating_sub(1)))
     }
 }
 
@@ -285,7 +301,7 @@ pub fn run_history(
         if output_json {
             print_json(&output)?;
         } else {
-            let short = &recipe_hash[..recipe_hash.len().min(16)];
+            let short = prefix_on_char_boundary(recipe_hash, 16);
             println!("Executions of recipe {short}…:");
             println!(
                 "{:<14} {:<24} {:<24} {:<10} {:<12} {:<10}",
@@ -333,7 +349,7 @@ pub fn run_history(
                         .map(|r| r.to_string())
                         .unwrap_or_else(|| "-".to_string()),
                     exec.status,
-                    &exec.sql_hash[..exec.sql_hash.len().min(8)],
+                    prefix_on_char_boundary(&exec.sql_hash, 8),
                 );
             }
             println!("\nTotal executions: {}", output.executions.len());
@@ -546,6 +562,18 @@ fn compute_rolling_stats(
 mod tests {
     use super::*;
     use rocky_core::state::{ModelExecution, RunStatus, RunTrigger};
+
+    #[test]
+    fn prefix_on_char_boundary_never_splits_a_codepoint() {
+        // 16 bytes would land mid-'€' (3 bytes each): floor to the boundary.
+        let s = "€€€€€€"; // 18 bytes, 6 chars
+        assert_eq!(prefix_on_char_boundary(s, 16), "€€€€€");
+        assert_eq!(prefix_on_char_boundary(s, 18), s);
+        assert_eq!(prefix_on_char_boundary(s, 2), "");
+        assert_eq!(prefix_on_char_boundary("abcdef", 4), "abcd");
+        // The pre-fix shape: `&arg[..16]` panicked on exactly this input.
+        assert_eq!(truncate_cell("é-model-name-that-is-long", 10), "é-model-…");
+    }
 
     fn sample_record() -> RunRecord {
         RunRecord {

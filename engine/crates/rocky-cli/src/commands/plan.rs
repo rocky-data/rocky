@@ -214,6 +214,22 @@ pub async fn plan(
                 &conn.schema,
                 &table.name,
             );
+            // `enabled = false` → `rocky run` excludes the table (reason
+            // `table_override_disabled`), so the preview must not render copy
+            // SQL for it — a reviewer would approve a statement run never
+            // executes. Surface the exclusion instead.
+            if effective_override.enabled == Some(false) {
+                output.statements.push(PlannedStatement {
+                    purpose: "excluded".into(),
+                    target: target_label,
+                    sql: format!(
+                        "-- {}: excluded by [[table_overrides]] enabled = false \
+                         (rocky run skips this table)",
+                        table.name
+                    ),
+                });
+                continue;
+            }
             let strategy = match super::run::build_replication_strategy_with_override(
                 pipeline,
                 &effective_override,
@@ -2102,6 +2118,59 @@ schema_template = "s__{source}"
         assert!(
             matches!(s2, MaterializationStrategy::FullRefresh),
             "non-matching table must stay FullRefresh, got {s2:?}"
+        );
+    }
+
+    #[test]
+    fn table_override_disabled_resolves_for_exclusion() {
+        // Pins the resolution feeding the plan-loop exclusion arm: a
+        // `[[table_overrides]] enabled = false` table must resolve with
+        // `enabled == Some(false)` so the preview emits an "excluded"
+        // statement instead of copy SQL `rocky run` will never execute
+        // (run skips it with reason `table_override_disabled`).
+        let toml = r#"
+[adapter.duck]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.p]
+type = "replication"
+
+[[pipeline.p.table_overrides]]
+match.table = "legacy_dump"
+enabled = false
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+catalog_template = "c"
+schema_template = "s__{source}"
+"#;
+        let cfg: rocky_core::config::RockyConfig = toml::from_str(toml).expect("parse config");
+        let (_name, pipeline) =
+            crate::registry::resolve_replication_pipeline(&cfg, None).expect("resolve pipeline");
+
+        let disabled = resolve_table_override(
+            &pipeline.table_overrides,
+            "conn",
+            "raw__orders",
+            "legacy_dump",
+        );
+        assert_eq!(
+            disabled.enabled,
+            Some(false),
+            "disabled table must resolve enabled = Some(false) → excluded from the preview"
+        );
+
+        let kept =
+            resolve_table_override(&pipeline.table_overrides, "conn", "raw__orders", "orders");
+        assert_ne!(
+            kept.enabled,
+            Some(false),
+            "non-matching table must stay in the preview"
         );
     }
 

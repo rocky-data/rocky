@@ -165,14 +165,26 @@ pub fn compute_audit_for(
         (Vec::new(), Vec::new())
     };
 
-    // Resolve the subject kind (plan file > run id > model name).
+    // Resolve the subject kind (plan file > run id > ledger plan id > model
+    // name). The ledger fallback matters twice: a plan whose .rocky/plans
+    // file was housekept away (or queried from a clone sharing only the state
+    // store) still has decision rows keyed by its plan_id, and decision-only
+    // custody ids (`freeze:…`, `draft:…`, `autoapply:…` — the rows the review
+    // queue's footnote sends here) are plan-keyed but never 64-hex and never
+    // on disk. Without it, both fall through to the Model join
+    // (`d.model == selector`), match nothing, and the drill-down reports
+    // "nothing in the ledger references this subject" while the ledger holds
+    // exactly those rows.
     let is_hex64 = selector.len() == 64 && selector.chars().all(|c| c.is_ascii_hexdigit());
     let plan_on_disk = is_hex64 && plan_file_path(root, selector).exists();
     let run_match = runs.iter().any(|r| r.run_id == selector);
+    let plan_in_ledger = decisions.iter().any(|d| d.plan_id == selector);
     let kind = if plan_on_disk {
         AuditSubjectKind::Plan
     } else if run_match {
         AuditSubjectKind::Run
+    } else if plan_in_ledger {
+        AuditSubjectKind::Plan
     } else {
         AuditSubjectKind::Model
     };
@@ -1260,6 +1272,41 @@ mod tests {
         assert!(ld.is_empty() && lt.is_empty());
         // An unknown model is absent from the graph.
         assert!(blast_radius_of(&result, "nope").is_none());
+    }
+
+    /// FIX: a selector that matches ledger plan_ids must resolve as a Plan
+    /// subject even when the plan file is gone (housekeeping, shared state
+    /// store) or the id is a decision-only custody key (`freeze:…`,
+    /// `draft:…`, `autoapply:…` — never 64-hex, never on disk). Pre-fix these
+    /// fell through to the Model join, matched nothing, and the drill-down
+    /// claimed nothing in the ledger referenced the subject.
+    #[test]
+    fn audit_for_resolves_ledger_plan_ids_without_a_plan_file() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let models_dir = root.join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        let state_path = root.join("state.redb");
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            store
+                .record_policy_decision(&decision(1, "freeze:global", "*", PolicyEffect::Deny))
+                .unwrap();
+        }
+
+        let out = compute_audit_for(
+            root,
+            &root.join("rocky.toml"),
+            &state_path,
+            &models_dir,
+            "freeze:global",
+        )
+        .unwrap();
+
+        assert_eq!(out.subject_kind, AuditSubjectKind::Plan);
+        assert!(out.resolved, "a ledger-only plan id must resolve: {out:?}");
+        assert_eq!(out.decisions.total, 1);
+        assert_eq!(out.decisions.entries[0].plan_id, "freeze:global");
     }
 
     #[test]

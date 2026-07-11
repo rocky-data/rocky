@@ -187,7 +187,16 @@ pub fn compute_brief(
     windowed_decisions.sort_by_key(|d| Reverse(d.timestamp));
 
     let agent_activity = build_agent_activity(&windowed_decisions);
-    let escalations = build_escalations(root, &windowed_decisions);
+    // Escalations are a *current-state* projection, like `autonomy` below: an
+    // escalation raised BEFORE the window that is still pending is precisely
+    // what "Needs you" exists to surface — the review queue ranks staleness
+    // up, so yesterday's unactioned item must not vanish from today's
+    // `--since last` brief. Selection runs over the full ledger, newest
+    // first; approved/withdrawn items drop out via the same
+    // outstanding-selection core the review queue uses.
+    let mut all_decisions_newest_first: Vec<&PolicyDecisionRecord> = decisions.iter().collect();
+    all_decisions_newest_first.sort_by_key(|d| Reverse(d.timestamp));
+    let escalations = build_escalations(root, &all_decisions_newest_first);
     let runs_section = build_runs(&windowed_runs);
     let drift = build_drift(&store, since_ts);
     let (freshness, quality) = build_freshness_and_quality(&store, &windowed_runs, since_ts);
@@ -307,8 +316,10 @@ fn build_agent_activity(decisions: &[&PolicyDecisionRecord]) -> BriefAgentActivi
 /// The "Needs you" section: decisions **still** awaiting review.
 ///
 /// Reuses the review queue's outstanding-selection core
-/// ([`select_outstanding`]) rather than re-listing every windowed
-/// `require_review` row, so the digest and `rocky review --queue` agree: one
+/// ([`select_outstanding`]) over the FULL ledger (current-state, not the
+/// `--since` slice — a still-pending escalation raised before the window is
+/// exactly what "Needs you" must surface), so the digest and
+/// `rocky review --queue` agree: one
 /// entry per `(plan_id, model)` (the newest row), already-approved plans
 /// dropped (their sign-off marker exists), and decision-only custody rows
 /// with no persisted plan dropped (nothing to approve). The raw per-effect
@@ -329,7 +340,7 @@ fn build_escalations(root: &Path, decisions: &[&PolicyDecisionRecord]) -> BriefE
     if pending.is_empty() {
         return BriefEscalationsSection {
             availability: SectionAvailability::NoData,
-            note: Some("no decisions awaiting review in the window".to_string()),
+            note: Some("no decisions awaiting review".to_string()),
             total: 0,
             ranking: "recency".to_string(),
             pending,
@@ -1539,5 +1550,49 @@ mod tests {
         assert!(md.contains("rule 3"));
         // Drift fails closed, not silently.
         assert!(md.contains("unavailable: not wired"));
+    }
+
+    /// FIX: escalations are a current-state projection — a still-pending
+    /// escalation raised BEFORE the `--since` window must not vanish from
+    /// the digest ("Needs you" and `rocky review --queue` must agree; the
+    /// queue ranks staleness UP). History sections stay windowed.
+    #[test]
+    fn escalations_survive_the_since_window() {
+        let root = tempfile::tempdir().unwrap();
+        let state_path = root.path().join("state.redb");
+        let stale = decision(
+            1,
+            PolicyPrincipal::Agent,
+            PolicyEffect::RequireReview,
+            "fct_orders",
+            None,
+        );
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            store.record_policy_decision(&stale).unwrap();
+        }
+        seed_plan_file(root.path(), &stale.plan_id);
+
+        // `now` is days after the decision, so the 24h window excludes it.
+        let now = ts(1) + Duration::days(3);
+        let out = compute_brief(
+            root.path(),
+            &state_path,
+            &root.path().join("rocky.toml"),
+            BriefSince::Hours24,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            out.escalations.total, 1,
+            "a pending escalation older than the window must still surface"
+        );
+        assert_eq!(out.escalations.pending[0].model, "fct_orders");
+        // The windowed history sections do NOT admit the old row.
+        assert_eq!(
+            out.agent_activity.total, 0,
+            "agent activity reports the window, not all history"
+        );
     }
 }
