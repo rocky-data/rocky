@@ -113,6 +113,10 @@ impl SqlDialect for DatabricksSqlDialect {
 
         for mc in metadata {
             validation::validate_identifier(&mc.name).map_err(AdapterError::new)?;
+            // `data_type` is interpolated raw into the CAST — validate it as a
+            // SQL type (the same guard the drift path uses) so a hostile
+            // `rocky.toml` metadata `type` can't break out of the cast.
+            rocky_core::sql_gen::validate_sql_type(&mc.data_type).map_err(AdapterError::new)?;
             write!(
                 sql,
                 ", CAST({} AS {}) AS {}",
