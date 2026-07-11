@@ -42,16 +42,22 @@ export function createWebviewPanelApp(
  * Handle to a registered webview-view app. Lets a command push data into the
  * view, buffering until the view is first resolved (the {@link WebviewHost}
  * then buffers further until the React app posts `ready`).
+ *
+ * The latest payload of every message type is remembered across the view's
+ * lifetime, not just until first resolve: dragging the panel to another dock
+ * (or hiding it in a way that disposes the webview) destroys the host, and
+ * the re-resolved view must be re-seeded with the state the old one showed —
+ * otherwise it renders blank until the next push.
  */
 export class WebviewViewController {
   private host: WebviewHost | undefined;
-  private readonly preResolve: Array<{ type: string; payload: unknown }> = [];
+  private readonly lastByType = new Map<string, unknown>();
   private isVisible = false;
 
-  /** @internal Bind the live host once the view resolves; flushes buffered pushes. */
+  /** @internal Bind the live host once the view resolves; replays remembered state. */
   attach(host: WebviewHost): void {
     this.host = host;
-    for (const { type, payload } of this.preResolve.splice(0)) {
+    for (const [type, payload] of this.lastByType) {
       host.push(type, payload);
     }
   }
@@ -75,10 +81,10 @@ export class WebviewViewController {
     return this.host !== undefined && this.isVisible;
   }
 
-  /** Push to the view, buffering until it is resolved and ready. */
+  /** Push to the view, buffering (latest per type) until it is resolved and ready. */
   push<P>(type: string, payload: P): void {
+    this.lastByType.set(type, payload);
     if (this.host) this.host.push(type, payload);
-    else this.preResolve.push({ type, payload });
   }
 }
 
@@ -98,9 +104,9 @@ export function registerWebviewViewApp(
       const host = new WebviewHost(view.webview, context.extensionUri);
       const extra = opts.setup?.(host);
       // Render first: it resets the host's ready flag and push buffer. Only
-      // then attach the controller, whose flush of pre-resolve pushes (e.g. a
-      // `focus` queued before the view existed) must land in the fresh buffer
-      // rather than being wiped by render().
+      // then attach the controller, whose replay of remembered pushes (e.g. a
+      // `target` queued before the view existed, or shown by a previous host)
+      // must land in the fresh buffer rather than being wiped by render().
       host.render({ entry: opts.entry, title: opts.title });
       controller.attach(host);
       controller.setVisible(view.visible);

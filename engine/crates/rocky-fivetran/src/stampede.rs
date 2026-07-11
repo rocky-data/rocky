@@ -26,8 +26,8 @@
 //!
 //! ## Lock fencing
 //!
-//! Each acquisition generates a unique 128-bit token persisted in the
-//! Valkey value. `LockGuard::Drop` issues an EVAL Lua script that
+//! Each acquisition generates a process-unique token (`{pid}-{ns}-{seq}`)
+//! persisted in the Valkey value. `LockGuard::Drop` issues an EVAL Lua script that
 //! check-and-DELs only if the value still matches our token; this
 //! prevents a leader that overran the TTL from deleting a fresh
 //! lock acquired by a different holder after expiry. The mechanism is
@@ -353,16 +353,23 @@ pub mod valkey {
         }
 
         /// Generate a fresh unique token for a lock acquisition.
-        /// Combines the process id, a high-resolution clock read, and
-        /// a hash of both so that two `rocky` processes that race to
-        /// acquire at the same nanosecond still get distinct tokens.
+        /// Combines the process id (distinct across processes), a
+        /// high-resolution clock read, and a per-process sequence
+        /// counter — so two acquisitions in the same process that race
+        /// to the same clock reading still get distinct tokens. The
+        /// release script's check-and-DEL fencing compares tokens by
+        /// exact equality, so a reused token would let one holder
+        /// delete another's lock.
         fn generate_token() -> String {
+            use std::sync::atomic::{AtomicU64, Ordering};
             use std::time::{SystemTime, UNIX_EPOCH};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
             let ns = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            format!("{}-{}", std::process::id(), ns)
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            format!("{}-{}-{}", std::process::id(), ns, seq)
         }
     }
 
@@ -468,6 +475,20 @@ pub mod valkey {
         fn from_url_is_sync_and_doesnt_connect() {
             let lock = ValkeyLock::from_url("redis://127.0.0.1:1/");
             assert!(lock.is_ok());
+        }
+
+        #[test]
+        fn tokens_are_unique_even_at_the_same_clock_reading() {
+            // Back-to-back generation can observe the same coarse clock
+            // value; the sequence counter must still keep tokens distinct
+            // (the fencing check-and-DEL compares by exact equality).
+            let tokens: Vec<String> = (0..100).map(|_| ValkeyLock::generate_token()).collect();
+            let unique: std::collections::HashSet<&String> = tokens.iter().collect();
+            assert_eq!(
+                unique.len(),
+                tokens.len(),
+                "duplicate lock tokens generated"
+            );
         }
 
         /// Live Valkey integration — gated on `ROCKY_TEST_VALKEY_URL`.

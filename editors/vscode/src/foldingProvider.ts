@@ -42,8 +42,19 @@ export class RockyFoldingRangeProvider implements vscode.FoldingRangeProvider {
       // Strip trailing comment (naive: first `--` outside a string)
       const code = stripTrailingComment(text);
 
+      // Track string state so a brace inside a literal (e.g.
+      // `derive { label = "a{b" }`) doesn't desync the stack and mispair
+      // every fold region below it — mirrors the formatter's countBraces.
+      let inSingle = false;
+      let inDouble = false;
       for (const ch of code) {
-        if (ch === "{") {
+        if (ch === "'" && !inDouble) {
+          inSingle = !inSingle;
+        } else if (ch === '"' && !inSingle) {
+          inDouble = !inDouble;
+        } else if (inSingle || inDouble) {
+          continue;
+        } else if (ch === "{") {
           openStack.push(i);
         } else if (ch === "}") {
           const start = openStack.pop();
