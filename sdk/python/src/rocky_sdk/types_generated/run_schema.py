@@ -135,7 +135,7 @@ class ExecutionSummary(BaseModel):
     Summary of execution parallelism and throughput.
     """
 
-    adaptive_concurrency: bool
+    adaptive_concurrency: bool | None = None
     """
     Whether adaptive concurrency (AIMD throttle) was enabled for this run.
     """
@@ -357,7 +357,7 @@ class PartitionInfo(BaseModel):
     `key` is the canonical Rocky partition key (e.g. `"2026-04-07"` for daily; `"2026-04-07T13"` for hourly). `start` / `end` are the half-open `[start, end)` window the SQL substituted for `@start_date` / `@end_date`. `batched_with` lists any additional partition keys that were merged into this batch when `batch_size > 1` — empty for the default one-partition-per-statement case.
     """
 
-    batched_with: list[str]
+    batched_with: list[str] | None = None
     end: AwareDatetime
     key: str
     start: AwareDatetime
@@ -373,7 +373,7 @@ class PartitionSummary(BaseModel):
     model: str
     partitions_failed: conint(ge=0)
     partitions_planned: conint(ge=0)
-    partitions_skipped: conint(ge=0)
+    partitions_skipped: conint(ge=0) | None = None
     """
     Partitions that were already `Computed` in the state store and skipped by the runtime (currently always 0; reserved for the `--missing` change-detection optimization).
     """
@@ -410,7 +410,7 @@ class QuarantineOutput(BaseModel):
     """
     `true` when every quarantine statement executed successfully. `false` means a partial failure — inspect `error` for details.
     """
-    quarantine_table: str
+    quarantine_table: str | None = None
     """
     Fully-qualified name of the `__quarantine` output table. Empty for `mode = "drop"` (failing rows discarded) and `mode = "tag"`.
     """
@@ -422,7 +422,7 @@ class QuarantineOutput(BaseModel):
     """
     Number of rows in the `__valid` output, when the adapter can report it.
     """
-    valid_table: str
+    valid_table: str | None = None
     """
     Fully-qualified `catalog.schema.table` name of the `__valid` output table. Empty for `mode = "tag"` (source is rewritten in place).
     """
@@ -671,7 +671,7 @@ class MaterializationOutput(BaseModel):
     """
     bytes_written: conint(ge=0) | None = None
     """
-    Adapter-reported bytes-written figure, summed across all statements. Currently `None` on every adapter — BigQuery doesn't expose a bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet. Reserved so future waves can populate it without a schema break.
+    Adapter-reported bytes-written figure, summed across all statements. Currently `None` on every adapter — BigQuery doesn't expose a bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet. Reserved so a future release can populate it without a schema break.
     """
     cost_usd: float | None = None
     """
@@ -718,7 +718,7 @@ class RunOutput(BaseModel):
     JSON output for `rocky run`.
     """
 
-    anomalies: list[AnomalyOutput]
+    anomalies: list[AnomalyOutput] | None = None
     budget_breaches: list[BudgetBreachOutput] | None = None
     """
     Budget breaches detected at end of run. Empty when no `[budget]` block is configured or all configured limits were respected. Each breach is also emitted as a `budget_breach` [`rocky_observe::events::PipelineEvent`] and fires the `on_budget_breach` hook so subscribers see them live.
@@ -735,7 +735,7 @@ class RunOutput(BaseModel):
     """
     drift: DriftSummary
     duration_ms: conint(ge=0)
-    errors: list[TableErrorOutput]
+    errors: list[TableErrorOutput] | None = None
     excluded_tables: list[ExcludedTableOutput] | None = None
     """
     Tables that the discovery adapter reported as enabled but that do not exist in the source warehouse (e.g. Fivetran has them configured but hasn't synced them, or they carry the `do_not_alter__` broken-table marker). Surfaced so orchestrators can flag the gap in their UIs instead of silently dropping the assets.
@@ -760,7 +760,7 @@ class RunOutput(BaseModel):
     """
     Soft warnings raised by the per-table override resolver — one entry per `[[table_overrides]]` rule that matched zero `(connector, table)` pairs this run, or whose connector half resolved nothing. Discovery-time-only — the pipeline runs to completion regardless. Empty for runs whose pipeline declares no overrides.
     """
-    partition_summaries: list[PartitionSummary]
+    partition_summaries: list[PartitionSummary] | None = None
     """
     Per-model partition execution summaries, present only when the run touched one or more `time_interval` models. Empty for runs that didn't execute any partitioned models.
     """
@@ -769,12 +769,12 @@ class RunOutput(BaseModel):
     """
     Pipeline type that was executed (e.g., "replication").
     """
-    quarantine: list[QuarantineOutput]
+    quarantine: list[QuarantineOutput] | None = None
     """
     Row-quarantine outcomes — one entry per table the quality pipeline quarantined. Empty for runs that did not use `[pipeline.x.checks.quarantine]`.
     """
     resumed_from: str | None = None
-    shadow: bool
+    shadow: bool | None = None
     """
     True when running in shadow mode (targets rewritten).
     """
@@ -791,5 +791,5 @@ class RunOutput(BaseModel):
     """
     Total number of failed tables/models for the run, **including** pre-execution compile failures: a model that fails to type-check is counted here even though it never reached the execution phase. This is the authoritative failure count — consumers should key overall pass/fail on the top-level `tables_failed` / `status` / `errors`, not on `execution.tables_failed`, which counts only execution-phase (copy / runtime) failures and excludes models excluded before execution.
     """
-    tables_skipped: conint(ge=0)
+    tables_skipped: conint(ge=0) | None = None
     version: str

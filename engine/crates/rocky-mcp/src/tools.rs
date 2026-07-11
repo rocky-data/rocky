@@ -1914,22 +1914,18 @@ impl RockyMcpServer {
             )
         })?;
 
-        // Snapshot prior on-disk state so a policy DENY (or a write failure) rolls
-        // back to leave NO new artifact — a draft the policy plane refuses must
-        // not linger on disk (mirrors the propose gate's deny → no plan written).
-        let prior_sql = std::fs::read(&paths.sql_path).ok();
-        let prior_sidecar = std::fs::read(&paths.sidecar_path).ok();
-        let rollback = || {
-            restore_or_remove(&paths.sql_path, prior_sql.as_deref());
-            restore_or_remove(&paths.sidecar_path, prior_sidecar.as_deref());
-        };
+        // Snapshot prior on-disk state so a policy DENY (or a write failure, or
+        // a panic anywhere before the verdict) rolls back to leave NO new
+        // artifact — a draft the policy plane refuses must not linger on disk
+        // (mirrors the propose gate's deny → no plan written). A drop-guard,
+        // not a manual closure: unwinding restores too.
+        let rollback = DraftRollback::snapshot([&paths.sql_path, &paths.sidecar_path]);
 
         // Write the draft: the SQL body verbatim + a minimal sidecar that carries
         // the intent. Target/strategy resolve from the project's conventions
         // (rocky.toml pipeline + _defaults.toml), exactly as a hand-authored bare
         // model — the draft tool never invents a target the agent didn't ask for.
         if let Err(e) = std::fs::write(&paths.sql_path, ensure_trailing_newline(&args.sql)) {
-            rollback();
             return Err(ToolError::internal(
                 format!(
                     "failed to write draft SQL to {}: {e}",
@@ -1942,7 +1938,6 @@ impl RockyMcpServer {
             &paths.sidecar_path,
             draft_sidecar(&paths.stem, args.intent.trim()),
         ) {
-            rollback();
             return Err(ToolError::internal(
                 format!(
                     "failed to write draft sidecar to {}: {e}",
@@ -1969,7 +1964,6 @@ impl RockyMcpServer {
         ) {
             Ok(o) => o,
             Err(e) => {
-                rollback();
                 return Err(ToolError::compile_failed(format!("{e:#}")));
             }
         };
@@ -2002,16 +1996,19 @@ impl RockyMcpServer {
 
         match gate {
             rocky_cli::commands::PolicyGate::NotConfigured
-            | rocky_cli::commands::PolicyGate::Allow => Ok(Json(DraftModelResult {
-                model: paths.stem.clone(),
-                sql_path: rel_display(&self.root, &paths.sql_path),
-                sidecar_path: rel_display(&self.root, &paths.sidecar_path),
-                has_errors: compiled.has_errors,
-                error_count: compiled.error_count,
-                warning_count: compiled.warning_count,
-                diagnostics: compiled.diagnostics,
-                next_steps: DRAFT_NEXT_STEPS.to_string(),
-            })),
+            | rocky_cli::commands::PolicyGate::Allow => {
+                rollback.defuse();
+                Ok(Json(DraftModelResult {
+                    model: paths.stem.clone(),
+                    sql_path: rel_display(&self.root, &paths.sql_path),
+                    sidecar_path: rel_display(&self.root, &paths.sidecar_path),
+                    has_errors: compiled.has_errors,
+                    error_count: compiled.error_count,
+                    warning_count: compiled.warning_count,
+                    diagnostics: compiled.diagnostics,
+                    next_steps: DRAFT_NEXT_STEPS.to_string(),
+                }))
+            }
             rocky_cli::commands::PolicyGate::RequireReview {
                 model,
                 rule_id,
@@ -2021,6 +2018,7 @@ impl RockyMcpServer {
                 // reviewable artifact, so it PERSISTS; the structured signal
                 // routes the agent to human review before it takes the change
                 // further in this governed scope.
+                rollback.defuse();
                 let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
                 Err(ToolError::policy_review_required(
                     format!(
@@ -2040,10 +2038,10 @@ impl RockyMcpServer {
                 rule_id,
                 reason,
             } => {
-                // A deny cannot be satisfied by review — roll the draft back so
-                // NO artifact lingers on disk (the decision is already in the
-                // ledger), consistent with the propose gate's deny semantics.
-                rollback();
+                // A deny cannot be satisfied by review — the guard rolls the
+                // draft back on return so NO artifact lingers on disk (the
+                // decision is already in the ledger), consistent with the
+                // propose gate's deny semantics.
                 let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
                 Err(ToolError::policy_denied(
                     format!(
@@ -2092,13 +2090,12 @@ impl RockyMcpServer {
             return Err(ToolError::model_not_found(&paths.stem));
         }
 
-        // Snapshot so a policy DENY (or a write/compile failure) rolls back to
-        // leave NO new artifact — mirrors `draft_model` and the propose gate.
-        let prior = std::fs::read(&paths.contract_path).ok();
-        let rollback = || restore_or_remove(&paths.contract_path, prior.as_deref());
+        // Snapshot so a policy DENY (or a write/compile failure, or a panic
+        // before the verdict) rolls back to leave NO new artifact — mirrors
+        // `draft_model` and the propose gate. Drop-guard: unwinding restores.
+        let rollback = DraftRollback::snapshot([&paths.contract_path]);
 
         if let Err(e) = std::fs::write(&paths.contract_path, ensure_trailing_newline(&spec)) {
-            rollback();
             return Err(ToolError::internal(
                 format!(
                     "failed to write draft contract to {}: {e}",
@@ -2110,31 +2107,29 @@ impl RockyMcpServer {
 
         // Compile with the write — the contract is validated against the model's
         // inferred schema. A hard compile failure rolls the draft back.
-        let compiled = match self.compile_drafted(&paths.stem) {
-            Ok(c) => c,
-            Err(e) => {
-                rollback();
-                return Err(e);
-            }
-        };
+        let compiled = self.compile_drafted(&paths.stem)?;
 
         let decision_id = format!("draft-contract:{}", paths.stem);
         match self.evaluate_draft_policy(&paths.stem, &decision_id) {
             rocky_cli::commands::PolicyGate::NotConfigured
-            | rocky_cli::commands::PolicyGate::Allow => Ok(Json(DraftContractResult {
-                model: paths.stem.clone(),
-                contract_path: rel_display(&self.root, &paths.contract_path),
-                has_errors: compiled.has_errors,
-                error_count: compiled.error_count,
-                warning_count: compiled.warning_count,
-                diagnostics: compiled.diagnostics,
-                next_steps: DRAFT_CONTRACT_NEXT_STEPS.to_string(),
-            })),
+            | rocky_cli::commands::PolicyGate::Allow => {
+                rollback.defuse();
+                Ok(Json(DraftContractResult {
+                    model: paths.stem.clone(),
+                    contract_path: rel_display(&self.root, &paths.contract_path),
+                    has_errors: compiled.has_errors,
+                    error_count: compiled.error_count,
+                    warning_count: compiled.warning_count,
+                    diagnostics: compiled.diagnostics,
+                    next_steps: DRAFT_CONTRACT_NEXT_STEPS.to_string(),
+                }))
+            }
             rocky_cli::commands::PolicyGate::RequireReview {
                 model,
                 rule_id,
                 reason,
             } => {
+                rollback.defuse();
                 let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
                 Err(ToolError::policy_review_required(
                     format!(
@@ -2154,7 +2149,6 @@ impl RockyMcpServer {
                 rule_id,
                 reason,
             } => {
-                rollback();
                 let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
                 Err(ToolError::policy_denied(
                     format!(
@@ -2207,20 +2201,25 @@ impl RockyMcpServer {
                  \"not_null\"\ncolumn = \"id\"\nThen pass it as `spec`.",
             ));
         }
+        // Structural gate: the spec parses as TOML and carries NOTHING but the
+        // `tests` array-of-tables — a `[target]`/`[strategy]` override (or a
+        // bare top-level key) smuggled alongside a valid `[[tests]]` block is
+        // rejected instead of being appended verbatim into the model's sidecar.
+        validate_check_spec(&spec)?;
         let paths = self.resolve_draft_paths(&args.model)?;
         if !self.model_source_exists(&paths.stem) {
             return Err(ToolError::model_not_found(&paths.stem));
         }
 
-        // Snapshot the sidecar so a DENY restores the model's PRIOR sidecar (the
-        // name/intent draft_model wrote), never deletes it — the check is what
-        // rolls back, not the model. A model with no sidecar yet snapshots None.
-        let prior = std::fs::read(&paths.sidecar_path).ok();
-        let rollback = || restore_or_remove(&paths.sidecar_path, prior.as_deref());
+        // Snapshot the sidecar so a DENY (or a failure/panic before the
+        // verdict) restores the model's PRIOR sidecar (the name/intent
+        // draft_model wrote), never deletes it — the check is what rolls back,
+        // not the model. A model with no sidecar yet snapshots None.
+        let rollback = DraftRollback::snapshot([&paths.sidecar_path]);
 
         // Merge: append the `[[tests]]` block(s) to the existing sidecar, or seed
         // a minimal sidecar (`name = "<stem>"`) when the model is a bare `.sql`.
-        let merged = match &prior {
+        let merged = match rollback.prior(&paths.sidecar_path) {
             Some(bytes) => {
                 let prior_text = String::from_utf8_lossy(bytes);
                 format!(
@@ -2232,7 +2231,6 @@ impl RockyMcpServer {
             None => format!("name = {}\n\n{}", toml_basic_string(&paths.stem), spec),
         };
         if let Err(e) = std::fs::write(&paths.sidecar_path, ensure_trailing_newline(&merged)) {
-            rollback();
             return Err(ToolError::internal(
                 format!(
                     "failed to write draft check to {}: {e}",
@@ -2242,31 +2240,29 @@ impl RockyMcpServer {
             ));
         }
 
-        let compiled = match self.compile_drafted(&paths.stem) {
-            Ok(c) => c,
-            Err(e) => {
-                rollback();
-                return Err(e);
-            }
-        };
+        let compiled = self.compile_drafted(&paths.stem)?;
 
         let decision_id = format!("draft-check:{}", paths.stem);
         match self.evaluate_draft_policy(&paths.stem, &decision_id) {
             rocky_cli::commands::PolicyGate::NotConfigured
-            | rocky_cli::commands::PolicyGate::Allow => Ok(Json(DraftCheckResult {
-                model: paths.stem.clone(),
-                sidecar_path: rel_display(&self.root, &paths.sidecar_path),
-                has_errors: compiled.has_errors,
-                error_count: compiled.error_count,
-                warning_count: compiled.warning_count,
-                diagnostics: compiled.diagnostics,
-                next_steps: DRAFT_CHECK_NEXT_STEPS.to_string(),
-            })),
+            | rocky_cli::commands::PolicyGate::Allow => {
+                rollback.defuse();
+                Ok(Json(DraftCheckResult {
+                    model: paths.stem.clone(),
+                    sidecar_path: rel_display(&self.root, &paths.sidecar_path),
+                    has_errors: compiled.has_errors,
+                    error_count: compiled.error_count,
+                    warning_count: compiled.warning_count,
+                    diagnostics: compiled.diagnostics,
+                    next_steps: DRAFT_CHECK_NEXT_STEPS.to_string(),
+                }))
+            }
             rocky_cli::commands::PolicyGate::RequireReview {
                 model,
                 rule_id,
                 reason,
             } => {
+                rollback.defuse();
                 let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
                 Err(ToolError::policy_review_required(
                     format!(
@@ -2286,7 +2282,6 @@ impl RockyMcpServer {
                 rule_id,
                 reason,
             } => {
-                rollback();
                 let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
                 Err(ToolError::policy_denied(
                     format!(
@@ -2480,6 +2475,7 @@ impl RockyMcpServer {
             }
         };
         let output = commands::compute_brief(
+            &self.root,
             &self.state_path(),
             &self.config_path,
             since,
@@ -3578,6 +3574,109 @@ fn restore_or_remove(path: &Path, prior: Option<&[u8]>) {
     }
 }
 
+/// Panic-safe rollback guard for the `draft_*` write tools.
+///
+/// Snapshots each path's prior bytes at construction and restores them (via
+/// [`restore_or_remove`]) when dropped — on an error return, a policy deny,
+/// **or a panic anywhere between the write and the verdict** (e.g. inside
+/// compile). A manual rollback closure only runs on the arms that call it;
+/// unwinding past it would leave a denied/broken draft on disk, violating the
+/// "a denied draft leaves NO file" contract. Call [`defuse`](Self::defuse) on
+/// the keep paths: success, or require-review (where the draft IS the
+/// reviewable artifact).
+struct DraftRollback {
+    /// `(path, prior bytes)` — `None` when the file did not exist.
+    entries: Vec<(PathBuf, Option<Vec<u8>>)>,
+    defused: bool,
+}
+
+impl DraftRollback {
+    /// Snapshot `paths` before the draft writes them.
+    fn snapshot<I, P>(paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        let entries = paths
+            .into_iter()
+            .map(|p| {
+                let path = p.into();
+                let prior = std::fs::read(&path).ok();
+                (path, prior)
+            })
+            .collect();
+        Self {
+            entries,
+            defused: false,
+        }
+    }
+
+    /// The snapshotted prior bytes for `path` (`None` = the file did not
+    /// exist, or the path was never snapshotted).
+    fn prior(&self, path: &Path) -> Option<&[u8]> {
+        self.entries
+            .iter()
+            .find(|(p, _)| p == path)
+            .and_then(|(_, prior)| prior.as_deref())
+    }
+
+    /// Keep the draft on disk: consume the guard without restoring.
+    fn defuse(mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for DraftRollback {
+    fn drop(&mut self) {
+        if self.defused {
+            return;
+        }
+        for (path, prior) in &self.entries {
+            restore_or_remove(path, prior.as_deref());
+        }
+    }
+}
+
+/// Structural gate for a `draft_check` spec: parse it as TOML and require
+/// every top-level key to be the `tests` array-of-tables.
+///
+/// The spec is appended verbatim to the model's sidecar, so any other
+/// top-level table or key — `[target]`, `[strategy]`, or a bare `key = value`
+/// that would attach to the sidecar's last table — is model config smuggled
+/// through the check write path. Rejected with a structured
+/// `invalid_argument` naming the offending key.
+fn validate_check_spec(spec: &str) -> Result<(), Json<ToolError>> {
+    let parsed: toml::Table = toml::from_str(spec).map_err(|e| {
+        ToolError::invalid_argument(
+            format!("draft_check `spec` is not valid TOML: {e}"),
+            "Author the check as one or more declarative `[[tests]]` blocks, e.g.\n[[tests]]\n\
+             type = \"not_null\"\ncolumn = \"id\"\nThen pass it as `spec`.",
+        )
+    })?;
+    for (key, value) in &parsed {
+        if key != "tests" {
+            return Err(ToolError::invalid_argument(
+                format!(
+                    "draft_check `spec` may only contain `[[tests]]` blocks; found top-level \
+                     `{key}`"
+                ),
+                "A check spec cannot carry model config: keys like `[target]` or `[strategy]` \
+                 belong to the model's own sidecar. Drop them from the spec; to change the model \
+                 itself, use draft_model.",
+            ));
+        }
+        if !value.is_array() {
+            return Err(ToolError::invalid_argument(
+                "draft_check `spec` must declare `tests` as an array of tables (`[[tests]]`), \
+                 not a single table or value",
+                "Use the array-of-tables header form:\n[[tests]]\ntype = \"not_null\"\n\
+                 column = \"id\"",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Ensure the drafted SQL ends in exactly one trailing newline (POSIX text
 /// file), without disturbing a body that already does.
 fn ensure_trailing_newline(sql: &str) -> String {
@@ -3788,6 +3887,144 @@ mod tests {
         assert_eq!(ensure_trailing_newline("SELECT 1"), "SELECT 1\n");
         assert_eq!(ensure_trailing_newline("SELECT 1\n"), "SELECT 1\n");
         assert_eq!(ensure_trailing_newline("SELECT 1\n\n"), "SELECT 1\n");
+    }
+
+    // --- DraftRollback (panic-safe draft rollback) ---
+
+    /// The drop-guard contract under a PANIC between the write and the
+    /// verdict (e.g. inside compile): unwinding drops the guard, which
+    /// restores the pre-existing file byte-for-byte and removes the fresh
+    /// artifact — "a denied draft leaves NO file" holds even when no error
+    /// arm ever ran.
+    #[test]
+    fn draft_rollback_restores_on_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("model.toml");
+        std::fs::write(&existing, "original").unwrap();
+        let fresh = dir.path().join("fresh.sql");
+
+        let guard = DraftRollback::snapshot([&existing, &fresh]);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = guard;
+            std::fs::write(&existing, "clobbered").unwrap();
+            std::fs::write(&fresh, "new artifact").unwrap();
+            panic!("simulated panic between the write and the policy verdict");
+        }));
+        assert!(unwound.is_err(), "the panic propagates to the caller");
+
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "original",
+            "a pre-existing file is restored byte-for-byte"
+        );
+        assert!(!fresh.exists(), "a freshly written draft is removed");
+    }
+
+    /// A plain (non-panic) drop without `defuse` — the shape every `?` /
+    /// early-`return Err` path takes — restores exactly like the panic path.
+    #[test]
+    fn draft_rollback_restores_on_err_return_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.sql");
+        {
+            let _guard = DraftRollback::snapshot([&fresh]);
+            std::fs::write(&fresh, "draft body").unwrap();
+            // The guard drops here without defuse, as on an Err return.
+        }
+        assert!(!fresh.exists(), "the un-defused drop rolls the write back");
+    }
+
+    /// `defuse` is the keep path (success / require-review): the write
+    /// persists. Also pins the `prior` accessor `draft_check` merges with.
+    #[test]
+    fn draft_rollback_defused_keeps_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("model.toml");
+        std::fs::write(&sidecar, "name = \"m\"").unwrap();
+
+        let guard = DraftRollback::snapshot([&sidecar]);
+        assert_eq!(
+            guard.prior(&sidecar),
+            Some("name = \"m\"".as_bytes()),
+            "the snapshot exposes the prior bytes for the merge"
+        );
+        assert_eq!(
+            guard.prior(&dir.path().join("other.toml")),
+            None,
+            "an unsnapshotted path has no prior"
+        );
+
+        std::fs::write(&sidecar, "name = \"m\"\n\n[[tests]]\n").unwrap();
+        guard.defuse();
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).unwrap(),
+            "name = \"m\"\n\n[[tests]]\n",
+            "a defused guard keeps the draft"
+        );
+    }
+
+    // --- validate_check_spec (draft_check structural gate) ---
+
+    /// A `[target]` (or any non-`tests`) table smuggled alongside a valid
+    /// `[[tests]]` block is rejected with a structured `invalid_argument`
+    /// naming the offending key — the check write path cannot override model
+    /// config.
+    #[test]
+    fn check_spec_rejects_smuggled_config_tables() {
+        let spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n\n\
+                    [target]\nschema = \"prod\"\n";
+        let err = validate_check_spec(spec).expect_err("a [target] override must be rejected");
+        assert_eq!(err.0.code, crate::error::ToolErrorCode::InvalidArgument);
+        assert!(
+            err.0.message.contains("`target`"),
+            "the offending key is named: {}",
+            err.0.message
+        );
+
+        // A bare top-level key BEFORE the first [[tests]] header would attach
+        // to the prior sidecar's last table when appended — same rejection.
+        let spec = "path = \"evil\"\n\n[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n";
+        let err = validate_check_spec(spec).expect_err("a bare top-level key must be rejected");
+        assert!(
+            err.0.message.contains("`path`"),
+            "the offending key is named: {}",
+            err.0.message
+        );
+
+        // `[strategy]` is config, exactly like `[target]`.
+        let spec = "[[tests]]\ntype = \"unique\"\ncolumn = \"id\"\n\n\
+                    [strategy]\ntype = \"full_refresh\"\n";
+        assert!(validate_check_spec(spec).is_err());
+    }
+
+    /// A pure `[[tests]]` spec (one or many blocks) passes the gate.
+    #[test]
+    fn check_spec_accepts_pure_tests_blocks() {
+        let single = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n";
+        assert!(validate_check_spec(single).is_ok());
+
+        let many = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n\n\
+                    [[tests]]\ntype = \"accepted_values\"\ncolumn = \"status\"\n\
+                    values = [\"COMPLETE\", \"PENDING\"]\n";
+        assert!(validate_check_spec(many).is_ok());
+    }
+
+    /// Degenerate shapes: invalid TOML, and a `[tests]` TABLE (with the
+    /// literal `[[tests]]` hidden inside a string so the substring pre-check
+    /// passes) — both are structured `invalid_argument`s, not writes.
+    #[test]
+    fn check_spec_rejects_invalid_toml_and_non_array_tests() {
+        let err = validate_check_spec("[[tests]\ntype =").expect_err("invalid TOML must fail");
+        assert_eq!(err.0.code, crate::error::ToolErrorCode::InvalidArgument);
+        assert!(err.0.message.contains("not valid TOML"));
+
+        let table_form = "[tests]\nnote = \"[[tests]]\"\n";
+        let err = validate_check_spec(table_form).expect_err("a `[tests]` table must fail");
+        assert!(
+            err.0.message.contains("array of tables"),
+            "unexpected message: {}",
+            err.0.message
+        );
     }
 
     #[test]

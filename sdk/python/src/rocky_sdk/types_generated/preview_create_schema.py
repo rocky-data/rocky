@@ -24,7 +24,7 @@ class PreviewPrunedModel(BaseModel):
     One entry in [`PreviewCreateOutput::prune_set`].
     """
 
-    changed_columns: list[str]
+    changed_columns: list[str] | None = None
     """
     Columns the diff reports as changed on this model. Only populated when `reason = "changed"`.
     """

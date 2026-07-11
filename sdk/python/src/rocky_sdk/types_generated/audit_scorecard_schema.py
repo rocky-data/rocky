@@ -77,6 +77,31 @@ class ScorecardGroup(BaseModel):
     """
 
 
+class ScorecardVerifyAfter(BaseModel):
+    """
+    The verify-after aggregate inside an [`AuditScorecardOutput`]: pass/fail counts over the post-apply verification custody rows in the window.
+
+    Each row's aggregate verdict is its recorded `effect` (`allow` = every named check passed, `deny` = a check failed or was absent and the apply halted), so the pass rate summarizes exactly what the ledger persists.
+    """
+
+    failed: conint(ge=0)
+    """
+    Rows whose verdict was `deny` (a named check failed or was absent).
+    """
+    pass_rate: float
+    """
+    `passed / total`.
+    """
+    passed: conint(ge=0)
+    """
+    Rows whose verdict was `allow` (every named check passed).
+    """
+    total: conint(ge=0)
+    """
+    Verification custody rows in the window.
+    """
+
+
 class SectionAvailability4(StrEnum):
     """
     The query ran and the section carries data for the window.
@@ -103,7 +128,7 @@ class SectionAvailability6(StrEnum):
 
 class ScorecardUnavailableMetric(BaseModel):
     """
-    A metric the scorecard cannot compute because the ledger does not persist its inputs.
+    A metric the scorecard cannot compute from the persisted ledger for this window.
 
     Declared explicitly (not silently omitted) so the honesty is machine-readable: a consumer sees the metric name, that it is `unavailable`, and exactly why.
     """
@@ -114,7 +139,7 @@ class ScorecardUnavailableMetric(BaseModel):
     """
     metric: str
     """
-    The metric identifier (`verify_after_pass_rate`, `reverts`, `escalation_latency`).
+    The metric identifier (`reverts`, `escalation_latency`, or `verify_after_pass_rate` when no verification row falls in the window).
     """
     note: str
     """
@@ -128,7 +153,7 @@ class AuditScorecardOutput(BaseModel):
 
     A decisions-by-group aggregation over the persisted policy-decision ledger, windowed by `--window`. It is the evidence base for widening or tightening autonomy, and it informs human judgment only — nothing here is wired to any automatic policy change.
 
-    Only metrics the ledger actually persists are computed. The ledger records one row per policy *evaluation* — `(principal, capability, model, effect, rule_id)` — and nothing about what happened *after* the decision. So verify-after outcomes, reverts, and escalation-resolution latency are not derivable; they are declared, once, in [`Self::unavailable_metrics`] as `unavailable` with the reason, never faked into a number. A ledger read failure renders the whole scorecard `unavailable` rather than a smoothed-over zero.
+    Only metrics the ledger actually persists are computed. Post-apply verification outcomes *are* persisted (custody rows with a non-empty `verify_after` check list), so [`Self::verify_after`] reports their pass rate when any fall in the window. Reverts and escalation-resolution latency are not persisted; they are declared in [`Self::unavailable_metrics`] as `unavailable` with the reason, never faked into a number — and `verify_after_pass_rate` joins that list only when no verification row falls in the window. A ledger read failure renders the whole scorecard `unavailable` rather than a smoothed-over zero.
     """
 
     availability: SectionAvailability4 | SectionAvailability5 | SectionAvailability6
@@ -151,7 +176,11 @@ class AuditScorecardOutput(BaseModel):
     """
     unavailable_metrics: list[ScorecardUnavailableMetric]
     """
-    Metrics the ledger does not persist, declared plainly rather than computed. Each is `unavailable` with the reason it cannot be derived.
+    Metrics the persisted ledger cannot support for this window, declared plainly rather than computed. Each is `unavailable` with the reason it cannot be derived.
+    """
+    verify_after: ScorecardVerifyAfter | None = None
+    """
+    Aggregate of the post-apply verification custody rows in the window (rows with a non-empty `verify_after` check list). `null` when no verification row falls in the window — then `verify_after_pass_rate` is declared in [`Self::unavailable_metrics`] instead.
     """
     version: str
     window: str

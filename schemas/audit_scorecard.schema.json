@@ -95,7 +95,7 @@
       "type": "object"
     },
     "ScorecardUnavailableMetric": {
-      "description": "A metric the scorecard cannot compute because the ledger does not persist its inputs.\n\nDeclared explicitly (not silently omitted) so the honesty is machine-readable: a consumer sees the metric name, that it is `unavailable`, and exactly why.",
+      "description": "A metric the scorecard cannot compute from the persisted ledger for this window.\n\nDeclared explicitly (not silently omitted) so the honesty is machine-readable: a consumer sees the metric name, that it is `unavailable`, and exactly why.",
       "properties": {
         "availability": {
           "allOf": [
@@ -106,7 +106,7 @@
           "description": "Always [`SectionAvailability::Unavailable`]."
         },
         "metric": {
-          "description": "The metric identifier (`verify_after_pass_rate`, `reverts`, `escalation_latency`).",
+          "description": "The metric identifier (`reverts`, `escalation_latency`, or `verify_after_pass_rate` when no verification row falls in the window).",
           "type": "string"
         },
         "note": {
@@ -118,6 +118,41 @@
         "availability",
         "metric",
         "note"
+      ],
+      "type": "object"
+    },
+    "ScorecardVerifyAfter": {
+      "description": "The verify-after aggregate inside an [`AuditScorecardOutput`]: pass/fail counts over the post-apply verification custody rows in the window.\n\nEach row's aggregate verdict is its recorded `effect` (`allow` = every named check passed, `deny` = a check failed or was absent and the apply halted), so the pass rate summarizes exactly what the ledger persists.",
+      "properties": {
+        "failed": {
+          "description": "Rows whose verdict was `deny` (a named check failed or was absent).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "pass_rate": {
+          "description": "`passed / total`.",
+          "format": "double",
+          "type": "number"
+        },
+        "passed": {
+          "description": "Rows whose verdict was `allow` (every named check passed).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total": {
+          "description": "Verification custody rows in the window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "failed",
+        "pass_rate",
+        "passed",
+        "total"
       ],
       "type": "object"
     },
@@ -148,7 +183,7 @@
       ]
     }
   },
-  "description": "JSON output for `rocky audit --scorecard` — a trust-calibration digest.\n\nA decisions-by-group aggregation over the persisted policy-decision ledger, windowed by `--window`. It is the evidence base for widening or tightening autonomy, and it informs human judgment only — nothing here is wired to any automatic policy change.\n\nOnly metrics the ledger actually persists are computed. The ledger records one row per policy *evaluation* — `(principal, capability, model, effect, rule_id)` — and nothing about what happened *after* the decision. So verify-after outcomes, reverts, and escalation-resolution latency are not derivable; they are declared, once, in [`Self::unavailable_metrics`] as `unavailable` with the reason, never faked into a number. A ledger read failure renders the whole scorecard `unavailable` rather than a smoothed-over zero.",
+  "description": "JSON output for `rocky audit --scorecard` — a trust-calibration digest.\n\nA decisions-by-group aggregation over the persisted policy-decision ledger, windowed by `--window`. It is the evidence base for widening or tightening autonomy, and it informs human judgment only — nothing here is wired to any automatic policy change.\n\nOnly metrics the ledger actually persists are computed. Post-apply verification outcomes *are* persisted (custody rows with a non-empty `verify_after` check list), so [`Self::verify_after`] reports their pass rate when any fall in the window. Reverts and escalation-resolution latency are not persisted; they are declared in [`Self::unavailable_metrics`] as `unavailable` with the reason, never faked into a number — and `verify_after_pass_rate` joins that list only when no verification row falls in the window. A ledger read failure renders the whole scorecard `unavailable` rather than a smoothed-over zero.",
   "properties": {
     "availability": {
       "allOf": [
@@ -189,11 +224,22 @@
       "type": "integer"
     },
     "unavailable_metrics": {
-      "description": "Metrics the ledger does not persist, declared plainly rather than computed. Each is `unavailable` with the reason it cannot be derived.",
+      "description": "Metrics the persisted ledger cannot support for this window, declared plainly rather than computed. Each is `unavailable` with the reason it cannot be derived.",
       "items": {
         "$ref": "#/definitions/ScorecardUnavailableMetric"
       },
       "type": "array"
+    },
+    "verify_after": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ScorecardVerifyAfter"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Aggregate of the post-apply verification custody rows in the window (rows with a non-empty `verify_after` check list). `null` when no verification row falls in the window — then `verify_after_pass_rate` is declared in [`Self::unavailable_metrics`] instead."
     },
     "version": {
       "type": "string"

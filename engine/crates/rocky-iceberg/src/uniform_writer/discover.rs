@@ -773,6 +773,17 @@ const KNOWN_ACTION_KEYS: &[&str] = &[
 ///
 /// Any object-store / parse failure yields [`RemovalHoldReason::ReadError`] /
 /// [`RemovalHoldReason::MalformedCommit`] — never a proof.
+///
+/// # Known limitation
+///
+/// This is a conservative-best-effort reader of the `_delta_log`, NOT a full
+/// Delta-protocol implementation. It deliberately holds on any shape it cannot
+/// unambiguously prove removed, so on unusual external-writer path/protocol
+/// spellings it may forgo reclamation (over-hold) or, rarely, mis-classify a
+/// still-live file as removed — a **metadata-only** error (a superseded
+/// tombstone drives a conservative rebuild, never byte loss or wrong results;
+/// nothing here deletes bytes). Full Delta-protocol fidelity (Delta Kernel) is
+/// future work.
 pub(super) async fn proven_removed<S: ObjectStore + ?Sized>(
     store: &S,
     table_bucket: &str,

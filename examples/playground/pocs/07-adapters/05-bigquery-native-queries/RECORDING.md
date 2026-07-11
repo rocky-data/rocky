@@ -152,7 +152,7 @@ rocky compile --models live/models/ --output json
 
 ## Notes
 
-- **Self-cleaning.** Every driver pre-creates its own `hc_phase*` dataset
+- **Self-cleaning.** Every driver pre-creates its own `poc_step*` dataset
   and drops it on exit (success or failure) via a `trap`. Nothing persists
   in the project between takes.
 - **Independent and re-runnable.** Each driver owns its `live.rocky.toml`,

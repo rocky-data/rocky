@@ -8,15 +8,13 @@ import pytest
 
 from dagster_rocky.types import (
     AiContractOutput,
-    ApplyOutput,
     CatalogOutput,
     CiResult,
     ColumnLineageResult,
     CompileResult,
     DiscoverResult,
     DoctorResult,
-    DriftActionKind,
-    DriftDetectResult,
+    GcApplyOutput,
     HealthStatus,
     HistoryResult,
     MetricsResult,
@@ -358,10 +356,6 @@ def test_parse_run(run_json: str):
     assert len(result.drift.actions_taken) == 1
     assert result.drift.actions_taken[0].action == "drop_and_recreate"
 
-    # Contracts
-    assert result.contracts is not None
-    assert result.contracts.passed is True
-
     # Anomalies
     assert len(result.anomalies) == 1
     assert result.anomalies[0].deviation_pct == 1.2
@@ -426,15 +420,16 @@ def test_parse_plan_with_run_spine(plan_with_run_spine_json: str):
 
 
 def test_parse_apply(apply_json: str):
-    """ApplyOutput envelope wrapping a run result."""
-    result = ApplyOutput.model_validate_json(apply_json)
+    """``rocky apply`` emits NO wrapping envelope. A ``gc`` plan's apply prints
+    ``command:"apply"`` with gc markers, which ``parse_rocky_output`` routes to
+    the generated ``GcApplyOutput`` (the old hand-written ``ApplyOutput`` envelope
+    the engine never emitted was removed)."""
+    result = GcApplyOutput.model_validate_json(apply_json)
     assert result.command == "apply"
     assert result.plan_id == "a" * 64
-    assert result.plan_kind == "run"
-    assert result.success is True
-    assert isinstance(result.result, dict)
-    assert result.result["command"] == "run"
-    assert isinstance(parse_rocky_output(apply_json), ApplyOutput)
+    assert result.evicted_count == 1
+    assert result.evicted[0].model_name == "stale_model"
+    assert isinstance(parse_rocky_output(apply_json), GcApplyOutput)
 
 
 def test_parse_state(state_json: str):
@@ -659,7 +654,7 @@ def test_parse_rocky_output_auto_detect(
     metrics_json: str,
     optimize_json: str,
     doctor_json: str,
-    drift_json: str,
+    apply_json: str,
     catalog_json: str,
 ):
     assert isinstance(parse_rocky_output(discover_json), DiscoverResult)
@@ -674,7 +669,7 @@ def test_parse_rocky_output_auto_detect(
     assert isinstance(parse_rocky_output(metrics_json), MetricsResult)
     assert isinstance(parse_rocky_output(optimize_json), OptimizeResult)
     assert isinstance(parse_rocky_output(doctor_json), DoctorResult)
-    assert isinstance(parse_rocky_output(drift_json), DriftDetectResult)
+    assert isinstance(parse_rocky_output(apply_json), GcApplyOutput)
     assert isinstance(parse_rocky_output(catalog_json), CatalogOutput)
 
 
@@ -694,19 +689,6 @@ def test_parse_non_dict_json_raises_value_error(payload: str):
     ValueError, not crash on ``.get`` with an uncaught AttributeError."""
     with pytest.raises(ValueError, match="not a JSON object"):
         parse_rocky_output(payload)
-
-
-def test_parse_drift_result(drift_json: str):
-    result = DriftDetectResult.model_validate_json(drift_json)
-    assert result.command == "drift"
-    assert result.tables_checked == 3
-    assert result.tables_drifted == 1
-    assert len(result.results) == 1
-    table_result = result.results[0]
-    assert table_result.action == DriftActionKind.drop_and_recreate
-    assert table_result.drifted_columns[0].name == "status"
-    assert table_result.drifted_columns[0].source_type == "STRING"
-    assert table_result.drifted_columns[0].target_type == "INT"
 
 
 def test_run_result_without_optional_fields():
@@ -732,7 +714,12 @@ def test_run_result_without_optional_fields():
     assert result.execution is None
     assert result.metrics is None
     assert result.anomalies == []
-    assert result.contracts is None
+    # New backfilled fields default cleanly on a minimal payload.
+    assert result.status is None
+    assert result.tables_skipped == 0
+    assert result.interrupted is False
+    assert result.quarantine == []
+    assert result.model_decisions == []
 
 
 def test_parse_doctor(doctor_json: str):

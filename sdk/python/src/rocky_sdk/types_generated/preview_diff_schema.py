@@ -108,9 +108,9 @@ class PreviewStructuralDiff(BaseModel):
     Column-level structural diff. Mirrors the shape produced by `rocky ci-diff` at the column granularity.
     """
 
-    added_columns: list[str]
-    removed_columns: list[str]
-    type_changes: list[PreviewColumnTypeChange]
+    added_columns: list[str] | None = None
+    removed_columns: list[str] | None = None
+    type_changes: list[PreviewColumnTypeChange] | None = None
     """
     One entry per column whose type changed. Each carries `name`, `from`, `to`.
     """
@@ -136,7 +136,7 @@ class PreviewSampledRowDiff(BaseModel):
     rows_added: conint(ge=0)
     rows_changed: conint(ge=0)
     rows_removed: conint(ge=0)
-    samples: list[PreviewRowSample]
+    samples: list[PreviewRowSample] | None = None
     """
     Up to `--max-samples` (default 5) representative changed rows for human review. Pure noise when sampling found no change.
     """
@@ -150,7 +150,7 @@ class PreviewBisectionRowDiff(BaseModel):
     rows_added: conint(ge=0)
     rows_changed: conint(ge=0)
     rows_removed: conint(ge=0)
-    samples: list[PreviewRowSample]
+    samples: list[PreviewRowSample] | None = None
     """
     Up to `--max-samples` (default 5) representative changed rows surfaced from the leaves. Bisection samples only carry the primary key — column-level diffs are not retained on the kernel's leaf record. Empty when no rows differ.
     """

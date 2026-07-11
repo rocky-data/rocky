@@ -6,10 +6,21 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-# Use the freshly-built engine binary by default (the smoke runner's bare
-# `rocky` on PATH is often a stale install that predates --defer). Override
-# with ROCKY_BIN=... to point at a different binary.
-ROCKY_BIN="${ROCKY_BIN:-$(git rev-parse --show-toplevel)/engine/target/release/rocky}"
+# Binary resolution: honor $ROCKY_BIN; inside the monorepo prefer the
+# freshly-built engine binary (the smoke runner's bare `rocky` on PATH is
+# often a stale install that predates --defer); outside a git checkout fall
+# back to `rocky` on PATH.
+if [ -z "${ROCKY_BIN:-}" ]; then
+  if repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" && [ -x "$repo_root/engine/target/release/rocky" ]; then
+    ROCKY_BIN="$repo_root/engine/target/release/rocky"
+  else
+    ROCKY_BIN="$(command -v rocky || true)"
+  fi
+fi
+if [ -z "$ROCKY_BIN" ]; then
+  echo "error: no rocky binary found. Set ROCKY_BIN, build the engine (cd engine && cargo build --release), or install rocky on PATH." >&2
+  exit 1
+fi
 
 mkdir -p expected
 # A single pinned state file so this POC's run history is self-contained and

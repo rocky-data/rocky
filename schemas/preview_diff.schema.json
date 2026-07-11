@@ -83,8 +83,7 @@
       "required": [
         "rows_added",
         "rows_changed",
-        "rows_removed",
-        "samples"
+        "rows_removed"
       ],
       "type": "object"
     },
@@ -296,8 +295,7 @@
       "required": [
         "rows_added",
         "rows_changed",
-        "rows_removed",
-        "samples"
+        "rows_removed"
       ],
       "type": "object"
     },
@@ -351,11 +349,6 @@
           "type": "array"
         }
       },
-      "required": [
-        "added_columns",
-        "removed_columns",
-        "type_changes"
-      ],
       "type": "object"
     }
   },

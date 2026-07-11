@@ -8,7 +8,7 @@
 /**
  * JSON output for `rocky retention-status`.
  *
- * Reports which models declare a `retention = "<N>[dy]"` sidecar value and — when `--drift` is set in a future wave — whether the warehouse's current retention matches. Today `warehouse_days` is always `None` because the probe is deferred to v2; the schema is stable so v2 can populate the field without a JSON shape break.
+ * Reports which models declare a `retention = "<N>[dy]"` sidecar value and — when `--drift` is set in a future release — whether the warehouse's current retention matches. Today `warehouse_days` is always `None` because the probe is deferred to v2; the schema is stable so v2 can populate the field without a JSON shape break.
  */
 export interface RetentionStatusOutput {
   command: string;

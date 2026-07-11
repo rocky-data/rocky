@@ -170,20 +170,35 @@
       "type": "object"
     },
     "AuditChainVerify": {
-      "description": "Verify-after link of the custody chain.\n\nPost-apply verification outcomes are not persisted to the state store today, so this link is always [`SectionAvailability::Unavailable`] with a note — never a smoothed-over \"verification passed\".",
+      "description": "Verify-after link of the custody chain.\n\nPost-apply verification outcomes are persisted to the decision ledger as custody rows with a non-empty `verify_after` check list — the two-step `rocky apply` gate writes one per verified apply, and the drift auto-apply path writes them under its `autoapply-verify:<run_id>` plan id. This link renders those rows for the subject's plan. When none exist the link says so plainly (\"not recorded\") — never a smoothed-over \"verification passed\".",
       "properties": {
         "availability": {
           "$ref": "#/definitions/SectionAvailability"
+        },
+        "entries": {
+          "description": "The verification outcomes, newest first.",
+          "items": {
+            "$ref": "#/definitions/AuditVerifyEntry"
+          },
+          "type": "array"
         },
         "note": {
           "type": [
             "string",
             "null"
           ]
+        },
+        "total": {
+          "description": "Count of verification custody rows found for the subject.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
         }
       },
       "required": [
-        "availability"
+        "availability",
+        "entries",
+        "total"
       ],
       "type": "object"
     },
@@ -328,6 +343,42 @@
           "type": "string"
         }
       ]
+    },
+    "AuditVerifyEntry": {
+      "description": "One post-apply verification outcome inside [`AuditChainVerify`] — a decision-ledger custody row with a non-empty `verify_after` check list.\n\nThe ledger records the required check names, the aggregate verdict (`allow` = every named check passed, `deny` = a check failed or was absent and the apply halted), and a human-readable reason; per-check pass/fail detail beyond that lives only in the reason string, which is rendered verbatim rather than re-parsed.",
+      "properties": {
+        "checks": {
+          "description": "The named post-apply checks the verification required.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "passed": {
+          "description": "Whether the verification passed (`allow` custody row) or failed (`deny`).",
+          "type": "boolean"
+        },
+        "plan_id": {
+          "description": "The plan id the custody row was filed under (the applied plan, or the auto-apply path's `autoapply-verify:<run_id>`).",
+          "type": "string"
+        },
+        "reason": {
+          "description": "The recorded outcome, verbatim from the custody row.",
+          "type": "string"
+        },
+        "timestamp": {
+          "description": "RFC 3339 timestamp when the verification outcome was recorded.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "checks",
+        "passed",
+        "plan_id",
+        "reason",
+        "timestamp"
+      ],
+      "type": "object"
     },
     "PolicyCapability": {
       "description": "The class of action a policy rule governs.\n\n`read` is always allowed (short-circuit). The mutating verbs (`propose` … `quarantine`) name coarse operations; `schema_change.additive`, `schema_change.breaking`, and `value_change` are *refinements* of the apply/promote verbs — a rule naming a bare verb (`apply`/`promote`) matches those refinements too, but a rule naming a refinement matches only that exact refinement.",
@@ -483,7 +534,7 @@
       ]
     }
   },
-  "description": "JSON output for `rocky audit --for <table|run|plan>` — the custody chain.\n\nA one-query drill-down assembled link by link from the data Rocky already records: who proposed the change and what the policy plane decided ([`Self::decisions`]), what the plan changed ([`Self::plan`]), which runs materialized it ([`Self::runs`]), what a post-apply verification found ([`Self::verify_after`]), and what sits downstream in its blast radius ([`Self::blast_radius`]).\n\nEvery link fails closed the same way the estate brief does: a link whose signal is genuinely not recorded renders [`SectionAvailability::Unavailable`] with a note, never a fabricated or assumed value. Notably, post-apply verification outcomes are not persisted anywhere today, so [`Self::verify_after`] is always `unavailable`; and the run ledger is not keyed to policy decisions, so a `run` selector cannot join back to a decision. The blast radius is recomputed from the current compiled graph (a live query, not a stored snapshot).",
+  "description": "JSON output for `rocky audit --for <table|run|plan>` — the custody chain.\n\nA one-query drill-down assembled link by link from the data Rocky already records: who proposed the change and what the policy plane decided ([`Self::decisions`]), what the plan changed ([`Self::plan`]), which runs materialized it ([`Self::runs`]), what a post-apply verification found ([`Self::verify_after`]), and what sits downstream in its blast radius ([`Self::blast_radius`]).\n\nEvery link fails closed the same way the estate brief does: a link whose signal is genuinely not recorded renders [`SectionAvailability::Unavailable`] with a note, never a fabricated or assumed value. Post-apply verification outcomes are persisted as decision-ledger custody rows (non-empty `verify_after`), so [`Self::verify_after`] renders them when they exist and says \"not recorded\" when none exist for the subject. The run ledger is not keyed to policy decisions, so a `run` selector cannot join back to a decision. The blast radius is recomputed from the current compiled graph (a live query, not a stored snapshot).",
   "properties": {
     "blast_radius": {
       "allOf": [
@@ -542,7 +593,7 @@
           "$ref": "#/definitions/AuditChainVerify"
         }
       ],
-      "description": "What a post-apply verification found — not recorded today."
+      "description": "What a post-apply verification found — the verification custody rows recorded against the subject's plan."
     },
     "version": {
       "type": "string"

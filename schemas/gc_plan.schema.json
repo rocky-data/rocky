@@ -5,7 +5,7 @@
       "description": "One artifact scheduled for eviction inside a persisted `rocky gc` plan ([`GcPlan`]).\n\nCaptures the identity of a single derivable artifact — enough to (a) re-locate its exact ledger row at apply time, (b) re-verify eligibility against the live ledger, and (c) write a complete restore tombstone. The recipe-identity triple is captured at plan time from the producing execution.",
       "properties": {
         "blake3_hash": {
-          "description": "Content hash (hex) of the artifact bytes — the eviction unit and the identity a restore re-computes and compares against.",
+          "description": "Content hash (hex) of the artifact bytes — the eviction unit and the identity a restore would re-compute and compare against.",
           "type": "string"
         },
         "commit_version": {
@@ -22,7 +22,7 @@
           ]
         },
         "file_path": {
-          "description": "Object-store path of the artifact — the byte location a physical reclamation deletes and a restore re-materializes to.",
+          "description": "Object-store path of the artifact — the byte location a physical reclamation deletes and a restore would re-materialize to.",
           "type": "string"
         },
         "hash_scheme": {
@@ -58,7 +58,7 @@
           ]
         },
         "run_id": {
-          "description": "Run that produced it — half of the provenance key restore replays from.",
+          "description": "Run that produced it — half of the provenance key a restore would replay from.",
           "type": "string"
         },
         "size_bytes": {
@@ -103,7 +103,7 @@
       "type": "array"
     },
     "notes": {
-      "description": "Operator caveats (re-verification at apply, restore safety net, scope).",
+      "description": "Operator caveats (e.g. re-verification at apply, scope). Each eviction records what a restore will need; `rocky restore` itself is a planned follow-up.",
       "items": {
         "type": "string"
       },

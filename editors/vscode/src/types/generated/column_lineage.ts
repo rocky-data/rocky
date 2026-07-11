@@ -12,7 +12,7 @@ export interface ColumnLineageOutput {
   column: string;
   command: string;
   /**
-   * Direction of the trace walk: `"upstream"` (producers) or `"downstream"` (consumers). Defaults to upstream when `--column` is set without direction flags, matching pre-Arc-1 behaviour.
+   * Direction of the trace walk: `"upstream"` (producers) or `"downstream"` (consumers). Defaults to upstream when `--column` is set without direction flags, matching the historical default.
    */
   direction: string;
   /**

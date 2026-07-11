@@ -108,11 +108,6 @@ def doctor_json() -> str:
 
 
 @pytest.fixture
-def drift_json() -> str:
-    return json.dumps(scenarios.DRIFT)
-
-
-@pytest.fixture
 def compliance_json() -> str:
     return json.dumps(scenarios.COMPLIANCE)
 

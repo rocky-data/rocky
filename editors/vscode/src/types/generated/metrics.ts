@@ -11,9 +11,9 @@
  * All optional fields are present-or-absent depending on the flags (`--trend`, `--alerts`, `--column`). The empty case (no snapshots available) sets `message` and leaves the collections empty.
  */
 export interface MetricsOutput {
-  alerts: MetricsAlert[];
+  alerts?: MetricsAlert[];
   column?: string | null;
-  column_trend: ColumnTrendPoint[];
+  column_trend?: ColumnTrendPoint[];
   command: string;
   count: number;
   message?: string | null;

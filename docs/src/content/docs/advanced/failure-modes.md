@@ -138,10 +138,23 @@ The dispatched adapter classifies its own failures:
 | DuckDB | File lock contention, out-of-memory on large CTAS |
 | Fivetran / Airbyte | `403 Forbidden` (missing API scope), connector currently syncing |
 
+### Classified retry
+
+Since engine 1.58.0 the run loop retries proven-transient failures itself, **on by default**. A model whose materialization fails is classified via the adapter's own retryable judgement into `Transient`, `Permanent`, or `Unknown`; only a *proven* transient failure (a 429, a connection reset, a warehouse warming up, a lock conflict) is re-run, with capped exponential backoff. `Permanent` and `Unknown` failures are never retried, and auth errors are never retried even when an adapter labels them transient — expired credentials don't heal on a second attempt. Every retry is recorded as an attempt trail on the execution record and surfaced in the run's JSON output.
+
+```toml
+[resilience]
+transient_max_retries = 2   # default; at most three attempts per model. 0 opts out.
+```
+
+A run-loop circuit breaker backs this up: after several consecutive transient model failures (default 3) no further model is retried for the rest of the run, so a systemically unhealthy warehouse fails fast instead of multiplying the retry budget across the DAG. Set `transient_max_retries = 0` (or `[resilience] enabled = false`) to restore the prior single-attempt behavior, for example in CI where a fast fail is preferred.
+
+The consequence for orchestrators: by the time a `failure_kind: "transient"` entry reaches your `errors[*]`, the engine has already retried it within the run. An immediate external retry duplicates work; prefer a delayed re-run or `--resume-latest`.
+
 **Recovery playbook.**
 
 1. Run `rocky doctor --output json` first. The `adapters[]` block tells you which adapter Rocky thinks should work and which it currently can't reach. Treat doctor as a credentials / connectivity smoke test.
-2. For **transient** failures (entries with `failure_kind: "transient"` or `"connection-failed"` on `errors[*]`), use `rocky plan --resume-latest && rocky apply <plan-id>` (or the single-step `rocky run --resume-latest` alias) to pick up where the failed run left off rather than restarting from scratch.
+2. For **transient** failures (entries with `failure_kind: "transient"` or `"connection-failed"` on `errors[*]`), the engine has already retried them in-run (see [Classified retry](#classified-retry)) — a failure that still surfaced exhausted its retry budget. Once the underlying condition clears, use `rocky plan --resume-latest && rocky apply <plan-id>` (or the single-step `rocky run --resume-latest` alias) to pick up where the failed run left off rather than restarting from scratch.
 3. For **auth** failures, walk the adapter's auth chain (e.g. Snowflake: OAuth → JWT → password) and verify the env-vars / config in `rocky.toml`. The [authentication guide](../../reference/authentication) has the per-adapter checklist.
 4. For **quota** failures, check the warehouse-side quota dashboard. Rocky's adaptive concurrency (Databricks AIMD throttle) automatically backs off, but a hard quota reset is a warehouse-side action.
 5. For **statement timeouts**, increase `timeout_secs` on the adapter, or better, re-evaluate whether the model's materialization strategy is right (a multi-hour `FullRefresh` is often a missed `Merge` or `Incremental` opportunity; `rocky optimize` will surface the recommendation).

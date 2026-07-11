@@ -5,4 +5,4 @@ type = "full_refresh"
 # don't honor `${VAR}` env substitution today (see live/README.md).
 [target]
 catalog = "__GCP_PROJECT__"
-schema = "hc_phase21_cost_check"
+schema = "poc_step21_cost_check"

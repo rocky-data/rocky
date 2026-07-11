@@ -47,7 +47,7 @@ The full-refresh run is the primary receipt the top-level script captures; the o
     └── cost-cross-check/              bytes_scanned vs `bq show -j` totalBytesBilled
 ```
 
-Each `live/<scenario>/run.sh` is independent: own `live.rocky.toml`, own model(s), own `hc_phase*` dataset, trap-cleanup on exit. They can run in any order. The top-level `./run.sh` runs the full-refresh live demo directly; the other surfaces are runnable individually under `live/`.
+Each `live/<scenario>/run.sh` is independent: own `live.rocky.toml`, own model(s), own `poc_step*` dataset, trap-cleanup on exit. They can run in any order. The top-level `./run.sh` runs the full-refresh live demo directly; the other surfaces are runnable individually under `live/`.
 
 ## Prerequisites
 
@@ -83,7 +83,7 @@ export BQ_LOCATION="EU"   # optional; default EU
 ./run.sh
 ```
 
-The script creates the `hc_phase4_poc` dataset, runs `rocky run --output json`, captures the receipt to `expected/run.json`, queries the target table back to confirm the row landed, and drops the dataset on exit (success or failure).
+The script creates the `poc_step4_poc` dataset, runs `rocky run --output json`, captures the receipt to `expected/run.json`, queries the target table back to confirm the row landed, and drops the dataset on exit (success or failure).
 
 `GCP_PROJECT_ID` is templated into the staged `live.rocky.toml` and model files at runtime via a `__GCP_PROJECT__` placeholder; no project ID is checked into the repo. See [`live/README.md`](./live/README.md) for details.
 
@@ -98,7 +98,7 @@ Full BigQuery surface tour, one scenario at a time:
 ./live/cost-cross-check/run.sh
 ```
 
-Each driver creates its own `hc_phase*_*` dataset, runs end-to-end, and cleans up on exit.
+Each driver creates its own `poc_step*_*` dataset, runs end-to-end, and cleans up on exit.
 
 ## Recording
 
@@ -118,7 +118,7 @@ The live demo prints a subset of the run receipt for fast inspection:
 
 ```
 ==> rocky run receipt (subset)
-    asset_key       : <project>.hc_phase4_poc.full_refresh_demo
+    asset_key       : <project>.poc_step4_poc.full_refresh_demo
     strategy        : full_refresh
     duration_ms     : 1748
     bytes_scanned   : 0
