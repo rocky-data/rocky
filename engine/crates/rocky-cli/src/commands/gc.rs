@@ -3398,9 +3398,14 @@ auto_create_schemas = true
         )
         .await
         .expect_err("a malformed [gc] config must hard-error, not silently disable");
+        // The hard error may surface from either config-load seam — the
+        // policy pre-check ("… failed to load, so any configured [policy]
+        // rules cannot be enforced") runs before the `[gc] physical_delete`
+        // resolution — and both satisfy the invariant under test: a
+        // malformed config never silently degrades into "tombstone+retire".
         assert!(
             err.to_string().contains("physical_delete")
-                || err.to_string().contains("failed to load config"),
+                || err.to_string().contains("failed to load"),
             "got: {err}"
         );
         let store = StateStore::open(&state_path).unwrap();
