@@ -213,18 +213,37 @@ pub struct EmbeddedCapabilities {
     /// are not gated.
     #[serde(default)]
     pub changed: BTreeMap<String, PolicyCapability>,
-    /// Content fingerprint of the models directory the gate authorized at plan
-    /// time (a hash of every model file's path + bytes — see
-    /// `apply::models_dir_fingerprint`). Bound into the `plan_id` (it lives in
-    /// the hashed payload). At apply time the executing content is
-    /// re-fingerprinted and REJECTED (fail-closed) if it differs — a model
-    /// changed `additive → breaking`, or a new protected model added, between
-    /// plan authoring and execution can no longer run under the stale
-    /// authorization. `None` on a legacy plan or when the models dir could not
-    /// be read (the apply then falls back to the pre-fingerprint behaviour).
+    /// Compiled-IR execution fingerprint the gate authorized at plan time (see
+    /// `apply::execution_ir_fingerprint`): the typed-config + SQL projection plus
+    /// the routing config identity. Bound into the `plan_id` (it lives in the
+    /// hashed payload). At apply the executing compiled set is re-fingerprinted
+    /// at the execution choke-point and REFUSED (fail-closed) on mismatch.
+    ///
+    /// `None` means the fingerprint could not be produced at plan time (the head
+    /// did not compile). For a **new** plan (`fingerprint_version >= 1`) that is
+    /// a production failure → the governed apply REFUSES (finding #7). For a
+    /// **legacy** plan (`fingerprint_version == 0`, written before this feature)
+    /// the check is skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_fingerprint: Option<String>,
+    /// The routing config identity (`apply::config_policy_identity`) the gate
+    /// authorized — the physical destination / adapter-target shape, credentials
+    /// excluded. Verified BEFORE any replication/governance mutation (finding
+    /// #4/#5), so a `path`/adapter/target swap is refused before the first
+    /// warehouse statement. `None` on a legacy plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_identity: Option<String>,
+    /// Fingerprint feature version. `0` (serde default) marks a genuinely-legacy
+    /// plan written before the TOCTOU fingerprint existed — its checks are
+    /// skipped. Every plan THIS binary writes stamps `>= 1`, so a `>= 1` plan
+    /// with a `None` `models_fingerprint`/`config_identity` is a production
+    /// FAILURE and the governed apply REFUSES (finding #7 — legacy vs failure).
+    #[serde(default)]
+    pub fingerprint_version: u32,
 }
+
+/// The fingerprint feature version this binary stamps onto every plan it writes.
+pub const CURRENT_FINGERPRINT_VERSION: u32 = 1;
 
 /// The principal an absent stamp resolves to, **by kind** (never a blanket
 /// `human`): an `ai_authored` plan is agent-authored by construction
@@ -1126,6 +1145,8 @@ mod tests {
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
+            config_identity: None,
+            fingerprint_version: 0,
         };
         let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
         assert_eq!(
@@ -1145,6 +1166,8 @@ mod tests {
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
+            config_identity: None,
+            fingerprint_version: 0,
         };
         assert!(caps.touched(&[]).is_empty());
     }
@@ -1166,6 +1189,8 @@ mod tests {
             diff_available: true,
             changed,
             models_fingerprint: None,
+            config_identity: None,
+            fingerprint_version: 0,
         };
         let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
         assert_eq!(
@@ -1192,6 +1217,8 @@ mod tests {
             diff_available: true,
             changed,
             models_fingerprint: None,
+            config_identity: None,
+            fingerprint_version: 0,
         };
         // Only `orders` executes; the change to the non-executing `customers`
         // is absent from the touched set.

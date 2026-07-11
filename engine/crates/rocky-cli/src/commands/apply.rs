@@ -276,12 +276,18 @@ fn governed_run_context<'a>(
     if principal != PolicyPrincipal::Agent {
         return None;
     }
+    let embedded = plan.embedded_capabilities();
     Some(GovernedRunContext {
         principal,
         plan_id,
         root,
         config_path,
-        expected_ir_fingerprint: plan.embedded_capabilities().models_fingerprint,
+        expected_ir_fingerprint: embedded.models_fingerprint,
+        expected_config_identity: embedded.config_identity,
+        // A `fingerprint_version >= 1` plan is a NEW plan this binary wrote and
+        // MUST carry a fingerprint; version 0 is genuinely legacy (skip).
+        require_fingerprint: embedded.fingerprint_version
+            >= crate::plan_store::CURRENT_FINGERPRINT_VERSION,
     })
 }
 
@@ -993,29 +999,47 @@ pub(crate) fn execution_ir_fingerprint(
     Some(hasher.finalize().to_hex().to_string())
 }
 
-/// The env-resolved, **secret-free** config identity relevant to authorization:
-/// each adapter's `type` (catches an adapter-type swap under the same name) and
-/// each pipeline's target adapter (catches a default-adapter swap) — resolved
-/// from the loaded config, which already substituted `${VAR}`. Excludes hosts,
-/// tokens, paths, and all connection secrets so a rotated credential never
-/// causes a spurious mismatch.
+/// The env-resolved, **routing** config identity that authorization depends on —
+/// the physical destination and adapter/target shape, with connection
+/// **credentials excluded** (finding #4).
+///
+/// Each adapter and pipeline is serialized in full via `serde_json::to_value`
+/// (sorted keys — serde_json has no `preserve_order`). Every credential field is
+/// a [`RedactedString`](rocky_core::redacted::RedactedString), whose `Serialize`
+/// writes `"***"`, so tokens / passwords / api-keys / secrets are excluded **by
+/// construction** while every routing field — `host`, `account`, `database`,
+/// `project_id`, `location`, `warehouse`, `path`, `http_path`, the target
+/// `catalog_template` / `schema_template`, the target adapter, and per-pipeline
+/// governance — is captured. So swapping `path = a.duckdb → b.duckdb` (a
+/// different physical DB), swapping the adapter type, or changing a target
+/// template / governance tag CHANGES the identity (→ refuse), while rotating a
+/// credential does NOT (→ no spurious refuse). New secret fields are
+/// auto-redacted; new routing fields are auto-included.
 pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> String {
-    let adapters: BTreeMap<&str, &str> = cfg
+    let adapters: BTreeMap<&str, serde_json::Value> = cfg
         .adapters
         .iter()
-        .map(|(name, a)| (name.as_str(), a.adapter_type.as_str()))
+        .map(|(name, a)| {
+            (
+                name.as_str(),
+                serde_json::to_value(a).unwrap_or(serde_json::Value::Null),
+            )
+        })
         .collect();
-    let pipelines: BTreeMap<&str, String> = cfg
+    let pipelines: BTreeMap<&str, serde_json::Value> = cfg
         .pipelines
         .iter()
         .map(|(name, p)| {
             (
                 name.as_str(),
-                format!("{}:{}", p.pipeline_type_str(), p.target_adapter()),
+                serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
             )
         })
         .collect();
-    serde_json::json!({ "adapters": adapters, "pipelines": pipelines }).to_string()
+    // Canonicalize (sorted keys) via `to_value`, then a stable string.
+    serde_json::to_value(serde_json::json!({ "adapters": adapters, "pipelines": pipelines }))
+        .map(|v| v.to_string())
+        .unwrap_or_default()
 }
 
 /// The TOCTOU check threaded to the single execution choke-point
@@ -1026,22 +1050,37 @@ pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> S
 #[derive(Clone)]
 pub struct ExecFingerprintGate {
     /// The IR fingerprint the plan authorized (from `EmbeddedCapabilities`).
-    /// `None` only for a genuinely-legacy plan (no bound fingerprint) → skip.
+    /// `None` on a legacy plan (skip) OR a production fingerprint failure — the
+    /// two are told apart by `require`.
     pub expected: Option<String>,
     /// The config identity computed from the execute-time config.
     pub config_identity: String,
     /// The plan id, for the refusal message.
     pub plan_id: String,
+    /// `true` when the plan is a NEW (`fingerprint_version >= 1`) governed plan
+    /// that MUST carry a fingerprint (finding #7): a `None` `expected` here is a
+    /// production failure and REFUSES, not a legacy skip.
+    pub require: bool,
 }
 
 impl ExecFingerprintGate {
     /// Fail-closed: recompute the IR fingerprint over the exact compiled set
-    /// about to execute and bail on mismatch. A legacy plan (no bound
-    /// fingerprint) is allowed through; a fingerprint-production failure over
-    /// the live set is a refusal.
+    /// about to execute and bail on mismatch. A genuinely-legacy plan (no bound
+    /// fingerprint AND `!require`) is allowed through; a NEW plan whose
+    /// fingerprint is missing (`require && expected.is_none()`) is REFUSED
+    /// (production failure, #7); and a live mismatch is refused.
     pub(crate) fn verify(&self, models: &[rocky_core::models::Model]) -> Result<()> {
         let Some(expected) = self.expected.as_deref() else {
-            return Ok(()); // legacy plan — no bound fingerprint
+            if self.require {
+                bail!(
+                    "refusing to execute plan '{}': it is a governed plan whose execution \
+                     fingerprint could not be produced at plan time (the project did not \
+                     compile), so its execution cannot be authorized. Re-plan with `rocky plan` \
+                     (and fix any compile error) before applying.",
+                    self.plan_id
+                );
+            }
+            return Ok(()); // genuinely-legacy plan — no bound fingerprint
         };
         let actual = execution_ir_fingerprint(models, &self.config_identity);
         if actual.as_deref() != Some(expected) {
@@ -1088,8 +1127,14 @@ pub struct GovernedRunContext<'a> {
     pub config_path: &'a Path,
     /// The plan-authorized compiled-IR fingerprint (from `EmbeddedCapabilities`)
     /// — checked at the execution choke-point to close the gate/execute TOCTOU.
-    /// `None` only for a genuinely-legacy plan.
     pub expected_ir_fingerprint: Option<String>,
+    /// The plan-authorized routing config identity — verified BEFORE any
+    /// replication/governance mutation (finding #4/#5). `None` on a legacy plan.
+    pub expected_config_identity: Option<String>,
+    /// `true` when the plan is a NEW governed plan (`fingerprint_version >= 1`)
+    /// that MUST carry a fingerprint/identity: a missing one is a production
+    /// failure and REFUSES (finding #7), not a legacy skip.
+    pub require_fingerprint: bool,
 }
 
 impl GovernedRunContext<'_> {
@@ -1103,6 +1148,38 @@ impl GovernedRunContext<'_> {
             expected: self.expected_ir_fingerprint.clone(),
             config_identity: config_policy_identity(cfg),
             plan_id: self.plan_id.to_string(),
+            require: self.require_fingerprint,
+        }
+    }
+
+    /// Fail-closed pre-mutation routing gate (finding #4/#5): verify the
+    /// execute-time routing config identity matches what the plan authorized,
+    /// BEFORE any replication/governance warehouse statement runs. A `path` /
+    /// adapter / target swap between plan and apply (e.g. duckdb→snowflake, or
+    /// `a.duckdb`→`b.duckdb`) is refused before a single DDL executes. A
+    /// genuinely-legacy plan (`!require` and no stored identity) is allowed
+    /// through; a NEW plan with a missing identity is refused (#7).
+    pub(crate) fn verify_routing_identity(
+        &self,
+        cfg: &rocky_core::config::RockyConfig,
+    ) -> Result<()> {
+        let actual = config_policy_identity(cfg);
+        match self.expected_config_identity.as_deref() {
+            Some(expected) if expected == actual => Ok(()),
+            Some(_) => bail!(
+                "refusing to execute plan '{}': the resolved routing config (adapter / physical \
+                 destination / target / governance) changed since the plan was authorized — a \
+                 different warehouse or object would be written. Re-plan with `rocky plan` before \
+                 applying.",
+                self.plan_id
+            ),
+            None if self.require_fingerprint => bail!(
+                "refusing to execute plan '{}': it is a governed plan whose routing identity \
+                 could not be produced at plan time, so its physical destination cannot be \
+                 authorized. Re-plan with `rocky plan` before applying.",
+                self.plan_id
+            ),
+            None => Ok(()), // genuinely-legacy plan
         }
     }
 }
@@ -1655,7 +1732,19 @@ async fn run_apply_backfill_plan(
         config_path,
     );
     let exec_fp_gate = match (governed.as_ref(), backfill_cfg.as_ref()) {
-        (Some(ctx), Some(cfg)) => Some(ctx.exec_fingerprint_gate(cfg)),
+        (Some(ctx), Some(cfg)) => {
+            // Fail-closed (#4/#5): verify the routing identity before executing.
+            ctx.verify_routing_identity(cfg)?;
+            Some(ctx.exec_fingerprint_gate(cfg))
+        }
+        // Fail-closed (#7): a governed backfill whose config would not load
+        // cannot be routing-verified — refuse rather than execute ungated.
+        (Some(_), None) => bail!(
+            "refusing to apply governed backfill plan '{plan_id}': the config at {} could not be \
+             loaded, so the execution's routing/identity cannot be verified against the plan. \
+             Fix the config and re-run `rocky apply {plan_id}`.",
+            config_path.display()
+        ),
         _ => None,
     };
 
@@ -2751,6 +2840,8 @@ effect = "deny"
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
+            config_identity: None,
+            fingerprint_version: 0,
         };
         let touched = caps.touched(&["m".to_string()]);
         assert!(!touched.is_empty(), "FIX 3 must synthesize a touched set");
@@ -2785,6 +2876,8 @@ effect = "deny"
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
+            config_identity: None,
+            fingerprint_version: 0,
         };
         let touched = caps.touched(&["m".to_string()]);
         let gate = super::evaluate_apply_policy(
@@ -2812,6 +2905,8 @@ effect = "deny"
             diff_available: true,
             changed: BTreeMap::new(),
             models_fingerprint: None,
+            config_identity: None,
+            fingerprint_version: 0,
         };
         let touched = caps.touched(&["m".to_string()]);
         let gate = super::evaluate_apply_policy(
@@ -2996,6 +3091,8 @@ effect = "allow"
                 c
             },
             models_fingerprint: None,
+            config_identity: None,
+            fingerprint_version: 0,
         };
         // Both models execute; only stg_x changed.
         let touched = caps.touched(&["stg_x".to_string(), "prod_critical".to_string()]);
@@ -3415,49 +3512,160 @@ auto_create_schemas = true
         );
     }
 
-    /// 🔴 E config dimension: `config_policy_identity` changes on an
-    /// adapter-type swap (identical model bytes), and that change flows into the
-    /// fingerprint — so a rocky.toml adapter/target change between plan and
-    /// apply refuses. Secrets (host/token) are NOT in the identity, so a rotated
-    /// credential does not spuriously refuse.
+    /// 🔴 #4 (routing identity): `config_policy_identity` captures ROUTING —
+    /// the physical destination (`path`), account, adapter type, target — so a
+    /// change there refuses; but a CREDENTIAL change (token/password, a
+    /// `RedactedString`) does NOT, because it serializes to `"***"`. This is the
+    /// corrected equality (round-5 wrongly treated `path` as a secret).
     #[test]
-    fn config_identity_tracks_adapter_swap_not_secrets() {
+    fn config_identity_captures_routing_but_not_credentials() {
         fn cfg(body: &str) -> rocky_core::config::RockyConfig {
             let dir = tempfile::tempdir().unwrap();
             let p = dir.path().join("rocky.toml");
             std::fs::write(&p, body).unwrap();
             rocky_core::config::load_rocky_config(&p).unwrap()
         }
-        let duck = cfg(
-            "[adapter]\ntype = \"duckdb\"\npath = \"a.duckdb\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        let base = |path: &str, tok: &str| {
+            format!(
+                "[adapter]\ntype = \"databricks\"\nhost = \"h.example.com\"\nhttp_path = \"{path}\"\ntoken = \"{tok}\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n"
+            )
+        };
+        let id_a = super::config_policy_identity(&cfg(&base("/sql/1", "SECRET_A")));
+        // A rotated CREDENTIAL (token, a RedactedString) must NOT change the
+        // identity — it serializes to "***".
+        assert_eq!(
+            id_a,
+            super::config_policy_identity(&cfg(&base("/sql/1", "SECRET_B"))),
+            "a rotated credential must not change the routing identity (no spurious refuse)"
         );
-        let duck_rotated = cfg(
-            "[adapter]\ntype = \"duckdb\"\npath = \"b.duckdb\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        // The identity must NOT leak the secret.
+        assert!(
+            !id_a.contains("SECRET_A"),
+            "the identity must redact credentials"
         );
-        let snow = cfg(
-            "[adapter]\ntype = \"snowflake\"\naccount = \"x\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        // A ROUTING change (http_path — where statements are sent) MUST change it.
+        assert_ne!(
+            id_a,
+            super::config_policy_identity(&cfg(&base("/sql/2", "SECRET_A"))),
+            "a routing change (http_path) must change the identity"
         );
 
-        let id_duck = super::config_policy_identity(&duck);
-        // A different path (a connection secret/detail) must NOT change the identity.
-        assert_eq!(
-            id_duck,
-            super::config_policy_identity(&duck_rotated),
-            "a connection detail (path) must not change the identity — no spurious refuse"
-        );
-        // An adapter-type swap MUST change it.
+        // A DuckDB `path` swap (a different physical DB file) MUST change it.
+        let duck = |path: &str| {
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{path}\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n"
+            )
+        };
         assert_ne!(
-            id_duck,
-            super::config_policy_identity(&snow),
-            "an adapter-type swap must change the config identity"
+            super::config_policy_identity(&cfg(&duck("a.duckdb"))),
+            super::config_policy_identity(&cfg(&duck("b.duckdb"))),
+            "a DuckDB path swap writes a different physical DB — must change the identity"
         );
-        // And that flows into the fingerprint (same models, different identity).
+        // An adapter-type swap MUST change it, and it flows into the fingerprint.
+        let snow = super::config_policy_identity(&cfg(
+            "[adapter]\ntype = \"snowflake\"\naccount = \"x\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n",
+        ));
         let models: Vec<rocky_core::models::Model> = Vec::new();
         assert_ne!(
-            super::execution_ir_fingerprint(&models, &id_duck),
-            super::execution_ir_fingerprint(&models, &super::config_policy_identity(&snow)),
-            "the config identity must change the execution fingerprint"
+            super::execution_ir_fingerprint(&models, &id_a),
+            super::execution_ir_fingerprint(&models, &snow),
+            "the routing identity must change the execution fingerprint"
         );
+    }
+
+    /// 🔴 #7 (fail-closed on fingerprint-production failure): a NEW governed
+    /// plan (`require`) whose fingerprint is missing REFUSES; a genuinely-legacy
+    /// plan (`!require`, no fingerprint) is allowed; a live mismatch refuses.
+    #[test]
+    fn exec_fingerprint_gate_fail_closed_semantics() {
+        let m: Vec<rocky_core::models::Model> = Vec::new();
+        let expected = super::execution_ir_fingerprint(&m, "c").unwrap();
+        // Genuinely-legacy (no fingerprint, not required) → allowed.
+        super::ExecFingerprintGate {
+            expected: None,
+            config_identity: "c".to_string(),
+            plan_id: "p".to_string(),
+            require: false,
+        }
+        .verify(&m)
+        .expect("a legacy plan without a fingerprint is allowed through");
+        // NEW plan whose fingerprint could not be produced (required) → REFUSE.
+        let err = super::ExecFingerprintGate {
+            expected: None,
+            config_identity: "c".to_string(),
+            plan_id: "p".to_string(),
+            require: true,
+        }
+        .verify(&m)
+        .expect_err("a governed plan with no fingerprint must refuse (#7)");
+        assert!(err.to_string().contains("could not be produced"), "{err}");
+        // Matching → ok; live mismatch → refuse.
+        super::ExecFingerprintGate {
+            expected: Some(expected.clone()),
+            config_identity: "c".to_string(),
+            plan_id: "p".to_string(),
+            require: true,
+        }
+        .verify(&m)
+        .expect("a matching fingerprint applies");
+        assert!(
+            super::ExecFingerprintGate {
+                expected: Some(expected),
+                config_identity: "DIFFERENT".to_string(),
+                plan_id: "p".to_string(),
+                require: true,
+            }
+            .verify(&m)
+            .is_err(),
+            "a config-identity change must refuse"
+        );
+    }
+
+    /// 🔴 #4/#5 (pre-mutation routing gate): `verify_routing_identity` refuses a
+    /// routing change BEFORE any mutation, allows an unchanged/credential-only
+    /// config, refuses a required-but-missing identity (#7), and skips for a
+    /// genuinely-legacy plan.
+    #[test]
+    fn verify_routing_identity_semantics() -> anyhow::Result<()> {
+        fn cfg(dir: &Path, path: &str) -> rocky_core::config::RockyConfig {
+            let p = dir.join("rocky.toml");
+            std::fs::write(
+                &p,
+                format!("[adapter]\ntype = \"duckdb\"\npath = \"{path}\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n"),
+            )
+            .unwrap();
+            rocky_core::config::load_rocky_config(&p).unwrap()
+        }
+        let dir = tempfile::tempdir()?;
+        let cfg_a = cfg(dir.path(), "a.duckdb");
+        let cfg_b = cfg(dir.path(), "b.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let mk = |expected: Option<String>, require: bool| super::GovernedRunContext {
+            principal: PolicyPrincipal::Agent,
+            plan_id: "plan_x",
+            root: dir.path(),
+            config_path: &config_path,
+            expected_ir_fingerprint: None,
+            expected_config_identity: expected,
+            require_fingerprint: require,
+        };
+        let authorized = super::config_policy_identity(&cfg_a);
+        // Unchanged routing → proceeds.
+        mk(Some(authorized.clone()), true)
+            .verify_routing_identity(&cfg_a)
+            .expect("unchanged routing must not refuse");
+        // Routing change (path a→b) → REFUSE before any mutation.
+        let err = mk(Some(authorized), true)
+            .verify_routing_identity(&cfg_b)
+            .expect_err("a routing change must refuse");
+        assert!(err.to_string().contains("routing config"), "{err}");
+        // Required but missing identity (#7) → refuse.
+        assert!(mk(None, true).verify_routing_identity(&cfg_a).is_err());
+        // Genuinely-legacy (not required, no identity) → allowed.
+        mk(None, false)
+            .verify_routing_identity(&cfg_a)
+            .expect("a legacy plan skips the routing check");
+        Ok(())
     }
 
     /// 🔴 D regression: the discovered replication target set is gated. An
@@ -3485,6 +3693,8 @@ effect = "deny"
             root: dir.path(),
             config_path: &config,
             expected_ir_fingerprint: None,
+            expected_config_identity: None,
+            require_fingerprint: false,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         let err = ctx
@@ -3528,6 +3738,8 @@ effect = "allow"
             root: dir.path(),
             config_path: &config,
             expected_ir_fingerprint: None,
+            expected_config_identity: None,
+            require_fingerprint: false,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
 
@@ -3573,6 +3785,8 @@ effect = "allow"
             root: dir.path(),
             config_path: &dir.path().join("rocky.toml"),
             expected_ir_fingerprint: None,
+            expected_config_identity: None,
+            require_fingerprint: false,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         ctx.gate_replication_targets(&targets, &ledger)

@@ -1701,6 +1701,12 @@ pub async fn run(
     // executing anything. Read/record through the write handle `run` already
     // holds. (This supersedes the later per-`tables_to_process` gate.)
     if let Some(ctx) = governed_ctx {
+        // Fail-closed routing gate (#4/#5), BEFORE any warehouse statement:
+        // a `path`/adapter/target swap (e.g. duckdb→snowflake, a.duckdb→b.duckdb)
+        // between plan and apply would mutate a DIFFERENT physical destination —
+        // refuse before the replication DDL below, not after it.
+        ctx.verify_routing_identity(&rocky_cfg)?;
+
         let replication_targets: std::collections::BTreeSet<String> = connectors
             .iter()
             .filter(|conn| {
@@ -11391,6 +11397,7 @@ merge_keys = ["id"]
             expected: Some(fp1.clone()),
             config_identity: "cfg".to_string(),
             plan_id: "p".to_string(),
+            require: true,
         };
         let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
         let mut output = RunOutput::new(String::new(), 0, 1);
