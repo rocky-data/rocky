@@ -75,6 +75,11 @@ pub async fn run_transformation(
     run_vars: &rocky_core::run_vars::RunVars,
     // Governed-apply TOCTOU gate (E) — `Some` for an agent transformation apply.
     exec_fp_gate: Option<&super::apply::ExecFingerprintGate>,
+    // Finding #2 (missing-dir): the governed plan reviewed a non-empty model set,
+    // so a missing models directory at execution is a fail-closed error rather than
+    // the legitimate no-op silent-skip. `false` for a bare `rocky run` and for a
+    // governed plan with an empty reviewed set — both keep the silent-skip.
+    expects_models: bool,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -190,6 +195,24 @@ pub async fn run_transformation(
         }
 
         state_store = Some(store);
+    } else if expects_models {
+        // ‼️ Finding #2 (missing-dir), transformation executor leg: this is the
+        // PRIMARY guard for the transformation path — the apply seam does not
+        // check here because `run_local` resolves `config_dir.join(models_base)`
+        // from the pipeline config (this `models_dir`), which the seam's
+        // `run_plan.models_dir` does not match. A governed apply whose plan
+        // reviewed a non-empty model set but whose (config-resolved) models
+        // directory is absent at execution must FAIL CLOSED rather than silently
+        // succeed with nothing built. Fires before the state store is opened —
+        // no warehouse mutation. A bare `rocky run` / an empty reviewed set has
+        // `expects_models == false` and keeps the silent no-op below.
+        anyhow::bail!(
+            "refusing to complete governed apply: the reviewed models directory '{}' does not \
+             exist at execution (deleted or renamed since the plan was authorized), so its \
+             planned models cannot run — refusing rather than reporting success for models that \
+             never executed. Re-plan with `rocky plan` before applying.",
+            models_dir.display()
+        );
     } else {
         warn!(
             models_dir = %models_dir.display(),

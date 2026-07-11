@@ -253,7 +253,14 @@ async fn run_apply_run_plan(
     // their apply behaviour stays byte-identical). Carries the plan-authorized
     // models fingerprint for the in-run TOCTOU reject and the identity for the
     // post-discovery replication gate.
-    let governed = governed_run_context(&plan, principal, plan_id, root, config_path);
+    let governed = governed_run_context(
+        &plan,
+        principal,
+        plan_id,
+        root,
+        config_path,
+        !run_plan.models.is_empty(),
+    );
     execute_run_plan(
         config_path,
         plan_id,
@@ -281,6 +288,9 @@ fn governed_run_context<'a>(
     plan_id: &'a str,
     root: &'a Path,
     config_path: &'a Path,
+    // `!run_plan.models.is_empty()` — the plan reviewed a non-empty model set
+    // (finding #2, threaded to the executor fail-closed legs).
+    expects_models: bool,
 ) -> Option<GovernedRunContext<'a>> {
     if principal != PolicyPrincipal::Agent {
         return None;
@@ -291,6 +301,7 @@ fn governed_run_context<'a>(
         plan_id,
         root,
         config_path,
+        expects_models,
         expected_ir_fingerprint: embedded.models_fingerprint,
         expected_config_identity: embedded.config_identity,
         // A `fingerprint_version >= 1` plan is a NEW plan this binary wrote and
@@ -416,8 +427,10 @@ async fn execute_run_plan(
     // plan must be refused here rather than after the first statement runs. A
     // replication-only plan (no `--all`/`--models`/`--model`) executes NO models
     // → exempt (fail-safe: a config that will not load stays strict).
-    let executes_models = rocky_core::config::load_rocky_config(config_path)
-        .map(|cfg| !is_replication_only(&cfg, &run_plan))
+    let resolved_cfg = rocky_core::config::load_rocky_config(config_path).ok();
+    let executes_models = resolved_cfg
+        .as_ref()
+        .map(|cfg| !is_replication_only(cfg, &run_plan))
         .unwrap_or(true);
     preflight_snapshot(governed_ctx, plan_id, executes_models)?;
 
@@ -503,22 +516,35 @@ async fn execute_run_plan(
         .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"));
     }
 
-    // ‼️ Finding #2 (missing-dir): a governed non-dag apply whose plan REVIEWED a
-    // non-empty model set, but whose models directory no longer compiles to any
-    // model (deleted / renamed / broken since the plan), must FAIL CLOSED here —
-    // otherwise the executor's model leg silently skips (`if mdir.exists()`) or
-    // returns a successful no-op, the execution fingerprint is never recomputed,
-    // and apply reports SUCCESS without executing the planned models. Recompile the
-    // exact dir at the seam, BEFORE any warehouse statement (`run()` below is the
-    // first mutation; the `partition_opts`/`shadow_config` setup above is read-only).
-    // Placed AFTER the `--dag` guard so a governed dag apply keeps its categorical
-    // refusal (that path never reaches here).
+    // ‼️ Finding #2 (missing-dir), REPLICATION seam: a governed non-dag apply whose
+    // plan REVIEWED a non-empty silver-model set, but whose models directory no
+    // longer compiles to any model (deleted / renamed / broken since the plan),
+    // must FAIL CLOSED here — otherwise the replication path's model leg silently
+    // skips (`if mdir.exists()` at run.rs), the execution fingerprint is never
+    // recomputed, and apply reports SUCCESS without executing the planned models.
+    // Recompile the exact dir at the seam, BEFORE the replication DDL runs (the
+    // first warehouse mutation; the `partition_opts`/`shadow_config` setup above is
+    // read-only). Placed AFTER the `--dag` guard so a governed dag apply keeps its
+    // categorical refusal (that path never reaches here).
     //
-    // Scoped to `!run_plan.models.is_empty()` so a legitimate run of a replication
-    // pipeline with `--all` and NO silver `models/` (a valid pure-replication run
-    // whose reviewed model set is empty) is NOT failed. Human applies and
-    // replication-only plans are exempt (not governed / no model execution).
-    if governed_ctx.is_some() && executes_models && !run_plan.models.is_empty() {
+    // SCOPED to a Replication pipeline: replication resolves its silver-model leg
+    // cwd-relative (`run.rs`'s `models_dir.unwrap_or("models")`), which is exactly
+    // what we recompile here, so seam and executor agree on the path. The
+    // TRANSFORMATION path is NOT checked at this seam — `run_local` resolves
+    // `config_dir.join(models_base)` from the pipeline config (ignoring
+    // `run_plan.models_dir`), so a seam keyed on `run_plan.models_dir` would check a
+    // DIFFERENT directory and could false-refuse a valid apply; transformation is
+    // instead fail-closed at its OWN executor (`run_local`, which is its first
+    // mutation anyway). Scoped to a non-empty reviewed set so a valid pure-
+    // replication run with no silver `models/` is not failed; and the executor legs
+    // (guarded by `expects_models`) close the residual seam→execute race.
+    if governed_ctx.is_some()
+        && executes_models
+        && !run_plan.models.is_empty()
+        && resolved_cfg
+            .as_ref()
+            .is_some_and(|cfg| pipeline_is_replication(cfg, run_plan.pipeline.as_deref()))
+    {
         let mdir = models_dir_path
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("models"));
@@ -1479,6 +1505,14 @@ pub struct GovernedRunContext<'a> {
     /// REFUSES (fail-closed).
     pub reviewed_source_schemas:
         Option<std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
+    /// `true` when the plan REVIEWED a non-empty model set (`!run_plan.models
+    /// .is_empty()`). Finding #2 (missing-dir): threaded to the executor legs so a
+    /// governed model-executing apply whose reviewed models directory is deleted
+    /// AFTER the apply seam's compile (the seam→execute race) still fails CLOSED at
+    /// the executor rather than silently skipping. `false` (an empty reviewed set,
+    /// e.g. a pure-replication run with no silver models) preserves the executor's
+    /// legitimate silent-skip.
+    pub expects_models: bool,
 }
 
 impl GovernedRunContext<'_> {
@@ -1961,7 +1995,14 @@ async fn run_apply_ai_authored_plan(
     // One unique id for this apply's run, threaded into execution and into the
     // post-apply gate so the gate reads exactly this run, not "latest".
     let apply_run_id = new_apply_run_id();
-    let governed = governed_run_context(&plan, principal, plan_id, root, config_path);
+    let governed = governed_run_context(
+        &plan,
+        principal,
+        plan_id,
+        root,
+        config_path,
+        !run_plan.models.is_empty(),
+    );
     execute_run_plan(
         config_path,
         plan_id,
@@ -2107,6 +2148,10 @@ async fn run_apply_backfill_plan(
         plan_id,
         root,
         config_path,
+        // A backfill executes its `model_set`; carry the reviewed-set signal (it
+        // routes through `execute_backfill_set`, not the seam-guarded legs, but
+        // keep the derivation consistent).
+        !run_plan.models.is_empty(),
     );
     // ‼️ Finding #2: a backfill ALWAYS executes models (its `model_set`) —
     // preflight the reviewed source-schema snapshot before any warehouse mutation.
@@ -2284,6 +2329,10 @@ async fn run_apply_replication_plan(
         plan_id,
         root,
         config_path,
+        // A pure replication apply delegates to `run` with default model args
+        // (no --all/--models/--model) → it executes NO compiled models → an empty
+        // reviewed set, so the executor legs keep their legitimate silent-skip.
+        false,
     );
 
     crate::commands::run::run(
@@ -4172,6 +4221,7 @@ auto_create_schemas = true
             expected_config_identity: expected,
             require_fingerprint: require,
             reviewed_source_schemas: None,
+            expects_models: true,
         };
         let authorized = super::config_policy_identity(&cfg_a);
         // Unchanged routing → proceeds.
@@ -4275,6 +4325,7 @@ auto_create_schemas = true
             expected_config_identity: None,
             require_fingerprint: require,
             reviewed_source_schemas: snapshot,
+            expects_models: true,
         };
         // MODEL-EXECUTING (executes_models = true):
         // v1 / v2-capture-failure (require, None) → REFUSE.
@@ -4334,6 +4385,7 @@ effect = "deny"
             expected_config_identity: None,
             require_fingerprint: false,
             reviewed_source_schemas: None,
+            expects_models: true,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         let err = ctx
@@ -4380,6 +4432,7 @@ effect = "allow"
             expected_config_identity: None,
             require_fingerprint: false,
             reviewed_source_schemas: None,
+            expects_models: true,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
 
@@ -4428,6 +4481,7 @@ effect = "allow"
             expected_config_identity: None,
             require_fingerprint: false,
             reviewed_source_schemas: None,
+            expects_models: true,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         ctx.gate_replication_targets(&targets, &ledger)
@@ -4470,31 +4524,52 @@ effect = "allow"
         Ok(())
     }
 
-    /// ‼️ Finding #2 (missing-dir): a governed (agent) apply whose plan reviewed a
-    /// NON-EMPTY model set, but whose models directory no longer compiles to any
-    /// model (deleted / renamed / broken since the plan), must FAIL CLOSED at the
-    /// apply seam — BEFORE any warehouse statement — rather than silently skipping
-    /// the planned models (the executor's `if mdir.exists()` leg / a transformation
-    /// no-op) and reporting SUCCESS without recomputing the execution fingerprint.
-    /// A v0 plan is used so the snapshot preflight is exempt and this isolates the
-    /// missing-dir seam. Neuter the seam (delete the `bail!` at execute_run_plan)
-    /// and this apply returns `Ok` — the silent-success the fix closes.
+    // A replication pipeline (duckdb, creds-free). Its silver-model leg resolves
+    // `run_plan.models_dir` cwd-relative — the path the apply seam recompiles.
+    const REPLICATION_TOML: &str = r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "default"
+catalog_template = "c"
+schema_template = "s__{source}"
+"#;
+
+    /// ‼️ Finding #2 (missing-dir), REPLICATION apply seam: a governed (agent)
+    /// replication apply whose plan reviewed a NON-EMPTY silver-model set, but whose
+    /// reviewed models directory no longer compiles (deleted / renamed since the
+    /// plan), must FAIL CLOSED at the apply seam — BEFORE the replication DDL — not
+    /// silently skip and report SUCCESS. A v0 plan keeps the snapshot preflight
+    /// exempt so this isolates the seam. Neuter the seam `bail!` and this apply
+    /// still fails, now via the run.rs `else if governed…expects_models` executor
+    /// leg (the seam→execute race-closer) — the two layers are independent.
     #[tokio::test]
-    async fn governed_apply_refuses_a_deleted_reviewed_models_dir() -> anyhow::Result<()> {
+    async fn governed_replication_apply_seam_refuses_deleted_reviewed_dir() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        std::fs::write(dir.path().join("rocky.toml"), NO_POLICY_TOML)?;
-        // The plan reviewed a real, compilable models dir …
+        std::fs::write(dir.path().join("rocky.toml"), REPLICATION_TOML)?;
+        // The plan reviewed a real, compilable silver-models dir …
         let models_dir = dir.path().join("silver");
         write_min_model(&models_dir, "orders");
         let mut rp = minimal_run_plan();
         rp.pipeline = Some("p".to_string());
+        rp.run_all = true; // replication --all → enters the silver-model leg
         rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
         rp.models = vec!["s.orders".to_string()]; // a non-empty reviewed set
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let state = dir.path().join("state.redb");
 
-        // … then the dir is DELETED after the plan was authorized (post-preflight
-        // drift). The seam recompiles the exact dir and finds nothing.
+        // … then the dir is DELETED after the plan was authorized.
         std::fs::remove_dir_all(&models_dir)?;
 
         let err = super::run_apply_run_plan(
@@ -4506,10 +4581,56 @@ effect = "allow"
             true,
         )
         .await
-        .expect_err("a governed apply of a deleted reviewed models dir must fail closed");
+        .expect_err("a governed replication apply of a deleted reviewed dir must fail closed");
         assert!(
             err.to_string().contains("no longer compiles to any model"),
-            "must refuse at the missing-dir seam, got: {err}"
+            "must refuse at the replication apply seam, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// ‼️ Finding #2 (missing-dir), TRANSFORMATION executor leg: the apply seam does
+    /// NOT check the transformation path (it resolves `config_dir.join(models_base)`
+    /// from the pipeline config, which the seam's `run_plan.models_dir` does not
+    /// match), so `run_local` is the SOLE fail-closed guard here. A governed
+    /// transformation apply whose plan reviewed a non-empty model set but whose
+    /// config-resolved models directory is gone at execution must FAIL CLOSED at the
+    /// executor — before any warehouse mutation — not report SUCCESS with nothing
+    /// built. This is the real seam↔executor path-resolution gap the scoping fixes.
+    #[tokio::test]
+    async fn governed_transformation_apply_executor_refuses_deleted_reviewed_dir()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // NO_POLICY_TOML is a transformation pipeline with `models = "models/**"`,
+        // so the reviewed dir `run_local` resolves is `<config_dir>/models`.
+        std::fs::write(dir.path().join("rocky.toml"), NO_POLICY_TOML)?;
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        let mut rp = minimal_run_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.models = vec!["s.orders".to_string()]; // a non-empty reviewed set
+        // rp.models_dir intentionally None — `run_local` ignores it and uses the
+        // config-resolved `<config_dir>/models`.
+        let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
+        let state = dir.path().join("state.redb");
+
+        std::fs::remove_dir_all(&models_dir)?;
+
+        let err = super::run_apply_run_plan(
+            dir.path(),
+            &dir.path().join("rocky.toml"),
+            &plan_id,
+            &state,
+            PolicyPrincipal::Agent,
+            true,
+        )
+        .await
+        .expect_err("a governed transformation apply of a deleted reviewed dir must fail closed");
+        // The executor `bail!` is wrapped by `run`'s apply context, so inspect the
+        // full cause chain (`{:#}`), not just the outermost message.
+        assert!(
+            format!("{err:#}").contains("does not exist at execution"),
+            "must fail closed at the transformation executor leg, got: {err:#}"
         );
         Ok(())
     }

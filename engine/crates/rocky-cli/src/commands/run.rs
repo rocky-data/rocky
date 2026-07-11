@@ -1518,6 +1518,10 @@ pub async fn run(
                 // values (or inline defaults) at compile time.
                 run_vars,
                 exec_fp_gate.as_ref(),
+                // Finding #2 (missing-dir): fail closed at the transformation
+                // executor when a governed plan reviewed a non-empty model set but
+                // its models directory is gone. `false` for a bare run.
+                governed_ctx.is_some_and(|c| c.expects_models),
             )
             .await?;
             finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
@@ -4129,6 +4133,23 @@ pub async fn run(
                     // Execution did not complete cleanly — governance skipped.
                 }
             }
+        } else if governed_ctx.is_some_and(|c| c.expects_models) {
+            // ‼️ Finding #2 (missing-dir), executor leg: a governed apply entered the
+            // replication silver-model leg (`--all` / `--models`) with a NON-EMPTY
+            // reviewed model set, but the models directory is gone at execution
+            // (deleted / renamed AFTER the apply seam's compile — the seam→execute
+            // race). Fail CLOSED rather than silently skip and report success for
+            // models that never ran. An empty reviewed set (`expects_models ==
+            // false`, e.g. a pure-replication run with no silver `models/`) keeps
+            // the legitimate silent-skip. Bare `rocky run` (governed_ctx None) is
+            // likewise unaffected.
+            anyhow::bail!(
+                "refusing to complete governed apply: the reviewed models directory '{}' does not \
+                 exist at execution (deleted or renamed since the plan was authorized), so its \
+                 planned models cannot run — refusing rather than reporting success for models that \
+                 never executed. Re-plan with `rocky plan` before applying.",
+                mdir.display()
+            );
         }
     }
 
