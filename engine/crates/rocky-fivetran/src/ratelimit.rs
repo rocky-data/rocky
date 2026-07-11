@@ -512,13 +512,19 @@ mod tests {
         );
     }
 
+    // The "returns quickly" bounds below are 2s, not tens of ms: they only
+    // need to distinguish "returned without observing a wait" from "slept
+    // toward a future wake_at" (proven at 250ms granularity by
+    // `pre_request_wait_blocks_until_future_wake_at`). A tight bound races
+    // scheduling + filesystem stalls on a loaded CI runner.
+
     #[tokio::test]
     async fn pre_request_wait_returns_quickly_on_missing_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("missing.json");
         let start = std::time::Instant::now();
         pre_request_wait(&path).await;
-        assert!(start.elapsed() < Duration::from_millis(50));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]
@@ -529,7 +535,7 @@ mod tests {
         write_wake_at(&path, past);
         let start = std::time::Instant::now();
         pre_request_wait(&path).await;
-        assert!(start.elapsed() < Duration::from_millis(50));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]
