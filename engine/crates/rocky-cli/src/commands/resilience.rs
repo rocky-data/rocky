@@ -86,6 +86,26 @@ pub(crate) fn retry_policy_allows(config: &rocky_core::config::RockyConfig) -> b
     }
 }
 
+/// Whether re-running a model's WHOLE materialization after an ambiguous
+/// failure is idempotent for its strategy.
+///
+/// A transient transport failure (connection reset, gateway 5xx, poll
+/// timeout) can land AFTER the warehouse durably committed the statement.
+/// Replace-shaped strategies converge on re-run (CTAS full refresh, keyed
+/// MERGE, delete+insert of the same window, view/MV/dynamic-table DDL,
+/// ephemeral no-op) — but `incremental` and `microbatch` materialize as a
+/// bare `INSERT INTO … <model SQL>` with no watermark literal or dedup key
+/// threaded in, so a commit-then-error retry appends every row a second
+/// time. Those strategies must surface the transient failure instead of
+/// silently double-applying.
+pub(crate) fn rerun_is_idempotent(strategy: &rocky_core::models::StrategyConfig) -> bool {
+    !matches!(
+        strategy,
+        rocky_core::models::StrategyConfig::Incremental { .. }
+            | rocky_core::models::StrategyConfig::Microbatch { .. }
+    )
+}
+
 /// Run `attempt_fn` under the classified-retry policy, returning the eventual
 /// [`MaterializationOutput`] (with its attempt trail stamped when a retry
 /// occurred) or the terminal error.
@@ -93,11 +113,13 @@ pub(crate) fn retry_policy_allows(config: &rocky_core::config::RockyConfig) -> b
 /// `attempt_fn` is invoked once per attempt; it should re-run the whole model
 /// materialization each time (a fresh timing clock is taken internally). Only
 /// a [`FailureClass::Transient`] verdict — within the per-model budget, the
-/// run-level budget, the breaker, and the policy gate — triggers a retry.
+/// run-level budget, the breaker, the policy gate, AND `rerun_idempotent`
+/// (see [`rerun_is_idempotent`]) — triggers a retry.
 pub(crate) async fn run_model_with_retry<F, Fut>(
     plan: &ResiliencePlan<'_>,
     warehouse: &dyn WarehouseAdapter,
     model_name: &str,
+    rerun_idempotent: bool,
     mut attempt_fn: F,
 ) -> anyhow::Result<MaterializationOutput>
 where
@@ -137,10 +159,23 @@ where
             Err(err) => {
                 let duration_ms = started.elapsed().as_millis() as u64;
                 let class = classify_anyhow(&err, warehouse);
-                // Run-loop retryability: transient AND not auth. A survived
-                // auth/permission failure is terminal here (the connector owns
-                // credential recovery); see `FailureClass::is_run_retryable`.
-                let run_retryable = class.is_run_retryable();
+                // Run-loop retryability: transient AND not auth (a survived
+                // auth/permission failure is terminal here — the connector
+                // owns credential recovery; see
+                // `FailureClass::is_run_retryable`) AND idempotent to re-run:
+                // a commit-ambiguous transient on a bare-INSERT strategy must
+                // not be re-applied.
+                let class_retryable = class.is_run_retryable();
+                if class_retryable && !rerun_idempotent {
+                    warn!(
+                        model = model_name,
+                        class = class.label(),
+                        "transient model failure NOT retried: this strategy's \
+                         re-run is not idempotent (a bare INSERT may already \
+                         have committed); surfacing the error instead"
+                    );
+                }
+                let run_retryable = class_retryable && rerun_idempotent;
 
                 // Record this transient failure into the run-level breaker
                 // *before* the gate reads it, so the failure that crosses the
@@ -348,7 +383,7 @@ mod tests {
         let breaker = CircuitBreaker::new(cfg.circuit_breaker_threshold);
         let plan = plan_for(&cfg, &budget, Some(&breaker));
 
-        let mat = run_model_with_retry(&plan, &adapter, "orders", || {
+        let mat = run_model_with_retry(&plan, &adapter, "orders", true, || {
             let adapter = &adapter;
             async move {
                 adapter
@@ -381,7 +416,7 @@ mod tests {
         let budget = RetryBudget::from_config(cfg.max_retries_per_run);
         let plan = plan_for(&cfg, &budget, None);
 
-        let mat = run_model_with_retry(&plan, &adapter, "orders", || {
+        let mat = run_model_with_retry(&plan, &adapter, "orders", true, || {
             let adapter = &adapter;
             async move {
                 adapter
@@ -411,7 +446,7 @@ mod tests {
         let plan = plan_for(&cfg, &budget, None);
 
         let attempts = std::sync::atomic::AtomicU32::new(0);
-        let result = run_model_with_retry(&plan, &adapter, "orders", || {
+        let result = run_model_with_retry(&plan, &adapter, "orders", true, || {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let adapter = &adapter;
             async move {
@@ -426,6 +461,62 @@ mod tests {
         assert!(result.is_err());
         // 1 initial + 2 retries = 3 invocations, then it gives up.
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// FIX: a transient failure on a NON-idempotent strategy (incremental /
+    /// microbatch — bare `INSERT INTO … <model SQL>`) is never retried: a
+    /// commit-ambiguous transport error may land after the warehouse durably
+    /// applied the statement, and a re-run would append every row a second
+    /// time. One attempt, then the (transient) error surfaces.
+    #[tokio::test]
+    async fn transient_failure_on_non_idempotent_strategy_not_retried() {
+        let adapter = FlakyAdapter::new(1);
+        let cfg = ResilienceConfig {
+            transient_max_retries: 2,
+            initial_backoff_ms: 0,
+            jitter: false,
+            ..Default::default()
+        };
+        let budget = RetryBudget::unbounded();
+        let plan = plan_for(&cfg, &budget, None);
+
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result = run_model_with_retry(&plan, &adapter, "orders", false, || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let adapter = &adapter;
+            async move {
+                adapter
+                    .execute_statement("x")
+                    .await
+                    .map(|()| sample_mat())
+                    .map_err(anyhow::Error::from)
+            }
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "the transient error must surface un-retried"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a non-idempotent re-run must not be attempted"
+        );
+    }
+
+    /// `rerun_is_idempotent` gates exactly the bare-INSERT strategies.
+    #[test]
+    fn rerun_idempotency_by_strategy() {
+        use rocky_core::models::StrategyConfig;
+        assert!(rerun_is_idempotent(&StrategyConfig::FullRefresh));
+        assert!(rerun_is_idempotent(&StrategyConfig::Merge {
+            unique_key: vec!["id".into()],
+            update_columns: None,
+        }));
+        assert!(rerun_is_idempotent(&StrategyConfig::View));
+        assert!(!rerun_is_idempotent(&StrategyConfig::Incremental {
+            timestamp_column: "ts".into(),
+        }));
     }
 
     /// A permanent failure is never retried — a single attempt, then the error.
@@ -466,7 +557,7 @@ mod tests {
         let plan = plan_for(&cfg, &budget, None);
 
         let attempts = std::sync::atomic::AtomicU32::new(0);
-        let result = run_model_with_retry(&plan, &adapter, "orders", || {
+        let result = run_model_with_retry(&plan, &adapter, "orders", true, || {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let adapter = &adapter;
             async move {
@@ -497,7 +588,7 @@ mod tests {
         };
         let budget = RetryBudget::unbounded();
         let plan = plan_for(&cfg, &budget, None);
-        let result = run_model_with_retry(&plan, &adapter, "orders", || {
+        let result = run_model_with_retry(&plan, &adapter, "orders", true, || {
             let adapter = &adapter;
             async move {
                 adapter
@@ -530,7 +621,7 @@ mod tests {
             budget: &budget,
             breaker: None,
         };
-        let result = run_model_with_retry(&plan, &adapter, "orders", || {
+        let result = run_model_with_retry(&plan, &adapter, "orders", true, || {
             let adapter = &adapter;
             async move {
                 adapter
@@ -548,7 +639,7 @@ mod tests {
     /// materialization was actually attempted.
     async fn count_attempts(plan: &ResiliencePlan<'_>, adapter: &FlakyAdapter, name: &str) -> u32 {
         let calls = std::sync::atomic::AtomicU32::new(0);
-        let _ = run_model_with_retry(plan, adapter, name, || {
+        let _ = run_model_with_retry(plan, adapter, name, true, || {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let adapter = &adapter;
             async move {
@@ -667,7 +758,7 @@ mod tests {
         let plan = plan_for(&cfg, &budget, None);
 
         let calls = std::sync::atomic::AtomicU32::new(0);
-        let result = run_model_with_retry(&plan, &adapter, "orders", || {
+        let result = run_model_with_retry(&plan, &adapter, "orders", true, || {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let adapter = &adapter;
             async move {

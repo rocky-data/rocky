@@ -185,13 +185,24 @@ impl CircuitBreaker {
     /// failure counter; in `HalfOpen` it also closes the breaker.
     /// Returns [`TransitionOutcome::Recovered`] when a HalfOpen → Closed
     /// transition happened, otherwise [`TransitionOutcome::Unchanged`].
+    ///
+    /// In `Open` the breaker stays Open: recovery goes exclusively through
+    /// the timeout → HalfOpen → trial path. Closing from Open here would let
+    /// an in-flight success that raced the trip (or, for the run loop's
+    /// shared breaker, any later model's clean build) silently re-arm — the
+    /// `[resilience]` contract is "once tripped, no further model is retried
+    /// for the rest of the run", and event subscribers would see Open end
+    /// with no `Recovered` transition.
     pub fn record_success(&self) -> TransitionOutcome {
         self.consecutive_failures.store(0, Ordering::Release);
-        let prev = self.state.swap(STATE_CLOSED, Ordering::AcqRel);
-        if prev == STATE_HALF_OPEN {
-            TransitionOutcome::Recovered
-        } else {
-            TransitionOutcome::Unchanged
+        match self.state.compare_exchange(
+            STATE_HALF_OPEN,
+            STATE_CLOSED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => TransitionOutcome::Recovered,
+            Err(_) => TransitionOutcome::Unchanged,
         }
     }
 
@@ -305,6 +316,20 @@ mod tests {
     }
 
     #[test]
+    fn test_success_while_open_does_not_close() {
+        // A straggler success racing the trip (it passed `check()` before the
+        // breaker opened) must not silently re-arm: Open recovers exclusively
+        // via timeout → HalfOpen → trial, and — for the run loop's shared
+        // breaker — "once tripped, no further model is retried this run".
+        let cb = CircuitBreaker::new(1);
+        cb.record_failure("boom");
+        assert!(cb.is_tripped());
+        assert_eq!(cb.record_success(), TransitionOutcome::Unchanged);
+        assert!(cb.is_tripped(), "Open must survive a raced success");
+        assert!(cb.check().is_err());
+    }
+
+    #[test]
     fn test_disabled_when_threshold_zero() {
         let cb = CircuitBreaker::new(0);
         for _ in 0..100 {
@@ -335,13 +360,25 @@ mod tests {
     }
 
     #[test]
-    fn test_half_open_after_timeout() {
-        // Threshold 2 so the counter-reset post-recovery is observable:
-        // one follow-up failure should NOT re-trip.
-        let cb = CircuitBreaker::with_recovery_timeout(2, Duration::from_millis(30));
+    fn test_open_before_recovery_timeout() {
+        // A window no loaded CI runner can plausibly cross between the trip
+        // and the check — asserting still-Open on a millisecond window races
+        // the wall clock and flakes when the scheduler stalls the thread.
+        let cb = CircuitBreaker::with_recovery_timeout(2, Duration::from_secs(300));
         cb.record_failure("boom 1");
         assert_eq!(cb.record_failure("boom 2"), TransitionOutcome::Tripped);
         assert!(cb.check().is_err(), "still Open before timeout");
+    }
+
+    #[test]
+    fn test_half_open_after_timeout() {
+        // Threshold 2 so the counter-reset post-recovery is observable:
+        // one follow-up failure should NOT re-trip. (The pre-timeout
+        // still-Open assertion lives in `test_open_before_recovery_timeout`
+        // on a generous window — on this 30ms window it would race.)
+        let cb = CircuitBreaker::with_recovery_timeout(2, Duration::from_millis(30));
+        cb.record_failure("boom 1");
+        assert_eq!(cb.record_failure("boom 2"), TransitionOutcome::Tripped);
 
         std::thread::sleep(Duration::from_millis(40));
         assert!(cb.check().is_ok(), "HalfOpen should let trial through");
