@@ -2341,6 +2341,7 @@ impl RockyMcpServer {
             &self.models_dir,
             "main",
             Some(&state_path),
+            None, // MCP propose has no `--env`; governance identity binds defaults
         );
 
         // Consult the agent-policy plane before persisting — the same per-model

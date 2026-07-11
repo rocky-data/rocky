@@ -1218,7 +1218,7 @@ pub async fn run(
     // Governed-apply TOCTOU gate (E) — pairs the plan-authorized IR fingerprint
     // with THIS run's config identity; verified at the execution choke-point
     // (`execute_models`). `None` for bare run / human apply.
-    let exec_fp_gate = governed_ctx.map(|c| c.exec_fingerprint_gate(&rocky_cfg));
+    let exec_fp_gate = governed_ctx.map(|c| c.exec_fingerprint_gate(&rocky_cfg, env));
 
     // Apply the optional `--cache-ttl` override once at the top of the
     // run. All downstream `execute_models` calls receive this already-
@@ -5168,6 +5168,15 @@ pub(crate) async fn execute_models(
         }
     };
 
+    // Per-model surrogate-key specs — loaded ONCE here (execute-from-owned-value,
+    // #1) so the SAME owned map feeds BOTH the TOCTOU fingerprint below AND
+    // execution (via `ExecutionContext`), with no post-verification reload that
+    // could apply different key columns than were gated. Surface a malformed key
+    // spec as a hard failure rather than silently emitting broken SQL. Bare
+    // `rocky run` loads exactly once, as before — byte-identical.
+    let surrogate_keys = rocky_core::models::load_surrogate_keys_from_dir(models_dir)
+        .context("invalid surrogate_key configuration")?;
+
     // ‼️ Governed-apply TOCTOU gate (E) — the single execution choke-point. The
     // fingerprint is recomputed over the EXACT compiled set about to execute
     // (`compile_result`, before any defer-rewrite mutates SQL) and refuses on
@@ -5175,12 +5184,9 @@ pub(crate) async fn execute_models(
     // content. `None` (bare run / human apply / legacy plan) is a no-op.
     if let Some(gate) = exec_fp_gate {
         // Fold the seeding-independent on-disk extras the compiled IR omits —
-        // surrogate-key sidecars (#1) and contract presence/contents (#3) — into
+        // the OWNED surrogate map (#1) and contract presence/contents (#3) — into
         // the recomputed fingerprint so a post-plan swap of either refuses here.
-        // Loaded on the governed path only, so bare `rocky run` is byte-
-        // identical. `models_dir` is the SAME directory the plan fingerprinted.
-        let surrogate_keys = rocky_core::models::load_surrogate_keys_from_dir(models_dir)
-            .context("invalid surrogate_key configuration")?;
+        // `models_dir` is the SAME directory the plan fingerprinted.
         let extras = crate::commands::apply::ExecutionExtras::build(
             &surrogate_keys,
             &compile_result.project.models,
@@ -5356,11 +5362,9 @@ pub(crate) async fn execute_models(
     // execution path. Future compile-time fields (semantic info, optimize
     // results, contract diagnostics) ride on this struct without further
     // signature churn.
-    // Per-model surrogate-key specs, loaded once and threaded via the context.
-    // Surface a malformed key spec (bad output name, empty/invalid input
-    // columns) as a hard run failure rather than silently emitting broken SQL.
-    let surrogate_keys = rocky_core::models::load_surrogate_keys_from_dir(models_dir)
-        .context("invalid surrogate_key configuration")?;
+    //
+    // `surrogate_keys` is the SAME owned map loaded once above the gate (#1):
+    // execution consumes exactly what the fingerprint hashed — no reload.
     let exec_ctx = ExecutionContext {
         typed_models: &compile_result.type_check.typed_models,
         model_timings: &compile_result.model_timings,
@@ -11621,8 +11625,8 @@ merge_keys = ["id"]
         // (1) process-stability across two independent compiles — computed the
         // exact way `execute_models` recomputes at the choke-point (compile +
         // surrogate/contract extras), so the two must agree.
-        let fp1 = exec_choke_fingerprint(&models, "cfg");
-        let fp2 = exec_choke_fingerprint(&models, "cfg");
+        let fp1 = exec_choke_fingerprint(&models, "cfg", "");
+        let fp2 = exec_choke_fingerprint(&models, "cfg", "");
         assert_eq!(
             fp1, fp2,
             "same bytes must fingerprint identically (stability)"
@@ -11635,6 +11639,7 @@ merge_keys = ["id"]
         let gate = crate::commands::apply::ExecFingerprintGate {
             expected: Some(fp1.clone()),
             config_identity: "cfg".to_string(),
+            governance_identity: String::new(),
             plan_id: "p".to_string(),
             require: true,
         };
@@ -11746,7 +11751,11 @@ merge_keys = ["id"]
     /// choke-point does — compile + surrogate-key + contract extras — so a
     /// gate built with this value does not spuriously refuse an unchanged apply.
     #[cfg(feature = "duckdb")]
-    fn exec_choke_fingerprint(models_dir: &std::path::Path, config_identity: &str) -> String {
+    fn exec_choke_fingerprint(
+        models_dir: &std::path::Path,
+        config_identity: &str,
+        governance_identity: &str,
+    ) -> String {
         use rocky_compiler::compile::{self, CompilerConfig};
         let cc = CompilerConfig {
             models_dir: models_dir.to_path_buf(),
@@ -11758,6 +11767,7 @@ merge_keys = ["id"]
         crate::commands::apply::execution_ir_fingerprint(
             &result.project.models,
             config_identity,
+            governance_identity,
             &extras,
         )
         .unwrap()
@@ -11776,6 +11786,7 @@ merge_keys = ["id"]
         let gate = crate::commands::apply::ExecFingerprintGate {
             expected: Some(expected_fp.to_string()),
             config_identity: "cfg".to_string(),
+            governance_identity: String::new(),
             plan_id: "p".to_string(),
             require: true,
         };
@@ -11828,7 +11839,7 @@ merge_keys = ["id"]
 
         let db = dir.path().join("wh.duckdb");
         // Plan-time fingerprint binds the surrogate spec (columns = [id]).
-        let fp = exec_choke_fingerprint(&models, "cfg");
+        let fp = exec_choke_fingerprint(&models, "cfg", "");
         // (2) unchanged apply → no refuse.
         governed_apply(&models, &db, "sk-ok", &fp)
             .await
@@ -11864,10 +11875,26 @@ merge_keys = ["id"]
         .unwrap();
 
         let db = dir.path().join("wh.duckdb");
-        let fp = exec_choke_fingerprint(&models, "cfg");
+        let fp = exec_choke_fingerprint(&models, "cfg", "");
         governed_apply(&models, &db, "contract-ok", &fp)
             .await
             .expect("KILL-CHECK: unchanged contract apply must NOT refuse");
+
+        // SAME-PRESENCE CONTENT EDIT — the contract file still exists (presence
+        // unchanged) but its CONTENTS change. This is the case a presence-only
+        // hash would miss; it proves the fingerprint binds contract CONTENTS.
+        std::fs::write(
+            models.join("orders.contract.toml"),
+            "[[columns]]\nname = \"id\"\ntype = \"Int64\"\n",
+        )
+        .unwrap();
+        let err = governed_apply(&models, &db, "contract-edited", &fp)
+            .await
+            .expect_err("KILL-CHECK: a same-presence contract CONTENT edit must be REFUSED (#3)");
+        assert!(
+            err.to_string().contains("fingerprint mismatch"),
+            "must refuse with a fingerprint mismatch, got: {err}"
+        );
 
         // Remove the contract — presence flips, ModelConfig + SQL unchanged.
         std::fs::remove_file(models.join("orders.contract.toml")).unwrap();
@@ -11915,23 +11942,27 @@ merge_keys = ["id"]
         )
         .unwrap();
 
-        // Plan side: the real capability-embed path stamps `models_fingerprint`.
+        // Plan side: the real capability-embed path stamps `models_fingerprint`
+        // (env = None here, matching the apply-side governance resolution below).
         let caps = crate::commands::plan::compute_embedded_capabilities(
             &config_path,
             &models,
             "main",
             None,
+            None,
         );
-        // Apply side: the choke-point's config identity is the loaded config's.
+        // Apply side: the choke-point's routing + governance identity are the
+        // loaded config's, resolved for the same (None) env.
         let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
         let identity = crate::commands::apply::config_policy_identity(&cfg);
-        let apply_fp = exec_choke_fingerprint(&models, &identity);
+        let gov = crate::commands::apply::governance_policy_identity(&cfg, None);
+        let apply_fp = exec_choke_fingerprint(&models, &identity, &gov);
 
         assert_eq!(
             caps.models_fingerprint.as_deref(),
             Some(apply_fp.as_str()),
             "plan-side and apply-side fingerprints must AGREE for an unchanged \
-             project with a surrogate key + contract (no spurious refuse)"
+             project with a surrogate key + contract + governance (no spurious refuse)"
         );
     }
 

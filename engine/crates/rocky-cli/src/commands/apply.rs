@@ -994,6 +994,7 @@ fn touched_models_for_promote(
 pub(crate) fn execution_ir_fingerprint(
     models: &[rocky_core::models::Model],
     config_identity: &str,
+    governance_identity: &str,
     extras: &ExecutionExtras,
 ) -> Option<String> {
     let mut projection: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -1016,6 +1017,8 @@ pub(crate) fn execution_ir_fingerprint(
     hasher.update(&bytes);
     hasher.update(b"\x00cfg\x00");
     hasher.update(config_identity.as_bytes());
+    hasher.update(b"\x00gov\x00");
+    hasher.update(governance_identity.as_bytes());
     hasher.update(b"\x00extras\x00");
     hasher.update(&extras_bytes);
     Some(hasher.finalize().to_hex().to_string())
@@ -1089,10 +1092,9 @@ impl ExecutionExtras {
     }
 }
 
-/// The env-resolved, **routing + governance-policy** config identity that
-/// authorization depends on — the physical destination and adapter/target
-/// shape, plus the workspace governance policy, with connection **credentials
-/// excluded** (finding #4).
+/// The env-resolved, **routing** config identity that authorization depends on —
+/// the physical destination and adapter/target shape, with connection
+/// **credentials excluded** (finding #4).
 ///
 /// Each adapter and pipeline is serialized in full via `serde_json::to_value`
 /// (sorted keys — serde_json has no `preserve_order`). Every credential field is
@@ -1101,17 +1103,19 @@ impl ExecutionExtras {
 /// construction** while every routing field — `host`, `account`, `database`,
 /// `project_id`, `location`, `warehouse`, `path`, `http_path`, the target
 /// `catalog_template` / `schema_template`, the target adapter, and per-pipeline
-/// governance — is captured. Additionally the **workspace governance policy** —
-/// the top-level `[mask]` tag→strategy mapping and `[classifications]` — is
-/// folded in (finding #6): these drive which masking / classification the
-/// governance reconcile applies to the warehouse, yet they live outside
-/// `ModelConfig` and the per-pipeline block, so a post-plan `[mask]` swap would
-/// otherwise change the applied governance invisibly. So swapping
-/// `path = a.duckdb → b.duckdb` (a different physical DB), swapping the adapter
-/// type, changing a target template, or changing a mask/classification policy
-/// CHANGES the identity (→ refuse), while rotating a credential does NOT (→ no
-/// spurious refuse). New secret fields are auto-redacted; new routing/governance
+/// governance — is captured. So swapping `path = a.duckdb → b.duckdb` (a
+/// different physical DB), swapping the adapter type, or changing a target
+/// template CHANGES the identity (→ refuse), while rotating a credential does
+/// NOT (→ no spurious refuse). New secret fields are auto-redacted; new routing
 /// fields are auto-included.
+///
+/// This identity is **routing-only** and env-invariant, so it is safe to compare
+/// in the pre-mutation [`GovernedRunContext::verify_routing_identity`] gate
+/// (which runs with no `env`). Workspace *governance* policy (mask / roles /
+/// cache-selection) is env-resolved and lives in a separate
+/// [`governance_policy_identity`], hashed into the execution fingerprint only —
+/// never here — so an env-var-templated advisory value cannot cause a
+/// cross-process routing false-refuse (finding #5).
 pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> String {
     let adapters: BTreeMap<&str, serde_json::Value> = cfg
         .adapters
@@ -1133,19 +1137,49 @@ pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> S
             )
         })
         .collect();
-    // Workspace governance policy (finding #6): env-invariant raw `[mask]` +
-    // `[classifications]`. Folding the raw (all-env) map is fail-closed — a
-    // change to any env's mask refuses — and needs no `env` threading. Both are
-    // credential-free.
-    let governance = serde_json::json!({
-        "mask": cfg.mask,
-        "classifications": cfg.classifications,
-    });
     // Canonicalize (sorted keys) via `to_value`, then a stable string.
+    serde_json::to_value(serde_json::json!({ "adapters": adapters, "pipelines": pipelines }))
+        .map(|v| v.to_string())
+        .unwrap_or_default()
+}
+
+/// The env-resolved **governance** identity — the mutation-driving workspace
+/// governance the reviewed plan authorized. Hashed into the execution
+/// fingerprint **only** (never the routing gate), so a post-plan change to what
+/// the governance reconcile would apply is refused, while it cannot cause a
+/// routing false-refuse.
+///
+/// Binds exactly the fields that **drive a warehouse mutation**:
+/// - `resolve_mask_for_env(env)` — the tag→strategy map the masking reconcile
+///   applies, resolved for the plan's persisted `--env` (so `[mask.<env>]`
+///   overlays are captured for the env that will actually run, and an unrelated
+///   env's mask does not over-bind);
+/// - the **flattened** role graph (`role_graph()`) — the resolved GRANT set the
+///   role reconcile applies (finding #2: a `SELECT → MANAGE` permission edit
+///   changes this); `None` when the graph is malformed (deterministic on both
+///   sides);
+/// - the `[cache.schemas]` selection policy — an agent-controlled on-disk toggle
+///   that changes whether apply resolves concrete `typed_columns` vs `Unknown`
+///   (finding #4a).
+///
+/// Advisory `[classifications]` is **excluded by design** (finding #5): it drives
+/// no warehouse action (W004-only) and its env-var-templated `allow_unmasked`
+/// values would differ across processes → a false-refuse. Mask *values* are a
+/// closed vocabulary (`hash`/`redact`/`partial`/`none`), so the resolved map
+/// carries no cross-process templating variance.
+pub(crate) fn governance_policy_identity(
+    cfg: &rocky_core::config::RockyConfig,
+    env: Option<&str>,
+) -> String {
+    let mask = cfg.resolve_mask_for_env(env);
+    // Deterministic on both sides: a malformed graph serializes to `null` at
+    // plan and apply alike (same cfg), so it does not false-refuse; a valid→
+    // malformed edit moves the identity → refuse.
+    let roles = cfg.role_graph().ok();
     serde_json::to_value(serde_json::json!({
-        "adapters": adapters,
-        "pipelines": pipelines,
-        "governance": governance,
+        "mask": mask,
+        "roles": roles,
+        "cache_schemas": cfg.cache.schemas,
     }))
     .map(|v| v.to_string())
     .unwrap_or_default()
@@ -1162,8 +1196,11 @@ pub struct ExecFingerprintGate {
     /// `None` on a legacy plan (skip) OR a production fingerprint failure — the
     /// two are told apart by `require`.
     pub expected: Option<String>,
-    /// The config identity computed from the execute-time config.
+    /// The routing config identity computed from the execute-time config.
     pub config_identity: String,
+    /// The env-resolved governance identity computed from the execute-time
+    /// config + the plan's persisted `--env` (mask / roles / cache-selection).
+    pub governance_identity: String,
     /// The plan id, for the refusal message.
     pub plan_id: String,
     /// `true` when the plan is a NEW (`fingerprint_version >= 1`) governed plan
@@ -1195,7 +1232,12 @@ impl ExecFingerprintGate {
             }
             return Ok(()); // genuinely-legacy plan — no bound fingerprint
         };
-        let actual = execution_ir_fingerprint(models, &self.config_identity, extras);
+        let actual = execution_ir_fingerprint(
+            models,
+            &self.config_identity,
+            &self.governance_identity,
+            extras,
+        );
         if actual.as_deref() != Some(expected) {
             bail!(
                 "refusing to execute plan '{}': the models/config changed since the plan was \
@@ -1252,14 +1294,19 @@ pub struct GovernedRunContext<'a> {
 
 impl GovernedRunContext<'_> {
     /// Build the execution-choke-point TOCTOU gate for this apply, pairing the
-    /// plan-authorized fingerprint with the execute-time config identity.
+    /// plan-authorized fingerprint with the execute-time routing + governance
+    /// identity. `env` is the plan's persisted `--env` (from the caller, which
+    /// holds it — `execute_models` does not), so the governance identity binds
+    /// the mask resolved for the env that will actually run.
     pub(crate) fn exec_fingerprint_gate(
         &self,
         cfg: &rocky_core::config::RockyConfig,
+        env: Option<&str>,
     ) -> ExecFingerprintGate {
         ExecFingerprintGate {
             expected: self.expected_ir_fingerprint.clone(),
             config_identity: config_policy_identity(cfg),
+            governance_identity: governance_policy_identity(cfg, env),
             plan_id: self.plan_id.to_string(),
             require: self.require_fingerprint,
         }
@@ -1848,7 +1895,9 @@ async fn run_apply_backfill_plan(
         (Some(ctx), Some(cfg)) => {
             // Fail-closed (#4/#5): verify the routing identity before executing.
             ctx.verify_routing_identity(cfg)?;
-            Some(ctx.exec_fingerprint_gate(cfg))
+            // The governance identity resolves the plan's persisted `--env` (a
+            // backfill persists `None`), matching the plan-side fingerprint.
+            Some(ctx.exec_fingerprint_gate(cfg, run_plan.env.as_deref()))
         }
         // Fail-closed (#7): a governed backfill whose config would not load
         // cannot be routing-verified — refuse rather than execute ungated.
@@ -3681,23 +3730,84 @@ auto_create_schemas = true
         let models: Vec<rocky_core::models::Model> = Vec::new();
         let extras = super::ExecutionExtras::default();
         assert_ne!(
-            super::execution_ir_fingerprint(&models, &id_a, &extras),
-            super::execution_ir_fingerprint(&models, &snow, &extras),
+            super::execution_ir_fingerprint(&models, &id_a, "", &extras),
+            super::execution_ir_fingerprint(&models, &snow, "", &extras),
             "the routing identity must change the execution fingerprint"
         );
 
-        // 🔴 #6 (governance policy): a `[mask]` change MUST move the identity
-        // (the governance reconcile would apply a different masking strategy),
-        // while it stays credential-free.
+        // Governance policy (mask) must NOT leak into the ROUTING identity
+        // (finding #5): the routing gate is env-free and must not refuse on a
+        // governance edit. A `[mask]` change leaves `config_policy_identity`
+        // unchanged — governance lives in `governance_policy_identity` instead.
         let masked = |strategy: &str| {
             format!(
                 "[adapter]\ntype = \"duckdb\"\npath = \"a.duckdb\"\n\n[mask]\npii = \"{strategy}\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n"
             )
         };
-        assert_ne!(
+        assert_eq!(
             super::config_policy_identity(&cfg(&masked("hash"))),
             super::config_policy_identity(&cfg(&masked("redact"))),
-            "a [mask] strategy change must change the governance-policy identity (#6)"
+            "a [mask] change must NOT touch the routing identity (routing-only)"
+        );
+    }
+
+    /// 🔴 #5/#6/#2/#4a (governance identity): the env-resolved governance
+    /// identity moves on a mutation-driving change (mask strategy, role
+    /// permission, `[cache.schemas]` toggle) but NOT on advisory
+    /// `[classifications].allow_unmasked` — including an env-var-templated value
+    /// that resolves differently across processes (the false-refuse #5 fixes).
+    #[test]
+    fn governance_identity_binds_mutation_not_advisory() {
+        fn cfg(body: &str) -> rocky_core::config::RockyConfig {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("rocky.toml");
+            std::fs::write(&p, body).unwrap();
+            rocky_core::config::load_rocky_config(&p).unwrap()
+        }
+        let gid = |c: &rocky_core::config::RockyConfig| super::governance_policy_identity(c, None);
+        let base = "[adapter]\ntype = \"duckdb\"\npath = \"a.duckdb\"\n\n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n[pipeline.p.target]\nadapter = \"default\"\n";
+
+        // #6 mask strategy change → identity moves (drives a masking mutation).
+        assert_ne!(
+            gid(&cfg(&format!("{base}\n[mask]\npii = \"hash\"\n"))),
+            gid(&cfg(&format!("{base}\n[mask]\npii = \"redact\"\n"))),
+            "a [mask] strategy change must move the governance identity (#6)"
+        );
+
+        // #2 role permission change (SELECT → MANAGE) → identity moves.
+        let role = |perm: &str| format!("{base}\n[role.analyst]\npermissions = [\"{perm}\"]\n");
+        assert_ne!(
+            gid(&cfg(&role("SELECT"))),
+            gid(&cfg(&role("MANAGE"))),
+            "a role permission change must move the governance identity (#2)"
+        );
+
+        // #4a [cache.schemas] toggle → identity moves (changes whether apply
+        // resolves concrete typed_columns vs Unknown).
+        assert_ne!(
+            gid(&cfg(&format!("{base}\n[cache.schemas]\nenabled = true\n"))),
+            gid(&cfg(&format!("{base}\n[cache.schemas]\nenabled = false\n"))),
+            "a [cache.schemas] toggle must move the governance identity (#4a)"
+        );
+
+        // 🔴 #5 (the false-refuse this fixes): advisory `allow_unmasked` — even
+        // with an env-var-templated value resolving DIFFERENTLY across processes
+        // — must NOT move the identity (it drives no warehouse action). Simulate
+        // the two processes by setting the env var to different values.
+        // SAFETY: single-threaded test; restore after.
+        unsafe { std::env::set_var("ROCKY_TEST_TAG_5", "internal") };
+        let a = gid(&cfg(&format!(
+            "{base}\n[classifications]\nallow_unmasked = [\"${{ROCKY_TEST_TAG_5:-internal}}\"]\n"
+        )));
+        unsafe { std::env::set_var("ROCKY_TEST_TAG_5", "public") };
+        let b = gid(&cfg(&format!(
+            "{base}\n[classifications]\nallow_unmasked = [\"${{ROCKY_TEST_TAG_5:-internal}}\"]\n"
+        )));
+        unsafe { std::env::remove_var("ROCKY_TEST_TAG_5") };
+        assert_eq!(
+            a, b,
+            "advisory classifications must NOT move the governance identity — \
+             an env-var-templated allow_unmasked would otherwise false-refuse (#5)"
         );
     }
 
@@ -3708,11 +3818,12 @@ auto_create_schemas = true
     fn exec_fingerprint_gate_fail_closed_semantics() {
         let m: Vec<rocky_core::models::Model> = Vec::new();
         let extras = super::ExecutionExtras::default();
-        let expected = super::execution_ir_fingerprint(&m, "c", &extras).unwrap();
+        let expected = super::execution_ir_fingerprint(&m, "c", "g", &extras).unwrap();
         // Genuinely-legacy (no fingerprint, not required) → allowed.
         super::ExecFingerprintGate {
             expected: None,
             config_identity: "c".to_string(),
+            governance_identity: "g".to_string(),
             plan_id: "p".to_string(),
             require: false,
         }
@@ -3722,6 +3833,7 @@ auto_create_schemas = true
         let err = super::ExecFingerprintGate {
             expected: None,
             config_identity: "c".to_string(),
+            governance_identity: "g".to_string(),
             plan_id: "p".to_string(),
             require: true,
         }
@@ -3732,6 +3844,7 @@ auto_create_schemas = true
         super::ExecFingerprintGate {
             expected: Some(expected.clone()),
             config_identity: "c".to_string(),
+            governance_identity: "g".to_string(),
             plan_id: "p".to_string(),
             require: true,
         }
@@ -3739,14 +3852,28 @@ auto_create_schemas = true
         .expect("a matching fingerprint applies");
         assert!(
             super::ExecFingerprintGate {
-                expected: Some(expected),
+                expected: Some(expected.clone()),
                 config_identity: "DIFFERENT".to_string(),
+                governance_identity: "g".to_string(),
                 plan_id: "p".to_string(),
                 require: true,
             }
             .verify(&m, &extras)
             .is_err(),
             "a config-identity change must refuse"
+        );
+        // A GOVERNANCE-identity change must refuse too (mask / roles / cache).
+        assert!(
+            super::ExecFingerprintGate {
+                expected: Some(expected),
+                config_identity: "c".to_string(),
+                governance_identity: "DIFFERENT".to_string(),
+                plan_id: "p".to_string(),
+                require: true,
+            }
+            .verify(&m, &extras)
+            .is_err(),
+            "a governance-identity change must refuse"
         );
     }
 

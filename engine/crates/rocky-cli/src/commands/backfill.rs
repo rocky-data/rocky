@@ -195,6 +195,13 @@ pub(crate) fn run_backfill_in(
         .as_ref()
         .map(crate::commands::apply::config_policy_identity);
     let identity = config_identity.clone().unwrap_or_default();
+    // A backfill runs with no `--env`, so the governance identity resolves the
+    // env-default mask (+ roles + cache-selection).
+    let governance_identity = rocky_core::config::load_rocky_config(config_path)
+        .ok()
+        .as_ref()
+        .map(|cfg| crate::commands::apply::governance_policy_identity(cfg, None))
+        .unwrap_or_default();
     // Fold the seeding-independent extras (surrogate-key sidecars #1, contract
     // presence/contents #3) into the bound fingerprint so the apply-time TOCTOU
     // gate rejects a post-plan swap of either, built from the SAME `models_dir`
@@ -212,6 +219,7 @@ pub(crate) fn run_backfill_in(
         models_fingerprint: crate::commands::apply::execution_ir_fingerprint(
             &compiled.project.models,
             &identity,
+            &governance_identity,
             &extras,
         ),
         config_identity,

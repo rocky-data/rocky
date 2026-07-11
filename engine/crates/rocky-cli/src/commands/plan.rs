@@ -936,7 +936,7 @@ fn build_and_persist_run_plan(
     // capabilities that were reviewed.
     let principal = run_options.principal.unwrap_or(PolicyPrincipal::Human);
     let capabilities =
-        compute_embedded_capabilities(config_path, models_dir, base_ref, Some(state_path));
+        compute_embedded_capabilities(config_path, models_dir, base_ref, Some(state_path), env);
     let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
         .context("failed to write run plan")?;
 
@@ -962,6 +962,7 @@ pub fn compute_embedded_capabilities(
     models_dir: &Path,
     base_ref: &str,
     state_path: Option<&Path>,
+    env: Option<&str>,
 ) -> EmbeddedCapabilities {
     use crate::plan_store::CURRENT_FINGERPRINT_VERSION;
     use rocky_compiler::compile::{self, CompilerConfig};
@@ -974,6 +975,13 @@ pub fn compute_embedded_capabilities(
     let config_identity = loaded_cfg
         .as_ref()
         .map(crate::commands::apply::config_policy_identity);
+    // The env-resolved governance identity (mask / roles / cache-selection),
+    // bound into the fingerprint so a post-plan governance change refuses. `env`
+    // is the plan's `--env`, so apply refuses if applied against a different env.
+    let governance_identity = loaded_cfg
+        .as_ref()
+        .map(|cfg| crate::commands::apply::governance_policy_identity(cfg, env))
+        .unwrap_or_default();
 
     // A plan whose fingerprint could not be produced (broken/absent models dir):
     // stamped as a NEW plan with NO fingerprint → the governed apply REFUSES.
@@ -1024,8 +1032,12 @@ pub fn compute_embedded_capabilities(
         &rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap_or_default(),
         &head.project.models,
     );
-    let models_fingerprint =
-        crate::commands::apply::execution_ir_fingerprint(&head.project.models, &identity, &extras);
+    let models_fingerprint = crate::commands::apply::execution_ir_fingerprint(
+        &head.project.models,
+        &identity,
+        &governance_identity,
+        &extras,
+    );
 
     let base = match super::ci_diff::extract_base_compile(base_ref, models_dir, source_schemas) {
         Ok(r) => r,
