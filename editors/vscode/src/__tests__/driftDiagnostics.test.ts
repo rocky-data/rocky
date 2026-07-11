@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mockDiagnosticCollection = {
   set: vi.fn(),
   delete: vi.fn(),
+  clear: vi.fn(),
   dispose: vi.fn(),
 };
 
@@ -145,6 +146,20 @@ vi.mock("../views/getStartedView", () => ({
   onDidChangeRockyProject: () => ({ dispose: (): void => undefined }),
 }));
 
+// The drift provider is a CLI fallback behind the language server: it only
+// shells out while the LSP is Stopped/Failed. Default to Stopped so the
+// existing open/save tests exercise the CLI path; individual tests flip the
+// status and fire the captured listener to test the ownership handoff.
+const lspStateMock: { status: string } = { status: "Stopped" };
+let lspStateListener: ((state: { status: string }) => void) | undefined;
+vi.mock("../lspClient", () => ({
+  getLspState: () => lspStateMock,
+  onDidChangeLspState: (cb: (state: { status: string }) => void) => {
+    lspStateListener = cb;
+    return { dispose: (): void => undefined };
+  },
+}));
+
 import * as vscode from "vscode";
 import { runRockyJson } from "../rockyCli";
 import { registerDriftDiagnostics } from "../driftDiagnostics";
@@ -162,6 +177,8 @@ describe("registerDriftDiagnostics", () => {
     vi.clearAllMocks();
     mockDiagnosticCollection.set.mockReset();
     mockDiagnosticCollection.delete.mockReset();
+    mockDiagnosticCollection.clear.mockReset();
+    lspStateMock.status = "Stopped";
   });
 
   it("creates a diagnostic collection named 'rocky-drift'", () => {
@@ -180,13 +197,13 @@ describe("registerDriftDiagnostics", () => {
     expect(vscode.workspace.onDidCloseTextDocument).toHaveBeenCalled();
   });
 
-  it("pushes collection + code action provider + acceptDrift command + 3 listeners + config + project listener into subscriptions", () => {
+  it("pushes collection + code action provider + acceptDrift command + 3 listeners + config + project + lsp listeners into subscriptions", () => {
     const ctx = makeContext();
     registerDriftDiagnostics(ctx);
     // collection + codeActionsProvider + acceptDrift cmd +
     // onDidOpen + onDidSave + onDidClose + onDidChangeConfiguration +
-    // onDidChangeRockyProject = 8
-    expect(ctx.subscriptions.length).toBe(8);
+    // onDidChangeRockyProject + onDidChangeLspState = 9
+    expect(ctx.subscriptions.length).toBe(9);
   });
 
   it("registers a code actions provider for rocky diagnostics", () => {
@@ -204,7 +221,9 @@ describe("diagnostic mapping", () => {
     vi.clearAllMocks();
     mockDiagnosticCollection.set.mockReset();
     mockDiagnosticCollection.delete.mockReset();
+    mockDiagnosticCollection.clear.mockReset();
     runRockyJsonMock.mockReset();
+    lspStateMock.status = "Stopped";
   });
 
   it("maps Rocky diagnostics to vscode diagnostics with correct severity", async () => {
@@ -421,5 +440,99 @@ describe("diagnostic mapping", () => {
     const [, diags] = mockDiagnosticCollection.set.mock.calls[0];
     expect(diags).toHaveLength(1);
     expect(diags[0].message).toBe("Drift in target_model");
+  });
+});
+
+describe("LSP ownership handoff", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockDiagnosticCollection.set.mockReset();
+    mockDiagnosticCollection.delete.mockReset();
+    mockDiagnosticCollection.clear.mockReset();
+    runRockyJsonMock.mockReset();
+    lspStateMock.status = "Stopped";
+    lspStateListener = undefined;
+  });
+
+  it("does not shell out while the language server owns diagnostics", async () => {
+    lspStateMock.status = "Ready";
+
+    let openCallback: ((doc: vscode.TextDocument) => void) | undefined;
+    (vscode.workspace.onDidOpenTextDocument as ReturnType<typeof vi.fn>).mockImplementation(
+      (cb: (doc: vscode.TextDocument) => void) => {
+        openCallback = cb;
+        return { dispose: vi.fn() };
+      },
+    );
+    Object.defineProperty(vscode.workspace, "textDocuments", { value: [], configurable: true });
+
+    const ctx = makeContext();
+    registerDriftDiagnostics(ctx);
+
+    const mockDoc = {
+      fileName: "/project/models/my_model.sql",
+      uri: vscode.Uri.file("/project/models/my_model.sql"),
+    } as unknown as vscode.TextDocument;
+    openCallback!(mockDoc);
+
+    // Outlast the 500ms debounce window — no compile may fire.
+    await new Promise((r) => setTimeout(r, 700));
+    expect(runRockyJsonMock).not.toHaveBeenCalled();
+  });
+
+  it("clears fallback diagnostics when the language server comes up", () => {
+    Object.defineProperty(vscode.workspace, "textDocuments", { value: [], configurable: true });
+
+    const ctx = makeContext();
+    registerDriftDiagnostics(ctx);
+
+    lspStateMock.status = "Ready";
+    lspStateListener!({ status: "Ready" });
+
+    expect(mockDiagnosticCollection.clear).toHaveBeenCalled();
+  });
+
+  it("sweeps open model documents when the language server dies", async () => {
+    lspStateMock.status = "Ready";
+    runRockyJsonMock.mockResolvedValue({
+      command: "compile",
+      version: "0.4.0",
+      models: 1,
+      execution_layers: 1,
+      has_errors: false,
+      compile_timings: {
+        total_ms: 1,
+        project_load_ms: 0,
+        semantic_graph_ms: 0,
+        typecheck_ms: 0,
+        typecheck_join_keys_ms: 0,
+        contracts_ms: 0,
+      },
+      diagnostics: [],
+    });
+
+    const mockDoc = {
+      fileName: "/project/models/my_model.sql",
+      uri: vscode.Uri.file("/project/models/my_model.sql"),
+    } as unknown as vscode.TextDocument;
+    Object.defineProperty(vscode.workspace, "textDocuments", {
+      value: [mockDoc],
+      configurable: true,
+    });
+
+    const ctx = makeContext();
+    registerDriftDiagnostics(ctx);
+    expect(runRockyJsonMock).not.toHaveBeenCalled();
+
+    lspStateMock.status = "Failed";
+    lspStateListener!({ status: "Failed" });
+
+    // The fallback sweep is debounced (500ms per URI).
+    await vi.waitFor(
+      () => {
+        expect(runRockyJsonMock).toHaveBeenCalled();
+      },
+      { timeout: 2000 },
+    );
   });
 });
