@@ -323,8 +323,17 @@ impl RatelimitBudget for FileBudget {
         // The original file backend is sync + fail-open; lift its
         // result into the async trait surface without losing the
         // fail-open contract — a missing / corrupt file still maps
-        // to `Ok(None)`.
-        Ok(read_wake_at(&self.path(account_hash)))
+        // to `Ok(None)`. The sync read runs on the blocking pool so a
+        // slow filesystem (e.g. a networked TMPDIR) can't park the
+        // executor worker this request shares with every other future.
+        let path = self.path(account_hash);
+        match tokio::task::spawn_blocking(move || read_wake_at(&path)).await {
+            Ok(wake_at) => Ok(wake_at),
+            Err(e) => {
+                warn!(error = %e, "ratelimit read task failed; fail-open");
+                Ok(None)
+            }
+        }
     }
 
     async fn set_wake_at(
@@ -332,9 +341,13 @@ impl RatelimitBudget for FileBudget {
         account_hash: &str,
         wake_at: SystemTime,
     ) -> Result<(), BudgetError> {
-        // `record_wake_at` is sync + fail-open; never returns an
-        // error to surface.
-        record_wake_at(&self.path(account_hash), wake_at);
+        // `record_wake_at` is sync + fail-open and takes a *blocking*
+        // advisory file lock (`fs4`) that can wait on a peer process —
+        // it must run on the blocking pool, not an executor worker.
+        let path = self.path(account_hash);
+        if let Err(e) = tokio::task::spawn_blocking(move || record_wake_at(&path, wake_at)).await {
+            warn!(error = %e, "ratelimit write task failed; fail-open");
+        }
         Ok(())
     }
 

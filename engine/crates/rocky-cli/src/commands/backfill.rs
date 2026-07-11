@@ -211,12 +211,43 @@ pub(crate) fn run_backfill_in(
 
     // 7. Persist the plan (always review-gated).
     let run_plan = build_run_plan(models_dir, &ordered, &layers, partition_from, partition_to);
+    // A backfill executes the same on-disk models it plans; bind their
+    // compiled-IR fingerprint + routing identity so the apply-time TOCTOU gate
+    // rejects a change.
+    let config_identity = rocky_core::config::load_rocky_config(config_path)
+        .ok()
+        .as_ref()
+        .map(crate::commands::apply::config_policy_identity);
+    let identity = config_identity.clone().unwrap_or_default();
+    // A backfill runs with no `--env`, so the governance identity resolves the
+    // env-default mask (+ roles + cache-selection).
+    let governance_identity = rocky_core::config::load_rocky_config(config_path)
+        .ok()
+        .as_ref()
+        .map(|cfg| crate::commands::apply::governance_policy_identity(cfg, None))
+        .unwrap_or_default();
+    // Fold the seeding-independent extras (surrogate-key sidecars #1, contract
+    // presence/contents #3) into the bound fingerprint so the apply-time TOCTOU
+    // gate rejects a post-plan swap of either, built from the SAME `models_dir`
+    // the apply choke-point re-reads.
+    let extras = crate::commands::apply::ExecutionExtras::build(
+        &rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap_or_default(),
+        &compiled.project.models,
+    );
     let capabilities = EmbeddedCapabilities {
         diff_available: true,
         changed: ordered
             .iter()
             .map(|m| (m.clone(), PolicyCapability::Backfill))
             .collect(),
+        models_fingerprint: crate::commands::apply::execution_ir_fingerprint(
+            &compiled.project.models,
+            &identity,
+            &governance_identity,
+            &extras,
+        ),
+        config_identity,
+        fingerprint_version: crate::plan_store::CURRENT_FINGERPRINT_VERSION,
     };
     let plan_id = write_plan_governed(
         root,

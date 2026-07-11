@@ -1045,7 +1045,7 @@ class PolicyScope(BaseModel):
     """
     max_downstreams: conint(ge=0) | None = None
     """
-    Blast-radius guard: maximum downstream count. **Parse-only in v0** — accepted and validated but not yet evaluated by the matcher.
+    Blast-radius guard: maximum transitive downstream count. Enforced as a **post-match ceiling on `allow`**, not a scope predicate: the rule still matches, and when its effect is `allow` and the target's transitive downstream reachability exceeds the ceiling — or cannot be computed — the effect degrades to `require_review` (fail-closed). `deny` / `require_review` rules are unaffected.
     """
     models: list[str] | None = []
     """

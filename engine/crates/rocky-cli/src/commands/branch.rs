@@ -1621,6 +1621,7 @@ pub async fn run_branch_promote_from_plan(
     config_path: &Path,
     plan_id: &str,
     name: Option<&str>,
+    state_path: &Path,
     json: bool,
 ) -> Result<()> {
     use crate::output::{AuditEvent, AuditEventKind, PromotePlan, print_json};
@@ -1649,6 +1650,20 @@ pub async fn run_branch_promote_from_plan(
             promote_plan.branch_name
         );
     }
+
+    // Route the `--plan` path through the canonical agent-policy gate BEFORE
+    // any target SQL executes — the same gate `rocky apply <promote-plan>`
+    // runs. Without this, an agent-authored Promote plan a `deny agent promote`
+    // rule (or freeze) would refuse could still execute here directly. The
+    // plan's stamped principal binds (an agent plan evaluates as agent).
+    crate::commands::apply::gate_promote_plan(
+        root,
+        config_path,
+        plan_id,
+        plan.resolved_principal(),
+        &promote_plan,
+        state_path,
+    )?;
 
     let actor = approver_identity().unwrap_or_else(|_| crate::output::ApproverIdentity {
         email: "unknown".to_string(),
@@ -3085,6 +3100,226 @@ auto_create_schemas = true
         assert_eq!(
             dim_count, 1,
             "promote must copy the row from branch__fix-price.dim_customers to prod"
+        );
+    }
+
+    /// 🔴 D9 regression (drives the PRODUCTION call site): an agent-invoked
+    /// promote plan must PERSIST `principal = agent`. This drives
+    /// `build_promote_plan_inner` — the call site FIX 2 changed — end-to-end and
+    /// reads the persisted plan back. Reverting the production fix (back to a
+    /// bare `write_plan` / dropping the threaded principal) makes this fail: the
+    /// persisted plan would resolve to the `Human` default.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn build_promote_plan_inner_stamps_agent_principal() {
+        use crate::plan_store::{PlanKind, read_plan};
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+
+        // Self-contained git repo with a local identity (approver_identity runs
+        // `git config --get user.email` in cwd; CI runners have no ambient one).
+        for git_args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "test@rocky.invalid"].as_slice(),
+            ["config", "user.name", "Rocky Test"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git setup");
+            assert!(status.success(), "git {git_args:?} failed");
+        }
+
+        write_transformation_model(
+            &models_dir,
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "default"
+
+[pipeline.t.target.governance]
+auto_create_schemas = true
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        run_branch_create(&state_path, "fix-price", None, false).unwrap();
+
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        let result = crate::commands::plan::build_promote_plan_inner(
+            dir,
+            &config_path,
+            &models_dir,
+            "main", // base_ref — repo is fresh so the breaking-change gate skips
+            "fix-price",
+            None, // filter
+            None, // pipeline
+            true, // allow_breaking — irrelevant; gate skips fail-open anyway
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Agent, // the agent-invoked promote
+        )
+        .await;
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        let result = result.expect("build_promote_plan_inner must succeed");
+        let plan_id = result
+            .plan_output
+            .plan_id
+            .expect("a plan_id must be persisted");
+
+        // The PERSISTED plan must resolve to Agent — not the Human default.
+        let persisted = read_plan(dir, &plan_id).expect("read persisted promote plan");
+        assert_eq!(
+            persisted.kind,
+            PlanKind::Promote,
+            "the persisted plan is a promote plan"
+        );
+        assert_eq!(
+            persisted.resolved_principal(),
+            rocky_core::config::PolicyPrincipal::Agent,
+            "an agent-invoked promote must persist principal = agent (FIX 2), not fall to Human"
+        );
+    }
+
+    /// 🔴 A regression: `rocky branch promote --plan <id>` must route through
+    /// the agent-policy gate. An agent-authored Promote plan under a
+    /// `deny agent promote { any }` rule must be REFUSED before any target SQL
+    /// executes. Pre-fix `run_branch_promote_from_plan` called `run_promote_apply`
+    /// directly with no policy evaluation, so the denied plan executed.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn branch_promote_from_plan_gates_a_denied_agent_promote() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+
+        for git_args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "test@rocky.invalid"].as_slice(),
+            ["config", "user.name", "Rocky Test"].as_slice(),
+        ] {
+            std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git setup");
+        }
+
+        write_transformation_model(
+            &models_dir,
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        // Config carries a `[policy]` block that DENIES every agent promote.
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "default"
+
+[pipeline.t.target.governance]
+auto_create_schemas = true
+
+[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "promote"
+scope = {{ any = true }}
+effect = "deny"
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        run_branch_create(&state_path, "fix-price", None, false).unwrap();
+
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+
+        // Build an AGENT-authored promote plan (build does not gate).
+        let build = crate::commands::plan::build_promote_plan_inner(
+            dir,
+            &config_path,
+            &models_dir,
+            "main",
+            "fix-price",
+            None,
+            None,
+            true,
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Agent,
+        )
+        .await;
+        let plan_id = build
+            .expect("plan build must succeed")
+            .plan_output
+            .plan_id
+            .expect("plan_id");
+
+        // Now apply it via the --plan path — the gate must REFUSE it.
+        let result = crate::commands::run_branch_promote_from_plan(
+            dir,
+            &config_path,
+            &plan_id,
+            None,
+            &state_path,
+            false,
+        )
+        .await;
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        let err = result.expect_err("a denied agent promote must be refused via --plan");
+        assert!(
+            err.to_string().contains("DENIES"),
+            "the --plan path must be gated by the policy plane, got: {err}"
         );
     }
 

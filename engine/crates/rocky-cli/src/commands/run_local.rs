@@ -73,6 +73,8 @@ pub async fn run_transformation(
     // `@var()` markers in this pipeline's model SQL at compile time (both the
     // execution compile and the governance reconcile compile below).
     run_vars: &rocky_core::run_vars::RunVars,
+    // Governed-apply TOCTOU gate (E) — `Some` for an agent transformation apply.
+    exec_fp_gate: Option<&super::apply::ExecFingerprintGate>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -134,6 +136,7 @@ pub async fn run_transformation(
             run_vars,
             rocky_cfg.resilience.clone(),
             super::resilience::retry_policy_allows(rocky_cfg),
+            exec_fp_gate,
         )
         .await;
 
@@ -1035,6 +1038,7 @@ mod tests {
             &skip_opts,
             &rocky_core::run_vars::RunVars::new(),
             None, // no run_id override — mint the usual timestamp id
+            None, // no governance ctx (test)
         )
         .await
         .expect("full-DAG transformation run should succeed");
@@ -1221,6 +1225,7 @@ auto_create_schemas = true
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
             None, // no run_id override — mint the usual timestamp id
+            None, // no governance ctx (test)
         )
         .await
         .expect("full-DAG transformation run with idempotency key should succeed");
@@ -1378,6 +1383,7 @@ auto_create_schemas = true
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
             None, // no run_id override — mint the usual timestamp id
+            None, // no governance ctx (test)
         )
         .await
         .expect("model-only run must reach the governance.tags apply path and succeed");
@@ -1453,6 +1459,7 @@ auto_create_schemas = true
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
             None, // no run_id override — mint the usual timestamp id
+            None, // no governance ctx (test)
         )
         .await;
 

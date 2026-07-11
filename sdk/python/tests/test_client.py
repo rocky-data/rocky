@@ -8,6 +8,8 @@ from __future__ import annotations
 import io
 import json
 import signal
+import threading
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -36,6 +38,33 @@ def _fake_popen(*, stdout: str = "", stderr: str = "", returncode: int = 0) -> M
     proc.returncode = returncode
     proc.wait.return_value = returncode
     return proc
+
+
+@contextmanager
+def _hung_popen(*, stderr: str = "slow\n"):
+    """A Popen double that blocks in ``wait()`` until the watchdog kills it.
+
+    Patches ``kill_process_group`` (so no real signal is sent) to release the
+    blocked ``wait()`` with the POSIX SIGKILL exit status — the shape a genuine
+    watchdog kill produces.
+    """
+    proc = MagicMock()
+    proc.pid = 4321
+    proc.stdout = io.StringIO("")
+    proc.stderr = io.StringIO(stderr)
+    killed = threading.Event()
+
+    def _wait() -> int:
+        killed.wait(timeout=30)  # released by the (patched) watchdog kill
+        proc.returncode = -signal.SIGKILL
+        return proc.returncode
+
+    proc.wait.side_effect = _wait
+    with (
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        patch("rocky_sdk.client.kill_process_group", side_effect=lambda _p: killed.set()),
+    ):
+        yield proc
 
 
 def _client(**kwargs) -> RockyClient:
@@ -141,6 +170,31 @@ def test_verify_version_accepts_dev_suffix_at_or_above_floor():
     assert client._version_checked is True
 
 
+def test_verify_version_accepts_two_component_version_at_floor():
+    """A short "X.Y" version compares as "X.Y.0", not below it."""
+    client = RockyClient(binary_path="rocky")
+    completed = MagicMock(stdout="rocky 1.34\n")
+    with (
+        patch("rocky_sdk.client.shutil.which", return_value="/bin/rocky"),
+        patch("rocky_sdk.client.subprocess.run", return_value=completed),
+    ):
+        client._verify_engine_version()  # no raise
+    assert client._version_checked is True
+
+
+def test_verify_version_enforces_despite_trailing_build_metadata():
+    """ "rocky 1.2.0 (abc123)" must still be gated, not silently skipped."""
+    client = RockyClient(binary_path="rocky")
+    completed = MagicMock(stdout="rocky 1.2.0 (abc123)\n")
+    with (
+        patch("rocky_sdk.client.shutil.which", return_value="/bin/rocky"),
+        patch("rocky_sdk.client.subprocess.run", return_value=completed),
+        pytest.raises(RockyVersionError) as exc,
+    ):
+        client._verify_engine_version()
+    assert exc.value.min_version == "1.34.0"
+
+
 def test_verify_version_missing_binary():
     client = RockyClient(binary_path="rocky")
     with (
@@ -198,43 +252,54 @@ def test_run_cli_hard_failure_carries_stderr_tail():
 
 
 def test_run_cli_timeout_when_watchdog_kills():
-    client = _client()
-    # POSIX SIGKILL marker is the canonical timeout signal.
-    proc = _fake_popen(stdout="", stderr="slow\n", returncode=-signal.SIGKILL)
+    client = _client(timeout_seconds=0.05)
     with (
         patch("rocky_sdk.client.os.name", "posix"),
-        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        _hung_popen(),
         pytest.raises(RockyTimeoutError) as exc,
     ):
         client.run_cli(["run"], allow_partial=True)
     assert exc.value.timeout_seconds == client.timeout_seconds
 
 
-def test_run_cli_per_call_timeout_overrides_static():
-    """A per-call ``timeout_seconds`` supersedes the construction-time budget."""
+def test_run_cli_external_sigkill_is_not_a_timeout():
+    """A SIGKILL the watchdog did not deliver (e.g. the OOM killer) is a
+    command failure — reporting it as a timeout hides the real cause."""
     client = _client(timeout_seconds=3600)
-    proc = _fake_popen(stdout="", stderr="slow\n", returncode=-signal.SIGKILL)
+    proc = _fake_popen(stdout="", stderr="Killed\n", returncode=-signal.SIGKILL)
     with (
         patch("rocky_sdk.client.os.name", "posix"),
         patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        pytest.raises(RockyCommandError) as exc,
+    ):
+        client.run_cli(["run"])
+    assert exc.value.returncode == -signal.SIGKILL
+    assert "Killed" in exc.value.stderr_tail
+
+
+def test_run_cli_per_call_timeout_overrides_static():
+    """A per-call ``timeout_seconds`` supersedes the construction-time budget."""
+    client = _client(timeout_seconds=3600)
+    with (
+        patch("rocky_sdk.client.os.name", "posix"),
+        _hung_popen(),
         pytest.raises(RockyTimeoutError) as exc,
     ):
-        client.run_cli(["run"], allow_partial=True, timeout_seconds=5)
+        client.run_cli(["run"], allow_partial=True, timeout_seconds=0.05)
     # The error carries the effective (per-call) budget, not the static 3600.
-    assert exc.value.timeout_seconds == 5
+    assert exc.value.timeout_seconds == 0.05
 
 
 def test_run_cli_none_timeout_uses_static_budget():
     """``timeout_seconds=None`` leaves the construction-time budget in force."""
-    client = _client(timeout_seconds=1234)
-    proc = _fake_popen(stdout="", stderr="", returncode=-signal.SIGKILL)
+    client = _client(timeout_seconds=0.05)
     with (
         patch("rocky_sdk.client.os.name", "posix"),
-        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        _hung_popen(stderr=""),
         pytest.raises(RockyTimeoutError) as exc,
     ):
         client.run_cli(["run"], allow_partial=True, timeout_seconds=None)
-    assert exc.value.timeout_seconds == 1234
+    assert exc.value.timeout_seconds == 0.05
 
 
 @pytest.mark.parametrize("bad", [0, -1, -900])
@@ -253,14 +318,13 @@ def test_run_cli_rejects_nonpositive_timeout(bad):
 def test_run_forwards_per_call_timeout_to_watchdog():
     """``run()`` threads its ``timeout_seconds`` down to the watchdog boundary."""
     client = _client(timeout_seconds=3600)
-    proc = _fake_popen(stdout="", stderr="", returncode=-signal.SIGKILL)
     with (
         patch("rocky_sdk.client.os.name", "posix"),
-        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        _hung_popen(stderr=""),
         pytest.raises(RockyTimeoutError) as exc,
     ):
-        client.run("client=cocacola", timeout_seconds=42)
-    assert exc.value.timeout_seconds == 42
+        client.run("client=cocacola", timeout_seconds=0.05)
+    assert exc.value.timeout_seconds == 0.05
 
 
 def test_run_cli_binary_not_found():

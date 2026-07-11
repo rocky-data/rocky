@@ -3,7 +3,10 @@
 //!
 //! Plans are written to `<root>/.rocky/plans/<plan_id>.json` where `plan_id`
 //! is the full 64-character blake3 hex digest of the canonical JSON
-//! `{"kind": "<kind>", "payload": <payload>}`.
+//! `{"kind": "<kind>", "payload": <payload>}`. The authoring principal is NOT
+//! in the digest — it is not an authorization boundary (an unkeyed hash is
+//! attacker-recomputable), and enforcement evaluates the apply-time runtime
+//! principal, not the stored field. See [`PersistedPlan::principal`].
 //!
 //! ## Determinism guarantee
 //!
@@ -155,17 +158,18 @@ pub struct PersistedPlan {
     pub format_version: u32,
     /// The principal that authored this plan (agent-policy plane).
     ///
-    /// Rides **outside** the `plan_id` digest (like `created_at` /
-    /// `format_version`) — the authoring identity must not perturb the hash,
-    /// while the reviewed capability classification (in `payload`) must bind
-    /// to it. Stamped at plan-creation.
+    /// **Advisory only.** It rides outside the `plan_id` digest and is NOT the
+    /// enforcement source — an unkeyed hash is attacker-recomputable, so binding
+    /// it would not actually prevent a downgrade. Enforcement instead evaluates
+    /// the **apply-time runtime principal** (`ROCKY_PRINCIPAL` at apply),
+    /// combined most-restrictively with the kind-forced principal (see
+    /// [`default_principal_for_kind`]): an agent running `rocky apply` is gated
+    /// as agent regardless of this field, and an `AiAuthored`/`Backfill` plan is
+    /// gated as agent by kind. This field is used only for display (`rocky
+    /// audit` / the review queue) and the review-flow reviewability check.
     ///
-    /// **Absent on legacy plans** (written before the field existed). An
-    /// absent value does NOT default to `human`: it resolves *by kind* via
-    /// [`PersistedPlan::resolved_principal`] — an `ai_authored` plan with no
-    /// stamp resolves to `agent` (never `human`, which would let a legacy
-    /// AI plan apply unreviewed once the hardcoded gate becomes rule-driven);
-    /// any other kind resolves to `human`.
+    /// **Absent on legacy plans** (written before the field existed). Resolved
+    /// by kind via [`PersistedPlan::resolved_principal`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<PolicyPrincipal>,
     /// Raw plan body, opaque to plan_store. For `format_version = 2`
@@ -209,7 +213,37 @@ pub struct EmbeddedCapabilities {
     /// are not gated.
     #[serde(default)]
     pub changed: BTreeMap<String, PolicyCapability>,
+    /// Compiled-IR execution fingerprint the gate authorized at plan time (see
+    /// `apply::execution_ir_fingerprint`): the typed-config + SQL projection plus
+    /// the routing config identity. Bound into the `plan_id` (it lives in the
+    /// hashed payload). At apply the executing compiled set is re-fingerprinted
+    /// at the execution choke-point and REFUSED (fail-closed) on mismatch.
+    ///
+    /// `None` means the fingerprint could not be produced at plan time (the head
+    /// did not compile). For a **new** plan (`fingerprint_version >= 1`) that is
+    /// a production failure → the governed apply REFUSES (finding #7). For a
+    /// **legacy** plan (`fingerprint_version == 0`, written before this feature)
+    /// the check is skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_fingerprint: Option<String>,
+    /// The routing config identity (`apply::config_policy_identity`) the gate
+    /// authorized — the physical destination / adapter-target shape, credentials
+    /// excluded. Verified BEFORE any replication/governance mutation (finding
+    /// #4/#5), so a `path`/adapter/target swap is refused before the first
+    /// warehouse statement. `None` on a legacy plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_identity: Option<String>,
+    /// Fingerprint feature version. `0` (serde default) marks a genuinely-legacy
+    /// plan written before the TOCTOU fingerprint existed — its checks are
+    /// skipped. Every plan THIS binary writes stamps `>= 1`, so a `>= 1` plan
+    /// with a `None` `models_fingerprint`/`config_identity` is a production
+    /// FAILURE and the governed apply REFUSES (finding #7 — legacy vs failure).
+    #[serde(default)]
+    pub fingerprint_version: u32,
 }
+
+/// The fingerprint feature version this binary stamps onto every plan it writes.
+pub const CURRENT_FINGERPRINT_VERSION: u32 = 1;
 
 /// The principal an absent stamp resolves to, **by kind** (never a blanket
 /// `human`): an `ai_authored` plan is agent-authored by construction
@@ -225,14 +259,42 @@ fn default_principal_for_kind(kind: &PlanKind) -> PolicyPrincipal {
     }
 }
 
+/// The more restrictive of two principals — `Agent` outranks `Human`.
+pub(crate) fn most_restrictive(a: PolicyPrincipal, b: PolicyPrincipal) -> PolicyPrincipal {
+    if a == PolicyPrincipal::Agent || b == PolicyPrincipal::Agent {
+        PolicyPrincipal::Agent
+    } else {
+        PolicyPrincipal::Human
+    }
+}
+
 impl PersistedPlan {
     /// The authoring principal, resolving an absent stamp by kind (see
-    /// [`default_principal_for_kind`]). This is the value the policy plane
-    /// evaluates — the *authoring* identity binds, so a plan authored by an
-    /// agent still evaluates as `agent` regardless of who runs `apply`.
+    /// [`default_principal_for_kind`]).
+    ///
+    /// **Advisory / display only** — this reads the tamperable stored field.
+    /// The policy plane does NOT enforce against it; use
+    /// [`Self::enforcement_principal`] for any gate decision.
     pub fn resolved_principal(&self) -> PolicyPrincipal {
         self.principal
             .unwrap_or_else(|| default_principal_for_kind(&self.kind))
+    }
+
+    /// The principal the policy plane ENFORCES against — the most restrictive
+    /// of the apply-time `runtime` principal and the plan's kind-forced
+    /// principal. The stored `principal` field is **not** consulted: an unkeyed
+    /// hash is attacker-recomputable, so a stored stamp is not a trustworthy
+    /// authorization source. Instead:
+    ///
+    /// - an **agent** running `rocky apply` (`ROCKY_PRINCIPAL=agent`) is gated
+    ///   as agent regardless of the plan file (the tamper-proof property), and
+    /// - an `AiAuthored` / `Backfill` plan is gated as agent **by kind** even
+    ///   when a human applies it (these are machine-composed by construction).
+    ///
+    /// A human applying a `Run` / `Gc` / `Promote` plan resolves to `human`
+    /// (the "human vouches" model) — the human is the responsible applier.
+    pub fn enforcement_principal(&self, runtime: PolicyPrincipal) -> PolicyPrincipal {
+        most_restrictive(runtime, default_principal_for_kind(&self.kind))
     }
 
     /// The propose-time change-classification embedded in the payload (capability-embed).
@@ -246,25 +308,53 @@ impl PersistedPlan {
 }
 
 impl EmbeddedCapabilities {
-    /// The `(model, capability)` set the policy plane evaluates for a plan
-    /// covering `planned_models`.
+    /// The `(model, capability)` set the policy plane evaluates for a plan.
     ///
-    /// - Diff available at propose time → the embedded per-changed-model
-    ///   classification (unchanged models are absent and are not gated).
-    /// - Diff unavailable (skipped, or a legacy plan with no embed) → **every**
-    ///   planned model, classified `schema_change.breaking` (fail closed).
+    /// `executable_models` is the set of models the apply will **actually
+    /// execute** — for a run-shaped plan this is the compiled project narrowed
+    /// by the plan's `--model` selection (re-derived at apply time the same way
+    /// the run does), NOT the plan's *informational* `models` list. Gating on
+    /// the informational list is a fail-open in both directions: an absent list
+    /// (serde-default/skip-if-empty) would gate nothing while real models
+    /// execute, and a list that over-lists (e.g. `--model A` stored every
+    /// compiled model) would wrongly fire a rule scoped to an unexecuted model.
+    ///
+    /// Every executing model is gated (symmetric with the promote gate, which
+    /// gates the full executable target set — D4):
+    ///
+    /// - Diff unavailable (skipped, or a legacy plan with no embed) → every
+    ///   executable model classified `schema_change.breaking` (fail closed).
+    /// - Diff available → each executable model under its embedded change
+    ///   classification when the diff found a change on it, otherwise under the
+    ///   bare `apply` verb. Re-materializing an unchanged model is still a
+    ///   governed mutation, so an `apply`-scoped deny/freeze (or a
+    ///   `models`-scoped rule targeting an unchanged-but-executing model) must
+    ///   fire; a `schema_change.*` refinement only matches the models that
+    ///   actually changed.
+    /// - A change to a model that will **not** execute is not gated.
+    /// - No executable models at all → empty (a genuine no-op executes nothing
+    ///   and is not gated).
     ///
     /// The apply-time enforcement and the propose-time MCP gate share this so
     /// the two evaluate the identical touched set for the same plan.
-    pub fn touched(&self, planned_models: &[String]) -> BTreeMap<String, PolicyCapability> {
-        if self.diff_available {
-            self.changed.clone()
-        } else {
-            planned_models
+    pub fn touched(&self, executable_models: &[String]) -> BTreeMap<String, PolicyCapability> {
+        if !self.diff_available {
+            return executable_models
                 .iter()
                 .map(|m| (m.clone(), PolicyCapability::SchemaChangeBreaking))
-                .collect()
+                .collect();
         }
+        executable_models
+            .iter()
+            .map(|m| {
+                let cap = self
+                    .changed
+                    .get(m)
+                    .copied()
+                    .unwrap_or(PolicyCapability::Apply);
+                (m.clone(), cap)
+            })
+            .collect()
     }
 }
 
@@ -284,6 +374,13 @@ fn default_format_version() -> u32 {
 /// The digest is over the JSON bytes of `{"kind": <kind>, "payload": <payload>}`.
 /// `payload` must be the pre-`plan_id` version (i.e. `plan_id` field is `None`
 /// or absent) so the id is stable.
+///
+/// The authoring principal is **not** part of the digest. It is not an
+/// authorization boundary: an unkeyed hash is attacker-recomputable (rehash +
+/// rename downgrades the stamp), and enforcement no longer trusts the stored
+/// field — it evaluates the **apply-time runtime principal** instead (an agent
+/// running `rocky apply` is gated as agent regardless of any file). See
+/// [`PersistedPlan::principal`].
 fn compute_plan_id(kind: &PlanKind, payload: &serde_json::Value) -> String {
     #[derive(Serialize)]
     struct Envelope<'a> {
@@ -353,11 +450,10 @@ pub fn write_plan_governed<T: Serialize>(
 ///
 /// Used by `rocky gc`: the `gc` verb carries no per-model change
 /// classification (every eviction is uniformly a `gc` capability, computed at
-/// apply time from the plan's eviction list), so there is nothing to embed —
-/// but the invoker principal must still ride on the record so an agent-scoped
-/// `deny agent gc` rule fires on an agent-run GC. The `principal` rides outside
-/// the `plan_id` digest, exactly as [`write_plan`] and [`write_plan_governed`]
-/// stamp it.
+/// apply time from the plan's eviction list), so there is nothing to embed.
+/// The `principal` is stamped for display/advisory purposes (it rides outside
+/// the `plan_id` digest); enforcement uses the apply-time runtime principal,
+/// not this field.
 pub fn write_plan_with_principal<T: Serialize>(
     root: &Path,
     kind: PlanKind,
@@ -445,6 +541,9 @@ fn write_plan_inner<T: Serialize>(
     // (run/ai_authored); typed-IR compact/archive payloads never carry it.
     let payload_value = payload_with_capabilities(payload, capabilities)?;
 
+    // The authoring principal is part of the integrity digest (see
+    // `compute_plan_id`) so a later tamper of the stamped principal invalidates
+    // the id.
     let plan_id = compute_plan_id(&kind, &payload_value);
 
     let record = PersistedPlan {
@@ -500,8 +599,10 @@ pub fn read_plan(root: &Path, plan_id: &str) -> Result<PersistedPlan> {
     // Recompute it from the bytes we just parsed and reject the plan if it does
     // not match the requested id (and the stored id). This binds the applied
     // bytes to the reviewed plan id — a plan whose payload was tampered with or
-    // truncated-but-still-parseable after it was written (and reviewed) no
-    // longer matches its filename / stored id, so apply refuses it.
+    // truncated-but-still-parseable after it was written no longer matches its
+    // filename / stored id, so apply refuses it. (The authoring `principal` is
+    // NOT bound — it is advisory; enforcement uses the apply-time runtime
+    // principal, so a stored-principal tamper cannot downgrade an agent apply.)
     let recomputed = compute_plan_id(&plan.kind, &plan.payload);
     if recomputed != plan_id || recomputed != plan.plan_id {
         bail!(
@@ -771,6 +872,20 @@ mod tests {
         Ok(())
     }
 
+    /// The `Promote` kind's *default* principal is `Human`
+    /// (`default_principal_for_kind`) — which is exactly why FIX 2 threads an
+    /// explicit principal through the production `build_promote_plan_inner`
+    /// call site. The end-to-end proof that an agent-invoked promote *persists*
+    /// `Agent` drives that real call site in
+    /// `commands::branch::tests::build_promote_plan_inner_stamps_agent_principal`.
+    #[test]
+    fn promote_kind_default_principal_is_human() {
+        assert_eq!(
+            super::default_principal_for_kind(&PlanKind::Promote),
+            PolicyPrincipal::Human
+        );
+    }
+
     #[test]
     fn plan_kind_display() {
         assert_eq!(PlanKind::Compact.to_string(), "compact");
@@ -875,6 +990,55 @@ mod tests {
         Ok(())
     }
 
+    /// 🔴 B regression: enforcement uses the apply-time RUNTIME principal +
+    /// kind, NOT the stored (tamperable) field. Pre-fix (`resolved_principal`)
+    /// read the stored stamp, so a stored-agent Run plan was agent-gated
+    /// regardless of who applied — and a downgraded stored field could escape.
+    #[test]
+    fn enforcement_principal_uses_runtime_and_kind_not_the_stored_field() {
+        fn plan(kind: PlanKind, stored: Option<PolicyPrincipal>) -> PersistedPlan {
+            PersistedPlan {
+                plan_id: "x".to_string(),
+                kind,
+                created_at: Utc::now(),
+                format_version: 1,
+                principal: stored,
+                payload: serde_json::json!({}),
+            }
+        }
+        // Tamper-proof: an AGENT applier gates as agent regardless of the stored
+        // field (even a human-stamped or unstamped Run plan).
+        assert_eq!(
+            plan(PlanKind::Run, Some(PolicyPrincipal::Human))
+                .enforcement_principal(PolicyPrincipal::Agent),
+            PolicyPrincipal::Agent,
+            "an agent running apply is gated as agent regardless of the plan file"
+        );
+        // Human vouches: a human applying a Run plan resolves to human — even
+        // when the stored field says agent (stored is advisory, not consulted).
+        assert_eq!(
+            plan(PlanKind::Run, Some(PolicyPrincipal::Agent))
+                .enforcement_principal(PolicyPrincipal::Human),
+            PolicyPrincipal::Human,
+            "a human applier of a Run plan resolves to human (stored agent ignored)"
+        );
+        // Kind-forcing: an AiAuthored / Backfill plan is agent by KIND even when
+        // a human applies it.
+        for kind in [PlanKind::AiAuthored, PlanKind::Backfill] {
+            assert_eq!(
+                plan(kind.clone(), Some(PolicyPrincipal::Human))
+                    .enforcement_principal(PolicyPrincipal::Human),
+                PolicyPrincipal::Agent,
+                "{kind} is agent by kind even when a human applies it"
+            );
+        }
+        // Normal: a human applying a plain human Run plan → human.
+        assert_eq!(
+            plan(PlanKind::Run, None).enforcement_principal(PolicyPrincipal::Human),
+            PolicyPrincipal::Human
+        );
+    }
+
     /// `write_plan` stamps the kind-derived principal explicitly: an
     /// `ai_authored` plan is stamped `agent`, a `run` plan `human`.
     #[test]
@@ -893,6 +1057,40 @@ mod tests {
         assert_eq!(
             read_plan(dir.path(), &run_id)?.principal,
             Some(PolicyPrincipal::Human)
+        );
+        Ok(())
+    }
+
+    /// 🔴 B regression: the authoring principal is bound into the plan_id
+    /// integrity digest. Tampering a written agent plan's `principal` down to
+    /// `human` (to drop agent-scoped denies/freezes) — while keeping the
+    /// filename/plan_id — must fail the integrity check on read. Pre-fix the
+    /// digest covered only `{kind, payload}`, so the tamper passed and the plan
+    /// resolved to an ungated `human`.
+    /// The authoring `principal` rides OUTSIDE the `plan_id` digest (it is not
+    /// an authorization boundary): a plan and its principal-stripped copy share
+    /// the same id, so stripping the field does not invalidate the plan. (The
+    /// tamper is neutralised at enforcement time by evaluating the apply-time
+    /// runtime principal, not this field — see the apply-seam tests.)
+    #[test]
+    fn principal_is_outside_the_plan_id_digest() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = serde_json::json!({"branch_name": "b", "targets": []});
+        let agent_id = write_plan_with_principal(
+            dir.path(),
+            PlanKind::Promote,
+            &payload,
+            PolicyPrincipal::Agent,
+        )?;
+        let human_id = write_plan_with_principal(
+            dir.path(),
+            PlanKind::Promote,
+            &payload,
+            PolicyPrincipal::Human,
+        )?;
+        assert_eq!(
+            agent_id, human_id,
+            "principal is advisory, outside the digest — same payload ⇒ same id"
         );
         Ok(())
     }
@@ -933,6 +1131,100 @@ mod tests {
         assert_eq!(plan.principal, Some(PolicyPrincipal::Agent));
         assert_eq!(plan.embedded_capabilities(), caps);
         Ok(())
+    }
+
+    /// 🔴 FIX 3 regression: a no-change plan (`diff_available = true`, empty
+    /// `changed`) that still names planned models must synthesize a touched set
+    /// under the bare `apply` verb — the plan executes those models, so its
+    /// execution stays governed. Pre-fix `touched()` returned an EMPTY map
+    /// here, which the apply seam short-circuited to `Allow`, letting a
+    /// no-change agent plan execute past a `deny agent apply` rule or a freeze.
+    #[test]
+    fn no_change_plan_touches_planned_models_under_apply() {
+        let caps = EmbeddedCapabilities {
+            diff_available: true,
+            changed: BTreeMap::new(),
+            models_fingerprint: None,
+            config_identity: None,
+            fingerprint_version: 0,
+        };
+        let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
+        assert_eq!(
+            touched.get("stg_orders"),
+            Some(&PolicyCapability::Apply),
+            "a no-change plan must still gate each planned model under `apply`"
+        );
+        assert_eq!(touched.get("fct_sales"), Some(&PolicyCapability::Apply));
+        assert_eq!(touched.len(), 2);
+    }
+
+    /// A genuine no-op — no planned models at all — stays empty (nothing to
+    /// execute, nothing to gate).
+    #[test]
+    fn no_planned_models_touches_nothing() {
+        let caps = EmbeddedCapabilities {
+            diff_available: true,
+            changed: BTreeMap::new(),
+            models_fingerprint: None,
+            config_identity: None,
+            fingerprint_version: 0,
+        };
+        assert!(caps.touched(&[]).is_empty());
+    }
+
+    /// 🔴 D4-analog on the run side: a changed executable model is gated under
+    /// its classification, and an UNCHANGED-but-executing sibling is still gated
+    /// under the bare `apply` verb — so a `deny agent apply { models = [...] }`
+    /// (or freeze) targeting the unchanged sibling fires instead of the sibling
+    /// re-materializing ungated. A `schema_change.*` refinement, however, only
+    /// matches the model that actually changed.
+    #[test]
+    fn changed_and_unchanged_executing_models_are_both_gated() {
+        let mut changed = BTreeMap::new();
+        changed.insert(
+            "stg_orders".to_string(),
+            PolicyCapability::SchemaChangeAdditive,
+        );
+        let caps = EmbeddedCapabilities {
+            diff_available: true,
+            changed,
+            models_fingerprint: None,
+            config_identity: None,
+            fingerprint_version: 0,
+        };
+        let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
+        assert_eq!(
+            touched.get("stg_orders"),
+            Some(&PolicyCapability::SchemaChangeAdditive),
+            "the changed model keeps its refined classification"
+        );
+        assert_eq!(
+            touched.get("fct_sales"),
+            Some(&PolicyCapability::Apply),
+            "the unchanged-but-executing sibling is gated under `apply`, not dropped"
+        );
+    }
+
+    /// A change to a model that will NOT execute is not gated (D1 direction b).
+    #[test]
+    fn change_to_a_non_executing_model_is_not_gated() {
+        let mut changed = BTreeMap::new();
+        changed.insert(
+            "customers".to_string(),
+            PolicyCapability::SchemaChangeBreaking,
+        );
+        let caps = EmbeddedCapabilities {
+            diff_available: true,
+            changed,
+            models_fingerprint: None,
+            config_identity: None,
+            fingerprint_version: 0,
+        };
+        // Only `orders` executes; the change to the non-executing `customers`
+        // is absent from the touched set.
+        let touched = caps.touched(&["orders".to_string()]);
+        assert_eq!(touched.get("orders"), Some(&PolicyCapability::Apply));
+        assert!(!touched.contains_key("customers"));
     }
 
     /// A plan with no embed yields the fail-closed default:

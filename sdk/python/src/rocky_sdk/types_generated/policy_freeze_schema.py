@@ -94,6 +94,10 @@ class PolicyFreezeOutput(BaseModel):
     """
     `true` when this call lifted a freeze rather than establishing one.
     """
+    notes: list[str] | None = None
+    """
+    Advisory notes about enforcement status — e.g. a warning that the freeze was recorded but is inert because the project has no `[policy]` block. Empty when the freeze is enforceable.
+    """
     recorded_at: str
     """
     RFC 3339 wall clock when the freeze/unfreeze was recorded.

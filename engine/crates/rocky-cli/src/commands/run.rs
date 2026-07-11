@@ -1110,6 +1110,12 @@ pub async fn run(
     // `verify_after` gate can resolve *this apply's own* run (not "latest") by
     // id, immune to a concurrent run finishing in between.
     run_id_override: Option<&str>,
+    // Governance context for a two-step agent apply. `Some` only on the
+    // `rocky apply` path for a governed plan; `None` for bare `rocky run`, the
+    // DAG runner, and inline execution → the two extra fail-closed checks below
+    // (TOCTOU models-drift reject + post-discovery replication gate) are
+    // skipped and behaviour is byte-identical. See [`GovernedRunContext`].
+    governed_ctx: Option<&crate::commands::apply::GovernedRunContext<'_>>,
 ) -> Result<()> {
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
@@ -1208,6 +1214,11 @@ pub async fn run(
         config_path.display()
     ))?;
     let config_hash = crate::output::config_fingerprint(config_path);
+
+    // Governed-apply TOCTOU gate (E) — pairs the plan-authorized IR fingerprint
+    // with THIS run's config identity; verified at the execution choke-point
+    // (`execute_models`). `None` for bare run / human apply.
+    let exec_fp_gate = governed_ctx.map(|c| c.exec_fingerprint_gate(&rocky_cfg, env));
 
     // Apply the optional `--cache-ttl` override once at the top of the
     // run. All downstream `execute_models` calls receive this already-
@@ -1313,6 +1324,7 @@ pub async fn run(
             run_vars,
             rocky_cfg.resilience.clone(),
             super::resilience::retry_policy_allows(&rocky_cfg),
+            exec_fp_gate.as_ref(),
         )
         .await;
 
@@ -1492,6 +1504,7 @@ pub async fn run(
                 // transformation pipeline's models resolve to the supplied
                 // values (or inline defaults) at compile time.
                 run_vars,
+                exec_fp_gate.as_ref(),
             )
             .await?;
             finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
@@ -1557,10 +1570,20 @@ pub async fn run(
     let pattern = pipeline.schema_pattern()?;
     let parsed_filter = filter.map(parse_filter).transpose()?;
 
-    // Download state from remote storage (S3/GCS/Valkey) if configured
-    if let Err(e) = rocky_core::state_sync::download_state(&rocky_cfg.state, state_path).await {
-        warn!(error = %e, "state download failed, continuing with local state");
-    }
+    // Download state from remote storage (S3/GCS/Valkey) if configured.
+    // A no-op `Ok(())` when no remote is configured; an `Err` when a configured
+    // remote download failed — in which case the local ledger may be missing
+    // freeze/budget history recorded by another pod, so it is not authoritative
+    // for the auto-apply governor below (fail-closed).
+    let state_download_ok = match rocky_core::state_sync::download_state(&rocky_cfg.state, state_path)
+        .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(error = %e, "state download failed, continuing with local state");
+            false
+        }
+    };
 
     // Build adapter registry and resolve adapters
     let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
@@ -1600,6 +1623,15 @@ pub async fn run(
     // remote tier — doing so would clobber the newer state that already-upgraded
     // pods depend on. Suppress both the periodic and the end-of-run upload.
     let suppress_state_upload = state_store.was_recreated_for_forward_incompat();
+
+    // The decision ledger is authoritative for the auto-apply governor only
+    // when it carries the estate's real freeze/budget history: the store was
+    // NOT bootstrapped fresh for a forward-incompatible schema, AND any
+    // configured remote download succeeded. When it is non-authoritative an
+    // active freeze / exhausted budget recorded elsewhere would be invisible,
+    // so the governor refuses every auto-apply (fail-closed).
+    let ledger_authoritative =
+        !state_store.was_recreated_for_forward_incompat() && state_download_ok;
 
     // Discover sources
     let discovery_result = async {
@@ -1669,6 +1701,40 @@ pub async fn run(
         .separator
         .as_deref()
         .unwrap_or(&pattern.separator);
+
+    // Fail-closed replication gate (D), BEFORE any warehouse setup. The setup
+    // loop below creates catalogs/schemas, sets tags, binds workspaces, and
+    // applies grants — all warehouse mutations. A governed (agent) apply must be
+    // policy-evaluated over the complete post-discovery target set FIRST, so a
+    // denied / unreviewed replication is refused before a single warehouse
+    // statement runs. The target set is derived here from the discovered
+    // connectors + the active filter (mirroring the loop's own filter), never
+    // executing anything. Read/record through the write handle `run` already
+    // holds. (This supersedes the later per-`tables_to_process` gate.)
+    if let Some(ctx) = governed_ctx {
+        // Fail-closed routing gate (#4/#5), BEFORE any warehouse statement:
+        // a `path`/adapter/target swap (e.g. duckdb→snowflake, a.duckdb→b.duckdb)
+        // between plan and apply would mutate a DIFFERENT physical destination —
+        // refuse before the replication DDL below, not after it.
+        ctx.verify_routing_identity(&rocky_cfg)?;
+
+        let replication_targets: std::collections::BTreeSet<String> = connectors
+            .iter()
+            .filter(|conn| {
+                pattern.parse(&conn.schema).ok().is_some_and(|parsed| {
+                    parsed_filter.as_ref().is_none_or(|(k, v)| {
+                        matches_filter(conn, &parsed, k, v)
+                    })
+                })
+            })
+            .flat_map(|conn| {
+                conn.tables
+                    .iter()
+                    .flat_map(|t| shadow_gate_target_names(&t.name, shadow_config))
+            })
+            .collect();
+        ctx.gate_replication_targets(&replication_targets, &state_store)?;
+    }
 
     // --- Sequential: catalog/schema setup + table collection ---
     // Governance operations route through the GovernanceAdapter trait
@@ -2170,6 +2236,7 @@ pub async fn run(
                         &rocky_cfg,
                         &run_id,
                         &table.name,
+                        ledger_authoritative,
                     ),
                 });
             }
@@ -2241,6 +2308,10 @@ pub async fn run(
             connectors.len(),
         ))
         .await;
+
+    // (The replication policy gate ran BEFORE the warehouse-setup loop above —
+    // see the `governed_ctx` gate ahead of `governance_setup` — so no warehouse
+    // statement executes for a denied / unreviewed agent replication.)
 
     let completed_keys: std::collections::HashSet<String> = if resume_latest {
         if let Ok(Some(prev)) = state_store.get_latest_run_progress() {
@@ -3810,6 +3881,7 @@ pub async fn run(
                     run_vars,
                     rocky_cfg.resilience.clone(),
                     super::resilience::retry_policy_allows(&rocky_cfg),
+                    exec_fp_gate.as_ref(),
                 )
                 .await?;
                 Ok(())
@@ -4099,6 +4171,65 @@ pub async fn run(
         &config_hash,
         &audit,
     );
+
+    // Post-apply `verify_after` gate for any additive drift this run
+    // auto-applied. Writes an allow/deny verification custody row per healed
+    // table and yields `Err` when a required check failed or did not run. There
+    // is no rollback substrate on a plain warehouse target, so a failed
+    // verification is halt-only: the migration stands until a human reverts it.
+    // A no-op when nothing was auto-applied (default-off runs never hit it).
+    //
+    // Evaluated (C) BEFORE any terminal-success handling — the run record must
+    // exist first (the gate reads its check outcomes), so on failure we fold the
+    // custody failure into the tallies, RE-persist the run as a Failure,
+    // finalize idempotency as failed, fire `pipeline_error`, and stop —
+    // idempotency must NOT finalize success and `pipeline_complete` must NOT
+    // fire for a run whose auto-applied mutation could not be verified.
+    let verify_after_result = super::drift_governance::finalize_drift_verify_after(
+        state_store.as_ref(),
+        &run_id,
+        rocky_cfg.policy.as_ref(),
+    );
+    if let Err(custody_err) = &verify_after_result {
+        output.tables_failed += 1;
+        output.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec!["<verify_after>".to_string()],
+            error: custody_err.to_string(),
+            failure_kind: crate::output::FailureKind::Unknown,
+            cooldown_seconds: None,
+        });
+        // Re-persist so `rocky history` records a Failure (status is derived
+        // from the now-failed tallies), and finalize idempotency as failed.
+        persist_run_record(
+            state_store.as_ref(),
+            &output,
+            &run_id,
+            started_at,
+            &config_hash,
+            &audit,
+        );
+        finalize_idempotency(
+            &mut idempotency_ctx,
+            state_store.as_ref(),
+            &run_id,
+            &output,
+        )
+        .await;
+        let msg = format!("verify_after gate failed for run {run_id}");
+        let _ = hook_registry
+            .fire(&HookContext::pipeline_error(&run_id, pipeline_name, &msg))
+            .await;
+        let _ = hook_registry.wait_async_webhooks().await;
+        if let Some(p) = &pipes {
+            emit_pipes_events(p, &output);
+            p.closed();
+        }
+        if output_json {
+            print_json(&output)?;
+        }
+        return verify_after_result;
+    }
+
     finalize_idempotency(
         &mut idempotency_ctx,
         state_store.as_ref(),
@@ -4106,16 +4237,6 @@ pub async fn run(
         &output,
     )
     .await;
-
-    // Post-apply `verify_after` gate for any additive drift this run
-    // auto-applied. Writes an allow/deny verification custody row per healed
-    // table and yields `Err` when a required check failed or did not run —
-    // propagated at the happy-path exit so an otherwise-green run halts. There
-    // is no rollback substrate on a plain warehouse target, so a failed
-    // verification is halt-only: the migration stands until a human reverts it.
-    // A no-op when nothing was auto-applied (default-off runs never hit it).
-    let verify_after_result =
-        super::drift_governance::finalize_drift_verify_after(state_store.as_ref(), &run_id);
 
     // Fire the `on_budget_breach` hook for each recorded breach so
     // shell hooks / webhooks configured via `[hook.on_budget_breach]`
@@ -4248,9 +4369,9 @@ pub async fn run(
     // exits non-zero.
     budget_result?;
 
-    // Halt an otherwise-green run when a post-apply `verify_after` gate on an
-    // auto-applied additive migration failed (custody already recorded above).
-    verify_after_result?;
+    // NB: a failed `verify_after` gate is handled ABOVE (C) — before any
+    // terminal-success handling — so it never reaches this happy-path exit.
+    let _ = &verify_after_result;
 
         Ok(())
     }
@@ -4747,6 +4868,8 @@ pub(crate) async fn execute_backfill_set(
     models_dir: &Path,
     model_set: &std::collections::BTreeSet<String>,
     partition_opts: &PartitionRunOptions,
+    // Governed-apply TOCTOU gate (E) — `Some` for an agent backfill apply.
+    exec_fp_gate: Option<&crate::commands::apply::ExecFingerprintGate>,
     output_json: bool,
 ) -> Result<()> {
     if output_json {
@@ -4843,6 +4966,7 @@ pub(crate) async fn execute_backfill_set(
         &run_vars,
         rocky_cfg.resilience.clone(),
         super::resilience::retry_policy_allows(&rocky_cfg),
+        exec_fp_gate,
     )
     .await;
 
@@ -4978,6 +5102,12 @@ pub(crate) async fn execute_models(
     // run (allow-by-default; only an explicit `capability = "retry"` policy rule
     // gates it). Resolved once by the caller from `[policy]`.
     retry_policy_allows: bool,
+    // Governed-apply TOCTOU gate (E). `Some` only for a two-step agent apply.
+    // This is the SINGLE execution choke-point every non-DAG path funnels
+    // through, so the check here recomputes the compiled-IR fingerprint over the
+    // EXACT set about to execute and refuses (fail-closed) on mismatch —
+    // checked == executed. `None` for bare `rocky run` and human applies.
+    exec_fp_gate: Option<&crate::commands::apply::ExecFingerprintGate>,
 ) -> Result<()> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
@@ -5051,6 +5181,32 @@ pub(crate) async fn execute_models(
             return Ok(());
         }
     };
+
+    // Per-model surrogate-key specs — loaded ONCE here (execute-from-owned-value,
+    // #1) so the SAME owned map feeds BOTH the TOCTOU fingerprint below AND
+    // execution (via `ExecutionContext`), with no post-verification reload that
+    // could apply different key columns than were gated. Surface a malformed key
+    // spec as a hard failure rather than silently emitting broken SQL. Bare
+    // `rocky run` loads exactly once, as before — byte-identical.
+    let surrogate_keys = rocky_core::models::load_surrogate_keys_from_dir(models_dir)
+        .context("invalid surrogate_key configuration")?;
+
+    // ‼️ Governed-apply TOCTOU gate (E) — the single execution choke-point. The
+    // fingerprint is recomputed over the EXACT compiled set about to execute
+    // (`compile_result`, before any defer-rewrite mutates SQL) and refuses on
+    // mismatch, so no model runs under authorization computed against different
+    // content. `None` (bare run / human apply / legacy plan) is a no-op.
+    if let Some(gate) = exec_fp_gate {
+        // Fold the seeding-independent on-disk extras the compiled IR omits —
+        // the OWNED surrogate map (#1) and contract presence/contents (#3) — into
+        // the recomputed fingerprint so a post-plan swap of either refuses here.
+        // `models_dir` is the SAME directory the plan fingerprinted.
+        let extras = crate::commands::apply::ExecutionExtras::build(
+            &surrogate_keys,
+            &compile_result.project.models,
+        );
+        gate.verify(&compile_result.project.models, &extras)?;
+    }
 
     // Per-model compile errors are first-class run failures, not silent
     // skips. Each model that fails to type-check (e.g. E020 — a
@@ -5220,11 +5376,9 @@ pub(crate) async fn execute_models(
     // execution path. Future compile-time fields (semantic info, optimize
     // results, contract diagnostics) ride on this struct without further
     // signature churn.
-    // Per-model surrogate-key specs, loaded once and threaded via the context.
-    // Surface a malformed key spec (bad output name, empty/invalid input
-    // columns) as a hard run failure rather than silently emitting broken SQL.
-    let surrogate_keys = rocky_core::models::load_surrogate_keys_from_dir(models_dir)
-        .context("invalid surrogate_key configuration")?;
+    //
+    // `surrogate_keys` is the SAME owned map loaded once above the gate (#1):
+    // execution consumes exactly what the fingerprint hashed — no reload.
     let exec_ctx = ExecutionContext {
         typed_models: &compile_result.type_check.typed_models,
         model_timings: &compile_result.model_timings,
@@ -7035,6 +7189,29 @@ pub(crate) fn governance_tag_target(
 /// (`content_addressed`, `time_interval`) that the serial loop handles
 /// inline. Only plain models are eligible for intra-layer concurrent
 /// execution via [`execute_one_plain_model`].
+/// The replication target names the agent-policy gate must evaluate for one
+/// discovered table (#8): always the logical name, plus the resolved **physical**
+/// name execution writes under suffix-shadow mode. `run` resolves the suffixed
+/// physical name (`<table><suffix>`) for the `TableTask` it materializes, so a
+/// policy rule denying the shadow physical name must be evaluated against it —
+/// gating the logical name alone would let a denied shadow write through.
+///
+/// The `schema_override` shadow variant keeps the bare table name (only its
+/// schema changes), which the name-matched policy plane does not scope — a
+/// flagged residual, not closed here.
+fn shadow_gate_target_names(
+    table_name: &str,
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+) -> Vec<String> {
+    let mut names = vec![table_name.to_string()];
+    if let Some(sc) = shadow_config
+        && sc.schema_override.is_none()
+    {
+        names.push(format!("{}{}", table_name, sc.suffix));
+    }
+    names
+}
+
 pub(crate) fn is_plain_strategy(model: &rocky_core::models::Model) -> bool {
     !matches!(
         model.config.strategy,
@@ -9864,6 +10041,7 @@ adapter = "default"
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
             None, // no run_id override — mint the usual timestamp id
+            None, // no governance ctx (test)
         )
         .await
         .expect("transformation run should succeed");
@@ -9972,6 +10150,7 @@ schema = "mart"
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
             None, // no run_id override — mint the usual timestamp id
+            None, // no governance ctx (test)
         )
         .await
         .expect(
@@ -11494,9 +11673,376 @@ merge_keys = ["id"]
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
             true,
+            None, // exec_fp_gate (test)
         )
         .await;
         (output, result)
+    }
+
+    /// 🔴 E KILL-CHECK (real DuckDB, the choke-point): the sound TOCTOU close.
+    ///
+    /// 1. **process-stability** — two fresh compiles of the same bytes produce
+    ///    the SAME compiled-IR fingerprint (this is what broke round-3: file
+    ///    hashing pulled in the mutating state file; the IR projection is
+    ///    stable).
+    /// 2. **unchanged applies** — `execute_models` with a gate whose expected
+    ///    fingerprint MATCHES the unchanged models must NOT refuse — it applies
+    ///    (the round-3 disaster was refuse-everything; this proves it doesn't).
+    /// 3. **changed refuses** — after editing a model, the same gate REFUSES
+    ///    (fingerprint mismatch), because the choke-point recomputes over the
+    ///    exact set about to execute.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn e_toctou_kill_check_real_duckdb() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        write_model_with_target(&models, "orders", "SELECT 1 AS id", "main", "orders");
+
+        // (1) process-stability across two independent compiles — computed the
+        // exact way `execute_models` recomputes at the choke-point (compile +
+        // surrogate/contract extras), so the two must agree.
+        let fp1 = exec_choke_fingerprint(&models, "cfg", "");
+        let fp2 = exec_choke_fingerprint(&models, "cfg", "");
+        assert_eq!(
+            fp1, fp2,
+            "same bytes must fingerprint identically (stability)"
+        );
+
+        let db = dir.path().join("wh.duckdb");
+        let opts = PartitionRunOptions::default();
+
+        // (2) unchanged apply with a MATCHING gate → must NOT refuse.
+        let gate = crate::commands::apply::ExecFingerprintGate {
+            expected: Some(fp1.clone()),
+            config_identity: "cfg".to_string(),
+            governance_identity: String::new(),
+            plan_id: "p".to_string(),
+            require: true,
+        };
+        let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let ok = super::execute_models(
+            &models,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &opts,
+            "run-ok",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            true, // auto_create_schemas
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            true,
+            Some(&gate),
+        )
+        .await;
+        ok.expect("KILL-CHECK: an unchanged governed apply must NOT refuse");
+        assert_eq!(output.tables_failed, 0, "the model materialized");
+
+        // (3) change the model → the SAME gate must REFUSE.
+        write_model_with_target(
+            &models,
+            "orders",
+            "SELECT 1 AS id, 2 AS extra",
+            "main",
+            "orders",
+        );
+        let mut output2 = RunOutput::new(String::new(), 0, 1);
+        let err = super::execute_models(
+            &models,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &opts,
+            "run-changed",
+            None,
+            None,
+            &mut output2,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            true,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            true,
+            Some(&gate),
+        )
+        .await
+        .expect_err("KILL-CHECK: a changed model must be REFUSED at the choke-point");
+        assert!(
+            err.to_string().contains("fingerprint mismatch"),
+            "must refuse with a fingerprint mismatch, got: {err}"
+        );
+    }
+
+    /// 🔴 #8 (shadow physical-name gating): the replication policy gate must see
+    /// the RESOLVED physical name suffix-shadow execution writes, not only the
+    /// logical name. Fails on producer revert (gating logical-only) because the
+    /// suffixed name would be absent from the gated set.
+    #[test]
+    fn shadow_gate_target_names_includes_physical_shadow_name() {
+        use rocky_core::shadow::ShadowConfig;
+        // No shadow → logical name only.
+        assert_eq!(
+            super::shadow_gate_target_names("orders", None),
+            vec!["orders".to_string()]
+        );
+        // Suffix-shadow → BOTH logical and the physical `<table><suffix>` that
+        // `TableTask` materializes must be gated.
+        let suffixed = ShadowConfig {
+            suffix: "_shadow".to_string(),
+            schema_override: None,
+            cleanup_after: true,
+        };
+        assert_eq!(
+            super::shadow_gate_target_names("orders", Some(&suffixed)),
+            vec!["orders".to_string(), "orders_shadow".to_string()],
+            "suffix-shadow must gate the resolved physical name (#8)"
+        );
+        // schema-override shadow keeps the bare name (flagged residual: schema
+        // differs, name-matched policy does not scope it).
+        let schema_override = ShadowConfig {
+            suffix: "_shadow".to_string(),
+            schema_override: Some("_rocky_shadow".to_string()),
+            cleanup_after: true,
+        };
+        assert_eq!(
+            super::shadow_gate_target_names("orders", Some(&schema_override)),
+            vec!["orders".to_string()]
+        );
+    }
+
+    /// Recompute the execution fingerprint EXACTLY the way the `execute_models`
+    /// choke-point does — compile + surrogate-key + contract extras — so a
+    /// gate built with this value does not spuriously refuse an unchanged apply.
+    #[cfg(feature = "duckdb")]
+    fn exec_choke_fingerprint(
+        models_dir: &std::path::Path,
+        config_identity: &str,
+        governance_identity: &str,
+    ) -> String {
+        use rocky_compiler::compile::{self, CompilerConfig};
+        let cc = CompilerConfig {
+            models_dir: models_dir.to_path_buf(),
+            ..Default::default()
+        };
+        let result = compile::compile(&cc).unwrap();
+        let sk = rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap();
+        let extras = crate::commands::apply::ExecutionExtras::build(&sk, &result.project.models);
+        crate::commands::apply::execution_ir_fingerprint(
+            &result.project.models,
+            config_identity,
+            governance_identity,
+            &extras,
+        )
+        .unwrap()
+    }
+
+    /// Run one governed `execute_models` apply under a fixed gate and return the
+    /// `Result` — the shared driver for the extras kill-checks below.
+    #[cfg(feature = "duckdb")]
+    async fn governed_apply(
+        models_dir: &std::path::Path,
+        db: &std::path::Path,
+        run_id: &str,
+        expected_fp: &str,
+    ) -> Result<()> {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        let gate = crate::commands::apply::ExecFingerprintGate {
+            expected: Some(expected_fp.to_string()),
+            config_identity: "cfg".to_string(),
+            governance_identity: String::new(),
+            plan_id: "p".to_string(),
+            require: true,
+        };
+        let adapter = DuckDbWarehouseAdapter::open(db).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::execute_models(
+            models_dir,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &PartitionRunOptions::default(),
+            run_id,
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            true,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            true,
+            Some(&gate),
+        )
+        .await
+    }
+
+    /// 🔴 #1 KILL-CHECK (real DuckDB): a `[[surrogate_key]]` sidecar change after
+    /// plan REFUSES — even though the `.sql` and every `ModelConfig` field are
+    /// byte-identical (surrogate specs live outside `ModelConfig`, loaded
+    /// separately). Fails on producer revert: without the surrogate extras in the
+    /// fingerprint, the key-only change would not move it and the apply would
+    /// proceed under stale authorization.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn surrogate_key_change_refuses_kill_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        let sidecar = |cols: &str| {
+            format!(
+                "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"orders\"\n\n[[surrogate_key]]\nname = \"sk\"\ncolumns = [{cols}]\n"
+            )
+        };
+        std::fs::write(models.join("orders.toml"), sidecar("\"id\"")).unwrap();
+
+        let db = dir.path().join("wh.duckdb");
+        // Plan-time fingerprint binds the surrogate spec (columns = [id]).
+        let fp = exec_choke_fingerprint(&models, "cfg", "");
+        // (2) unchanged apply → no refuse.
+        governed_apply(&models, &db, "sk-ok", &fp)
+            .await
+            .expect("KILL-CHECK: unchanged surrogate apply must NOT refuse");
+
+        // (3) change ONLY the surrogate columns — ModelConfig + SQL unchanged.
+        std::fs::write(models.join("orders.toml"), sidecar("\"id\", \"id\"")).unwrap();
+        let err = governed_apply(&models, &db, "sk-changed", &fp)
+            .await
+            .expect_err("KILL-CHECK: a surrogate-key change must be REFUSED (#1)");
+        assert!(
+            err.to_string().contains("fingerprint mismatch"),
+            "must refuse with a fingerprint mismatch, got: {err}"
+        );
+    }
+
+    /// 🔴 #3 KILL-CHECK (real DuckDB): a `.contract.toml` change/removal after
+    /// plan REFUSES — contract presence + contents live on `Model.contract_path`,
+    /// outside `ModelConfig`, yet presence is authorization-relevant and contents
+    /// constrain the output. Fails on producer revert: without the contract
+    /// extras, the contract edit would not move the fingerprint.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn contract_change_refuses_kill_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        write_model_with_target(&models, "orders", "SELECT 1 AS id", "main", "orders");
+        std::fs::write(
+            models.join("orders.contract.toml"),
+            "[[columns]]\nname = \"id\"\n",
+        )
+        .unwrap();
+
+        let db = dir.path().join("wh.duckdb");
+        let fp = exec_choke_fingerprint(&models, "cfg", "");
+        governed_apply(&models, &db, "contract-ok", &fp)
+            .await
+            .expect("KILL-CHECK: unchanged contract apply must NOT refuse");
+
+        // SAME-PRESENCE CONTENT EDIT — the contract file still exists (presence
+        // unchanged) but its CONTENTS change. This is the case a presence-only
+        // hash would miss; it proves the fingerprint binds contract CONTENTS.
+        std::fs::write(
+            models.join("orders.contract.toml"),
+            "[[columns]]\nname = \"id\"\ntype = \"Int64\"\n",
+        )
+        .unwrap();
+        let err = governed_apply(&models, &db, "contract-edited", &fp)
+            .await
+            .expect_err("KILL-CHECK: a same-presence contract CONTENT edit must be REFUSED (#3)");
+        assert!(
+            err.to_string().contains("fingerprint mismatch"),
+            "must refuse with a fingerprint mismatch, got: {err}"
+        );
+
+        // Remove the contract — presence flips, ModelConfig + SQL unchanged.
+        std::fs::remove_file(models.join("orders.contract.toml")).unwrap();
+        let err = governed_apply(&models, &db, "contract-removed", &fp)
+            .await
+            .expect_err("KILL-CHECK: a removed contract must be REFUSED (#3)");
+        assert!(
+            err.to_string().contains("fingerprint mismatch"),
+            "must refuse with a fingerprint mismatch, got: {err}"
+        );
+    }
+
+    /// 🔴 KILL-CHECK (unchanged plan→apply does NOT refuse, with the new
+    /// inputs): the REAL plan-side `compute_embedded_capabilities` must produce
+    /// the SAME fingerprint the apply-side choke-point recomputes, for a project
+    /// carrying BOTH a `[[surrogate_key]]` block AND a `.contract.toml`. This is
+    /// the guard against the historical refuse-everything: the plan and apply
+    /// build the extras through *different* code (`unwrap_or_default()` vs
+    /// `context(...)?`), and this pins that they agree — folding #1/#3/#6 in
+    /// without a spurious refuse on an unchanged apply.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn plan_and_apply_fingerprints_agree_with_extras() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n\n\
+             [mask]\npii = \"hash\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"orders\"\n\n[[surrogate_key]]\nname = \"sk\"\ncolumns = [\"id\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("orders.contract.toml"),
+            "[[columns]]\nname = \"id\"\n",
+        )
+        .unwrap();
+
+        // Plan side: the real capability-embed path stamps `models_fingerprint`
+        // (env = None here, matching the apply-side governance resolution below).
+        let caps = crate::commands::plan::compute_embedded_capabilities(
+            &config_path,
+            &models,
+            "main",
+            None,
+            None,
+        );
+        // Apply side: the choke-point's routing + governance identity are the
+        // loaded config's, resolved for the same (None) env.
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let identity = crate::commands::apply::config_policy_identity(&cfg);
+        let gov = crate::commands::apply::governance_policy_identity(&cfg, None);
+        let apply_fp = exec_choke_fingerprint(&models, &identity, &gov);
+
+        assert_eq!(
+            caps.models_fingerprint.as_deref(),
+            Some(apply_fp.as_str()),
+            "plan-side and apply-side fingerprints must AGREE for an unchanged \
+             project with a surrogate key + contract + governance (no spurious refuse)"
+        );
     }
 
     /// Drive `execute_models` serially (DuckDB) with `[resilience]
@@ -11534,6 +12080,7 @@ merge_keys = ["id"]
             &rocky_core::run_vars::RunVars::new(),
             resilience,
             true,
+            None, // exec_fp_gate (test)
         )
         .await;
         (output, result)
@@ -11575,6 +12122,7 @@ merge_keys = ["id"]
             &rocky_core::run_vars::RunVars::new(),
             resilience,
             true,
+            None, // exec_fp_gate (test)
         )
         .await;
         (output, result)
@@ -11622,6 +12170,7 @@ merge_keys = ["id"]
             &rocky_core::run_vars::RunVars::new(),
             resilience,
             true,
+            None, // exec_fp_gate (test)
         )
         .await;
         (output, result)
@@ -12642,6 +13191,7 @@ merge_keys = ["id"]
             &run_vars,
             rocky_core::config::ResilienceConfig::default(),
             true,
+            None, // exec_fp_gate (test)
         )
         .await
         .expect("run with --var should succeed");
@@ -12747,6 +13297,7 @@ merge_keys = ["id"]
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
             true,
+            None, // exec_fp_gate (test)
         )
         .await
         .expect("deferred run must succeed");
@@ -12867,6 +13418,7 @@ merge_keys = ["id"]
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
             true,
+            None, // exec_fp_gate (test)
         )
         .await;
 
@@ -13148,6 +13700,7 @@ merge_keys = ["id"]
                 &rocky_core::run_vars::RunVars::new(),
                 rocky_core::config::ResilienceConfig::default(),
                 true,
+                None, // exec_fp_gate (test)
             )
             .await
             .expect("backfill run must succeed on serial DuckDB under --parallel");
@@ -13272,6 +13825,7 @@ merge_keys = ["id"]
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
             true,
+            None, // exec_fp_gate (test)
         )
         .await
         .expect("gate run must succeed");
@@ -14244,6 +14798,7 @@ merge_keys = ["id"]
                 &rocky_core::run_vars::RunVars::new(),
                 rocky_core::config::ResilienceConfig::default(),
                 true,
+                None, // exec_fp_gate (test)
             )
             .await
             .unwrap();

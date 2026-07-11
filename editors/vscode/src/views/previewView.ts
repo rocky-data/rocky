@@ -675,8 +675,13 @@ export function registerPreviewView(
         const editor = await vscode.window.showTextDocument(doc, {
           preview: true,
         });
+        // Replace the whole document: the untitled URI is keyed by model name,
+        // so a repeat click reuses the already-populated document — an insert
+        // at (0,0) would stack a second copy above the first.
         await editor.edit((edit) => {
-          edit.insert(new vscode.Position(0, 0), markdown);
+          const lastLine = editor.document.lineAt(editor.document.lineCount - 1);
+          const fullRange = new vscode.Range(new vscode.Position(0, 0), lastLine.range.end);
+          edit.replace(fullRange, markdown);
         });
       },
     ),

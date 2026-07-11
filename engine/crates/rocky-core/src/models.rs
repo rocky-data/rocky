@@ -1698,7 +1698,7 @@ pub fn load_column_docs_from_dir(
 /// `deny_unknown_fields` so a typo in a `[[surrogate_key]]` block (e.g.
 /// `colums = [...]`) fails the load loudly rather than silently dropping the
 /// columns and computing the hash over nothing.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurrogateKeySpec {
     pub name: String,
