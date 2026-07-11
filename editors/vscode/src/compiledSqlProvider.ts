@@ -54,6 +54,19 @@ export class CompiledSqlProvider implements vscode.TextDocumentContentProvider {
   refresh(model: string): void {
     this.emitter.fire(compiledUri(model));
   }
+
+  /**
+   * Refresh every open compiled doc. Compiled SQL is macro-expanded across
+   * the whole project, so editing one model can change a *downstream*
+   * model's output — a per-model refresh would leave those panels stale.
+   */
+  refreshAllOpen(): void {
+    for (const doc of vscode.workspace.textDocuments) {
+      if (doc.uri.scheme === COMPILED_SCHEME) {
+        this.emitter.fire(doc.uri);
+      }
+    }
+  }
 }
 
 /** Resolve a model name from a command arg or the active editor. */
@@ -78,10 +91,8 @@ export function registerCompiledSqlProvider(context: vscode.ExtensionContext): v
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(COMPILED_SCHEME, provider),
     vscode.workspace.onDidSaveTextDocument((doc) => {
-      // Refresh the compiled view for the saved model (no-op if not open).
       if (!/\.(rocky|sql)$/.test(doc.fileName)) return;
-      const model = path.basename(doc.fileName).replace(/\.(rocky|sql)$/, "");
-      provider.refresh(model);
+      provider.refreshAllOpen();
     }),
     vscode.commands.registerCommand("rocky.showCompiledSql", showCompiledSql),
   );

@@ -138,4 +138,26 @@ describe("RockyFoldingRangeProvider", () => {
     const braceRanges = ranges.filter((r: { kind: number }) => r.kind === 3);
     expect(braceRanges).toHaveLength(0);
   });
+
+  it("an unbalanced brace inside a string does not desync later folds", () => {
+    // The `"a{b"` literal carries a lone `{`. If it were counted, the
+    // real `derive { ... }` block below would mispair (its `}` would
+    // close the string's phantom `{`), so the block wouldn't fold.
+    const doc = fakeDoc(
+      [
+        "from raw",
+        "derive {",
+        "  label = \"a{b\"",
+        "  n = 1",
+        "}",
+        "take 5",
+      ].join("\n"),
+    );
+    const ranges = provider.provideFoldingRanges(doc);
+    const braceRanges = ranges.filter((r: { kind: number }) => r.kind === 3);
+    expect(braceRanges).toHaveLength(1);
+    expect(braceRanges).toContainEqual(
+      expect.objectContaining({ start: 1, end: 4 }),
+    );
+  });
 });
