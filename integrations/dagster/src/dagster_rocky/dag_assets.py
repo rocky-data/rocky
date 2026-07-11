@@ -31,8 +31,6 @@ from . import partitions
 from .freshness import freshness_policy_from_model
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from .contracts import ContractRules
     from .resource import RockyResource
     from .translator import RockyDagsterTranslator
@@ -41,6 +39,7 @@ if TYPE_CHECKING:
         DagResult,
         DiscoverResult,
         LineageEdgeRecord,
+        MaterializationInfo,
         OptimizeResult,
         RunResult,
     )
@@ -272,41 +271,113 @@ def _partition_kwargs_from_context(
     return {}
 
 
-def _emit_model_results(
-    result: RunResult,
-    selected_keys: set[dg.AssetKey],
-) -> Iterator[dg.MaterializeResult]:
-    """Yield MaterializeResult for model materializations in the run output."""
+def _model_materialization_metadata(mat: MaterializationInfo) -> dict[str, dg.MetadataValue]:
+    """Build the enriched Dagster metadata for one engine materialization."""
     from .component import RockyMetadataSet
 
-    for mat in result.materializations:
-        asset_key = dg.AssetKey(mat.asset_key)
-        if asset_key not in selected_keys:
-            continue
-        metadata: dict[str, dg.MetadataValue] = {
-            **RockyMetadataSet(
-                strategy=mat.metadata.strategy if mat.metadata else None,
-                duration_ms=mat.duration_ms,
-                rows_copied=mat.rows_copied,
-                watermark=(
-                    mat.metadata.watermark.isoformat()
-                    if mat.metadata is not None and mat.metadata.watermark is not None
-                    else None
-                ),
-                target_table_full_name=(
-                    mat.metadata.target_table_full_name if mat.metadata else None
-                ),
-                sql_hash=mat.metadata.sql_hash if mat.metadata else None,
-                column_count=mat.metadata.column_count if mat.metadata else None,
-                compile_time_ms=mat.metadata.compile_time_ms if mat.metadata else None,
+    metadata: dict[str, dg.MetadataValue] = {
+        **RockyMetadataSet(
+            strategy=mat.metadata.strategy if mat.metadata else None,
+            duration_ms=mat.duration_ms,
+            rows_copied=mat.rows_copied,
+            watermark=(
+                mat.metadata.watermark.isoformat()
+                if mat.metadata is not None and mat.metadata.watermark is not None
+                else None
             ),
-            "dagster/duration_ms": dg.MetadataValue.int(mat.duration_ms),
-        }
-        if mat.rows_copied is not None:
-            metadata["dagster/row_count"] = dg.MetadataValue.int(mat.rows_copied)
-        if mat.partition is not None:
-            metadata["rocky/partition_key"] = dg.MetadataValue.text(mat.partition.key)
-        yield dg.MaterializeResult(asset_key=asset_key, metadata=metadata)
+            target_table_full_name=(mat.metadata.target_table_full_name if mat.metadata else None),
+            sql_hash=mat.metadata.sql_hash if mat.metadata else None,
+            column_count=mat.metadata.column_count if mat.metadata else None,
+            compile_time_ms=mat.metadata.compile_time_ms if mat.metadata else None,
+        ),
+        "dagster/duration_ms": dg.MetadataValue.int(mat.duration_ms),
+    }
+    if mat.rows_copied is not None:
+        metadata["dagster/row_count"] = dg.MetadataValue.int(mat.rows_copied)
+    if mat.partition is not None:
+        metadata["rocky/partition_key"] = dg.MetadataValue.text(mat.partition.key)
+    return metadata
+
+
+def _resolve_transformation_outcome(
+    *,
+    result: RunResult,
+    node: DagNodeOutput,
+    spec_key: dg.AssetKey,
+) -> dg.MaterializeResult | dg.Failure:
+    """Decide the Dagster outcome for one transformation model's ``run_model`` result.
+
+    ``rocky run --model`` allows partial failure — a failed or contained model
+    comes back as a parsed :class:`RunResult`, not an exception — so the run
+    result itself must be read for the verdict instead of stamping a green
+    :class:`dg.MaterializeResult` whenever the call returned.
+
+    Matching is by the engine's *native* key: the engine stamps
+    materializations and errors with the model's target triple
+    ``[catalog, schema, table]`` regardless of how the translator shaped the
+    spec key, so the triple is derived from ``node.target`` exactly the way
+    ``RockyDagsterTranslator.get_dag_node_asset_key`` does. The spec key and
+    the bare model label are accepted too, so a custom translator (or an
+    engine emitting label-keyed entries) still matches instead of silently
+    falling through to a fake-green result.
+
+    Returns the :class:`dg.MaterializeResult` to yield when the model really
+    materialized (matched entry — enriched with its metadata — or an
+    engine-reported success with nothing to match), or the :class:`dg.Failure`
+    to raise when the model was contained (blast-radius reason) or failed
+    (the engine's own error).
+    """
+    model_keys = {spec_key, dg.AssetKey([node.label])}
+    if node.target is not None:
+        model_keys.add(dg.AssetKey([node.target.catalog, node.target.schema_, node.target.table]))
+
+    contained = [entry for entry in result.contained if entry.model == node.label]
+    if contained:
+        from .component import _contained_models_failure
+
+        return _contained_models_failure(contained)
+
+    matched = next(
+        (mat for mat in result.materializations if dg.AssetKey(mat.asset_key) in model_keys),
+        None,
+    )
+    if matched is not None:
+        return dg.MaterializeResult(
+            asset_key=spec_key,
+            metadata=_model_materialization_metadata(matched),
+        )
+
+    matched_errors = [err for err in result.errors if dg.AssetKey(err.asset_key) in model_keys]
+    # A single-model run's errors pertain to that model's execution even when
+    # the engine keys them differently — fall back to all itemised errors.
+    errors = matched_errors or result.errors
+    if errors:
+        detail = "; ".join(err.error for err in errors)
+        return dg.Failure(
+            description=f"Model '{node.label}' failed: {detail}",
+            metadata={
+                "rocky/model_name": dg.MetadataValue.text(node.label),
+                "rocky/failure_kind": dg.MetadataValue.text(errors[0].failure_kind),
+            },
+        )
+    if result.tables_failed > 0 or result.status in ("Failure", "PartialFailure"):
+        return dg.Failure(
+            description=(
+                f"Model '{node.label}' did not materialize: the engine reported "
+                f"status {result.status or 'unknown'} with "
+                f"{result.tables_failed} failed table(s) but itemised no "
+                f"matching error."
+            ),
+            metadata={"rocky/model_name": dg.MetadataValue.text(node.label)},
+        )
+    # Engine-reported success with no per-model entry to enrich from (e.g. a
+    # node without a target triple on an engine that keys entries another way).
+    return dg.MaterializeResult(
+        asset_key=spec_key,
+        metadata={
+            "dagster/duration_ms": dg.MetadataValue.int(result.duration_ms),
+        },
+    )
 
 
 def _build_source_filters(discover_result: DiscoverResult | None) -> list[str]:
@@ -405,6 +476,13 @@ def _make_dag_group_asset(
         selected_keys = set(context.selected_asset_keys)
         partition_kwargs = _partition_kwargs_from_context(context, group.partitions_def)
 
+        # Failed / contained models are collected and raised AFTER the loop so
+        # the remaining selected nodes still execute and their
+        # materializations are recorded — the op's retry then only re-runs
+        # what was lost (same partial-progress pattern as the component's
+        # quota-breach handling).
+        model_failures: list[dg.Failure] = []
+
         for spec_key in selected_keys:
             node_id = spec_key_to_node_id.get(spec_key)
             if node_id is None:
@@ -426,17 +504,18 @@ def _make_dag_group_asset(
                     f"Model {node.label}: {result.tables_copied} copied, "
                     f"{result.tables_failed} failed in {result.duration_ms}ms"
                 )
-                emitted = False
-                for mr in _emit_model_results(result, {spec_key}):
-                    emitted = True
-                    yield mr
-                if not emitted:
-                    yield dg.MaterializeResult(
-                        asset_key=spec_key,
-                        metadata={
-                            "dagster/duration_ms": dg.MetadataValue.int(result.duration_ms),
-                        },
+                outcome = _resolve_transformation_outcome(
+                    result=result,
+                    node=node,
+                    spec_key=spec_key,
+                )
+                if isinstance(outcome, dg.Failure):
+                    context.log.error(
+                        f"Model {node.label} did not materialize: {outcome.description}"
                     )
+                    model_failures.append(outcome)
+                else:
+                    yield outcome
 
             elif node.kind in ("source", "load"):
                 # Source/load nodes run the replication pipeline using
@@ -486,5 +565,15 @@ def _make_dag_group_asset(
                     f"Node {node.label} ({node.kind}): graph-only asset (marking as materialized)"
                 )
                 yield dg.MaterializeResult(asset_key=spec_key)
+
+        if model_failures:
+            if len(model_failures) == 1:
+                raise model_failures[0]
+            raise dg.Failure(
+                description="\n".join(failure.description or "" for failure in model_failures),
+                metadata={
+                    "rocky/failed_model_count": dg.MetadataValue.int(len(model_failures)),
+                },
+            )
 
     return _asset
