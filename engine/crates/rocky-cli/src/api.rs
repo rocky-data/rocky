@@ -43,14 +43,21 @@
 //! All routes except `/api/v1/health` require a Bearer token when one is
 //! configured on [`ServerState`]; see [`rocky_server::auth`]. Error
 //! responses carry the [`ErrorEnvelope`] body (`{code, message,
-//! remediation_hint}`), never an empty body.
+//! remediation_hint}`), never an empty body — including the router-level
+//! fallbacks (`404 route_not_found` for an unmatched path,
+//! `405 method_not_allowed` for a known path hit with the wrong method) and
+//! malformed path parameters (`400 bad_request`). The one exception: a
+//! request the HTTP stack rejects before it reaches the router (e.g.
+//! malformed HTTP or an aborted body read) is answered below this layer and
+//! carries no envelope.
 
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{FromRequestParts, Path, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -95,6 +102,18 @@ impl Default for ServeConfig {
 }
 
 /// Build the axum router with all API routes.
+///
+/// ## Adding a route? Two rules, both load-bearing
+///
+/// 1. Register it **before** the `.layer(require_bearer_token)` call below.
+///    `Router::layer` only wraps what is already in the router, so a route
+///    (or fallback) appended after that call would silently **dodge auth**.
+///    The probe test `every_declared_route_is_auth_wrapped_except_health`
+///    fails on such a route — do not weaken it.
+/// 2. Mirror it in [`api_v1_routes`]. That table anchors `/meta.routes` and
+///    the generated OpenAPI paths; the probe test
+///    `every_declared_route_is_registered_on_the_router` fails when the two
+///    drift.
 pub fn router(state: Arc<ServerState>) -> Router {
     let cors = build_cors_layer(&state.allowed_origins);
 
@@ -119,6 +138,13 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/plan", post(submit_plan))
         .route("/api/v1/jobs/apply", post(submit_apply))
         .route("/api/v1/jobs/{id}", get(get_job))
+        // Envelope fallbacks (see the module doc's error contract). Both are
+        // registered BEFORE the auth layer so they are auth-wrapped like every
+        // route: with a token configured, an unauthenticated probe of an
+        // unknown path is a 401, not a route-existence oracle.
+        .fallback(fallback_route_not_found)
+        // Applies to the method routers registered ABOVE this line.
+        .method_not_allowed_fallback(fallback_method_not_allowed)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_token,
@@ -128,6 +154,11 @@ pub fn router(state: Arc<ServerState>) -> Router {
 }
 
 /// Start the HTTP server.
+///
+/// Before the router serves, persisted jobs stranded in a non-terminal state
+/// by a previous sidecar process are swept to `failed` (see
+/// [`sweep_interrupted_jobs`]) so embedders polling `GET /api/v1/jobs/{id}`
+/// until a terminal state never poll a dead job forever.
 ///
 /// # Errors
 ///
@@ -145,6 +176,27 @@ pub async fn serve(state: Arc<ServerState>, config: ServeConfig) -> anyhow::Resu
              127.0.0.1 (the default).",
             host = config.host,
         );
+    }
+
+    // Startup reconciliation, ONCE, before the router serves: any job this
+    // process submits from here on can never be swept. Best-effort — a locked
+    // state store (e.g. a concurrent CLI run) only defers the sweep to the
+    // next restart, it never blocks serving.
+    let sweep_path = state_path_for(&state);
+    match tokio::task::spawn_blocking(move || sweep_interrupted_jobs(&sweep_path)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(swept)) => {
+            tracing::warn!(
+                swept,
+                "marked jobs interrupted by a previous engine shutdown as failed"
+            );
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "job-record sweep failed; stale `running` records may linger");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "job-record sweep task failed");
+        }
     }
 
     let app = router(state);
@@ -227,13 +279,20 @@ impl ApiError {
     /// concurrent `rocky run` (or an API mutation job) holds the redb flock
     /// for the duration of the run; the three state-backed read routes are
     /// unavailable until it finishes.
-    fn engine_busy() -> Self {
-        Self::new(
+    ///
+    /// When the lock holder is a mutation job submitted through THIS sidecar,
+    /// `running_job_id` carries its id so the embedder can poll
+    /// `GET /api/v1/jobs/{id}` instead of blind-retrying. An external writer
+    /// (e.g. a concurrent CLI `rocky run`) has no job id, so it stays `None`.
+    fn engine_busy(running_job_id: Option<String>) -> Self {
+        let mut err = Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "engine_busy",
             "the state store is locked by a running job",
             Some("state locked by a running job; retry"),
-        )
+        );
+        err.envelope.running_job_id = running_job_id;
+        err
     }
 
     /// `404` — the named model is not in the compiled graph.
@@ -276,6 +335,29 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message, None)
     }
 
+    /// `404` — no route matches the request path. Deliberately distinct from
+    /// the resource-level 404s (`model_not_found`, `job_not_found`) so a
+    /// client — and the route-registration probe test — can tell "no such
+    /// route" from "route exists, resource doesn't".
+    fn route_not_found(path: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "route_not_found",
+            format!("no route matches '{path}'"),
+            Some("list the routes this build serves via GET /api/v1/meta"),
+        )
+    }
+
+    /// `405` — the path exists, but not for this method.
+    fn method_not_allowed(method: &Method, path: &str) -> Self {
+        Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            format!("method {method} is not supported for '{path}'"),
+            Some("check the method against the route list at GET /api/v1/meta"),
+        )
+    }
+
     /// `500` — an unexpected internal error.
     fn internal(message: impl Into<String>) -> Self {
         Self::new(
@@ -301,14 +383,74 @@ impl IntoResponse for ApiError {
 /// An embedder must be able to tell "the engine broke" from "retry in a
 /// moment". Everything else is a genuine `500`.
 ///
+/// `running_job_id` is the mutation permit's current holder
+/// ([`MutationPermit::running_job`]); when this sidecar's own mutation job is
+/// what holds the lock, the `503` carries its id so the embedder can poll the
+/// job instead of blind-retrying. Only the busy arm forwards it.
+///
 /// [`StateError::Busy`]: rocky_core::state::StateError::Busy
 /// [`StateError::LockHeldByOther`]: rocky_core::state::StateError::LockHeldByOther
-fn map_state_err(err: anyhow::Error) -> ApiError {
+/// [`MutationPermit::running_job`]: rocky_server::jobs::MutationPermit::running_job
+fn map_state_err(err: anyhow::Error, running_job_id: Option<String>) -> ApiError {
     use rocky_core::state::StateError;
     match err.downcast::<StateError>() {
-        Ok(StateError::Busy { .. } | StateError::LockHeldByOther { .. }) => ApiError::engine_busy(),
+        Ok(StateError::Busy { .. } | StateError::LockHeldByOther { .. }) => {
+            ApiError::engine_busy(running_job_id)
+        }
         Ok(other) => ApiError::internal(other.to_string()),
         Err(other) => ApiError::internal(other.to_string()),
+    }
+}
+
+/// Router-level fallback: an unmatched path answers the enveloped
+/// `404 route_not_found` instead of axum's default empty body. Registered
+/// before the auth layer in [`router`], so it is auth-wrapped like every
+/// route.
+async fn fallback_route_not_found(uri: Uri) -> ApiError {
+    ApiError::route_not_found(uri.path())
+}
+
+/// Method-router fallback: a known path hit with an unsupported method
+/// answers the enveloped `405 method_not_allowed` instead of axum's default
+/// empty body.
+async fn fallback_method_not_allowed(method: Method, uri: Uri) -> ApiError {
+    ApiError::method_not_allowed(&method, uri.path())
+}
+
+/// [`Path`] wrapper whose rejection is the [`ErrorEnvelope`]: a malformed path
+/// parameter (e.g. an invalid percent-encoded UTF-8 sequence) answers the
+/// enveloped `400 bad_request` instead of axum's plain-text default, keeping
+/// the module-level "every error carries the envelope" contract. Use this —
+/// not bare [`Path`] — in `/api/v1` handlers.
+struct ApiPath<T>(T);
+
+impl<S, T> FromRequestParts<S> for ApiPath<T>
+where
+    T: serde::de::DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Path::<T>::from_request_parts(parts, state).await {
+            Ok(Path(value)) => Ok(Self(value)),
+            Err(rejection) => {
+                // Preserve axum's status class (deserialization → 400,
+                // missing-params wiring bug → 500); only the body changes
+                // shape, from plain text to the envelope.
+                let code = if rejection.status() == StatusCode::BAD_REQUEST {
+                    "bad_request"
+                } else {
+                    "internal_error"
+                };
+                Err(ApiError::new(
+                    rejection.status(),
+                    code,
+                    rejection.body_text(),
+                    None,
+                ))
+            }
+        }
     }
 }
 
@@ -440,7 +582,7 @@ async fn list_models(
 /// `GET /api/v1/models/:name` — dashboard-only model detail (out of contract).
 async fn get_model(
     State(state): State<Arc<ServerState>>,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let lock = state.compile_result.read().await;
     let result = lock.as_ref().ok_or_else(ApiError::engine_not_ready)?;
@@ -477,7 +619,7 @@ async fn get_model(
 /// `"Direct"` the ad-hoc handler used to leak).
 async fn model_lineage(
     State(state): State<Arc<ServerState>>,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
 ) -> Result<PrettyJson<LineageOutput>, ApiError> {
     let lock = state.compile_result.read().await;
     let result = lock.as_ref().ok_or_else(ApiError::engine_not_ready)?;
@@ -491,7 +633,7 @@ async fn model_lineage(
 /// trace, `downstream = false`).
 async fn trace_column(
     State(state): State<Arc<ServerState>>,
-    Path((name, column)): Path<(String, String)>,
+    ApiPath((name, column)): ApiPath<(String, String)>,
 ) -> Result<PrettyJson<ColumnLineageOutput>, ApiError> {
     let lock = state.compile_result.read().await;
     let result = lock.as_ref().ok_or_else(ApiError::engine_not_ready)?;
@@ -588,7 +730,7 @@ async fn list_runs(
     let output = tokio::task::spawn_blocking(move || history_runs_output(&state_path, None, false))
         .await
         .map_err(|e| map_join_err(&e))?
-        .map_err(map_state_err)?;
+        .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     Ok(PrettyJson(output))
 }
 
@@ -597,7 +739,7 @@ async fn list_runs(
 /// Mirrors `rocky history --model <name> --output json` (no rolling stats).
 async fn model_history(
     State(state): State<Arc<ServerState>>,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
 ) -> Result<PrettyJson<ModelHistoryOutput>, ApiError> {
     let state_path = state_path_for(&state);
     let output = tokio::task::spawn_blocking(move || {
@@ -607,7 +749,7 @@ async fn model_history(
     })
     .await
     .map_err(|e| map_join_err(&e))?
-    .map_err(map_state_err)?;
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     Ok(PrettyJson(output))
 }
 
@@ -617,14 +759,14 @@ async fn model_history(
 /// or `--alerts`).
 async fn model_metrics(
     State(state): State<Arc<ServerState>>,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
 ) -> Result<PrettyJson<MetricsOutput>, ApiError> {
     let state_path = state_path_for(&state);
     let output =
         tokio::task::spawn_blocking(move || metrics_output(&state_path, &name, false, None, false))
             .await
             .map_err(|e| map_join_err(&e))?
-            .map_err(map_state_err)?;
+            .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
     Ok(PrettyJson(output))
 }
 
@@ -745,6 +887,40 @@ fn principal_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiErro
         ));
     }
     Ok(Some(value.to_string()))
+}
+
+/// Mark every persisted job stranded in a non-terminal state (`running` /
+/// `queued`) as `failed` with the error `"interrupted by engine restart"`,
+/// returning how many records were reconciled.
+///
+/// A job's terminal-state write lives in the background task of the process
+/// that accepted the submission (see [`submit_job`]); when a sidecar dies
+/// mid-job, nothing will ever finish the persisted record — even if the
+/// orphaned subprocess completes, its outcome is never recorded — so an
+/// embedder following the documented poll-until-terminal contract would poll
+/// forever. [`serve`] runs this sweep **once, before the router serves**,
+/// which is what makes it safe: a job submitted by the current process cannot
+/// exist yet, so only records from a previous process are ever swept.
+///
+/// A missing state file is a no-op (nothing was ever persisted).
+pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Result<usize> {
+    if !state_path.exists() {
+        return Ok(0);
+    }
+    let store = rocky_core::state::StateStore::open(state_path)?;
+    let mut swept = 0;
+    for job in store.list_jobs()? {
+        if matches!(job.state.as_str(), "succeeded" | "failed") {
+            continue;
+        }
+        let mut done = job;
+        done.state = job_state_str(JobState::Failed).to_string();
+        done.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        done.error = Some("interrupted by engine restart".to_string());
+        store.record_job(&done)?;
+        swept += 1;
+    }
+    Ok(swept)
 }
 
 /// Persist a job record (brief open-write-close on the blocking pool).
@@ -961,7 +1137,7 @@ async fn execute_job_subprocess(
 /// crash still reports its last-persisted status instead of a spurious `404`.
 async fn get_job(
     State(state): State<Arc<ServerState>>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
 ) -> Result<PrettyJson<JobStatus>, ApiError> {
     if let Some(record) = state.jobs.get(&id).await {
         return Ok(PrettyJson(job_status_from(record)));
@@ -979,7 +1155,7 @@ async fn get_job(
     })
     .await
     .map_err(|e| map_join_err(&e))?
-    .map_err(|e| map_state_err(anyhow::Error::from(e)))?;
+    .map_err(|e| map_state_err(anyhow::Error::from(e), state.mutation_permit.running_job()))?;
 
     match record {
         Some(record) => {
@@ -1315,23 +1491,67 @@ mod tests {
         let busy = anyhow::Error::from(StateError::Busy {
             path: "x".to_string(),
         });
-        let mapped = map_state_err(busy);
+        let mapped = map_state_err(busy, None);
         assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(mapped.envelope.code, "engine_busy");
         assert_eq!(
             mapped.envelope.remediation_hint.as_deref(),
             Some("state locked by a running job; retry")
         );
+        // No permit holder known → no job id on the envelope.
+        assert!(mapped.envelope.running_job_id.is_none());
 
         let held = anyhow::Error::from(StateError::LockHeldByOther {
             path: "x".to_string(),
         });
-        assert_eq!(map_state_err(held).envelope.code, "engine_busy");
+        assert_eq!(map_state_err(held, None).envelope.code, "engine_busy");
 
         // A genuine, non-lock failure stays a 500.
-        let other = map_state_err(anyhow::anyhow!("disk exploded"));
+        let other = map_state_err(anyhow::anyhow!("disk exploded"), None);
         assert_eq!(other.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(other.envelope.code, "internal_error");
+    }
+
+    /// When this sidecar's own mutation job holds the permit, the `503
+    /// engine_busy` carries its `running_job_id` (as the [`ErrorEnvelope`]
+    /// field doc promises) so the embedder polls the job instead of
+    /// blind-retrying. Only the busy arm forwards it — a genuine `500` never
+    /// names a job even when one is running.
+    #[test]
+    fn engine_busy_names_the_permit_holding_job() {
+        use rocky_core::state::StateError;
+
+        // The handler wiring: the id comes from `mutation_permit.running_job()`.
+        let permit = rocky_server::jobs::MutationPermit::new();
+        let guard = permit.try_acquire("job_holder").expect("permit is free");
+
+        let busy = anyhow::Error::from(StateError::Busy {
+            path: "x".to_string(),
+        });
+        let mapped = map_state_err(busy, permit.running_job());
+        assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.envelope.code, "engine_busy");
+        assert_eq!(
+            mapped.envelope.running_job_id.as_deref(),
+            Some("job_holder")
+        );
+
+        // A non-lock failure ignores the holder entirely.
+        let other = map_state_err(anyhow::anyhow!("disk exploded"), permit.running_job());
+        assert_eq!(other.envelope.code, "internal_error");
+        assert!(other.envelope.running_job_id.is_none());
+
+        drop(guard);
+        // Permit released → nothing to name.
+        let busy = anyhow::Error::from(StateError::Busy {
+            path: "x".to_string(),
+        });
+        assert!(
+            map_state_err(busy, permit.running_job())
+                .envelope
+                .running_job_id
+                .is_none()
+        );
     }
 
     // --- Auth (moved from rocky-server) ---
@@ -1510,14 +1730,31 @@ mod tests {
         assert_eq!(body.code, "bad_request");
     }
 
-    /// The durability done-criterion: a job persisted as `running` (as if the
-    /// sidecar was killed mid-job, before the terminal write) is reported with
-    /// honest status by a **freshly restarted** server — an empty in-memory
-    /// registry falls back to the durable `jobs` state table — not a spurious
-    /// `404`/`succeeded`.
+    /// A [`PersistedJob`] fixture in the given lifecycle `state`.
+    fn persisted_job(id: &str, state: &str) -> rocky_core::state::PersistedJob {
+        rocky_core::state::PersistedJob {
+            job_id: id.to_string(),
+            kind: "run".to_string(),
+            state: state.to_string(),
+            submitted_at: "2026-07-07T00:00:00Z".to_string(),
+            started_at: Some("2026-07-07T00:00:00Z".to_string()),
+            finished_at: None,
+            principal: None,
+            error: None,
+            result: None,
+        }
+    }
+
+    /// The restart contract: a job persisted as `running` by a sidecar that
+    /// died mid-job can never reach a terminal state on its own (the terminal
+    /// write lived in the dead process's background task), so the startup
+    /// sweep marks it failed — and a **freshly restarted** server (empty
+    /// in-memory registry, durable-table fallback) reports that honestly. An
+    /// embedder following the poll-until-terminal contract now terminates
+    /// instead of polling a permanent `running` forever.
     #[tokio::test]
-    async fn job_status_survives_restart_via_persisted_record() {
-        use rocky_core::state::{PersistedJob, StateStore};
+    async fn job_interrupted_by_restart_is_swept_to_failed() {
+        use rocky_core::state::StateStore;
 
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
@@ -1528,21 +1765,15 @@ mod tests {
         {
             let store = StateStore::open(&state_path).unwrap();
             store
-                .record_job(&PersistedJob {
-                    job_id: "job_inflight".to_string(),
-                    kind: "run".to_string(),
-                    state: "running".to_string(),
-                    submitted_at: "2026-07-07T00:00:00Z".to_string(),
-                    started_at: Some("2026-07-07T00:00:00Z".to_string()),
-                    finished_at: None,
-                    principal: None,
-                    error: None,
-                    result: None,
-                })
+                .record_job(&persisted_job("job_inflight", "running"))
                 .unwrap();
         }
 
-        // A brand-new server (empty in-memory registry) — the "restart".
+        // The "restart": `serve` runs the sweep once, before the router serves.
+        let swept = sweep_interrupted_jobs(&state_path).unwrap();
+        assert_eq!(swept, 1);
+
+        // A brand-new server (empty in-memory registry) reads the durable record.
         let state = ServerState::new(models_dir, None, None);
         let base = spawn_router(state).await;
 
@@ -1553,10 +1784,271 @@ mod tests {
         let body: JobStatus = resp.json().await.unwrap();
         assert_eq!(body.job_id, "job_inflight");
         assert!(
-            matches!(body.state, JobState::Running),
-            "a killed-mid-job record must report honest `running` status after restart, got {:?}",
+            matches!(body.state, JobState::Failed),
+            "a killed-mid-job record must be swept to terminal `failed` on restart, got {:?}",
             body.state
         );
+        assert_eq!(body.error.as_deref(), Some("interrupted by engine restart"));
+        assert!(
+            body.finished_at.is_some(),
+            "the sweep stamps the terminal timestamp"
+        );
         assert!(body.result.is_none());
+    }
+
+    /// The sweep reconciles ONLY non-terminal records: `running` and `queued`
+    /// flip to `failed` with the documented error, while terminal
+    /// `succeeded`/`failed` history is untouched. A missing state file is a
+    /// no-op, not an error (fresh project, nothing ever persisted).
+    #[test]
+    fn sweep_marks_only_nonterminal_jobs_failed() {
+        use rocky_core::state::StateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join(".rocky-state.redb");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_job(&persisted_job("job_run", "running"))
+                .unwrap();
+            store.record_job(&persisted_job("job_q", "queued")).unwrap();
+            store
+                .record_job(&persisted_job("job_ok", "succeeded"))
+                .unwrap();
+            store
+                .record_job(&persisted_job("job_bad", "failed"))
+                .unwrap();
+        }
+
+        let swept = sweep_interrupted_jobs(&state_path).unwrap();
+        assert_eq!(swept, 2, "exactly the running + queued records are swept");
+
+        let store = StateStore::open(&state_path).unwrap();
+        for id in ["job_run", "job_q"] {
+            let job = store.get_job(id).unwrap().expect("record present");
+            assert_eq!(job.state, "failed", "{id} must be terminal after sweep");
+            assert_eq!(job.error.as_deref(), Some("interrupted by engine restart"));
+            assert!(job.finished_at.is_some());
+        }
+        // Terminal history is preserved verbatim.
+        let ok = store.get_job("job_ok").unwrap().unwrap();
+        assert_eq!(ok.state, "succeeded");
+        assert!(ok.error.is_none());
+        let bad = store.get_job("job_bad").unwrap().unwrap();
+        assert_eq!(bad.state, "failed");
+        assert!(
+            bad.error.is_none(),
+            "an already-failed job keeps its own error"
+        );
+        drop(store);
+
+        // Idempotent: a second sweep finds nothing non-terminal.
+        assert_eq!(sweep_interrupted_jobs(&state_path).unwrap(), 0);
+        // A state file that never existed is a clean no-op.
+        assert_eq!(
+            sweep_interrupted_jobs(&dir.path().join("nope.redb")).unwrap(),
+            0
+        );
+    }
+
+    /// A running job in the CURRENT process is never swept: the sweep runs
+    /// once at startup, before the router serves, so any job submitted through
+    /// this process's router postdates it by construction. Simulated here by
+    /// sweeping first (the startup) and then registering a running job exactly
+    /// the way `submit_job` does (registry + durable record) — it must still
+    /// report `running`.
+    #[tokio::test]
+    async fn job_running_in_current_process_is_not_swept() {
+        use rocky_core::state::StateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+
+        // Startup: nothing persisted yet, nothing to sweep.
+        assert_eq!(sweep_interrupted_jobs(&state_path).unwrap(), 0);
+
+        // A live submission in THIS process, after the sweep.
+        let state = ServerState::new(models_dir, None, None);
+        let record = persisted_job("job_live", "running");
+        state.jobs.upsert(record.clone()).await;
+        StateStore::open(&state_path)
+            .unwrap()
+            .record_job(&record)
+            .unwrap();
+
+        let base = spawn_router(state).await;
+        let resp = reqwest::get(format!("{base}/api/v1/jobs/job_live"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: JobStatus = resp.json().await.unwrap();
+        assert!(
+            matches!(body.state, JobState::Running),
+            "a job submitted after startup must stay honestly `running`, got {:?}",
+            body.state
+        );
+        assert!(body.error.is_none());
+    }
+
+    // --- Route-table ↔ router anti-drift probes (FIX for silent drift) ---
+
+    /// Substitute the `{param}` placeholders in an `api_v1_routes()` entry
+    /// with probe values so the declared route can actually be requested.
+    fn probe_url(base: &str, path: &str) -> String {
+        let path = path
+            .replace("{name}", "probe_model")
+            .replace("{column}", "probe_column")
+            .replace("{id}", "probe_job");
+        format!("{base}{path}")
+    }
+
+    /// Every route `api_v1_routes()` declares must actually be served by
+    /// `router()` — the two tables are maintained by hand side by side, and
+    /// this probe is the only executable link between them. A
+    /// declared-but-unregistered path would answer with the fallback's
+    /// distinctive `route_not_found` code, and an unregistered method with a
+    /// `405`; any other answer (2xx, resource-level 404, 400, 503) proves the
+    /// route + method are registered. The canary at the end asserts an
+    /// UNdeclared path really does hit the fallback, so the discriminator
+    /// cannot silently rot.
+    #[tokio::test]
+    async fn every_declared_route_is_registered_on_the_router() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        // An initialized (empty) state store so the state-backed reads answer.
+        let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+        let state = ServerState::new(models_dir, None, None);
+        state.recompile().await;
+        let base = spawn_router(state).await;
+
+        let client = reqwest::Client::new();
+        for entry in api_v1_routes() {
+            let (method, path) = entry.split_once(' ').expect("entries are 'METHOD /path'");
+            let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+            // The malformed principal short-circuits the POST /jobs/* routes
+            // with a 400 BEFORE any permit/persist/subprocess side effect —
+            // the probe needs "the route answered", not a submitted job. GET
+            // routes ignore the header.
+            let resp = client
+                .request(method, probe_url(&base, path))
+                .header("X-Rocky-Principal", "bad/slash")
+                .send()
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                405,
+                "{entry}: declared method is not registered on the router"
+            );
+            if resp.status() == 404 {
+                let body: ErrorEnvelope = resp.json().await.unwrap();
+                assert_ne!(
+                    body.code, "route_not_found",
+                    "{entry}: declared path is not registered on the router"
+                );
+            }
+        }
+
+        // Canary: an undeclared path must hit the fallback discriminator.
+        let resp = reqwest::get(format!("{base}/api/v1/definitely-not-a-route"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "route_not_found");
+    }
+
+    /// With a token configured, every declared route except the auth-exempt
+    /// `GET /api/v1/health` must reject a token-less request with a `401` —
+    /// this pins the requirement that routes are registered BEFORE the
+    /// `.layer(require_bearer_token)` call in `router()` (a route appended
+    /// after it would silently dodge auth). The fallback is wrapped too: an
+    /// unknown path without a token is a `401`, never a route-existence
+    /// oracle.
+    #[tokio::test]
+    async fn every_declared_route_is_auth_wrapped_except_health() {
+        let base = spawn_router(test_state_with_token("s3cret")).await;
+        let client = reqwest::Client::new();
+
+        for entry in api_v1_routes() {
+            let (method, path) = entry.split_once(' ').expect("entries are 'METHOD /path'");
+            let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+            let resp = client
+                .request(method, probe_url(&base, path))
+                .send()
+                .await
+                .unwrap();
+            if entry == "GET /api/v1/health" {
+                assert_eq!(resp.status(), 200, "{entry}: health is auth-exempt");
+            } else {
+                assert_eq!(
+                    resp.status(),
+                    401,
+                    "{entry}: must sit behind the auth layer"
+                );
+            }
+        }
+
+        let resp = reqwest::get(format!("{base}/api/v1/definitely-not-a-route"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "the 404 fallback sits behind auth too");
+    }
+
+    // --- Envelope fallbacks (unknown path / wrong method / bad path param) ---
+
+    /// An unmatched path answers the enveloped `404 route_not_found`, not
+    /// axum's default empty body — the documented "every error carries the
+    /// envelope" contract.
+    #[tokio::test]
+    async fn unknown_path_returns_enveloped_404() {
+        let base = spawn_router(test_state()).await;
+        let resp = reqwest::get(format!("{base}/api/v1/no-such-route"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "route_not_found");
+        assert!(body.message.contains("/api/v1/no-such-route"));
+        assert!(body.remediation_hint.is_some());
+    }
+
+    /// A known path hit with an unsupported method answers the enveloped
+    /// `405 method_not_allowed`, not axum's default empty-body 405.
+    #[tokio::test]
+    async fn wrong_method_returns_enveloped_405() {
+        let base = spawn_router(test_state()).await;
+        let client = reqwest::Client::new();
+        // /api/v1/meta only serves GET.
+        let resp = client
+            .post(format!("{base}/api/v1/meta"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 405);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "method_not_allowed");
+        assert!(body.message.contains("POST"));
+    }
+
+    /// A malformed path parameter (invalid percent-encoded UTF-8) answers the
+    /// enveloped `400 bad_request` through the [`ApiPath`] wrapper, not
+    /// axum's plain-text rejection.
+    #[tokio::test]
+    async fn invalid_path_param_returns_enveloped_400() {
+        let state = test_state();
+        state.recompile().await;
+        let base = spawn_router(state).await;
+        // `%FF` percent-decodes to invalid UTF-8 → Path<String> rejection.
+        let resp = reqwest::get(format!("{base}/api/v1/models/%FF"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "bad_request");
     }
 }

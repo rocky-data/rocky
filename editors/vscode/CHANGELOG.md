@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Generated TypeScript types for the engine-v1.62.0 output surface** — `rocky policy test` (`policy_test`), `rocky policy freeze` (`policy_freeze`), the autonomy-budget policy config fields, and the auto-apply drift custody. Additive; the LSP client and existing commands are unchanged.
+- **Generated TypeScript types for the engine-v1.60.0 through v1.62.0 output surfaces.** This release is the first to ship the engine-v1.60.0 types — the `rocky gc --dry-run` reclamation inventory (`gc.ts`), `rocky backfill` (`backfill.ts`), and the policy-condition fields (`max_downstreams`, `verify_after`) — alongside the engine-v1.62.0 additions: `rocky policy test` (`policy_test`), `rocky policy freeze` (`policy_freeze`), the autonomy-budget policy config fields, and the auto-apply drift custody. Additive; the LSP client and existing commands are unchanged.
 
 
 ## [1.34.1] — 2026-07-08

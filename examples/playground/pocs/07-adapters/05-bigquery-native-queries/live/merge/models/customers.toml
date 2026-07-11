@@ -10,4 +10,4 @@ update_columns = ["name", "amount"]
 # honor ${VAR} env substitution today (see live/README.md for context).
 [target]
 catalog = "__GCP_PROJECT__"
-schema = "hc_phase1_live_merge"
+schema = "poc_step1_live_merge"

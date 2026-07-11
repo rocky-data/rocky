@@ -1308,20 +1308,35 @@
         "type": "object"
       },
       "AuditChainVerify": {
-        "description": "Verify-after link of the custody chain.\n\nPost-apply verification outcomes are not persisted to the state store today, so this link is always [`SectionAvailability::Unavailable`] with a note — never a smoothed-over \"verification passed\".",
+        "description": "Verify-after link of the custody chain.\n\nPost-apply verification outcomes are persisted to the decision ledger as custody rows with a non-empty `verify_after` check list — the two-step `rocky apply` gate writes one per verified apply, and the drift auto-apply path writes them under its `autoapply-verify:<run_id>` plan id. This link renders those rows for the subject's plan. When none exist the link says so plainly (\"not recorded\") — never a smoothed-over \"verification passed\".",
         "properties": {
           "availability": {
             "$ref": "#/components/schemas/SectionAvailability"
+          },
+          "entries": {
+            "description": "The verification outcomes, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/AuditVerifyEntry"
+            },
+            "type": "array"
           },
           "note": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "total": {
+            "description": "Count of verification custody rows found for the subject.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
           }
         },
         "required": [
-          "availability"
+          "availability",
+          "entries",
+          "total"
         ],
         "type": "object"
       },
@@ -1484,7 +1499,7 @@
         ]
       },
       "AuditForOutput": {
-        "description": "JSON output for `rocky audit --for <table|run|plan>` — the custody chain.\n\nA one-query drill-down assembled link by link from the data Rocky already records: who proposed the change and what the policy plane decided ([`Self::decisions`]), what the plan changed ([`Self::plan`]), which runs materialized it ([`Self::runs`]), what a post-apply verification found ([`Self::verify_after`]), and what sits downstream in its blast radius ([`Self::blast_radius`]).\n\nEvery link fails closed the same way the estate brief does: a link whose signal is genuinely not recorded renders [`SectionAvailability::Unavailable`] with a note, never a fabricated or assumed value. Notably, post-apply verification outcomes are not persisted anywhere today, so [`Self::verify_after`] is always `unavailable`; and the run ledger is not keyed to policy decisions, so a `run` selector cannot join back to a decision. The blast radius is recomputed from the current compiled graph (a live query, not a stored snapshot).",
+        "description": "JSON output for `rocky audit --for <table|run|plan>` — the custody chain.\n\nA one-query drill-down assembled link by link from the data Rocky already records: who proposed the change and what the policy plane decided ([`Self::decisions`]), what the plan changed ([`Self::plan`]), which runs materialized it ([`Self::runs`]), what a post-apply verification found ([`Self::verify_after`]), and what sits downstream in its blast radius ([`Self::blast_radius`]).\n\nEvery link fails closed the same way the estate brief does: a link whose signal is genuinely not recorded renders [`SectionAvailability::Unavailable`] with a note, never a fabricated or assumed value. Post-apply verification outcomes are persisted as decision-ledger custody rows (non-empty `verify_after`), so [`Self::verify_after`] renders them when they exist and says \"not recorded\" when none exist for the subject. The run ledger is not keyed to policy decisions, so a `run` selector cannot join back to a decision. The blast radius is recomputed from the current compiled graph (a live query, not a stored snapshot).",
         "properties": {
           "blast_radius": {
             "allOf": [
@@ -1543,7 +1558,7 @@
                 "$ref": "#/components/schemas/AuditChainVerify"
               }
             ],
-            "description": "What a post-apply verification found — not recorded today."
+            "description": "What a post-apply verification found — the verification custody rows recorded against the subject's plan."
           },
           "version": {
             "type": "string"
@@ -1640,7 +1655,7 @@
         "type": "object"
       },
       "AuditScorecardOutput": {
-        "description": "JSON output for `rocky audit --scorecard` — a trust-calibration digest.\n\nA decisions-by-group aggregation over the persisted policy-decision ledger, windowed by `--window`. It is the evidence base for widening or tightening autonomy, and it informs human judgment only — nothing here is wired to any automatic policy change.\n\nOnly metrics the ledger actually persists are computed. The ledger records one row per policy *evaluation* — `(principal, capability, model, effect, rule_id)` — and nothing about what happened *after* the decision. So verify-after outcomes, reverts, and escalation-resolution latency are not derivable; they are declared, once, in [`Self::unavailable_metrics`] as `unavailable` with the reason, never faked into a number. A ledger read failure renders the whole scorecard `unavailable` rather than a smoothed-over zero.",
+        "description": "JSON output for `rocky audit --scorecard` — a trust-calibration digest.\n\nA decisions-by-group aggregation over the persisted policy-decision ledger, windowed by `--window`. It is the evidence base for widening or tightening autonomy, and it informs human judgment only — nothing here is wired to any automatic policy change.\n\nOnly metrics the ledger actually persists are computed. Post-apply verification outcomes *are* persisted (custody rows with a non-empty `verify_after` check list), so [`Self::verify_after`] reports their pass rate when any fall in the window. Reverts and escalation-resolution latency are not persisted; they are declared in [`Self::unavailable_metrics`] as `unavailable` with the reason, never faked into a number — and `verify_after_pass_rate` joins that list only when no verification row falls in the window. A ledger read failure renders the whole scorecard `unavailable` rather than a smoothed-over zero.",
         "properties": {
           "availability": {
             "allOf": [
@@ -1681,11 +1696,22 @@
             "type": "integer"
           },
           "unavailable_metrics": {
-            "description": "Metrics the ledger does not persist, declared plainly rather than computed. Each is `unavailable` with the reason it cannot be derived.",
+            "description": "Metrics the persisted ledger cannot support for this window, declared plainly rather than computed. Each is `unavailable` with the reason it cannot be derived.",
             "items": {
               "$ref": "#/components/schemas/ScorecardUnavailableMetric"
             },
             "type": "array"
+          },
+          "verify_after": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScorecardVerifyAfter"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Aggregate of the post-apply verification custody rows in the window (rows with a non-empty `verify_after` check list). `null` when no verification row falls in the window — then `verify_after_pass_rate` is declared in [`Self::unavailable_metrics`] instead."
           },
           "version": {
             "type": "string"
@@ -1739,6 +1765,42 @@
             "type": "string"
           }
         ]
+      },
+      "AuditVerifyEntry": {
+        "description": "One post-apply verification outcome inside [`AuditChainVerify`] — a decision-ledger custody row with a non-empty `verify_after` check list.\n\nThe ledger records the required check names, the aggregate verdict (`allow` = every named check passed, `deny` = a check failed or was absent and the apply halted), and a human-readable reason; per-check pass/fail detail beyond that lives only in the reason string, which is rendered verbatim rather than re-parsed.",
+        "properties": {
+          "checks": {
+            "description": "The named post-apply checks the verification required.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "passed": {
+            "description": "Whether the verification passed (`allow` custody row) or failed (`deny`).",
+            "type": "boolean"
+          },
+          "plan_id": {
+            "description": "The plan id the custody row was filed under (the applied plan, or the auto-apply path's `autoapply-verify:<run_id>`).",
+            "type": "string"
+          },
+          "reason": {
+            "description": "The recorded outcome, verbatim from the custody row.",
+            "type": "string"
+          },
+          "timestamp": {
+            "description": "RFC 3339 timestamp when the verification outcome was recorded.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "checks",
+          "passed",
+          "plan_id",
+          "reason",
+          "timestamp"
+        ],
+        "type": "object"
       },
       "AutonomyBudget": {
         "additionalProperties": false,
@@ -4589,7 +4651,7 @@
             "type": "string"
           },
           "direction": {
-            "description": "Direction of the trace walk: `\"upstream\"` (producers) or `\"downstream\"` (consumers). Defaults to upstream when `--column` is set without direction flags, matching pre-Arc-1 behaviour.",
+            "description": "Direction of the trace walk: `\"upstream\"` (producers) or `\"downstream\"` (consumers). Defaults to upstream when `--column` is set without direction flags, matching the historical default.",
             "type": "string"
           },
           "downstream_consumers": {
@@ -5053,7 +5115,7 @@
         "type": "object"
       },
       "ComplianceOutput": {
-        "description": "JSON output for `rocky compliance`.\n\nA thin rollup over Wave A governance: classification sidecars (`[classification]` per model) + project-level `[mask]` / `[mask.<env>]` policy. Answers the question **\"are all classified columns masked wherever policy says they should be?\"** without making any warehouse calls — purely a static resolver over `rocky.toml` + model sidecars.\n\nConsumers (CI gates, dagster) dispatch on the top-level `command` field (`\"compliance\"`).",
+        "description": "JSON output for `rocky compliance`.\n\nA thin rollup over the project's governance config: classification sidecars (`[classification]` per model) + project-level `[mask]` / `[mask.<env>]` policy. Answers the question **\"are all classified columns masked wherever policy says they should be?\"** without making any warehouse calls — purely a static resolver over `rocky.toml` + model sidecars.\n\nConsumers (CI gates, dagster) dispatch on the top-level `command` field (`\"compliance\"`).",
         "properties": {
           "command": {
             "description": "Always `\"compliance\"`. Consumers key dispatch off this field.",
@@ -5372,7 +5434,7 @@
         "type": "object"
       },
       "CostOutput": {
-        "description": "JSON output for `rocky cost <run_id|latest>`.\n\nHistorical per-run cost attribution read from the embedded state store's [`rocky_core::state::RunRecord`]. Re-derives per-model cost via [`rocky_core::cost::compute_observed_cost_usd`] — the same formula [`RunOutput::populate_cost_summary`] applies at the end of a live run. The per-model and per-run totals make the \"what did my last run cost?\" question answerable from the recorded run alone, without re-materialising tables.\n\n# Adapter type resolution\n\nThe `RunRecord` only carries `config_hash`, not the adapter type. The command loads `rocky.toml` to resolve the billed-warehouse type. When the config can't be loaded (working-dir mismatch, missing file, parse error), the output degrades gracefully: `adapter_type` stays `None` and `cost_usd` is `None` on every model, but durations and byte counts are still populated from the stored record.\n\n# BigQuery note\n\nBecause [`rocky_core::state::ModelExecution::bytes_scanned`] is persisted, this command can return a real cost figure for BigQuery runs even though the live `rocky run` path currently reports `cost_usd: None` for BQ (adapter bytes-scanned plumbing is a follow-up wave).",
+        "description": "JSON output for `rocky cost <run_id|latest>`.\n\nHistorical per-run cost attribution read from the embedded state store's [`rocky_core::state::RunRecord`]. Re-derives per-model cost via [`rocky_core::cost::compute_observed_cost_usd`] — the same formula [`RunOutput::populate_cost_summary`] applies at the end of a live run. The per-model and per-run totals make the \"what did my last run cost?\" question answerable from the recorded run alone, without re-materialising tables.\n\n# Adapter type resolution\n\nThe `RunRecord` only carries `config_hash`, not the adapter type. The command loads `rocky.toml` to resolve the billed-warehouse type. When the config can't be loaded (working-dir mismatch, missing file, parse error), the output degrades gracefully: `adapter_type` stays `None` and `cost_usd` is `None` on every model, but durations and byte counts are still populated from the stored record.\n\n# BigQuery note\n\nBecause [`rocky_core::state::ModelExecution::bytes_scanned`] is persisted, this command can return a real cost figure for BigQuery runs even though the live `rocky run` path currently reports `cost_usd: None` for BQ (adapter bytes-scanned plumbing is a follow-up).",
         "properties": {
           "adapter_type": {
             "description": "Adapter type the cost formula was parameterised against, for audit. Mirrors `AdapterConfig.type`. `None` when the config couldn't be loaded or the adapter isn't a billed warehouse.",
@@ -6674,7 +6736,6 @@
           }
         },
         "required": [
-          "adaptive_concurrency",
           "concurrency",
           "tables_failed",
           "tables_processed"
@@ -7418,7 +7479,7 @@
             "type": "integer"
           },
           "notes": {
-            "description": "Operator caveats (physical-reclamation reachability, restore held).",
+            "description": "Operator caveats (e.g. physical-reclamation reachability). Each eviction's tombstone records what a restore will need; `rocky restore` itself is a planned follow-up.",
             "items": {
               "type": "string"
             },
@@ -7570,7 +7631,7 @@
             "type": "string"
           },
           "physical_reclaimed": {
-            "description": "`true` when the bytes were physically deleted through the object-store adapter; `false` when the physical delete was deferred or failed (a safe leaked orphan — the tombstone stands and restore still works).",
+            "description": "`true` when the bytes were physically deleted through the object-store adapter; `false` when the physical delete was deferred or failed (a safe leaked orphan — the tombstone still records everything a restore will need; `rocky restore` itself is a planned follow-up).",
             "type": "boolean"
           },
           "physical_status": {
@@ -7605,7 +7666,7 @@
         "description": "One artifact scheduled for eviction inside a persisted `rocky gc` plan ([`GcPlan`]).\n\nCaptures the identity of a single derivable artifact — enough to (a) re-locate its exact ledger row at apply time, (b) re-verify eligibility against the live ledger, and (c) write a complete restore tombstone. The recipe-identity triple is captured at plan time from the producing execution.",
         "properties": {
           "blake3_hash": {
-            "description": "Content hash (hex) of the artifact bytes — the eviction unit and the identity a restore re-computes and compares against.",
+            "description": "Content hash (hex) of the artifact bytes — the eviction unit and the identity a restore would re-compute and compare against.",
             "type": "string"
           },
           "commit_version": {
@@ -7622,7 +7683,7 @@
             ]
           },
           "file_path": {
-            "description": "Object-store path of the artifact — the byte location a physical reclamation deletes and a restore re-materializes to.",
+            "description": "Object-store path of the artifact — the byte location a physical reclamation deletes and a restore would re-materialize to.",
             "type": "string"
           },
           "hash_scheme": {
@@ -7658,7 +7719,7 @@
             ]
           },
           "run_id": {
-            "description": "Run that produced it — half of the provenance key restore replays from.",
+            "description": "Run that produced it — half of the provenance key a restore would replay from.",
             "type": "string"
           },
           "size_bytes": {
@@ -7703,7 +7764,7 @@
             "type": "array"
           },
           "notes": {
-            "description": "Operator caveats (re-verification at apply, restore safety net, scope).",
+            "description": "Operator caveats (e.g. re-verification at apply, scope). Each eviction records what a restore will need; `rocky restore` itself is a planned follow-up.",
             "items": {
               "type": "string"
             },
@@ -9708,7 +9769,7 @@
             ]
           },
           "bytes_written": {
-            "description": "Adapter-reported bytes-written figure, summed across all statements. Currently `None` on every adapter — BigQuery doesn't expose a bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet. Reserved so future waves can populate it without a schema break.",
+            "description": "Adapter-reported bytes-written figure, summed across all statements. Currently `None` on every adapter — BigQuery doesn't expose a bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet. Reserved so a future release can populate it without a schema break.",
             "format": "uint64",
             "minimum": 0.0,
             "type": [
@@ -9926,8 +9987,6 @@
           }
         },
         "required": [
-          "alerts",
-          "column_trend",
           "command",
           "count",
           "model",
@@ -10791,7 +10850,6 @@
           }
         },
         "required": [
-          "batched_with",
           "end",
           "key",
           "start"
@@ -10850,7 +10908,6 @@
           "model",
           "partitions_failed",
           "partitions_planned",
-          "partitions_skipped",
           "partitions_succeeded"
         ],
         "type": "object"
@@ -11247,7 +11304,7 @@
         "description": "Schema-only helper mirroring [`AdaptersFieldSchema`] for `[pipeline.*]`.\n\nThe flat-pipeline shorthand exists in [`normalize_toml_shorthands`] but is unused across all committed POCs; including it in the schema is defensive — a user typing `[pipeline] source = ...` shouldn't see a false IDE error. The pipeline payload references [`PipelineConfig`] directly, whose hand-written `JsonSchema` impl emits an `anyOf` of the five pipeline variants."
       },
       "PlanOutput": {
-        "description": "JSON output for `rocky plan`.\n\n`statements` enumerates the warehouse SQL Rocky would emit. The three `*_actions` collections are a parallel view of the control-plane governance work `rocky run` would do *after* a successful DAG — the classification / masking / retention reconcile pass. These never show up as SQL; they fire through [`rocky_core::traits::GovernanceAdapter`] methods (e.g. `apply_column_tags`, `apply_masking_policy`, `apply_retention_policy`). Projects without any `[classification]`, `[mask]`, or `retention` config get empty lists — the fields `skip_serializing_if = Vec::is_empty`, so JSON consumers written against the pre-Wave A shape are byte-stable.\n\n## Phase 2 additions (Cluster 3 B)\n\n`plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers` are additive — all have `skip_serializing_if` so existing fixtures and consumers that do not include a compile step remain byte-stable. When `rocky plan` runs against a project with a `models/` directory, these fields are populated and the plan is persisted to `.rocky/plans/`.",
+        "description": "JSON output for `rocky plan`.\n\n`statements` enumerates the warehouse SQL Rocky would emit. The three `*_actions` collections are a parallel view of the control-plane governance work `rocky run` would do *after* a successful DAG — the classification / masking / retention reconcile pass. These never show up as SQL; they fire through [`rocky_core::traits::GovernanceAdapter`] methods (e.g. `apply_column_tags`, `apply_masking_policy`, `apply_retention_policy`). Projects without any `[classification]`, `[mask]`, or `retention` config get empty lists — the fields `skip_serializing_if = Vec::is_empty`, so JSON consumers written against the earlier shape are byte-stable.\n\n## Plan-persistence additions\n\n`plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers` are additive — all have `skip_serializing_if` so existing fixtures and consumers that do not include a compile step remain byte-stable. When `rocky plan` runs against a project with a `models/` directory, these fields are populated and the plan is persisted to `.rocky/plans/`.",
         "properties": {
           "breaking_verdict": {
             "anyOf": [
@@ -12162,8 +12219,7 @@
         "required": [
           "rows_added",
           "rows_changed",
-          "rows_removed",
-          "samples"
+          "rows_removed"
         ],
         "type": "object"
       },
@@ -12655,7 +12711,6 @@
           }
         },
         "required": [
-          "changed_columns",
           "model_name",
           "reason"
         ],
@@ -12810,8 +12865,7 @@
         "required": [
           "rows_added",
           "rows_changed",
-          "rows_removed",
-          "samples"
+          "rows_removed"
         ],
         "type": "object"
       },
@@ -12865,11 +12919,6 @@
             "type": "array"
           }
         },
-        "required": [
-          "added_columns",
-          "removed_columns",
-          "type_changes"
-        ],
         "type": "object"
       },
       "ProfileColumnStats": {
@@ -13724,9 +13773,7 @@
         "required": [
           "asset_key",
           "mode",
-          "ok",
-          "quarantine_table",
-          "valid_table"
+          "ok"
         ],
         "type": "object"
       },
@@ -14186,7 +14233,7 @@
         "type": "object"
       },
       "ReplayOutput": {
-        "description": "JSON output for `rocky replay <run_id|latest>`.\n\nInspection-only surface over the state store's [`RunRecord`]: shows every model that ran, with the SQL hash, row counts, bytes, and timings captured at the time. Re-execution (with pinned inputs + content-addressed writes) is deferred to a follow-up when the Arc-1 storage path arrives.",
+        "description": "JSON output for `rocky replay <run_id|latest>`.\n\nInspection-only surface over the state store's [`RunRecord`]: shows every model that ran, with the SQL hash, row counts, bytes, and timings captured at the time. Re-execution is the separate `rocky replay --execute` surface ([`ReplayExecuteOutput`]), which re-runs recorded models on an ephemeral engine and byte-compares to the recording.",
         "properties": {
           "command": {
             "type": "string"
@@ -14490,7 +14537,7 @@
         "type": "object"
       },
       "RetentionStatusOutput": {
-        "description": "JSON output for `rocky retention-status`.\n\nReports which models declare a `retention = \"<N>[dy]\"` sidecar value and — when `--drift` is set in a future wave — whether the warehouse's current retention matches. Today `warehouse_days` is always `None` because the probe is deferred to v2; the schema is stable so v2 can populate the field without a JSON shape break.",
+        "description": "JSON output for `rocky retention-status`.\n\nReports which models declare a `retention = \"<N>[dy]\"` sidecar value and — when `--drift` is set in a future release — whether the warehouse's current retention matches. Today `warehouse_days` is always `None` because the probe is deferred to v2; the schema is stable so v2 can populate the field without a JSON shape break.",
         "properties": {
           "command": {
             "type": "string"
@@ -14584,7 +14631,7 @@
             "type": "integer"
           },
           "traces_deleted": {
-            "description": "JSONL trace files removed by the last-N-by-mtime sweep. Always zero for the explicit `rocky state retention sweep` command — the trace sweep is only invoked from `rocky run`'s end-of-run auto-sweep (Arc 4 span retention).",
+            "description": "JSONL trace files removed by the last-N-by-mtime sweep. Always zero for the explicit `rocky state retention sweep` command — the trace sweep is only invoked from `rocky run`'s end-of-run auto-sweep.",
             "format": "uint64",
             "minimum": 0.0,
             "type": "integer"
@@ -14846,6 +14893,12 @@
           "command": {
             "type": "string"
           },
+          "excluded_non_plan_rows": {
+            "description": "Count of outstanding `require_review` ledger rows excluded from the queue because their `plan_id` resolves to no persisted plan file — decision-only custody rows (e.g. refused drafts, auto-apply evaluations) that nothing could approve. They stay in the audit ledger; they are just not approvable queue items.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
           "pending": {
             "description": "The pending escalations, highest-priority first.",
             "items": {
@@ -14869,6 +14922,7 @@
         },
         "required": [
           "command",
+          "excluded_non_plan_rows",
           "pending",
           "ranking",
           "total",
@@ -15682,24 +15736,18 @@
           }
         },
         "required": [
-          "anomalies",
           "check_results",
           "command",
           "drift",
           "duration_ms",
-          "errors",
           "execution",
           "filter",
           "interrupted",
           "materializations",
-          "partition_summaries",
           "permissions",
-          "quarantine",
-          "shadow",
           "status",
           "tables_copied",
           "tables_failed",
-          "tables_skipped",
           "version"
         ],
         "type": "object"
@@ -15923,7 +15971,7 @@
         "type": "object"
       },
       "ScorecardUnavailableMetric": {
-        "description": "A metric the scorecard cannot compute because the ledger does not persist its inputs.\n\nDeclared explicitly (not silently omitted) so the honesty is machine-readable: a consumer sees the metric name, that it is `unavailable`, and exactly why.",
+        "description": "A metric the scorecard cannot compute from the persisted ledger for this window.\n\nDeclared explicitly (not silently omitted) so the honesty is machine-readable: a consumer sees the metric name, that it is `unavailable`, and exactly why.",
         "properties": {
           "availability": {
             "allOf": [
@@ -15934,7 +15982,7 @@
             "description": "Always [`SectionAvailability::Unavailable`]."
           },
           "metric": {
-            "description": "The metric identifier (`verify_after_pass_rate`, `reverts`, `escalation_latency`).",
+            "description": "The metric identifier (`reverts`, `escalation_latency`, or `verify_after_pass_rate` when no verification row falls in the window).",
             "type": "string"
           },
           "note": {
@@ -15946,6 +15994,41 @@
           "availability",
           "metric",
           "note"
+        ],
+        "type": "object"
+      },
+      "ScorecardVerifyAfter": {
+        "description": "The verify-after aggregate inside an [`AuditScorecardOutput`]: pass/fail counts over the post-apply verification custody rows in the window.\n\nEach row's aggregate verdict is its recorded `effect` (`allow` = every named check passed, `deny` = a check failed or was absent and the apply halted), so the pass rate summarizes exactly what the ledger persists.",
+        "properties": {
+          "failed": {
+            "description": "Rows whose verdict was `deny` (a named check failed or was absent).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "pass_rate": {
+            "description": "`passed / total`.",
+            "format": "double",
+            "type": "number"
+          },
+          "passed": {
+            "description": "Rows whose verdict was `allow` (every named check passed).",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Verification custody rows in the window.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "failed",
+          "pass_rate",
+          "passed",
+          "total"
         ],
         "type": "object"
       },

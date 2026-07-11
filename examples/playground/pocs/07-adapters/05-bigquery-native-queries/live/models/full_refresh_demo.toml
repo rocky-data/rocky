@@ -7,4 +7,4 @@ type = "full_refresh"
 # against a different project.
 [target]
 catalog = "__GCP_PROJECT__"
-schema = "hc_phase1_live"
+schema = "poc_step1_live"

@@ -110,7 +110,7 @@ export type RunStatus = ("Success" | "PartialFailure" | "Failure") | "SkippedIde
  * JSON output for `rocky run`.
  */
 export interface RunOutput {
-  anomalies: AnomalyOutput[];
+  anomalies?: AnomalyOutput[];
   /**
    * Budget breaches detected at end of run. Empty when no `[budget]` block is configured or all configured limits were respected. Each breach is also emitted as a `budget_breach` [`rocky_observe::events::PipelineEvent`] and fires the `on_budget_breach` hook so subscribers see them live.
    */
@@ -127,7 +127,7 @@ export interface RunOutput {
   cost_summary?: RunCostSummary | null;
   drift: DriftSummary;
   duration_ms: number;
-  errors: TableErrorOutput[];
+  errors?: TableErrorOutput[];
   /**
    * Tables that the discovery adapter reported as enabled but that do not exist in the source warehouse (e.g. Fivetran has them configured but hasn't synced them, or they carry the `do_not_alter__` broken-table marker). Surfaced so orchestrators can flag the gap in their UIs instead of silently dropping the assets.
    */
@@ -155,7 +155,7 @@ export interface RunOutput {
   /**
    * Per-model partition execution summaries, present only when the run touched one or more `time_interval` models. Empty for runs that didn't execute any partitioned models.
    */
-  partition_summaries: PartitionSummary[];
+  partition_summaries?: PartitionSummary[];
   permissions: PermissionSummary;
   /**
    * Pipeline type that was executed (e.g., "replication").
@@ -164,12 +164,12 @@ export interface RunOutput {
   /**
    * Row-quarantine outcomes — one entry per table the quality pipeline quarantined. Empty for runs that did not use `[pipeline.x.checks.quarantine]`.
    */
-  quarantine: QuarantineOutput[];
+  quarantine?: QuarantineOutput[];
   resumed_from?: string | null;
   /**
    * True when running in shadow mode (targets rewritten).
    */
-  shadow: boolean;
+  shadow?: boolean;
   /**
    * Prior run whose idempotency key deflected this call, or the run currently holding the in-flight claim. Populated only when `status` is `skipped_idempotent` or `skipped_in_flight`.
    */
@@ -183,7 +183,7 @@ export interface RunOutput {
    * Total number of failed tables/models for the run, **including** pre-execution compile failures: a model that fails to type-check is counted here even though it never reached the execution phase. This is the authoritative failure count — consumers should key overall pass/fail on the top-level `tables_failed` / `status` / `errors`, not on `execution.tables_failed`, which counts only execution-phase (copy / runtime) failures and excludes models excluded before execution.
    */
   tables_failed: number;
-  tables_skipped: number;
+  tables_skipped?: number;
   version: string;
   [k: string]: unknown;
 }
@@ -337,7 +337,7 @@ export interface ExecutionSummary {
   /**
    * Whether adaptive concurrency (AIMD throttle) was enabled for this run.
    */
-  adaptive_concurrency: boolean;
+  adaptive_concurrency?: boolean;
   concurrency: number;
   /**
    * Final concurrency level at end of run (may differ from initial if adaptive concurrency adjusted it). Only present when adaptive concurrency is enabled.
@@ -367,7 +367,7 @@ export interface MaterializationOutput {
    */
   bytes_scanned?: number | null;
   /**
-   * Adapter-reported bytes-written figure, summed across all statements. Currently `None` on every adapter — BigQuery doesn't expose a bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet. Reserved so future waves can populate it without a schema break.
+   * Adapter-reported bytes-written figure, summed across all statements. Currently `None` on every adapter — BigQuery doesn't expose a bytes-written figure for query jobs, and the Databricks / Snowflake paths haven't wired it yet. Reserved so a future release can populate it without a schema break.
    */
   bytes_written?: number | null;
   /**
@@ -462,7 +462,7 @@ export interface MaterializationMetadata {
  * `key` is the canonical Rocky partition key (e.g. `"2026-04-07"` for daily; `"2026-04-07T13"` for hourly). `start` / `end` are the half-open `[start, end)` window the SQL substituted for `@start_date` / `@end_date`. `batched_with` lists any additional partition keys that were merged into this batch when `batch_size > 1` — empty for the default one-partition-per-statement case.
  */
 export interface PartitionInfo {
-  batched_with: string[];
+  batched_with?: string[];
   end: string;
   key: string;
   start: string;
@@ -547,7 +547,7 @@ export interface PartitionSummary {
   /**
    * Partitions that were already `Computed` in the state store and skipped by the runtime (currently always 0; reserved for the `--missing` change-detection optimization).
    */
-  partitions_skipped: number;
+  partitions_skipped?: number;
   partitions_succeeded: number;
   [k: string]: unknown;
 }
@@ -583,7 +583,7 @@ export interface QuarantineOutput {
   /**
    * Fully-qualified name of the `__quarantine` output table. Empty for `mode = "drop"` (failing rows discarded) and `mode = "tag"`.
    */
-  quarantine_table: string;
+  quarantine_table?: string;
   /**
    * Number of rows in the `__quarantine` output, when the adapter can report it.
    */
@@ -595,6 +595,6 @@ export interface QuarantineOutput {
   /**
    * Fully-qualified `catalog.schema.table` name of the `__valid` output table. Empty for `mode = "tag"` (source is rewritten in place).
    */
-  valid_table: string;
+  valid_table?: string;
   [k: string]: unknown;
 }

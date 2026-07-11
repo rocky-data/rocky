@@ -89,9 +89,11 @@ from .compile_schema import (
 # Discover command
 from .discover_schema import (
     ChecksConfigOutput,
+    CollisionCandidateOutput,
     DiscoverOutput,
     FailedSourceOutput,
     FreshnessConfigOutput,
+    ResolvedCheckNameOutput,
     SourceOutput,
     TableOutput,
 )
@@ -138,14 +140,22 @@ from .optimize_schema import OptimizeOutput, OptimizeRecommendation
 # Plan command
 from .plan_schema import PlannedStatement, PlanOutput
 
-# Run command — canonical source for all the run-only nested types.
+# Run command — canonical source for all the run-only nested types (including
+# the shared ``BudgetBreachOutput`` / ``ExcludedTableOutput`` also referenced by
+# preview_cost / discover).
 from .run_schema import (
     AnomalyOutput,
+    BudgetBreachOutput,
+    ContainedModelOutput,
+    ExcludedTableOutput,
     ExecutionSummary,
     MaterializationMetadata,
     MaterializationOutput,
     MetricsSnapshot,
+    ModelDecisionOutput,
+    OverrideWarningOutput,
     PermissionSummary,
+    QuarantineOutput,
     RunOutput,
     TableCheckOutput,
     TableErrorOutput,
@@ -158,7 +168,13 @@ from .state_schema import StateOutput, WatermarkEntry
 from .state_clear_schema_cache_schema import ClearSchemaCacheOutput
 
 # Test command — canonical source for TestFailure
-from .test_schema import TestFailure, TestOutput
+from .test_schema import (
+    DeclarativeTestResult,
+    ModelTestResult,
+    TestFailure,
+    TestOutput,
+    UnitTestResult,
+)
 
 # Compare command
 from .compare_schema import CompareOutput, TableCompareResult
@@ -324,6 +340,7 @@ from .preview_create_schema import (
     PreviewPrunedModel,
 )
 from .preview_diff_schema import (
+    BisectionStatsOutput,
     PreviewColumnTypeChange,
     PreviewDiffOutput,
     PreviewDiffSummary,
@@ -335,10 +352,14 @@ from .preview_diff_schema import (
     PreviewStructuralDiff,
 )
 from .preview_cost_schema import (
+    PerModelBudgetBreachOutput,
     PreviewCostOutput,
     PreviewCostSummary,
     PreviewModelCostDelta,
 )
+
+# Preview rows (`rocky preview rows`)
+from .preview_rows_schema import PreviewRowsOutput
 
 # Fivetran state envelope — canonical shape written by
 # `rocky discover --emit-fivetran-state-to <PATH>` and the contract
@@ -354,6 +375,62 @@ from .rocky_fivetran_state_schema import (
     FivetranStateEnvelope,
     FivetranTableConfig,
 )
+
+# Governor surface — audit ledger + scorecard + policy plane + review queue.
+from .audit_schema import AuditDecisionEntry, AuditOutput
+from .audit_for_schema import (
+    AuditChainBlastRadius,
+    AuditChainDecisions,
+    AuditChainPlan,
+    AuditChainRuns,
+    AuditChainVerify,
+    AuditForOutput,
+    AuditPlanChange,
+    AuditRunEntry,
+)
+from .audit_scorecard_schema import (
+    AuditScorecardOutput,
+    ScorecardGroup,
+    ScorecardUnavailableMetric,
+)
+from .policy_check_schema import PolicyCheckOutput, PolicyModelAttributes
+from .policy_test_schema import PolicyTestOutput, PolicyTestResult
+from .policy_freeze_schema import PolicyFreezeEntry, PolicyFreezeOutput
+from .review_schema import ReviewOutput
+from .review_queue_schema import ReviewQueueEntry, ReviewQueueOutput
+
+# Seed / load — file-ingest + seed commands.
+from .seed_schema import SeedOutput, SeedTableOutput
+from .load_schema import ContractResult, ContractViolation, LoadFileOutput, LoadOutput
+
+# Estimate / profile — warehouse-cost estimate + column profiler.
+from .estimate_schema import EstimateOutput, ModelEstimate
+from .profile_schema import ProfileColumnStats, ProfileOutput
+
+# Trace / validate — run-timeline trace + config validation.
+from .trace_schema import TraceModelEntry, TraceOutput
+from .validate_schema import (
+    ValidateAdapterStatus,
+    ValidateMessage,
+    ValidateModelsStatus,
+    ValidateOutput,
+    ValidatePipelineStatus,
+)
+
+# DAG run — DAG-mode run summary.
+from .dag_run_schema import DagRunNodeOutput, DagRunOutput
+
+# Compact-dedup — cross-table dedup report.
+from .compact_dedup_schema import (
+    ByteCalibration,
+    CompactDedupOutput,
+    DedupPair,
+    DedupSummary,
+    TableDedupContribution,
+)
+
+# State-retention sweep — scheduled state GC report.
+from .state_retention_sweep_schema import RetentionSweepOutput
 
 __all__ = [
     # ai
@@ -593,4 +670,82 @@ __all__ = [
     "FivetranSchemaEntry",
     "FivetranTableConfig",
     "FivetranColumnConfig",
+    # lineage-diff (already imported above; add the missing __all__ entries)
+    "LineageColumnChange",
+    "LineageDiffOutput",
+    "LineageDiffResult",
+    # discover (nested command-output types)
+    "CollisionCandidateOutput",
+    "ResolvedCheckNameOutput",
+    # run (nested command-output types; canonical for the shared
+    # BudgetBreachOutput / ExcludedTableOutput also referenced elsewhere)
+    "BudgetBreachOutput",
+    "ContainedModelOutput",
+    "ExcludedTableOutput",
+    "ModelDecisionOutput",
+    "OverrideWarningOutput",
+    "QuarantineOutput",
+    # test (per-model / declarative / unit test result shapes)
+    "DeclarativeTestResult",
+    "ModelTestResult",
+    "UnitTestResult",
+    # preview (rows + diff/cost nested)
+    "PreviewRowsOutput",
+    "BisectionStatsOutput",
+    "PerModelBudgetBreachOutput",
+    # governor — audit ledger
+    "AuditOutput",
+    "AuditDecisionEntry",
+    "AuditForOutput",
+    "AuditRunEntry",
+    "AuditChainBlastRadius",
+    "AuditChainRuns",
+    "AuditChainVerify",
+    "AuditPlanChange",
+    "AuditChainDecisions",
+    "AuditChainPlan",
+    "AuditScorecardOutput",
+    "ScorecardGroup",
+    "ScorecardUnavailableMetric",
+    # governor — policy plane
+    "PolicyCheckOutput",
+    "PolicyModelAttributes",
+    "PolicyTestOutput",
+    "PolicyTestResult",
+    "PolicyFreezeOutput",
+    "PolicyFreezeEntry",
+    "ReviewOutput",
+    "ReviewQueueOutput",
+    "ReviewQueueEntry",
+    # seed / load
+    "SeedOutput",
+    "SeedTableOutput",
+    "LoadOutput",
+    "LoadFileOutput",
+    "ContractResult",
+    "ContractViolation",
+    # estimate / profile
+    "EstimateOutput",
+    "ModelEstimate",
+    "ProfileOutput",
+    "ProfileColumnStats",
+    # trace / validate
+    "TraceOutput",
+    "TraceModelEntry",
+    "ValidateOutput",
+    "ValidateAdapterStatus",
+    "ValidateMessage",
+    "ValidateModelsStatus",
+    "ValidatePipelineStatus",
+    # dag run
+    "DagRunOutput",
+    "DagRunNodeOutput",
+    # compact-dedup
+    "CompactDedupOutput",
+    "ByteCalibration",
+    "DedupPair",
+    "DedupSummary",
+    "TableDedupContribution",
+    # state-retention sweep
+    "RetentionSweepOutput",
 ]

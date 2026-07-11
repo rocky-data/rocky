@@ -33,6 +33,7 @@ use rocky_core::state::StateStore;
 use rocky_ir::dag::{DagNode, execution_layers};
 
 use crate::commands::audit::{blast_radius_of, compile_project};
+use crate::commands::review::record_plan_review_escalation;
 use crate::output::{
     BackfillCostEstimate, BackfillModelCost, BackfillOutput, BackfillPartitionScope, RunPlan,
     print_json,
@@ -180,6 +181,9 @@ pub(crate) fn run_backfill_in(
 
     // 6. Cost estimate from historical observations (offline).
     let cost_estimate = estimate_cost(&ordered, store.as_ref(), config_path);
+    // The read handle drops here so the escalation write below can open its
+    // own handle on the same store.
+    drop(store);
 
     // 7. Persist the plan (always review-gated).
     let run_plan = build_run_plan(models_dir, &ordered, &layers, partition_from, partition_to);
@@ -209,6 +213,20 @@ pub(crate) fn run_backfill_in(
         capabilities,
     )
     .context("failed to persist the backfill plan")?;
+
+    // A backfill's apply bails on the missing review marker before
+    // `evaluate_apply_policy` could record anything, so record its escalation
+    // at creation — this one plan-level row is what puts it in the review
+    // queue (and in front of the governor's MCP approve path).
+    record_plan_review_escalation(
+        state_path,
+        &plan_id,
+        PolicyPrincipal::Agent,
+        PolicyCapability::Backfill,
+        &format!("backfill: {} model(s)", ordered.len()),
+        "backfill plan awaits review — backfills are unconditionally review-gated (blast \
+         radius hides in scoped rebuilds)",
+    );
 
     let message = format!(
         "composed a backfill of {} model(s) ({} seed → {} closure); review required before apply",
@@ -571,6 +589,91 @@ mod tests {
         assert!(est.total_cost_usd.is_none());
         assert_eq!(est.per_model.len(), 2);
         assert!(est.per_model.iter().all(|m| m.cost_usd.is_none()));
+    }
+
+    /// FIX: a backfill plan is unconditionally review-gated but its apply
+    /// bails before `evaluate_apply_policy` runs — so plan creation itself
+    /// must record the `require_review` ledger row that puts it in the
+    /// decision-driven review queue.
+    #[test]
+    fn backfill_plan_records_review_escalation_and_enters_queue() {
+        use rocky_core::config::PolicyEffect;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models_dir = root.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        for (name, sql) in [
+            ("a", "SELECT id FROM source.raw.t"),
+            ("b", "SELECT id FROM a"),
+        ] {
+            std::fs::write(models_dir.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let state_path = root.join("state.redb");
+        let config_path = root.join("rocky.toml"); // absent — fine, degrades
+
+        run_backfill_in(
+            root,
+            &config_path,
+            &state_path,
+            &models_dir,
+            &["a".to_string()],
+            false,
+            None,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+
+        // The plan file landed under <root>/.rocky/plans.
+        let plans_dir = root.join(".rocky").join("plans");
+        let plan_id = std::fs::read_dir(&plans_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                name.strip_suffix(".json").map(str::to_string)
+            })
+            .next()
+            .expect("a backfill plan file must exist");
+
+        // Plan creation recorded exactly one plan-level escalation row.
+        let decisions = {
+            let store = StateStore::open_read_only(&state_path).unwrap();
+            store.list_policy_decisions().unwrap()
+        };
+        assert_eq!(decisions.len(), 1, "one plan-level row, not one per model");
+        let d = &decisions[0];
+        assert_eq!(d.plan_id, plan_id);
+        assert_eq!(d.effect, PolicyEffect::RequireReview);
+        assert_eq!(d.capability, PolicyCapability::Backfill);
+        assert_eq!(d.principal, PolicyPrincipal::Agent);
+        assert!(d.model.contains("2 model(s)"), "scope summary: {}", d.model);
+
+        // And the decision-driven review queue now lists the backfill.
+        let queue = crate::commands::review::compute_review_queue(
+            root,
+            &config_path,
+            &state_path,
+            &models_dir,
+        )
+        .unwrap();
+        assert_eq!(queue.total, 1);
+        assert_eq!(queue.pending[0].plan_id, plan_id);
+        assert_eq!(queue.excluded_non_plan_rows, 0);
+        assert_eq!(
+            queue.pending[0].approve_command,
+            format!("rocky review {plan_id} --approve")
+        );
     }
 
     /// The persisted `RunPlan` carries the closure, layers, partition window,

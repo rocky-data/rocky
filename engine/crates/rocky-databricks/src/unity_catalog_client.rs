@@ -685,8 +685,8 @@ impl CatalogClient for UnityCatalogClient {
         //   above); no row count, no byte total, no file count.
         // - `INFORMATION_SCHEMA.TABLES` on Databricks does not carry
         //   `row_count` or `table_size_bytes` columns (verified live
-        //   2026-05-20 against the dev_hcv2_uniform.information_schema
-        //   sandbox).
+        //   2026-05-20 against the live-verify sandbox catalog's
+        //   information_schema).
         // - The only working paths to stats are
         //   `DESCRIBE DETAIL <table>.sizeInBytes` (bytes, no ANALYZE
         //   prereq) and `DESCRIBE EXTENDED <table>` (parses the
@@ -1037,9 +1037,9 @@ mod tests {
 
     fn sample_table_ref() -> TableRef {
         TableRef {
-            catalog: Some("hcv2_cat".to_string()),
-            namespace: vec!["hcv2_sch".to_string()],
-            name: "hcv2_tbl".to_string(),
+            catalog: Some("cat_a".to_string()),
+            namespace: vec!["sch_a".to_string()],
+            name: "tbl_a".to_string(),
         }
     }
 
@@ -1066,7 +1066,7 @@ mod tests {
     fn unity_parts_accepts_three_level_shape() {
         let table = sample_table_ref();
         let r = unity_parts(&table).expect("ok");
-        assert_eq!(r, ("hcv2_cat", "hcv2_sch", "hcv2_tbl"));
+        assert_eq!(r, ("cat_a", "sch_a", "tbl_a"));
     }
 
     #[test]
@@ -1123,8 +1123,8 @@ mod tests {
     #[test]
     fn build_full_name_preserves_alphanumerics_and_underscores() {
         assert_eq!(
-            build_full_name("hcv2_cat", "hcv2_sch", "hcv2_orders_2026"),
-            "hcv2_cat.hcv2_sch.hcv2_orders_2026"
+            build_full_name("cat_a", "sch_a", "orders_a_2026"),
+            "cat_a.sch_a.orders_a_2026"
         );
     }
 
@@ -1289,17 +1289,17 @@ mod tests {
     fn create_table_body_serialises_managed_delta() {
         let schema = sample_schema();
         let body = CreateTableBody {
-            name: "hcv2_orders",
-            catalog_name: "hcv2_cat",
-            schema_name: "hcv2_sch",
+            name: "orders_a",
+            catalog_name: "cat_a",
+            schema_name: "sch_a",
             table_type: "MANAGED",
             data_source_format: "DELTA",
             columns: create_columns_from_schema(&schema),
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
-        assert_eq!(v["name"], "hcv2_orders");
-        assert_eq!(v["catalog_name"], "hcv2_cat");
-        assert_eq!(v["schema_name"], "hcv2_sch");
+        assert_eq!(v["name"], "orders_a");
+        assert_eq!(v["catalog_name"], "cat_a");
+        assert_eq!(v["schema_name"], "sch_a");
         assert_eq!(v["table_type"], "MANAGED");
         assert_eq!(v["data_source_format"], "DELTA");
         assert_eq!(v["columns"][0]["name"], "id");
@@ -1498,24 +1498,24 @@ mod tests {
     fn securable_full_name_renders_three_levels() {
         assert_eq!(
             securable_full_name(&Securable::Catalog {
-                name: "hcv2_cat".into()
+                name: "cat_a".into()
             }),
-            "hcv2_cat"
+            "cat_a"
         );
         assert_eq!(
             securable_full_name(&Securable::Schema {
-                catalog: "hcv2_cat".into(),
-                name: "hcv2_sch".into(),
+                catalog: "cat_a".into(),
+                name: "sch_a".into(),
             }),
-            "hcv2_cat.hcv2_sch"
+            "cat_a.sch_a"
         );
         assert_eq!(
             securable_full_name(&Securable::Table {
-                catalog: "hcv2_cat".into(),
-                schema: "hcv2_sch".into(),
-                name: "hcv2_orders".into(),
+                catalog: "cat_a".into(),
+                schema: "sch_a".into(),
+                name: "orders_a".into(),
             }),
-            "hcv2_cat.hcv2_sch.hcv2_orders"
+            "cat_a.sch_a.orders_a"
         );
     }
 
@@ -1588,7 +1588,7 @@ mod tests {
         client
             .apply_grants(
                 &Securable::Catalog {
-                    name: "hcv2_cat".into(),
+                    name: "cat_a".into(),
                 },
                 &[],
             )
@@ -1597,8 +1597,8 @@ mod tests {
         client
             .revoke_grants(
                 &Securable::Schema {
-                    catalog: "hcv2_cat".into(),
-                    name: "hcv2_sch".into(),
+                    catalog: "cat_a".into(),
+                    name: "sch_a".into(),
                 },
                 &[],
             )

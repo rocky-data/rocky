@@ -76,7 +76,7 @@ export GCP_PROJECT_ID="$PROJECT"
 # warehouse, not just that the rocky CLI exited 0.
 
 LOCATION="${BQ_LOCATION:-EU}"
-DATASET="hc_phase4_poc"
+DATASET="poc_step4_poc"
 
 drop_dataset() {
     bq --location="$LOCATION" --project_id="$GCP_PROJECT_ID" \
@@ -105,7 +105,7 @@ cp -R live/models "$STAGE/"
 find "$STAGE" -type f \( -name "*.toml" -o -name "*.sql" \) \
     -exec sed -i.bak \
         -e "s|__GCP_PROJECT__|${GCP_PROJECT_ID}|g" \
-        -e "s|hc_phase1_live|${DATASET}|g" \
+        -e "s|poc_step1_live|${DATASET}|g" \
         {} +
 find "$STAGE" -name "*.bak" -delete
 

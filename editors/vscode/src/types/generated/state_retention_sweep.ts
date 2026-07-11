@@ -57,7 +57,7 @@ export interface RetentionSweepOutput {
    */
   runs_kept: number;
   /**
-   * JSONL trace files removed by the last-N-by-mtime sweep. Always zero for the explicit `rocky state retention sweep` command — the trace sweep is only invoked from `rocky run`'s end-of-run auto-sweep (Arc 4 span retention).
+   * JSONL trace files removed by the last-N-by-mtime sweep. Always zero for the explicit `rocky state retention sweep` command — the trace sweep is only invoked from `rocky run`'s end-of-run auto-sweep.
    */
   traces_deleted: number;
   version: string;

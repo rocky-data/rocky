@@ -246,7 +246,7 @@ pub struct RunOutput {
     /// `execution.tables_failed`, which counts only execution-phase (copy /
     /// runtime) failures and excludes models excluded before execution.
     pub tables_failed: usize,
-    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub tables_skipped: usize,
     /// Tables that the discovery adapter reported as enabled but that do not
     /// exist in the source warehouse (e.g. Fivetran has them configured but
@@ -258,7 +258,7 @@ pub struct RunOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resumed_from: Option<String>,
     /// True when running in shadow mode (targets rewritten).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shadow: bool,
     pub materializations: Vec<MaterializationOutput>,
     /// Per-model build/skip/reuse decision + reason, surfaced for
@@ -279,11 +279,11 @@ pub struct RunOutput {
     /// Row-quarantine outcomes — one entry per table the quality
     /// pipeline quarantined. Empty for runs that did not use
     /// `[pipeline.x.checks.quarantine]`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quarantine: Vec<QuarantineOutput>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anomalies: Vec<AnomalyOutput>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<TableErrorOutput>,
     pub execution: ExecutionSummary,
     pub metrics: Option<MetricsSnapshot>,
@@ -292,7 +292,7 @@ pub struct RunOutput {
     /// Per-model partition execution summaries, present only when the run
     /// touched one or more `time_interval` models. Empty for runs that
     /// didn't execute any partitioned models.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partition_summaries: Vec<PartitionSummary>,
     /// `true` when the run was cancelled by a SIGINT (Ctrl-C). Surfaced so
     /// orchestrators can distinguish "user interrupted" from "run failed".
@@ -456,7 +456,7 @@ pub struct ExecutionSummary {
     /// not this `execution.tables_failed`.
     pub tables_failed: usize,
     /// Whether adaptive concurrency (AIMD throttle) was enabled for this run.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub adaptive_concurrency: bool,
     /// Final concurrency level at end of run (may differ from initial if
     /// adaptive concurrency adjusted it). Only present when adaptive
@@ -928,8 +928,8 @@ pub struct MaterializationOutput {
     /// Adapter-reported bytes-written figure, summed across all
     /// statements. Currently `None` on every adapter — BigQuery doesn't
     /// expose a bytes-written figure for query jobs, and the Databricks
-    /// / Snowflake paths haven't wired it yet. Reserved so future waves
-    /// can populate it without a schema break.
+    /// / Snowflake paths haven't wired it yet. Reserved so a future
+    /// release can populate it without a schema break.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
     /// Tenant this materialization is attributed to, taken from the
@@ -1309,7 +1309,7 @@ pub struct PartitionInfo {
     pub key: String,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub batched_with: Vec<String>,
 }
 
@@ -1327,7 +1327,7 @@ pub struct PartitionSummary {
     /// Partitions that were already `Computed` in the state store and
     /// skipped by the runtime (currently always 0; reserved for the
     /// `--missing` change-detection optimization).
-    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub partitions_skipped: usize,
 }
 
@@ -1357,11 +1357,11 @@ pub struct QuarantineOutput {
     /// Fully-qualified `catalog.schema.table` name of the `__valid`
     /// output table. Empty for `mode = "tag"` (source is rewritten in
     /// place).
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub valid_table: String,
     /// Fully-qualified name of the `__quarantine` output table. Empty
     /// for `mode = "drop"` (failing rows discarded) and `mode = "tag"`.
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub quarantine_table: String,
     /// Number of rows in the `__valid` output, when the adapter can
     /// report it.
@@ -1412,9 +1412,9 @@ pub struct DriftActionOutput {
 /// `apply_retention_policy`). Projects without any `[classification]`,
 /// `[mask]`, or `retention` config get empty lists — the fields
 /// `skip_serializing_if = Vec::is_empty`, so JSON consumers written
-/// against the pre-Wave A shape are byte-stable.
+/// against the earlier shape are byte-stable.
 ///
-/// ## Phase 2 additions (Cluster 3 B)
+/// ## Plan-persistence additions
 ///
 /// `plan_id`, `plan_kind`, `created_at`, `models`, and `execution_layers`
 /// are additive — all have `skip_serializing_if` so existing fixtures and
@@ -2393,11 +2393,11 @@ pub struct MetricsOutput {
     pub model: String,
     pub snapshots: Vec<MetricsSnapshotEntry>,
     pub count: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alerts: Vec<MetricsAlert>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub column: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_trend: Vec<ColumnTrendPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -2695,7 +2695,7 @@ pub struct ColumnLineageOutput {
     pub column: String,
     /// Direction of the trace walk: `"upstream"` (producers) or `"downstream"`
     /// (consumers). Defaults to upstream when `--column` is set without
-    /// direction flags, matching pre-Arc-1 behaviour.
+    /// direction flags, matching the historical default.
     pub direction: String,
     pub trace: Vec<LineageEdgeRecord>,
     /// Every downstream column that transitively consumes
@@ -2972,7 +2972,7 @@ pub struct RetentionSweepOutput {
     /// JSONL trace files removed by the last-N-by-mtime sweep. Always
     /// zero for the explicit `rocky state retention sweep` command —
     /// the trace sweep is only invoked from `rocky run`'s end-of-run
-    /// auto-sweep (Arc 4 span retention).
+    /// auto-sweep.
     pub traces_deleted: u64,
     /// Wall-clock duration of the sweep in milliseconds.
     pub duration_ms: u64,
@@ -4667,7 +4667,7 @@ impl RunOutput {
             // stub which returns `None`, so those adapters continue to
             // compute cost from `duration_ms` alone; wiring their native
             // stats (Databricks `result.manifest.total_byte_count`,
-            // Snowflake `statistics.queryLoad`) is a follow-up wave.
+            // Snowflake `statistics.queryLoad`) is a follow-up.
             let cost = rocky_core::cost::compute_observed_cost_usd(
                 wh,
                 mat.bytes_scanned,
@@ -6447,6 +6447,12 @@ pub struct ReviewQueueOutput {
     pub ranking: String,
     /// Count of pending escalations in the queue.
     pub total: u64,
+    /// Count of outstanding `require_review` ledger rows excluded from the
+    /// queue because their `plan_id` resolves to no persisted plan file —
+    /// decision-only custody rows (e.g. refused drafts, auto-apply
+    /// evaluations) that nothing could approve. They stay in the audit
+    /// ledger; they are just not approvable queue items.
+    pub excluded_non_plan_rows: u64,
     /// The pending escalations, highest-priority first.
     pub pending: Vec<ReviewQueueEntry>,
 }
@@ -6701,9 +6707,10 @@ pub enum AuditSubjectKind {
 ///
 /// Every link fails closed the same way the estate brief does: a link whose
 /// signal is genuinely not recorded renders [`SectionAvailability::Unavailable`]
-/// with a note, never a fabricated or assumed value. Notably, post-apply
-/// verification outcomes are not persisted anywhere today, so
-/// [`Self::verify_after`] is always `unavailable`; and the run ledger is not
+/// with a note, never a fabricated or assumed value. Post-apply verification
+/// outcomes are persisted as decision-ledger custody rows (non-empty
+/// `verify_after`), so [`Self::verify_after`] renders them when they exist and
+/// says "not recorded" when none exist for the subject. The run ledger is not
 /// keyed to policy decisions, so a `run` selector cannot join back to a
 /// decision. The blast radius is recomputed from the current compiled graph
 /// (a live query, not a stored snapshot).
@@ -6727,7 +6734,8 @@ pub struct AuditForOutput {
     pub plan: AuditChainPlan,
     /// Runs that materialized the subject.
     pub runs: AuditChainRuns,
-    /// What a post-apply verification found — not recorded today.
+    /// What a post-apply verification found — the verification custody rows
+    /// recorded against the subject's plan.
     pub verify_after: AuditChainVerify,
     /// What sits downstream of the subject — the CLL blast radius.
     pub blast_radius: AuditChainBlastRadius,
@@ -6808,14 +6816,45 @@ pub struct AuditRunEntry {
 
 /// Verify-after link of the custody chain.
 ///
-/// Post-apply verification outcomes are not persisted to the state store
-/// today, so this link is always [`SectionAvailability::Unavailable`] with a
-/// note — never a smoothed-over "verification passed".
+/// Post-apply verification outcomes are persisted to the decision ledger as
+/// custody rows with a non-empty `verify_after` check list — the two-step
+/// `rocky apply` gate writes one per verified apply, and the drift auto-apply
+/// path writes them under its `autoapply-verify:<run_id>` plan id. This link
+/// renders those rows for the subject's plan. When none exist the link says
+/// so plainly ("not recorded") — never a smoothed-over "verification passed".
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AuditChainVerify {
     pub availability: SectionAvailability,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Count of verification custody rows found for the subject.
+    pub total: u64,
+    /// The verification outcomes, newest first.
+    pub entries: Vec<AuditVerifyEntry>,
+}
+
+/// One post-apply verification outcome inside [`AuditChainVerify`] — a
+/// decision-ledger custody row with a non-empty `verify_after` check list.
+///
+/// The ledger records the required check names, the aggregate verdict
+/// (`allow` = every named check passed, `deny` = a check failed or was absent
+/// and the apply halted), and a human-readable reason; per-check pass/fail
+/// detail beyond that lives only in the reason string, which is rendered
+/// verbatim rather than re-parsed.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AuditVerifyEntry {
+    /// RFC 3339 timestamp when the verification outcome was recorded.
+    pub timestamp: String,
+    /// The plan id the custody row was filed under (the applied plan, or the
+    /// auto-apply path's `autoapply-verify:<run_id>`).
+    pub plan_id: String,
+    /// The named post-apply checks the verification required.
+    pub checks: Vec<String>,
+    /// Whether the verification passed (`allow` custody row) or failed
+    /// (`deny`).
+    pub passed: bool,
+    /// The recorded outcome, verbatim from the custody row.
+    pub reason: String,
 }
 
 /// Blast-radius link of the custody chain: the models that transitively
@@ -6865,14 +6904,16 @@ pub enum ScorecardDimension {
 /// autonomy, and it informs human judgment only — nothing here is wired to any
 /// automatic policy change.
 ///
-/// Only metrics the ledger actually persists are computed. The ledger records
-/// one row per policy *evaluation* — `(principal, capability, model, effect,
-/// rule_id)` — and nothing about what happened *after* the decision. So
-/// verify-after outcomes, reverts, and escalation-resolution latency are not
-/// derivable; they are declared, once, in [`Self::unavailable_metrics`] as
-/// `unavailable` with the reason, never faked into a number. A ledger read
-/// failure renders the whole scorecard `unavailable` rather than a
-/// smoothed-over zero.
+/// Only metrics the ledger actually persists are computed. Post-apply
+/// verification outcomes *are* persisted (custody rows with a non-empty
+/// `verify_after` check list), so [`Self::verify_after`] reports their pass
+/// rate when any fall in the window. Reverts and escalation-resolution
+/// latency are not persisted; they are declared in
+/// [`Self::unavailable_metrics`] as `unavailable` with the reason, never
+/// faked into a number — and `verify_after_pass_rate` joins that list only
+/// when no verification row falls in the window. A ledger read failure
+/// renders the whole scorecard `unavailable` rather than a smoothed-over
+/// zero.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AuditScorecardOutput {
     pub version: String,
@@ -6894,9 +6935,34 @@ pub struct AuditScorecardOutput {
     pub total_decisions: u64,
     /// One row per group, ranked by decision count descending.
     pub groups: Vec<ScorecardGroup>,
-    /// Metrics the ledger does not persist, declared plainly rather than
-    /// computed. Each is `unavailable` with the reason it cannot be derived.
+    /// Aggregate of the post-apply verification custody rows in the window
+    /// (rows with a non-empty `verify_after` check list). `null` when no
+    /// verification row falls in the window — then `verify_after_pass_rate`
+    /// is declared in [`Self::unavailable_metrics`] instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_after: Option<ScorecardVerifyAfter>,
+    /// Metrics the persisted ledger cannot support for this window, declared
+    /// plainly rather than computed. Each is `unavailable` with the reason it
+    /// cannot be derived.
     pub unavailable_metrics: Vec<ScorecardUnavailableMetric>,
+}
+
+/// The verify-after aggregate inside an [`AuditScorecardOutput`]: pass/fail
+/// counts over the post-apply verification custody rows in the window.
+///
+/// Each row's aggregate verdict is its recorded `effect` (`allow` = every
+/// named check passed, `deny` = a check failed or was absent and the apply
+/// halted), so the pass rate summarizes exactly what the ledger persists.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ScorecardVerifyAfter {
+    /// Verification custody rows in the window.
+    pub total: u64,
+    /// Rows whose verdict was `allow` (every named check passed).
+    pub passed: u64,
+    /// Rows whose verdict was `deny` (a named check failed or was absent).
+    pub failed: u64,
+    /// `passed / total`.
+    pub pass_rate: f64,
 }
 
 /// One group's decision aggregate in an [`AuditScorecardOutput`].
@@ -6929,16 +6995,17 @@ pub struct ScorecardGroup {
     pub decision_refs: Vec<String>,
 }
 
-/// A metric the scorecard cannot compute because the ledger does not persist
-/// its inputs.
+/// A metric the scorecard cannot compute from the persisted ledger for this
+/// window.
 ///
 /// Declared explicitly (not silently omitted) so the honesty is
 /// machine-readable: a consumer sees the metric name, that it is `unavailable`,
 /// and exactly why.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ScorecardUnavailableMetric {
-    /// The metric identifier (`verify_after_pass_rate`, `reverts`,
-    /// `escalation_latency`).
+    /// The metric identifier (`reverts`, `escalation_latency`, or
+    /// `verify_after_pass_rate` when no verification row falls in the
+    /// window).
     pub metric: String,
     /// Always [`SectionAvailability::Unavailable`].
     pub availability: SectionAvailability,
@@ -7296,8 +7363,9 @@ pub struct BriefBudgetStatus {
 ///
 /// Inspection-only surface over the state store's [`RunRecord`]: shows every
 /// model that ran, with the SQL hash, row counts, bytes, and timings
-/// captured at the time. Re-execution (with pinned inputs + content-addressed
-/// writes) is deferred to a follow-up when the Arc-1 storage path arrives.
+/// captured at the time. Re-execution is the separate `rocky replay
+/// --execute` surface ([`ReplayExecuteOutput`]), which re-runs recorded
+/// models on an ephemeral engine and byte-compares to the recording.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ReplayOutput {
     pub version: String,
@@ -7643,13 +7711,14 @@ pub struct GcRebuildCostOutput {
 pub struct GcPlanEviction {
     /// Model that produced the artifact.
     pub model_name: String,
-    /// Run that produced it — half of the provenance key restore replays from.
+    /// Run that produced it — half of the provenance key a restore would
+    /// replay from.
     pub run_id: String,
     /// Content hash (hex) of the artifact bytes — the eviction unit and the
-    /// identity a restore re-computes and compares against.
+    /// identity a restore would re-compute and compare against.
     pub blake3_hash: String,
     /// Object-store path of the artifact — the byte location a physical
-    /// reclamation deletes and a restore re-materializes to.
+    /// reclamation deletes and a restore would re-materialize to.
     pub file_path: String,
     /// Physical size of the artifact in bytes.
     pub size_bytes: u64,
@@ -7712,7 +7781,9 @@ pub struct GcPlanOutput {
     pub total_bytes: u64,
     /// Always `true`: a `gc` plan is unconditionally review-gated before apply.
     pub review_required: bool,
-    /// Operator caveats (re-verification at apply, restore safety net, scope).
+    /// Operator caveats (e.g. re-verification at apply, scope). Each eviction
+    /// records what a restore will need; `rocky restore` itself is a planned
+    /// follow-up.
     pub notes: Vec<String>,
     /// The proposed evictions.
     pub evictions: Vec<GcPlanEviction>,
@@ -7731,7 +7802,8 @@ pub struct GcEvictedOutput {
     pub tombstone_recorded: bool,
     /// `true` when the bytes were physically deleted through the object-store
     /// adapter; `false` when the physical delete was deferred or failed (a safe
-    /// leaked orphan — the tombstone stands and restore still works).
+    /// leaked orphan — the tombstone still records everything a restore will
+    /// need; `rocky restore` itself is a planned follow-up).
     pub physical_reclaimed: bool,
     /// Human-readable physical-reclamation outcome (`deleted`, `deferred: …`,
     /// or `failed: …`).
@@ -7780,7 +7852,9 @@ pub struct GcApplyOutput {
     pub evicted_count: usize,
     /// Count of refused artifacts.
     pub refused_count: usize,
-    /// Operator caveats (physical-reclamation reachability, restore held).
+    /// Operator caveats (e.g. physical-reclamation reachability). Each
+    /// eviction's tombstone records what a restore will need; `rocky restore`
+    /// itself is a planned follow-up.
     pub notes: Vec<String>,
 }
 
@@ -7876,7 +7950,7 @@ pub struct TraceModelEntry {
 /// persisted, this command can return a real cost figure for BigQuery
 /// runs even though the live `rocky run` path currently reports
 /// `cost_usd: None` for BQ (adapter bytes-scanned plumbing is a
-/// follow-up wave).
+/// follow-up).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CostOutput {
     pub version: String,
@@ -8002,12 +8076,12 @@ pub struct PerModelCostHistorical {
 }
 
 // ---------------------------------------------------------------------------
-// `rocky compliance` — governance compliance rollup (Wave B)
+// `rocky compliance` — governance compliance rollup
 // ---------------------------------------------------------------------------
 
 /// JSON output for `rocky compliance`.
 ///
-/// A thin rollup over Wave A governance: classification sidecars
+/// A thin rollup over the project's governance config: classification sidecars
 /// (`[classification]` per model) + project-level `[mask]` / `[mask.<env>]`
 /// policy. Answers the question **"are all classified columns masked
 /// wherever policy says they should be?"** without making any warehouse
@@ -8115,13 +8189,13 @@ pub struct ComplianceException {
 }
 
 // ---------------------------------------------------------------------------
-// Retention status (Wave C-2)
+// Retention status
 // ---------------------------------------------------------------------------
 
 /// JSON output for `rocky retention-status`.
 ///
 /// Reports which models declare a `retention = "<N>[dy]"` sidecar value and
-/// — when `--drift` is set in a future wave — whether the warehouse's
+/// — when `--drift` is set in a future release — whether the warehouse's
 /// current retention matches. Today `warehouse_days` is always `None`
 /// because the probe is deferred to v2; the schema is stable so v2 can
 /// populate the field without a JSON shape break.
@@ -8163,7 +8237,7 @@ impl RetentionStatusOutput {
 }
 
 // ---------------------------------------------------------------------------
-// `rocky preview` — PR preview workflow (Arc 1 ∩ Arc 2 user-facing surface)
+// `rocky preview` — PR preview workflow
 //
 // Three subcommands compose into a single PR comment:
 //   * `preview create` — pruned re-run on a per-PR branch with copy-from-base
@@ -8259,7 +8333,7 @@ pub struct PreviewPrunedModel {
     pub reason: String,
     /// Columns the diff reports as changed on this model. Only
     /// populated when `reason = "changed"`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_columns: Vec<String>,
 }
 
@@ -8376,7 +8450,7 @@ pub struct PreviewBisectionRowDiff {
     /// surfaced from the leaves. Bisection samples only carry the
     /// primary key — column-level diffs are not retained on the
     /// kernel's leaf record. Empty when no rows differ.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<PreviewRowSample>,
 }
 
@@ -8437,13 +8511,13 @@ impl BisectionStatsOutput {
 /// `rocky ci-diff` at the column granularity.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PreviewStructuralDiff {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub added_columns: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_columns: Vec<String>,
     /// One entry per column whose type changed. Each carries `name`,
     /// `from`, `to`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_changes: Vec<PreviewColumnTypeChange>,
 }
 
@@ -8463,7 +8537,7 @@ pub struct PreviewSampledRowDiff {
     pub rows_changed: u64,
     /// Up to `--max-samples` (default 5) representative changed rows
     /// for human review. Pure noise when sampling found no change.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<PreviewRowSample>,
 }
 

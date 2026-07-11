@@ -34,7 +34,7 @@ class ReplayOutput(BaseModel):
     """
     JSON output for `rocky replay <run_id|latest>`.
 
-    Inspection-only surface over the state store's [`RunRecord`]: shows every model that ran, with the SQL hash, row counts, bytes, and timings captured at the time. Re-execution (with pinned inputs + content-addressed writes) is deferred to a follow-up when the Arc-1 storage path arrives.
+    Inspection-only surface over the state store's [`RunRecord`]: shows every model that ran, with the SQL hash, row counts, bytes, and timings captured at the time. Re-execution is the separate `rocky replay --execute` surface ([`ReplayExecuteOutput`]), which re-runs recorded models on an ephemeral engine and byte-compares to the recording.
     """
 
     command: str

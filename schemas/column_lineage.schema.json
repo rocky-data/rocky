@@ -46,7 +46,7 @@
       "type": "string"
     },
     "direction": {
-      "description": "Direction of the trace walk: `\"upstream\"` (producers) or `\"downstream\"` (consumers). Defaults to upstream when `--column` is set without direction flags, matching pre-Arc-1 behaviour.",
+      "description": "Direction of the trace walk: `\"upstream\"` (producers) or `\"downstream\"` (consumers). Defaults to upstream when `--column` is set without direction flags, matching the historical default.",
       "type": "string"
     },
     "downstream_consumers": {

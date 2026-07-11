@@ -36,9 +36,9 @@ class MetricsOutput(BaseModel):
     All optional fields are present-or-absent depending on the flags (`--trend`, `--alerts`, `--column`). The empty case (no snapshots available) sets `message` and leaves the collections empty.
     """
 
-    alerts: list[MetricsAlert]
+    alerts: list[MetricsAlert] | None = None
     column: str | None = None
-    column_trend: list[ColumnTrendPoint]
+    column_trend: list[ColumnTrendPoint] | None = None
     command: str
     count: conint(ge=0)
     message: str | None = None

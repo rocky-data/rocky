@@ -29,7 +29,7 @@ from typing import Annotated, Any, Literal
 import dagster as dg
 from pydantic import BaseModel, ConfigDict
 from rocky_sdk import RockyClient
-from rocky_sdk.client import DEFAULT_TIMEOUT_SECONDS, MIN_ROCKY_VERSION
+from rocky_sdk.client import DEFAULT_TIMEOUT_SECONDS, MIN_ROCKY_VERSION, ApplyResult
 from rocky_sdk.exceptions import (
     RockyBinaryNotFoundError,
     RockyCommandError,
@@ -46,7 +46,6 @@ from .types import (
     AiResult,
     AiSyncResult,
     AiTestResult,
-    ApplyOutput,
     ApproveOutput,
     BranchPromoteOutput,
     CatalogOutput,
@@ -814,8 +813,14 @@ class RockyResource(dg.ConfigurableResource):
         with _translating():
             return self._get_client().plan(filter, pipeline=pipeline, env=env)
 
-    def apply(self, plan_id: str) -> ApplyOutput:
-        """Run ``rocky apply <plan-id>`` and return the parsed envelope."""
+    def apply(self, plan_id: str) -> ApplyResult:
+        """Run ``rocky apply <plan-id>`` and return the parsed result.
+
+        ``rocky apply`` prints the plan-kind's own output (no wrapping
+        envelope), so the return type is the :data:`~rocky_sdk.client.ApplyResult`
+        union: run-shaped plans yield a :class:`RunResult`, a ``gc`` plan a
+        ``GcApplyOutput``, compact / archive / promote plans their own outputs.
+        """
         with _translating():
             return self._get_client().apply(plan_id)
 

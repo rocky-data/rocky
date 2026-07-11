@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Arc 4 — render a completed run as a timeline
+# 07-run-trace-gantt — render a completed run as a timeline
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,7 +15,7 @@ echo "==> 2. Run two pipeline stages concurrently"
 rocky -c rocky.toml -o json run --filter source=orders > expected/run_orders.json
 rocky -c rocky.toml -o json run --filter source=customers > expected/run_customers.json
 
-echo "==> 3. Inspect 'rocky trace latest' — the Gantt read path (Arc 1 wave 2 ships the write path)"
+echo "==> 3. 'rocky trace latest' — render the persisted run record as a Gantt timeline"
 rocky trace latest > expected/trace_latest.json 2>&1 || true
 
 echo "==> 4. Inspect 'rocky replay latest' — same state store, different view"

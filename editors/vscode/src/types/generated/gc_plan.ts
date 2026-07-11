@@ -21,7 +21,7 @@ export interface GcPlanOutput {
    */
   evictions: GcPlanEviction[];
   /**
-   * Operator caveats (re-verification at apply, restore safety net, scope).
+   * Operator caveats (e.g. re-verification at apply, scope). Each eviction records what a restore will need; `rocky restore` itself is a planned follow-up.
    */
   notes: string[];
   /**
@@ -46,7 +46,7 @@ export interface GcPlanOutput {
  */
 export interface GcPlanEviction {
   /**
-   * Content hash (hex) of the artifact bytes — the eviction unit and the identity a restore re-computes and compares against.
+   * Content hash (hex) of the artifact bytes — the eviction unit and the identity a restore would re-compute and compare against.
    */
   blake3_hash: string;
   /**
@@ -58,7 +58,7 @@ export interface GcPlanEviction {
    */
   env_hash?: string | null;
   /**
-   * Object-store path of the artifact — the byte location a physical reclamation deletes and a restore re-materializes to.
+   * Object-store path of the artifact — the byte location a physical reclamation deletes and a restore would re-materialize to.
    */
   file_path: string;
   /**
@@ -82,7 +82,7 @@ export interface GcPlanEviction {
    */
   recipe_hash?: string | null;
   /**
-   * Run that produced it — half of the provenance key restore replays from.
+   * Run that produced it — half of the provenance key a restore would replay from.
    */
   run_id: string;
   /**

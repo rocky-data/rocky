@@ -23,7 +23,7 @@ cd "$HERE"
 mkdir -p expected
 
 LOCATION="${BQ_LOCATION:-EU}"
-DATASET="hc_phase1_live_ti"
+DATASET="poc_step1_live_ti"
 
 drop_dataset() {
     bq --location="$LOCATION" --project_id="$GCP_PROJECT_ID" \

@@ -28,6 +28,9 @@ rocky-ai = { path = "../rocky-ai" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# draft_check's structural spec gate: the `[[tests]]` spec is parsed as TOML
+# and any top-level key other than `tests` is rejected before the write.
+toml = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
