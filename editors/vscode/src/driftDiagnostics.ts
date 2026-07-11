@@ -1,6 +1,7 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import { runRockyJson, RockyCliError } from "./rockyCli";
+import { getLspState, onDidChangeLspState } from "./lspClient";
 import { getOutputChannel } from "./output";
 import type { CompileOutput, Diagnostic, Severity } from "./types/generated/compile";
 import { hasRockyProject, onDidChangeRockyProject } from "./views/getStartedView";
@@ -160,7 +161,14 @@ async function refreshDiagnostics(
 /**
  * Register the drift diagnostics provider and code-action quick fixes.
  *
- * Diagnostics are refreshed:
+ * This provider is a **CLI fallback**: the `rocky lsp` server publishes the
+ * same compile diagnostics (same `source: "rocky"`) for `.rocky` and model
+ * `.sql` files while it is running, so compiling here too would duplicate
+ * every squiggle in the Problems panel and double the status-bar error
+ * count. The CLI path only activates when the language server is stopped
+ * or failed.
+ *
+ * In fallback mode, diagnostics are refreshed:
  * - When a model file is opened
  * - When a model file is saved (debounced to avoid rapid-fire compiles)
  *
@@ -209,12 +217,31 @@ export function registerDriftDiagnostics(
   }
 
   /**
-   * The CLI can only run when both the user has diagnostics enabled and a
-   * Rocky project is present in the workspace — otherwise `rocky compile`
-   * just fails with "no rocky.toml found".
+   * The language server publishes the same compile diagnostics while it is
+   * alive (including during startup, which resolves within moments) — the
+   * CLI fallback only takes over on `Stopped` / `Failed`.
+   */
+  function lspOwnsDiagnostics(): boolean {
+    const status = getLspState().status;
+    return status !== "Stopped" && status !== "Failed";
+  }
+
+  /**
+   * The CLI can only run when the user has diagnostics enabled, a Rocky
+   * project is present in the workspace (otherwise `rocky compile` just
+   * fails with "no rocky.toml found"), and the language server isn't
+   * already publishing the same diagnostics.
    */
   function shouldRunCli(): boolean {
-    return isDiagnosticsEnabled() && hasRockyProject();
+    return (
+      isDiagnosticsEnabled() && hasRockyProject() && !lspOwnsDiagnostics()
+    );
+  }
+
+  /** Cancel every pending debounce timer. */
+  function clearPendingTimers(): void {
+    for (const timer of pendingTimers.values()) clearTimeout(timer);
+    pendingTimers.clear();
   }
 
   /** Schedule a debounced diagnostic refresh (500ms). */
@@ -283,20 +310,44 @@ export function registerDriftDiagnostics(
     }),
   );
 
+  /**
+   * Schedule a refresh for every open model document. Routed through the
+   * per-URI debounce so a session restore with many model tabs coalesces
+   * with any in-flight open/save timers instead of spawning one
+   * `rocky compile --model` per document immediately.
+   */
+  function sweepOpenModelDocuments(): void {
+    for (const document of vscode.workspace.textDocuments) {
+      if (!modelNameFromFile(document.fileName)) continue;
+      scheduleRefresh(document);
+    }
+  }
+
   // When the workspace gains or loses a rocky.toml, re-sweep open documents
   // (gain) or clear stale diagnostics (loss).
   context.subscriptions.push(
     onDidChangeRockyProject((has) => {
       if (!has) {
         collection.clear();
-        for (const timer of pendingTimers.values()) clearTimeout(timer);
-        pendingTimers.clear();
+        clearPendingTimers();
         return;
       }
-      if (!isDiagnosticsEnabled()) return;
-      for (const document of vscode.workspace.textDocuments) {
-        void refreshDiagnostics(document, collection);
+      sweepOpenModelDocuments();
+    }),
+  );
+
+  // Hand ownership back and forth with the language server: when it comes
+  // (back) up, drop the CLI fallback's diagnostics so the LSP's copies are
+  // the only ones on each file; when it dies, sweep so the fallback fills
+  // the gap.
+  context.subscriptions.push(
+    onDidChangeLspState(() => {
+      if (lspOwnsDiagnostics()) {
+        collection.clear();
+        clearPendingTimers();
+        return;
       }
+      sweepOpenModelDocuments();
     }),
   );
 
@@ -305,8 +356,6 @@ export function registerDriftDiagnostics(
   // asynchronously after activation; the onDidChangeRockyProject listener
   // above catches that transition.
   if (shouldRunCli()) {
-    for (const document of vscode.workspace.textDocuments) {
-      void refreshDiagnostics(document, collection);
-    }
+    sweepOpenModelDocuments();
   }
 }
