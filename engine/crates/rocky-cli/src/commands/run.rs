@@ -12216,6 +12216,142 @@ merge_keys = ["id"]
         );
     }
 
+    /// 🔴 #4 KILL-CHECK (real DuckDB): on a model-SCOPED apply (`--model a`), a
+    /// change to a mask used ONLY by an unselected model (`b`) must NOT refuse —
+    /// masking is not reconciled on the scoped path, so binding `b`'s mask would
+    /// be a spurious refusal. Fails on producer revert (binding masks on scoped
+    /// paths): the gate would then fold `b`'s mask and the fingerprint would
+    /// mismatch the reviewed (mask-omitted) value.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn model_scoped_apply_omits_unselected_mask() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_ir::MaskStrategy;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        // `a` classifies `id` as pii; `b` classifies `x` as confidential.
+        std::fs::write(models.join("a.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("a.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"a\"\n\n[classification]\nid = \"pii\"\n",
+        )
+        .unwrap();
+        std::fs::write(models.join("b.sql"), "SELECT 2 AS x\n").unwrap();
+        std::fs::write(
+            models.join("b.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"b\"\n\n[classification]\nx = \"confidential\"\n",
+        )
+        .unwrap();
+        let db = dir.path().join("wh.duckdb");
+
+        // A scoped apply omits the mask, so the reviewed fingerprint is computed
+        // with an EMPTY mask (over all compiled models).
+        let empty_mask = std::collections::BTreeMap::new();
+        let fp = exec_choke_fingerprint(&models, "cfg", "", &empty_mask);
+
+        // The gate still carries `b`'s (and `a`'s) resolved mask — but the scoped
+        // choke-point must ignore it. A confidential→redact change on `b` must not
+        // move the recomputed fingerprint for a `--model a` apply.
+        let with_b_mask = std::collections::BTreeMap::from([
+            ("pii".to_string(), MaskStrategy::Hash),
+            ("confidential".to_string(), MaskStrategy::Redact),
+        ]);
+        let gate = crate::commands::apply::ExecFingerprintGate {
+            expected: Some(fp),
+            config_identity: "cfg".to_string(),
+            governance_identity: String::new(),
+            resolved_mask: with_b_mask,
+            reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
+            plan_id: "p".to_string(),
+            require: true,
+        };
+        let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::execute_models(
+            &models,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &PartitionRunOptions::default(),
+            "scoped-run",
+            Some("a"), // model_name_filter → scoped path
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            true,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            true,
+            Some(&gate),
+        )
+        .await
+        .expect(
+            "KILL-CHECK: a `--model a` apply must NOT refuse on an unselected model's mask (#4)",
+        );
+        assert_eq!(output.tables_failed, 0, "errors: {:?}", output.errors);
+    }
+
+    /// 🔴 #2 KILL-CHECK: a REQUIRED (v2 governed) plan whose reviewed source-schema
+    /// snapshot is `None` REFUSES — apply must never fall through to the live
+    /// (agent-swappable) cache. Fails on producer revert (falling back to cache):
+    /// the run would type from the live cache and execute.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn required_plan_without_snapshot_refuses() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        write_model_with_target(&models, "orders", "SELECT 1 AS id", "main", "orders");
+        let db = dir.path().join("wh.duckdb");
+        let gate = crate::commands::apply::ExecFingerprintGate {
+            expected: None,
+            config_identity: "cfg".to_string(),
+            governance_identity: String::new(),
+            resolved_mask: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None, // v2 governed plan MUST carry Some
+            plan_id: "p".to_string(),
+            require: true,
+        };
+        let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        let err = super::execute_models(
+            &models,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &PartitionRunOptions::default(),
+            "no-snapshot",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            true,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            true,
+            Some(&gate),
+        )
+        .await
+        .expect_err("KILL-CHECK: a required plan with no reviewed snapshot must REFUSE (#2)");
+        assert!(
+            err.to_string().contains("no reviewed"),
+            "must refuse for the missing snapshot, got: {err}"
+        );
+    }
+
     /// 🔴 KILL-CHECK (unchanged plan→apply does NOT refuse, with the new
     /// inputs): the REAL plan-side `compute_embedded_capabilities` must produce
     /// the SAME fingerprint the apply-side choke-point recomputes, for a project

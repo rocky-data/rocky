@@ -1242,8 +1242,7 @@ pub struct ExecFingerprintGate {
     /// replay the reviewed schema. `None` on a genuinely-legacy plan; a required
     /// (v2 governed) plan with `None` REFUSES. Carried here because
     /// `execute_models` has no plan handle.
-    pub reviewed_source_schemas:
-        Option<BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
+    pub reviewed_source_schemas: Option<BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
     /// The plan id, for the refusal message.
     pub plan_id: String,
     /// `true` when the plan is a NEW (`fingerprint_version >= 1`) governed plan

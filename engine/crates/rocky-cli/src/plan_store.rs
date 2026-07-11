@@ -256,8 +256,7 @@ pub struct EmbeddedCapabilities {
     /// no snapshot; a version-2 governed plan whose snapshot is `None` is a
     /// production capture failure and the governed apply REFUSES (fail-closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reviewed_source_schemas:
-        Option<BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
+    pub reviewed_source_schemas: Option<BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
 }
 
 /// The fingerprint feature version this binary stamps onto every plan it writes.
