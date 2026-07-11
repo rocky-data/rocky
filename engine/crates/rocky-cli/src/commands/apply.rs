@@ -4077,6 +4077,48 @@ auto_create_schemas = true
         Ok(())
     }
 
+    /// 🔴 #2 (snapshot preflight): a MODEL-EXECUTING governed plan must carry the
+    /// v2 reviewed source-schema snapshot BEFORE any mutation. A NEW
+    /// (`require_fingerprint`, i.e. version >= 1) plan with `None` snapshot — a v1
+    /// plan or a v2 capture failure — is REFUSED (re-plan at v2); a `Some`
+    /// (authoritative even empty) plan proceeds; a genuinely-legacy (v0) plan and
+    /// a human apply are exempt.
+    #[test]
+    fn preflight_snapshot_semantics() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("rocky.toml");
+        let mk = |require: bool,
+                  snapshot: Option<
+            std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
+        >| super::GovernedRunContext {
+            principal: PolicyPrincipal::Agent,
+            plan_id: "p",
+            root: dir.path(),
+            config_path: &config_path,
+            expected_ir_fingerprint: None,
+            expected_config_identity: None,
+            require_fingerprint: require,
+            reviewed_source_schemas: snapshot,
+        };
+        // v1 / v2-capture-failure (require, None) → REFUSE.
+        let v1 = mk(true, None);
+        let err = super::preflight_snapshot(Some(&v1), "p")
+            .expect_err("a required plan with no snapshot must refuse (#2)");
+        assert!(
+            err.to_string()
+                .contains("no reviewed source-schema snapshot"),
+            "{err}"
+        );
+        // v2 (require, Some authoritative even empty) → OK.
+        let v2 = mk(true, Some(std::collections::BTreeMap::new()));
+        super::preflight_snapshot(Some(&v2), "p").expect("a v2 plan with a snapshot proceeds");
+        // Genuinely-legacy v0 (not required) → exempt.
+        super::preflight_snapshot(Some(&mk(false, None)), "p").expect("a legacy v0 plan is exempt");
+        // Human apply (no governed context) → exempt.
+        super::preflight_snapshot(None, "p").expect("a human apply is exempt");
+        Ok(())
+    }
+
     /// 🔴 D regression: the discovered replication target set is gated. An
     /// agent replication under `deny agent apply { any }` must be refused before
     /// any table materializes. Pre-fix the replication set was never
