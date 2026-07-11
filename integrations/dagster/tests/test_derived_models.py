@@ -521,3 +521,223 @@ def test_component_skips_derived_models_when_flag_disabled(tmp_path):
     assert dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"]) in all_keys
     # Derived-model asset is NOT present
     assert dg.AssetKey(["warehouse", "marts", "fct_orders"]) not in all_keys
+
+
+# ---------------------------------------------------------------------------
+# Failure containment — a contained model must fail the derived-model op
+# loudly with the blast-radius reason, not with the generic unyielded-output
+# error.
+# ---------------------------------------------------------------------------
+
+
+def _derived_run_result(
+    *,
+    materializations: list[dict] | None = None,
+    errors: list[dict] | None = None,
+    contained: list[dict] | None = None,
+):
+    from dagster_rocky.types import RunResult
+
+    mats = materializations or []
+    errs = errors or []
+    return RunResult.model_validate(
+        {
+            "version": "0.3.0",
+            "command": "run",
+            "filter": "client=acme",
+            "duration_ms": 100,
+            "tables_copied": len(mats),
+            "tables_failed": len(errs),
+            "materializations": mats,
+            "check_results": [],
+            "errors": errs,
+            "contained": contained or [],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+
+
+def test_emit_derived_model_results_raises_for_contained_model():
+    """Unit-level: a contained model in the group raises ``dg.Failure`` naming
+    the model, its blocked_by upstream and the unblock hint — after yielding
+    the sibling's real materialization. A contained model OUTSIDE the group is
+    ignored (the failure belongs to the op that ran it)."""
+    import pytest
+
+    from dagster_rocky.component import _emit_derived_model_results
+
+    dim_a = dg.AssetKey(["warehouse", "marts", "dim_a"])
+    dim_b = dg.AssetKey(["warehouse", "marts", "dim_b"])
+    key_by_model_name = {"dim_a": dim_a, "dim_b": dim_b}
+    result = _derived_run_result(
+        materializations=[
+            {
+                "asset_key": ["warehouse", "marts", "dim_a"],
+                "rows_copied": 10,
+                "duration_ms": 5,
+                "metadata": {"strategy": "full_refresh"},
+            }
+        ],
+        errors=[{"asset_key": ["stg_orders"], "error": "boom", "failure_kind": "query-rejected"}],
+        contained=[
+            {
+                "model": "dim_b",
+                "blocked_by": ["stg_orders"],
+                "unblock_hint": "fix stg_orders, then re-run",
+            }
+        ],
+    )
+
+    events = []
+    with pytest.raises(dg.Failure) as exc_info:
+        for event in _emit_derived_model_results(
+            result=result,
+            selected_keys={dim_a, dim_b},
+            key_by_model_name=key_by_model_name,
+        ):
+            events.append(event)
+
+    # The sibling's real materialization was yielded BEFORE the raise, so
+    # partial progress is preserved in the asset graph.
+    assert [e.asset_key for e in events] == [dim_a]
+
+    failure = exc_info.value
+    assert "dim_b" in failure.description
+    assert "stg_orders" in failure.description
+    assert "fix stg_orders, then re-run" in failure.description
+    assert failure.metadata["rocky/contained"].value is True
+    assert failure.metadata["rocky/blocked_by"].value == "stg_orders"
+
+    # A contained model that is NOT one of this group's models does not raise.
+    other = _derived_run_result(
+        contained=[{"model": "some_other_model", "blocked_by": ["root"], "unblock_hint": ""}]
+    )
+    assert (
+        list(
+            _emit_derived_model_results(
+                result=other,
+                selected_keys={dim_a, dim_b},
+                key_by_model_name=key_by_model_name,
+            )
+        )
+        == []
+    )
+
+
+def test_derived_model_contained_fails_op_with_blast_radius_reason(tmp_path):
+    """End-to-end through the real derived-model multi_asset: when the engine
+    contains a model, the op FAILS with the blocked_by / unblock_hint reason
+    (not the generic "did not yield expected outputs"), while the sibling
+    model's materialization is still recorded."""
+    import json
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from dagster_rocky.component import RockyComponent
+    from dagster_rocky.resource import RockyResource
+
+    state_file = Path(tmp_path) / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "discover": {
+                    "version": "0.1.0",
+                    "command": "discover",
+                    "sources": [
+                        {
+                            "id": "src_001",
+                            "components": {"client": "acme", "source": "shopify"},
+                            "source_type": "fivetran",
+                            "tables": [{"name": "orders"}],
+                        }
+                    ],
+                },
+                "compile": {
+                    "version": "0.1.0",
+                    "command": "compile",
+                    "models": 2,
+                    "execution_layers": 1,
+                    "diagnostics": [],
+                    "has_errors": False,
+                    "models_detail": [
+                        {
+                            "name": "dim_a",
+                            "strategy": {"type": "full_refresh"},
+                            "target": {
+                                "catalog": "warehouse",
+                                "schema": "marts",
+                                "table": "dim_a",
+                            },
+                            "freshness": None,
+                        },
+                        {
+                            "name": "dim_b",
+                            "strategy": {"type": "full_refresh"},
+                            "target": {
+                                "catalog": "warehouse",
+                                "schema": "marts",
+                                "table": "dim_b",
+                            },
+                            "freshness": None,
+                        },
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    component = RockyComponent(config_path="rocky.toml", surface_derived_models=True)
+    defs = component.build_defs_from_state(context=None, state_path=state_file)
+    asset_defs = [a for a in (defs.assets or []) if isinstance(a, dg.AssetsDefinition)]
+
+    dim_a = dg.AssetKey(["warehouse", "marts", "dim_a"])
+    dim_b = dg.AssetKey(["warehouse", "marts", "dim_b"])
+
+    run_result = _derived_run_result(
+        materializations=[
+            {
+                "asset_key": ["warehouse", "marts", "dim_a"],
+                "rows_copied": 10,
+                "duration_ms": 5,
+                "metadata": {"strategy": "full_refresh"},
+            }
+        ],
+        errors=[{"asset_key": ["stg_orders"], "error": "boom", "failure_kind": "query-rejected"}],
+        contained=[
+            {
+                "model": "dim_b",
+                "blocked_by": ["stg_orders"],
+                "unblock_hint": "fix stg_orders, then re-run",
+            }
+        ],
+    )
+
+    with patch.object(RockyResource, "run", return_value=run_result):
+        result = dg.materialize(
+            asset_defs,
+            resources={"rocky": RockyResource(config_path="rocky.toml")},
+            selection=[dim_a, dim_b],
+            raise_on_error=False,
+        )
+
+    assert result.success is False
+    # The sibling's materialization was recorded before the failure.
+    mat_keys = {e.asset_key for e in result.get_asset_materialization_events()}
+    assert dim_a in mat_keys
+    assert dim_b not in mat_keys
+
+    failures = [e for e in result.all_events if e.event_type_value == "STEP_FAILURE"]
+    assert len(failures) == 1
+    failure_data = failures[0].event_specific_data.user_failure_data
+    assert "dim_b" in failure_data.description
+    assert "stg_orders" in failure_data.description
+    assert "fix stg_orders, then re-run" in failure_data.description
+    assert failure_data.metadata["rocky/contained"].value is True
+    assert failure_data.metadata["rocky/blocked_by"].value == "stg_orders"

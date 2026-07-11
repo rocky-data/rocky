@@ -156,17 +156,28 @@ fn classify_input(store: &StateStore, upstream: &UpstreamIdentity) -> ReplayChec
             upstream_key,
             blake3_hash,
         } => {
-            let present = store
-                .list_artifacts_by_hash(blake3_hash)
-                .map(|rows| !rows.is_empty())
-                .unwrap_or(false);
-            let reason = if present {
-                None
-            } else {
-                Some(format!(
-                    "upstream '{upstream_key}' output (blake3 {}) is absent from the artifact ledger",
-                    short_hash(blake3_hash)
-                ))
+            // A ledger READ error is not absence: report it as itself
+            // (fail-closed on resolvability, honest in the reason) instead of
+            // letting a corrupt/failing store masquerade as "bytes were never
+            // recorded".
+            let (present, reason) = match store.list_artifacts_by_hash(blake3_hash) {
+                Ok(rows) if !rows.is_empty() => (true, None),
+                Ok(_) => (
+                    false,
+                    Some(format!(
+                        "upstream '{upstream_key}' output (blake3 {}) is absent from the artifact ledger",
+                        short_hash(blake3_hash)
+                    )),
+                ),
+                Err(e) => (
+                    false,
+                    Some(format!(
+                        "artifact-ledger read failed for upstream '{upstream_key}' (blake3 {}): {e} \
+                         — fail-closed (this is a state-store read error, not evidence the bytes \
+                         were never recorded)",
+                        short_hash(blake3_hash)
+                    )),
+                ),
             };
             ReplayCheckInputOutput {
                 upstream_key: upstream_key.clone(),
@@ -203,24 +214,35 @@ pub(crate) fn classify_model(
     run_id: &str,
     model_name: &str,
 ) -> ReplayCheckModelOutput {
-    let provenance: Option<ProvenanceRecord> =
-        store.get_provenance(run_id, model_name).ok().flatten();
+    let non_replayable = |reason: String| ReplayCheckModelOutput {
+        model_name: model_name.to_string(),
+        verdict: "non_replayable".to_string(),
+        reasons: vec![reason],
+        has_provenance: false,
+        ir_parseable: false,
+        nondeterministic: false,
+        proof_class: None,
+        inputs: Vec::new(),
+    };
+    // A provenance READ error is not "no provenance": say so (fail-closed
+    // verdict either way, but the reason must not claim reuse was disabled
+    // when the store failed to answer).
+    let provenance: Option<ProvenanceRecord> = match store.get_provenance(run_id, model_name) {
+        Ok(p) => p,
+        Err(e) => {
+            return non_replayable(format!(
+                "provenance read failed: {e} — fail-closed (state-store read error, not \
+                 evidence the run was un-indexed)"
+            ));
+        }
+    };
 
     let Some(prov) = provenance else {
-        return ReplayCheckModelOutput {
-            model_name: model_name.to_string(),
-            verdict: "non_replayable".to_string(),
-            reasons: vec![
-                "no provenance recorded for this model (the run was not content-addressed, \
-                 or auditable reuse was disabled)"
-                    .to_string(),
-            ],
-            has_provenance: false,
-            ir_parseable: false,
-            nondeterministic: false,
-            proof_class: None,
-            inputs: Vec::new(),
-        };
+        return non_replayable(
+            "no provenance recorded for this model (the run was not content-addressed, \
+             or auditable reuse was disabled)"
+                .to_string(),
+        );
     };
 
     let mut reasons: Vec<String> = Vec::new();
@@ -247,11 +269,51 @@ pub(crate) fn classify_model(
         .unwrap_or(false);
 
     // Resolve every declared input against the ledger.
-    let inputs: Vec<ReplayCheckInputOutput> = prov
+    let mut inputs: Vec<ReplayCheckInputOutput> = prov
         .upstreams
         .iter()
         .map(|u| classify_input(store, u))
         .collect();
+
+    // Check ↔ execute parity for the all-in-run case: `--execute` (DAG)
+    // rebuilds every in-run upstream from ITS provenance, so an upstream
+    // produced in this same run by a model that recorded none cannot be
+    // replayed — even though its artifact row makes it ledger-resolvable.
+    // Without this, `--check` (and `rocky gc`, which reuses this verdict as
+    // its derivability eligibility) reports `replayable` for a chain the
+    // executor always refuses. In-run producers are probed by the target
+    // FQN's table segment against the run's executed names (absent or
+    // unreadable run record ⇒ probe skipped, current semantics kept).
+    if let Ok(Some(run)) = store.get_run(run_id) {
+        for input in &mut inputs {
+            if !input.resolvable || input.kind != "content" {
+                continue;
+            }
+            let table = input
+                .upstream_key
+                .rsplit('.')
+                .next()
+                .unwrap_or(&input.upstream_key);
+            let in_run_producer = run
+                .models_executed
+                .iter()
+                .map(|e| e.model_name.as_str())
+                .filter(|n| *n != model_name)
+                .find(|n| n.eq_ignore_ascii_case(table));
+            if let Some(producer) = in_run_producer
+                && matches!(store.get_provenance(run_id, producer), Ok(None))
+            {
+                input.resolvable = false;
+                input.reason = Some(format!(
+                    "upstream '{}' is produced in this same run by '{producer}', which recorded \
+                     no provenance — the DAG replay rebuilds in-run upstreams from their \
+                     provenance and cannot; `--execute` refuses this model even though the \
+                     artifact row exists",
+                    input.upstream_key
+                ));
+            }
+        }
+    }
     for input in &inputs {
         if let Some(reason) = &input.reason {
             reasons.push(reason.clone());
@@ -603,6 +665,12 @@ async fn replay_execute_model(
             short_hash(&computed),
             short_hash(&recorded)
         )];
+        if let Some(caveat) = encoding_skew_caveat(store, &recorded) {
+            reasons.push(caveat);
+        }
+        if let Some(caveat) = version_skew_caveat(store, run_id) {
+            reasons.push(caveat);
+        }
         if check.nondeterministic {
             reasons.push(
                 "expected: the recipe contains a nondeterministic construct \
@@ -626,6 +694,60 @@ async fn replay_execute_model(
 // `rocky replay --execute [--verify]` (whole run) — DAG-order multi-model
 // re-execution
 // ---------------------------------------------------------------------------
+
+/// A `diverged` caveat when the recorded hash's artifact row points at
+/// object storage: a live UniForm write encodes parquet with the table's
+/// physical column mapping (`col-<uuid>` names read from its `_delta_log`),
+/// which the offline replay's deterministic logical mapping does not
+/// reproduce — so the mismatch may be an encoding difference over identical
+/// rows rather than a reproducibility gap. The provenance does not record
+/// the encoding identity, so this is disclosed as ambiguity on `diverged`
+/// (a matching hash is still `bit_exact`: byte equality is meaningful
+/// regardless of how the recording was encoded).
+fn encoding_skew_caveat(store: &StateStore, recorded_hash: &str) -> Option<String> {
+    let live_writer_artifact = store
+        .list_artifacts_by_hash(recorded_hash)
+        .ok()
+        .map(|rows| {
+            rows.iter()
+                .any(|r| r.file_path.starts_with("s3://") || r.file_path.starts_with("s3a://"))
+        })
+        .unwrap_or(false);
+    live_writer_artifact.then(|| {
+        "caveat: the recorded hash's artifact lives on object storage, where the live UniForm \
+         writer encodes parquet with the table's physical column mapping — a mapping the \
+         offline replay's deterministic encoding does not reproduce — so this mismatch may be \
+         encoding skew over identical rows rather than a reproducibility gap (the \
+         warehouse-path replay is a later phase)"
+            .to_string()
+    })
+}
+
+/// A `diverged` caveat when the recording came from a DIFFERENT engine
+/// version: parquet byte-identity is only pinned for the same version over
+/// the same inputs (a parquet-rs upgrade legitimately changes file bytes),
+/// so a cross-version mismatch is ambiguous — it may be encoding drift, not
+/// nondeterminism. Ambiguity stays `diverged` (unlike the provably-undefined
+/// live-writer shape) but the reason must say so.
+fn version_skew_caveat(store: &StateStore, run_id: &str) -> Option<String> {
+    let current = env!("CARGO_PKG_VERSION");
+    match store.get_run(run_id) {
+        Ok(Some(run))
+            if !run.rocky_version.is_empty()
+                && run.rocky_version != "<pre-audit>"
+                && run.rocky_version != current =>
+        {
+            Some(format!(
+                "caveat: recorded under rocky {}, replayed under rocky {current} — parquet \
+                 byte-identity is only pinned within one engine version, so this mismatch may \
+                 be encoding drift rather than nondeterminism; re-record on the current version \
+                 to re-baseline",
+                run.rocky_version
+            ))
+        }
+        _ => None,
+    }
+}
 
 /// Fully-qualified `catalog.schema.table` identity of a model's output.
 ///
@@ -833,12 +955,30 @@ async fn replay_execute_dag(
                     if produced.contains(&upstream_key) {
                         cand.in_run_upstreams.push(upstream_key);
                     } else {
-                        cand.blocked_reason = Some(format!(
-                            "upstream '{upstream_key}' is content-addressed but is not produced by \
-                             any model in this recorded run; its recorded bytes live on object \
-                             storage that the creds-free DAG replay never reads (a warehouse-path \
-                             replay is a later phase)"
-                        ));
+                        // Diagnose honestly: an in-run producer that simply
+                        // recorded no provenance (so it is not a candidate) is
+                        // a different failure from a genuinely cross-run
+                        // upstream — the old message sent operators hunting a
+                        // phantom external dependency.
+                        let table = upstream_key.rsplit('.').next().unwrap_or(&upstream_key);
+                        let unindexed_in_run = record
+                            .models_executed
+                            .iter()
+                            .any(|e| e.model_name.eq_ignore_ascii_case(table));
+                        cand.blocked_reason = Some(if unindexed_in_run {
+                            format!(
+                                "upstream '{upstream_key}' is produced in this run by a model \
+                                 that recorded no provenance, so the DAG replay cannot rebuild \
+                                 it (the run predates auditable reuse or `[reuse]` was disabled)"
+                            )
+                        } else {
+                            format!(
+                                "upstream '{upstream_key}' is content-addressed but is not produced by \
+                                 any model in this recorded run; its recorded bytes live on object \
+                                 storage that the creds-free DAG replay never reads (a warehouse-path \
+                                 replay is a later phase)"
+                            )
+                        });
                         break;
                     }
                 }
@@ -925,7 +1065,16 @@ async fn replay_execute_dag(
 
         finished.insert(
             cand.model_name.clone(),
-            replay_execute_dag_node(&adapter, cand, verify, &mut attached, &mut materialized).await,
+            replay_execute_dag_node(
+                store,
+                run_id,
+                &adapter,
+                cand,
+                verify,
+                &mut attached,
+                &mut materialized,
+            )
+            .await,
         );
     }
 
@@ -939,6 +1088,8 @@ async fn replay_execute_dag(
 /// fail-closed cascade denies its downstreams.
 #[cfg(feature = "duckdb")]
 async fn replay_execute_dag_node(
+    store: &StateStore,
+    run_id: &str,
     adapter: &rocky_duckdb::adapter::DuckDbWarehouseAdapter,
     cand: &DagCandidate,
     verify: bool,
@@ -1035,6 +1186,12 @@ async fn replay_execute_dag_node(
             short_hash(&computed),
             short_hash(&recorded)
         )];
+        if let Some(caveat) = encoding_skew_caveat(store, &recorded) {
+            reasons.push(caveat);
+        }
+        if let Some(caveat) = version_skew_caveat(store, run_id) {
+            reasons.push(caveat);
+        }
         if cand.nondeterministic {
             reasons.push(
                 "expected: the recipe contains a nondeterministic construct \

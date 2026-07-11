@@ -63,6 +63,10 @@ export interface BackfillOutput {
    * Rocky version that composed the plan.
    */
   version: string;
+  /**
+   * Composition warnings the reviewer must weigh before approving. Today: `incremental` / `microbatch` closure members, whose transformation re-run is a bare `INSERT INTO … <model SQL>` — depending on the model's own filtering it appends duplicate rows or loads nothing, rather than rebuilding a window. Empty (and omitted from JSON) when the closure carries no such member.
+   */
+  warnings?: string[];
   [k: string]: unknown;
 }
 /**

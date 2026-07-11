@@ -97,7 +97,7 @@ pub(crate) struct ProducerIndex {
 }
 
 /// How a single physical read resolves against the produced targets.
-enum ReadResolution {
+pub(crate) enum ReadResolution {
     /// Resolves to one or more candidate producers — each is added as a
     /// containment edge, so the reader is blocked iff at least one is poisoned.
     /// Exactly one candidate for an unambiguous 2/3-part read; possibly several
@@ -162,7 +162,7 @@ impl ProducerIndex {
     /// target table is a candidate edge to that producer. A qualified read
     /// (2/3-part) resolves uniquely or is [`ReadResolution::Ambiguous`]; a read
     /// with more than three parts is out of range → [`ReadResolution::External`].
-    fn resolve(&self, read: &str) -> ReadResolution {
+    pub(crate) fn resolve(&self, read: &str) -> ReadResolution {
         let Some(parts) = canonicalize_identifier(read) else {
             // Un-canonicalizable — cannot attribute the read; fail closed.
             return ReadResolution::Ambiguous;
@@ -322,7 +322,6 @@ impl ContainmentLedger {
         &mut self,
         name: &str,
         ref_deps: &[String],
-        model_names: &HashSet<String>,
         reads: &[String],
         reads_complete: bool,
         producers: &ProducerIndex,
@@ -332,8 +331,17 @@ impl ContainmentLedger {
         // A read set we cannot fully enumerate cannot prove disjointness.
         let mut uncertain = !reads_complete;
         for read in reads {
-            // A bare model-name read is already a `ref()` edge (in `ref_deps`).
-            if model_names.contains(read) {
+            // A bare read is "already covered" only when the resolver made the
+            // SAME call — ref-edge derivation is case-sensitive on the
+            // as-written identifier, so the test must be exact membership in
+            // `ref_deps`, not membership in the model-name set: a
+            // case-differing bare read (`FROM ORDERS` for model `orders`) has
+            // NO ref edge, and skipping it here dropped the dependency
+            // entirely (unquoted identifiers are case-insensitive in every
+            // supported warehouse, so it IS a real data dependency). Anything
+            // not exactly covered falls through to producer resolution, which
+            // is set-deduped and fail-closed.
+            if ref_deps.iter().any(|d| d == read) {
                 continue;
             }
             match producers.resolve(read) {
@@ -525,12 +533,11 @@ mod tests {
         producers: &[(&str, &str, &str, &str)],
     ) -> ContainmentLedger {
         let index = ProducerIndex::build(producers.iter().copied());
-        let names: HashSet<String> = models.iter().map(|(n, ..)| n.to_string()).collect();
         let mut led = ContainmentLedger::new();
         for (name, deps, reads, complete) in models {
             let deps: Vec<String> = deps.iter().copied().map(String::from).collect();
             let reads: Vec<String> = reads.iter().map(|s| s.to_lowercase()).collect();
-            led.add_model(name, &deps, &names, &reads, *complete, &index);
+            led.add_model(name, &deps, &reads, *complete, &index);
         }
         led
     }
@@ -552,6 +559,48 @@ mod tests {
         assert!(led.evaluate("B").is_some(), "B depends on failed A");
         assert!(led.evaluate("C").is_none(), "C is disjoint");
         assert!(led.evaluate("D").is_none(), "D is disjoint");
+    }
+
+    /// FIX: a case-differing bare read of a model (`FROM ORDERS` for model
+    /// `orders`) is a real data dependency — unquoted identifiers are
+    /// case-insensitive in every supported warehouse — but ref-edge
+    /// derivation is case-sensitive on the as-written identifier, so no
+    /// `ref()` edge exists. The old "bare model-name read is already a ref
+    /// edge" skip compared against the (lowercased) model-name set and
+    /// dropped the dependency entirely: `rollup` built on failed `orders`'
+    /// stale output. The skip now requires exact `ref_deps` membership, so
+    /// the read falls through to producer resolution and yields the edge.
+    #[test]
+    fn case_differing_bare_read_of_failed_producer_is_contained() {
+        // As collected by the run loop: reads arrive lowercased, so
+        // `FROM ORDERS` in rollup's SQL is the read "orders"; model `orders`
+        // produces `c.main.orders`. No ref edge (case-sensitive derivation
+        // classified `ORDERS` as a raw ref).
+        let mut led = ledger(
+            &[
+                ("orders", &[], &[], true),
+                ("rollup", &[], &["orders"], true),
+            ],
+            &[("orders", "c", "main", "orders")],
+        );
+        led.poison("orders");
+        assert!(
+            led.evaluate("rollup").is_some(),
+            "a case-differing bare read of a failed producer must be contained"
+        );
+
+        // The exact-match skip still dedups a true ref-edge bare read: with
+        // the ref edge present the read is already covered, and the verdict
+        // is identical (edge via ref_deps).
+        let mut led2 = ledger(
+            &[
+                ("orders", &[], &[], true),
+                ("rollup", &["orders"], &["orders"], true),
+            ],
+            &[("orders", "c", "main", "orders")],
+        );
+        led2.poison("orders");
+        assert!(led2.evaluate("rollup").is_some());
     }
 
     /// (b) Physical-table read of a failed producer's TARGET is contained even

@@ -453,3 +453,189 @@ def test_build_dag_multi_assets_groups_by_kind():
     )
     # source, load, and transformation are different kinds → 3 groups.
     assert len(assets) == 3
+
+
+# ---------------------------------------------------------------------------
+# Transformation execution outcomes — a failed/contained model must fail the
+# op with the engine's reason, never be stamped fake-green; a materialized
+# model must match by the engine's target-triple key even under a custom
+# translator.
+# ---------------------------------------------------------------------------
+
+
+def _dag_run_result(
+    *,
+    status: str | None = "Success",
+    materializations: list[dict] | None = None,
+    errors: list[dict] | None = None,
+    contained: list[dict] | None = None,
+):
+    from dagster_rocky.types import RunResult
+
+    mats = materializations or []
+    errs = errors or []
+    payload = {
+        "version": "0.3.0",
+        "command": "run",
+        "filter": "",
+        "duration_ms": 100,
+        "tables_copied": len(mats),
+        "tables_failed": len(errs),
+        "materializations": mats,
+        "check_results": [],
+        "errors": errs,
+        "contained": contained or [],
+        "permissions": {
+            "grants_added": 0,
+            "grants_revoked": 0,
+            "catalogs_created": 0,
+            "schemas_created": 0,
+        },
+        "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+    }
+    if status is not None:
+        payload["status"] = status
+    return RunResult.model_validate(payload)
+
+
+def _single_transformation_dag() -> DagResult:
+    return _make_dag_result(
+        nodes=[
+            {
+                "id": "transformation:m1",
+                "kind": "transformation",
+                "label": "m1",
+                "target": {"catalog": "w", "schema": "s", "table": "m1"},
+            },
+        ]
+    )
+
+
+def _materialize_dag(dag: DagResult, run_result, translator=None):
+    from unittest.mock import MagicMock
+
+    mock_rocky = MagicMock()
+    mock_rocky.run_model.return_value = run_result
+    assets = build_dag_multi_assets(
+        dag,
+        rocky=mock_rocky,
+        translator=translator or RockyDagsterTranslator(),
+    )
+    return dg.materialize(assets, raise_on_error=False)
+
+
+def test_dag_transformation_failed_model_raises_failure_not_green():
+    """A model run that came back with itemised errors (run_model allows
+    partial failure) must FAIL the op with the engine's error — not yield the
+    bare fake-green MaterializeResult the old fallback stamped."""
+    run_result = _dag_run_result(
+        status="Failure",
+        errors=[
+            {
+                "asset_key": ["w", "s", "m1"],
+                "error": "SQL compilation error: column `amount` not found",
+                "failure_kind": "query-rejected",
+            }
+        ],
+    )
+
+    result = _materialize_dag(_single_transformation_dag(), run_result)
+
+    assert result.success is False
+    assert list(result.get_asset_materialization_events()) == []  # no green stamp
+
+    failures = [e for e in result.all_events if e.event_type_value == "STEP_FAILURE"]
+    assert len(failures) == 1
+    failure_data = failures[0].event_specific_data.user_failure_data
+    assert "m1" in failure_data.description
+    assert "SQL compilation error" in failure_data.description
+    assert failure_data.metadata["rocky/failure_kind"].value == "query-rejected"
+
+
+def test_dag_transformation_contained_model_fails_with_blocked_by():
+    """A model withheld by failure containment must fail the op with the
+    blast-radius reason (blocked_by / unblock_hint), same shape as the
+    derived-model path — not a green MaterializeResult."""
+    run_result = _dag_run_result(
+        status="PartialFailure",
+        errors=[{"asset_key": ["stg_upstream"], "error": "boom", "failure_kind": "query-rejected"}],
+        contained=[
+            {
+                "model": "m1",
+                "blocked_by": ["stg_upstream"],
+                "unblock_hint": "fix stg_upstream, then re-run",
+            }
+        ],
+    )
+
+    result = _materialize_dag(_single_transformation_dag(), run_result)
+
+    assert result.success is False
+    assert list(result.get_asset_materialization_events()) == []
+
+    failures = [e for e in result.all_events if e.event_type_value == "STEP_FAILURE"]
+    assert len(failures) == 1
+    failure_data = failures[0].event_specific_data.user_failure_data
+    assert "m1" in failure_data.description
+    assert "stg_upstream" in failure_data.description
+    assert "fix stg_upstream, then re-run" in failure_data.description
+    assert failure_data.metadata["rocky/contained"].value is True
+    assert failure_data.metadata["rocky/blocked_by"].value == "stg_upstream"
+
+
+def test_dag_transformation_success_matches_target_triple_and_yields_green():
+    """A materialization keyed by the engine's [catalog, schema, table] triple
+    matches the spec and yields green, enriched with the engine metadata
+    (row count proves the real entry was used, not the bare fallback)."""
+    run_result = _dag_run_result(
+        materializations=[
+            {
+                "asset_key": ["w", "s", "m1"],
+                "rows_copied": 42,
+                "duration_ms": 7,
+                "metadata": {"strategy": "incremental"},
+            }
+        ],
+    )
+
+    result = _materialize_dag(_single_transformation_dag(), run_result)
+
+    assert result.success
+    mats = list(result.get_asset_materialization_events())
+    assert [e.asset_key for e in mats] == [dg.AssetKey(["w", "s", "m1"])]
+    metadata = mats[0].materialization.metadata
+    assert metadata["dagster/row_count"].value == 42
+    assert metadata["dagster-rocky/strategy"].value == "incremental"
+
+
+def test_dag_transformation_custom_translator_key_still_matches_engine_triple():
+    """With a translator that reshapes spec keys, the engine's target-triple
+    materialization must still be matched (and remapped onto the spec key) —
+    previously naive key equality silently failed here and the fake-green
+    fallback became the common path."""
+
+    class PrefixedTranslator(RockyDagsterTranslator):
+        def get_dag_node_asset_key(self, node):
+            base = super().get_dag_node_asset_key(node)
+            return dg.AssetKey(["my_prefix", *base.path])
+
+    run_result = _dag_run_result(
+        materializations=[
+            {
+                "asset_key": ["w", "s", "m1"],
+                "rows_copied": 42,
+                "duration_ms": 7,
+                "metadata": {"strategy": "incremental"},
+            }
+        ],
+    )
+
+    result = _materialize_dag(
+        _single_transformation_dag(), run_result, translator=PrefixedTranslator()
+    )
+
+    assert result.success
+    mats = list(result.get_asset_materialization_events())
+    assert [e.asset_key for e in mats] == [dg.AssetKey(["my_prefix", "w", "s", "m1"])]
+    # Enriched from the matched engine entry — the fallback carries no row count.
+    assert mats[0].materialization.metadata["dagster/row_count"].value == 42

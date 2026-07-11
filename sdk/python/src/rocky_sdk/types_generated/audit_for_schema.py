@@ -41,7 +41,7 @@ class AuditSubjectKind2(StrEnum):
 
 class AuditSubjectKind3(StrEnum):
     """
-    A `plan_id` (64-char blake3 hex) with a plan file on disk.
+    A `plan_id` — a 64-char blake3 hex with a plan file on disk, or any id the decision ledger keys rows by (including decision-only custody ids like `freeze:…` / `draft:…` / `autoapply:…`, which never had a plan file).
     """
 
     plan = "plan"

@@ -42,6 +42,7 @@ def _run_result(
     tables_failed: int | None = None,
     excluded_tables: list[dict] | None = None,
     contained: list[dict] | None = None,
+    check_results: list[dict] | None = None,
 ) -> RunResult:
     mats = materializations or []
     errs = errors or []
@@ -57,7 +58,7 @@ def _run_result(
             "tables_copied": len(mats),
             "tables_failed": len(errs) if tables_failed is None else tables_failed,
             "materializations": mats,
-            "check_results": [],
+            "check_results": check_results or [],
             "errors": errs,
             "excluded_tables": excluded_tables or [],
             "contained": contained or [],
@@ -529,10 +530,13 @@ def test_pruned_table_gets_distinct_empty_stamp():
     assert "absent or empty" in by_key[c_raw].metadata["rocky/reason"].value
 
 
-def test_pruned_table_check_passes_not_warns():
-    """A declared check on a pruned table emits passed=True (prior result
-    stands), NOT the passed=False/WARN placeholder an unmaterialized table would
-    otherwise get — pruning must not overwrite a passing check with a failure."""
+def test_pruned_table_check_with_no_prior_evaluation_passes_not_warns():
+    """A declared check on a pruned table with NO recorded prior evaluation
+    emits passed=True with an explicit "pruned before this check ever ran"
+    status — NOT the passed=False/WARN placeholder an unmaterialized table
+    would otherwise get. Marked ``rocky/pruned_unchanged`` so the UI can tell
+    it from a real evaluation. (No instance is passed here, which is the same
+    "no prior verdict" degradation direct ``_emit_results`` callers get.)"""
     b_raw = dg.AssetKey(["b_raw"])
     mapping = {("b_raw",): b_raw}
     run_result = _run_result(excluded_tables=[_excluded("b_raw")])
@@ -552,6 +556,195 @@ def test_pruned_table_check_passes_not_warns():
     assert checks[0].check_name == "row_count"
     assert checks[0].passed is True
     assert "unchanged" in checks[0].metadata["status"].value
+    assert "no prior evaluation" in checks[0].metadata["status"].value
+    assert checks[0].metadata["rocky/pruned_unchanged"].value is True
+
+
+def _seed_check_evaluation(
+    instance: dg.DagsterInstance,
+    asset_key: dg.AssetKey,
+    check_name: str,
+    *,
+    passed: bool,
+    severity: dg.AssetCheckSeverity = dg.AssetCheckSeverity.ERROR,
+) -> None:
+    """Record a real check evaluation in ``instance``'s event log."""
+
+    @dg.multi_asset(
+        specs=[dg.AssetSpec(asset_key)],
+        check_specs=[dg.AssetCheckSpec(name=check_name, asset=asset_key)],
+        name="seed_prior_evaluation",
+    )
+    def seed(context):
+        yield dg.MaterializeResult(asset_key=asset_key)
+        yield dg.AssetCheckResult(
+            asset_key=asset_key, check_name=check_name, passed=passed, severity=severity
+        )
+
+    result = dg.materialize([seed], instance=instance, raise_on_error=False)
+    assert result.success
+
+
+def test_pruned_table_check_carries_forward_prior_failure():
+    """THE regression the prune placeholder existed to avoid inverting: the
+    engine records the prune marker when the COPY succeeds, before data checks
+    run — so Monday's copy can succeed while its check FAILS. Tuesday's prune
+    must carry that red verdict (and its severity) forward, not flip the check
+    green without re-evaluation."""
+    b_raw = dg.AssetKey(["b_raw"])
+    mapping = {("b_raw",): b_raw}
+    run_result = _run_result(excluded_tables=[_excluded("b_raw")])
+
+    with dg.DagsterInstance.ephemeral() as instance:
+        _seed_check_evaluation(
+            instance, b_raw, "row_count", passed=False, severity=dg.AssetCheckSeverity.WARN
+        )
+        events = list(
+            _emit_results(
+                results=[run_result],
+                check_specs=[dg.AssetCheckSpec(name="row_count", asset=b_raw)],
+                selected_keys={b_raw},
+                rocky_key_to_dagster_key=mapping,
+                satisfy_empty_outputs=True,
+                instance=instance,
+            )
+        )
+
+    checks = [e for e in events if isinstance(e, dg.AssetCheckResult)]
+    assert len(checks) == 1
+    assert checks[0].passed is False  # the prior failure is carried, not reset
+    assert checks[0].severity == dg.AssetCheckSeverity.WARN  # severity carried too
+    assert "carrying forward" in checks[0].metadata["status"].value
+    assert "failed" in checks[0].metadata["status"].value
+    assert checks[0].metadata["rocky/pruned_unchanged"].value is True
+
+
+def test_pruned_table_check_carries_forward_prior_success():
+    """The healthy-pipeline counterpart: a prior passing verdict is carried
+    forward as passed=True with the carry-forward status."""
+    b_raw = dg.AssetKey(["b_raw"])
+    mapping = {("b_raw",): b_raw}
+    run_result = _run_result(excluded_tables=[_excluded("b_raw")])
+
+    with dg.DagsterInstance.ephemeral() as instance:
+        _seed_check_evaluation(instance, b_raw, "row_count", passed=True)
+        events = list(
+            _emit_results(
+                results=[run_result],
+                check_specs=[dg.AssetCheckSpec(name="row_count", asset=b_raw)],
+                selected_keys={b_raw},
+                rocky_key_to_dagster_key=mapping,
+                satisfy_empty_outputs=True,
+                instance=instance,
+            )
+        )
+
+    checks = [e for e in events if isinstance(e, dg.AssetCheckResult)]
+    assert len(checks) == 1
+    assert checks[0].passed is True
+    assert "carrying forward" in checks[0].metadata["status"].value
+    assert checks[0].metadata["rocky/pruned_unchanged"].value is True
+
+
+def test_pruned_placeholder_carries_prior_failure_end_to_end(tmp_path):
+    """The full Monday/Tuesday story through the real component op — proving
+    both that ``_make_rocky_asset`` threads ``context.instance`` into the
+    placeholder pass and that the current run's own PLANNED check row (written
+    at run creation) is skipped in favour of the last *completed* verdict.
+
+    Run 1: the copy succeeds but ``row_count`` FAILS. Run 2: the source is
+    unchanged, the engine prunes the table — the placeholder must carry the
+    red verdict forward."""
+    discover = {
+        "version": "0.3.0",
+        "command": "discover",
+        "sources": [
+            {
+                "id": "src_sw",
+                "source_type": "fivetran",
+                "components": {"client": "sw", "source": "shopify"},
+                "tables": [{"name": "orders"}],
+            }
+        ],
+    }
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"discover": discover}))
+    component = RockyComponent(config_path="rocky.toml")
+    defs = component.build_defs_from_state(context=None, state_path=state_file)
+    asset_defs = [a for a in (defs.assets or []) if isinstance(a, dg.AssetsDefinition)]
+
+    orders_key = dg.AssetKey(["fivetran", "sw", "shopify", "orders"])
+    engine_key = ["fivetran", "sw", "shopify", "orders"]
+
+    monday = _run_result(
+        materializations=[
+            {
+                "asset_key": engine_key,
+                "rows_copied": 100,
+                "duration_ms": 5,
+                "metadata": {"strategy": "full_refresh"},
+            }
+        ],
+        check_results=[
+            {
+                "asset_key": engine_key,
+                "checks": [
+                    {
+                        "name": "row_count",
+                        "passed": False,
+                        "source_count": 100,
+                        "target_count": 90,
+                    }
+                ],
+            }
+        ],
+    )
+    tuesday = _run_result(
+        excluded_tables=[
+            {
+                "asset_key": engine_key,
+                "source_schema": "raw__sw",
+                "table_name": "orders",
+                "reason": "unchanged_since_last_copy",
+            }
+        ],
+    )
+
+    def _materialize(run_result, instance):
+        with (
+            patch.object(RockyResource, "run", return_value=run_result),
+            patch.object(RockyResource, "run_streaming", return_value=run_result),
+        ):
+            return dg.materialize(
+                asset_defs,
+                resources={"rocky": RockyResource(config_path="rocky.toml")},
+                selection=[orders_key],
+                instance=instance,
+                raise_on_error=False,
+            )
+
+    with dg.DagsterInstance.ephemeral() as instance:
+        result_1 = _materialize(monday, instance)
+        assert result_1.success  # a failed non-blocking check doesn't fail the run
+        result_2 = _materialize(tuesday, instance)
+        assert result_2.success
+
+    def _checks_by_name(result):
+        return {
+            e.event_specific_data.check_name: e.event_specific_data
+            for e in result.all_events
+            if e.event_type_value == "ASSET_CHECK_EVALUATION"
+        }
+
+    assert _checks_by_name(result_1)["row_count"].passed is False  # Monday: real failure
+
+    tuesday_checks = _checks_by_name(result_2)
+    # Tuesday's prune carries Monday's red verdict — the check stays red.
+    assert tuesday_checks["row_count"].passed is False
+    assert tuesday_checks["row_count"].metadata["rocky/pruned_unchanged"].value is True
+    # A sibling check whose Monday verdict passed carries forward green.
+    assert tuesday_checks["freshness"].passed is True
+    assert tuesday_checks["freshness"].metadata["rocky/pruned_unchanged"].value is True
 
 
 def test_prune_without_satisfy_empty_outputs_warns(caplog):

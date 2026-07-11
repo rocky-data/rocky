@@ -4922,9 +4922,23 @@ pub(crate) async fn execute_backfill_set(
     let mut output = RunOutput::new(String::new(), 0, 1);
 
     let schema_cache_cfg = rocky_cfg.cache.schemas.clone().with_ttl_override(None);
-    // A backfill never runs shadowed, so the skip gate resolves against the
-    // `[run]` config alone; it stays inert unless the operator enabled it.
-    let skip_gate = SkipGateConfig::resolve(&SkipRunOptions::default(), &rocky_cfg.run, false);
+    // A backfill is an explicit, reviewed rebuild order, so the plain skip
+    // gate must never adjudicate it — its signals (upstream `MAX(ts)` /
+    // rowcount) are blind to exactly the backdated corrections backfills
+    // exist to repair, and `[run] skip_unchanged = true` would otherwise
+    // silently no-op the whole approved recovery. `force_rebuild` makes the
+    // gate inert (`is_active()` = false) and pins the content-addressed
+    // column-skip off (belt over `backfill_reuse_gates`' suspenders), while
+    // point-to reuse stays governed by `backfill_reuse_gates` alone — a
+    // byte-identical reuse still satisfies a rebuild order.
+    let skip_gate = SkipGateConfig::resolve(
+        &SkipRunOptions {
+            force_rebuild: true,
+            ..Default::default()
+        },
+        &rocky_cfg.run,
+        false,
+    );
     let run_vars = rocky_core::run_vars::RunVars::new();
     // A backfill is an explicit rebuild order: point-to reuse may still
     // satisfy it byte-identically, but the column-level skip never may.
@@ -5411,12 +5425,6 @@ pub(crate) async fn execute_models(
                 )
             }),
         );
-        let model_names: std::collections::HashSet<String> = compile_result
-            .project
-            .models
-            .iter()
-            .map(|m| m.config.name.clone())
-            .collect();
         let dep_by_model: std::collections::HashMap<&str, &[String]> = compile_result
             .project
             .dag_nodes
@@ -5446,14 +5454,7 @@ pub(crate) async fn execute_models(
                 } else {
                     (Vec::new(), false)
                 };
-            containment.add_model(
-                name,
-                ref_deps,
-                &model_names,
-                &reads,
-                reads_complete,
-                &producers,
-            );
+            containment.add_model(name, ref_deps, &reads, reads_complete, &producers);
         }
         containment.seed_failed(compile_failed_models.iter().cloned());
     }
@@ -5495,6 +5496,29 @@ pub(crate) async fn execute_models(
             cooldown_seconds: None,
         });
     }
+    // A supervised backfill's planned set must survive contact with the
+    // compiled project intact: the per-layer filter below silently DROPS set
+    // members that no longer compile to a model (renamed/deleted since the
+    // plan was approved), and a zero-or-partial-model run then reports
+    // Success — the approved recovery quietly shrinks. Fail loud instead.
+    if let Some(set) = model_set {
+        let missing: Vec<&str> = set
+            .iter()
+            .map(String::as_str)
+            .filter(|name| compile_result.project.model(name).is_none())
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "backfill plan names {} model(s) that no longer exist in the compiled project: \
+                 {} — the approved scope cannot be executed as reviewed (models renamed or \
+                 deleted since the plan was composed). Re-compose the backfill against the \
+                 current project.",
+                missing.len(),
+                missing.join(", "),
+            );
+        }
+    }
+
     let execution_layers: &[Vec<String>] = match &augmented_plan {
         Some(plan) => &plan.layers,
         None => &compile_result.project.layers,
@@ -5705,6 +5729,7 @@ pub(crate) async fn execute_models(
                                 plan,
                                 warehouse,
                                 name,
+                                super::resilience::rerun_is_idempotent(&model.config.strategy),
                                 || {
                                     execute_one_plain_model(
                                         model,
@@ -5811,6 +5836,35 @@ pub(crate) async fn execute_models(
         for &(idx, model_name, model) in &matched {
             let model_name: &str = model_name.as_str();
 
+            // Re-adjudicate immediately before dispatch (serial path): the
+            // layer's verdicts were computed before any of this layer's models
+            // ran, but a mid-layer failure poisons the ledger, and a later
+            // same-layer model — an *uncertain* one, whose reads yield no
+            // ordering edge that augmented layering could separate on — must
+            // fail closed the moment any failure exists, not build on data it
+            // can't be proven disjoint from. Serial fail-fast aborts at that
+            // failure, so this never withholds anything fail-fast would build.
+            if resilience.contain_failures
+                && let Some(decision) = containment.evaluate(model_name)
+            {
+                containment.poison(model_name);
+                info!(
+                    model = model_name,
+                    blocked_by = decision.blocked_by.join(",").as_str(),
+                    fail_closed = decision.fail_closed,
+                    "containment: withholding model (mid-layer failure preceded it)"
+                );
+                output.contained.push(crate::output::ContainedModelOutput {
+                    model: model_name.to_string(),
+                    unblock_hint: super::containment::unblock_hint(
+                        &decision.blocked_by,
+                        decision.fail_closed,
+                    ),
+                    blocked_by: decision.blocked_by,
+                });
+                continue;
+            }
+
             // Content-addressed column-level skip, default-ON behind
             // `[reuse] column_level` (the caller has already folded the
             // `--no-reuse` escape hatch and the backfill rebuild-order into
@@ -5830,7 +5884,16 @@ pub(crate) async fn execute_models(
                     rocky_core::models::StrategyConfig::ContentAddressed { .. }
                 )
             {
-                let model_ir = model.to_model_ir();
+                // The fully-typed IR, not bare `to_model_ir()`: an empty
+                // `typed_columns` forces `skip_hash()` to the never-equal
+                // `None` sentinel, which made this gate silently inert on the
+                // real CLI path (every evaluation fell through to build).
+                let model_ir = typed_model_ir(
+                    model,
+                    exec_ctx.typed_models,
+                    exec_ctx.surrogate_keys,
+                    dialect,
+                );
                 if let ColumnSkipOutcome::Skip {
                     prior_output_column_hashes,
                     prior_blake3,
@@ -5914,7 +5977,19 @@ pub(crate) async fn execute_models(
                 model.config.strategy,
                 rocky_core::models::StrategyConfig::ContentAddressed { .. }
             ) {
-                let model_ir = model.to_model_ir();
+                // The fully-typed IR (typechecker columns + surrogate-key
+                // wrap), never bare `to_model_ir()`: the Arrow conversion in
+                // `execute_content_addressed_model` hard-errors when the
+                // declared column count (0 when unenriched) disagrees with the
+                // warehouse result, and an empty `typed_columns` also nulls
+                // `skip_hash()`, so the reuse spine / provenance ledger was
+                // never populated by a real `rocky run`.
+                let model_ir = typed_model_ir(
+                    model,
+                    exec_ctx.typed_models,
+                    exec_ctx.surrogate_keys,
+                    dialect,
+                );
                 let model_started_at = Utc::now();
                 let target_table_full_name = format!(
                     "{}.{}.{}",
@@ -6025,11 +6100,14 @@ pub(crate) async fn execute_models(
                         // downstream can record what it read from this upstream.
                         // Recorded only when the build produced hashes: a
                         // genuine unpartitioned build always does; a point-to
-                        // reuse carries the referenced run's recorded hashes
-                        // when present; a partitioned build produces none (the
-                        // per-file fold is deferred). An absent entry degrades a
-                        // downstream baseline to a safe rebuild. Keyed by target
-                        // full name as `reuse_outputs` is.
+                        // reuse never does (every pointer commit returns empty
+                        // `column_hashes` — see `WriteResult` — so a reused
+                        // upstream seeds no downstream baseline and the
+                        // consumer rebuilds, the safe direction); a partitioned
+                        // build produces none either (the per-file fold is
+                        // deferred). An absent entry degrades a downstream
+                        // baseline to a safe rebuild. Keyed by target full name
+                        // as `reuse_outputs` is.
                         if !summary.output_column_hashes.is_empty() {
                             built_output_hashes.insert(
                                 target_table_full_name.clone(),
@@ -6303,6 +6381,7 @@ pub(crate) async fn execute_models(
                 &resilience_plan,
                 warehouse,
                 model_name,
+                super::resilience::rerun_is_idempotent(&model.config.strategy),
                 || {
                     execute_one_plain_model(
                         model,
@@ -12397,6 +12476,54 @@ merge_keys = ["id"]
         );
     }
 
+    /// The content-addressed dispatch must hand the CA runner and the
+    /// column-skip gate the fully-typed IR — `typed_model_ir`, the same
+    /// helper the plain gate uses — never bare `to_model_ir()`. Bare IR
+    /// leaves `typed_columns` empty, which (a) hard-errors the Arrow
+    /// conversion ("model declares 0 typed columns") for any non-empty
+    /// SELECT and (b) nulls `skip_hash()`, silently disabling the reuse
+    /// spine and the default-ON column-level skip on the real CLI path.
+    #[test]
+    fn content_addressed_dispatch_ir_is_typed() {
+        let content = "---toml\nname = \"ca_events\"\n\n[strategy]\ntype = \"content_addressed\"\nstorage_prefix = \"s3://bucket/ca_events\"\n\n[target]\ncatalog = \"analytics\"\nschema = \"marts\"\ntable = \"ca_events\"\n---\n\nSELECT 1 AS id, 'a' AS name\n";
+        let model = rocky_core::models::parse_model_inline(content, "ca_events.sql", None)
+            .expect("parse content-addressed model");
+        assert!(
+            model.to_model_ir().skip_hash().is_none(),
+            "bare to_model_ir() has no typed columns — the regression shape"
+        );
+
+        let mut typed_models = indexmap::IndexMap::new();
+        typed_models.insert(
+            "ca_events".to_string(),
+            vec![
+                rocky_compiler::types::TypedColumn {
+                    name: "id".into(),
+                    data_type: rocky_ir::RockyType::Int64,
+                    nullable: false,
+                },
+                rocky_compiler::types::TypedColumn {
+                    name: "name".into(),
+                    data_type: rocky_ir::RockyType::String,
+                    nullable: false,
+                },
+            ],
+        );
+        let surrogate_keys = std::collections::HashMap::new();
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let ir = super::typed_model_ir(&model, &typed_models, &surrogate_keys, &dialect);
+        assert_eq!(
+            ir.typed_columns.len(),
+            2,
+            "dispatch IR must carry the typechecker's columns"
+        );
+        assert!(
+            ir.skip_hash().is_some(),
+            "a typed content-addressed IR canonicalises for the skip gate / reuse spine"
+        );
+    }
+
     /// Write a `full_refresh` model with an explicit `(schema, table)` target.
     fn write_model_with_target(
         dir: &std::path::Path,
@@ -12727,6 +12854,62 @@ merge_keys = ["id"]
     /// (CTE) project: `stage_orders` produces `main.orders_current` and fails;
     /// `rollup` reads it through a CTE, so its read set is unenumerable
     /// (`lineage_is_provably_complete` is false) and no ordering edge is derived.
+    /// FIX (serial fail-closed belt): once a mid-layer failure has poisoned
+    /// the ledger, a LATER same-layer *uncertain* (CTE — unenumerable reads)
+    /// model is re-adjudicated immediately before its serial dispatch and
+    /// withheld. Pre-fix, the layer's verdicts were computed only once,
+    /// before any model ran, so the uncertain model built on data it could
+    /// not be proven disjoint from — something serial fail-fast (which
+    /// aborts at the failure) would never have materialized, violating the
+    /// containment ⊆ fail-fast invariant. Kahn layering dispatches
+    /// alphabetically, so `a_fail` deterministically precedes `z_rollup`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn containment_serial_withholds_uncertain_after_mid_layer_failure() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = tmp.path().join("t.duckdb");
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db).expect("seed open");
+            seed.execute_statement("CREATE TABLE main.orders_current AS SELECT 999 AS id")
+                .await
+                .unwrap();
+        }
+        write_model_with_target(
+            &models_dir,
+            "a_fail",
+            "SELECT * FROM main.missing_source",
+            "main",
+            "a_fail_t",
+        );
+        write_model_with_target(
+            &models_dir,
+            "z_rollup",
+            "WITH x AS (SELECT id FROM main.orders_current) SELECT COUNT(*) AS n FROM x",
+            "main",
+            "z_rollup",
+        );
+
+        let (out, _) = run_models_with_containment(&models_dir, &db).await;
+
+        assert!(
+            out.contained.iter().any(|c| c.model == "z_rollup"),
+            "the uncertain model dispatched after a same-layer failure must be \
+             withheld, got contained = {:?}",
+            out.contained
+        );
+        assert!(
+            !out.materializations
+                .iter()
+                .any(|m| m.asset_key.last().map(String::as_str) == Some("z_rollup")),
+            "the withheld model must not materialize"
+        );
+    }
+
     async fn setup_same_layer_uncertain_project(
         models_dir: &std::path::Path,
         db: &std::path::Path,
@@ -15666,6 +15849,37 @@ merge_keys = ["id"]
         assert!(!backfill_reuse_gates(&default_cfg).1);
     }
 
+    /// FIX-cluster regression: the PLAIN skip gate is likewise inert for a
+    /// supervised backfill even when `[run] skip_unchanged = true`. The
+    /// gate's signals (upstream `MAX(ts)` / rowcount) are blind to backdated
+    /// corrections — exactly what a backfill repairs — so an operator-enabled
+    /// gate would silently no-op the whole approved rebuild while reporting
+    /// Success. `execute_backfill_set` resolves its gate with
+    /// `force_rebuild: true`; this pins that resolution shape.
+    #[test]
+    fn backfill_skip_gate_is_inert_even_when_run_config_opts_in() {
+        let cfg: rocky_core::config::RockyConfig =
+            toml::from_str("[run]\nskip_unchanged = true").unwrap();
+        assert!(cfg.run.skip_unchanged, "premise: operator opted in");
+        let gate = SkipGateConfig::resolve(
+            &SkipRunOptions {
+                force_rebuild: true,
+                ..Default::default()
+            },
+            &cfg.run,
+            false,
+        );
+        assert!(
+            !gate.is_active(),
+            "a reviewed backfill is an explicit rebuild order — the plain \
+             gate must never adjudicate it"
+        );
+        assert!(
+            gate.force_rebuild,
+            "force_rebuild also pins the content-addressed column-skip off"
+        );
+    }
+
     /// FIX-cluster regression: a column-skipped model publishes its PRIOR
     /// outputs to both in-run composition maps — the producer column hashes
     /// into `built_output_hashes` and (under `[reuse]`) the prior artifact's
@@ -17159,8 +17373,12 @@ table = "fct_events"
             inner: &inner,
             fail_next: AtomicU32::new(0),
         };
-        let mat_clean =
-            crate::commands::resilience::run_model_with_retry(&plan, &clean_adapter, "fct", || {
+        let mat_clean = crate::commands::resilience::run_model_with_retry(
+            &plan,
+            &clean_adapter,
+            "fct",
+            true,
+            || {
                 super::execute_one_plain_model(
                     &model,
                     &clean_adapter as &dyn WarehouseAdapter,
@@ -17169,9 +17387,10 @@ table = "fct_events"
                     Instant::now(),
                     exec_ctx,
                 )
-            })
-            .await
-            .expect("clean build succeeds");
+            },
+        )
+        .await
+        .expect("clean build succeeds");
         assert!(
             mat_clean.attempts.is_empty(),
             "a clean first-try success carries no attempt trail"
@@ -17186,8 +17405,12 @@ table = "fct_events"
             inner: &inner,
             fail_next: AtomicU32::new(1),
         };
-        let mat_flaky =
-            crate::commands::resilience::run_model_with_retry(&plan, &flaky_adapter, "fct", || {
+        let mat_flaky = crate::commands::resilience::run_model_with_retry(
+            &plan,
+            &flaky_adapter,
+            "fct",
+            true,
+            || {
                 super::execute_one_plain_model(
                     &model,
                     &flaky_adapter as &dyn WarehouseAdapter,
@@ -17196,9 +17419,10 @@ table = "fct_events"
                     Instant::now(),
                     exec_ctx,
                 )
-            })
-            .await
-            .expect("flaky build recovers after a transient failure");
+            },
+        )
+        .await
+        .expect("flaky build recovers after a transient failure");
 
         // (1) Reachability: recovered, with an honest attempt trail.
         assert_eq!(

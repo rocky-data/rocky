@@ -36,6 +36,14 @@ from typing import TYPE_CHECKING, Annotated, Literal
 
 import dagster as dg
 from dagster._core.definitions.metadata.metadata_set import NamespacedMetadataSet
+
+# Status enum for the event-log query in ``_latest_completed_check_verdict``.
+# Not re-exported from the public ``dagster`` namespace in 1.13.x, but the
+# same storage surface ``DagsterInstance.get_latest_asset_check_evaluation_record``
+# is built on.
+from dagster._core.storage.asset_check_execution_record import (
+    AssetCheckExecutionRecordStatus,
+)
 from dagster._utils.env import using_dagster_dev
 from dagster.components.component.state_backed_component import StateBackedComponent
 from dagster.components.utils.defs_state import (
@@ -2289,15 +2297,68 @@ def _make_derived_model_asset(
         yield from _emit_derived_model_results(
             result=result,
             selected_keys=selected_keys,
+            key_by_model_name=_model_name_to_key(group.specs),
         )
 
     return _asset
+
+
+def _model_name_to_key(specs: list[dg.AssetSpec]) -> dict[str, dg.AssetKey]:
+    """Map each derived-model spec's Rocky model name to its Dagster asset key.
+
+    The authoritative name source is the ``rocky/model_name`` tag the stock
+    translator stamps on every derived-model spec (second pass, so it wins any
+    collision). The key's last path segment — the target table, which usually
+    equals the model name — is kept as a fallback so name-based lookups still
+    resolve under a custom translator that drops the tag.
+    """
+    key_by_name: dict[str, dg.AssetKey] = {}
+    for spec in specs:
+        key_by_name.setdefault(spec.key.path[-1], spec.key)
+    for spec in specs:
+        tag_name = (spec.tags or {}).get("rocky/model_name")
+        if tag_name:
+            key_by_name[tag_name] = spec.key
+    return key_by_name
+
+
+def _contained_models_failure(contained: list[ContainedModel]) -> dg.Failure:
+    """Build the loud failure for model(s) this op ran that containment withheld.
+
+    A contained model was **not built** — its upstream failed and
+    ``[resilience] contain_failures`` withheld it. Failing the op with the
+    blast-radius reason (``blocked_by`` / ``unblock_hint``) surfaces *why* in
+    the run viewer, instead of Dagster's generic "did not yield expected
+    outputs" error for the unyielded output.
+    """
+    lines: list[str] = []
+    blocked_by: list[str] = []
+    for entry in contained:
+        blocked = ", ".join(entry.blocked_by) or "an upstream failure"
+        line = (
+            f"Model '{entry.model}' was not built: withheld by failure "
+            f"containment (blocked by {blocked})."
+        )
+        if entry.unblock_hint:
+            line = f"{line} {entry.unblock_hint}"
+        lines.append(line)
+        for upstream in entry.blocked_by:
+            if upstream not in blocked_by:
+                blocked_by.append(upstream)
+    return dg.Failure(
+        description="\n".join(lines),
+        metadata={
+            "rocky/contained": dg.MetadataValue.bool(True),
+            "rocky/blocked_by": dg.MetadataValue.text(", ".join(blocked_by)),
+        },
+    )
 
 
 def _emit_derived_model_results(
     *,
     result: RunResult,
     selected_keys: set[dg.AssetKey],
+    key_by_model_name: Mapping[str, dg.AssetKey] | None = None,
 ) -> Iterator[dg.MaterializeResult]:
     """Yield ``MaterializeResult`` for the derived-model assets in ``selected_keys``.
 
@@ -2305,6 +2366,13 @@ def _emit_derived_model_results(
     materialization whose remapped asset key is in ``selected_keys``.
     Source-replication materializations (which Rocky also emits when the
     fallback filter matches a source) are dropped silently.
+
+    When the run withheld one of this op's models via failure containment
+    (``result.contained``, resolved through ``key_by_model_name``), a
+    :class:`dg.Failure` naming the model, its ``blocked_by`` upstream(s) and
+    the ``unblock_hint`` is raised **after** the loop — so sibling models'
+    materializations are recorded first and the containment reason reaches the
+    run viewer instead of the generic unyielded-output error.
     """
     for mat in result.materializations:
         # Derived-model materializations identify their key directly via
@@ -2338,6 +2406,14 @@ def _emit_derived_model_results(
             asset_key=asset_key,
             metadata=metadata,
         )
+
+    contained_here = [
+        entry
+        for entry in result.contained
+        if (key_by_model_name or {}).get(entry.model) in selected_keys
+    ]
+    if contained_here:
+        raise _contained_models_failure(contained_here)
 
 
 def _make_rocky_asset(
@@ -2485,6 +2561,7 @@ def _make_rocky_asset(
                 extra_yielded_checks=compliance_yielded,
                 collapsed_key_by_table=group.collapsed_key_by_table or None,
                 satisfy_empty_outputs=satisfy_empty_outputs,
+                instance=context.instance,
             )
 
             # If a filter surfaced the Fivetran-storm signal, raise the
@@ -2908,6 +2985,7 @@ def _emit_results(
     extra_yielded_checks: set[tuple[dg.AssetKey, str]] | None = None,
     collapsed_key_by_table: dict[str, dg.AssetKey] | None = None,
     satisfy_empty_outputs: bool = False,
+    instance: dg.DagsterInstance | None = None,
 ) -> Iterator[dg.MaterializeResult | dg.AssetCheckResult | dg.AssetObservation]:
     """Yield Dagster events for every materialization, check, drift event and anomaly.
 
@@ -3206,6 +3284,7 @@ def _emit_results(
         materialized_keys=materialized_keys,
         pruned_keys=pruned_keys,
         contained_by_key=contained_by_key,
+        instance=instance,
     )
 
 
@@ -3300,6 +3379,64 @@ def _build_table_resolver(
     return resolve
 
 
+def _latest_completed_check_verdict(
+    instance: dg.DagsterInstance | None,
+    check_key: dg.AssetCheckKey,
+) -> tuple[bool, dg.AssetCheckSeverity] | None:
+    """Return ``(passed, severity)`` from the last completed evaluation of ``check_key``.
+
+    Backs the pruned-table placeholder in :func:`_emit_placeholder_checks`: a
+    ``prune_unchanged`` skip must carry the prior verdict forward, not stamp an
+    unconditional pass — the engine records the prune marker when the *copy*
+    succeeds, before data checks run, so a failing check would otherwise be
+    flipped green for as long as the source stays unchanged.
+
+    Reads the event log via ``get_asset_check_execution_history`` with a
+    completed-status filter instead of
+    ``DagsterInstance.get_latest_asset_check_evaluation_record`` because the
+    *current* run records a PLANNED row for every declared check at run
+    creation — the unfiltered "latest" is therefore almost always this run's
+    own PLANNED record, never the last real verdict.
+
+    Returns ``None`` when there is no instance (direct ``_emit_results``
+    calls), no completed evaluation on record, or the storage query fails —
+    callers treat all three as "no prior verdict to carry forward".
+    """
+    if instance is None:
+        return None
+    try:
+        records = instance.event_log_storage.get_asset_check_execution_history(
+            check_key,
+            limit=1,
+            status={
+                AssetCheckExecutionRecordStatus.SUCCEEDED,
+                AssetCheckExecutionRecordStatus.FAILED,
+            },
+        )
+    except Exception:
+        # A placeholder must never crash the op — degrade to the no-prior
+        # path (an explicit "no recorded result" pass) and leave a trail.
+        _log.warning(
+            "Could not read the prior evaluation for check %r on %s from the "
+            "event log; emitting the pruned-table placeholder without a "
+            "carried-forward verdict.",
+            check_key.name,
+            check_key.asset_key.to_user_string(),
+            exc_info=True,
+        )
+        return None
+    if not records:
+        return None
+    record = records[0]
+    evaluation = record.evaluation
+    if evaluation is None:
+        # Completed records always carry an evaluation event per the storage
+        # invariant; fall back to the row status if that ever changes.
+        succeeded = record.status == AssetCheckExecutionRecordStatus.SUCCEEDED
+        return succeeded, dg.AssetCheckSeverity.ERROR
+    return evaluation.passed, evaluation.severity
+
+
 def _emit_placeholder_checks(
     *,
     check_specs: list[dg.AssetCheckSpec],
@@ -3308,6 +3445,7 @@ def _emit_placeholder_checks(
     materialized_keys: set[dg.AssetKey],
     pruned_keys: AbstractSet[dg.AssetKey] = frozenset(),
     contained_by_key: Mapping[dg.AssetKey, ContainedModel] = MappingProxyType({}),
+    instance: dg.DagsterInstance | None = None,
 ) -> Iterator[dg.AssetCheckResult]:
     """Emit placeholders for declared checks Rocky did not produce.
 
@@ -3315,10 +3453,16 @@ def _emit_placeholder_checks(
     for any pre-declared check that the actual run didn't cover.
 
     A check on a ``prune_unchanged``-pruned table is neither run nor a failure:
-    the source is unchanged, so the last real evaluation still holds. Those emit
-    ``passed=True`` with a "not re-checked" status rather than the WARN /
-    ``passed=False`` placeholder an unmaterialized table would otherwise get —
-    so pruning doesn't overwrite a passing check with a spurious failure.
+    the source is unchanged, so the last real evaluation still holds — and is
+    what the placeholder must report. The prune marker is recorded when the
+    *copy* succeeds, before data checks run, so the prior evaluation may well
+    be a failure; carrying it forward (verdict + severity, read from
+    ``instance`` via :func:`_latest_completed_check_verdict`) keeps a red check
+    red instead of silently flipping it green. When no completed evaluation is
+    on record (or no ``instance`` is available), the placeholder passes with an
+    explicit "pruned before this check ever ran" status. Both variants carry
+    ``rocky/pruned_unchanged=True`` so the UI can tell them from real
+    evaluations.
 
     A check on a model in ``contained_by_key`` was withheld by failure
     containment (its upstream failed). It is unmaterialized, so it would
@@ -3351,17 +3495,48 @@ def _emit_placeholder_checks(
             continue
 
         if cs.asset_key in pruned_keys:
-            yield dg.AssetCheckResult(
-                asset_key=cs.asset_key,
-                check_name=cs.name,
-                passed=True,
-                metadata={
-                    "status": dg.MetadataValue.text(
-                        "not re-checked: source unchanged since last copy "
-                        "(prune_unchanged) — prior result stands"
-                    )
-                },
+            prior = _latest_completed_check_verdict(
+                instance, dg.AssetCheckKey(cs.asset_key, cs.name)
             )
+            if prior is None:
+                yield dg.AssetCheckResult(
+                    asset_key=cs.asset_key,
+                    check_name=cs.name,
+                    passed=True,
+                    description=(
+                        "source unchanged since last copy (prune_unchanged) — "
+                        "table was pruned before this check ever ran; no "
+                        "recorded result to carry forward"
+                    ),
+                    metadata={
+                        "status": dg.MetadataValue.text(
+                            "not checked: source unchanged since last copy "
+                            "(prune_unchanged) — no prior evaluation on record"
+                        ),
+                        "rocky/pruned_unchanged": dg.MetadataValue.bool(True),
+                    },
+                )
+            else:
+                prior_passed, prior_severity = prior
+                yield dg.AssetCheckResult(
+                    asset_key=cs.asset_key,
+                    check_name=cs.name,
+                    passed=prior_passed,
+                    severity=prior_severity,
+                    description=(
+                        "source unchanged — not re-evaluated; carrying forward "
+                        "the last recorded result"
+                    ),
+                    metadata={
+                        "status": dg.MetadataValue.text(
+                            "not re-checked: source unchanged since last copy "
+                            "(prune_unchanged) — carrying forward the last "
+                            f"recorded result "
+                            f"({'passed' if prior_passed else 'failed'})"
+                        ),
+                        "rocky/pruned_unchanged": dg.MetadataValue.bool(True),
+                    },
+                )
             continue
 
         materialized = cs.asset_key in materialized_keys

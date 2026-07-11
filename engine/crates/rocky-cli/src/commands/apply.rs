@@ -1871,6 +1871,23 @@ async fn run_apply_backfill_plan(
         bail!("backfill plan '{plan_id}' names no models to rebuild");
     }
 
+    // A half-open window must never execute: `to_selection` only yields a
+    // Range when BOTH bounds are present, so a lone bound would silently fall
+    // through to `PartitionSelection::Latest` — rebuilding one partition of a
+    // scope the reviewer approved as "from January". The CLI now rejects lone
+    // bounds at parse time; this guards plans persisted before that (or
+    // hand-authored plan files).
+    if run_plan.partition_from.is_some() != run_plan.partition_to.is_some() {
+        bail!(
+            "backfill plan '{plan_id}' carries a half-open partition window \
+             (from: {:?}, to: {:?}) — executing it would rebuild only the \
+             latest partition, not the approved range. Re-compose the backfill \
+             with both --from and --to (or neither).",
+            run_plan.partition_from,
+            run_plan.partition_to,
+        );
+    }
+
     // Only the partition window carries over — a backfill never resumes,
     // shadows, or runs `--latest`/`--missing`.
     let partition_opts = crate::commands::run::PartitionRunOptions {

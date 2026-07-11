@@ -185,13 +185,24 @@ impl CircuitBreaker {
     /// failure counter; in `HalfOpen` it also closes the breaker.
     /// Returns [`TransitionOutcome::Recovered`] when a HalfOpen → Closed
     /// transition happened, otherwise [`TransitionOutcome::Unchanged`].
+    ///
+    /// In `Open` the breaker stays Open: recovery goes exclusively through
+    /// the timeout → HalfOpen → trial path. Closing from Open here would let
+    /// an in-flight success that raced the trip (or, for the run loop's
+    /// shared breaker, any later model's clean build) silently re-arm — the
+    /// `[resilience]` contract is "once tripped, no further model is retried
+    /// for the rest of the run", and event subscribers would see Open end
+    /// with no `Recovered` transition.
     pub fn record_success(&self) -> TransitionOutcome {
         self.consecutive_failures.store(0, Ordering::Release);
-        let prev = self.state.swap(STATE_CLOSED, Ordering::AcqRel);
-        if prev == STATE_HALF_OPEN {
-            TransitionOutcome::Recovered
-        } else {
-            TransitionOutcome::Unchanged
+        match self.state.compare_exchange(
+            STATE_HALF_OPEN,
+            STATE_CLOSED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => TransitionOutcome::Recovered,
+            Err(_) => TransitionOutcome::Unchanged,
         }
     }
 
@@ -302,6 +313,20 @@ mod tests {
         assert_eq!(cb.record_success(), TransitionOutcome::Unchanged);
         cb.record_failure("err 3");
         assert!(!cb.is_tripped()); // counter was reset
+    }
+
+    #[test]
+    fn test_success_while_open_does_not_close() {
+        // A straggler success racing the trip (it passed `check()` before the
+        // breaker opened) must not silently re-arm: Open recovers exclusively
+        // via timeout → HalfOpen → trial, and — for the run loop's shared
+        // breaker — "once tripped, no further model is retried this run".
+        let cb = CircuitBreaker::new(1);
+        cb.record_failure("boom");
+        assert!(cb.is_tripped());
+        assert_eq!(cb.record_success(), TransitionOutcome::Unchanged);
+        assert!(cb.is_tripped(), "Open must survive a raced success");
+        assert!(cb.check().is_err());
     }
 
     #[test]
