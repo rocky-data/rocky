@@ -231,21 +231,23 @@ pub(crate) fn run_backfill_in(
     // skips the mask. An empty map ⇒ empty `effective_masks`.
     let resolved_mask: std::collections::BTreeMap<String, rocky_ir::MaskStrategy> =
         std::collections::BTreeMap::new();
-    // Capture the REVIEWED source-schema snapshot (finding #2b) the same way
-    // `compile_project` seeded the compile above (cache, `ttl_override(None)`),
-    // so apply replays these exact schemas → `typed_columns` cannot drift.
-    let reviewed_source_schemas: std::collections::BTreeMap<
-        String,
-        Vec<rocky_compiler::types::TypedColumn>,
-    > = backfill_cfg
-        .as_ref()
-        .map(|cfg| {
-            let schema_cfg = cfg.cache.schemas.clone().with_ttl_override(None);
-            crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
-        })
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    // Capture the REVIEWED source-schema snapshot (finding #2) the same way
+    // `compile_project` seeded the compile above (cache, `ttl_override(None)`), so
+    // apply replays these exact schemas → `typed_columns` cannot drift. `Some` is
+    // authoritative even when empty (a cold cache → apply types from empty).
+    let reviewed_source_schemas: Option<
+        std::collections::BTreeMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    > = Some(
+        backfill_cfg
+            .as_ref()
+            .map(|cfg| {
+                let schema_cfg = cfg.cache.schemas.clone().with_ttl_override(None);
+                crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+    );
     // Fold the seeding-independent extras (surrogate-key sidecars #1, contract
     // presence/contents #3, effective mask C) into the bound fingerprint so the
     // apply-time TOCTOU gate rejects a post-plan swap of any, built from the SAME

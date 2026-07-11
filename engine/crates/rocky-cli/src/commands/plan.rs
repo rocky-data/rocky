@@ -1032,8 +1032,8 @@ pub fn compute_embedded_capabilities(
         models_fingerprint: None,
         config_identity,
         fingerprint_version: CURRENT_FINGERPRINT_VERSION,
-        // No fingerprint ⇒ apply refuses regardless; the snapshot is moot.
-        reviewed_source_schemas: std::collections::BTreeMap::new(),
+        // No fingerprint ⇒ apply refuses regardless; the snapshot is moot (`None`).
+        reviewed_source_schemas: None,
     };
 
     if !models_dir.is_dir() {
@@ -1064,17 +1064,19 @@ pub fn compute_embedded_capabilities(
             Err(_) => return failed(config_identity),
         }
     };
-    // Capture the REVIEWED source-schema snapshot (finding #2b) — the exact
-    // schemas the head compile typed against. Apply seeds its compile from this
-    // (via the plan payload) so `typed_columns` replay the reviewed schema, not a
-    // drifted live read. Name-sorted (BTreeMap) for a stable `plan_id` digest.
-    let reviewed_source_schemas: std::collections::BTreeMap<
-        String,
-        Vec<rocky_compiler::types::TypedColumn>,
-    > = source_schemas
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    // Capture the REVIEWED source-schema snapshot (finding #2) — the exact
+    // schemas the head compile typed against. `Some` is AUTHORITATIVE even when
+    // empty (a cold-cache plan captures `Some(empty)`, and apply must type from
+    // that, never a later-warmed live cache). Apply seeds its compile from this
+    // via the plan payload. Name-sorted (BTreeMap) for a stable `plan_id` digest.
+    let reviewed_source_schemas: Option<
+        std::collections::BTreeMap<String, Vec<rocky_compiler::types::TypedColumn>>,
+    > = Some(
+        source_schemas
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    );
     // Bind the compiled-IR fingerprint the gate authorizes so apply can refuse a
     // models/config change between planning and execution (TOCTOU), checked at
     // the single execution choke-point. Computed from the head compile that a

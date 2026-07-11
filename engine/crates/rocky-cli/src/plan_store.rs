@@ -240,21 +240,31 @@ pub struct EmbeddedCapabilities {
     /// FAILURE and the governed apply REFUSES (finding #7 — legacy vs failure).
     #[serde(default)]
     pub fingerprint_version: u32,
-    /// The REVIEWED source-schema snapshot (finding #2b) — the per-source typed
-    /// columns the plan-time compile resolved. Apply seeds its compile's
+    /// The REVIEWED source-schema snapshot (finding #2b/#2) — the per-source
+    /// typed columns the plan-time compile resolved. Apply seeds its compile's
     /// `source_schemas` from THIS snapshot instead of a live/cache read, so a
     /// post-plan source-schema drift (or a `[cache.schemas]` toggle / ttl change)
-    /// cannot change the executed `typed_columns` → the MERGE column list the
-    /// warehouse receives is exactly what was reviewed. Empty ⇒ apply falls back
-    /// to its live cache load (legacy plans, replication-only, or a creds-free
-    /// plan with no cached schemas). Bound into the `plan_id` (tamper-evident);
-    /// keyed by source table, name-sorted for a stable digest.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub reviewed_source_schemas: BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
+    /// cannot change the resolved `typed_columns` — apply types from exactly what
+    /// was reviewed. Bound into the `plan_id` (tamper-evident); keyed by source
+    /// table, name-sorted for a stable digest.
+    ///
+    /// `Some(map)` is **authoritative even when empty** (finding #2): a plan built
+    /// against a cold/missing schema cache captures `Some(empty)`, and apply MUST
+    /// type from that empty set — NOT fall through to a (later-warmed, agent-
+    /// swappable) live cache that could silently clear a reviewed diagnostic.
+    /// `None` marks a genuinely-legacy plan (`fingerprint_version < 2`) that has
+    /// no snapshot; a version-2 governed plan whose snapshot is `None` is a
+    /// production capture failure and the governed apply REFUSES (fail-closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_source_schemas:
+        Option<BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
 }
 
 /// The fingerprint feature version this binary stamps onto every plan it writes.
-pub const CURRENT_FINGERPRINT_VERSION: u32 = 1;
+///
+/// v2 (finding #2): every plan now carries an authoritative `Some` reviewed
+/// source-schema snapshot; a v2 governed plan whose snapshot is absent refuses.
+pub const CURRENT_FINGERPRINT_VERSION: u32 = 2;
 
 /// The principal an absent stamp resolves to, **by kind** (never a blanket
 /// `human`): an `ai_authored` plan is agent-authored by construction
@@ -689,7 +699,7 @@ mod tests {
             models_fingerprint: Some("fp".to_string()),
             config_identity: Some("cfg".to_string()),
             fingerprint_version: CURRENT_FINGERPRINT_VERSION,
-            reviewed_source_schemas: BTreeMap::from([(
+            reviewed_source_schemas: Some(BTreeMap::from([(
                 "main.src".to_string(),
                 vec![
                     TypedColumn {
@@ -706,7 +716,7 @@ mod tests {
                         nullable: true,
                     },
                 ],
-            )]),
+            )])),
         };
         let plan_id = write_plan_governed(
             dir.path(),
@@ -1217,7 +1227,7 @@ mod tests {
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
         };
         let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
         assert_eq!(
@@ -1239,7 +1249,7 @@ mod tests {
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
         };
         assert!(caps.touched(&[]).is_empty());
     }
@@ -1263,7 +1273,7 @@ mod tests {
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
         };
         let touched = caps.touched(&["stg_orders".to_string(), "fct_sales".to_string()]);
         assert_eq!(
@@ -1292,7 +1302,7 @@ mod tests {
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
         };
         // Only `orders` executes; the change to the non-executing `customers`
         // is absent from the touched set.

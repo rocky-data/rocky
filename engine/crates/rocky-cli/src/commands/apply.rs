@@ -1236,12 +1236,14 @@ pub struct ExecFingerprintGate {
     /// building [`ExecutionExtras`] (finding C — an unused mask entry must not
     /// refuse). Carried here because `execute_models` has no `env`/`cfg`.
     pub resolved_mask: BTreeMap<String, rocky_ir::MaskStrategy>,
-    /// The plan-authorized REVIEWED source-schema snapshot (finding #2b). When
-    /// non-empty, the choke-point seeds its compile's `source_schemas` from this
-    /// so `typed_columns` (→ the MERGE column list) replay the reviewed schema,
-    /// not a drifted live/cache read. Carried here because `execute_models` has
-    /// no plan handle.
-    pub reviewed_source_schemas: BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
+    /// The plan-authorized REVIEWED source-schema snapshot (finding #2). `Some`
+    /// (authoritative even if empty) ⇒ the choke-point seeds its compile's
+    /// `source_schemas` from EXACTLY this, never the live cache, so `typed_columns`
+    /// replay the reviewed schema. `None` on a genuinely-legacy plan; a required
+    /// (v2 governed) plan with `None` REFUSES. Carried here because
+    /// `execute_models` has no plan handle.
+    pub reviewed_source_schemas:
+        Option<BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
     /// The plan id, for the refusal message.
     pub plan_id: String,
     /// `true` when the plan is a NEW (`fingerprint_version >= 1`) governed plan
@@ -1331,13 +1333,12 @@ pub struct GovernedRunContext<'a> {
     /// that MUST carry a fingerprint/identity: a missing one is a production
     /// failure and REFUSES (finding #7), not a legacy skip.
     pub require_fingerprint: bool,
-    /// The plan-authorized REVIEWED source-schema snapshot (finding #2b). Apply
-    /// seeds its compile's `source_schemas` from this instead of a live/cache
-    /// read, so a post-plan source-schema drift cannot change `typed_columns` →
-    /// the executed MERGE column list stays what was reviewed. Empty ⇒ apply
-    /// uses its live cache load.
+    /// The plan-authorized REVIEWED source-schema snapshot (finding #2). `Some`
+    /// (authoritative even if empty) ⇒ apply seeds its compile from EXACTLY this,
+    /// never the live cache. `None` on a legacy plan; a required plan with `None`
+    /// REFUSES (fail-closed).
     pub reviewed_source_schemas:
-        std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>,
+        Option<std::collections::BTreeMap<String, Vec<rocky_ir::types::TypedColumn>>>,
 }
 
 impl GovernedRunContext<'_> {
@@ -3085,7 +3086,7 @@ effect = "deny"
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
         };
         let touched = caps.touched(&["m".to_string()]);
         assert!(!touched.is_empty(), "FIX 3 must synthesize a touched set");
@@ -3122,7 +3123,7 @@ effect = "deny"
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
         };
         let touched = caps.touched(&["m".to_string()]);
         let gate = super::evaluate_apply_policy(
@@ -3152,7 +3153,7 @@ effect = "deny"
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
         };
         let touched = caps.touched(&["m".to_string()]);
         let gate = super::evaluate_apply_policy(
@@ -3339,7 +3340,7 @@ effect = "allow"
             models_fingerprint: None,
             config_identity: None,
             fingerprint_version: 0,
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
         };
         // Both models execute; only stg_x changed.
         let touched = caps.touched(&["stg_x".to_string(), "prod_critical".to_string()]);
@@ -3929,7 +3930,7 @@ auto_create_schemas = true
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
             resolved_mask: std::collections::BTreeMap::new(),
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
             plan_id: "p".to_string(),
             require: false,
         }
@@ -3941,7 +3942,7 @@ auto_create_schemas = true
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
             resolved_mask: std::collections::BTreeMap::new(),
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
             plan_id: "p".to_string(),
             require: true,
         }
@@ -3954,7 +3955,7 @@ auto_create_schemas = true
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
             resolved_mask: std::collections::BTreeMap::new(),
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
             plan_id: "p".to_string(),
             require: true,
         }
@@ -3966,7 +3967,7 @@ auto_create_schemas = true
                 config_identity: "DIFFERENT".to_string(),
                 governance_identity: "g".to_string(),
                 resolved_mask: std::collections::BTreeMap::new(),
-                reviewed_source_schemas: std::collections::BTreeMap::new(),
+                reviewed_source_schemas: None,
                 plan_id: "p".to_string(),
                 require: true,
             }
@@ -3981,7 +3982,7 @@ auto_create_schemas = true
                 config_identity: "c".to_string(),
                 governance_identity: "DIFFERENT".to_string(),
                 resolved_mask: std::collections::BTreeMap::new(),
-                reviewed_source_schemas: std::collections::BTreeMap::new(),
+                reviewed_source_schemas: None,
                 plan_id: "p".to_string(),
                 require: true,
             }
@@ -4018,7 +4019,7 @@ auto_create_schemas = true
             expected_ir_fingerprint: None,
             expected_config_identity: expected,
             require_fingerprint: require,
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
         };
         let authorized = super::config_policy_identity(&cfg_a);
         // Unchanged routing → proceeds.
@@ -4066,7 +4067,7 @@ effect = "deny"
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         let err = ctx
@@ -4112,7 +4113,7 @@ effect = "allow"
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
 
@@ -4160,7 +4161,7 @@ effect = "allow"
             expected_ir_fingerprint: None,
             expected_config_identity: None,
             require_fingerprint: false,
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: None,
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         ctx.gate_replication_targets(&targets, &ledger)

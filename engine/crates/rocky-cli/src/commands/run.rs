@@ -5151,38 +5151,50 @@ pub(crate) async fn execute_models(
         breaker: retry_breaker.as_ref(),
     };
 
-    // Source schemas for the typecheck that resolves `typed_columns` (→ the
-    // MERGE column list). A governed apply whose plan carries a REVIEWED
-    // source-schema snapshot (finding #2b) SEEDS from that snapshot, so a
-    // post-plan source-schema drift, cache refresh, or `[cache.schemas]` toggle
-    // cannot change the executed columns — apply types against exactly what was
-    // reviewed. `execute-from-owned`, like surrogate keys (#1). Every other path
-    // (bare `rocky run`, human apply, a plan with no captured snapshot) falls
-    // through to the live cache load below — byte-identical to before.
-    let reviewed_snapshot = exec_fp_gate
-        .map(|g| &g.reviewed_source_schemas)
-        .filter(|s| !s.is_empty());
-    let source_schemas = if let Some(snapshot) = reviewed_snapshot {
-        snapshot
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect::<std::collections::HashMap<_, _>>()
-    } else if schema_cache_config.enabled {
-        // Load the persisted schema cache directly from the live `StateStore` —
-        // no round-trip through `crate::source_schemas::load_cached_source_schemas`,
-        // because that helper opens a read-only handle and we already hold a
-        // write-capable one here. Degrades silently when the cache is cold.
-        match state_store {
-            Some(store) => rocky_compiler::schema_cache::load_source_schemas_from_cache(
-                store,
-                chrono::Utc::now(),
-                schema_cache_config.ttl(),
-            )
-            .unwrap_or_default(),
-            None => std::collections::HashMap::new(),
+    // Source schemas for the typecheck that resolves `typed_columns`. A governed
+    // apply whose plan carries a REVIEWED source-schema snapshot (finding #2)
+    // types from EXACTLY that snapshot — `Some(map)` is authoritative even when
+    // empty, so a post-plan source drift, cache refresh, `[cache.schemas]` toggle,
+    // or a later-warmed cache cannot change `typed_columns` (which could silently
+    // clear a reviewed diagnostic). `execute-from-owned`, like surrogate keys.
+    //
+    // Fail-closed: a REQUIRED (v2 governed) plan whose snapshot is `None` is a
+    // production capture failure → refuse (do NOT fall through to the live cache).
+    // Only a genuinely-legacy plan (`None` + `!require`) and the non-gated paths
+    // (bare `rocky run`, human apply) load the live cache — byte-identical.
+    let cache_source_schemas = || {
+        if schema_cache_config.enabled {
+            match state_store {
+                Some(store) => rocky_compiler::schema_cache::load_source_schemas_from_cache(
+                    store,
+                    chrono::Utc::now(),
+                    schema_cache_config.ttl(),
+                )
+                .unwrap_or_default(),
+                None => std::collections::HashMap::new(),
+            }
+        } else {
+            std::collections::HashMap::new()
         }
-    } else {
-        std::collections::HashMap::new()
+    };
+    let source_schemas = match exec_fp_gate {
+        Some(gate) => match &gate.reviewed_source_schemas {
+            Some(snapshot) => snapshot
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<std::collections::HashMap<_, _>>(),
+            None if gate.require => {
+                anyhow::bail!(
+                    "refusing to execute plan '{}': it is a governed plan carrying no reviewed \
+                     source-schema snapshot, so `typed_columns` cannot be replayed against the \
+                     reviewed schema (a warmed/drifted cache could change them undetected). \
+                     Re-plan with `rocky plan` before applying.",
+                    gate.plan_id
+                );
+            }
+            None => cache_source_schemas(), // genuinely-legacy plan
+        },
+        None => cache_source_schemas(), // bare run / human apply
     };
 
     let compile_config = rocky_compiler::compile::CompilerConfig {
@@ -5943,7 +5955,9 @@ pub(crate) async fn execute_models(
                 // The fully-typed IR, not bare `to_model_ir()`: an empty
                 // `typed_columns` forces `skip_hash()` to the never-equal
                 // `None` sentinel, which made this gate silently inert on the
-                // real CLI path (every evaluation fell through to build).
+                // real CLI path (every evaluation fell through to build). The
+                // seeded typed IR (typed from the reviewed source-schema
+                // snapshot #2) is what the column-skip decision consumes (#3).
                 let model_ir = typed_model_ir(
                     model,
                     exec_ctx.typed_models,
@@ -6039,7 +6053,8 @@ pub(crate) async fn execute_models(
                 // declared column count (0 when unenriched) disagrees with the
                 // warehouse result, and an empty `typed_columns` also nulls
                 // `skip_hash()`, so the reuse spine / provenance ledger was
-                // never populated by a real `rocky run`.
+                // never populated by a real `rocky run`. Seeded from the
+                // reviewed source-schema snapshot (#2) so CAS consumes it (#3).
                 let model_ir = typed_model_ir(
                     model,
                     exec_ctx.typed_models,
@@ -11777,7 +11792,7 @@ merge_keys = ["id"]
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
             require: true,
         };
@@ -11932,7 +11947,7 @@ merge_keys = ["id"]
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
             resolved_mask: resolved_mask.clone(),
-            reviewed_source_schemas: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
             require: true,
         };
@@ -12164,7 +12179,7 @@ merge_keys = ["id"]
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
-            reviewed_source_schemas: snapshot,
+            reviewed_source_schemas: Some(snapshot),
             plan_id: "p".to_string(),
             require: false,
         };
