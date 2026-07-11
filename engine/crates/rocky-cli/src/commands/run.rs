@@ -12098,6 +12098,76 @@ merge_keys = ["id"]
         );
     }
 
+    /// A SMOKE TEST (real DuckDB): a governed apply whose gate carries a NON-EMPTY
+    /// `reviewed_source_schemas` snapshot (finding A) exercises the seed override
+    /// in `execute_models` — the branch that replays the reviewed source schema
+    /// into the typecheck instead of the live cache. Every other test uses an
+    /// empty snapshot, so this is the only runtime coverage of that
+    /// production-reachable branch: it must run, not panic, and materialize.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn nonempty_source_schema_snapshot_seed_runs() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_ir::RockyType;
+        use rocky_ir::types::TypedColumn;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        // A source-free `full_refresh` model: the snapshot is loaded (exercising
+        // the seed branch) but the CTAS types itself, so it materializes cleanly.
+        write_model_with_target(&models, "orders", "SELECT 1 AS id", "main", "orders");
+        let db = dir.path().join("wh.duckdb");
+        let snapshot = std::collections::BTreeMap::from([(
+            "main.src".to_string(),
+            vec![TypedColumn {
+                name: "id".to_string(),
+                data_type: RockyType::Int64,
+                nullable: false,
+            }],
+        )]);
+        let gate = crate::commands::apply::ExecFingerprintGate {
+            expected: None,
+            config_identity: "cfg".to_string(),
+            governance_identity: String::new(),
+            resolved_mask: std::collections::BTreeMap::new(),
+            reviewed_source_schemas: snapshot,
+            plan_id: "p".to_string(),
+            require: false,
+        };
+        let adapter = DuckDbWarehouseAdapter::open(&db).expect("open duckdb");
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::execute_models(
+            &models,
+            &adapter as &dyn rocky_core::traits::WarehouseAdapter,
+            None,
+            &PartitionRunOptions::default(),
+            "seed-run",
+            None,
+            None,
+            &mut output,
+            None,
+            None,
+            &rocky_core::config::SchemaCacheConfig::default(),
+            true,
+            &DeferOptions::default(),
+            super::SkipGateConfig::off(),
+            false,
+            false,
+            &rocky_core::run_vars::RunVars::new(),
+            rocky_core::config::ResilienceConfig::default(),
+            true,
+            Some(&gate),
+        )
+        .await
+        .expect("the non-empty-snapshot seed branch must run, not panic");
+        assert_eq!(
+            output.tables_failed, 0,
+            "the model materialized under a non-empty reviewed-schema seed (errors: {:?})",
+            output.errors
+        );
+    }
+
     /// 🔴 KILL-CHECK (unchanged plan→apply does NOT refuse, with the new
     /// inputs): the REAL plan-side `compute_embedded_capabilities` must produce
     /// the SAME fingerprint the apply-side choke-point recomputes, for a project
