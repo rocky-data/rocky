@@ -16,7 +16,7 @@ import os
 import signal
 import subprocess
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, MutableSequence
 from typing import IO
 
 _log = logging.getLogger("rocky_sdk")
@@ -51,7 +51,7 @@ def redact_argv(argv: list[str]) -> list[str]:
 def forward_stderr_to_sink(
     stderr: Iterable[str] | None,
     log_line: Callable[[str], None],
-    sink: list[str],
+    sink: MutableSequence[str],
     *,
     mirror_to_stderr: bool = False,
 ) -> None:

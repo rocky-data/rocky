@@ -488,7 +488,9 @@ def test_write_state_optimize_slot_propagates_validation_error(
 
     component = RockyComponent(
         config_path="rocky.toml",
-        models_dir=_missing_models_dir(tmp_path),  # skip compile
+        # Real models dir so optimize actually runs (it is now guarded by
+        # models_dir.is_dir() like compile — see the skip test below).
+        models_dir=_existing_models_dir(tmp_path),
         surface_optimize_metadata=True,
     )
 
@@ -497,6 +499,34 @@ def test_write_state_optimize_slot_propagates_validation_error(
 
     assert excinfo.value.metadata is not None
     assert excinfo.value.metadata["command"].text == "optimize"
+
+
+def test_write_state_optimize_skipped_when_no_models_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    """A replication-only project (no models dir) must NOT spawn ``rocky
+    optimize`` — there are no transformation models to analyze. Guarded like
+    ``_compile_payload``, so a would-be optimize error never even fires."""
+    discover = _make_discover_result()
+    stub = _StubResource(
+        discover_result=discover,
+        # If optimize were (wrongly) invoked, this would raise and fail the run.
+        optimize_result=RuntimeError("optimize must not be called without a models dir"),
+    )
+    _install_stub_resource(monkeypatch, stub)
+
+    component = RockyComponent(
+        config_path="rocky.toml",
+        models_dir=_missing_models_dir(tmp_path),
+        surface_optimize_metadata=True,
+    )
+    state_path = tmp_path / "state"
+
+    # Must not raise: optimize is skipped, discover state still written.
+    component.write_state_to_path(state_path)
+    state = json.loads(state_path.read_text())
+    assert "optimize" not in state or state["optimize"] is None
 
 
 def test_write_state_discover_failure_writes_empty_envelope(
