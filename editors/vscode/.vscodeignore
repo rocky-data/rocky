@@ -5,6 +5,8 @@ src/**
 scripts/**
 out/**
 node_modules/**
+recording/**
+media/demo-*.gif
 eslint.config.mjs
 esbuild.mjs
 vitest.config.ts
@@ -14,4 +16,5 @@ AGENTS.md
 CLAUDE.md
 DEVELOPMENT.md
 **/*.ts
+**/*.tsx
 **/*.map
