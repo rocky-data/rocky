@@ -133,12 +133,14 @@ pub async fn compute_review(
     let reviewable = plan.kind == PlanKind::AiAuthored
         || plan.kind == PlanKind::Backfill
         || plan.kind == PlanKind::Gc
+        || plan.kind == PlanKind::Restore
         || (plan.kind == PlanKind::Run
             && plan.resolved_principal() == rocky_core::config::PolicyPrincipal::Agent);
     if !reviewable {
         bail!(
             "plan '{plan_id}' is a {} plan authored by {}; `rocky review` only applies to \
-             AI-authored plans, agent-authored run plans, backfills, and gc plans.",
+             AI-authored plans, agent-authored run plans, backfills, gc plans, and restore \
+             plans.",
             plan.kind,
             serde_json::to_value(plan.resolved_principal())
                 .ok()
@@ -147,12 +149,12 @@ pub async fn compute_review(
         );
     }
 
-    // A gc plan carries a `GcPlan` payload (not a `RunPlan`) and changes no
-    // model definitions, so the breaking-change gate does not apply — reviewing
-    // it is purely the human sign-off that unblocks the eviction. Branch here,
-    // before the `RunPlan` deserialize the other kinds need.
-    if plan.kind == PlanKind::Gc {
-        return compute_review_gc_plan(root, plan_id, approve).await;
+    // A gc / restore plan carries its own payload shape (not a `RunPlan`) and
+    // changes no model definitions, so the breaking-change gate does not apply
+    // — reviewing it is purely the human sign-off that unblocks the apply.
+    // Branch here, before the `RunPlan` deserialize the other kinds need.
+    if plan.kind == PlanKind::Gc || plan.kind == PlanKind::Restore {
+        return compute_review_gc_plan(root, plan_id, approve, &plan.kind).await;
     }
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
@@ -219,14 +221,21 @@ pub async fn compute_review(
     })
 }
 
-/// Review (and optionally approve) a `PlanKind::Gc` reclamation plan.
+/// Review (and optionally approve) a `PlanKind::Gc` reclamation plan or a
+/// `PlanKind::Restore` restoration plan.
 ///
-/// A gc plan changes no model definitions, so there is no breaking-change gate
-/// to compute — reviewing it is the human sign-off that unblocks the eviction.
+/// Neither changes model definitions, so there is no breaking-change gate to
+/// compute — reviewing is the human sign-off that unblocks the apply.
 /// `--approve` writes the same marker (`<plan_id>.reviewed.json`) the apply gate
 /// checks; without it, apply stays blocked. The marker is payload-agnostic, so
 /// the existing `ai_plan_is_reviewed` gate in `commands::apply` recognises it.
-async fn compute_review_gc_plan(root: &Path, plan_id: &str, approve: bool) -> Result<ReviewOutput> {
+/// Both verbs are symmetric-caution gated: even a human goes through review.
+async fn compute_review_gc_plan(
+    root: &Path,
+    plan_id: &str,
+    approve: bool,
+    kind: &PlanKind,
+) -> Result<ReviewOutput> {
     let mut marker_written = false;
     if approve {
         let approver =
@@ -248,22 +257,32 @@ async fn compute_review_gc_plan(root: &Path, plan_id: &str, approve: bool) -> Re
         tracing::info!(
             target: "rocky::review",
             plan_id,
-            "gc plan approved — review marker written"
+            kind = %kind,
+            "gc/restore plan approved — review marker written"
         );
     }
 
-    let message = if approve {
-        format!(
+    let message = match (kind, approve) {
+        (PlanKind::Restore, true) => format!(
+            "approved restore plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked. Apply \
+             rebuilds each artifact from its recorded recipe and asserts the recomputed blake3 \
+             equals the tombstoned hash before any write becomes visible."
+        ),
+        (PlanKind::Restore, false) => format!(
+            "reviewed restore plan '{plan_id}' — re-run with `--approve` to unblock \
+             `rocky apply {plan_id}`. Restoration is symmetric-caution gated: even a human \
+             restore goes through review."
+        ),
+        (_, true) => format!(
             "approved gc plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked. Apply \
              re-verifies each artifact against the live ledger before deleting, and every \
              eviction is tombstoned for restore."
-        )
-    } else {
-        format!(
+        ),
+        (_, false) => format!(
             "reviewed gc plan '{plan_id}' — re-run with `--approve` to unblock \
              `rocky apply {plan_id}`. Deletion is symmetric-caution gated: even a human gc goes \
              through review."
-        )
+        ),
     };
 
     Ok(ReviewOutput {

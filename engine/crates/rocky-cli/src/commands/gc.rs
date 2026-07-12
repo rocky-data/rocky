@@ -134,7 +134,12 @@ fn check_recipe_recorded(class: &ReplayCheckModelOutput) -> GcCheckOutput {
 /// when the provenance recorded paths, the aligned object path) must appear
 /// among the provenance's recorded outputs. Anything else fails closed. This is
 /// what makes the hash — not the `(run, model)` pair — the eviction identity.
-fn check_recipe_produces_output(
+///
+/// Shared with `rocky restore` (`crate::commands::restore`), which re-runs the
+/// same binding check before re-deriving a tombstoned artifact — the restore's
+/// rebuild claim is bound to the exact evicted hash the same way the eviction
+/// verdict was.
+pub(crate) fn check_recipe_produces_output(
     artifact_hash: &str,
     artifact_path: &str,
     prov: Option<&ProvenanceRecord>,
@@ -909,7 +914,7 @@ fn print_plan_table(output: &GcPlanOutput) {
 // ===========================================================================
 
 /// The manifest-truth reclaimability verdict for a candidate artifact.
-enum ReclaimVerdict {
+pub(crate) enum ReclaimVerdict {
     /// The candidate's file is **affirmatively proven removed** in its own
     /// table's Delta log (an external compaction/VACUUM retired it) — the
     /// ledger row may be tombstoned + retired. Carries the Delta head version
@@ -940,7 +945,7 @@ enum ReclaimVerdict {
 ///
 /// Injectable so tests exercise the SAME decision path over an in-memory store.
 #[async_trait]
-trait LivenessOracle: Send + Sync {
+pub(crate) trait LivenessOracle: Send + Sync {
     /// `storage_prefix` is the candidate table's root; `file_path` is the
     /// artifact's object path; `commit_version` is its recorded Delta version.
     async fn reclaim_verdict(
@@ -988,7 +993,9 @@ impl LivenessOracle for ManifestLivenessOracle {
 
 /// Map a strict [`RemovalProof`] to the gc [`ReclaimVerdict`]: only an
 /// affirmative `ProvenRemoved` reclaims; every hold reason is surfaced.
-fn map_removal_proof(proof: &rocky_iceberg::uniform_writer::RemovalProof) -> ReclaimVerdict {
+pub(crate) fn map_removal_proof(
+    proof: &rocky_iceberg::uniform_writer::RemovalProof,
+) -> ReclaimVerdict {
     use rocky_iceberg::uniform_writer::RemovalProof;
     match proof {
         RemovalProof::ProvenRemoved { head_version } => ReclaimVerdict::Reclaimable {
@@ -1021,9 +1028,9 @@ fn gc_apply_notes() -> Vec<String> {
          TOCTOU-safe deletion against concurrent re-adds), which is future work. Setting `[gc] \
          physical_delete = true` is a hard error until then."
             .to_string(),
-        "Restore (evict → rebuild → bit-exact) is a later phase and is not exercised here — an \
-         evicted artifact's tombstone captures the recipe to rebuild it, but the roundtrip is \
-         unverified."
+        "Every eviction is restorable: `rocky restore <target>` writes a review-gated plan that \
+         rebuilds the artifact from its tombstone's recorded recipe and asserts the recomputed \
+         blake3 equals the tombstoned hash before any write becomes visible."
             .to_string(),
         "KNOWN LIMITATION: the liveness gate is a conservative-best-effort reader of the Delta \
          log, not a full Delta-protocol implementation. It HOLDs on any log shape it cannot \
@@ -1239,6 +1246,8 @@ async fn execute_gc_apply(
                     plan_id: plan_id.to_string(),
                     physical_reclaimed: false,
                     observed_delta_version: Some(head_version),
+                    restored_at: None,
+                    restore_plan_id: None,
                 };
 
                 // Atomic tombstone + ledger-row retirement, hash-checked inside
@@ -1365,7 +1374,9 @@ async fn execute_gc_apply(
 /// relative to the config file's parent — the same derivation
 /// `crate::scope::resolve_transformation_managed_tables` uses. Falls back to
 /// `models` when no config or no transformation pipeline is present.
-fn gc_models_dir(
+///
+/// Shared with the `rocky restore` apply seam, which gates policy the same way.
+pub(crate) fn gc_models_dir(
     cfg: Option<&rocky_core::config::RockyConfig>,
     config_path: &Path,
 ) -> std::path::PathBuf {
@@ -1424,7 +1435,7 @@ pub(crate) async fn run_gc_apply_in(
 
 /// [`run_gc_apply_in`] with an injectable [`LivenessOracle`] — the real path
 /// passes [`ManifestLivenessOracle`]; tests pass a deterministic oracle.
-async fn run_gc_apply_in_with(
+pub(crate) async fn run_gc_apply_in_with(
     root: &Path,
     config_path: &Path,
     plan_id: &str,

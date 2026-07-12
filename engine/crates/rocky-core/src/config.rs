@@ -2716,6 +2716,8 @@ pub enum PolicyCapability {
     Backfill,
     /// Garbage-collect / reclaim storage.
     Gc,
+    /// Restore a gc-evicted artifact from its tombstone (rebuild + verify).
+    Restore,
     /// Retry a failed run.
     Retry,
     /// Quarantine a partition / model.

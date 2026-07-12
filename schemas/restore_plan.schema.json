@@ -1,0 +1,138 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "RestorePlanRestoration": {
+      "description": "One tombstoned artifact scheduled for restoration inside a persisted `rocky restore` plan ([`RestorePlan`]).\n\nCaptures the tombstone's full identity — enough to (a) re-locate the exact live tombstone at apply time (the plan is advisory; apply re-resolves against the live custody ledger), and (b) report the restoration to the reviewer. Identity is always the full `(run, model, path, hash)` tuple.",
+      "properties": {
+        "blake3_hash": {
+          "description": "Content hash (hex) of the evicted bytes — the identity the restore re-computes and asserts equality against **before any write**.",
+          "type": "string"
+        },
+        "commit_version": {
+          "description": "Delta commit version the artifact was attached to, for correlation.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "evicted_at": {
+          "description": "When the artifact was evicted (RFC 3339) — with the hash, this is the tombstone's ledger key.",
+          "type": "string"
+        },
+        "file_path": {
+          "description": "Object-store path the restore re-materializes to (the tombstoned location).",
+          "type": "string"
+        },
+        "gc_plan_id": {
+          "description": "The `rocky gc` plan that authorized the eviction (custody back-link).",
+          "type": "string"
+        },
+        "input_hash": {
+          "description": "Input-closure hash captured on the tombstone; `null` when unrecorded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_proof_class": {
+          "description": "Input match-strength (`strong` / `heuristic`); `null` when unrecorded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_name": {
+          "description": "Model that produced the evicted artifact.",
+          "type": "string"
+        },
+        "recipe_hash": {
+          "description": "Recipe-identity hash captured on the tombstone; `null` when unrecorded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "description": "Run that produced it — half of the provenance key the restore replays from.",
+          "type": "string"
+        },
+        "size_bytes": {
+          "description": "Physical size of the evicted artifact in bytes.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "blake3_hash",
+        "commit_version",
+        "evicted_at",
+        "file_path",
+        "gc_plan_id",
+        "model_name",
+        "run_id",
+        "size_bytes"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output of `rocky restore <target>` (plan mode).\n\nThe plan has been written to the plan store; this reports its id and the resolved tombstone(s). Restoration is symmetric-caution gated like gc: the operator must `rocky review <plan-id> --approve` and then `rocky apply <plan-id>` — the plan itself writes nothing.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "notes": {
+      "description": "Operator caveats (re-derivation source, hash-exactness gate, no-overwrite rule).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "plan_id": {
+      "description": "The persisted plan id — pass to `rocky review` then `rocky apply`.",
+      "type": "string"
+    },
+    "restoration_count": {
+      "description": "Number of tombstoned artifacts the plan restores.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "restorations": {
+      "description": "The resolved restorations.",
+      "items": {
+        "$ref": "#/definitions/RestorePlanRestoration"
+      },
+      "type": "array"
+    },
+    "review_required": {
+      "description": "Always `true`: a restore plan is unconditionally review-gated.",
+      "type": "boolean"
+    },
+    "target": {
+      "description": "The user-supplied target the resolution matched.",
+      "type": "string"
+    },
+    "total_bytes": {
+      "description": "Total tombstoned bytes the plan restores.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "notes",
+    "plan_id",
+    "restoration_count",
+    "restorations",
+    "review_required",
+    "target",
+    "total_bytes",
+    "version"
+  ],
+  "title": "RestorePlanOutput",
+  "type": "object"
+}

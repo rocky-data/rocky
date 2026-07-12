@@ -16456,6 +16456,8 @@ merge_keys = ["id"]
             plan_id: "plan-test".to_string(),
             physical_reclaimed: false,
             observed_delta_version: None,
+            restored_at: None,
+            restore_plan_id: None,
         };
         let outcome = store
             .evict_artifact(&tombstone, "run-1", "fct", &file_path)

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rocky restore` — rebuild a gc-evicted artifact from its tombstone, hash-exact.** A gc tombstone claims "these bytes can be rebuilt"; `rocky restore <target>` is the proof. It resolves the tombstone by model name, `model@<recipe-hash-prefix>`, or content hash (refusing an ambiguous target with the candidates listed, and distinguishing "never evicted" from "not found"), then writes a review-gated restore plan. `rocky apply <plan>` re-derives the artifact from the recorded recipe **on the recording engine** (the project's configured warehouse — a content-addressed artifact is only reproducible bit-for-bit on the engine that wrote it), verifies the recomputed content hash equals the tombstoned hash **before anything is written**, and only then re-materializes to the original path and reinstates the ledger row — the tombstone is kept, stamped with the restore for an auditable evict→restore history. Every failure mode is fail-closed: a recipe that no longer reproduces the exact bytes refuses and writes nothing, bytes already present with a different hash are never overwritten, and restore is symmetric-caution gated like gc (even a human restore goes through review; policy can only tighten). This closes the reclaim→replay loop that makes gc eviction safe. (#1103)
+
+### Changed
+
+- State schema `v19 → v20`: two serde-defaulted restore-custody fields on the tombstone record (`restored_at`, `restore_plan_id`) so a consumed tombstone records who restored it and when, without leaving the eviction ledger. Additive — older (v19) state opens forward-compatibly. As with prior bumps the schema-version-qualified **remote** state key rotates, so a `state_sync`-backed deployment starts a fresh remote copy at the new key on its first post-upgrade sync; local state migrates in place. (#1103)
+
 ## [1.63.0] - 2026-07-10
 
 ### Added

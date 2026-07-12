@@ -178,6 +178,17 @@ pub(crate) async fn run_apply_in(
             )
             .await
         }
+        PlanKind::Restore => {
+            super::restore::run_restore_apply_in(
+                root,
+                config_path,
+                plan_id,
+                state_path,
+                runtime_principal,
+                output_json,
+            )
+            .await
+        }
     }
 }
 
