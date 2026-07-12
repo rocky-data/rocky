@@ -7502,11 +7502,16 @@ pub struct ReplayCheckInputOutput {
 
 /// JSON output for `rocky replay --at <run_id> --execute [--verify]`.
 ///
-/// Re-execution surface (DuckDB). Each model's recipe is reconstructed from its
+/// Re-execution surface. Each model's recipe is reconstructed from its
 /// recorded [`rocky_core::state::ProvenanceRecord`] — never the working tree —
-/// re-executed on an in-memory DuckDB engine, and its output artifact's blake3
-/// re-derived. With `--verify` that digest is compared against the recorded
-/// output hash and a per-model verdict is emitted.
+/// re-executed, and its output artifact's blake3 re-derived. With `--verify`
+/// that digest is compared against the recorded output hash and a per-model
+/// verdict is emitted. Execution runs on an in-memory DuckDB engine by
+/// default; with `--warehouse` it runs on the configured live warehouse
+/// instead, materializing replayed outputs into an isolated replay schema
+/// (see `replay_schema`) and encoding the recomputed artifact with the live
+/// table's physical column mapping so the digest is directly comparable to
+/// what the content-addressed writer recorded.
 ///
 /// Two modes share this shape:
 ///
@@ -7521,9 +7526,10 @@ pub struct ReplayCheckInputOutput {
 ///   upstream not produced by any model in this run, or a mutable-source
 ///   watermark, is likewise `non_replayable` rather than substituted.
 ///
-/// Nothing is materialized to any warehouse schema: the entire in-memory engine
-/// is an ephemeral replay namespace, discarded after the run, so no production
-/// identity is ever touched.
+/// No production identity is ever touched in either mode: the local path's
+/// entire in-memory engine is an ephemeral replay namespace discarded after
+/// the run, and the warehouse path writes only into the isolated
+/// `replay_schema`, dropped after the run unless `--keep` is passed.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ReplayExecuteOutput {
     pub version: String,
@@ -7538,6 +7544,18 @@ pub struct ReplayExecuteOutput {
     /// Number of models whose re-execution reproduced the recorded output
     /// byte-for-byte. Always `0` when `--verify` was not requested.
     pub bit_exact_count: usize,
+    /// Isolated warehouse schema the replayed outputs were materialized
+    /// into (`--warehouse` only; absent on the local re-execution path).
+    /// Replay never writes to the production location of any recorded
+    /// target — every replayed table lands in this namespace, one schema
+    /// per catalog touched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_schema: Option<String>,
+    /// Whether the replay namespace was removed after the run
+    /// (`--warehouse` only). `true` when no replay schema remains on the
+    /// warehouse; `false` when `--keep` was passed or a drop failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_schema_dropped: Option<bool>,
     pub models: Vec<ReplayExecuteModelOutput>,
 }
 

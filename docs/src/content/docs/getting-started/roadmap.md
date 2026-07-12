@@ -11,7 +11,7 @@ The trust primitives (compiler, branches, run records, lineage, contracts, cost 
 
 - **Databricks** is the production target for 2026: SQL Statement API, Unity Catalog, OAuth M2M, adaptive concurrency, and schema-prefix branches (warehouse-native `SHALLOW CLONE` is a follow-up).
 - **The compiler.** Typed column-level inference, the diagnostic codes, and the LSP all run the same in CI and in your editor.
-- **Branches and run records.** Named branches as isolated schemas, and a content-addressed record of each run that you inspect and verify against the ledger with `rocky replay`. (Re-execution from the pinned record is on the 2026 roadmap.)
+- **Branches and run records.** Named branches as isolated schemas, and a content-addressed record of each run that you inspect and verify against the ledger with `rocky replay`. For deterministic content-addressed models, `rocky replay --execute --verify` re-runs the recorded recipe to reproduce the output bit-for-bit — locally or, with `--warehouse`, on the live warehouse in an isolated replay schema.
 - **Cost attribution.** Per-model cost on every run record, with `[budget]` blocks that fail a run on overspend.
 - **The AI compile-validate loop.** `rocky ai` generates a model, compiles it, and auto-fixes parse errors before it lands.
 - **Deterministic surrogate keys.** A model declares a [`[[surrogate_key]]`](/reference/model-format/#surrogate_key) block, and `rocky run` injects a dialect-correct hash column at materialization on DuckDB, Databricks, Snowflake, and BigQuery. On a given warehouse the value matches what dbt Core's `dbt_utils.generate_surrogate_key` produces over the same columns, so a key joins across a Rocky/dbt Core boundary either way.

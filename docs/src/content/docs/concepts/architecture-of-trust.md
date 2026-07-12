@@ -101,11 +101,11 @@ The first is deterministic recording with ledger verification. Rocky records eac
 
 Alongside the run record, every materialization stamps a recipe-identity triple: `recipe_hash` (a fingerprint of the model's canonical typed IR, so the same program hashes the same no matter when it ran), `input_hash` (the inputs it read), and `env_hash` (the engine, adapter, and dialect it ran under). `rocky history --recipe <hash>` answers the audit question directly — "what produced this, and every other time this exact program ran." The triple is honest about strength: an `input_hash` proven by an observed freshness signature is tagged `heuristic` and is never presented as a byte-content claim, while a content-addressed input is `strong`. This is an identity and audit primitive, not a reproducibility claim.
 
-The second is re-execution from the pinned record: replaying a past run by feeding the recorded inputs back through the engine to reproduce its outputs from scratch. That is the follow-up. It arrives on top of the content-addressed write path, and it is not what `rocky replay` does now.
+The second is re-execution from the pinned record: replaying a past run by reconstructing each model's recipe from provenance (never the working tree) and re-running it to reproduce its output from scratch. `rocky replay --execute --verify` does this and compares the re-derived BLAKE3 against the recorded hash. It runs on a local DuckDB engine by default, or against the live warehouse with `--warehouse` — the latter materializes into an isolated `hcv2_replay_<run>` schema (never the recorded target's production location) and encodes the recomputed artifact with the target table's own physical column mapping, so a `bit_exact` verdict means the warehouse reproduced the recorded bytes exactly. Re-execution is scoped honestly: it covers deterministic, content-addressed models; a mutable-source read is `non_replayable` rather than re-run against current data, and a non-deterministic recipe is flagged so a `diverged` verdict there is expected rather than a failure.
 
-In short: deterministic recording and content-addressed verification today, re-execution from the record next.
+In short: deterministic recording and content-addressed verification, plus re-execution from the record for deterministic content-addressed models — locally or on the warehouse.
 
-**Partial.** Recording and ledger verification ship; re-execution from the record is the follow-up.
+**Shipped for deterministic content-addressed models.** Recording and ledger verification ship; re-execution ships for the deterministic content-addressed case (mutable-source models classified `non_replayable`, non-deterministic recipes flagged).
 
 Content-addressed materialization itself ships for single-writer Delta and UniForm: blake3-hashed Parquet files plus a Delta log commit, with Iceberg-compatible readers seeing the same snapshot. It is single-writer and does not yet cover multi-writer concurrency, broad schema evolution, or deletion vectors.
 
@@ -135,7 +135,7 @@ Every load-bearing claim, in one table. The partial and not-yet rows are where t
 | Dialect-divergence lint (`P001`) | Shipped | Opt-in via `--target-dialect`; error severity. |
 | VS Code trust overlays | Shipped | Exactly four: Drift, Breaking, Replay, Governance. |
 | Branches | Partial | Schema-prefix isolation with signed approval/promotion; no warehouse-native zero-copy clones yet. |
-| Replay | Partial | Deterministic recording + ledger verification today; re-execution from the pinned record is the follow-up. |
+| Replay | Partial | Deterministic recording + ledger verification, plus re-execution (`rocky replay --execute --verify`, local or `--warehouse`) for deterministic content-addressed models; mutable-source models are `non_replayable`, non-deterministic recipes flagged. |
 | Content-addressed writes | Partial | Single-writer Delta/UniForm; no multi-writer, broad schema evolution, or deletion vectors yet. |
 | Per-model cost | Partial | Billing-exact on BigQuery; a duration × DBU-rate estimate on Databricks and Snowflake; zero on DuckDB. Warehouse-reported-bytes plumbing on the non-BigQuery adapters is the follow-up. |
 | Declarative governance | Partial | Full on Databricks (Unity Catalog); `GRANT`/`REVOKE` only on Snowflake and BigQuery; no-op on DuckDB. |

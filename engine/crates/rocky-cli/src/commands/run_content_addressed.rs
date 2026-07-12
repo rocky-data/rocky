@@ -917,6 +917,89 @@ pub async fn execute_content_addressed_model(
     })
 }
 
+/// Re-derive a content-addressed model's output blake3 **against the live
+/// table's encoding identity**, without writing anything.
+///
+/// The warehouse replay path (`rocky replay --execute --warehouse`) uses this
+/// to make its recomputed digest directly comparable to the hash the live
+/// [`UniformWriter`] recorded: the recorded parquet was encoded with the
+/// table's physical column mapping (`col-<uuid>` names + field ids read from
+/// its `_delta_log`), so the replay must encode with the *same* discovered
+/// state — not the deterministic logical mapping the offline DuckDB replay
+/// pins.
+///
+/// Effects: one `discover()` (object-store GETs over the table's Delta log)
+/// and one `execute_query(sql)` on the warehouse. No object-store PUTs, no
+/// Delta commits, no DDL — this function never mutates the table, its log,
+/// or the CAS prefix.
+///
+/// `sql` is passed separately from `model_ir` because DAG replay may have
+/// redirected the recipe's in-run upstream references into the replay
+/// namespace; the typed columns and `storage_prefix` still come from the
+/// recorded IR.
+///
+/// # Errors
+///
+/// Fails when the strategy is not unpartitioned `ContentAddressed`, the
+/// table state cannot be discovered, the discovered table is partitioned,
+/// the query fails, or the rows cannot be encoded — callers map every error
+/// to a fail-closed `non_replayable` verdict.
+pub(crate) async fn rederive_live_output_hash(
+    model_ir: &ModelIr,
+    sql: &str,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+) -> Result<(u64, String)> {
+    let MaterializationStrategy::ContentAddressed {
+        storage_prefix,
+        partition_columns,
+    } = &model_ir.materialization
+    else {
+        return Err(anyhow!(
+            "rederive_live_output_hash called on a non-ContentAddressed model"
+        ));
+    };
+    if !partition_columns.is_empty() {
+        return Err(anyhow!(
+            "partitioned models carry per-partition hashes, not a single whole-output digest"
+        ));
+    }
+
+    let store = build_object_store(storage_prefix)?;
+    let (_bucket, key_prefix) = parse_s3_url(storage_prefix)?;
+    let writer = UniformWriter::new(
+        UniformWriterConfig {
+            catalog: model_ir.target.catalog.clone(),
+            schema: model_ir.target.schema.clone(),
+            table: model_ir.target.table.clone(),
+            prefix: key_prefix,
+            engine_info: format!("rocky-cli/{}", env!("CARGO_PKG_VERSION")),
+        },
+        store,
+        Arc::new(NoOpSqlClient),
+    );
+    let state = writer
+        .discover()
+        .await
+        .with_context(|| format!("discover() failed for {:?}", model_ir.target))?;
+    if !state.partition_columns.is_empty() {
+        return Err(anyhow!(
+            "table at {storage_prefix:?} is partitioned ({:?}); the recorded whole-output hash \
+             is not reproducible from a single batch",
+            state.partition_columns
+        ));
+    }
+
+    let result = warehouse
+        .execute_query(sql)
+        .await
+        .map_err(|e| anyhow!("execute_query failed: {e}"))?;
+    let batch = query_result_to_record_batch(&model_ir.typed_columns, &result)?;
+    let rows = batch.num_rows() as u64;
+    let parquet = rocky_iceberg::uniform_writer::parquet_builder::build_parquet(&batch, &state)
+        .map_err(|e| anyhow!("replay parquet encode failed: {e}"))?;
+    Ok((rows, blake3::hash(&parquet).to_hex().to_string()))
+}
+
 /// Issue `MSCK REPAIR TABLE ... SYNC METADATA` directly via the warehouse
 /// adapter so DuckDB iceberg_scan + Iceberg-aware Trino + Photon see the
 /// commit(s) the writer just landed.

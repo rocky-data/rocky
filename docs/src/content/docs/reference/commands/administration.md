@@ -633,7 +633,7 @@ The single-model envelope is byte-stable: `catalog`, `scope`, `tables`, and `tot
 
 ## `rocky replay`
 
-Inspect a recorded run from the state store. Surfaces the per-model SQL hashes, row counts, bytes, and timings captured by `RunRecord` at execution time: the concrete artefact behind the reproducibility claim. Inspection-only today; re-execution with pinned inputs is a follow-up.
+Inspect, audit, or re-execute a recorded run from the state store. The default view surfaces the per-model SQL hashes, row counts, bytes, and timings captured by `RunRecord` at execution time: the concrete artefact behind the reproducibility claim. `--check` runs a read-only replayability audit, and `--execute` re-runs the recorded recipes and re-derives each output hash — locally on DuckDB, or against the live warehouse with `--warehouse`.
 
 ```bash
 rocky replay <target> [flags]
@@ -650,6 +650,11 @@ rocky replay <target> [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--model <NAME>` | `string` | | Filter to a single model within the run. Errors if the model wasn't executed. |
+| `--check` | `bool` | `false` | Read-only replayability audit instead of the inspection view. Classifies each model as `replayable` or `non_replayable` from the ledger alone and flags static non-determinism. Executes nothing. |
+| `--execute` | `bool` | `false` | Re-execute the recorded recipe (reconstructed from provenance, never the working tree) and re-derive the output hash. Runs on an ephemeral in-memory DuckDB engine by default. |
+| `--verify` | `bool` | `false` | With `--execute`, compare the re-derived blake3 against the recorded hash and emit a per-model verdict (`bit_exact` / `diverged` / `non_replayable`). Requires `--execute`. |
+| `--warehouse` | `bool` | `false` | With `--execute`, re-run against the live warehouse configured in `rocky.toml` instead of a local engine. Content-addressed models only. All replay writes land in an isolated `hcv2_replay_<run>` schema — never the production location of any recorded target — and it is dropped afterwards unless `--keep`. Requires `--execute`. |
+| `--keep` | `bool` | `false` | With `--warehouse`, keep the isolated replay schema (and the replayed tables) after the run for inspection. Requires `--warehouse`. |
 
 ### Examples
 
@@ -703,6 +708,38 @@ rocky replay run_20260420_143022 --model fct_revenue
 ```
 
 `sql_hash` is stable across runs where the compiled SQL is identical, so diffing two replays is a fast way to detect whether a re-run would execute the same statements.
+
+### Re-execution
+
+`--execute` reconstructs each model's recipe from its recorded provenance — the canonical `ModelIr` embedded at run time, never the current working tree — and re-runs it, re-deriving the output artifact's blake3. With `--verify`, that digest is compared against the recorded hash:
+
+```bash
+rocky replay latest --execute --verify
+```
+
+```json
+{
+  "command": "replay --execute --verify",
+  "run_id": "run_20260420_143022",
+  "verified": true,
+  "model_count": 2,
+  "bit_exact_count": 2,
+  "models": [
+    { "model_name": "stg_orders", "verdict": "bit_exact", "rows": 150000 },
+    { "model_name": "fct_revenue", "verdict": "bit_exact", "rows": 8900 }
+  ]
+}
+```
+
+Each per-model `verdict` is a classification, not a tool failure — `bit_exact`, `diverged`, `executed` (without `--verify`), or `non_replayable` — so the command exits `0` and you read the verdict. A model that reads a mutable source is classified `non_replayable` rather than silently re-run against current data; a model whose recipe contains a non-deterministic construct (`now()`, `random()`) is flagged and a `diverged` there is expected.
+
+By default re-execution runs on an ephemeral in-memory DuckDB engine. `--warehouse` re-runs against the live warehouse in `rocky.toml` instead, for content-addressed models whose artifacts live in the lakehouse:
+
+```bash
+rocky replay latest --execute --verify --warehouse
+```
+
+The warehouse path re-derives each output's blake3 encoded with the target table's own physical column mapping (read from its Delta log), so a `bit_exact` verdict means the warehouse reproduced exactly the bytes the content-addressed writer recorded. Execution is isolated: every replayed model is materialized into a fresh `hcv2_replay_<run>` schema, never the production location of any recorded target, and that schema is dropped after the run unless you pass `--keep`. No object-store objects are written — the recomputed artifact is hashed in memory, and existing content-addressed files are never touched. In-run upstream references are redirected into the replay schema, so a downstream model reads its upstream's replayed output rather than production; an upstream the run did not itself produce (or a mutable-source read) makes the model `non_replayable` rather than reading production data.
 
 ### Related Commands
 

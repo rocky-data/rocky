@@ -1,10 +1,15 @@
-//! `rocky replay <run_id|latest>` — inspect a recorded run.
+//! `rocky replay <run_id|latest>` — inspect, audit, or re-execute a recorded
+//! run.
 //!
-//! Surfaces the per-model SQL hashes, row counts, bytes, and timings captured
-//! by the state store's `RunRecord`. Re-execution with pinned inputs is an
-//! Arc-1 follow-up once the content-addressed write path arrives — the
-//! inspection surface exists today so the reproducibility claim has a
-//! concrete artefact to point at.
+//! Three surfaces share this module: the inspection view (per-model SQL
+//! hashes, row counts, bytes, and timings captured by the state store's
+//! `RunRecord`), the read-only replayability audit (`--check`), and
+//! re-execution (`--execute [--verify]`). Re-execution reconstructs each
+//! model's recipe from its recorded provenance — never the working tree —
+//! and runs it either on an ephemeral local DuckDB engine or, with
+//! `--warehouse`, against the live warehouse inside an isolated replay
+//! namespace, re-deriving the content-addressed output blake3 for comparison
+//! against the recorded artifact hash.
 
 use std::path::Path;
 
@@ -485,7 +490,6 @@ async fn execute_and_hash(
 
 /// A `non_replayable` per-model result — the fail-closed default for any
 /// re-execution the recording alone cannot support.
-#[cfg(feature = "duckdb")]
 fn non_replayable_exec(
     model_name: &str,
     nondeterministic: bool,
@@ -498,6 +502,92 @@ fn non_replayable_exec(
         recorded_hash: None,
         computed_hash: None,
         rows: None,
+        reasons,
+    }
+}
+
+/// Classify a completed re-execution into its per-model verdict.
+///
+/// Shared by the single-model, DAG, and warehouse re-execution paths so the
+/// verdict lattice is defined once: without `verify` the result is
+/// `executed`; with `verify`, a missing recorded hash is `non_replayable`, a
+/// matching digest is `bit_exact`, and a mismatch is `diverged` with the
+/// applicable caveats attached. `live_encoding` is `true` on the warehouse
+/// path, where the digest was re-derived with the live table's physical
+/// column mapping — making the offline encoding-skew caveat inapplicable.
+#[allow(clippy::too_many_arguments)]
+fn build_execute_verdict(
+    store: &StateStore,
+    run_id: &str,
+    model_name: &str,
+    nondeterministic: bool,
+    recorded_hash: Option<String>,
+    computed: String,
+    rows: u64,
+    verify: bool,
+    live_encoding: bool,
+) -> ReplayExecuteModelOutput {
+    if !verify {
+        return ReplayExecuteModelOutput {
+            model_name: model_name.to_string(),
+            verdict: "executed".to_string(),
+            nondeterministic,
+            recorded_hash,
+            computed_hash: Some(computed),
+            rows: Some(rows),
+            reasons: Vec::new(),
+        };
+    }
+
+    let Some(recorded) = recorded_hash else {
+        return ReplayExecuteModelOutput {
+            model_name: model_name.to_string(),
+            verdict: "non_replayable".to_string(),
+            nondeterministic,
+            recorded_hash: None,
+            computed_hash: Some(computed),
+            rows: Some(rows),
+            reasons: vec!["provenance record carried no output hash to verify against".to_string()],
+        };
+    };
+
+    if computed == recorded {
+        return ReplayExecuteModelOutput {
+            model_name: model_name.to_string(),
+            verdict: "bit_exact".to_string(),
+            nondeterministic,
+            recorded_hash: Some(recorded),
+            computed_hash: Some(computed),
+            rows: Some(rows),
+            reasons: Vec::new(),
+        };
+    }
+
+    let mut reasons = vec![format!(
+        "re-executed output blake3 {} != recorded {}",
+        short_hash(&computed),
+        short_hash(&recorded)
+    )];
+    if !live_encoding && let Some(caveat) = encoding_skew_caveat(store, &recorded) {
+        reasons.push(caveat);
+    }
+    if let Some(caveat) = version_skew_caveat(store, run_id) {
+        reasons.push(caveat);
+    }
+    if nondeterministic {
+        reasons.push(
+            "expected: the recipe contains a nondeterministic construct \
+             (now()/random()/…), so a byte-identical replay is not guaranteed"
+                .to_string(),
+        );
+    }
+    ReplayExecuteModelOutput {
+        model_name: model_name.to_string(),
+        verdict: "diverged".to_string(),
+        nondeterministic,
+        recorded_hash: Some(recorded),
+        computed_hash: Some(computed),
+        rows: Some(rows),
         reasons,
     }
 }
@@ -623,71 +713,17 @@ async fn replay_execute_model(
         }
     };
 
-    let recorded = prov.output_blake3.first().cloned();
-
-    if !verify {
-        return ReplayExecuteModelOutput {
-            model_name: model_name.to_string(),
-            verdict: "executed".to_string(),
-            nondeterministic: check.nondeterministic,
-            recorded_hash: recorded,
-            computed_hash: Some(computed),
-            rows: Some(rows),
-            reasons: Vec::new(),
-        };
-    }
-
-    let Some(recorded) = recorded else {
-        return ReplayExecuteModelOutput {
-            model_name: model_name.to_string(),
-            verdict: "non_replayable".to_string(),
-            nondeterministic: check.nondeterministic,
-            recorded_hash: None,
-            computed_hash: Some(computed),
-            rows: Some(rows),
-            reasons: vec!["provenance record carried no output hash to verify against".to_string()],
-        };
-    };
-
-    if computed == recorded {
-        ReplayExecuteModelOutput {
-            model_name: model_name.to_string(),
-            verdict: "bit_exact".to_string(),
-            nondeterministic: check.nondeterministic,
-            recorded_hash: Some(recorded),
-            computed_hash: Some(computed),
-            rows: Some(rows),
-            reasons: Vec::new(),
-        }
-    } else {
-        let mut reasons = vec![format!(
-            "re-executed output blake3 {} != recorded {}",
-            short_hash(&computed),
-            short_hash(&recorded)
-        )];
-        if let Some(caveat) = encoding_skew_caveat(store, &recorded) {
-            reasons.push(caveat);
-        }
-        if let Some(caveat) = version_skew_caveat(store, run_id) {
-            reasons.push(caveat);
-        }
-        if check.nondeterministic {
-            reasons.push(
-                "expected: the recipe contains a nondeterministic construct \
-                 (now()/random()/…), so a byte-identical replay is not guaranteed"
-                    .to_string(),
-            );
-        }
-        ReplayExecuteModelOutput {
-            model_name: model_name.to_string(),
-            verdict: "diverged".to_string(),
-            nondeterministic: check.nondeterministic,
-            recorded_hash: Some(recorded),
-            computed_hash: Some(computed),
-            rows: Some(rows),
-            reasons,
-        }
-    }
+    build_execute_verdict(
+        store,
+        run_id,
+        model_name,
+        check.nondeterministic,
+        prov.output_blake3.first().cloned(),
+        computed,
+        rows,
+        verify,
+        false,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -717,8 +753,8 @@ fn encoding_skew_caveat(store: &StateStore, recorded_hash: &str) -> Option<Strin
         "caveat: the recorded hash's artifact lives on object storage, where the live UniForm \
          writer encodes parquet with the table's physical column mapping — a mapping the \
          offline replay's deterministic encoding does not reproduce — so this mismatch may be \
-         encoding skew over identical rows rather than a reproducibility gap (the \
-         warehouse-path replay is a later phase)"
+         encoding skew over identical rows rather than a reproducibility gap (re-run with \
+         `--warehouse` to compare against the live table's encoding)"
             .to_string()
     })
 }
@@ -765,7 +801,6 @@ fn target_fqn(ir: &ModelIr) -> String {
 /// record, its embedded IR parses, and it materialises a single whole-output
 /// blake3 (unpartitioned content-addressed). Models failing any of these get a
 /// direct `non_replayable` verdict and are never producers in the graph.
-#[cfg(feature = "duckdb")]
 struct DagCandidate {
     model_name: String,
     ir: ModelIr,
@@ -818,48 +853,33 @@ async fn ensure_namespace(
     Ok(())
 }
 
-/// Re-execute the *whole* recorded run in dependency order.
-///
-/// This is the DAG-order path taken when no `--model` filter is given. Each
-/// content-addressed model is reconstructed from its recording and executed on
-/// a **single shared** in-memory DuckDB engine in topological order, so a
-/// downstream model's `SELECT` reads its upstream's **replayed** output
-/// (materialised into the shared engine as `catalog.schema.table`) rather than
-/// the recorded object-store bytes or any production table. That is the real
-/// test of recipe sufficiency: a recipe that under-specifies its inputs
-/// diverges here because it consumed a freshly-replayed upstream.
-///
-/// Fail-closed cascade: a node whose in-run upstream did not materialise
-/// (blocked, errored, or itself `non_replayable`) is reported `non_replayable`
-/// and never runs against a missing/stale table — a divergent or errored
-/// upstream can never let a downstream fabricate a `bit_exact`. An upstream
-/// that *executed* but merely `diverged` still materialises (a diverged replay
-/// is still a replayed output), so its downstream reads those replayed bytes.
-///
-/// The `nondeterministic` flag is a static scan of a node's **own** SQL. A
-/// deterministic downstream of a nondeterministic upstream can therefore
-/// `diverge` without carrying the flag itself — the divergence is inherited
-/// through the replayed input, which is the honest, expected behaviour (the
-/// reason string still reports the byte mismatch). Propagating the flag
-/// transitively is a later refinement.
-///
-/// Isolation carries through from single-model replay: the entire engine is an
-/// ephemeral replay namespace, nothing is written to any warehouse or object
-/// store, and the working tree is never consulted.
-#[cfg(feature = "duckdb")]
-async fn replay_execute_dag(
+/// Which execution engine a DAG replay runs on. Decides the wording of the
+/// external-upstream block reason: the local path cannot reach object
+/// storage at all, while the warehouse path deliberately rebuilds only
+/// in-run upstreams (never substituting a table's current contents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayEngineKind {
+    LocalDuckDb,
+    LiveWarehouse,
+}
+
+/// Pass A of DAG replay: reconstruct each recorded model from its provenance
+/// and split the run into executable [`DagCandidate`]s vs directly
+/// `non_replayable` verdicts. Reconstructs from the recording only — never
+/// the working tree.
+fn collect_dag_candidates(
     store: &StateStore,
     record: &RunRecord,
-    verify: bool,
-) -> Vec<ReplayExecuteModelOutput> {
-    use std::collections::{HashMap, HashSet};
+) -> (
+    std::collections::HashMap<String, ReplayExecuteModelOutput>,
+    Vec<DagCandidate>,
+) {
+    use std::collections::HashMap;
 
     let run_id = &record.run_id;
     let mut finished: HashMap<String, ReplayExecuteModelOutput> = HashMap::new();
     let mut candidates: Vec<DagCandidate> = Vec::new();
 
-    // --- Pass A: reconstruct each model; separate executable candidates from
-    // directly-non_replayable models. Reconstruct from the recording only. ---
     for exec in &record.models_executed {
         let name = exec.model_name.clone();
         let Some(prov) = store.get_provenance(run_id, &name).ok().flatten() else {
@@ -943,12 +963,23 @@ async fn replay_execute_dag(
         });
     }
 
+    (finished, candidates)
+}
+
+/// Pass B of DAG replay: classify each candidate's upstreams into in-run
+/// edges vs a blocking external/watermark read. `upstreams` is moved out so
+/// the loop can mutate the candidate's other fields without an aliasing
+/// borrow.
+fn classify_candidate_upstreams(
+    candidates: &mut [DagCandidate],
+    record: &RunRecord,
+    engine: ReplayEngineKind,
+) {
+    use std::collections::HashSet;
+
     let produced: HashSet<String> = candidates.iter().map(|c| c.output_fqn.clone()).collect();
 
-    // --- Pass B: classify each candidate's upstreams into in-run edges vs a
-    // blocking external/watermark read. `upstreams` is moved out so the loop
-    // can mutate the candidate's other fields without an aliasing borrow. ---
-    for cand in &mut candidates {
+    for cand in candidates.iter_mut() {
         for upstream in std::mem::take(&mut cand.upstreams) {
             match upstream {
                 UpstreamIdentity::Content { upstream_key, .. } => {
@@ -972,12 +1003,21 @@ async fn replay_execute_dag(
                                  it (the run predates auditable reuse or `[reuse]` was disabled)"
                             )
                         } else {
-                            format!(
-                                "upstream '{upstream_key}' is content-addressed but is not produced by \
-                                 any model in this recorded run; its recorded bytes live on object \
-                                 storage that the creds-free DAG replay never reads (a warehouse-path \
-                                 replay is a later phase)"
-                            )
+                            match engine {
+                                ReplayEngineKind::LocalDuckDb => format!(
+                                    "upstream '{upstream_key}' is content-addressed but is not \
+                                     produced by any model in this recorded run; its recorded \
+                                     bytes live on object storage that the creds-free DAG replay \
+                                     never reads"
+                                ),
+                                ReplayEngineKind::LiveWarehouse => format!(
+                                    "upstream '{upstream_key}' is content-addressed but is not \
+                                     produced by any model in this recorded run; the warehouse \
+                                     replay rebuilds only in-run upstreams from their recipes \
+                                     and never substitutes an upstream table's current contents \
+                                     (pinning a cross-run recorded upstream is a later phase)"
+                                ),
+                            }
                         });
                         break;
                     }
@@ -992,6 +1032,47 @@ async fn replay_execute_dag(
             }
         }
     }
+}
+
+/// Re-execute the *whole* recorded run in dependency order.
+///
+/// This is the DAG-order path taken when no `--model` filter is given. Each
+/// content-addressed model is reconstructed from its recording and executed on
+/// a **single shared** in-memory DuckDB engine in topological order, so a
+/// downstream model's `SELECT` reads its upstream's **replayed** output
+/// (materialised into the shared engine as `catalog.schema.table`) rather than
+/// the recorded object-store bytes or any production table. That is the real
+/// test of recipe sufficiency: a recipe that under-specifies its inputs
+/// diverges here because it consumed a freshly-replayed upstream.
+///
+/// Fail-closed cascade: a node whose in-run upstream did not materialise
+/// (blocked, errored, or itself `non_replayable`) is reported `non_replayable`
+/// and never runs against a missing/stale table — a divergent or errored
+/// upstream can never let a downstream fabricate a `bit_exact`. An upstream
+/// that *executed* but merely `diverged` still materialises (a diverged replay
+/// is still a replayed output), so its downstream reads those replayed bytes.
+///
+/// The `nondeterministic` flag is a static scan of a node's **own** SQL. A
+/// deterministic downstream of a nondeterministic upstream can therefore
+/// `diverge` without carrying the flag itself — the divergence is inherited
+/// through the replayed input, which is the honest, expected behaviour (the
+/// reason string still reports the byte mismatch). Propagating the flag
+/// transitively is a later refinement.
+///
+/// Isolation carries through from single-model replay: the entire engine is an
+/// ephemeral replay namespace, nothing is written to any warehouse or object
+/// store, and the working tree is never consulted.
+#[cfg(feature = "duckdb")]
+async fn replay_execute_dag(
+    store: &StateStore,
+    record: &RunRecord,
+    verify: bool,
+) -> Vec<ReplayExecuteModelOutput> {
+    use std::collections::{HashMap, HashSet};
+
+    let run_id = &record.run_id;
+    let (mut finished, mut candidates) = collect_dag_candidates(store, record);
+    classify_candidate_upstreams(&mut candidates, record, ReplayEngineKind::LocalDuckDb);
 
     // --- Topological order over the in-run edges (Kahn). A cycle (which the
     // real engine's acyclic DAG never produces) leaves its members unordered;
@@ -1146,76 +1227,23 @@ async fn replay_execute_dag_node(
     }
     materialized.insert(cand.output_fqn.clone());
 
-    if !verify {
-        return ReplayExecuteModelOutput {
-            model_name: cand.model_name.clone(),
-            verdict: "executed".to_string(),
-            nondeterministic: cand.nondeterministic,
-            recorded_hash: cand.recorded_hash.clone(),
-            computed_hash: Some(computed),
-            rows: Some(rows),
-            reasons: Vec::new(),
-        };
-    }
-
-    let Some(recorded) = cand.recorded_hash.clone() else {
-        return ReplayExecuteModelOutput {
-            model_name: cand.model_name.clone(),
-            verdict: "non_replayable".to_string(),
-            nondeterministic: cand.nondeterministic,
-            recorded_hash: None,
-            computed_hash: Some(computed),
-            rows: Some(rows),
-            reasons: vec!["provenance record carried no output hash to verify against".to_string()],
-        };
-    };
-
-    if computed == recorded {
-        ReplayExecuteModelOutput {
-            model_name: cand.model_name.clone(),
-            verdict: "bit_exact".to_string(),
-            nondeterministic: cand.nondeterministic,
-            recorded_hash: Some(recorded),
-            computed_hash: Some(computed),
-            rows: Some(rows),
-            reasons: Vec::new(),
-        }
-    } else {
-        let mut reasons = vec![format!(
-            "re-executed output blake3 {} != recorded {}",
-            short_hash(&computed),
-            short_hash(&recorded)
-        )];
-        if let Some(caveat) = encoding_skew_caveat(store, &recorded) {
-            reasons.push(caveat);
-        }
-        if let Some(caveat) = version_skew_caveat(store, run_id) {
-            reasons.push(caveat);
-        }
-        if cand.nondeterministic {
-            reasons.push(
-                "expected: the recipe contains a nondeterministic construct \
-                 (now()/random()/…), so a byte-identical replay is not guaranteed"
-                    .to_string(),
-            );
-        }
-        ReplayExecuteModelOutput {
-            model_name: cand.model_name.clone(),
-            verdict: "diverged".to_string(),
-            nondeterministic: cand.nondeterministic,
-            recorded_hash: Some(recorded),
-            computed_hash: Some(computed),
-            rows: Some(rows),
-            reasons,
-        }
-    }
+    build_execute_verdict(
+        store,
+        run_id,
+        &cand.model_name,
+        cand.nondeterministic,
+        cand.recorded_hash.clone(),
+        computed,
+        rows,
+        verify,
+        false,
+    )
 }
 
 /// Kahn topological sort of the candidates over their in-run edges. Any node
 /// left over after the queue drains (only possible under a cycle the real
 /// acyclic engine never emits) is appended so it still receives an
 /// unmaterialised-upstream cascade verdict.
-#[cfg(feature = "duckdb")]
 fn topo_order(candidates: &[DagCandidate]) -> Vec<String> {
     use std::collections::{HashMap, VecDeque};
 
@@ -1268,7 +1296,6 @@ fn topo_order(candidates: &[DagCandidate]) -> Vec<String> {
 }
 
 /// Assemble the per-model verdicts back into `record.models_executed` order.
-#[cfg(feature = "duckdb")]
 fn assemble(
     record: &RunRecord,
     mut finished: std::collections::HashMap<String, ReplayExecuteModelOutput>,
@@ -1347,6 +1374,8 @@ pub async fn run_replay_execute(
             verified: verify,
             model_count: models.len(),
             bit_exact_count,
+            replay_schema: None,
+            replay_schema_dropped: None,
             models,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -1359,6 +1388,530 @@ pub async fn run_replay_execute(
             println!("re-executed: {} models", models.len());
         }
         for m in &models {
+            print!("  {}  {}", m.model_name, m.verdict);
+            if m.nondeterministic {
+                print!("  [nondeterministic]");
+            }
+            if let Some(rows) = m.rows {
+                print!("  rows={rows}");
+            }
+            println!();
+            if let (Some(c), Some(r)) = (&m.computed_hash, &m.recorded_hash) {
+                println!(
+                    "      computed={}  recorded={}",
+                    short_hash(c),
+                    short_hash(r)
+                );
+            }
+            for reason in &m.reasons {
+                println!("      - {reason}");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `rocky replay --execute --warehouse [--verify] [--keep]` — content-addressed
+// re-execution on the live warehouse, isolated in a replay-scoped schema
+// ---------------------------------------------------------------------------
+
+/// Prefix of the isolated warehouse schema a replay materialises into.
+const REPLAY_SCHEMA_PREFIX: &str = "hcv2_replay_";
+
+/// Isolated schema name for a warehouse replay of `run_id`.
+///
+/// The run id is reduced to lowercase alphanumerics (bounded length) so the
+/// name is always a valid SQL identifier, and it is deterministic per run —
+/// re-replaying the same run reuses (and `CREATE OR REPLACE`s within) the
+/// same namespace instead of leaking one schema per attempt.
+fn replay_schema_name(run_id: &str) -> String {
+    let mut sanitized: String = run_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .take(24)
+        .collect();
+    if sanitized.is_empty() {
+        sanitized.push_str("unnamed");
+    }
+    format!("{REPLAY_SCHEMA_PREFIX}{sanitized}")
+}
+
+/// Result of a warehouse DAG replay: the per-model verdicts plus the
+/// isolation bookkeeping the output surface reports.
+struct WarehouseReplayOutcome {
+    models: Vec<ReplayExecuteModelOutput>,
+    replay_schema: String,
+    /// `true` iff no replay-namespace schema remains on the warehouse
+    /// (vacuously true when nothing was created).
+    schema_dropped: bool,
+}
+
+/// Re-execute a recorded run on the live warehouse, isolated in
+/// [`replay_schema_name`]'s namespace.
+///
+/// Same DAG semantics as [`replay_execute_dag`], with three warehouse
+/// specifics:
+///
+/// - **Isolation.** Nothing is ever written to the production location of a
+///   recorded target. Each node's replayed output is materialised as
+///   `catalog.<replay_schema>.<orig_schema>__<orig_table>`, and a downstream
+///   node's recorded SQL has its in-run upstream references rewritten to
+///   those replay tables before executing. Every rewrite is checked: an
+///   upstream whose reference cannot be located (or is ambiguous) makes the
+///   node `non_replayable` rather than letting the recipe silently read the
+///   production upstream.
+/// - **Live encoding identity.** The recomputed digest is encoded with the
+///   target table's *discovered* physical column mapping (via
+///   [`rederive_live_output_hash`]), so it is directly comparable to the
+///   hash the live content-addressed writer recorded. No object-store
+///   writes, no Delta commits: the S3 side is read-only.
+/// - **Teardown.** Every replay schema created is dropped (`CASCADE`) after
+///   the run unless `keep` — including after per-model failures, which are
+///   verdicts, not early exits.
+///
+/// [`rederive_live_output_hash`]: crate::commands::run_content_addressed::rederive_live_output_hash
+async fn replay_execute_warehouse(
+    store: &StateStore,
+    record: &RunRecord,
+    model_filter: Option<&str>,
+    verify: bool,
+    keep: bool,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+) -> WarehouseReplayOutcome {
+    use std::collections::{HashMap, HashSet};
+
+    let run_id = &record.run_id;
+    let replay_schema = replay_schema_name(run_id);
+    let (mut finished, mut candidates) = collect_dag_candidates(store, record);
+
+    if let Some(name) = model_filter {
+        // Single-model mode mirrors the local path: only a self-contained
+        // recipe replays, because a filtered run rebuilds no upstreams.
+        candidates.retain(|c| c.model_name == name);
+        for cand in &mut candidates {
+            if !cand.upstreams.is_empty() {
+                cand.blocked_reason = Some(format!(
+                    "single-model re-execution requires a self-contained recipe, but this model \
+                     reads {} recorded upstream(s); omit --model to replay the whole run in DAG \
+                     order (upstream references are then redirected to their replayed outputs — \
+                     current warehouse data is never substituted)",
+                    cand.upstreams.len()
+                ));
+            }
+        }
+    } else {
+        classify_candidate_upstreams(&mut candidates, record, ReplayEngineKind::LiveWarehouse);
+    }
+
+    let order = topo_order(&candidates);
+    let by_name: HashMap<&str, &DagCandidate> = candidates
+        .iter()
+        .map(|c| (c.model_name.as_str(), c))
+        .collect();
+
+    // Catalogs in which `CREATE SCHEMA <catalog>.<replay_schema>` succeeded —
+    // the exact set torn down afterwards.
+    let mut created_catalogs: HashSet<String> = HashSet::new();
+    let mut materialized: HashSet<String> = HashSet::new();
+
+    for name in order {
+        let cand = by_name[name.as_str()];
+
+        if let Some(reason) = &cand.blocked_reason {
+            finished.insert(
+                cand.model_name.clone(),
+                non_replayable_exec(
+                    &cand.model_name,
+                    cand.nondeterministic,
+                    vec![reason.clone()],
+                ),
+            );
+            continue;
+        }
+
+        // Fail-closed cascade: every in-run upstream must have materialised.
+        if let Some(missing) = cand
+            .in_run_upstreams
+            .iter()
+            .find(|u| !materialized.contains(*u))
+        {
+            finished.insert(
+                cand.model_name.clone(),
+                non_replayable_exec(
+                    &cand.model_name,
+                    cand.nondeterministic,
+                    vec![format!(
+                        "upstream '{missing}' could not be replayed, so its replayed output is \
+                         unavailable to feed this model (cascade)"
+                    )],
+                ),
+            );
+            continue;
+        }
+
+        finished.insert(
+            cand.model_name.clone(),
+            replay_execute_warehouse_node(
+                store,
+                run_id,
+                warehouse,
+                cand,
+                verify,
+                &replay_schema,
+                &mut created_catalogs,
+                &mut materialized,
+            )
+            .await,
+        );
+    }
+
+    // Teardown: drop every replay schema this run created, even when every
+    // node failed — a per-model failure is a verdict, never an early return,
+    // so control always reaches here.
+    let mut schema_dropped = true;
+    if keep {
+        schema_dropped = created_catalogs.is_empty();
+    } else {
+        for catalog in &created_catalogs {
+            let drop_sql = format!("DROP SCHEMA IF EXISTS {catalog}.{replay_schema} CASCADE");
+            if let Err(e) = warehouse.execute_statement(&drop_sql).await {
+                tracing::warn!(
+                    catalog = catalog.as_str(),
+                    replay_schema = replay_schema.as_str(),
+                    error = %e,
+                    "replay: failed to drop the replay schema — manual cleanup needed"
+                );
+                schema_dropped = false;
+            }
+        }
+    }
+
+    let models: Vec<ReplayExecuteModelOutput> = match model_filter {
+        Some(name) => record
+            .models_executed
+            .iter()
+            .filter(|exec| exec.model_name == name)
+            .map(|exec| {
+                finished.remove(&exec.model_name).unwrap_or_else(|| {
+                    non_replayable_exec(
+                        &exec.model_name,
+                        false,
+                        vec!["model was not reached by the replay DAG".to_string()],
+                    )
+                })
+            })
+            .collect(),
+        None => assemble(record, finished),
+    };
+
+    WarehouseReplayOutcome {
+        models,
+        replay_schema,
+        schema_dropped,
+    }
+}
+
+/// Execute one topologically-ready node on the live warehouse.
+///
+/// Order of operations (each failure is a fail-closed `non_replayable`
+/// verdict): validate the recorded identifiers, redirect in-run upstream
+/// references into the replay namespace (checked — no reference may remain
+/// pointing at a production upstream), ensure the replay schema exists in
+/// the node's catalog, re-derive the output digest against the live table's
+/// encoding identity, then materialise the replayed output for downstream
+/// consumers and operator inspection. Only after all of that is the digest
+/// compared (`verify`) via [`build_execute_verdict`].
+#[allow(clippy::too_many_arguments)]
+async fn replay_execute_warehouse_node(
+    store: &StateStore,
+    run_id: &str,
+    warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    cand: &DagCandidate,
+    verify: bool,
+    replay_schema: &str,
+    created_catalogs: &mut std::collections::HashSet<String>,
+    materialized: &mut std::collections::HashSet<String>,
+) -> ReplayExecuteModelOutput {
+    use std::collections::HashMap;
+
+    use rocky_sql::defer::DeferTarget;
+    use rocky_sql::validation::validate_identifier;
+
+    let catalog = &cand.ir.target.catalog;
+
+    // Validate every identifier interpolated into DDL below. The recorded IR
+    // is trusted provenance, but fail closed on anything malformed rather
+    // than hand it to the warehouse.
+    for part in [catalog, &cand.ir.target.schema, &cand.ir.target.table] {
+        if validate_identifier(part).is_err() {
+            return non_replayable_exec(
+                &cand.model_name,
+                cand.nondeterministic,
+                vec![format!(
+                    "recorded target identifier {part:?} is not a valid SQL identifier — \
+                     fail-closed rather than interpolate it into replay DDL"
+                )],
+            );
+        }
+    }
+
+    // `<orig_schema>__<orig_table>` keeps two same-named tables from
+    // different production schemas collision-free inside the one replay
+    // schema per catalog.
+    let replay_table = format!("{}__{}", cand.ir.target.schema, cand.ir.target.table);
+
+    // Redirect in-run upstream references into the replay namespace. Checked
+    // rewrite: every recorded upstream must be located (unambiguously) among
+    // the recipe's table references, otherwise executing the SQL would read
+    // the production upstream's *current* contents — exactly what replay
+    // must never silently do.
+    let sql = if cand.in_run_upstreams.is_empty() {
+        cand.ir.sql.clone()
+    } else {
+        let mut renames: HashMap<String, DeferTarget> = HashMap::new();
+        for upstream in &cand.in_run_upstreams {
+            let parts: Vec<&str> = upstream.split('.').collect();
+            let [up_catalog, up_schema, up_table] = parts.as_slice() else {
+                return non_replayable_exec(
+                    &cand.model_name,
+                    cand.nondeterministic,
+                    vec![format!(
+                        "recorded upstream key {upstream:?} is not a catalog.schema.table \
+                         identity"
+                    )],
+                );
+            };
+            if [up_catalog, up_schema, up_table]
+                .iter()
+                .any(|p| validate_identifier(p).is_err())
+            {
+                return non_replayable_exec(
+                    &cand.model_name,
+                    cand.nondeterministic,
+                    vec![format!(
+                        "recorded upstream key {upstream:?} contains a part that is not a \
+                         valid SQL identifier"
+                    )],
+                );
+            }
+            renames.insert(
+                upstream.to_ascii_lowercase(),
+                DeferTarget {
+                    catalog: (*up_catalog).to_string(),
+                    schema: replay_schema.to_string(),
+                    table: format!("{up_schema}__{up_table}"),
+                    quote_style: None,
+                },
+            );
+        }
+        let outcome = match rocky_sql::defer::rewrite_upstream_refs(&cand.ir.sql, &renames) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                return non_replayable_exec(
+                    &cand.model_name,
+                    cand.nondeterministic,
+                    vec![format!(
+                        "recorded SQL could not be parsed to redirect upstream references into \
+                         the replay namespace: {e}"
+                    )],
+                );
+            }
+        };
+        if !outcome.ambiguous_refs.is_empty() {
+            return non_replayable_exec(
+                &cand.model_name,
+                cand.nondeterministic,
+                vec![format!(
+                    "table reference(s) {:?} match more than one recorded upstream, so the \
+                     redirection into the replay namespace is ambiguous — fail-closed rather \
+                     than guess which replayed upstream to read",
+                    outcome.ambiguous_refs
+                )],
+            );
+        }
+        if let Some(missing) = renames
+            .keys()
+            .find(|k| !outcome.rewritten_keys.contains(*k))
+        {
+            return non_replayable_exec(
+                &cand.model_name,
+                cand.nondeterministic,
+                vec![format!(
+                    "recorded upstream '{missing}' was not found among the recipe's table \
+                     references, so its reference cannot be redirected into the replay \
+                     namespace — fail-closed rather than let the recipe read the production \
+                     upstream's current contents"
+                )],
+            );
+        }
+        outcome.sql
+    };
+
+    // Ensure the isolated replay schema exists in this node's catalog.
+    if !created_catalogs.contains(catalog) {
+        let create_sql = format!("CREATE SCHEMA IF NOT EXISTS {catalog}.{replay_schema}");
+        if let Err(e) = warehouse.execute_statement(&create_sql).await {
+            return non_replayable_exec(
+                &cand.model_name,
+                cand.nondeterministic,
+                vec![format!(
+                    "could not create the isolated replay schema {catalog}.{replay_schema}: {e}"
+                )],
+            );
+        }
+        created_catalogs.insert(catalog.clone());
+    }
+
+    // Re-derive the output digest against the live table's encoding identity
+    // (a SELECT + Delta-log GETs; no writes anywhere).
+    let (rows, computed) = match crate::commands::run_content_addressed::rederive_live_output_hash(
+        &cand.ir, &sql, warehouse,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return non_replayable_exec(
+                &cand.model_name,
+                cand.nondeterministic,
+                vec![format!(
+                    "re-execution could not reproduce the artifact: {e:#}"
+                )],
+            );
+        }
+    };
+
+    // Materialise the replayed output for downstream consumers (and for
+    // operator inspection under `--keep`). A second evaluation of the same
+    // recipe, exactly like the local DAG path; a failure creates no table,
+    // so the fail-closed cascade denies dependents.
+    let ctas = format!("CREATE OR REPLACE TABLE {catalog}.{replay_schema}.{replay_table} AS {sql}");
+    if let Err(e) = warehouse.execute_statement(&ctas).await {
+        return non_replayable_exec(
+            &cand.model_name,
+            cand.nondeterministic,
+            vec![format!(
+                "re-executed but could not materialise the replayed output for downstream \
+                 consumers: {e}"
+            )],
+        );
+    }
+    materialized.insert(cand.output_fqn.clone());
+
+    build_execute_verdict(
+        store,
+        run_id,
+        &cand.model_name,
+        cand.nondeterministic,
+        cand.recorded_hash.clone(),
+        computed,
+        rows,
+        verify,
+        true,
+    )
+}
+
+/// Execute `rocky replay --execute --warehouse [--verify] [--keep]`.
+///
+/// Re-executes a recorded content-addressed run against the live warehouse
+/// configured in `rocky.toml`, inside an isolated replay schema (never the
+/// production location of any recorded target). Each model's recipe comes
+/// from its recorded provenance — never the working tree — and its
+/// recomputed blake3 is encoded with the live table's physical column
+/// mapping, so with `--verify` a `bit_exact` verdict means the warehouse
+/// re-derived the recorded artifact byte-for-byte.
+///
+/// Verdicts (`bit_exact` / `diverged` / `non_replayable`) are
+/// classifications, not tool failures: this returns `Ok` (exit 0) unless the
+/// run, config, or adapter cannot be resolved at all.
+pub async fn run_replay_execute_warehouse(
+    config_path: &Path,
+    state_path: &Path,
+    target: &str,
+    model_filter: Option<&str>,
+    verify: bool,
+    keep: bool,
+    json: bool,
+) -> Result<()> {
+    let store = StateStore::open_read_only(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+
+    let record = resolve(&store, target)?;
+    if let Some(name) = model_filter
+        && !record.models_executed.iter().any(|m| m.model_name == name)
+    {
+        anyhow::bail!("run '{}' did not execute model '{name}'", record.run_id);
+    }
+
+    let cfg = rocky_core::config::load_rocky_config(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let registry = crate::registry::AdapterRegistry::from_config(&cfg)
+        .context("building adapter registry from config")?;
+    let adapter_names = registry.warehouse_adapter_names();
+    let adapter_name = if adapter_names.iter().any(|n| n == "default") {
+        "default".to_string()
+    } else {
+        adapter_names
+            .into_iter()
+            .next()
+            .context("no warehouse adapters configured for warehouse replay")?
+    };
+    let warehouse = registry.warehouse_adapter(&adapter_name)?;
+
+    let outcome = replay_execute_warehouse(
+        &store,
+        &record,
+        model_filter,
+        verify,
+        keep,
+        warehouse.as_ref(),
+    )
+    .await;
+
+    let bit_exact_count = outcome
+        .models
+        .iter()
+        .filter(|m| m.verdict == "bit_exact")
+        .count();
+
+    if json {
+        let output = ReplayExecuteOutput {
+            version: VERSION.to_string(),
+            command: if verify {
+                "replay --execute --warehouse --verify".to_string()
+            } else {
+                "replay --execute --warehouse".to_string()
+            },
+            run_id: record.run_id.clone(),
+            status: status_str(&record.status).to_string(),
+            verified: verify,
+            model_count: outcome.models.len(),
+            bit_exact_count,
+            replay_schema: Some(outcome.replay_schema),
+            replay_schema_dropped: Some(outcome.schema_dropped),
+            models: outcome.models,
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("run: {}", record.run_id);
+        println!("status: {}", status_str(&record.status));
+        println!("replay schema: {}", outcome.replay_schema);
+        println!(
+            "replay schema dropped: {}",
+            if outcome.schema_dropped { "yes" } else { "no" }
+        );
+        if verify {
+            println!(
+                "bit-exact: {}/{} models",
+                bit_exact_count,
+                outcome.models.len()
+            );
+        } else {
+            println!("re-executed: {} models", outcome.models.len());
+        }
+        for m in &outcome.models {
             print!("  {}  {}", m.model_name, m.verdict);
             if m.nondeterministic {
                 print!("  [nondeterministic]");
@@ -1823,5 +2376,357 @@ mod tests {
         assert!(v.computed_hash.is_some());
         assert_eq!(v.rows, Some(1));
         assert!(v.reasons.is_empty());
+    }
+
+    // -- warehouse replay: namespacing + isolation -------------------------
+
+    #[test]
+    fn replay_schema_name_is_a_valid_identifier() {
+        let name = replay_schema_name("run-20260712-101112-334");
+        assert!(name.starts_with(REPLAY_SCHEMA_PREFIX));
+        // Every character is a valid SQL identifier char (the prefix is too).
+        assert!(
+            name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "replay schema name must be a bare SQL identifier: {name}"
+        );
+        // Deterministic per run id — re-replaying reuses the namespace.
+        assert_eq!(name, replay_schema_name("run-20260712-101112-334"));
+    }
+
+    #[test]
+    fn replay_schema_name_handles_degenerate_run_ids() {
+        // A run id with no alphanumerics still yields a usable identifier.
+        let name = replay_schema_name("///---");
+        assert_eq!(name, format!("{REPLAY_SCHEMA_PREFIX}unnamed"));
+        // Length is bounded so the schema name stays within warehouse limits.
+        let long = replay_schema_name(&"a".repeat(200));
+        assert_eq!(long.len(), REPLAY_SCHEMA_PREFIX.len() + 24);
+    }
+
+    // -- Databricks warehouse-replay live-verify (env-gated, #[ignore]) -----
+
+    /// Live end-to-end verification of the **content-addressed warehouse
+    /// replay** path against a real Databricks UniForm table. Written, not
+    /// run in CI — the `#[ignore]` is the real gate (CI runs `--all-features`
+    /// so a feature gate alone would still execute it).
+    ///
+    /// # What it certifies (and why only the live path can)
+    ///
+    /// Every offline `bit_exact` unit test seeds the recorded hash from the
+    /// same `build_parquet` the replay recomputes, so it can only prove
+    /// replay == replay. The load-bearing claim — that a warehouse replay
+    /// re-derives the digest the live `UniformWriter` recorded, encoded with
+    /// the table's *discovered* physical column mapping — is verifiable only
+    /// here: this test records a genuine content-addressed run (real S3 CAS
+    /// write + real artifact hash in the ledger), replays it through the
+    /// warehouse path, and asserts the verdict is `bit_exact`.
+    ///
+    /// # Isolation proof
+    ///
+    /// It also proves replay never writes the production target: the
+    /// production table's row count is captured after the recorded run and
+    /// again after replay and must be unchanged (replay materialises only
+    /// into the dropped-after `hcv2_replay_*` schema), and `schema_dropped`
+    /// must be `true`. The replay is run twice to confirm stability.
+    ///
+    /// # Reachability boundary (read before running)
+    ///
+    /// Mirrors `content_addressed_e2e_live_sandbox`: the target must be a
+    /// pre-provisioned external, unpartitioned, name-column-mapped UniForm
+    /// table with the canonical `(id BIGINT, name STRING, ts TIMESTAMP)`
+    /// shape, under an `hc_`/`hcv2_`-prefixed sandbox schema. Env vars:
+    /// `ROCKY_TEST_S3_BUCKET` / `ROCKY_TEST_S3_PREFIX` / `ROCKY_TEST_CATALOG`
+    /// / `ROCKY_TEST_SCHEMA` / `ROCKY_TEST_TABLE` + `DATABRICKS_*` + AWS env
+    /// creds. Teardown `DELETE`s the rows the recorded run appended (a `DROP
+    /// SCHEMA CASCADE` would destroy the externally provisioned fixture); the
+    /// content-addressed parquet objects are not deletable with these creds
+    /// and leak by design.
+    #[tokio::test]
+    #[ignore = "requires Databricks + s3 credentials; run manually — see doc comment"]
+    async fn warehouse_replay_bit_exact_live_sandbox() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use rocky_core::reuse::{OutputArtifact, build_records};
+        use rocky_core::state::{
+            ArtifactRecord, ModelExecution, RunRecord, RunStatus, RunTrigger, SessionSource,
+        };
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_databricks::adapter::DatabricksWarehouseAdapter;
+        use rocky_databricks::auth::{Auth, AuthConfig};
+        use rocky_databricks::connector::{ConnectorConfig, DatabricksConnector};
+        use rocky_ir::{
+            GovernanceConfig, MaterializationStrategy, ModelIr, RockyType, TargetRef, TypedColumn,
+        };
+
+        let (Ok(bucket), Ok(prefix), Ok(catalog), Ok(schema), Ok(table)) = (
+            std::env::var("ROCKY_TEST_S3_BUCKET"),
+            std::env::var("ROCKY_TEST_S3_PREFIX"),
+            std::env::var("ROCKY_TEST_CATALOG"),
+            std::env::var("ROCKY_TEST_SCHEMA"),
+            std::env::var("ROCKY_TEST_TABLE"),
+        ) else {
+            eprintln!("skipping warehouse_replay_bit_exact_live_sandbox: ROCKY_TEST_* not set");
+            return;
+        };
+        let (Ok(host), Ok(http_path)) = (
+            std::env::var("DATABRICKS_HOST"),
+            std::env::var("DATABRICKS_HTTP_PATH"),
+        ) else {
+            eprintln!("skipping warehouse_replay_bit_exact_live_sandbox: DATABRICKS_* not set");
+            return;
+        };
+        let Some(warehouse_id) = ConnectorConfig::warehouse_id_from_http_path(&http_path) else {
+            eprintln!("skipping: DATABRICKS_HTTP_PATH has no warehouse id");
+            return;
+        };
+        let Ok(auth) = Auth::from_config(AuthConfig {
+            host: host.clone(),
+            token: std::env::var("DATABRICKS_TOKEN").ok(),
+            client_id: std::env::var("DATABRICKS_CLIENT_ID").ok(),
+            client_secret: std::env::var("DATABRICKS_CLIENT_SECRET").ok(),
+        }) else {
+            eprintln!("skipping: Databricks auth could not be constructed");
+            return;
+        };
+        let warehouse = DatabricksWarehouseAdapter::new(DatabricksConnector::new(
+            ConnectorConfig {
+                host,
+                warehouse_id,
+                timeout: Duration::from_secs(120),
+                retry: Default::default(),
+            },
+            auth,
+        ));
+        let warehouse_dyn: &dyn WarehouseAdapter = &warehouse;
+        let storage_prefix = format!("s3://{bucket}/{prefix}");
+        let fqtn = format!("{catalog}.{schema}.{table}");
+
+        let count_rows = async |w: &dyn WarehouseAdapter| -> i64 {
+            let r = w
+                .execute_query(&format!("SELECT COUNT(*) AS n FROM {fqtn}"))
+                .await
+                .expect("count query");
+            r.rows[0][0]
+                .as_i64()
+                .or_else(|| r.rows[0][0].as_str().and_then(|s| s.parse().ok()))
+                .expect("count i64")
+        };
+
+        // Distinct id range so re-runs are self-cleaning; pre-clean any leak.
+        let (id_a, id_b, id_c) = (960_001_i64, 960_002, 960_003);
+        warehouse_dyn
+            .execute_statement(&format!(
+                "DELETE FROM {fqtn} WHERE id IN ({id_a}, {id_b}, {id_c})"
+            ))
+            .await
+            .expect("pre-clean");
+
+        // --- Record a genuine content-addressed run: real S3 CAS write +
+        // real artifact hash. The SQL bakes in literal timestamps so the
+        // recorded recipe is self-contained and deterministic on replay. ---
+        let now_micros = chrono::Utc::now().timestamp_micros();
+        let ts = |off: i64| {
+            chrono::DateTime::from_timestamp_micros(now_micros + off)
+                .unwrap()
+                .format("%Y-%m-%dT%H:%M:%S%.6f")
+                .to_string()
+        };
+        let model_sql = format!(
+            "SELECT id, name, ts FROM (VALUES \
+             (CAST({id_a} AS BIGINT), CAST('replay-a' AS STRING), TIMESTAMP'{}'), \
+             (CAST({id_b} AS BIGINT), CAST('replay-b' AS STRING), TIMESTAMP'{}'), \
+             (CAST({id_c} AS BIGINT), CAST('replay-c' AS STRING), TIMESTAMP'{}')) \
+             AS t(id, name, ts)",
+            ts(0),
+            ts(1),
+            ts(2),
+        );
+        let mut model_ir = ModelIr::transformation(
+            TargetRef {
+                catalog: catalog.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: storage_prefix.clone(),
+                partition_columns: vec![],
+            },
+            vec![],
+            model_sql.clone(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        model_ir.name = Arc::from("replay_live_model");
+        model_ir.typed_columns = vec![
+            TypedColumn {
+                name: "id".into(),
+                data_type: RockyType::Int64,
+                nullable: false,
+            },
+            TypedColumn {
+                name: "name".into(),
+                data_type: RockyType::String,
+                nullable: false,
+            },
+            TypedColumn {
+                name: "ts".into(),
+                data_type: RockyType::Timestamp,
+                nullable: false,
+            },
+        ];
+
+        let n_before_replay: i64;
+        {
+            let summary = crate::commands::run_content_addressed::execute_content_addressed_model(
+                &model_ir,
+                warehouse_dyn,
+                None,
+            )
+            .await
+            .expect("recorded content-addressed run must succeed");
+            assert_eq!(summary.num_rows, 3);
+            assert_eq!(summary.blake3_hash.len(), 64);
+            n_before_replay = count_rows(warehouse_dyn).await;
+
+            // --- Seed the ledger exactly as the runner would: provenance
+            // (with embedded canonical IR + real output hash) + artifact. ---
+            let tmp = TempDir::new().unwrap();
+            let store = StateStore::open(&tmp.path().join("state.redb")).unwrap();
+            let run_id = "run-warehouse-replay-live";
+            let outputs = vec![OutputArtifact {
+                blake3_hash: summary.blake3_hash.clone(),
+                file_path: summary.file_path.clone(),
+            }];
+            let (entry, prov) =
+                build_records(&model_ir, run_id, &[], &outputs, chrono::Utc::now()).unwrap();
+            store
+                .record_reuse_spine(std::slice::from_ref(&entry), std::slice::from_ref(&prov))
+                .unwrap();
+            store
+                .record_artifact(&ArtifactRecord {
+                    blake3_hash: summary.blake3_hash.clone(),
+                    run_id: run_id.to_string(),
+                    model_name: model_ir.name.to_string(),
+                    file_path: summary.file_path.clone(),
+                    commit_version: summary.commit_version,
+                    size_bytes: summary.size_bytes,
+                    written_at: chrono::Utc::now(),
+                })
+                .unwrap();
+            let now = chrono::Utc::now();
+            let record = RunRecord {
+                run_id: run_id.to_string(),
+                started_at: now,
+                finished_at: now,
+                status: RunStatus::Success,
+                models_executed: vec![ModelExecution {
+                    model_name: model_ir.name.to_string(),
+                    started_at: now,
+                    finished_at: now,
+                    duration_ms: 0,
+                    rows_affected: Some(3),
+                    status: "success".to_string(),
+                    sql_hash: String::new(),
+                    skip_hash: None,
+                    upstream_freshness: None,
+                    bytes_scanned: None,
+                    bytes_written: None,
+                    tenant: None,
+                    recipe_hash: None,
+                    input_hash: None,
+                    input_proof_class: None,
+                    env_hash: None,
+                    hash_scheme: None,
+                    output_column_hashes: None,
+                    attempts: Vec::new(),
+                }],
+                trigger: RunTrigger::Manual,
+                config_hash: "cfg".to_string(),
+                triggering_identity: None,
+                session_source: SessionSource::Cli,
+                git_commit: None,
+                git_branch: None,
+                idempotency_key: None,
+                target_catalog: None,
+                hostname: "replay-live".to_string(),
+                rocky_version: VERSION.to_string(),
+                check_outcomes: Vec::new(),
+            };
+            store.record_run(&record).unwrap();
+
+            // --- Replay through the warehouse path, twice, for stability. ---
+            for attempt in 1..=2 {
+                let outcome = replay_execute_warehouse(
+                    &store,
+                    &record,
+                    None,
+                    /* verify */ true,
+                    /* keep */ false,
+                    warehouse_dyn,
+                )
+                .await;
+                assert_eq!(outcome.models.len(), 1, "attempt {attempt}");
+                let m = &outcome.models[0];
+                assert_eq!(
+                    m.verdict, "bit_exact",
+                    "attempt {attempt}: warehouse replay must re-derive the recorded artifact \
+                     byte-for-byte; got {:?} reasons={:?}",
+                    m.verdict, m.reasons
+                );
+                assert_eq!(m.recorded_hash, m.computed_hash, "attempt {attempt}");
+                assert_eq!(m.rows, Some(3), "attempt {attempt}");
+                assert!(
+                    outcome.replay_schema.starts_with(REPLAY_SCHEMA_PREFIX),
+                    "attempt {attempt}: replayed into an isolated namespace"
+                );
+                assert!(
+                    outcome.schema_dropped,
+                    "attempt {attempt}: replay schema must be dropped after --verify"
+                );
+                // Isolation: production row count is untouched by replay.
+                let n_after = count_rows(warehouse_dyn).await;
+                assert_eq!(
+                    n_after, n_before_replay,
+                    "attempt {attempt}: replay must NOT write the production target \
+                     (before={n_before_replay}, after={n_after})"
+                );
+                // The replay schema must genuinely be gone.
+                let schema_gone = warehouse_dyn
+                    .execute_query(&format!(
+                        "SELECT COUNT(*) AS n FROM {catalog}.information_schema.schemata \
+                         WHERE schema_name = '{}'",
+                        outcome.replay_schema
+                    ))
+                    .await
+                    .ok()
+                    .and_then(|r| {
+                        r.rows[0][0]
+                            .as_i64()
+                            .or_else(|| r.rows[0][0].as_str().and_then(|s| s.parse().ok()))
+                    })
+                    .unwrap_or(0);
+                assert_eq!(
+                    schema_gone, 0,
+                    "attempt {attempt}: the replay schema {} must not remain",
+                    outcome.replay_schema
+                );
+            }
+        }
+
+        // Teardown: remove the rows the recorded run appended so re-runs are
+        // self-cleaning. The content-addressed parquet objects are not
+        // deletable with these creds and leak by design.
+        warehouse_dyn
+            .execute_statement(&format!(
+                "DELETE FROM {fqtn} WHERE id IN ({id_a}, {id_b}, {id_c})"
+            ))
+            .await
+            .expect("teardown DELETE");
     }
 }

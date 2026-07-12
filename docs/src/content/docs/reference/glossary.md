@@ -77,7 +77,7 @@ A deterministic, reviewable record of what a run will do: compiled SQL, drift ac
 
 ### Replay
 
-Inspecting and verifying a past run against its [content-addressed](#content-addressed) record: per-model SQL hashes, row counts, and bytes. `rocky replay <run_id>` checks the record against the ledger; re-executing a run bit-for-bit from the pinned record is on the roadmap. See [Roadmap](/getting-started/roadmap/).
+Inspecting, auditing, and re-executing a past run against its [content-addressed](#content-addressed) record. `rocky replay <run_id>` surfaces per-model SQL hashes, row counts, and bytes; `rocky replay <run_id> --execute --verify` reconstructs each recipe from its provenance and re-runs it to reproduce the recorded output bit-for-bit, on a local DuckDB engine or, with `--warehouse`, on the live warehouse in an isolated replay schema. Re-execution covers deterministic content-addressed models; mutable-source models are classified `non_replayable` and non-deterministic recipes are flagged. See [Roadmap](/getting-started/roadmap/).
 
 ### Shadow mode
 
