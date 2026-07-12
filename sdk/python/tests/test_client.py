@@ -251,6 +251,23 @@ def test_run_cli_hard_failure_carries_stderr_tail():
     assert "fatal: nope" in exc.value.stderr_tail
 
 
+def test_run_cli_stderr_tail_is_bounded_to_last_20_lines():
+    # A long verbose run must not retain the whole stderr stream — only the
+    # last 20 lines are ever surfaced, so the reader's sink is capped there.
+    client = _client()
+    noise = "".join(f"line {i}\n" for i in range(1000))
+    proc = _fake_popen(stdout="not json", stderr=noise, returncode=1)
+    with (
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        pytest.raises(RockyCommandError) as exc,
+    ):
+        client.run_cli(["discover"])
+    tail_lines = exc.value.stderr_tail.splitlines()
+    assert len(tail_lines) == 20
+    assert tail_lines[0] == "line 980"
+    assert tail_lines[-1] == "line 999"
+
+
 def test_run_cli_timeout_when_watchdog_kills():
     client = _client(timeout_seconds=0.05)
     with (
@@ -331,6 +348,19 @@ def test_run_cli_binary_not_found():
     client = _client()
     with (
         patch("rocky_sdk.client.subprocess.Popen", side_effect=FileNotFoundError),
+        pytest.raises(RockyBinaryNotFoundError),
+    ):
+        client.run_cli(["discover"])
+
+
+@pytest.mark.parametrize("exc", [PermissionError, NotADirectoryError])
+def test_run_cli_non_executable_binary_maps_to_typed_error(exc):
+    # RockyBinaryNotFoundError's contract is "could not be found *or executed*":
+    # a non-executable file (PermissionError) or a bad path component
+    # (NotADirectoryError) must surface as the typed error, not a raw OSError.
+    client = _client()
+    with (
+        patch("rocky_sdk.client.subprocess.Popen", side_effect=exc),
         pytest.raises(RockyBinaryNotFoundError),
     ):
         client.run_cli(["discover"])

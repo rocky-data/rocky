@@ -24,6 +24,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
@@ -130,6 +131,25 @@ def _parse_rocky_json(output: str, model_cls: type[_TModel], *, command: str) ->
         ) from exc
 
 
+def _validate_payload(
+    payload: object, model_cls: type[_TModel], *, command: str, raw: str
+) -> _TModel:
+    """Validate an *already-parsed* JSON payload into ``model_cls``.
+
+    Use this on the dispatch paths that ``json.loads`` the output to sniff a
+    discriminant field (``command`` / apply-envelope): validating the parsed
+    payload avoids re-parsing the same multi-MB string a second time via
+    ``model_validate_json``. ``raw`` is the original stdout, surfaced on error
+    so the caller still sees exactly what the binary wrote.
+    """
+    try:
+        return model_cls.model_validate(payload)
+    except ValidationError as exc:
+        raise RockyOutputParseError(
+            command, stdout=raw or "", parse_error=str(exc), kind="validation"
+        ) from exc
+
+
 def _parse_run_or_apply(output: str, *, command: str) -> RunResult:
     """Parse ``rocky run`` / ``rocky apply`` JSON into a :class:`RunResult`.
 
@@ -168,9 +188,12 @@ def _parse_run_or_apply(output: str, *, command: str) -> RunResult:
                 plan_kind=str(payload.get("plan_kind", "")),
                 inner_result_preview=inner_preview,
             )
-        return _parse_rocky_json(json.dumps(inner), RunResult, command=command)
+        # Validate the unwrapped inner dict directly — no dumps→re-parse round trip.
+        return _validate_payload(inner, RunResult, command=command, raw=output)
 
-    return _parse_rocky_json(output, RunResult, command=command)
+    # Non-envelope: `payload` is already the parsed RunResult dict; validate it
+    # once instead of re-parsing `output` via model_validate_json.
+    return _validate_payload(payload, RunResult, command=command, raw=output)
 
 
 def _parse_apply(output: str) -> ApplyResult:
@@ -206,17 +229,19 @@ def _parse_apply(output: str) -> ApplyResult:
             kind="validation",
         )
 
+    # `payload` is already parsed for the dispatch below; validate it directly
+    # rather than re-parsing `output` a second time via model_validate_json.
     command = payload.get("command", "")
     if command == "run":
-        return _parse_rocky_json(output, RunResult, command="apply")
+        return _validate_payload(payload, RunResult, command="apply", raw=output)
     if command == "compact apply":
-        return _parse_rocky_json(output, CompactApplyOutput, command="apply")
+        return _validate_payload(payload, CompactApplyOutput, command="apply", raw=output)
     if command == "archive apply":
-        return _parse_rocky_json(output, ArchiveApplyOutput, command="apply")
+        return _validate_payload(payload, ArchiveApplyOutput, command="apply", raw=output)
     if command == "branch promote":
-        return _parse_rocky_json(output, BranchPromoteOutput, command="apply")
+        return _validate_payload(payload, BranchPromoteOutput, command="apply", raw=output)
     if command == "apply" and ("evicted" in payload or "refused" in payload):
-        return _parse_rocky_json(output, GcApplyOutput, command="apply")
+        return _validate_payload(payload, GcApplyOutput, command="apply", raw=output)
 
     raise RockyOutputParseError(
         "apply",
@@ -631,7 +656,11 @@ class RockyClient:
         t0 = time.monotonic()
         try:
             proc = subprocess.Popen(cmd, **popen_kwargs)  # noqa: S603 - typed argv
-        except FileNotFoundError:
+        except (FileNotFoundError, PermissionError, NotADirectoryError):
+            # RockyBinaryNotFoundError's contract is "could not be found *or
+            # executed*" — a non-executable file (PermissionError) or a path
+            # component that isn't a directory maps to the same typed error
+            # instead of leaking a raw OSError to the caller.
             raise RockyBinaryNotFoundError(self.binary_path) from None
 
         self._logger.info(
@@ -644,7 +673,12 @@ class RockyClient:
         # Sole-reader threads must start before proc.wait() so they drain the
         # pipe buffers concurrently with rocky writing (else a large write
         # blocks rocky and we deadlock).
-        stderr_lines: list[str] = []
+        #
+        # stderr is bounded: only the last 20 lines are ever consumed (the
+        # failure tail below), so a multi-hour verbose run (engine `info!`
+        # tracing goes to stderr) does not accumulate tens of MB for 20 lines
+        # of value. The reader still sees and forwards every line live.
+        stderr_lines: deque[str] = deque(maxlen=20)
         stdout_chunks: list[str] = []
         stderr_reader = threading.Thread(
             target=forward_stderr_to_sink,
@@ -693,7 +727,7 @@ class RockyClient:
 
         duration_ms = int((time.monotonic() - t0) * 1000)
         stdout = "".join(stdout_chunks)
-        stderr_tail = "\n".join(stderr_lines[-20:])
+        stderr_tail = "\n".join(stderr_lines)
 
         # A timeout requires both signals: the watchdog fired AND the exit status
         # reflects its kill (POSIX: -SIGKILL; Windows: proc.kill() exits non-zero).
