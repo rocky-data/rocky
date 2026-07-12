@@ -22,6 +22,7 @@ Usage::
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -101,15 +102,15 @@ def _shape_key_for_node(node: DagNodeOutput) -> str:
 
 
 def _build_column_lineage_metadata(
-    node: DagNodeOutput,
-    column_lineage_edges: list[LineageEdgeRecord],
+    model_edges: list[LineageEdgeRecord],
     node_id_to_key: dict[str, dg.AssetKey],
 ) -> dict[str, dg.TableColumnLineage] | None:
-    """Build Dagster column lineage metadata from Rocky's lineage edges."""
-    if not column_lineage_edges:
-        return None
+    """Build Dagster column lineage metadata from a model's lineage edges.
 
-    model_edges = [e for e in column_lineage_edges if e.target.model == node.label]
+    ``model_edges`` are the edges whose target is this node's model, already
+    bucketed by the caller (see ``edges_by_target_model``) so this is not an
+    O(nodes × edges) rescan of the full edge list per node.
+    """
     if not model_edges:
         return None
 
@@ -154,6 +155,13 @@ def build_dag_specs(
     node_id_to_key: dict[str, dg.AssetKey] = {}
     column_lineage_edges = dag_result.column_lineage or []
 
+    # Bucket lineage edges by target model once (O(edges)) so the per-node
+    # metadata build below is an O(1) dict lookup rather than a full rescan of
+    # every edge per node (which was O(nodes × edges) on each definitions load).
+    edges_by_target_model: dict[str, list[LineageEdgeRecord]] = defaultdict(list)
+    for edge in column_lineage_edges:
+        edges_by_target_model[edge.target.model].append(edge)
+
     # First pass: compute all asset keys via the translator.
     for node in dag_result.nodes:
         if node.kind == "test":
@@ -180,8 +188,7 @@ def build_dag_specs(
             metadata["rocky/pipeline"] = node.pipeline
 
         col_lineage_meta = _build_column_lineage_metadata(
-            node,
-            column_lineage_edges,
+            edges_by_target_model.get(node.label, []),
             node_id_to_key,
         )
         if col_lineage_meta:
