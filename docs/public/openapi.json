@@ -14141,7 +14141,7 @@
         "type": "object"
       },
       "ReplayExecuteOutput": {
-        "description": "JSON output for `rocky replay --at <run_id> --execute [--verify]`.\n\nRe-execution surface (DuckDB). Each model's recipe is reconstructed from its recorded [`rocky_core::state::ProvenanceRecord`] — never the working tree — re-executed on an in-memory DuckDB engine, and its output artifact's blake3 re-derived. With `--verify` that digest is compared against the recorded output hash and a per-model verdict is emitted.\n\nTwo modes share this shape:\n\n- `--model <m>` re-executes a single, *self-contained* recipe on a throwaway engine. A recipe with recorded content upstreams is `non_replayable` in this mode — resolving those inputs is the DAG mode below. - no `--model` re-executes the *whole run* in topological order on one shared engine, materializing each upstream's **replayed** output so a downstream `SELECT` reads the replayed bytes (never the recorded object-store bytes, never production). A downstream whose in-run upstream could not be replayed is `non_replayable` (fail-closed cascade); an upstream not produced by any model in this run, or a mutable-source watermark, is likewise `non_replayable` rather than substituted.\n\nNothing is materialized to any warehouse schema: the entire in-memory engine is an ephemeral replay namespace, discarded after the run, so no production identity is ever touched.",
+        "description": "JSON output for `rocky replay --at <run_id> --execute [--verify]`.\n\nRe-execution surface. Each model's recipe is reconstructed from its recorded [`rocky_core::state::ProvenanceRecord`] — never the working tree — re-executed, and its output artifact's blake3 re-derived. With `--verify` that digest is compared against the recorded output hash and a per-model verdict is emitted. Execution runs on an in-memory DuckDB engine by default; with `--warehouse` it runs on the configured live warehouse instead, materializing replayed outputs into an isolated replay schema (see `replay_schema`) and encoding the recomputed artifact with the live table's physical column mapping so the digest is directly comparable to what the content-addressed writer recorded.\n\nTwo modes share this shape:\n\n- `--model <m>` re-executes a single, *self-contained* recipe on a throwaway engine. A recipe with recorded content upstreams is `non_replayable` in this mode — resolving those inputs is the DAG mode below. - no `--model` re-executes the *whole run* in topological order on one shared engine, materializing each upstream's **replayed** output so a downstream `SELECT` reads the replayed bytes (never the recorded object-store bytes, never production). A downstream whose in-run upstream could not be replayed is `non_replayable` (fail-closed cascade); an upstream not produced by any model in this run, or a mutable-source watermark, is likewise `non_replayable` rather than substituted.\n\nNo production identity is ever touched in either mode: the local path's entire in-memory engine is an ephemeral replay namespace discarded after the run, and the warehouse path writes only into the isolated `replay_schema`, dropped after the run unless `--keep` is passed.",
         "properties": {
           "bit_exact_count": {
             "description": "Number of models whose re-execution reproduced the recorded output byte-for-byte. Always `0` when `--verify` was not requested.",
@@ -14163,6 +14163,20 @@
               "$ref": "#/components/schemas/ReplayExecuteModelOutput"
             },
             "type": "array"
+          },
+          "replay_schema": {
+            "description": "Isolated warehouse schema the replayed outputs were materialized into (`--warehouse` only; absent on the local re-execution path). Replay never writes to the production location of any recorded target — every replayed table lands in this namespace, one schema per catalog touched.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replay_schema_dropped": {
+            "description": "Whether the replay namespace was removed after the run (`--warehouse` only). `true` when no replay schema remains on the warehouse; `false` when `--keep` was passed or a drop failed.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "run_id": {
             "type": "string"

@@ -1785,14 +1785,17 @@ enum Command {
     /// Shows every model that ran with SQL hash, row counts, bytes, and
     /// timings captured at the time. Useful for "what exactly ran at
     /// 03:15 UTC?" and as the reproducibility artefact for branch +
-    /// replay. Re-execution with pinned inputs is a follow-up once the
-    /// content-addressed write path arrives.
+    /// replay.
     ///
     /// With `--check`, runs a read-only replayability audit instead of the
     /// inspection view: for each model it classifies whether the recording
     /// alone is sufficient to re-execute it (provenance present, embedded IR
     /// parses under the current engine, inputs resolvable from the ledger)
     /// and flags static non-determinism. Nothing is executed.
+    ///
+    /// With `--execute`, re-executes the recorded recipes (see the flag docs
+    /// below) either on a local DuckDB engine or, with `--warehouse`, against
+    /// the configured live warehouse in an isolated replay schema.
     Replay {
         /// Run id or the literal `latest`. May also be given via `--at`.
         target: Option<String>,
@@ -1806,10 +1809,11 @@ enum Command {
         /// Run a read-only replayability audit instead of the inspection view.
         #[arg(long)]
         check: bool,
-        /// Re-execute the recorded recipe on a local DuckDB engine instead of
-        /// inspecting: reconstructs the recipe from the recording (never the
-        /// working tree), runs its `SELECT` in an ephemeral in-memory engine,
-        /// and re-derives the output hash. Single, self-contained models only.
+        /// Re-execute the recorded recipe instead of inspecting: reconstructs
+        /// the recipe from the recording (never the working tree), runs its
+        /// `SELECT`, and re-derives the output hash. Runs on an ephemeral
+        /// in-memory DuckDB engine by default; see `--warehouse` for live
+        /// warehouse re-execution.
         #[arg(long)]
         execute: bool,
         /// With `--execute`, compare the re-derived output blake3 against the
@@ -1817,6 +1821,21 @@ enum Command {
         /// `diverged` / `non_replayable`).
         #[arg(long)]
         verify: bool,
+        /// With `--execute`, re-execute on the live warehouse configured in
+        /// rocky.toml instead of a local engine. Content-addressed models
+        /// only: the recomputed artifact is encoded with the live table's
+        /// physical column mapping, so `--verify` compares against exactly
+        /// what the content-addressed writer recorded. All replay writes go
+        /// into an isolated replay schema — never the production location of
+        /// any recorded target — and that schema is dropped afterwards
+        /// unless `--keep` is passed.
+        #[arg(long)]
+        warehouse: bool,
+        /// With `--warehouse`, keep the isolated replay schema (and the
+        /// replayed tables in it) after the run for inspection instead of
+        /// dropping it.
+        #[arg(long)]
+        keep: bool,
     },
 
     /// Render a completed run as a timeline.
@@ -3862,6 +3881,8 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             check,
             execute,
             verify,
+            warehouse,
+            keep,
         } => {
             let run_ref = at.or(target).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -3871,7 +3892,24 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             if verify && !execute {
                 anyhow::bail!("`--verify` requires `--execute`");
             }
-            if execute {
+            if warehouse && !execute {
+                anyhow::bail!("`--warehouse` requires `--execute`");
+            }
+            if keep && !warehouse {
+                anyhow::bail!("`--keep` requires `--warehouse`");
+            }
+            if execute && warehouse {
+                rocky_cli::commands::run_replay_execute_warehouse(
+                    &cli.config,
+                    &state_path,
+                    &run_ref,
+                    model.as_deref(),
+                    verify,
+                    keep,
+                    json,
+                )
+                .await
+            } else if execute {
                 rocky_cli::commands::run_replay_execute(
                     &state_path,
                     &run_ref,

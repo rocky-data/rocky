@@ -151,7 +151,7 @@ pub use preview_rows::run_preview_rows;
 pub use profile::run_profile;
 pub use profile_storage::run_profile_storage;
 pub use publish_ir::run_publish_ir;
-pub use replay::{run_replay, run_replay_check, run_replay_execute};
+pub use replay::{run_replay, run_replay_check, run_replay_execute, run_replay_execute_warehouse};
 pub use retention_status::run_retention_status;
 pub use review::{compute_review, compute_review_queue, run_review, run_review_queue};
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
