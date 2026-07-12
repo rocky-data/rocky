@@ -486,14 +486,27 @@ impl RockyLsp {
     /// `didOpen`) still surface E028 for syntactically-broken `.rocky`
     /// files.
     async fn publish_dsl_parse_diagnostics(&self, models_dir: &std::path::Path) {
-        let Ok(entries) = std::fs::read_dir(models_dir) else {
+        // Collect the `.rocky` paths off the async worker: the directory scan
+        // is blocking I/O and this runs on LSP cold start (and after every
+        // compile), so a large or slow models dir would otherwise stall the
+        // tower-lsp task. Nested `Ok(Ok(..))`: outer is the `JoinError`, inner
+        // is the `read_dir` result.
+        let dir = models_dir.to_path_buf();
+        let scan = tokio::task::spawn_blocking(move || {
+            let mut paths = Vec::new();
+            for entry in std::fs::read_dir(&dir)?.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("rocky") {
+                    paths.push(path);
+                }
+            }
+            Ok::<Vec<std::path::PathBuf>, std::io::Error>(paths)
+        })
+        .await;
+        let Ok(Ok(rocky_paths)) = scan else {
             return;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("rocky") {
-                continue;
-            }
+        for path in rocky_paths {
             let Ok(uri) = Url::from_file_path(&path) else {
                 continue;
             };
@@ -516,10 +529,10 @@ impl RockyLsp {
             } else {
                 // Cold-start fallback: file not in salsa db yet (no
                 // `didOpen` seen). Match the legacy behaviour and re-read
-                // from disk; the parse runs through the original
-                // `rocky_lang::parse` because we don't have a salsa
-                // input to hang the memoization off.
-                let Ok(content) = std::fs::read_to_string(&path) else {
+                // from disk (async so the read doesn't block the worker); the
+                // parse runs through the original `rocky_lang::parse` because
+                // we don't have a salsa input to hang the memoization off.
+                let Ok(content) = tokio::fs::read_to_string(&path).await else {
                     continue;
                 };
                 let outcome = match rocky_lang::parse(&content) {

@@ -1919,7 +1919,9 @@ impl RockyMcpServer {
         // artifact — a draft the policy plane refuses must not linger on disk
         // (mirrors the propose gate's deny → no plan written). A drop-guard,
         // not a manual closure: unwinding restores too.
-        let rollback = DraftRollback::snapshot([&paths.sql_path, &paths.sidecar_path]);
+        let rollback =
+            DraftRollback::snapshot_async(vec![paths.sql_path.clone(), paths.sidecar_path.clone()])
+                .await;
 
         // Write the draft: the SQL body verbatim + a minimal sidecar that carries
         // the intent. Target/strategy resolve from the project's conventions
@@ -2093,7 +2095,7 @@ impl RockyMcpServer {
         // Snapshot so a policy DENY (or a write/compile failure, or a panic
         // before the verdict) rolls back to leave NO new artifact — mirrors
         // `draft_model` and the propose gate. Drop-guard: unwinding restores.
-        let rollback = DraftRollback::snapshot([&paths.contract_path]);
+        let rollback = DraftRollback::snapshot_async(vec![paths.contract_path.clone()]).await;
 
         if let Err(e) = std::fs::write(&paths.contract_path, ensure_trailing_newline(&spec)) {
             return Err(ToolError::internal(
@@ -2215,7 +2217,7 @@ impl RockyMcpServer {
         // verdict) restores the model's PRIOR sidecar (the name/intent
         // draft_model wrote), never deletes it — the check is what rolls back,
         // not the model. A model with no sidecar yet snapshots None.
-        let rollback = DraftRollback::snapshot([&paths.sidecar_path]);
+        let rollback = DraftRollback::snapshot_async(vec![paths.sidecar_path.clone()]).await;
 
         // Merge: append the `[[tests]]` block(s) to the existing sidecar, or seed
         // a minimal sidecar (`name = "<stem>"`) when the model is a bare `.sql`.
@@ -3632,6 +3634,18 @@ impl DraftRollback {
             entries,
             defused: false,
         }
+    }
+
+    /// Async wrapper over [`snapshot`](Self::snapshot) that runs the prior-bytes
+    /// reads on the blocking pool. The async draft handlers use this so the
+    /// snapshot reads don't block the tokio worker; the sync `snapshot` stays
+    /// for the `catch_unwind`-based restore-on-panic unit test.
+    async fn snapshot_async(paths: Vec<PathBuf>) -> Self {
+        // `snapshot` only ever reads with `.ok()`, so the closure can't panic
+        // and the `JoinError` arm is unreachable in practice.
+        tokio::task::spawn_blocking(move || Self::snapshot(paths))
+            .await
+            .expect("DraftRollback::snapshot does not panic")
     }
 
     /// The snapshotted prior bytes for `path` (`None` = the file did not
