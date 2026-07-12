@@ -3,7 +3,7 @@
 > **Category:** 00-foundations
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 5s
-> **Rocky features:** validate, list, doctor, seed, discover, plan, compile, test, `[[tests]]` declarative assertions, `[checks]` pipeline checks
+> **Rocky features:** validate, list, doctor, seed, discover, plan, compile, test, `[[tests]]` declarative assertions
 
 ## What it shows
 
@@ -58,6 +58,8 @@ Commands exercised:
 │   ├── orders.toml         routes to raw__orders schema
 │   ├── products.csv        5 rows (id, name, category, price, in_stock)
 │   └── products.toml       routes to raw__products schema
+├── data/
+│   └── seed.sql            raw__orders table — auto-loaded by `rocky test`
 └── models/
     ├── _defaults.toml      target: poc.analytics
     ├── stg_orders.sql      SELECT from replicated orders
@@ -76,9 +78,14 @@ bash run.sh
 
 ## Expected output
 
+Rocky emits **JSON by default** when stdout is not a TTY (as under `bash run.sh`);
+only the explicit `-o table` steps render as tables. The `plan`, `compile`, and
+`test` JSON is redirected into `expected/`, so those sections print little or
+nothing to the terminal.
+
 ```
 === validate ===
-Config is valid.
+{ "command": "validate", "valid": true, ... }        # JSON (auto-selected)
 
 === list pipelines ===
 NAME                      TYPE             TARGET               SOURCE               DEPENDS ON
@@ -93,25 +100,26 @@ NAME                           TARGET                                   STRATEGY
 stg_orders                     poc.analytics.stg_orders                 full_refresh     -            -
 
 === doctor --check auth ===
-...
+{ "command": "doctor", "overall": "healthy", ... }   # JSON
 
 === seed ===
-Seed complete: 3 loaded, 0 failed (...)
-  [OK] customers -> poc.raw__customers.customers (7 rows, ...)
-  [OK] orders -> poc.raw__orders.orders (10 rows, ...)
-  [OK] products -> poc.raw__products.products (5 rows, ...)
+{ "command": "seed", "tables_loaded": 3, "tables_failed": 0, ... }   # JSON
 
 === discover ===
-(3 source schemas: raw__customers, raw__orders, raw__products)
+raw__customers | source="customers" | 1 tables
+raw__orders    | source="orders"    | 1 tables
+raw__products  | source="products"  | 1 tables
 
 === plan (orders only) ===
-(SQL plan for raw__orders -> poc.staging__orders)
+-- full_refresh_copy (staging__orders.orders)
+CREATE OR REPLACE TABLE staging__orders.orders AS SELECT * FROM raw__orders.orders;
+Run plan persisted — 1 model(s) across 1 layer(s)
 
 === compile ===
-(stg_orders compiles successfully)
+(stg_orders compiles; JSON written to expected/compile.json)
 
 === test ===
-test result: 1 passed, 0 failed
+(1 passed, 0 failed; JSON written to expected/test.json)
 
 POC complete: generic adapter exercise passed.
 ```

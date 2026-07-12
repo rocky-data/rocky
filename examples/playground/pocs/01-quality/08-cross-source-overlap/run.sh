@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# 09-cross-source-overlap — the same business key arriving via two sources.
+# 08-cross-source-overlap — the same business key arriving via two sources.
 set -euo pipefail
-
-export ROCKY_SUPPRESS_DEPRECATION=1
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
@@ -37,11 +35,12 @@ def walk(o):
 found = list(walk(data))
 if not found:
     print("  (no cross_source_overlap result found)")
+# sort for deterministic output (tables/sample come back in nondeterministic order)
 for c in found:
     print(f"  {c['name']}: passed={c['passed']} "
           f"overlap_count={c.get('overlap_count')} "
-          f"contributing_tables={c.get('contributing_tables')} "
-          f"sample={c.get('sample')}")
+          f"contributing_tables={sorted(c.get('contributing_tables') or [])} "
+          f"sample={sorted(c.get('sample') or [])}")
 PY
 
 echo
@@ -61,7 +60,8 @@ def walk(o):
 found = list(walk(data))
 if not found:
     print("  (no unique_expr result found)")
-for c in found:
+# sort for deterministic output (per-table results come back in nondeterministic order)
+for c in sorted(found, key=lambda c: c["passed"]):
     print(f"  {c['name']}: passed={c['passed']} failing_rows={c.get('failing_rows')}")
 PY
 

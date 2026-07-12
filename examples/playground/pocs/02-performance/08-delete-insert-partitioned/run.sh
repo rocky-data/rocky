@@ -13,7 +13,7 @@ rocky validate
 rocky compile --models models > expected/compile.json
 
 echo "=== Compiled model ==="
-cat expected/compile.json | head -20
+jq -r '.models_detail[] | "  \(.name) — \(.strategy.type) (partition_by: [\(.strategy.partition_by | join(", "))])"' expected/compile.json
 
 echo
 echo "Delete+Insert strategy:"

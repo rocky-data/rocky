@@ -1,7 +1,5 @@
 # 08-branch-approve-promote — gated promotion of a branch into prod
 
-![Rocky refuses to promote without a signed approval, then ships once the artifact is on disk](../../../../../docs/public/demo-branch-approve-promote.gif)
-
 > **Category:** 00-foundations
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 10s

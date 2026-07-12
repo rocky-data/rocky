@@ -102,5 +102,5 @@ computed.
 | Backfill | Full refresh only | `--from / --to` walks the range |
 | Per-partition observability | No | Yes (`PartitionInfo` in JSON output) |
 
-See `docs/src/content/docs/features/time-interval.md` for the full
+See `docs/src/content/docs/concepts/time-interval.md` for the full
 feature reference.

@@ -27,9 +27,11 @@ echo "  This prevents overwhelming the warehouse while maximizing throughput."
 
 echo
 echo "=== Running 20 tables with concurrency=16 ==="
-rocky -c rocky.toml -o json run --filter source=orders > expected/run.json 2>&1 || true
+rocky -c rocky.toml -o json run --filter source=orders > expected/run.json 2>&1
 
-echo "    Tables processed: $(duckdb poc.duckdb "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'staging__orders'" -noheader -list 2>/dev/null || echo 'check expected/run.json')"
+PROCESSED=$(duckdb poc.duckdb "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'staging__orders'" -noheader -list)
+echo "    Tables processed: $PROCESSED"
+test "$PROCESSED" -eq 20
 
 echo
 echo "POC complete: adaptive concurrency config validated; 20 tables processed in parallel."

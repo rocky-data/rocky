@@ -43,6 +43,15 @@ after its file stem.
 - `rocky` on PATH
 - `duckdb` CLI (`brew install duckdb`) — mints `orders.parquet` from the seed
   CSV and queries the loaded tables back
+- Network access on first run: DuckDB reads Parquet and JSONL through its
+  `parquet` and `json` extensions, which it autoloads from
+  `extensions.duckdb.org` the first time they're used.
+
+> **Offline note:** in a fully offline / egress-restricted environment the
+> extension download is blocked, so the `.parquet` and `.jsonl` loads fail
+> (only the `.csv` loads) and `rocky load` exits non-zero — the run stops
+> before the query step. Run once with network to cache the extensions, after
+> which the demo works offline.
 
 ## Run
 
@@ -52,19 +61,26 @@ after its file stem.
 
 ## Expected output
 
+Shape of a successful `rocky load --output json` run (byte and `duration_ms`
+values vary per run; the Parquet size depends on DuckDB's writer):
+
 ```text
 === load (Parquet + CSV + JSONL → DuckDB, format auto-detected) ===
 {
+  "version": "1.63.0",
   "command": "load",
   "source_dir": "data/",
   "format": "auto",
   "files_loaded": 3,
+  "files_failed": 0,
   "total_rows": 21,
+  "total_bytes": 2180,
   "files": [
-    { "file": "data/customers.csv",   "target": "main.customers", "rows_loaded":  5 },
-    { "file": "data/events.jsonl",    "target": "main.events",    "rows_loaded":  6 },
-    { "file": "data/orders.parquet",  "target": "main.orders",    "rows_loaded": 10 }
-  ]
+    { "file": "data/customers.csv",  "target": "main.customers", "rows_loaded":  5, "bytes_read":  268, "duration_ms": 15 },
+    { "file": "data/events.jsonl",   "target": "main.events",    "rows_loaded":  6, "bytes_read":  693, "duration_ms": 12 },
+    { "file": "data/orders.parquet", "target": "main.orders",    "rows_loaded": 10, "bytes_read": 1219, "duration_ms": 18 }
+  ],
+  "duration_ms": 60
 }
 
 === query loaded tables ===

@@ -51,12 +51,16 @@ re-plans the same intent and shows the `plan_id` is byte-for-byte identical.
 
 ## Expected output
 
+The `plan_id` below is shown as `<plan_id>` — it is a blake3 content hash of the
+plan payload, so its literal value depends on the engine version. The invariant
+that matters is that the two `plan_id` values (step 1 and step 4) are identical.
+
 ```text
 ==> 1. rocky plan — generate a plan, persist it, DO NOT execute
-    plan_id    : 60210fad9cf22fc90b8d4a38c6b2983a1e42d15b9f02fc08359a9f75b6857ae2
+    plan_id    : <plan_id>
     plan_kind  : replication
     statements : 2
-    persisted  : yes (.rocky/plans/60210fad...ae2.json)
+    persisted  : yes (.rocky/plans/<plan_id>.json)
 
 ==> 2. Nothing materialized yet — plan is a dry-run
     target tables before apply : 0  (expected 0)
@@ -67,8 +71,8 @@ re-plans the same intent and shows the `plan_id` is byte-for-byte identical.
     rows in staging__orders.orders : 200  (expected 200)
 
 ==> 4. Idempotency — re-plan the same intent yields the SAME plan_id
-    first plan_id  : 60210fad...ae2
-    second plan_id : 60210fad...ae2
+    first plan_id  : <plan_id>
+    second plan_id : <plan_id>
 ```
 
 ## What happened

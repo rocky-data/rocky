@@ -16,6 +16,9 @@ components = ["source"]
 catalog_template = "poc"
 schema_template = "staging__{source}"
 
+[pipeline.poc.target.governance]
+auto_create_schemas = true
+
 # Adaptive concurrency: starts at concurrency=16 (ceiling),
 # auto-decreases on rate-limit/transient errors (AIMD halving),
 # auto-increases on consecutive successes.

@@ -1,0 +1,8 @@
+intent = "Clean raw order data for downstream consumption. Exclude cancelled orders and orders with non-positive amounts. One row per order; order_id is the unique grain. amount must be positive."
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "poc"
+schema = "demo"

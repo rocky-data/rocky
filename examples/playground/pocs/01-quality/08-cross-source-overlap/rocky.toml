@@ -1,4 +1,4 @@
-# 09-cross-source-overlap — detect the same business key arriving via two sources.
+# 08-cross-source-overlap — detect the same business key arriving via two sources.
 #
 # Two regional Shopify connectors (us, eu) both land an `orders` table. They
 # share some order_ids (the same orders onboarded under two paths), which a
@@ -14,9 +14,6 @@ path = "poc.duckdb"
 
 [pipeline.poc]
 strategy = "full_refresh"
-
-[pipeline.poc.source.discovery]
-adapter = "default"
 
 [pipeline.poc.source.schema_pattern]
 prefix = "raw__"

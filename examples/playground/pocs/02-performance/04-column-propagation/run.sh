@@ -13,4 +13,8 @@ rocky lineage stg_orders          --models models > expected/lineage_stg_orders.
 rocky lineage fct_status_summary  --models models > expected/lineage_fct_status_summary.json
 rocky lineage fct_status_summary  --models models --format dot > expected/lineage.dot
 
+# Column-level traces: `amount` dead-ends at stg_orders, `status` propagates on to fct_status_summary.
+rocky lineage stg_orders --models models --column amount  > expected/lineage_stg_orders_amount.json
+rocky lineage stg_orders --models models --column status  > expected/lineage_stg_orders_status.json
+
 echo "POC complete: column-level lineage emitted for branching DAG."

@@ -123,6 +123,41 @@ Enforcement is strictly opt-in. Without `enforce`, the same pin is allowed.
 ./run.sh
 ```
 
+## Expected output
+
+```
+=== Part 1: fan-out — three members of group 'daily_marts' ===
+    schema_template = "mart_{region}"; each member fills {region} from [args]
+
+Resolved member targets + inherited tags:
+  fct_orders_apac      -> warehouse.mart_apac.fct_orders_apac    [domain=sales,tier=gold]
+  fct_orders_emea      -> warehouse.mart_emea.fct_orders_emea    [domain=sales,tier=gold]
+  fct_orders_us_west   -> warehouse.mart_us_west.fct_orders_us_west [domain=sales,tier=silver]
+
+Distinct schemas: mart_apac mart_emea mart_us_west
+OK: group [tags] inherited by all members; us_west tier override merged per-key
+
+=== Part 2: load-time guard A — misplaced [args] (non-enforced group) ===
+    broken/misplaced-args pins target.schema AND supplies [args] -> the
+    pin bypasses the template, so the [args] are dead. Expect load FAILURE.
+
+    -> failed as expected. Error:
+      failed to load models: model 'fct_orders_broken' supplies [args] for config group 'daily_marts's schema_template but also pins its own target.schema; the pin overrides the template, so the [args] are dead. Remove the pinned schema to route via [args], or remove [args] if the pinned schema is intended.
+
+=== Part 3: load-time guard B — overriding an ENFORCED group ===
+    broken/enforce-override pins target.schema under an enforced group
+    that OWNS the schema. Expect load FAILURE (governance guarantee).
+
+    -> failed as expected. Error:
+      failed to load models: model 'fct_ledger_broken' overrides 'target.schema', which its enforced group 'regulated' controls; remove the local override or set the group's enforce = false
+
+POC complete:
+  - one config group fanned out to 3 distinct schemas (mart_emea / mart_us_west / mart_apac)
+  - every member inherited the group [tags] baseline; us_west overrode tier per-key
+  - misplacement guard rejected pin-schema + [args]
+  - enforcement guard rejected overriding an enforced group's schema
+```
+
 ## Precedence rules
 
 Per-model sidecar **>** group **>** `_defaults.toml`:

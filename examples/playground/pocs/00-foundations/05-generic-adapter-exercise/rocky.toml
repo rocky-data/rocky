@@ -1,8 +1,10 @@
 # 05-generic-adapter-exercise — DuckDB generic adapter end-to-end
 # No external credentials needed!
 #
-# Exercises: validate, list, doctor, seed, discover, plan, run, test
+# Exercises: validate, list, doctor, seed, discover, plan, compile, test
 # Demonstrates the full generic adapter surface against a local DuckDB file.
+# The [checks] block below is validated but only executes under `rocky run`,
+# which this POC does not invoke (run.sh stops at `rocky plan`).
 
 [adapter]
 type = "duckdb"

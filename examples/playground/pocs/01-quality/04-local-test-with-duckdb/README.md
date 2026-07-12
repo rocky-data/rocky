@@ -30,7 +30,6 @@ strict-contracts diagnostic surface is covered separately in
 ├── rocky.toml
 ├── run.sh
 ├── models/
-├── contracts/
 └── data/seed.sql
 ```
 

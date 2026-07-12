@@ -68,9 +68,12 @@ rocky test --models models --contracts contracts
 ## Expected output
 
 ```text
-materialized in playground.main: customer_orders, raw_orders, revenue_summary
-test result: 3 passed, 0 failed
+materialized in playground.main:
+customer_orders, raw_orders, revenue_summary
 ```
+
+`rocky test` writes its result to `expected/test.json`
+(`"total": 3, "passed": 3, "failed": 0`) rather than printing a text summary.
 
 ## What happened
 
