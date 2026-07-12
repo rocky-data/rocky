@@ -324,6 +324,7 @@ export type PolicyCapability =
   | "promote"
   | "backfill"
   | "gc"
+  | "restore"
   | "retry"
   | "quarantine"
   | "schema_change.additive"

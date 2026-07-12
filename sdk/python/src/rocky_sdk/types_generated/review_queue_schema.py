@@ -16,7 +16,7 @@ class PolicyCapability(StrEnum):
     read = "read"
 
 
-class PolicyCapability59(StrEnum):
+class PolicyCapability64(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -24,7 +24,7 @@ class PolicyCapability59(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability60(StrEnum):
+class PolicyCapability65(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -32,7 +32,7 @@ class PolicyCapability60(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability61(StrEnum):
+class PolicyCapability66(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -40,7 +40,7 @@ class PolicyCapability61(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability62(StrEnum):
+class PolicyCapability67(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -48,7 +48,7 @@ class PolicyCapability62(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability63(StrEnum):
+class PolicyCapability68(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -56,7 +56,15 @@ class PolicyCapability63(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability64(StrEnum):
+class PolicyCapability69(StrEnum):
+    """
+    Restore a gc-evicted artifact from its tombstone (rebuild + verify).
+    """
+
+    restore = "restore"
+
+
+class PolicyCapability70(StrEnum):
     """
     Retry a failed run.
     """
@@ -64,7 +72,7 @@ class PolicyCapability64(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability65(StrEnum):
+class PolicyCapability71(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -72,7 +80,7 @@ class PolicyCapability65(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability66(StrEnum):
+class PolicyCapability72(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -80,7 +88,7 @@ class PolicyCapability66(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability67(StrEnum):
+class PolicyCapability73(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -88,7 +96,7 @@ class PolicyCapability67(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability68(StrEnum):
+class PolicyCapability74(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -127,16 +135,17 @@ class ReviewQueueEntry(BaseModel):
     """
     capability: (
         PolicyCapability
-        | PolicyCapability59
-        | PolicyCapability60
-        | PolicyCapability61
-        | PolicyCapability62
-        | PolicyCapability63
         | PolicyCapability64
         | PolicyCapability65
         | PolicyCapability66
         | PolicyCapability67
         | PolicyCapability68
+        | PolicyCapability69
+        | PolicyCapability70
+        | PolicyCapability71
+        | PolicyCapability72
+        | PolicyCapability73
+        | PolicyCapability74
     )
     """
     The capability that was evaluated (its `schema_change.*` refinement is the change class the ranking weighs).

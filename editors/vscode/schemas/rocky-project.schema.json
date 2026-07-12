@@ -2110,6 +2110,13 @@
           "type": "string"
         },
         {
+          "description": "Restore a gc-evicted artifact from its tombstone (rebuild + verify).",
+          "enum": [
+            "restore"
+          ],
+          "type": "string"
+        },
+        {
           "description": "Retry a failed run.",
           "enum": [
             "retry"

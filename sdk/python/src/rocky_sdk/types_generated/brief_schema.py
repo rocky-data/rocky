@@ -156,7 +156,7 @@ class BriefSinceMode3(StrEnum):
     field_7d = "7d"
 
 
-class PolicyCapability23(StrEnum):
+class PolicyCapability25(StrEnum):
     """
     Read model output / metadata. Always allowed.
     """
@@ -164,7 +164,7 @@ class PolicyCapability23(StrEnum):
     read = "read"
 
 
-class PolicyCapability24(StrEnum):
+class PolicyCapability26(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -172,7 +172,7 @@ class PolicyCapability24(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability25(StrEnum):
+class PolicyCapability27(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -180,7 +180,7 @@ class PolicyCapability25(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability26(StrEnum):
+class PolicyCapability28(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -188,7 +188,7 @@ class PolicyCapability26(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability27(StrEnum):
+class PolicyCapability29(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -196,7 +196,7 @@ class PolicyCapability27(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability28(StrEnum):
+class PolicyCapability30(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -204,7 +204,15 @@ class PolicyCapability28(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability29(StrEnum):
+class PolicyCapability31(StrEnum):
+    """
+    Restore a gc-evicted artifact from its tombstone (rebuild + verify).
+    """
+
+    restore = "restore"
+
+
+class PolicyCapability32(StrEnum):
     """
     Retry a failed run.
     """
@@ -212,7 +220,7 @@ class PolicyCapability29(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability30(StrEnum):
+class PolicyCapability33(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -220,7 +228,7 @@ class PolicyCapability30(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability31(StrEnum):
+class PolicyCapability34(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -228,7 +236,7 @@ class PolicyCapability31(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability32(StrEnum):
+class PolicyCapability35(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -236,7 +244,7 @@ class PolicyCapability32(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability33(StrEnum):
+class PolicyCapability36(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -398,9 +406,7 @@ class BriefDecisionEntry(BaseModel):
     """
 
     capability: (
-        PolicyCapability23
-        | PolicyCapability24
-        | PolicyCapability25
+        PolicyCapability25
         | PolicyCapability26
         | PolicyCapability27
         | PolicyCapability28
@@ -409,6 +415,9 @@ class BriefDecisionEntry(BaseModel):
         | PolicyCapability31
         | PolicyCapability32
         | PolicyCapability33
+        | PolicyCapability34
+        | PolicyCapability35
+        | PolicyCapability36
     )
     """
     The class of action a policy rule governs.

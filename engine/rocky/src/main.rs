@@ -337,6 +337,7 @@ enum PolicyCapabilityArg {
     Promote,
     Backfill,
     Gc,
+    Restore,
     Retry,
     Quarantine,
     #[value(name = "schema_change.additive")]
@@ -357,6 +358,7 @@ impl From<PolicyCapabilityArg> for rocky_core::config::PolicyCapability {
             PolicyCapabilityArg::Promote => C::Promote,
             PolicyCapabilityArg::Backfill => C::Backfill,
             PolicyCapabilityArg::Gc => C::Gc,
+            PolicyCapabilityArg::Restore => C::Restore,
             PolicyCapabilityArg::Retry => C::Retry,
             PolicyCapabilityArg::Quarantine => C::Quarantine,
             PolicyCapabilityArg::SchemaChangeAdditive => C::SchemaChangeAdditive,
@@ -1901,6 +1903,26 @@ enum Command {
         /// time, not read-recency (no read-tracking on this adapter).
         #[arg(long, value_name = "DAYS", default_value_t = 7)]
         min_age_days: i64,
+    },
+
+    /// Restore a gc-evicted artifact from its durable tombstone, hash-exact.
+    ///
+    /// A gc tombstone claims "these bytes can be rebuilt"; `rocky restore` is
+    /// the proof. It resolves `<target>` (a model name, `model@<recipe-prefix>`,
+    /// or a content-hash prefix) to exactly one tombstone — refusing ambiguity
+    /// with the candidates listed — and writes a review-gated *restore plan*
+    /// (it never writes bytes directly). Approve it with `rocky review
+    /// <plan-id> --approve`, then `rocky apply <plan-id>` re-derives the
+    /// artifact from its recorded recipe, asserts the recomputed blake3 equals
+    /// the tombstoned hash BEFORE any write becomes visible, re-materializes
+    /// the bytes at the tombstoned path (never overwriting mismatched bytes),
+    /// and reinstates the ledger row. Restoration is symmetric-caution gated
+    /// like gc: even a human restore goes through review.
+    Restore {
+        /// The artifact to restore: a model name, `model@<recipe-hash-prefix>`,
+        /// or a content-hash prefix (≥ 8 hex chars). Ambiguous targets are
+        /// refused with the matching candidates listed.
+        target: String,
     },
 
     /// PR preview workflow — pruned re-run on a per-PR branch with
@@ -3961,6 +3983,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     json,
                 )
             }
+        }
+        Command::Restore { target } => {
+            // Plan mode: resolve the tombstone and write a review-gated restore
+            // plan. The invoker principal rides on the plan (an agent-scoped
+            // `deny agent restore` rule fires on an agent-run restore); the
+            // review gate is unconditional either way. Writes no bytes.
+            let principal = resolve_cli_principal(cli.principal)?;
+            rocky_cli::commands::run_restore_plan(&state_path, &target, principal, json)
         }
         Command::Preview { action } => match action {
             PreviewAction::Create { base, name, models } => {

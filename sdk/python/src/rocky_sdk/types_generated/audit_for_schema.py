@@ -76,7 +76,7 @@ class AuditVerifyEntry(BaseModel):
     """
 
 
-class PolicyCapability12(StrEnum):
+class PolicyCapability13(StrEnum):
     """
     Read model output / metadata. Always allowed.
     """
@@ -84,7 +84,7 @@ class PolicyCapability12(StrEnum):
     read = "read"
 
 
-class PolicyCapability13(StrEnum):
+class PolicyCapability14(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -92,7 +92,7 @@ class PolicyCapability13(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability14(StrEnum):
+class PolicyCapability15(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -100,7 +100,7 @@ class PolicyCapability14(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability15(StrEnum):
+class PolicyCapability16(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -108,7 +108,7 @@ class PolicyCapability15(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability16(StrEnum):
+class PolicyCapability17(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -116,7 +116,7 @@ class PolicyCapability16(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability17(StrEnum):
+class PolicyCapability18(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -124,7 +124,15 @@ class PolicyCapability17(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability18(StrEnum):
+class PolicyCapability19(StrEnum):
+    """
+    Restore a gc-evicted artifact from its tombstone (rebuild + verify).
+    """
+
+    restore = "restore"
+
+
+class PolicyCapability20(StrEnum):
     """
     Retry a failed run.
     """
@@ -132,7 +140,7 @@ class PolicyCapability18(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability19(StrEnum):
+class PolicyCapability21(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -140,7 +148,7 @@ class PolicyCapability19(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability20(StrEnum):
+class PolicyCapability22(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -148,7 +156,7 @@ class PolicyCapability20(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability21(StrEnum):
+class PolicyCapability23(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -156,7 +164,7 @@ class PolicyCapability21(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability22(StrEnum):
+class PolicyCapability24(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -307,8 +315,7 @@ class AuditDecisionEntry(BaseModel):
     """
 
     capability: (
-        PolicyCapability12
-        | PolicyCapability13
+        PolicyCapability13
         | PolicyCapability14
         | PolicyCapability15
         | PolicyCapability16
@@ -318,6 +325,8 @@ class AuditDecisionEntry(BaseModel):
         | PolicyCapability20
         | PolicyCapability21
         | PolicyCapability22
+        | PolicyCapability23
+        | PolicyCapability24
     )
     """
     The capability that was evaluated.
@@ -358,8 +367,7 @@ class AuditPlanChange(BaseModel):
     """
 
     capability: (
-        PolicyCapability12
-        | PolicyCapability13
+        PolicyCapability13
         | PolicyCapability14
         | PolicyCapability15
         | PolicyCapability16
@@ -369,6 +377,8 @@ class AuditPlanChange(BaseModel):
         | PolicyCapability20
         | PolicyCapability21
         | PolicyCapability22
+        | PolicyCapability23
+        | PolicyCapability24
     )
     """
     The change class the plan recorded for this model (`schema_change.additive` / `schema_change.breaking` / `value_change` / a bare verb).

@@ -281,6 +281,11 @@ _LAZY: dict[str, tuple[str, str]] = {
     "ReplayModelOutput": ("replay_schema", "ReplayModelOutput"),
     "ReplayOutput": ("replay_schema", "ReplayOutput"),
     "ResolvedCheckNameOutput": ("discover_schema", "ResolvedCheckNameOutput"),
+    "RestoreApplyOutput": ("restore_apply_schema", "RestoreApplyOutput"),
+    "RestorePlanOutput": ("restore_plan_schema", "RestorePlanOutput"),
+    "RestorePlanRestoration": ("restore_plan_schema", "RestorePlanRestoration"),
+    "RestoreRefusedOutput": ("restore_apply_schema", "RestoreRefusedOutput"),
+    "RestoredOutput": ("restore_apply_schema", "RestoredOutput"),
     "RetentionStatusOutput": ("retention_status_schema", "RetentionStatusOutput"),
     "RetentionSweepOutput": ("state_retention_sweep_schema", "RetentionSweepOutput"),
     "ReviewOutput": ("review_schema", "ReviewOutput"),
@@ -599,6 +604,15 @@ if TYPE_CHECKING:
         ReplayExecuteModelOutput,
         ReplayExecuteOutput,
     )
+    from .restore_apply_schema import (
+        RestoreApplyOutput,
+        RestoredOutput,
+        RestoreRefusedOutput,
+    )
+    from .restore_plan_schema import (
+        RestorePlanOutput,
+        RestorePlanRestoration,
+    )
     from .compliance_schema import (
         ColumnClassificationStatus,
         ComplianceException,
@@ -815,6 +829,11 @@ __all__ = [
     "GcRefusedOutput",
     "GcPlanEviction",
     "GcPlanOutput",
+    "RestorePlanOutput",
+    "RestorePlanRestoration",
+    "RestoreApplyOutput",
+    "RestoredOutput",
+    "RestoreRefusedOutput",
     "BriefOutput",
     "BriefAgentActivitySection",
     "BriefPrincipalActivity",

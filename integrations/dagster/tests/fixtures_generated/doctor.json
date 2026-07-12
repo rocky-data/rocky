@@ -17,7 +17,7 @@
     {
       "name": "state_schema",
       "status": "healthy",
-      "message": "state schema v19 matches this binary",
+      "message": "state schema v20 matches this binary",
       "duration_ms": 0
     },
     {

@@ -58,13 +58,21 @@ class PolicyCapability6(StrEnum):
 
 class PolicyCapability7(StrEnum):
     """
+    Restore a gc-evicted artifact from its tombstone (rebuild + verify).
+    """
+
+    restore = "restore"
+
+
+class PolicyCapability8(StrEnum):
+    """
     Retry a failed run.
     """
 
     retry = "retry"
 
 
-class PolicyCapability8(StrEnum):
+class PolicyCapability9(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -72,7 +80,7 @@ class PolicyCapability8(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability9(StrEnum):
+class PolicyCapability10(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -80,7 +88,7 @@ class PolicyCapability9(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability10(StrEnum):
+class PolicyCapability11(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -88,7 +96,7 @@ class PolicyCapability10(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability11(StrEnum):
+class PolicyCapability12(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -153,6 +161,7 @@ class AuditDecisionEntry(BaseModel):
         | PolicyCapability9
         | PolicyCapability10
         | PolicyCapability11
+        | PolicyCapability12
     )
     """
     The capability that was evaluated.

@@ -1,0 +1,153 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "RestoreRefusedOutput": {
+      "description": "One artifact `rocky apply <restore-plan>` **refused** to restore — the fail-closed verification caught a mismatch, so nothing was written for it.",
+      "properties": {
+        "blake3_hash": {
+          "type": "string"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why the restoration was refused. A recomputed-hash mismatch is surfaced honestly — it means the tombstone's rebuild claim failed, which is itself a finding, never papered over.",
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "blake3_hash",
+        "model_name",
+        "reason",
+        "run_id",
+        "size_bytes"
+      ],
+      "type": "object"
+    },
+    "RestoredOutput": {
+      "description": "One artifact successfully restored by `rocky apply <restore-plan>` — the recomputed blake3 matched the tombstoned hash, the bytes are present at the tombstoned path, and the ledger row was reinstated.",
+      "properties": {
+        "blake3_hash": {
+          "type": "string"
+        },
+        "bytes_written": {
+          "description": "`true` when the restore physically wrote the rebuilt bytes to the tombstoned path; `false` when verified bytes were already present there (an idempotent \"already present, verified\" restore — the ledger row was still reinstated if missing).",
+          "type": "boolean"
+        },
+        "file_path": {
+          "type": "string"
+        },
+        "hash_verified": {
+          "description": "Always `true` on this list: the rebuilt bytes' blake3 equalled the tombstoned hash **before** any write became visible.",
+          "type": "boolean"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "status": {
+          "description": "Human-readable restoration outcome.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "blake3_hash",
+        "bytes_written",
+        "file_path",
+        "hash_verified",
+        "model_name",
+        "run_id",
+        "size_bytes",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output of `rocky apply <restore-plan>`.\n\nReports the restoration outcome per planned tombstone: restored (rebuilt hash-exact, or verified already-present), refused (with the exact fail-closed reason), or already restored (idempotent no-op verified against the live bytes).",
+  "properties": {
+    "already_restored": {
+      "description": "Content hashes of plan entries whose tombstone was already consumed by a prior restore and whose live bytes re-verified — idempotent no-ops.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "bytes_restored": {
+      "description": "Total bytes restored (including verified-already-present bytes).",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "command": {
+      "type": "string"
+    },
+    "notes": {
+      "description": "Operator caveats (re-derivation engine, verification order, overwrite rule).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "plan_id": {
+      "type": "string"
+    },
+    "refused": {
+      "description": "Artifacts refused by a fail-closed guard; nothing was written for them.",
+      "items": {
+        "$ref": "#/definitions/RestoreRefusedOutput"
+      },
+      "type": "array"
+    },
+    "refused_count": {
+      "description": "Count of refused artifacts.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "restored": {
+      "description": "Artifacts restored — hash-verified bytes at the tombstoned path and a reinstated ledger row.",
+      "items": {
+        "$ref": "#/definitions/RestoredOutput"
+      },
+      "type": "array"
+    },
+    "restored_count": {
+      "description": "Count of restored artifacts.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "already_restored",
+    "bytes_restored",
+    "command",
+    "notes",
+    "plan_id",
+    "refused",
+    "refused_count",
+    "restored",
+    "restored_count",
+    "version"
+  ],
+  "title": "RestoreApplyOutput",
+  "type": "object"
+}
