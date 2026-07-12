@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.34.4] — 2026-07-12
+
+### Added
+
+- **Generated TypeScript types for the engine-v1.64.0 output surface** — `rocky replay --execute` (`replay_execute`) and `rocky restore` plan + apply (`restore_plan`, `restore_apply`). Additive; the LSP client and existing commands are unchanged.
+
+### Changed
+
+- Internal extension efficiency and health-probe pass (no user-facing change). (#1101)
+
 ## [1.34.3] — 2026-07-10
 
 ### Added
