@@ -31,7 +31,7 @@ For example, a table `orders` from a Fivetran source with components `tenant=acm
 
 ### Group
 
-The default group name is the first component value. For the example above, the group would be `"acme"`.
+The default group name is the first string-valued component; list-valued components are skipped, and it falls back to the source type when every component is list-valued. For the example above, the group would be `"acme"`.
 
 ### Tags
 

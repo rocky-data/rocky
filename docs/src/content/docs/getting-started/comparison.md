@@ -32,8 +32,9 @@ In these tables, **dbt-core** is the dbt Core 1.x Python line, still the dominan
 | Warehouse | Rocky | dbt-core | dbt-fusion | SQLMesh | Coalesce | Dataform |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
 | Databricks | **Yes** | Yes | Private preview | Yes | Yes | No |
-| Snowflake | **Yes** | Yes | GA | Yes | Yes | No |
+| Snowflake | Beta | Yes | GA | Yes | Yes | No |
 | BigQuery | Beta | Yes | Preview | Yes | Planned | **Yes** |
+| Trino | Beta | Community | No | Yes | No | No |
 | DuckDB | **Yes** | Yes | Beta (CLI only) | Yes | No | No |
 | Redshift | Planned | Yes | Preview | Yes | Planned | No |
 | PostgreSQL | Planned | Yes | No | Yes | No | No |
@@ -110,7 +111,7 @@ In these tables, **dbt-core** is the dbt Core 1.x Python line, still the dominan
 | Dagster | **Native** | Yes | Via dbt | Community (dagster-sqlmesh) |
 | Airflow | Via CLI | Yes | Via dbt | Yes |
 | Dagster Pipes protocol | **Yes** | No | No | No |
-| Typed output models | **Yes** (63 schemas) | No | No | No |
+| Typed output models | **Yes** (82 schemas) | No | No | No |
 
 ## Data Quality
 
@@ -123,8 +124,8 @@ In these tables, **dbt-core** is the dbt Core 1.x Python line, still the dominan
 | Custom SQL | **Yes** | Yes | Yes | Yes |
 | Anomaly detection | **Yes** | No | No | No |
 | Inline (not separate step) | **Yes** | No | No | No |
-| Unit tests / fixture-driven tests | **Yes** | (verify against current vendor docs) | (verify against current vendor docs) | (verify against current vendor docs) |
-| Reusable named / generic tests | **Yes** | (verify against current vendor docs) | (verify against current vendor docs) | (verify against current vendor docs) |
+| Unit tests / fixture-driven tests | **Yes** | Yes | Yes | Yes |
+| Reusable named / generic tests | **Yes** | Yes | Yes | Yes (audits) |
 
 **Rocky:** fixture-driven [unit tests](/concepts/testing/) (mocked inputs under `[[test]]`, asserted output rows, run locally on DuckDB by plain `rocky test`) and [reusable named tests](/concepts/data-quality-checks/#reusable-named-tests) (define an assertion once in `models/test_definitions.toml`, apply it by name with `[[use_test]]`, references resolved at load so a typo fails the load) are both first-class. Unit tests run on the default `rocky test` path; named tests resolve into declarative assertions that run against the warehouse with `rocky test --declarative`. See the [`[[test]]`](/reference/model-format/#test) and [`[[use_test]]`](/reference/model-format/#use_test) blocks in the model format.
 
@@ -132,7 +133,7 @@ In these tables, **dbt-core** is the dbt Core 1.x Python line, still the dominan
 
 | Feature | Rocky | dbt-core | dbt-fusion | SQLMesh |
 |---|:---:|:---:|:---:|:---:|
-| Surrogate keys | **Yes** | (verify against current vendor docs) | (verify against current vendor docs) | (verify against current vendor docs) |
+| Surrogate keys | **Yes** | Via dbt_utils | Via dbt_utils | No |
 
 **Rocky:** a [`[[surrogate_key]]`](/reference/model-format/#surrogate_key) block injects a deterministic hash column at materialization, computed in dialect-correct SQL on each warehouse, so you don't hand-write the hash. On a given warehouse the value is identical to what `dbt_utils.generate_surrogate_key` produces over the same columns (NULL inputs coalesce to the same sentinel), so a Rocky key joins against the matching key in an upstream dbt model and survives a migration in either direction.
 
@@ -174,7 +175,7 @@ In these tables, **dbt-core** is the dbt Core 1.x Python line, still the dominan
 | Benchmarks | **Yes** | No | No |
 | HTTP API / LSP | **Yes** | No | Yes |
 | Hook management | **Yes** | No | No |
-| **Total** | **38+** | ~15 | ~20 |
+| **Total** | **65+** | ~15 | ~20 |
 
 ## Performance (10k models)
 

@@ -125,24 +125,8 @@ protected = ["order_date", "revenue"]
 | Rule | Description |
 |---|---|
 | **required** | Column must exist in the model's output with the specified type. Compilation fails if missing or wrong type. |
-| **protected** | Column cannot be removed from the model in future changes. The compiler warns if a protected column disappears. |
+| **protected** | Column cannot be removed from the model in future changes. If a protected column disappears, compilation fails with error `E013`. |
 | **nullable** | When `false`, the compiler verifies the column is non-nullable in the type system. |
-
-### Allowed type changes
-
-By default, any type change to a required column is a violation. You can whitelist specific widenings:
-
-```toml
-[[allowed_type_changes]]
-from = "Int32"
-to = "Int64"
-
-[[allowed_type_changes]]
-from = "Float32"
-to = "Float64"
-```
-
-This allows `Int32` columns to be widened to `Int64` without triggering a violation.
 
 ### Compile with contracts
 
@@ -153,13 +137,11 @@ rocky compile --models models --contracts contracts
 Violations produce compiler errors:
 
 ```
-  error[C001]: contract violation in 'fct_daily_revenue'
-    Required column 'revenue' has type String, expected Decimal
-    = help: check the upstream transformation that produces 'revenue'
+  error[E011]: column 'revenue' type mismatch: contract expects Decimal, got String
+    = help: CAST `revenue` to Decimal in the SELECT, or update the contract's expected type
 
-  error[C002]: contract violation in 'fct_daily_revenue'
-    Protected column 'order_count' was removed
-    = help: add 'order_count' back to the SELECT clause
+  error[E013]: protected column 'order_count' has been removed
+    = help: restore `order_count` in the SELECT, or remove it from `[rules] protected`
 ```
 
 ### Contract validation in CI
@@ -182,15 +164,15 @@ Applied to every managed catalog created by the pipeline:
 
 ```toml
 [[pipeline.bronze.target.governance.grants]]
-principal = "group:data_engineers"
+principal = "data_engineers"
 permissions = ["USE CATALOG", "MANAGE"]
 
 [[pipeline.bronze.target.governance.grants]]
-principal = "group:analysts"
+principal = "analysts"
 permissions = ["BROWSE", "USE CATALOG"]
 
 [[pipeline.bronze.target.governance.grants]]
-principal = "group:ml_team"
+principal = "ml_team"
 permissions = ["BROWSE", "USE CATALOG", "SELECT"]
 ```
 
@@ -200,11 +182,11 @@ Applied to every managed schema created by the pipeline:
 
 ```toml
 [[pipeline.bronze.target.governance.schema_grants]]
-principal = "group:data_engineers"
+principal = "data_engineers"
 permissions = ["USE SCHEMA", "SELECT", "MODIFY"]
 
 [[pipeline.bronze.target.governance.schema_grants]]
-principal = "group:analysts"
+principal = "analysts"
 permissions = ["USE SCHEMA", "SELECT"]
 ```
 
@@ -219,9 +201,9 @@ During `rocky apply`, for each managed catalog and schema:
 
 ```sql
 -- Equivalent SQL (the form emitted on SQL-only warehouses)
-GRANT SELECT ON CATALOG `acme_warehouse` TO `group:analysts`;
-GRANT USE SCHEMA ON SCHEMA `acme_warehouse`.`staging__us_west__shopify` TO `group:analysts`;
-REVOKE MODIFY ON CATALOG `acme_warehouse` FROM `group:temp_access`;
+GRANT SELECT ON CATALOG `acme_warehouse` TO `analysts`;
+GRANT USE SCHEMA ON SCHEMA `acme_warehouse`.`staging__us_west__shopify` TO `analysts`;
+REVOKE MODIFY ON CATALOG `acme_warehouse` FROM `temp_access`;
 ```
 
 ### Managed vs skipped permissions
@@ -242,7 +224,7 @@ Skipped permissions are never granted or revoked by Rocky. This prevents Rocky f
 Principal names must match the pattern `^[a-zA-Z0-9_ \-\.@]+$`. In generated SQL, principals are always wrapped in backticks to handle spaces and special characters:
 
 ```sql
-GRANT USE CATALOG ON CATALOG acme_warehouse TO `group:data engineers`
+GRANT USE CATALOG ON CATALOG acme_warehouse TO `data engineers`
 ```
 
 ## 4. Column Classification and Masking (Pillar 2 of 5)
@@ -373,7 +355,7 @@ The JSON payload is the `ComplianceOutput` schema: a `summary` block with counte
 
 Rocky supports hierarchical role declarations that flatten into a resolved permission set per role. Inheritance is declarative and composable; cycles and unknown parents are rejected at config-load time.
 
-Shipped in engine-v1.16.0. The Databricks v1 adapter implementation is **log-only**: it validates the flattened graph and emits `debug!` events, but SCIM group creation and per-catalog GRANT emission are deferred to a follow-up.
+Shipped in engine-v1.16.0. When a SCIM client is configured, the Databricks adapter provisions `rocky_role_*` SCIM groups and emits add-only per-catalog `GRANT` statements from the flattened role graph. Groups and grants are never deleted — removal requires manual cleanup. When SCIM is not configured, the adapter falls back to **log-only**: it validates the flattened graph and emits `debug!` events without touching the warehouse.
 
 ### Declare roles in `rocky.toml`
 
@@ -408,14 +390,14 @@ At reconcile time, Rocky calls `RockyConfig::role_graph()` which flattens the `[
 
 Cycles and unknown parents are caught at config-load time, regardless of whether the target adapter supports role-graph reconcile. This means the resolver catches misconfiguration even on warehouses where the adapter silently no-ops.
 
-### Databricks v1: log-only
+### Databricks reconcile
 
-The Databricks `reconcile_role_graph` validates each flattened role's `rocky_role_<name>` principal syntax and logs the resolved permission set. It does not yet:
+The Databricks `reconcile_role_graph` validates each flattened role's `rocky_role_<name>` principal syntax and, when a SCIM client is configured, runs a two-pass reconcile:
 
-- Create SCIM groups for each role
-- Emit per-catalog / per-schema `GRANT` statements from the flattened role graph
+- **Pass 1** — create a `rocky_role_<name>` SCIM group per role (best-effort per role).
+- **Pass 2** — emit an add-only per-catalog `GRANT <permission> ON CATALOG ...` for every `(role, catalog, permission)` triple.
 
-If you need grants applied today, use the `[pipeline.*.target.governance.grants]` blocks from Pillar 1. When the follow-up lands, the same config migrates to the full apply without a rewrite. Other adapters default to no-op.
+These are add-only (v1) semantics: groups and grants are never revoked, so removing a role or permission from `rocky.toml` requires manual cleanup on the warehouse. When no SCIM client is configured, the adapter falls back to log-only — it validates and logs the resolved permission set without emitting any GRANTs. Other adapters default to no-op.
 
 ## 7. Data Retention (Pillar 5 of 5)
 
@@ -460,12 +442,14 @@ rocky retention-status
 ```
 
 ```
-MODEL              CONFIGURED DAYS   WAREHOUSE DAYS
-─────────────────────────────────────────────────────
-events_daily       90                (not probed)
-orders             365               (not probed)
-customers          (none)            (not probed)
+MODEL              CONFIGURED   WAREHOUSE   IN SYNC
+──────────────────────────────────────────────────────
+events_daily       90 days      -           no
+orders             365 days     -           yes
+customers          -            -           yes
 ```
+
+Without `--drift`, the `WAREHOUSE` column is `-` (not probed) and `IN SYNC` compares the configured value against nothing.
 
 Flags:
 
@@ -473,11 +457,11 @@ Flags:
 |---|---|
 | `--models <dir>` | Models directory (defaults to `models/`). |
 | `--model <name>` | Scope the report to a single model. |
-| `--drift` | Accepted for forward compatibility. Today it filters the report to models with a declared policy and leaves `warehouse_days` null. |
+| `--drift` | Probe the warehouse for the applied retention, fill `warehouse_days`, and filter the report to models with a declared policy. |
 
-### `--drift` is a v2 feature
+### `--drift` probes the warehouse
 
-The v2 plan for `--drift` is a warehouse probe that reads the currently-applied TBLPROPERTIES / session parameter and fills `warehouse_days` in the report, so teams can detect drift between `rocky.toml` and the live table. The report schema (`warehouse_days: Option<u32>`) is already stable, so the probe will slot in without a schema change. Wire your CI around the configured-days column for now.
+With `--drift`, Rocky resolves a governance adapter per model and reads the currently-applied TBLPROPERTIES / session parameter, filling `warehouse_days` and recomputing `in_sync` so teams can detect drift between `rocky.toml` and the live table. The probe is Databricks + Snowflake only — DuckDB and BigQuery inherit the default no-observation impl, so `--drift` leaves `warehouse_days` empty on those targets. Probe errors surface per-model on stderr but do not fail the command.
 
 ## 8. Workspace Isolation
 
@@ -889,12 +873,12 @@ Latest snapshot (run: abc12345678):
   Row count: 15432
 
 ALERTS:
-  [WARNING] null rate 15.3% exceeds 20% threshold (column: phone)
+  [WARNING] null rate 25.0% exceeds 20% threshold (column: phone)
 ```
 
 Alert severity levels:
-- **critical**: Null rate exceeds 50%, freshness exceeds 7 days
-- **warning**: Null rate exceeds 20%, freshness exceeds 24 hours
+- **critical**: Null rate exceeds 50%
+- **warning**: Null rate exceeds 20%, or freshness lag exceeds 24 hours
 
 ### JSON output
 
@@ -922,24 +906,24 @@ data_owner = "analytics-team"
 
 # Catalog-level grants
 [[pipeline.bronze.target.governance.grants]]
-principal = "group:data_engineers"
+principal = "data_engineers"
 permissions = ["USE CATALOG", "MANAGE"]
 
 [[pipeline.bronze.target.governance.grants]]
-principal = "group:analysts"
+principal = "analysts"
 permissions = ["BROWSE", "USE CATALOG"]
 
 [[pipeline.bronze.target.governance.grants]]
-principal = "group:ml_team"
+principal = "ml_team"
 permissions = ["BROWSE", "USE CATALOG", "SELECT"]
 
 # Schema-level grants
 [[pipeline.bronze.target.governance.schema_grants]]
-principal = "group:data_engineers"
+principal = "data_engineers"
 permissions = ["USE SCHEMA", "SELECT", "MODIFY"]
 
 [[pipeline.bronze.target.governance.schema_grants]]
-principal = "group:analysts"
+principal = "analysts"
 permissions = ["USE SCHEMA", "SELECT"]
 
 # Workspace isolation
@@ -1037,7 +1021,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rocky
-        run: curl -sSL https://install.rocky.dev | sh
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
       - name: Run compliance gate
         run: rocky compliance --env prod --fail-on exception
 ```

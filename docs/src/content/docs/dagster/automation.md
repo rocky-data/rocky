@@ -75,5 +75,10 @@ a stable Rocky-side import that won't shift if the mapping evolves.
 | `rocky_eager_automation` | You want Dagster to auto-materialize whenever upstreams update; least imperative, most declarative. |
 | `rocky_cron_automation` | You want scheduled execution gated on upstream freshness. |
 
-The four can coexist on the same asset graph. Dagster will deduplicate
-materializations via `run_key` so simultaneous triggers don't double-execute.
+The four can coexist on the same asset graph, but they do **not** deduplicate
+across mechanisms. Only `rocky_source_sensor` sets a `run_key` on its own
+`RunRequest`s, so Dagster collapses repeat firings of that sensor. A
+`build_rocky_schedule` tick and an `AutomationCondition` firing carry no
+`run_key`, so a schedule and an eager/cron condition landing in the same window
+each launch their own run. Pick one automation mechanism per asset rather than
+relying on cross-mechanism dedup.

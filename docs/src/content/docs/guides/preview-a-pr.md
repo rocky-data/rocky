@@ -31,11 +31,12 @@ rocky preview create --base main
 What this does:
 
 1. Runs `git diff --name-only main HEAD` against the models directory to find changed model files.
-2. Loads the working tree into the compiler and computes the **prune set**: every changed model plus everything that depends on a changed column.
+2. Scans the models directory into a DAG and computes the **prune set**: every changed model plus everything transitively downstream of it (via each model's `depends_on`).
 3. Computes the **copy set**: every working-DAG model not in the prune set.
 4. Registers a branch in the state store (mirrors `rocky branch create`).
 5. Issues `CREATE TABLE <branch_schema>.<model> AS SELECT * FROM <base_schema>.<model>` for each copy-set model.
-6. Calls `rocky plan --branch <name>` followed by `rocky apply <plan-id>` (or the single-step `rocky run --branch <name>` alias) with a model selector limited to the prune set.
+
+`preview create` does **not** run the prune-set models itself — it emits `run_status: "planned"` with an empty `run_id`. Run `rocky run --branch <name>` (with a selector limited to the prune set) before `preview diff` / `preview cost` so there's a branch run to compare against.
 
 The output is a `PreviewCreateOutput` JSON document:
 
@@ -48,36 +49,36 @@ The output is a `PreviewCreateOutput` JSON document:
   "base_ref": "main",
   "head_ref": "HEAD",
   "prune_set": [
-    { "model_name": "fct_revenue", "reason": "changed", "changed_columns": ["amount_cents"] },
-    { "model_name": "rev_by_region", "reason": "downstream_of_changed" }
+    { "model_name": "fct_revenue", "reason": "changed", "changed_columns": [] },
+    { "model_name": "rev_by_region", "reason": "downstream_of_changed", "changed_columns": [] }
   ],
   "copy_set": [
     { "model_name": "stg_orders",    "source_schema": "main", "target_schema": "branch__preview-fix-price", "copy_strategy": "ctas" },
     { "model_name": "stg_customers", "source_schema": "main", "target_schema": "branch__preview-fix-price", "copy_strategy": "ctas" }
   ],
   "skipped_set": [],
-  "run_id": "run-20260428-141033-002",
-  "run_status": "succeeded",
+  "run_id": "",
+  "run_status": "planned",
   "duration_ms": 4321
 }
 ```
 
-The `run_id` is the handle the next two commands use to look up cost telemetry.
+`run_id` comes back empty and `run_status` is `"planned"` because `preview create` only registers the branch and copies the base tables — it doesn't run the prune-set models. `preview diff` and `preview cost` don't key off this `run_id`; they pair the latest run tagged to the branch name against base over run history, so run `rocky run --branch preview-fix-price` before either.
 
 ## Step 2: Diff the branch against base
 
 ```bash
-rocky preview diff --name preview-fix-price --output markdown
+rocky preview diff --name preview-fix-price --output json | jq -r .markdown
 ```
 
 This combines two layers into one report:
 
-- **Structural diff**: column-level added/removed/type-changed, the same shape `rocky ci-diff` produces.
+- **Structural diff**: a `structural` block per model with `added_columns` / `removed_columns` / `type_changes`. These arrays are placeholders today — the `RunRecord` doesn't persist column lists, so they're always empty on the wire; typed schema-level detection lives in `rocky ci-diff`.
 - **Row-level diff**: per-model row delta surfaced through one of two algorithms (a discriminator on the JSON output picks which):
-  - `kind: "sampled"` (default): `LIMIT N` rows ordered by primary key (default `--sample-size 1000`); fast, but misses rows outside the window. Carries a `coverage_warning` when the sample doesn't cover the full table.
+  - `kind: "sampled"` (default): a row-count / bytes delta computed off the two `RunRecord`s. It doesn't read row content yet, so it always reports `coverage: "not_yet_sampled"` and `coverage_warning: true`, and `--sample-size` is currently ignored. Changes that don't shift row counts won't surface here.
   - `kind: "bisection"`: exhaustive checksum-bisection over a single-column integer / numeric `unique_key`. Walks the chunk lattice, recurses into mismatched chunks, surfaces every row-level diff. See the [How Preview Works](/concepts/preview-internals/) page for the algorithm. Runs only on Merge-strategy models with a single integer PK; other models stay on sampled (logged via `tracing::warn` with the skip reason).
 
-`--output markdown` writes a PR-comment-ready snippet to stdout. Use `--output json` for the full `PreviewDiffOutput` shape (the JSON output also includes the rendered Markdown in a top-level `markdown` field, so you can pipe it through `jq -r .markdown` for the same effect).
+The full `PreviewDiffOutput` shape (`--output json`) carries the rendered PR-comment-ready snippet in a top-level `markdown` field; pipe it through `jq -r .markdown` to print just that snippet to stdout. (There's no `--output markdown` mode — the valid values are `json`, `table`, and `md`, and `md` only logs a one-line status; the Markdown lives in the JSON `markdown` field.)
 
 ### Choosing the algorithm
 
@@ -88,6 +89,8 @@ rocky preview diff --name preview-fix-price
 # Exhaustive — checksum-bisection (covers the whole table)
 rocky preview diff --name preview-fix-price --algorithm bisection
 ```
+
+`--algorithm` is currently hidden from `rocky preview diff --help`, but it is accepted and stable.
 
 Per-model output uses a tagged `algorithm` discriminator:
 
@@ -115,7 +118,7 @@ Direct JSON consumers should read `model.algorithm.kind` first, then unpack the 
 ## Step 3: Compare cost vs. base
 
 ```bash
-rocky preview cost --name preview-fix-price --output markdown
+rocky preview cost --name preview-fix-price --output json | jq -r .markdown
 ```
 
 This is a diff layer over [`rocky cost latest`](/reference/commands/administration/#rocky-cost). For each model in the prune set, Rocky looks up the latest base-schema `RunRecord` from the state store and the branch run's `RunRecord`, then subtracts the per-model duration, bytes scanned, and USD cost.
@@ -146,25 +149,25 @@ The Markdown rendering surfaces a "Budget projection" section only when breaches
 
 The prune set is the set of models that re-execute against the branch. Two reasons can put a model in the prune set:
 
-- `reason: "changed"`: the model file itself changed in the diff (`changed_columns` lists which columns).
-- `reason: "downstream_of_changed"`: the model didn't change but transitively depends on a column that did.
+- `reason: "changed"`: the model file itself changed in the diff. (`changed_columns` is a placeholder that's always empty on the wire today.)
+- `reason: "downstream_of_changed"`: the model didn't change but sits transitively downstream of a changed model via `depends_on`.
 
-Models in neither bucket are either in the **copy set** (logically identical to base, so they get CTAS'd over) or the **skipped set** (the column-level pruner determined they're unaffected and not depended on). The skipped set is the empty-cost residue: nothing copies them, nothing runs them.
+Models in neither bucket are either in the **copy set** (logically identical to base, so they get CTAS'd over) or the **skipped set** (reserved for removed-in-PR detection; always empty on the wire today). The skipped set is the empty-cost residue: nothing copies them, nothing runs them.
 
 If the prune set is empty, your PR doesn't change any model output (e.g. a whitespace-only edit). The branch run is a no-op and `preview cost` reports a zero delta.
 
 ## What `coverage_warning: true` means
 
-The default `--algorithm sampled` reads a fixed window (`ORDER BY <pk> LIMIT N`), so it can miss changes outside that window. When the row count outside the window is non-trivial, the per-model diff sets:
+The default `--algorithm sampled` doesn't read row content yet — it computes a row-count / bytes delta off the two `RunRecord`s — so every model comes back flagged, with `coverage: "not_yet_sampled"` and `coverage_warning: true`:
 
 ```jsonc
 "algorithm": {
   "kind": "sampled",
   "sampled": { /* ... */ },
   "sampling_window": {
-    "ordered_by": "<column>",
-    "limit": <N>,
-    "coverage": "first_n_by_order",
+    "ordered_by": "",
+    "limit": 0,
+    "coverage": "not_yet_sampled",
     "coverage_warning": true
   }
 }
@@ -175,7 +178,6 @@ The aggregate `summary.any_coverage_warning` widens to fire on either condition:
 When you see the warning on a sampled diff, your options are:
 
 - **Re-run with `--algorithm bisection`**: covers the whole table exhaustively. Works for any model with a single-column integer / numeric `unique_key`.
-- Re-run with a larger `--sample-size` if a bounded sample of N more rows is enough confidence for this PR.
 - Inspect the changed columns directly via `rocky compile --model <name>` and reason about the change manually.
 
 A clean sample with `coverage_warning: true` is **not** evidence the PR is no-op for that model.
@@ -188,7 +190,7 @@ A clean sample with `coverage_warning: true` is **not** evidence the PR is no-op
 
 **`preview cost` reports `null` for the branch.** The cost rollup uses the same adapter telemetry as [`rocky cost`](/reference/commands/administration/#rocky-cost). DuckDB and unconfigured adapters report `null` USD by design; duration and bytes still surface. Configure `[cost]` in `rocky.toml` to get dollar amounts on Databricks / Snowflake.
 
-**Copy step is slow.** The copy substrate dispatches per adapter via `WarehouseAdapter::clone_table_for_branch`. Databricks (`SHALLOW CLONE`) and BigQuery (`CREATE TABLE … COPY`) both ship metadata-only overrides as of `engine-v1.19.1`; the per-PR branch table is effectively zero-cost at create time. DuckDB and Snowflake fall through to the portable CTAS default, which physically copies bytes; on large tables this is the dominant cost of `preview create`. Snowflake's native zero-copy `CLONE` will land once a Snowflake consumer drives the integration test against a workspace.
+**Copy step is slow.** The copy substrate dispatches per adapter via `WarehouseAdapter::clone_table_for_branch`. Databricks (`SHALLOW CLONE`), BigQuery (`CREATE TABLE … COPY`), and Snowflake (zero-copy `CREATE TABLE … CLONE`) all ship metadata-only overrides; the per-PR branch table is effectively zero-cost at create time. Only DuckDB falls through to the portable CTAS default, which physically copies bytes; on large tables this is the dominant cost of `preview create`.
 
 **The diff finds no changes but the model definitely changed.** Check `summary.any_coverage_warning` in the JSON output. If it's `true`, the sampling window missed the changed rows; see the section above.
 

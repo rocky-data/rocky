@@ -61,7 +61,7 @@ For partitioned tables, `partitionValues` in the Delta log are keyed by physical
 
 - **UniForm and Deletion Vectors are mutually exclusive.** The writer surfaces a clear error if the target table has DVs enabled. Use one or the other.
 - **rowTracking writers need `baseRowId`.** The Phase 3 writer surface for rowTracking carries `baseRowId` + `rowCommitVersion`; Rocky handles assignment.
-- **Replication tables don't accept this strategy.** Content-addressed is a *transformation* strategy. Pointing a replication pipeline target at a content-addressed model returns a "not supported on replication tables" error at validate time.
+- **Replication tables don't accept this strategy.** Content-addressed is a *transformation* strategy. Pointing a replication pipeline target at a content-addressed model returns a "not supported on replication tables" error when the pipeline runs (`rocky run` / `rocky apply`), not at `rocky validate` time.
 - **No DuckDB POC yet.** The strategy requires real Delta + object storage; it's exercised via live-verify tests against a sandbox rather than a playground POC. See `engine/crates/rocky-cli/src/commands/run_content_addressed.rs` for the e2e test if you want the reference invocation.
 
 ## Related

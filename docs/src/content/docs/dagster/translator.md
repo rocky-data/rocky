@@ -19,7 +19,7 @@ Returns the Dagster `AssetKey` for a given source and table combination.
 
 Returns the Dagster group name for assets from a given source.
 
-**Default:** first component value (e.g., `"acme"`)
+**Default:** first string-valued component (e.g., `"acme"`); list-valued components are skipped, and it falls back to `source_type` when no component value is a string
 
 ### `get_tags(source, table) -> dict[str, str]`
 
@@ -59,7 +59,7 @@ For a model named `customers` materialized into `analytics.marts.customers` with
 
 Returns metadata to attach to the asset.
 
-**Default:** `source_id`, `source_type`, `last_sync_at`, `row_count`
+**Default:** `source_id`, `source_type`, plus `last_sync_at` / `row_count` when present, plus every adapter-namespaced `source.metadata` entry (e.g. `fivetran.service`) forwarded verbatim (non-string values JSON-encoded)
 
 ## Custom translator example
 
@@ -91,5 +91,3 @@ defs = dg.Definitions(
     resources={"rocky": rocky},
 )
 ```
-
-The translator is also accepted by `emit_materializations()` for consistent asset key mapping between discovery and execution.

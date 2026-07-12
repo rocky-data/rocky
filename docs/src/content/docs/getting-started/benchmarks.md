@@ -38,7 +38,7 @@ A note on which dbt: the per-tool numbers below compare against **dbt Core 1.x**
 
 ## Why Rocky Needs Less CPU and Memory
 
-**No Python runtime overhead.** dbt loads the entire Python interpreter, its dependency tree (Jinja2, agate, networkx, protobuf, etc.), and the adapter plugin system before it does anything useful. Rocky is a single ~15 MB static binary compiled with `opt-level = 3`, thin LTO, and `panic = "abort"`. Startup is 14ms with no interpreter, no GC, no import chain.
+**No Python runtime overhead.** dbt loads the entire Python interpreter, its dependency tree (Jinja2, agate, networkx, protobuf, etc.), and the adapter plugin system before it does anything useful. Rocky is a single static binary compiled with `opt-level = 3`, `codegen-units = 1`, and `panic = "abort"`. Startup is 14ms with no interpreter, no GC, no import chain.
 
 **String interning.** In a large project, identifiers like `catalog.schema.table` and column names repeat thousands of times across model metadata. Rocky interns them via [lasso](https://github.com/Kixiron/lasso): each unique string is stored once, and every reference is a cheap integer handle. dbt duplicates these strings across Python dicts and dataclass instances, ballooning memory proportionally to project size. This is why Rocky uses 4.3x less memory.
 
@@ -158,9 +158,8 @@ python visualize.py results/benchmark_*.json
 
 | Version | Compile (10k) | Per-model | Peak RSS |
 |---|---:|---:|---:|
-| Rocky 0.1.0 | 1.33 s | 133 µs | 116 MB |
-| Rocky 0.3.0 | 1.20 s | 120 µs | 125 MB |
-| Rocky 0.3.0 (optimized) | 1.00 s | 100 µs | 147 MB |
-| Rocky 1.0.3 | **1.00 s** | **100 µs** | 147 MB |
+| Rocky 0.1.0 (Round 2) | 1.33 s | 133 µs | 116 MB |
+| Rocky 0.3.0 (Round 3) | 1.20 s | 120 µs | 125 MB |
+| Rocky 0.3.0 optimized (Round 4) | **1.00 s** | **100 µs** | 147 MB |
 
-Cumulative: **25% faster** compile since v0.1.0. The compile path has held through the 1.x series: features shipped in 1.1–1.6 (warehouse loaders, Dagster DAG mode, DQX parity phases 1–4, adapter-kind diagnostics) added surface area without regressing compile. The memory increase (116 → 147 MB) is a deliberate tradeoff: caching and pre-allocation that trade ~31 MB for 39% faster warm compiles. Re-run the suite against your current engine (`engine/target/release/rocky`) to get numbers pinned to your release.
+Cumulative: **25% faster** compile from Round 2 (v0.1.0) to Round 4 (v0.3.0 optimized). The memory increase (116 → 147 MB) is a deliberate tradeoff: caching and pre-allocation that trade ~31 MB for 39% faster warm compiles. These figures were last captured at v0.3.0 (see `examples/playground/benchmarks/REPORT_CURRENT.md`); the shipped engine has advanced well beyond that release since. Re-run the suite against your current engine (`engine/target/release/rocky`) to get numbers pinned to your release.

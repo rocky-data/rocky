@@ -8,7 +8,7 @@ sidebar:
 All data returned by `RockyResource` methods is parsed into Pydantic v2 models. These models provide type safety, validation, and IDE autocompletion.
 
 :::tip[Source of truth]
-These types are generated from the engine's JSON schemas via `just codegen`; the generated [`dagster_rocky.types_generated`](https://github.com/rocky-data/rocky/tree/main/integrations/dagster/src/dagster_rocky/types_generated) module is the canonical, complete definition, and `dagster_rocky.types` re-exports it with Python-flavored names. This page documents the types you consume most (discover, run, compile, test, ci, doctor) plus `parse_rocky_output`. For any type not shown here, consult the generated module or the [JSON Output reference](/reference/json-output/).
+These types are generated from the engine's JSON schemas via `just codegen`; the generated [`rocky_sdk.types_generated`](https://github.com/rocky-data/rocky/tree/main/sdk/python/src/rocky_sdk/types_generated) module is the canonical, complete definition. `dagster_rocky.types` (and the `dagster_rocky.types_generated` shim) re-export it with Python-flavored names for backward compatibility. This page documents the types you consume most (discover, run, compile, test, ci, doctor) plus `parse_rocky_output`. The field tables below are curated to the fields consumers branch on most; some models carry additional wire fields, so consult the generated module for the exhaustive shape. For any type not shown here, consult the generated module or the [JSON Output reference](/reference/json-output/).
 :::
 
 ## Discover types
@@ -24,6 +24,10 @@ Top-level result from `rocky discover`.
 | `sources` | `list[SourceInfo]` | Discovered sources |
 | `checks` | `ChecksConfig \| None` | Pipeline-level checks configuration |
 | `excluded_tables` | `list[ExcludedTable]` | Tables filtered because they don't exist in source |
+| `failed_sources` | `list[FailedSourceOutput]` | Sources the adapter tried and failed to fetch (transient error) — *not* deletions; consumers diffing against a prior run must not treat these as removed |
+| `collision_candidates` | `list[CollisionCandidate]` | Groups of sources sharing an external object id but resolving to different targets |
+| `new_sources` | `list[str]` | Source schemas seen for the first time vs the prior discover snapshot |
+| `schemas_cached` | `int \| None` | Count of source schemas served from the discovery cache (`None` on older binaries) |
 
 ### `SourceInfo`
 
@@ -70,7 +74,6 @@ Top-level result from `rocky run`.
 | `metrics` | `MetricsSnapshot \| None` | Engine-level execution metrics |
 | `permissions` | `PermissionInfo` | Permission reconciliation summary |
 | `drift` | `DriftInfo` | Schema drift detection summary |
-| `contracts` | `ContractResult \| None` | Contract validation results |
 | `anomalies` | `list[AnomalyResult]` | Anomaly detection results |
 | `partition_summaries` | `list[PartitionSummary]` | Per-model `time_interval` partition stats |
 
@@ -421,7 +424,7 @@ A single health check result.
 
 ### `parse_rocky_output(json_str) -> RockyOutput`
 
-Auto-detects the command type from the JSON `command` field and returns the appropriate Pydantic model. Supports all command types: `discover`, `run`, `plan`, `state`, `compile`, `lineage`, `history`, `test`, `ci`, `metrics`, `optimize`, `ai`, `ai_sync`, `ai_explain`, `ai_test`, `validate-migration`, `test-adapter`, `doctor`, and `drift`.
+Auto-detects the command type from the JSON `command` field and returns the appropriate Pydantic model. Supported commands include `discover`, `run`, `plan`, `state`, `compile`, `lineage`, `history`, `test`, `ci`, `metrics`, `optimize`, `ai`, `ai_sync`, `ai_explain`, `ai_test`, `validate-migration`, and `doctor` (see `_SIMPLE_DISPATCH` in `rocky_sdk.types` for the full table). There is no `test-adapter` dispatch entry — reach that output via `RockyClient.test_adapter()` — and no `drift` command; schema drift is surfaced on `RunResult.drift`.
 
 ```python
 from dagster_rocky import parse_rocky_output

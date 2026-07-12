@@ -138,8 +138,10 @@ ps aux | grep rocky
 
 If no process is running, the lock may be stale. Remove the lock file:
 ```bash
-rm -f .rocky-state.redb.lock
+rm -f models/.rocky-state.redb.lock
 ```
+
+The state store lives at `models/.rocky-state.redb` by default (run `rocky doctor` to confirm the path). Older projects using the legacy current-directory state file will instead have `.rocky-state.redb.lock` in the working directory.
 
 ### "State file corrupted"
 
@@ -147,7 +149,7 @@ The embedded redb state file is damaged.
 
 **Fix:** Delete the state file and re-run. This resets all watermarks, so the next run will be a full refresh:
 ```bash
-rm .rocky-state.redb
+rm models/.rocky-state.redb   # legacy projects: rm .rocky-state.redb in the current directory
 plan_id=$(rocky plan --filter client=acme --output json | jq -r .plan_id)
 rocky apply "$plan_id"
 ```

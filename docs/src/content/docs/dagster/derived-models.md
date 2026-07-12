@@ -15,19 +15,13 @@ single consistent `PartitionsDefinition`.
 
 ## Quickstart
 
-```python
-import dagster as dg
-from dagster_rocky import RockyComponent
-
-defs = dg.Definitions(
-    assets=[
-        RockyComponent(
-            config_path="rocky.toml",
-            models_dir="models",
-            surface_derived_models=True,  # ← opt in
-        ),
-    ],
-)
+```yaml
+# defs.yaml
+type: dagster_rocky.RockyComponent
+attributes:
+  config_path: rocky.toml
+  models_dir: models
+  surface_derived_models: true  # ← opt in
 ```
 
 When loaded, the code location now exposes:
@@ -185,15 +179,16 @@ class MyTranslator(RockyDagsterTranslator):
             target["schema"],
             target["table"],
         ])
+```
 
-# Pass to RockyComponent via the translator_class config
-defs = dg.Definitions(
-    assets=[
-        RockyComponent(
-            config_path="rocky.toml",
-            translator_class="my_module.MyTranslator",
-            surface_derived_models=True,
-        ),
-    ],
-)
+Wire the translator into `RockyComponent` via the `translator_class`
+attribute in `defs.yaml`:
+
+```yaml
+# defs.yaml
+type: dagster_rocky.RockyComponent
+attributes:
+  config_path: rocky.toml
+  translator_class: my_module.MyTranslator
+  surface_derived_models: true
 ```

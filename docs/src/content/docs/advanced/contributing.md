@@ -45,11 +45,12 @@ The right entry point depends on what you want to change.
 
 ## Monorepo Structure
 
-Rocky is a monorepo with four subprojects:
+Rocky is a monorepo with five subprojects:
 
 ```
 rocky-data/
-├── engine/                     # Rust CLI + engine (23-crate Cargo workspace)
+├── engine/                     # Rust CLI + engine (Cargo workspace)
+├── sdk/python/                 # rocky-sdk Python client
 ├── integrations/dagster/       # dagster-rocky Python package
 ├── editors/vscode/             # VS Code extension (LSP client)
 ├── examples/playground/        # POC catalog + benchmarks
@@ -78,6 +79,22 @@ cargo test
 # Lint
 cargo clippy -- -D warnings
 cargo fmt -- --check
+```
+
+### rocky-sdk (Python)
+
+```bash
+cd rocky-data/sdk/python
+
+# Install with dev dependencies
+uv sync --dev
+
+# Run tests
+uv run pytest
+
+# Lint
+uv run ruff check
+uv run ruff format --check
 ```
 
 ### dagster-rocky (Python)
@@ -134,7 +151,7 @@ just --list      # All recipes
 - **Public types**: Must derive `Debug`, `Clone`, `Serialize`, `Deserialize` where applicable
 
 ### Python
-- Target Python 3.10+
+- Target Python 3.11+
 - Type annotations required (use modern syntax: `list[str]`, `X | None`)
 - Use `ruff` for linting and formatting
 
@@ -196,27 +213,31 @@ cd editors/vscode && npm test
 | `engine-ci.yml` | `engine/**` changes | Tests, clippy, fmt |
 | `engine-weekly.yml` | Monday schedule + manual | Coverage (tarpaulin) + security audit |
 | `engine-release.yml` | `engine-v*` tag | Full 5-target matrix (macOS, Linux, Windows) |
-| `engine-bench.yml` | PRs labeled `perf` | Benchmark with 120% alert threshold |
+| `engine-bench.yml` | PRs labeled `perf` | criterion benchmarks; raw bencher output uploaded as an artifact (no baseline comparison) |
+| `sdk-ci.yml` | `sdk/python/**` changes | pytest + ruff |
+| `sdk-release.yml` | `sdk-v*` tag | PyPI publish via OIDC |
 | `dagster-ci.yml` | `integrations/dagster/**` changes | pytest + ruff |
 | `dagster-release.yml` | `dagster-v*` tag | PyPI publish via OIDC |
 | `vscode-ci.yml` | `editors/vscode/**` changes | npm test + eslint |
 | `vscode-release.yml` | `vscode-v*` tag | VS Code Marketplace publish |
 | `codegen-drift.yml` | Any subproject | Validates committed bindings match `just codegen` output |
-| `integration-ci.yml` | 2+ subprojects touched | Cross-project integration tests |
 
 ## Releases
 
-Tag-namespaced: each artifact ships independently. All three are **CI-driven**: land a release PR (version bump + CHANGELOG entry), tag the merged commit, push the tag.
+Tag-namespaced: each artifact ships independently. All four are **CI-driven**: land a release PR (version bump + CHANGELOG entry), tag the merged commit, push the tag.
 
 | Artifact | Tag | Workflow |
 |---|---|---|
 | Rocky CLI binary | `engine-v*` | `engine-release.yml` — 5-target matrix (macOS ARM64/Intel, Linux x86_64/ARM64, Windows) |
+| rocky-sdk wheel | `sdk-v*` | `sdk-release.yml` — PyPI publish via OIDC |
 | dagster-rocky wheel | `dagster-v*` | `dagster-release.yml` — PyPI publish via OIDC |
 | Rocky VSIX | `vscode-v*` | `vscode-release.yml` — VS Code Marketplace publish |
+
+Release **rocky-sdk before any dagster-rocky release that raises its `rocky-sdk>=…` floor** — the published `dagster-rocky` wheel resolves the SDK from PyPI, not the monorepo path source.
 
 ```bash
 git tag engine-v<version>
 git push origin engine-v<version>   # CI builds + publishes
 ```
 
-The `scripts/release.sh` helper remains as a **local-build fallback** for hotfix scenarios; `just release-engine <version>`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]` wrap it.
+The `scripts/release.sh` helper remains as a **local-build fallback** for hotfix scenarios; `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]` wrap it.

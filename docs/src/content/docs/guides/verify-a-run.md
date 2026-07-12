@@ -91,7 +91,7 @@ List `run_history` and pick the run by its timestamp. Each row is one `RunRecord
   "trigger": "Ci",
   "config_hash": "a54e8a0fa524b6a2",
   "triggering_identity": "data-eng@example.com",
-  "session_source": "ci",
+  "session_source": "cli",
   "git_commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
   "git_branch": "main",
   "target_catalog": "analytics_prod",
@@ -101,7 +101,7 @@ List `run_history` and pick the run by its timestamp. Each row is one `RunRecord
 }
 ```
 
-The `run_id` is Rocky's `run-<UTC-date>-<UTC-time>-<millis>` form. The `status` and `trigger` values are the capitalized enum forms as they serialize on disk (`"Success"`, `"Ci"` / `"Manual"`); `session_source` serializes lowercase (`"cli"`, `"ci"`, ...).
+The `run_id` is Rocky's `run-<UTC-date>-<UTC-time>-<millis>` form. The `status` and `trigger` values are the capitalized enum forms as they serialize on disk (`"Success"`, `"Ci"` / `"Manual"`); `session_source` serializes lowercase (`"cli"`, `"dagster"`, `"lsp"`, `"http_api"`; a CI runner records `"cli"`).
 
 That single row answers *who* (`triggering_identity` + `git_commit`), *when* (`started_at` / `finished_at`), and *under what config* (`config_hash`). The `git_commit` is the anchor for the next step.
 
@@ -265,7 +265,7 @@ Verifies, with the tools above and no `rocky` binary:
 
 Does **not** verify:
 
-- That re-running the SQL would reproduce the same output. Rocky's `replay` is an *inspection* of the recorded run, not a re-execution with pinned inputs; re-execution is a planned follow-up. The reuse provenance record makes the same input-logic + byte-identity attestation; it is likewise **not** a reproducibility claim.
+- That re-running the SQL would reproduce the same output **for a general pipeline**. `rocky replay --execute --verify` does re-execute a recorded recipe on a local DuckDB engine and compare the re-derived BLAKE3 against the recorded hash (emitting a `bit_exact` / `diverged` / `non_replayable` verdict per model) — but only for single, self-contained models; multi-model pipelines and warehouse-native re-execution are not covered. The reuse provenance record makes an input-logic + byte-identity attestation; it is likewise **not** a general reproducibility claim.
 - That the warehouse table was not mutated by something else after the run. The ledger records what Rocky wrote; a later out-of-band `UPDATE` is outside its scope (this is exactly why step 5 checks the live warehouse).
 
 ## Implementation honesty
@@ -275,8 +275,8 @@ Every load-bearing claim above, graded against what ships today:
 | Claim | Status |
 |---|---|
 | Ledger inspection: `run_history`, `sql_hash`, full audit trail | Shipped |
-| `rocky replay` surfaces the recorded run | Shipped (inspection only) |
-| Re-execution with pinned inputs reproduces the output | Not yet — planned follow-up |
+| `rocky replay` surfaces the recorded run | Shipped (default inspection view) |
+| Recorded-recipe re-execution + hash verification (`rocky replay --execute --verify`) | Shipped — single, self-contained models only, on a local DuckDB engine; multi-model pipelines and warehouse-native re-execution not yet |
 | Content-addressed Parquet named by BLAKE3 + recorded in `output_artifacts` | Shipped, but on the S3 content-addressed path only — not what a general DuckDB/Snowflake/BigQuery/Databricks run produces |
 | `[reuse]` input-match index + provenance record (offline-recomputable `skip_hash` *and* `input_hash` over persisted `upstreams` + `b3sum` + `proof_class`) | Shipped — opt-in (`[reuse] enabled`, default-off), recorded on the content-addressed (S3/UniForm) write path only |
 | Reuse *decision*: actually reusing a prior run's bytes instead of re-executing | Shipped — opt-in (`[reuse] enabled`, default-off), a fail-closed point-to decision on the content-addressed (S3/UniForm) write path, live-verified; any doubt builds |

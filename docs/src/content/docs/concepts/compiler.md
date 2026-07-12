@@ -186,8 +186,13 @@ The compiler produces structured diagnostics with codes, severity levels, source
 | `E013` | Protected column removed |
 | `E020`--`E026` | `time_interval` validation (`@start_date`/`@end_date` placeholders, `time_column` presence/type/nullability/granularity) |
 | `E027` | Budget exceeded -- projected spend over the model's `[budget]` ceiling |
+| `E028` | Required run variable (`@var(name)`) referenced but no `--var` supplied and no inline default |
 | `E030` | Imported producer dropped a column this project reads (cross-team contract) |
+| `E031` | Imported producer narrowed the type of a column this project reads (cross-team contract) |
+| `E032` | Imported producer tightened a column this project reads from nullable to NOT NULL (cross-team contract) |
 | `E033` | Imported snapshot's recipe hash does not match the configured `pin` |
+| `E034` | Imported snapshot declares a format version newer than this build of rocky can read |
+| `E035` | Managed-Iceberg `format_options` declares a combination the warehouse rejects (e.g. `partition_by` + `cluster_by`) |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W003` | `time_column` is TIMESTAMP where DATE is preferred for the granularity |
@@ -196,6 +201,8 @@ The compiler produces structured diagnostics with codes, severity levels, source
 | `W010` | Contract defines a column not in model output (not required) |
 | `W011` | Contract exists for a model not found in the project |
 | `W012` | An `[imports.<name>]` snapshot could not be loaded; `E030`/`E033` checks skipped |
+| `W030` | Imported producer added a column, surfaced only to consumers reading it via `SELECT *` |
+| `W031` | Imported producer widened the type of a column this project reads (cross-team contract) |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Model compiled with `SELECT *` |
 | `P001` | Construct not portable to the target dialect (opt-in via `--target-dialect`) |
@@ -248,8 +255,7 @@ use rocky_compiler::compile::{compile, CompilerConfig};
 let config = CompilerConfig {
     models_dir: "models/".into(),
     contracts_dir: Some("contracts/".into()),
-    source_schemas: HashMap::new(),
-    source_column_info: HashMap::new(),
+    ..Default::default()
 };
 
 let result = compile(&config)?;

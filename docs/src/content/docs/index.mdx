@@ -34,7 +34,7 @@ Rocky exists because the most expensive failures in modern data platforms aren't
     Every column traced through every transformation, before execution. `rocky lineage-diff main` lists per-column downstream blast radius for PR review.
   </Card>
   <Card title="Branches + content-addressed run records" icon="random">
-    Named branches as isolated schemas. `rocky replay <run_id>` inspects and verifies a run against its content-addressed record: per-model SQL hashes, row counts, and bytes. (Re-execution from the pinned record is on the roadmap.)
+    Named branches as isolated schemas. `rocky replay <run_id>` inspects and verifies a run against its content-addressed record: per-model SQL hashes, row counts, and bytes. (Local re-execution ships today via `rocky replay --execute --verify`; warehouse re-execution is on the roadmap.)
   </Card>
   <Card title="Per-model cost attribution" icon="rocket">
     Cost is a column on every run, not a dashboard. `[budget]` blocks fail the run on overspend. `rocky preview cost` projects spend at PR time.

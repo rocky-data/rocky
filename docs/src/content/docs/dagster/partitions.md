@@ -12,11 +12,12 @@ that converts these strategies into Dagster's
 [`PartitionsDefinition`](https://docs.dagster.io/api/dagster/partitions#dagster.PartitionsDefinition)
 variants.
 
-These are **standalone helpers** today. The `RockyComponent`-side wiring
-(group splitting by partitioning shape, threading partition keys through
-`rocky plan --partition` + `rocky apply`) is a follow-up that depends on
-derived-model surfacing; currently the component emits source-replication
-tables only, none of which use `time_interval`.
+These builders are also **standalone helpers** you can call directly from
+hand-rolled assets. The `RockyComponent`-side wiring has since landed: with
+`surface_derived_models=True` / `dag_mode=True`, the component splits
+derived-model multi-assets by partitioning shape and threads Dagster
+partition keys into a fused `rocky run --partition <key>`. Reach for the
+standalone helpers when you are building partitioned assets by hand.
 
 ## Strategy mapping
 
@@ -49,7 +50,10 @@ pdef = partitions_def_for_time_interval(
 
 Higher-level: takes a `ModelDetail` (from `CompileResult.models_detail`) and
 dispatches to the time_interval builder when the strategy discriminator
-matches. Returns `None` for `full_refresh`, `incremental`, or `merge`.
+matches. Returns `None` for any non-`time_interval` strategy
+(`full_refresh`, `incremental`, `merge`, `ephemeral`, `delete_insert`,
+`view` — and, today, `microbatch`, which is not translated despite being
+time-based).
 
 ```python
 from dagster_rocky import partitions_def_for_model_detail, RockyResource
@@ -120,7 +124,6 @@ splat them into the CLI argument list.
 
 ```python
 import dagster as dg
-from datetime import timedelta
 from dagster_rocky import (
     RockyResource,
     partitions_def_for_model_detail,
@@ -148,7 +151,7 @@ def fct_daily_orders_asset(
     rocky_key = dagster_to_rocky_partition_key("day", context.partition_key)
     result = rocky.run(
         filter="layer=marts",
-        partition=rocky_key,   # threads through to `rocky plan --partition <key>` + `rocky apply`
+        partition=rocky_key,   # threads through to `rocky run --partition <key>`
     )
     return result.tables_copied
 ```

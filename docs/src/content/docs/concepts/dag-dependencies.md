@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-Rocky builds a directed acyclic graph (DAG) from model dependencies to determine execution order. Models declare their upstream dependencies explicitly, and Rocky uses topological sorting to produce a valid execution plan with parallel execution layers.
+Rocky builds a directed acyclic graph (DAG) from model dependencies to determine execution order. Dependencies come from two merged sources: explicit `depends_on` declarations in a model's TOML, plus dependencies auto-resolved from bare table names in the model's SQL that match another project model (surfaced as diagnostic `I001`). Rocky uses topological sorting over the merged set to produce a valid execution plan with parallel execution layers.
 
 ## Declaring dependencies
 
@@ -50,7 +50,7 @@ Rocky validates the DAG at `rocky validate` time, catching problems before any S
 
 ### Cycle detection
 
-Circular dependencies are detected and reported with the full cycle path:
+Circular dependencies are detected and reported as the set of models involved in the cycle:
 
 ```toml
 # model_a.toml
@@ -63,7 +63,7 @@ depends_on = ["model_a"]
 ```
 
 ```
-Error: Circular dependency detected: model_a → model_b → model_a
+Error: DAG error: circular dependency detected involving: ["model_a", "model_b"]
 ```
 
 ### Unknown dependencies
@@ -76,8 +76,10 @@ depends_on = ["stg_orders", "nonexistent_model"]
 ```
 
 ```
-Error: Unknown dependency "nonexistent_model" in model "fct_orders"
+Error: DAG error: unknown dependency 'nonexistent_model' referenced by 'fct_orders'
 ```
+
+When the unknown name is a near miss for a real model, the message appends a `— did you mean '<model>'?` suggestion.
 
 ## External table references
 
@@ -128,7 +130,7 @@ The differences:
 
 | | dbt Core | Rocky |
 |---|---|---|
-| Declaration | Implicit via `{{ ref() }}` in SQL | Explicit `depends_on` in TOML |
+| Declaration | Implicit via `{{ ref() }}` in SQL | Explicit `depends_on` in TOML + inferred from plain SQL (no templating) |
 | When validated | During parsing/compilation | At `rocky validate` time |
 | SQL purity | SQL mixed with Jinja | Pure SQL, no template language |
 | Editor support | Requires dbt LSP for `ref()` | Standard SQL tooling works |

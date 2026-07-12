@@ -28,12 +28,14 @@ The primary trait for executing SQL and managing tables:
 
 ```rust
 #[async_trait]
-pub trait WarehouseAdapter {
-    async fn execute_statement(&self, sql: &str) -> Result<()>;
-    async fn execute_query(&self, sql: &str) -> Result<QueryResult>;
-    async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>>;
-    async fn table_exists(&self, table: &TableRef) -> Result<bool>;
-    async fn close(&self) -> Result<()>;
+pub trait WarehouseAdapter: Send + Sync {
+    fn dialect(&self) -> &dyn SqlDialect;
+    async fn execute_statement(&self, sql: &str) -> AdapterResult<()>;
+    async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult>;
+    async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>>;
+    async fn table_exists(&self, table: &TableRef) -> AdapterResult<bool>;
+    async fn close(&self) -> AdapterResult<()>;
+    // ... plus defaulted methods (ping, explain, execute_statement_with_stats)
 }
 ```
 
@@ -42,14 +44,14 @@ pub trait WarehouseAdapter {
 Generates warehouse-specific SQL syntax:
 
 ```rust
-pub trait SqlDialect {
+pub trait SqlDialect: Send + Sync {
     fn name(&self) -> &str;
-    fn format_table_ref(&self, table: &TableRef) -> String;
-    fn create_table_as(&self, table: &TableRef, query: &str) -> String;
-    fn insert_into(&self, table: &TableRef, query: &str) -> String;
-    fn merge_into(&self, target: &TableRef, source: &str, keys: &[String], updates: &[String]) -> String;
+    fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String>;
+    fn create_table_as(&self, target: &str, select_sql: &str) -> String;
+    fn insert_into(&self, target: &str, select_sql: &str) -> String;
+    fn merge_into(&self, target: &str, source_sql: &str, keys: &[String], update_cols: Option<&[String]>) -> AdapterResult<String>;
     fn row_hash_expr(&self, columns: &[String]) -> String;
-    fn watermark_where(&self, column: &str, value: &str) -> String;
+    fn watermark_where(&self, timestamp_col: &str, last_watermark: Option<&DateTime<Utc>>) -> AdapterResult<String>;
     // ... and more
 }
 ```
@@ -84,9 +86,10 @@ AdapterManifest {
         create_schema: true,    // BigQuery datasets
         merge: true,
         tablesample: true,
+        file_load: false,
     },
     auth_methods: vec!["service_account", "oauth"],
-    config_schema: None,
+    config_schema: serde_json::json!({}),
 }
 ```
 
@@ -99,14 +102,19 @@ rocky init-adapter bigquery
 ```
 
 This creates `crates/rocky-bigquery/` with:
-- `Cargo.toml` depending on `rocky-adapter-sdk`
-- `src/lib.rs` with trait implementation stubs
-- Conformance test template
+- `Cargo.toml` depending on `rocky-core` and `rocky-sql`
+- `src/lib.rs` declaring the `adapter`, `dialect`, and `types` modules
+- `src/{dialect,adapter,types}.rs` trait implementation stubs
+- `tests/integration.rs` — an `#[ignore]`d live-connection test stub
 
-Implement the required traits, then run conformance tests:
+Implement the required traits, then run the conformance suite. Note that
+`test-adapter --adapter <name>` only resolves the builtins (`databricks`,
+`snowflake`, `duckdb`) or a `rocky-<name>` process-adapter binary on your
+`PATH`; use a builtin to see the suite, or expose your adapter as a process
+adapter (or `--command`) to test it:
 
 ```bash
-rocky test-adapter --adapter bigquery
+rocky test-adapter --adapter duckdb
 ```
 
 ## Process adapter protocol
@@ -145,19 +153,21 @@ Rocky follows the `cargo`-subcommand convention: any executable on your `PATH` n
 
 ## Conformance tests
 
-The SDK includes 26 test specifications (19 core + 7 optional):
+The SDK includes 26 test specifications: 18 always run, and 8 are
+capability-gated (skipped when the adapter's manifest declares the
+required capability as `false`).
 
-| Category | Core Tests | Optional Tests |
-|----------|-----------|----------------|
-| Connection | 2 | — |
-| DDL | 3 | — |
-| DML | 4 | — |
-| Query | 3 | — |
-| Types | 4 | — |
-| Dialect | 3 | — |
-| Governance | — | 3 |
-| Discovery | — | 2 |
-| Batch Checks | — | 2 |
+| Category | Tests |
+|----------|-------|
+| Connection | 1 |
+| DDL | 4 |
+| DML | 2 |
+| Query | 4 |
+| Types | 7 |
+| Dialect | 3 |
+| Governance | 2 |
+| Batch Checks | 2 |
+| Discovery | 1 |
 
 Run them with:
 
