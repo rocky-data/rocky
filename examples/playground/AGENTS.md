@@ -28,6 +28,8 @@ data/          # seed.sql — CSV / SQL sample data, keep ≤1000 rows
 expected/      # Captured golden output from run.sh (gitignored)
 ```
 
+`rocky.toml` is required only for POCs that exercise the pipeline path (`rocky -c rocky.toml run/plan/discover`). A handful of POCs that only drive the models/compile path — e.g. `import-dbt`-based POCs and compile-only adapter smokes — legitimately ship no top-level `rocky.toml`.
+
 Use the scaffolder:
 
 ```bash

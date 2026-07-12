@@ -15,7 +15,7 @@ rm -f models/.rocky-state.redb models/.rocky-state.redb.lock
 mkdir -p expected
 
 # Optional: load seed data into the persistent DuckDB
-# duckdb poc.duckdb < seeds/seed.sql
+# duckdb poc.duckdb < data/seed.sql
 
 # Validate the config
 rocky validate -c rocky.toml

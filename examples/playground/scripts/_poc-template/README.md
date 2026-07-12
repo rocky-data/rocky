@@ -23,7 +23,7 @@
 ├── run.sh            end-to-end demo
 ├── models/           SQL / .rocky models + .toml sidecars
 ├── contracts/        (if applicable)
-└── seeds/            sample data (≤1000 rows)
+└── data/             seed.sql — sample data (≤1000 rows)
 ```
 
 ## Prerequisites
