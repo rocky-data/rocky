@@ -20,14 +20,14 @@ Stdout JSON (`rocky plan --output json`, `rocky compact --output json`, `rocky a
 The path (`.rocky/plans/<plan-id>.json`) and the blake3-content-addressed `plan-id` are unchanged; only the body shape changed:
 
 - **v1 (legacy, retired)** — the envelope shipped **inline SQL** as the canonical payload. `rocky apply` read the SQL out of the plan and submitted it to the warehouse verbatim. This is the shape Rocky < engine-v1.35.0 produced by default.
-- **v2 (typed IR, now the only loadable shape)** — the envelope ships the **typed-IR payload** (`CompactPlanIr` for `rocky compact` plans, `ArchivePlanIr` for `rocky archive` plans). `rocky apply` regenerates SQL from the IR at execution time via the `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}` helpers in the `rocky-ir` crate.
+- **v2 (typed IR, now the only loadable shape)** — the envelope ships the **typed-IR payload** (`CompactPlanIr` for `rocky compact` plans, `ArchivePlanIr` for `rocky archive` plans). `rocky apply` regenerates SQL from the IR at execution time via the `rocky_core::sql_gen::{compact_from_ir, archive_from_ir}` helpers in the `rocky-core` crate (the IR types themselves live in `rocky-ir`).
 
 ## Migration recipe
 
 If `rocky apply <plan-id>` fails with a "plan is in format v1" error after upgrading:
 
 1. **Drop any `[plan_store]` block from your `rocky.toml`.** The block no longer parses; `rocky.toml` will fail on first load if it's still there. The previous `format = "v2"` or `format = "v1"` setting is now a no-op (v2 is the only shape).
-2. **Re-run `rocky plan`** (or `rocky compact <model>` / `rocky archive <model>`). This produces a fresh v2 envelope with a new `plan-id`, content-addressed, so identical intent against an unchanged source state yields a stable id across machines.
+2. **Re-run `rocky plan`** (or `rocky compact <model>` / `rocky archive --older-than <age>`). This produces a fresh v2 envelope with a new `plan-id`, content-addressed, so identical intent against an unchanged source state yields a stable id across machines.
 3. **Apply the new plan**: `rocky apply <new-plan-id>`. The v2 reader regenerates SQL from the typed IR at execution time, producing the same warehouse outcomes the retired v1 path would have.
 
 There is no automatic in-place upgrade: a stale v1 envelope is simply not parseable. Re-plan is the only path forward, and it's a cheap operation on the same `rocky.toml` + `models/` you already have.

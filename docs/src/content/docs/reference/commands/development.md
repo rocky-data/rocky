@@ -23,6 +23,12 @@ rocky playground [path]
 |----------|------|---------|-------------|
 | `path` | `string` | `rocky-playground` | Directory name for the playground project. |
 
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--template <TEMPLATE>` | `string` | `quickstart` | Sample project template: `quickstart`, `ecommerce`, or `showcase`. |
+
 ### Examples
 
 Create a playground with the default name:
@@ -32,20 +38,18 @@ rocky playground
 ```
 
 ```
-Created rocky-playground/rocky.toml (DuckDB config)
-Created rocky-playground/models/stg_orders.sql
-Created rocky-playground/models/stg_orders.toml
-Created rocky-playground/models/stg_customers.sql
-Created rocky-playground/models/stg_customers.toml
-Created rocky-playground/models/fct_revenue.sql
-Created rocky-playground/models/fct_revenue.toml
-Created rocky-playground/seeds/orders.csv
-Created rocky-playground/seeds/customers.csv
+  Rocky Playground
 
-Playground ready! Run:
-  cd rocky-playground
-  rocky compile
-  rocky test
+  Created sample project at ./rocky-playground/
+  Template: Quickstart (3 models)
+  Using DuckDB (local, no warehouse needed)
+
+  Try:
+    cd rocky-playground
+    rocky compile                           # type-check the models
+    rocky test                              # run models on an in-memory DuckDB
+    rocky run                               # materialize the model DAG
+    rocky preview rows --model customer_orders  # peek at materialized rows
 ```
 
 Create a playground with a custom name:
@@ -55,12 +59,17 @@ rocky playground my-experiment
 ```
 
 ```
-Created my-experiment/rocky.toml (DuckDB config)
-Created my-experiment/models/...
-Playground ready! Run:
-  cd my-experiment
-  rocky compile
-  rocky test
+  Rocky Playground
+
+  Created sample project at ./my-experiment/
+  Template: Quickstart (3 models)
+  Using DuckDB (local, no warehouse needed)
+
+  Try:
+    cd my-experiment
+    rocky compile
+    rocky test
+    rocky run
 ```
 
 ### Related Commands
@@ -226,16 +235,16 @@ rocky serve
 Compiled 14 models in 42ms
 Listening on http://127.0.0.1:8080
 Endpoints:
-  GET /api/models          - List all compiled models
-  GET /api/models/:name    - Get model details
-  GET /api/lineage/:name   - Column-level lineage
-  GET /api/dag             - Full dependency graph
+  GET /api/v1/models              - List all compiled models
+  GET /api/v1/models/:name        - Get model details
+  GET /api/v1/models/:name/lineage - Column-level lineage
+  GET /api/v1/dag                 - Full dependency graph
 ```
 
 Call an authenticated endpoint:
 
 ```bash
-curl -H "Authorization: Bearer $ROCKY_SERVE_TOKEN" http://127.0.0.1:8080/api/models
+curl -H "Authorization: Bearer $ROCKY_SERVE_TOKEN" http://127.0.0.1:8080/api/v1/models
 ```
 
 Start with file watching on a custom port:
@@ -399,13 +408,13 @@ rocky hooks test <EVENT>
 
 | Argument | Type | Description |
 |----------|------|-------------|
-| `EVENT` | string | Event name (e.g., `pipeline_start`, `materialize_error`) |
+| `EVENT` | string | Event name (e.g., `on_pipeline_start`, `on_materialize_error`) |
 
 ### Examples
 
 ```bash
-$ rocky hooks test pipeline_start
-Firing test event: pipeline_start
+$ rocky hooks test on_pipeline_start
+Firing test event: on_pipeline_start
 Hook 'bash scripts/notify.sh': OK (exit 0, 120ms)
 ```
 

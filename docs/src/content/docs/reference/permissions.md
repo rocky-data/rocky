@@ -5,7 +5,7 @@ sidebar:
   order: 10
 ---
 
-Rocky manages **Databricks Unity Catalog** permissions declaratively. Define grants inline in `rocky.toml` and Rocky reconciles them during each `rocky apply`; there is no separate permissions command. Permissions are applied as part of the governance setup phase, before parallel table processing begins.
+Rocky manages **Databricks Unity Catalog** permissions declaratively. Define grants inline in `rocky.toml` and Rocky reconciles them during each `rocky run`; there is no separate permissions command. Permissions are applied as part of the governance setup phase, before parallel table processing begins.
 
 ## Inline Grants (Recommended)
 
@@ -35,11 +35,11 @@ principal = "group:analysts"
 permissions = ["USE SCHEMA", "SELECT"]
 ```
 
-Inline grants are applied as best-effort during `rocky apply`. If a grant fails (e.g., the principal doesn't exist), Rocky logs a warning and continues.
+Inline grants are applied as best-effort during `rocky run`. If a grant fails (e.g., the principal doesn't exist), Rocky logs a warning and continues.
 
 ## Reconciliation Flow
 
-Permission reconciliation runs during `rocky apply`, integrated into the catalog and schema creation sequence:
+Permission reconciliation runs during `rocky run`, integrated into the catalog and schema creation sequence:
 
 1. **Read** desired permissions from `[pipeline.<name>.target.governance.grants]` and `[pipeline.<name>.target.governance.schema_grants]` in config
 2. **Query** current state with Databricks `SHOW GRANTS ON CATALOG` and `SHOW GRANTS ON SCHEMA`
@@ -112,13 +112,15 @@ Tags are applied at three levels:
 
 ## Output
 
-Permission reconciliation results are included in the run output:
+Permission reconciliation results are included in the `rocky run` output under the `permissions` key:
 
 ```json
 {
-  "grants_added": 3,
-  "grants_revoked": 0,
-  "catalogs_created": 1,
-  "schemas_created": 2
+  "permissions": {
+    "grants_added": 3,
+    "grants_revoked": 0,
+    "catalogs_created": 1,
+    "schemas_created": 2
+  }
 }
 ```

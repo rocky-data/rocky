@@ -52,12 +52,12 @@ Examples: `STRING` to `INT`, `BIGINT` to `INT` (narrowing), `DATE` to `TIMESTAMP
 
 ## What Is NOT Drift
 
-- **New columns in source** -- these are picked up automatically by `SELECT *` and do not require special handling
+- **New columns in source** -- not a type mismatch, so not "drift" in the narrow sense, but still handled: Rocky issues `ALTER TABLE ADD COLUMN` for each before the next `INSERT ... SELECT *` (surfaced as the `add_columns` action). Without it, BigQuery / Snowflake / Databricks reject the INSERT.
 - **Columns removed from source** -- extra columns in the target table are ignored
 
 ## Output
 
-Drift detection runs inline during `rocky apply`; the actions taken are reported in the `drift` section of the run JSON output:
+Drift detection runs inline during `rocky run`; the actions taken are reported in the `drift` section of the run JSON output:
 
 ```json
 {
@@ -81,4 +81,4 @@ Use `rocky plan` to preview the SQL Rocky would emit (including any drop stateme
 rocky plan --filter client=acme --output json
 ```
 
-Today, only `drop_and_recreate` and `add_column` actions are surfaced in the run output. The engine also classifies all-safe type widenings as `AlterColumnTypes` in `rocky-core`, but the `ALTER TABLE ALTER COLUMN` execution path isn't wired through `rocky apply` yet, so safe-widening drift currently falls through without action.
+Three drift actions are surfaced in the run output: `drop_and_recreate` (unsafe type change -- the target is dropped and rebuilt from source), `alter_column_types` (every drifted column is a safe widening -- executed inline via `ALTER TABLE ALTER COLUMN`, preserving data), and `add_columns` (new source columns added via `ALTER TABLE ADD COLUMN` before the INSERT). Safe widenings are classified as `AlterColumnTypes` in `rocky-core` and applied during the run.

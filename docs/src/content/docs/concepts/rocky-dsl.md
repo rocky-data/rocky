@@ -131,7 +131,7 @@ join customers as c on customer_id {
 This lowers to:
 
 ```sql
-SELECT *, c.name, c.email
+SELECT c.name, c.email
 FROM orders o
 JOIN customers AS c ON o.customer_id = c.customer_id
 ```

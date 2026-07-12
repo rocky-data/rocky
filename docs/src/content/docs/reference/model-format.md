@@ -223,7 +223,7 @@ tier = "gold"
 
 A member model's own `[tags]` override the group per key (sidecar > group) without dropping the rest of the group's tags — so one model can set `tier = "silver"` and still inherit `domain = "finance"`. See [`[tags]`](#tags) for how resolved tags surface on `models_detail[].tags` and project onto Dagster assets.
 
-A group carries `schema_template`, `strategy`, `tags`, and `enforce`. An unrecognized key in a group file is rejected at load so typos surface immediately.
+A group carries `schema_template`, `strategy`, `tags`, `governance`, and `enforce`. An unrecognized key in a group file is rejected at load so typos surface immediately.
 
 ### `[classification]`
 

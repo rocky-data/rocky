@@ -32,15 +32,16 @@ Rejects SQL constructs that don't exist on the chosen warehouse dialect. Detecti
 
 | Construct | Supported by |
 |---|---|
-| `NVL`, `IFNULL` | Snowflake, Databricks |
+| `NVL` | Snowflake, Databricks |
+| `IFNULL` | BigQuery, DuckDB |
 | `DATEADD` | Snowflake, Databricks |
-| `DATE_ADD` | BigQuery |
+| `DATE_ADD` | BigQuery, Databricks |
 | `TO_VARCHAR` | Snowflake |
 | `LEN`, `CHARINDEX` | Snowflake |
 | `ARRAY_SIZE` | Snowflake |
-| `DATE_FORMAT` | BigQuery, Databricks |
-| `QUALIFY` | Snowflake, Databricks, DuckDB |
-| `ILIKE` | Snowflake, Databricks, DuckDB, BigQuery |
+| `DATE_FORMAT` | Databricks, DuckDB |
+| `QUALIFY` | Snowflake, Databricks, BigQuery |
+| `ILIKE` | Snowflake, Databricks, DuckDB |
 | `FLATTEN` | Snowflake |
 
 The catalog is conservative: anything not in it is assumed portable. False negatives (non-portable SQL that slips through) are expected; false positives (portable SQL flagged as non-portable) are not.
@@ -66,12 +67,12 @@ When both are set, the CLI flag wins. See [`[portability]`](/reference/configura
 
 ```json
 {
-  "severity": "error",
+  "severity": "Error",
   "code": "P001",
   "model": "fct_revenue",
   "message": "NVL is not portable to BigQuery (supported by: Snowflake, Databricks)",
   "span": { "file": "models/fct_revenue.sql", "line": 1, "col": 1 },
-  "suggestion": "use COALESCE"
+  "suggestion": "replace NVL(...) with IFNULL(...) or COALESCE(...)"
 }
 ```
 
@@ -102,10 +103,10 @@ If `raw__orders.orders` drops `total_amount`, `stg_orders` keeps compiling (it's
 
 ```json
 {
-  "severity": "warning",
+  "severity": "Warning",
   "code": "P002",
   "model": "stg_orders",
-  "message": "SELECT * silently propagates upstream schema changes to 2 downstream consumers: fct_revenue (order_id, total_amount, status), mart_ltv (customer_id)",
+  "message": "SELECT * silently propagates upstream schema changes to 2 downstream consumers: `fct_revenue` (order_id, total_amount, status), `mart_ltv` (customer_id)",
   "span": { "file": "models/stg_orders.sql", "line": 1, "col": 1 },
   "suggestion": "replace SELECT * with an explicit column list to make schema dependencies visible"
 }

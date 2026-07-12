@@ -218,7 +218,7 @@ Returns a complete summary of the pipeline execution.
 | Field | Type | Description |
 |-------|------|-------------|
 | `pipeline_type` | string or absent | Pipeline type executed (e.g., `"replication"`). |
-| `filter` | string or null | The filter applied to this run, if any. |
+| `filter` | string | The filter applied to this run. Empty string when no filter was set. |
 | `duration_ms` | integer | Total pipeline execution time in milliseconds. |
 | `tables_copied` | integer | Number of tables that were copied (full or incremental). |
 | `tables_failed` | integer | Number of tables that failed during processing. |
@@ -230,7 +230,7 @@ Returns a complete summary of the pipeline execution.
 | `metrics` | object or null | Counters and percentile histograms for the run. |
 | `anomalies` | array | Row count anomalies detected by historical baseline comparison. |
 | `partition_summaries` | array | Per-model partition execution summaries (present for `time_interval` models). |
-| `cost_summary` | object or absent | Per-run cost rollup: `total_usd` (float or null), `by_adapter` (map of adapter → USD). Present when at least one adapter reports cost data. See [`[budget]`](/reference/configuration/#budget) for how cost limits are enforced. |
+| `cost_summary` | object or absent | Per-run cost rollup: `total_cost_usd` (float or null), `adapter_type` (string), `total_bytes_scanned` (integer or null), `total_duration_ms` (integer), and `per_model` (array of `{asset_key, duration_ms, cost_usd}`). Absent only for unbilled source adapters (`fivetran`/`airbyte`); present otherwise — including DuckDB, which reports `total_cost_usd` `0`, and billed adapters that computed no cost, where `total_cost_usd` is null. See [`[budget]`](/reference/configuration/#budget) for how cost limits are enforced. |
 | `budget_breaches` | array | Populated when `[budget]` limits tripped. Each entry has `limit_type` (`"max_usd"` / `"max_duration_ms"` / `"max_bytes_scanned"`), `limit`, and `actual` (both floats). Empty array when within budget or no limits configured. |
 
 A transformation model that fails to compile during a run is now a counted failure rather than a silent skip: the model lands on `tables_failed`, gets an `errors[]` entry with `failure_kind: "compile-error"` carrying the diagnostic, and the run reports overall status `Failure` (or `PartialFailure` when other models succeeded) with a non-zero exit code (`1` or `2`). Earlier engine versions skipped the model and still reported success.
@@ -248,7 +248,7 @@ A transformation model that fails to compile during a run is now a counted failu
 | `metadata.sql_hash` | string or absent | 16-char hex hash of the generated SQL. |
 | `metadata.column_count` | integer or absent | Number of columns in the materialized table. |
 | `metadata.compile_time_ms` | integer or absent | Compile time in milliseconds for derived models. |
-| `metadata.cost_usd` | float or absent | Estimated cost for this materialization in USD. Rolls up into `cost_summary.total_usd` at the run level. |
+| `cost_usd` | float or absent | Observed cost of this materialization in USD, computed post-hoc from the adapter's cost formula. Rolls up into `cost_summary.total_cost_usd` at the run level. |
 | `job_ids` | array of strings | Warehouse-side job IDs for the statements this materialization issued, accumulated alongside `bytes_scanned` / `bytes_written`. Lets orchestrators cross-check rocky-reported figures against the warehouse console (`bq show -j`, Snowflake query history, Databricks SQL warehouse history). Empty `[]` for adapters that don't surface a job id. Available since engine `1.21.0`. |
 | `partition` | object or absent | Partition window info for `time_interval` materializations. |
 

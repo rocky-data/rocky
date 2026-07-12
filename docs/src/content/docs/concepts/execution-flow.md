@@ -90,8 +90,8 @@ This is the core loop. For each model in each layer (in parallel within the laye
 Rocky calls `describe_table(target)` to get the current column list and types from the warehouse. It compares this against the source schema.
 
 ```
-Source column: amount  type: BIGINT
-Target column: amount  type: INT     ← type narrowed
+Source column: amount  type: DOUBLE
+Target column: amount  type: INT     ← target too narrow for source
 
 Is this a safe widening? No → DROP target table, let it be recreated.
 
@@ -147,18 +147,18 @@ A model that fails to compile when its turn comes (`CompileError`) never reaches
 
 ### 6f. Quality checks
 
-After the SQL executes, Rocky runs the model's declared quality checks (from the model's `.toml` sidecar):
+After the SQL executes, Rocky runs the model's declared quality checks — the `[[tests]]` blocks in the model's `.toml` sidecar:
 
 ```toml
-[[checks]]
+[[tests]]
 type = "not_null"
 column = "order_id"
 
-[[checks]]
-type = "row_count"
+[[tests]]
+type = "row_count_range"
 min = 1
 
-[[checks]]
+[[tests]]
 type = "accepted_values"
 column = "status"
 values = ["completed", "cancelled", "pending"]
@@ -190,11 +190,23 @@ Rocky serializes the `RunOutput` struct to JSON on stdout. Illustrative shape (t
 {
   "version": "1.28.0",
   "command": "run",
+  "status": "PartialFailure",
   "tables_copied": 3,
+  "tables_failed": 1,
   "materializations": [
-    { "model": "orders_summary",  "status": "completed", "reason": "..." },
-    { "model": "product_stats",   "status": "skipped",   "reason": "unchanged" },
-    { "model": "customer_totals", "status": "failed",    "failure_kind": "query-rejected" }
+    {
+      "asset_key": ["analytics", "main", "orders_summary"],
+      "rows_copied": 1200,
+      "duration_ms": 45,
+      "metadata": {
+        "strategy": "incremental",
+        "target_table_full_name": "analytics.main.orders_summary",
+        "sql_hash": "..."
+      }
+    }
+  ],
+  "errors": [
+    { "asset_key": ["analytics", "main", "customer_totals"], "failure_kind": "query-rejected", "error": "..." }
   ],
   "check_results": [...],
   "drift": [...],
@@ -202,6 +214,8 @@ Rocky serializes the `RunOutput` struct to JSON on stdout. Illustrative shape (t
   "anomalies": [...]
 }
 ```
+
+A successful materialization is one entry in `materializations` (identified by its `asset_key` and `metadata.target_table_full_name`, not a `model`/`status` field); a failed model surfaces in the top-level `errors` array with its `failure_kind`. Run-level status lives in the top-level `status` field (`Success` / `PartialFailure` / `Failure`), and skipped/reused models are counted in `tables_skipped` and detailed in `model_decisions`.
 
 Exit code:
 - `0` — all models succeeded
@@ -212,7 +226,7 @@ Exit code:
 
 If a run is interrupted mid-layer (process killed, network failure, etc.), Rocky can resume from the last successful checkpoint.
 
-The state store records which models completed via the `run_progress_entries` table (one entry per `run_id` + table) and the `idempotency_keys` table (keyed by `run_id` + model + file). `rocky run --resume-latest` looks up the most recent `run_id`, checks which models already completed, and skips them. Models whose watermarks were not committed (because the layer didn't finish) are re-run from their last committed watermark.
+The state store records which tables completed via the `run_progress_entries` table (one entry per `run_id` + table), with a `run_progress` header row per `run_id`. `rocky run --resume-latest` looks up the most recent `run_id`, checks which tables already completed, and skips them. Models whose watermarks were not committed (because the layer didn't finish) are re-run from their last committed watermark.
 
 ```bash
 # Resume the most recent run:

@@ -108,7 +108,7 @@ Each per-model `Bisection` variant carries a `bisection_stats` block:
 }
 ```
 
-The `samples` field carries up to `--max-samples` (default 5) representative changed rows surfaced from the leaves.
+The `samples` field carries up to 5 representative changed rows (`DEFAULT_MAX_SAMPLES`) surfaced from the leaves.
 
 ### Which algorithm runs?
 

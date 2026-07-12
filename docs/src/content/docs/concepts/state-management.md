@@ -13,7 +13,7 @@ Rocky uses [redb](https://github.com/cberner/redb), an embedded key-value store 
 
 ## State file
 
-By default, Rocky stores state in `.rocky-state.redb` in the current directory. You can override this with the `--state-path` flag:
+By default, Rocky stores state in `<models>/.rocky-state.redb` (a legacy `.rocky-state.redb` in the current directory keeps working, with a one-time deprecation warning on stderr). You can override the location with the `--state-path` flag:
 
 ```bash
 plan_id=$(rocky --config rocky.toml --state-path /var/lib/rocky/state.redb plan --output json | jq -r .plan_id)
@@ -106,11 +106,20 @@ This displays all stored watermarks and their values, useful for debugging incre
 
 ## Deleting watermarks
 
-Removing a watermark for a table causes Rocky to perform a full refresh on the next run. This is useful when you need to backfill data or recover from issues:
+Clearing state causes Rocky to perform a full refresh on the next run — useful when you need to backfill data or recover from issues. There is no CLI command to remove a single table's watermark; the practical options are:
 
-```bash
-rocky state delete --table "acme_warehouse.staging__us_west__shopify.orders"
-```
+- **Delete the state file** to clear *all* watermarks (and run history) at once, then re-run:
+
+  ```bash
+  rm <models>/.rocky-state.redb
+  ```
+- **Route the run to a fresh namespace** so it starts from an empty state file without touching the global one:
+
+  ```bash
+  rocky run --state-namespace backfill
+  ```
+
+For a scoped, review-gated re-run of specific models, use [`rocky backfill`](/reference/commands/governance-reclamation/#rocky-backfill) instead.
 
 ## Anomaly detection
 

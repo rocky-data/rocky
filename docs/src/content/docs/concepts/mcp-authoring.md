@@ -52,7 +52,7 @@ Both are strictly read-only. They let an agent (or you) see the governed and dri
 
 ### Generators (draft-only, your key)
 
-These call an LLM under your `ANTHROPIC_API_KEY` and **return drafts**. They never write to disk, never apply, and never touch the warehouse beyond the aggregate read they need to ground the draft. Their names carry the `ai_` prefix, mirroring the `rocky ai-*` CLI verbs.
+These call an LLM under your `ANTHROPIC_API_KEY` and **return drafts**. They never write to disk, never apply, and never touch the warehouse beyond the aggregate read they need to ground the draft. Most mirror a `rocky ai-*` CLI generator (`ai_contract` ↔ `ai-contract`, `ai_test` ↔ `ai-test`, `explain_model` ↔ `ai-explain`).
 
 | Tool | What it drafts |
 |---|---|

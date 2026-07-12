@@ -529,7 +529,7 @@ Branch names accept `[A-Za-z0-9_.\-]` up to 64 characters. The default schema pr
 | `--message <text>` | `string` | (none) | Optional free-form note persisted in the approval artifact. |
 | `--out <path>` | `PathBuf` | `./.rocky/approvals/<branch>/<approval_id>.json` | Override the artifact destination path. |
 
-Writes a content-addressed approval artifact that binds the approver's git identity to the exact bytes of the branch's models and project config. Editing, adding, or renaming any model after approval voids that approval, so `rocky branch promote` refuses to run unless the on-disk approvals still match the current state and satisfy the [`[branch.approval]`](/reference/configuration/#branchapproval) policy.
+Writes a content-addressed approval artifact that binds the approver's git identity to the exact bytes of the branch's models and project config. Editing, adding, or renaming any model after approval voids that approval, so `rocky branch promote` refuses to run unless the on-disk approvals still match the current state and satisfy the `[branch.approval]` policy.
 
 > **Upgrade note (engine v1.43):** approvals created before v1.43 bound to the project config only, not the model bytes. They no longer satisfy the gate after upgrading. Run `rocky branch approve <name>` once to re-sign each branch against its current model contents.
 
@@ -603,5 +603,5 @@ Internally this is `rocky compare` pointed at the branch's `schema_prefix` via `
 
 ### Related Commands
 
-- [`rocky run`](#rocky-run) -- execute a pipeline against a branch via `--run --branch`
+- [`rocky run`](#rocky-run) -- execute a pipeline against a branch via `rocky run --branch`
 - [`rocky compare`](/reference/cli/#rocky-compare) -- diff an ad-hoc shadow against production (the generic form `rocky branch compare` specialises)

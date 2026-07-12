@@ -170,8 +170,8 @@ Rocky produces clear errors for invalid schemas:
 | Condition | Error |
 |---|---|
 | Schema doesn't start with prefix | Schema is skipped (not an error — it's simply not a managed schema) |
-| Not enough segments for all components | `"Not enough segments: expected at least N components, got M"` |
-| Missing required component | `"Missing component: tenant"` |
+| Not enough segments for all components | `"schema '<name>' has <actual> segments but pattern requires at least <minimum>"` |
+| Missing required component | `"schema '<name>': no segments remaining for component '<component>'"` |
 
 ## Custom patterns
 
@@ -221,7 +221,7 @@ See [Config groups](/reference/model-format/#config-groups) in the model format 
 
 ## Filtering by parsed component
 
-Once your sources are parsed into components, you can scope `rocky plan` and `rocky compare` (and the `rocky run` alias) to a subset via the `--filter` flag. The filter key is one of the component names you declared above (or the reserved `id`), and the value is matched against the parsed value, with containment semantics for multi-valued (`...`) components:
+Once your sources are parsed into components, you can scope `rocky plan` and `rocky compare` (and the single-step `rocky run` sibling) to a subset via the `--filter` flag. The filter key is one of the component names you declared above (or the reserved `id`), and the value is matched against the parsed value, with containment semantics for multi-valued (`...`) components:
 
 ```sh
 # Plan everything for tenant "acme" (then `rocky apply <plan-id>` to execute)
