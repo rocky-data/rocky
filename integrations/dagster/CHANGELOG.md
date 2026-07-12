@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.60.0] — 2026-07-12
+
+### Changed
+
+- **Floor raised to `rocky-sdk>=0.7.0`.** Picks up the SDK's generated types for `rocky replay --execute` and `rocky restore` plan + apply so a `dagster-rocky` consumer resolves them through `dagster_rocky.types` without relying on latest-SDK resolution. No behavior change in the integration itself.
+- Internal resource efficiency and health-probe pass (no public API change). (#1101)
+
 ## [1.59.0] — 2026-07-10
 
 ### Changed

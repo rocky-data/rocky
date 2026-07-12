@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-07-12
+
+### Added
+
+- **Generated types for the engine-v1.64.0 output surface** — `rocky replay --execute` (`replay_execute`) and `rocky restore` plan + apply (`restore_plan`, `restore_apply`), plus the new `restore` value on the policy-capability enum propagated across the embedding schemas. Additive — existing parses are unaffected.
+
+### Changed
+
+- Internal client efficiency and health-probe pass (no public API change). (#1101)
+
 ## [0.6.0] — 2026-07-10
 
 ### Added
