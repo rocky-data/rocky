@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{Instrument, debug, info, info_span, warn};
 
@@ -2521,7 +2521,13 @@ pub async fn run(
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let shared_batch_check = batch_check_adapter.clone();
     let shared_warehouse = warehouse_adapter.clone();
-    let shared_state = Arc::new(Mutex::new(state_store));
+    // `Arc<StateStore>` (not `Arc<Mutex<…>>`): every StateStore method takes
+    // `&self` and redb serialises writers internally, so a shared reference is
+    // sound. Concurrent state I/O runs on the blocking pool via `spawn_blocking`
+    // (see `checkpoint_table_progress` and the read sites in `process_table`),
+    // keeping the fsync-bearing redb commits off the tokio worker driving the
+    // fan-out.
+    let shared_state = Arc::new(state_store);
     let shared_run_id = run_id.clone();
     let shared_pipeline = Arc::new(pipeline.clone());
     // Skip-unchanged pruning is active only when the pipeline opts in
@@ -2796,26 +2802,20 @@ pub async fn run(
                 }
 
                 // Checkpoint: record successful table progress
-                {
-                    let state = shared_state.lock().await;
-                    if let Err(e) = state.record_table_progress(
-                        &shared_run_id,
-                        &rocky_core::state::TableProgress {
-                            index: total_completed - 1,
-                            table_key: tr.target_full_name,
-                            asset_key: tr.asset_key,
-                            status: rocky_core::state::TableStatus::Success,
-                            error: None,
-                            duration_ms: output
-                                .materializations
-                                .last()
-                                .map_or(0, |m| m.duration_ms),
-                            completed_at: Utc::now(),
-                        },
-                    ) {
-                        tracing::warn!(error = %e, "failed to record table progress for run ");
-                    }
-                }
+                checkpoint_table_progress(
+                    &shared_state,
+                    &shared_run_id,
+                    rocky_core::state::TableProgress {
+                        index: total_completed - 1,
+                        table_key: tr.target_full_name,
+                        asset_key: tr.asset_key,
+                        status: rocky_core::state::TableStatus::Success,
+                        error: None,
+                        duration_ms: output.materializations.last().map_or(0, |m| m.duration_ms),
+                        completed_at: Utc::now(),
+                    },
+                )
+                .await;
             }
             Ok((idx, Err(e))) => {
                 // Classify before stringification so the typed connector
@@ -2877,10 +2877,10 @@ pub async fn run(
                             &msg,
                         ))
                         .await;
-                    let state = shared_state.lock().await;
-                    if let Err(e) = state.record_table_progress(
+                    checkpoint_table_progress(
+                        &shared_state,
                         &shared_run_id,
-                        &rocky_core::state::TableProgress {
+                        rocky_core::state::TableProgress {
                             index: idx,
                             table_key,
                             asset_key: vec![],
@@ -2889,9 +2889,8 @@ pub async fn run(
                             duration_ms: 0,
                             completed_at: Utc::now(),
                         },
-                    ) {
-                        tracing::warn!(error = %e, "failed to record table progress for run ");
-                    }
+                    )
+                    .await;
                 }
 
                 table_errors.push(TableError {
@@ -2911,23 +2910,20 @@ pub async fn run(
                 warn!(error = msg, "table task panicked");
 
                 // Checkpoint: record panicked task progress
-                {
-                    let state = shared_state.lock().await;
-                    if let Err(e) = state.record_table_progress(
-                        &shared_run_id,
-                        &rocky_core::state::TableProgress {
-                            index: 0,
-                            table_key: String::new(),
-                            asset_key: vec![],
-                            status: rocky_core::state::TableStatus::Failed,
-                            error: Some(msg.clone()),
-                            duration_ms: 0,
-                            completed_at: Utc::now(),
-                        },
-                    ) {
-                        tracing::warn!(error = %e, "failed to record table progress for run ");
-                    }
-                }
+                checkpoint_table_progress(
+                    &shared_state,
+                    &shared_run_id,
+                    rocky_core::state::TableProgress {
+                        index: 0,
+                        table_key: String::new(),
+                        asset_key: vec![],
+                        status: rocky_core::state::TableStatus::Failed,
+                        error: Some(msg.clone()),
+                        duration_ms: 0,
+                        completed_at: Utc::now(),
+                    },
+                )
+                .await;
 
                 table_errors.push(TableError {
                     asset_key: vec![],
@@ -2969,7 +2965,10 @@ pub async fn run(
             // §P1.6: commit every deferred watermark in a single redb
             // transaction instead of one `begin_write → commit` cycle per
             // entry. Same per-key data, 1 fsync instead of N.
-            let state = shared_state.lock().await;
+            // Terminal SIGINT flush: the fan-out has drained and this returns
+            // right after, so nothing concurrent is running — call the store
+            // directly (`Arc<StateStore>` derefs to `&StateStore`) rather than
+            // routing this one-time shutdown write through the blocking pool.
             let materialized: Vec<WatermarkState> = deferred_watermarks
                 .iter()
                 .map(|wm| WatermarkState {
@@ -2982,7 +2981,7 @@ pub async fn run(
                 .zip(materialized.iter())
                 .map(|(wm, state_val)| (wm.state_key.as_str(), state_val))
                 .collect();
-            if let Err(e) = state.batch_set_watermarks(&entries) {
+            if let Err(e) = shared_state.batch_set_watermarks(&entries) {
                 tracing::warn!(
                     error = %e,
                     count = entries.len(),
@@ -2994,8 +2993,7 @@ pub async fn run(
         // Diff: plan \ {Success|Failed} → mark as Interrupted. Uses the
         // state store as source of truth for what already committed.
         let settled: std::collections::HashSet<String> = {
-            let state = shared_state.lock().await;
-            state
+            shared_state
                 .get_run_progress(&shared_run_id)
                 .ok()
                 .flatten()
@@ -3016,7 +3014,6 @@ pub async fn run(
         };
 
         {
-            let state = shared_state.lock().await;
             for (idx, task) in tables_to_process.iter().enumerate() {
                 let key = format!(
                     "{}.{}.{}",
@@ -3025,7 +3022,7 @@ pub async fn run(
                 if !settled.contains(&key) {
                     let mut asset_key = task.asset_key_prefix.clone();
                     asset_key.push(task.table_name.clone());
-                    if let Err(e) = state.record_table_progress(
+                    if let Err(e) = shared_state.record_table_progress(
                         &shared_run_id,
                         &rocky_core::state::TableProgress {
                             index: idx,
@@ -3064,22 +3061,16 @@ pub async fn run(
         // got done before the SIGINT. `output.interrupted` was set
         // above so `derive_run_status` picks the right variant.
         {
-            let state = shared_state.lock().await;
+            let state = shared_state.as_ref();
             persist_run_record(
-                Some(&state),
+                Some(state),
                 &output,
                 &shared_run_id,
                 started_at,
                 &config_hash,
                 &audit,
             );
-            finalize_idempotency(
-                &mut idempotency_ctx,
-                Some(&state),
-                &shared_run_id,
-                &output,
-            )
-            .await;
+            finalize_idempotency(&mut idempotency_ctx, Some(state), &shared_run_id, &output).await;
         }
 
         if output_json {
@@ -3212,26 +3203,35 @@ pub async fn run(
             deferred_watermarks.len(),
         );
     } else {
-        // §P1.6: single redb transaction for every deferred watermark.
-        let state = shared_state.lock().await;
-        let materialized: Vec<WatermarkState> = deferred_watermarks
+        // §P1.6: single redb transaction for every deferred watermark, run on
+        // the blocking pool so the commit fsync doesn't stall the async task.
+        let store = Arc::clone(&shared_state);
+        let owned: Vec<(String, WatermarkState)> = deferred_watermarks
             .iter()
-            .map(|wm| WatermarkState {
-                last_value: wm.timestamp,
-                updated_at: wm.timestamp,
+            .map(|wm| {
+                (
+                    wm.state_key.clone(),
+                    WatermarkState {
+                        last_value: wm.timestamp,
+                        updated_at: wm.timestamp,
+                    },
+                )
             })
             .collect();
-        let entries: Vec<(&str, &WatermarkState)> = deferred_watermarks
-            .iter()
-            .zip(materialized.iter())
-            .map(|(wm, state_val)| (wm.state_key.as_str(), state_val))
-            .collect();
-        if let Err(e) = state.batch_set_watermarks(&entries) {
-            tracing::warn!(
-                error = %e,
-                count = entries.len(),
-                "failed to persist watermarks for run",
-            );
+        let count = owned.len();
+        let res = tokio::task::spawn_blocking(move || {
+            let entries: Vec<(&str, &WatermarkState)> =
+                owned.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            store.batch_set_watermarks(&entries)
+        })
+        .await;
+        match res {
+            // `batch_set_watermarks` returns the count written; ignore it here.
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, count, "failed to persist watermarks for run")
+            }
+            Err(e) => tracing::warn!(error = %e, "watermark flush task panicked"),
         }
     }
 
@@ -3274,9 +3274,11 @@ pub async fn run(
         );
     }
 
-    let state_store = Arc::try_unwrap(shared_state)
-        .ok()
-        .map(tokio::sync::Mutex::into_inner);
+    // All concurrent tasks (which each held an `Arc` clone) have joined and the
+    // happy-path watermark flush's blocking closure has dropped its clone, so
+    // the refcount is back to 1 and `try_unwrap` recovers the owned store for
+    // the serial tail below.
+    let state_store = Arc::try_unwrap(shared_state).ok();
 
     // --- Batched checks ---
     // See the `_governance_span` note above — same reason.
@@ -8374,10 +8376,33 @@ fn epoch_watermark_sentinel() -> chrono::DateTime<Utc> {
 /// source, non-incremental strategies). See `resolve_new_watermark` for the
 /// per-strategy dispatch. The watermark reflects what's been processed *from*
 /// source — not what's *in* target.
+/// Record a per-table checkpoint on the blocking pool.
+///
+/// The redb write transaction fsyncs on commit; running it inline on the async
+/// task that drives the concurrent fan-out would stall permit hand-out for the
+/// duration of the sync. Offloading to `spawn_blocking` over the shared
+/// `Arc<StateStore>` keeps the driver responsive. Best-effort: a state error
+/// (or a panicking blocking task) is logged, never propagated — matching the
+/// prior inline `if let Err(e) = …` behaviour.
+async fn checkpoint_table_progress(
+    state: &Arc<StateStore>,
+    run_id: &str,
+    progress: rocky_core::state::TableProgress,
+) {
+    let store = Arc::clone(state);
+    let run_id = run_id.to_string();
+    match tokio::task::spawn_blocking(move || store.record_table_progress(&run_id, &progress)).await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "failed to record table progress for run "),
+        Err(e) => tracing::warn!(error = %e, "table-progress checkpoint task panicked"),
+    }
+}
+
 #[tracing::instrument(skip_all, fields(table = %task.table_name))]
 async fn process_table(
     warehouse: &dyn WarehouseAdapter,
-    state: &Mutex<StateStore>,
+    state: &Arc<StateStore>,
     pipeline: &ReplicationPipelineConfig,
     task: &TableTask,
     prune_enabled: bool,
@@ -8428,9 +8453,12 @@ async fn process_table(
     };
     if let Some(live) = &live_marker {
         let recorded = {
-            let guard = state.lock().await;
-            guard
-                .get_source_marker(&target_table.state_key())
+            // Read on the blocking pool: redb's open-a-read-txn path is
+            // synchronous, and this is on the hottest concurrent table path.
+            let store = Arc::clone(state);
+            let key = target_table.state_key();
+            tokio::task::spawn_blocking(move || store.get_source_marker(&key).ok().flatten())
+                .await
                 .ok()
                 .flatten()
         };
@@ -8672,15 +8700,26 @@ async fn process_table(
     // post-`delete_watermark`, `None` falls back to the 1970-01-01 sentinel
     // so the whole source is scanned.
     let prior_watermark: Option<chrono::DateTime<Utc>> = {
-        let state_guard = state.lock().await;
-        match state_guard.get_watermark(&target_table.state_key()) {
-            Ok(Some(wm)) => Some(wm.last_value),
-            Ok(None) => None,
-            Err(e) => {
+        // Read on the blocking pool so the redb read transaction doesn't stall
+        // the async worker on the concurrent table path.
+        let store = Arc::clone(state);
+        let key = target_table.state_key();
+        match tokio::task::spawn_blocking(move || store.get_watermark(&key)).await {
+            Ok(Ok(Some(wm))) => Some(wm.last_value),
+            Ok(Ok(None)) => None,
+            Ok(Err(e)) => {
                 tracing::warn!(
                     table = target_table.full_name(),
                     error = %e,
                     "could not read prior watermark from state — falling back to full scan"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    table = target_table.full_name(),
+                    error = %e,
+                    "watermark read task panicked — falling back to full scan"
                 );
                 None
             }
@@ -8963,16 +9002,26 @@ async fn process_table(
     // change. Written only on this success path — a copy failure early-returns
     // above, leaving the prior marker so the table is retried.
     if let Some(marker) = &live_marker {
-        let recorded = state
-            .lock()
-            .await
-            .set_source_marker(&target_table.state_key(), marker);
-        if let Err(e) = recorded {
-            tracing::warn!(
+        // Write the source change-marker on the blocking pool — this is the
+        // success tail of the concurrent per-table path, so the redb commit's
+        // fsync must not stall the async worker.
+        let store = Arc::clone(state);
+        let key = target_table.state_key();
+        let marker = marker.clone();
+        let recorded =
+            tokio::task::spawn_blocking(move || store.set_source_marker(&key, &marker)).await;
+        match recorded {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
                 table = %task.table_name,
                 error = %e,
                 "failed to record source change-marker; table will re-copy next run"
-            );
+            ),
+            Err(e) => tracing::warn!(
+                table = %task.table_name,
+                error = %e,
+                "source change-marker write task panicked; table will re-copy next run"
+            ),
         }
     }
 
@@ -9106,7 +9155,7 @@ async fn process_completed_result(
     table_errors: &mut Vec<TableError>,
     deferred_tags: &mut Vec<DeferredTagging>,
     deferred_watermarks: &mut Vec<DeferredWatermark>,
-    shared_state: &Mutex<StateStore>,
+    shared_state: &Arc<StateStore>,
     shared_run_id: &str,
     total_completed: &mut usize,
 ) {
@@ -9170,23 +9219,20 @@ async fn process_completed_result(
             }
 
             // Checkpoint: record successful table progress
-            {
-                let state = shared_state.lock().await;
-                if let Err(e) = state.record_table_progress(
-                    shared_run_id,
-                    &rocky_core::state::TableProgress {
-                        index: *total_completed - 1,
-                        table_key: tr.target_full_name,
-                        asset_key: tr.asset_key,
-                        status: rocky_core::state::TableStatus::Success,
-                        error: None,
-                        duration_ms: output.materializations.last().map_or(0, |m| m.duration_ms),
-                        completed_at: Utc::now(),
-                    },
-                ) {
-                    tracing::warn!(error = %e, "failed to record table progress for run ");
-                }
-            }
+            checkpoint_table_progress(
+                shared_state,
+                shared_run_id,
+                rocky_core::state::TableProgress {
+                    index: *total_completed - 1,
+                    table_key: tr.target_full_name,
+                    asset_key: tr.asset_key,
+                    status: rocky_core::state::TableStatus::Success,
+                    error: None,
+                    duration_ms: output.materializations.last().map_or(0, |m| m.duration_ms),
+                    completed_at: Utc::now(),
+                },
+            )
+            .await;
         }
         Ok((idx, Err(e))) => {
             // Classify before stringification so the typed connector
@@ -9220,10 +9266,10 @@ async fn process_completed_result(
                 let table_key = task
                     .map(|t| format!("{}.{}.{}", t.target_catalog, t.target_schema, t.table_name))
                     .unwrap_or_default();
-                let state = shared_state.lock().await;
-                if let Err(e) = state.record_table_progress(
+                checkpoint_table_progress(
+                    shared_state,
                     shared_run_id,
-                    &rocky_core::state::TableProgress {
+                    rocky_core::state::TableProgress {
                         index: idx,
                         table_key,
                         asset_key: vec![],
@@ -9232,9 +9278,8 @@ async fn process_completed_result(
                         duration_ms: 0,
                         completed_at: Utc::now(),
                     },
-                ) {
-                    tracing::warn!(error = %e, "failed to record table progress for run ");
-                }
+                )
+                .await;
             }
 
             table_errors.push(TableError {
@@ -9250,23 +9295,20 @@ async fn process_completed_result(
             warn!(error = msg, "table task panicked");
 
             // Checkpoint: record panicked task progress
-            {
-                let state = shared_state.lock().await;
-                if let Err(e) = state.record_table_progress(
-                    shared_run_id,
-                    &rocky_core::state::TableProgress {
-                        index: 0,
-                        table_key: String::new(),
-                        asset_key: vec![],
-                        status: rocky_core::state::TableStatus::Failed,
-                        error: Some(msg.clone()),
-                        duration_ms: 0,
-                        completed_at: Utc::now(),
-                    },
-                ) {
-                    tracing::warn!(error = %e, "failed to record table progress for run ");
-                }
-            }
+            checkpoint_table_progress(
+                shared_state,
+                shared_run_id,
+                rocky_core::state::TableProgress {
+                    index: 0,
+                    table_key: String::new(),
+                    asset_key: vec![],
+                    status: rocky_core::state::TableStatus::Failed,
+                    error: Some(msg.clone()),
+                    duration_ms: 0,
+                    completed_at: Utc::now(),
+                },
+            )
+            .await;
 
             table_errors.push(TableError {
                 asset_key: vec![],

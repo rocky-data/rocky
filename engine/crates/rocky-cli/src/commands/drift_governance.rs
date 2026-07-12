@@ -24,7 +24,7 @@
 //! migration has already landed and stays until a human reverts it.
 
 use anyhow::{Result, bail};
-use tokio::sync::Mutex;
+use std::sync::Arc;
 use tracing::warn;
 
 use rocky_core::auto_apply::{self, RefuseReason};
@@ -190,10 +190,8 @@ impl DriftGovernor {
         &self,
         drift: &DriftResult,
         model: &str,
-        state: &Mutex<StateStore>,
+        state: &Arc<StateStore>,
     ) -> GovernDecision {
-        let guard = state.lock().await;
-
         // Dynamic tightening over the prior decision ledger (freeze → deny,
         // exhausted budget → require_review). Monotone: never widens the
         // static effect.
@@ -215,8 +213,13 @@ impl DriftGovernor {
                 ),
             )
         } else {
-            match guard.list_policy_decisions() {
-                Ok(prior) => match &self.policy {
+            // Read the prior decision ledger on the blocking pool — this runs
+            // on the concurrent per-table drift path, so the redb read must not
+            // stall the tokio worker.
+            let store = Arc::clone(state);
+            let ledger = tokio::task::spawn_blocking(move || store.list_policy_decisions()).await;
+            match ledger {
+                Ok(Ok(prior)) => match &self.policy {
                     Some(policy) => {
                         let (effect, degradation) = policy::autonomy_degradation(
                             self.effect,
@@ -236,11 +239,20 @@ impl DriftGovernor {
                 },
                 // Fail-closed: with the ledger unreadable, a possibly-active
                 // freeze is invisible — never proceed on the static allow.
-                Err(e) => (
+                Ok(Err(e)) => (
                     tighten_to_require_review(self.effect),
                     Some(format!(
                         "policy ledger unreadable ({e}) — freeze/budget state unverifiable, \
                          degraded to require_review (fail-closed)"
+                    )),
+                ),
+                // The blocking read task itself failed (panic / cancellation);
+                // treat the ledger as unverifiable, same fail-closed posture.
+                Err(e) => (
+                    tighten_to_require_review(self.effect),
+                    Some(format!(
+                        "policy ledger read task failed ({e}) — freeze/budget state \
+                         unverifiable, degraded to require_review (fail-closed)"
                     )),
                 ),
             }
@@ -325,19 +337,30 @@ impl DriftGovernor {
                 revert_pointer: revert_pointer_for(),
             }),
         };
-        let write_result = guard.record_policy_decision(&record);
-        drop(guard);
-
-        if let Err(e) = &write_result {
-            warn!(
+        // Persist the custody row on the blocking pool. `row_persisted` gates
+        // the fail-closed decision below: a panicking write task counts as
+        // not-persisted, same as a returned error.
+        let store = Arc::clone(state);
+        let write_outcome =
+            tokio::task::spawn_blocking(move || store.record_policy_decision(&record)).await;
+        let row_persisted = matches!(write_outcome, Ok(Ok(_)));
+        match &write_outcome {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!(
                 target: "rocky::policy",
                 error = %e,
                 model,
                 "failed to record auto-apply custody entry"
-            );
+            ),
+            Err(e) => warn!(
+                target: "rocky::policy",
+                error = %e,
+                model,
+                "auto-apply custody write task failed"
+            ),
         }
 
-        govern_outcome(applied, write_result.is_ok(), model, reason)
+        govern_outcome(applied, row_persisted, model, reason)
     }
 }
 
@@ -696,7 +719,7 @@ mod tests {
         let gov =
             DriftGovernor::build(&cfg, "run-x", "wh.raw.orders", true).expect("governor present");
         let (store, _d) = temp_store();
-        let state = Mutex::new(store);
+        let state = Arc::new(store);
 
         // A breaking retype is refused (fails the additive proof first).
         let d = gov
@@ -718,7 +741,7 @@ mod tests {
         );
 
         // Both refusals recorded a require-review custody row; nothing applied.
-        let decisions = state.lock().await.list_policy_decisions().unwrap();
+        let decisions = state.list_policy_decisions().unwrap();
         assert_eq!(decisions.len(), 2, "one custody row per governed drift");
         assert!(
             decisions
@@ -946,7 +969,7 @@ mod tests {
         store
             .record_policy_decision(&freeze_record(PolicyPrincipal::Agent, "any"))
             .unwrap();
-        let state = Mutex::new(store);
+        let state = Arc::new(store);
 
         let d = gov
             .govern(&additive_add_drift(), "wh.raw.orders", &state)
@@ -960,7 +983,7 @@ mod tests {
         );
 
         // The custody row records the freeze-forced deny.
-        let decisions = state.lock().await.list_policy_decisions().unwrap();
+        let decisions = state.list_policy_decisions().unwrap();
         let row = decisions
             .iter()
             .find(|r| r.plan_id == decision_plan_id("run-fz"))
@@ -979,7 +1002,7 @@ mod tests {
         store
             .record_policy_decision(&freeze_record(PolicyPrincipal::Human, "any"))
             .unwrap();
-        let state = Mutex::new(store);
+        let state = Arc::new(store);
         let d = gov
             .govern(&additive_add_drift(), "wh.raw.orders", &state)
             .await;
@@ -1024,7 +1047,7 @@ mod tests {
                 auto_apply: None,
             })
             .unwrap();
-        let state = Mutex::new(store);
+        let state = Arc::new(store);
 
         let d = gov
             .govern(&additive_add_drift(), "wh.raw.orders", &state)
@@ -1053,7 +1076,7 @@ mod tests {
         let gov = DriftGovernor::build(&cfg, "run-burn", "wh.raw.orders", true).expect("governor");
 
         let (store, _d) = temp_store();
-        let state = Mutex::new(store);
+        let state = Arc::new(store);
 
         // The governed heal applies (grant is allow, drift provably additive).
         let d = gov
@@ -1061,7 +1084,7 @@ mod tests {
             .await;
         assert!(matches!(d, GovernDecision::Apply), "the heal must apply");
 
-        let store = state.into_inner();
+        let store = Arc::into_inner(state).unwrap();
 
         // The decision row is PLAIN (empty verify_after) with the granting
         // rule attributed, and preserves the custody payload.
@@ -1122,7 +1145,7 @@ mod tests {
         )
         .expect("governor");
         let (store, _d) = temp_store();
-        let state = Mutex::new(store);
+        let state = Arc::new(store);
 
         let d = gov
             .govern(&additive_add_drift(), "wh.raw.orders", &state)
@@ -1139,7 +1162,7 @@ mod tests {
         let gov_ok = DriftGovernor::build(&cfg, "run-ok", "wh.raw.orders", true).expect("governor");
         let (store2, _d2) = temp_store();
         let d2 = gov_ok
-            .govern(&additive_add_drift(), "wh.raw.orders", &Mutex::new(store2))
+            .govern(&additive_add_drift(), "wh.raw.orders", &Arc::new(store2))
             .await;
         assert!(
             matches!(d2, GovernDecision::Apply),
@@ -1162,7 +1185,7 @@ mod tests {
         store
             .record_policy_decision(&freeze_record(PolicyPrincipal::Agent, "any"))
             .unwrap();
-        let state = Mutex::new(store);
+        let state = Arc::new(store);
 
         // A breaking retype: eligibility trips on NotAdditive before the policy
         // check, yet the active freeze tightened the policy effect to deny.
@@ -1172,8 +1195,6 @@ mod tests {
         assert!(matches!(d, GovernDecision::Refuse(_)), "must refuse");
 
         let row = state
-            .lock()
-            .await
             .list_policy_decisions()
             .unwrap()
             .into_iter()
