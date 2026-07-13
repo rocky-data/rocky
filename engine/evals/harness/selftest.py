@@ -3,9 +3,9 @@
 Runs with no model key and no `rocky`/`duckdb` binary: it exercises the pure,
 transcript-derived half of the harness — the stream-json parser, the
 grounding/propose signal logic, and scorecard rendering — against a *recorded*
-transcript captured from a real run. This is what the label-gated CI job runs on
-the no-secret path so a fork PR still gets a meaningful signal (the harness logic
-is sound), not just a blanket skip. The binary-backed checks (compile,
+transcript captured from a real run. This is what credential-free pull-request
+CI runs so a fork PR still gets a meaningful signal (the harness logic is
+sound), not just a blanket skip. The binary-backed checks (compile,
 reconcile, mutation) are validated by the live suite, not here.
 """
 

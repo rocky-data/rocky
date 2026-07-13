@@ -1,0 +1,24 @@
+name: ci-security-policy-tests
+
+# Candidate policy code executes only under the ordinary pull-request trust
+# model. The trusted policy workflow separately evaluates candidate files as
+# data with its immutable checker.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  policy-tests:
+    name: Credential-containment regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out pull-request revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run executable workflow-policy regressions
+        run: python3 -m unittest discover -s .github/tests -p 'test_*.py' -v

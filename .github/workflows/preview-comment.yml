@@ -1,0 +1,36 @@
+name: rocky-preview-comment
+
+# GitHub's documented privilege-separation pattern: this workflow receives a
+# write token only after the ordinary pull-request producer completes. It
+# authenticates that run and treats its artifact solely as bounded data.
+on:
+  workflow_run:
+    workflows: [rocky-preview]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  comment:
+    name: Upsert trusted Rocky preview comment
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out trusted comment tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Authenticate producer artifact and upsert preview comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: python3 trusted/.github/scripts/preview_comment.py post-workflow-run

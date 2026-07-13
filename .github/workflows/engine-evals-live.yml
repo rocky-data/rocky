@@ -1,0 +1,109 @@
+name: engine-evals-live
+
+# The model key is available only to trusted code already on main. Configure
+# ANTHROPIC_API_KEY as a credentialed-ci environment secret and restrict that
+# environment to the main branch with a required trusted reviewer (see
+# .github/SECURITY_ENVIRONMENTS.md).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/evals/**'
+      - 'engine/crates/rocky-mcp/**'
+      - '.github/workflows/engine-evals-live.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-evals-live-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  evals:
+    name: Agent conformance evals (trusted main)
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: credentialed-ci
+    env:
+      # Disable both background and explicit self-update paths before the exact
+      # package installed below receives the model key.
+      DISABLE_AUTOUPDATER: '1'
+      DISABLE_UPDATES: '1'
+    steps:
+      - name: Check out exact trusted revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          workspaces: engine
+          key: evals-live
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+
+      - name: Configure swap
+        run: |
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 4G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - name: Build rocky (debug)
+        working-directory: engine
+        run: cargo build --bin rocky
+
+      # Pin to the DuckDB version bundled by the engine. Artifact checksum
+      # hardening is tracked separately from this PR trust-boundary fix.
+      - name: Install the DuckDB CLI
+        run: |
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.3/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
+          sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/duckdb
+          duckdb --version
+
+      - name: Install the Claude Code CLI
+        # Exact registry version: credential-bearing tooling must change only
+        # through a reviewed workflow diff.
+        run: npm install -g @anthropic-ai/claude-code@2.1.207
+
+      - name: Harness self-test
+        working-directory: engine/evals
+        run: uv run python run_evals.py --selftest
+
+      - name: Structured-error contract
+        working-directory: engine/evals
+        env:
+          ROCKY_BIN: ${{ github.workspace }}/engine/target/debug/rocky
+        run: uv run python run_evals.py --error-contract
+
+      - name: Run the agent conformance suite
+        working-directory: engine/evals
+        env:
+          ROCKY_BIN: ${{ github.workspace }}/engine/target/debug/rocky
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: uv run python run_evals.py --max-attempts 2
+
+      - name: Upload scorecard
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agent-eval-scorecard-${{ github.sha }}
+          path: |
+            engine/evals/results/scorecard.json
+            engine/evals/results/scorecard.md
+            engine/evals/results/transcripts/
+          if-no-files-found: warn

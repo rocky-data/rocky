@@ -50,16 +50,19 @@ inputs:
     default: 'false'
   github_token:
     description: >-
-      Token used to read the PR and upsert the comment. Pass the
-      workflow's github.token (or a PAT for cross-repo permissions).
-      Required because composite actions cannot reference the github
-      context in input defaults.
-    required: true
+      Token used to read the PR and upsert the comment when this action runs
+      directly on a pull_request event. Omit it when a caller stages the
+      body for a separate trusted commenter.
+    required: false
+    default: ''
 
 outputs:
   comment_url:
     description: 'HTML URL of the upserted PR comment.'
     value: ${{ steps.upsert-comment.outputs.comment_url }}
+  body_path:
+    description: 'Path to the rendered Markdown body for a trusted caller to stage.'
+    value: ${{ steps.render.outputs.body_path }}
   prune_set_size:
     description: 'Number of models in the prune set (changed + downstream-of-changed).'
     value: ${{ steps.run-preview.outputs.prune_set_size }}
@@ -140,7 +143,7 @@ runs:
         ROCKY_PREVIEW_WORKING_DIR: ${{ inputs.working_directory }}
       run: |
         set -euo pipefail
-        cd "$ROCKY_PREVIEW_WORKING_DIR"
+        cd "$ROCKY_PREVIEW_WORKING_DIR" || exit 1
 
         # Resolve the branch name. If the caller passed one, slug it for
         # warehouse-schema safety (only [A-Za-z0-9_-]). Otherwise default
@@ -324,7 +327,7 @@ runs:
     # don't blow the env-var size limit.
     - name: Upsert PR comment
       id: upsert-comment
-      if: github.event_name == 'pull_request'
+      if: github.event_name == 'pull_request' && inputs.github_token != ''
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
         BODY_PATH: ${{ steps.render.outputs.body_path }}
