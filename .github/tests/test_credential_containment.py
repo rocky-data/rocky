@@ -16,7 +16,9 @@ from unittest.mock import patch
 sys.dont_write_bytecode = True
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = REPOSITORY_ROOT / ".github" / "scripts"
+PREVIEW_ACTION = REPOSITORY_ROOT / ".github" / "actions" / "rocky-preview"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(1, str(PREVIEW_ACTION))
 
 from fetch_ai_review_context import (  # noqa: E402
     ContextError,
@@ -30,6 +32,12 @@ from fetch_policy_candidate import (  # noqa: E402
     MAX_BLOB_BYTES,
     PolicyCandidateError,
     fetch_policy_candidate,
+)
+from normalize_json import (  # noqa: E402
+    MAX_RAW_BYTES as MAX_PREVIEW_RAW_BYTES,
+    PreviewJsonError,
+    extract_command_object,
+    normalize_preview_json,
 )
 from check_credential_containment import FROZEN_TRUST_ROOTS, check_repository  # noqa: E402
 from preview_comment import (  # noqa: E402
@@ -92,6 +100,74 @@ def context_payload(*, head_sha: str = HEAD_SHA) -> bytes:
             },
         }
     ).encode()
+
+
+class PreviewJsonNormalizationTests(unittest.TestCase):
+    def preview_payload(self, command: str = "preview-create") -> dict[str, object]:
+        return {
+            "version": "1.64.0",
+            "command": command,
+            "branch_name": "fix_audit-remediation",
+            "prune_set": [],
+        }
+
+    def test_mixed_status_logs_and_command_json_extract_exact_payload(self) -> None:
+        expected = self.preview_payload()
+        warning = {
+            "timestamp": "2026-07-13T18:20:07Z",
+            "level": "WARN",
+            "fields": {"message": "copy from base failed"},
+        }
+        raw = (
+            b"created branch 'fix_audit-remediation'\n"
+            + json.dumps(warning).encode()
+            + b"\n"
+            + json.dumps(expected, indent=2).encode()
+            + b"\n"
+        )
+        self.assertEqual(
+            extract_command_object(raw, expected_command="preview-create"),
+            expected,
+        )
+
+    def test_missing_wrong_or_duplicate_command_objects_are_rejected(self) -> None:
+        expected = self.preview_payload()
+        for raw, message in (
+            (b"created branch only\n", "exactly one"),
+            (json.dumps(self.preview_payload("preview-diff")).encode(), "exactly one"),
+            (
+                (json.dumps(expected) + "\n" + json.dumps(expected)).encode(),
+                "exactly one",
+            ),
+        ):
+            with self.subTest(raw=raw), self.assertRaisesRegex(PreviewJsonError, message):
+                extract_command_object(raw, expected_command="preview-create")
+
+    def test_preview_stdout_limits_and_utf8_are_enforced(self) -> None:
+        with self.assertRaisesRegex(PreviewJsonError, "byte limit"):
+            extract_command_object(
+                b"x" * (MAX_PREVIEW_RAW_BYTES + 1),
+                expected_command="preview-create",
+            )
+        with self.assertRaisesRegex(PreviewJsonError, "UTF-8"):
+            extract_command_object(b"\xff", expected_command="preview-create")
+
+    def test_normalized_file_is_exact_json_with_restrictive_mode(self) -> None:
+        expected = self.preview_payload()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "create.raw"
+            destination = root / "create.json"
+            source.write_bytes(
+                b"created branch\n" + json.dumps(expected, indent=2).encode()
+            )
+            normalize_preview_json(
+                source,
+                destination,
+                expected_command="preview-create",
+            )
+            self.assertEqual(json.loads(destination.read_text()), expected)
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
 
 
 class PolicyCandidateFetchTests(unittest.TestCase):
@@ -1462,6 +1538,19 @@ jobs:
 class WorkflowPolicyTests(unittest.TestCase):
     def read(self, relative_path: str) -> str:
         return (REPOSITORY_ROOT / relative_path).read_text()
+
+    def test_preview_action_normalizes_each_expected_json_command(self) -> None:
+        action = self.read(".github/actions/rocky-preview/action.yml")
+        self.assertIn(
+            "ROCKY_PREVIEW_NORMALIZER: ${{ github.action_path }}/normalize_json.py",
+            action,
+        )
+        self.assertEqual(action.count("--output json"), 3)
+        for command in ("preview-create", "preview-diff", "preview-cost"):
+            self.assertIn(
+                f'"$WORK/{command.removeprefix("preview-")}.json" {command}',
+                action,
+            )
 
     def test_ai_review_has_two_job_trust_split_and_sync_invalidation(self) -> None:
         workflow = self.read(".github/workflows/ai-review.yml")

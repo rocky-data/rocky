@@ -141,6 +141,7 @@ runs:
         ROCKY_PREVIEW_BRANCH_RAW: ${{ inputs.branch_name }}
         ROCKY_PREVIEW_MODELS_DIR: ${{ inputs.models_dir }}
         ROCKY_PREVIEW_WORKING_DIR: ${{ inputs.working_directory }}
+        ROCKY_PREVIEW_NORMALIZER: ${{ github.action_path }}/normalize_json.py
       run: |
         set -euo pipefail
         cd "$ROCKY_PREVIEW_WORKING_DIR" || exit 1
@@ -167,11 +168,17 @@ runs:
         mkdir -p "$WORK"
 
         # ---- preview create ----
-        CREATE_ARGS=(preview create --base "$ROCKY_PREVIEW_BASE_REF" --models "$ROCKY_PREVIEW_MODELS_DIR")
+        CREATE_ARGS=(preview create --base "$ROCKY_PREVIEW_BASE_REF" --models "$ROCKY_PREVIEW_MODELS_DIR" --output json)
         if [ -n "$BRANCH_NAME" ]; then
           CREATE_ARGS+=(--name "$BRANCH_NAME")
         fi
-        if rocky "${CREATE_ARGS[@]}" > "$WORK/create.json" 2> "$WORK/create.err"; then
+        : > "$WORK/create.raw"
+        : > "$WORK/create.err"
+        rm -f "$WORK/create.json"
+        if rocky "${CREATE_ARGS[@]}" > "$WORK/create.raw" 2> "$WORK/create.err" &&
+            python3 "$ROCKY_PREVIEW_NORMALIZER" \
+              "$WORK/create.raw" "$WORK/create.json" preview-create \
+              2>> "$WORK/create.err"; then
           : > "$WORK/create_failed"
         else
           echo failed > "$WORK/create_failed"
@@ -186,10 +193,15 @@ runs:
         fi
 
         # ---- preview diff ----
-        : > "$WORK/diff.json"
+        : > "$WORK/diff.raw"
+        : > "$WORK/diff.err"
+        rm -f "$WORK/diff.json"
         if [ -n "$BRANCH_NAME" ]; then
           if rocky preview diff --name "$BRANCH_NAME" --base "$ROCKY_PREVIEW_BASE_REF" \
-              > "$WORK/diff.json" 2> "$WORK/diff.err"; then
+              --output json > "$WORK/diff.raw" 2> "$WORK/diff.err" &&
+              python3 "$ROCKY_PREVIEW_NORMALIZER" \
+                "$WORK/diff.raw" "$WORK/diff.json" preview-diff \
+                2>> "$WORK/diff.err"; then
             : > "$WORK/diff_failed"
           else
             echo failed > "$WORK/diff_failed"
@@ -200,10 +212,15 @@ runs:
         fi
 
         # ---- preview cost ----
-        : > "$WORK/cost.json"
+        : > "$WORK/cost.raw"
+        : > "$WORK/cost.err"
+        rm -f "$WORK/cost.json"
         if [ -n "$BRANCH_NAME" ]; then
-          if rocky preview cost --name "$BRANCH_NAME" \
-              > "$WORK/cost.json" 2> "$WORK/cost.err"; then
+          if rocky preview cost --name "$BRANCH_NAME" --output json \
+              > "$WORK/cost.raw" 2> "$WORK/cost.err" &&
+              python3 "$ROCKY_PREVIEW_NORMALIZER" \
+                "$WORK/cost.raw" "$WORK/cost.json" preview-cost \
+                2>> "$WORK/cost.err"; then
             : > "$WORK/cost_failed"
           else
             echo failed > "$WORK/cost_failed"
