@@ -1086,10 +1086,8 @@ def _check_policy_workflow(workflow: Workflow, job: str) -> list[str]:
     if _step_keys(steps[2]) != ["name", "run"]:
         violations.append("security policy enforcement step is not exact")
     if _run_scripts(job) != [
-        "python3 trusted/.github/scripts/fetch_policy_candidate.py "
-        '"$GITHUB_WORKSPACE/candidate"',
-        "python3 trusted/.github/scripts/check_credential_containment.py\n"
-        '"$GITHUB_WORKSPACE/candidate"',
+        'python3 trusted/.github/scripts/fetch_policy_candidate.py "$GITHUB_WORKSPACE/candidate"',
+        'python3 trusted/.github/scripts/check_credential_containment.py\n"$GITHUB_WORKSPACE/candidate"',
     ]:
         violations.append("security policy run scripts are not exact")
     executable = "\n".join(
