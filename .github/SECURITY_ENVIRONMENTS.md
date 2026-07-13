@@ -60,6 +60,13 @@ suite must report its own result, and GitHub must refuse the merge. Restore the
 test branch without merging it. A green policy job is advisory until these
 required-check rules are enabled.
 
+The trusted policy workflow never checks out the candidate revision. It uses a
+read-only token to fetch the exact candidate commit's `.github` Git tree as
+data, rejects truncated trees, symlinks, submodules, traversal-shaped paths,
+identity mismatches, oversized entries, and oversized aggregate snapshots, and
+then runs the trusted checker against restrictive regular files. This avoids
+executing candidate code in the default branch's cache security domain.
+
 ## Updating frozen trust roots
 
 The credential-containment workflow compares the candidate copies of its

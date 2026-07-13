@@ -19,14 +19,12 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: trusted
           persist-credentials: false
-      - name: Check out exact candidate policy input
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: candidate
-          persist-credentials: false
-          allow-unsafe-pr-checkout: true
+      - name: Fetch exact candidate policy data
+        env:
+          CANDIDATE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 trusted/.github/scripts/fetch_policy_candidate.py "$GITHUB_WORKSPACE/candidate"
       - name: Enforce credential-containment policy
         run: >-
           python3 trusted/.github/scripts/check_credential_containment.py

@@ -87,20 +87,6 @@ CANDIDATE_CHECKOUT_MAPS = {
     ("ci-security-policy-tests.yml", "policy-tests"): (
         {"persist-credentials": "false"},
     ),
-    ("ci-security-policy.yml", "credential-containment"): (
-        {
-            "ref": "${{ github.workflow_sha }}",
-            "path": "trusted",
-            "persist-credentials": "false",
-        },
-        {
-            "repository": "${{ github.event.pull_request.head.repo.full_name }}",
-            "ref": "${{ github.event.pull_request.head.sha }}",
-            "path": "candidate",
-            "persist-credentials": "false",
-            "allow-unsafe-pr-checkout": "true",
-        },
-    ),
     ("preview.yml", "context"): (
         {
             "fetch-depth": "0",
@@ -115,6 +101,7 @@ PROTECTED_CANDIDATE_WORKFLOWS = {name for name, _ in CANDIDATE_JOBS}
 TRUSTED_PRIVILEGED_JOBS = {
     ("ai-review.yml", "invalidate-approval"),
     ("ai-review.yml", "ai-review"),
+    ("ci-security-policy.yml", "credential-containment"),
     ("preview-comment.yml", "comment"),
 }
 REQUIRED_WORKFLOWS = {
@@ -131,6 +118,7 @@ FROZEN_TRUST_ROOTS = (
     ".github/scripts/check_credential_containment.py",
     ".github/scripts/collect_ai_review_context.py",
     ".github/scripts/fetch_ai_review_context.py",
+    ".github/scripts/fetch_policy_candidate.py",
     ".github/scripts/preview_comment.py",
     ".github/scripts/verify_pr_approval.py",
     ".github/tests/test_credential_containment.py",
@@ -140,6 +128,7 @@ TRUSTED_SCRIPT_ENTRIES = frozenset(
         "check_credential_containment.py",
         "collect_ai_review_context.py",
         "fetch_ai_review_context.py",
+        "fetch_policy_candidate.py",
         "preview_comment.py",
         "verify_pr_approval.py",
     }
@@ -1071,12 +1060,12 @@ def _check_policy_workflow(workflow: Workflow, job: str) -> list[str]:
     steps = _step_blocks(job)
     if [_step_name(step) for step in steps] != [
         "Check out trusted policy tooling",
-        "Check out exact candidate policy input",
+        "Fetch exact candidate policy data",
         "Enforce credential-containment policy",
     ]:
         violations.append("security policy steps are not exact")
         return violations
-    if _uses_sources(job) != [CHECKOUT_SOURCE, CHECKOUT_SOURCE]:
+    if _uses_sources(job) != [CHECKOUT_SOURCE]:
         violations.append("security policy action sources are not exact")
     if _step_keys(steps[0]) != ["name", "uses", "with"] or _scalar_mapping(
         steps[0], "with", indent=8
@@ -1086,19 +1075,19 @@ def _check_policy_workflow(workflow: Workflow, job: str) -> list[str]:
         "persist-credentials": "false",
     }:
         violations.append("security policy trusted checkout is not exact")
-    if _step_keys(steps[1]) != ["name", "uses", "with"] or _scalar_mapping(
-        steps[1], "with", indent=8
+    if _step_keys(steps[1]) != ["name", "env", "run"] or _scalar_mapping(
+        steps[1], "env", indent=8
     ) != {
-        "repository": "${{ github.event.pull_request.head.repo.full_name }}",
-        "ref": "${{ github.event.pull_request.head.sha }}",
-        "path": "candidate",
-        "persist-credentials": "false",
-        "allow-unsafe-pr-checkout": "true",
+        "CANDIDATE_REPOSITORY": "${{ github.event.pull_request.head.repo.full_name }}",
+        "CANDIDATE_SHA": "${{ github.event.pull_request.head.sha }}",
+        "GH_TOKEN": "${{ github.token }}",
     }:
-        violations.append("security policy candidate checkout is not exact")
+        violations.append("security policy candidate fetch environment is not exact")
     if _step_keys(steps[2]) != ["name", "run"]:
         violations.append("security policy enforcement step is not exact")
     if _run_scripts(job) != [
+        "python3 trusted/.github/scripts/fetch_policy_candidate.py "
+        '"$GITHUB_WORKSPACE/candidate"',
         "python3 trusted/.github/scripts/check_credential_containment.py\n"
         '"$GITHUB_WORKSPACE/candidate"',
     ]:
@@ -1108,11 +1097,15 @@ def _check_policy_workflow(workflow: Workflow, job: str) -> list[str]:
     )
     if (
         SECRET_RE.search(executable)
-        or TOKEN_CONTEXT_RE.search(executable)
         or WHOLE_GITHUB_CONTEXT_RE.search(executable)
         or COMPUTED_GITHUB_CONTEXT_RE.search(executable)
     ):
         violations.append("security policy consumes an unexpected credential")
+    expected_token = "${{ github.token }}"
+    if executable.count(expected_token) != 1 or TOKEN_CONTEXT_RE.search(
+        executable.replace(expected_token, "")
+    ):
+        violations.append("security policy token reference is not exact")
     return violations
 
 
@@ -1575,7 +1568,10 @@ def check_workflow(workflow: Workflow) -> list[str]:
             violations.append(f"{job_name} references the model key outside an allow-listed job")
         if not pr_triggered or not _is_credential_job(job):
             continue
-        if job_identity != ("ai-review.yml", "ai-review"):
+        if job_identity not in {
+            ("ai-review.yml", "ai-review"),
+            ("ci-security-policy.yml", "credential-containment"),
+        }:
             violations.append(
                 f"PR-triggered credential job {job_name} is not allow-listed"
             )

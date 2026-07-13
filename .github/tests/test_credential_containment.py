@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -24,6 +25,11 @@ from fetch_ai_review_context import (  # noqa: E402
     materialize_context,
     select_artifact,
     validate_context,
+)
+from fetch_policy_candidate import (  # noqa: E402
+    MAX_BLOB_BYTES,
+    PolicyCandidateError,
+    fetch_policy_candidate,
 )
 from check_credential_containment import FROZEN_TRUST_ROOTS, check_repository  # noqa: E402
 from preview_comment import (  # noqa: E402
@@ -50,6 +56,9 @@ NEW_HEAD_SHA = "c" * 40
 MERGE_SHA = "d" * 40
 HEAD_REPOSITORY = "rocky-data/rocky"
 FORK_REPOSITORY = "contributor/rocky"
+ROOT_TREE_SHA = "e" * 40
+GITHUB_TREE_SHA = "f" * 40
+BLOB_SHA = "1" * 40
 
 
 def pr_payload(*, head_sha: str = HEAD_SHA, base_sha: str = BASE_SHA) -> dict[str, object]:
@@ -83,6 +92,137 @@ def context_payload(*, head_sha: str = HEAD_SHA) -> bytes:
             },
         }
     ).encode()
+
+
+class PolicyCandidateFetchTests(unittest.TestCase):
+    def api_payloads(self, content: bytes = b"name: candidate-policy\n") -> dict[str, dict]:
+        prefix = f"repos/{HEAD_REPOSITORY}/git"
+        return {
+            f"{prefix}/commits/{HEAD_SHA}": {
+                "sha": HEAD_SHA,
+                "tree": {"sha": ROOT_TREE_SHA},
+            },
+            f"{prefix}/trees/{ROOT_TREE_SHA}": {
+                "sha": ROOT_TREE_SHA,
+                "truncated": False,
+                "tree": [
+                    {
+                        "path": ".github",
+                        "mode": "040000",
+                        "type": "tree",
+                        "sha": GITHUB_TREE_SHA,
+                    }
+                ],
+            },
+            f"{prefix}/trees/{GITHUB_TREE_SHA}?recursive=1": {
+                "sha": GITHUB_TREE_SHA,
+                "truncated": False,
+                "tree": [
+                    {
+                        "path": "workflows/candidate.yml",
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": BLOB_SHA,
+                        "size": len(content),
+                    }
+                ],
+            },
+            f"{prefix}/blobs/{BLOB_SHA}": {
+                "sha": BLOB_SHA,
+                "size": len(content),
+                "encoding": "base64",
+                "content": base64.b64encode(content).decode(),
+            },
+        }
+
+    def fetch(self, payloads: dict[str, dict], output: Path) -> int:
+        def request_json(api_url: str, endpoint: str, token: str) -> dict:
+            self.assertEqual(api_url, "https://api.github.com")
+            self.assertEqual(token, "read-token")
+            return payloads[endpoint]
+
+        return fetch_policy_candidate(
+            api_url="https://api.github.com",
+            repository=HEAD_REPOSITORY,
+            commit_sha=HEAD_SHA,
+            token="read-token",
+            output_root=output,
+            request_json=request_json,
+        )
+
+    def test_exact_candidate_tree_is_materialized_as_restrictive_data(self) -> None:
+        content = b"name: candidate-policy\n"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "candidate"
+            self.assertEqual(self.fetch(self.api_payloads(content), output), 1)
+            candidate = output / ".github/workflows/candidate.yml"
+            self.assertEqual(candidate.read_bytes(), content)
+            self.assertEqual(candidate.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o700)
+
+    def test_candidate_commit_identity_mismatch_is_rejected(self) -> None:
+        payloads = self.api_payloads()
+        payloads[f"repos/{HEAD_REPOSITORY}/git/commits/{HEAD_SHA}"]["sha"] = NEW_HEAD_SHA
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "candidate"
+            with self.assertRaisesRegex(PolicyCandidateError, "different candidate commit"):
+                self.fetch(payloads, output)
+            self.assertFalse(output.exists())
+
+    def test_candidate_tree_rejects_traversal_symlinks_and_submodules(self) -> None:
+        tree_endpoint = (
+            f"repos/{HEAD_REPOSITORY}/git/trees/{GITHUB_TREE_SHA}?recursive=1"
+        )
+        hostile_entries = (
+            ("../escape.yml", "100644", "blob"),
+            ("workflows/link", "120000", "blob"),
+            ("workflows/module", "160000", "commit"),
+        )
+        for path, mode, entry_type in hostile_entries:
+            with (
+                self.subTest(path=path, mode=mode),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                payloads = self.api_payloads()
+                payloads[tree_endpoint]["tree"][0]["path"] = path
+                payloads[tree_endpoint]["tree"][0]["mode"] = mode
+                payloads[tree_endpoint]["tree"][0]["type"] = entry_type
+                output = Path(directory) / "candidate"
+                with self.assertRaises(PolicyCandidateError):
+                    self.fetch(payloads, output)
+                self.assertFalse(output.exists())
+                self.assertFalse((Path(directory) / "escape.yml").exists())
+
+    def test_candidate_tree_rejects_truncated_api_results(self) -> None:
+        payloads = self.api_payloads()
+        tree_endpoint = (
+            f"repos/{HEAD_REPOSITORY}/git/trees/{GITHUB_TREE_SHA}?recursive=1"
+        )
+        payloads[tree_endpoint]["truncated"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(PolicyCandidateError, "truncated"):
+                self.fetch(payloads, Path(directory) / "candidate")
+
+    def test_candidate_tree_enforces_blob_size_limit(self) -> None:
+        payloads = self.api_payloads()
+        tree_endpoint = (
+            f"repos/{HEAD_REPOSITORY}/git/trees/{GITHUB_TREE_SHA}?recursive=1"
+        )
+        payloads[tree_endpoint]["tree"][0]["size"] = MAX_BLOB_BYTES + 1
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(PolicyCandidateError, "blob exceeds"):
+                self.fetch(payloads, Path(directory) / "candidate")
+
+    def test_failed_blob_authentication_cleans_partial_snapshot(self) -> None:
+        payloads = self.api_payloads()
+        payloads[f"repos/{HEAD_REPOSITORY}/git/blobs/{BLOB_SHA}"]["sha"] = "2" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "candidate"
+            with self.assertRaisesRegex(PolicyCandidateError, "different blob"):
+                self.fetch(payloads, output)
+            self.assertFalse(output.exists())
+            self.assertEqual(list(root.glob(".candidate-policy-*")), [])
 
 
 class ApprovalPolicyTests(unittest.TestCase):
@@ -1081,6 +1221,25 @@ jobs:
             any("security policy job keys are not exact" in item for item in violations)
         )
 
+    def test_policy_candidate_fetch_identity_and_token_are_exact(self) -> None:
+        workflow = self.read(".github/workflows/ci-security-policy.yml").replace(
+            "CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}",
+            "CANDIDATE_SHA: ${{ github.sha }}",
+            1,
+        )
+        violations = self.check_fixture("ci-security-policy.yml", workflow)
+        self.assertTrue(
+            any("candidate fetch environment is not exact" in item for item in violations)
+        )
+
+        workflow = self.read(".github/workflows/ci-security-policy.yml").replace(
+            "GH_TOKEN: ${{ github.token }}",
+            "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
+            1,
+        )
+        violations = self.check_fixture("ci-security-policy.yml", workflow)
+        self.assertTrue(any("token reference is not exact" in item for item in violations))
+
     def test_policy_workflow_cannot_add_an_untrusted_event(self) -> None:
         workflow = self.read(".github/workflows/ci-security-policy.yml").replace(
             "on:\n",
@@ -1345,7 +1504,15 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("pull_request_target:", workflow)
         self.assertIn("branches: [main]", workflow)
         self.assertIn("ref: ${{ github.workflow_sha }}", workflow)
-        self.assertIn("ref: ${{ github.event.pull_request.head.sha }}", workflow)
+        self.assertEqual(workflow.count("uses: actions/checkout@"), 1)
+        self.assertNotIn("ref: ${{ github.event.pull_request.head.sha }}", workflow)
+        self.assertNotIn("path: candidate", workflow)
+        self.assertNotIn("allow-unsafe-pr-checkout", workflow)
+        self.assertIn("CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}", workflow)
+        self.assertIn(
+            "python3 trusted/.github/scripts/fetch_policy_candidate.py",
+            workflow,
+        )
         self.assertIn(
             "python3 trusted/.github/scripts/check_credential_containment.py",
             workflow,
