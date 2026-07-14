@@ -11921,6 +11921,7 @@ merge_keys = ["id"]
             expected: Some(fp1.clone()),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
+            exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
@@ -12058,6 +12059,10 @@ merge_keys = ["id"]
             &result.project.models,
             config_identity,
             governance_identity,
+            // The exec-choke fingerprint helper models a project with no
+            // execution-control config bound (#1095) — the gates it feeds use an
+            // empty `exec_control_identity` too, so the two stay symmetric.
+            "",
             &extras,
         )
         .unwrap()
@@ -12079,6 +12084,7 @@ merge_keys = ["id"]
             expected: Some(expected_fp.to_string()),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
+            exec_control_identity: String::new(),
             resolved_mask: resolved_mask.clone(),
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
@@ -12317,6 +12323,7 @@ merge_keys = ["id"]
             expected: None,
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
+            exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
             reviewed_source_schemas: Some(snapshot),
             plan_id: "p".to_string(),
@@ -12402,6 +12409,7 @@ merge_keys = ["id"]
             expected: Some(fp),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
+            exec_control_identity: String::new(),
             resolved_mask: with_b_mask,
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
@@ -12456,6 +12464,7 @@ merge_keys = ["id"]
             expected: None,
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
+            exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
             reviewed_source_schemas: None, // v2 governed plan MUST carry Some
             plan_id: "p".to_string(),
