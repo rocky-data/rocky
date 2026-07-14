@@ -48,6 +48,19 @@ branch protection to require both GitHub Actions status checks:
 - `Credential containment policy`
 - `Credential-containment regression tests`
 
+These two checks are not equivalent, and the difference matters when you set up
+branch protection. `Credential containment policy` (`ci-security-policy.yml`) is
+the enforcing gate: it runs under `pull_request_target`, loads the checker from
+`github.workflow_sha`, fetches the candidate `.github` tree as data, and
+byte-compares every frozen trust root against the trusted base.
+`Credential-containment regression tests` (`ci-security-policy-tests.yml`) runs
+the candidate's own test files under the ordinary `pull_request` model, so on its
+own it is advisory: a hostile pull request could rewrite the tests to pass. Its
+integrity comes from the policy gate, because `test_credential_containment.py` is
+itself a frozen trust root, so any tampering fails the policy check. If the
+settings UI only lets you require one status, require `Credential containment
+policy`.
+
 Both workflows intentionally run on every pull request, without a path filter,
 so their required statuses cannot remain absent on a non-`.github` change. Pin
 the required checks to the GitHub Actions source if the settings UI offers that
@@ -66,6 +79,37 @@ data, rejects truncated trees, symlinks, submodules, traversal-shaped paths,
 identity mismatches, oversized entries, and oversized aggregate snapshots, and
 then runs the trusted checker against restrictive regular files. This avoids
 executing candidate code in the default branch's cache security domain.
+
+## Validating RD-026 before closure
+
+The offline regression tests cannot exercise the parts of this boundary that
+only exist at runtime: the `pull_request_target` and `workflow_run` events, the
+environment approval gate, and the live GitHub REST API responses that the
+credentialed jobs authenticate. Those workflows also cannot run from a pull
+request, because `pull_request_target` and `workflow_run` execute from the base
+branch, so they have no coverage until this change is on `main`. Treat RD-026 as
+closed only after these pass on the merged revision:
+
+1. Configure both environments and the two required checks above, then confirm
+   with a disposable regression pull request that the policy gate fails from
+   trusted `main` tooling and that GitHub refuses the merge.
+2. Add the `ai-review` label to a real pull request and approve the
+   `credentialed-pr-review` environment. Confirm the credentialed job posts a
+   review comment. This is the first execution of the live path. If the
+   `Fetch and validate current-run review context` step fails, read its
+   annotation: the validator names the exact run-object field that did not match
+   (for example `head_sha`), which localizes any wrong assumption about the
+   `pull_request_target` run shape.
+3. Reproduce the RD-026 acceptance test. After approval, push a new commit to the
+   same pull request. Confirm the `synchronize` event removes the label and
+   cancels the run, and that a re-labeled run reads only the new head's context.
+   The secret-bearing job must never consume the earlier approved artifact for a
+   changed head.
+4. Confirm `rocky-preview-comment` upserts exactly one comment on the same pull
+   request and that a later push updates that comment rather than duplicating it.
+
+Record the run URLs in the remediation ledger. Until these pass on `main`, the
+code is merge-ready but RD-026 stays In review.
 
 ## Updating frozen trust roots
 
