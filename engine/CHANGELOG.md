@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bumped `rmcp` (the MCP SDK) 1.7 → 2.2, a breaking major that realigns MCP model types to spec 2025-11-25. The JSON wire format is unchanged — MCP clients see identical bytes — so the migration is Rust-API-only (`PromptMessageRole` → `Role`, `PromptMessageContent::Text` → `ContentBlock::Text`). `rocky mcp` behavior is unchanged: `initialize` still advertises protocol version 2024-11-05 with the same 28 tools and 5 prompts. (#1109)
+
 ## [1.64.0] - 2026-07-12
 
 ### Added
