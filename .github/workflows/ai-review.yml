@@ -1,53 +1,186 @@
 name: rocky-ai-review
 
-# Self-test for the `.github/actions/rocky-ai-review` composite action.
+# Two-job trust split for credentialed pull-request review. The context job may
+# inspect the candidate revision, but has only a read token and no environment
+# or secret references. The credentialed job depends on that exact job in the
+# same workflow run, never checks out the candidate, validates the artifact as
+# bounded data, and executes tooling only from the immutable workflow revision.
 #
-# Label-gated rather than always-on: AI calls cost money and not every PR
-# benefits from a review (typo fixes, doc-only edits). Opt in by adding the
-# `ai-review` label to a PR; the workflow re-runs every time the label is
-# (re-)applied so iterating on the prompt + diff is just a label-toggle.
-#
-# Also serves as the canonical reference for users wiring the action into
-# their own repos. Copy the snippet under `Setting up the GitHub Action`
-# in `docs/src/content/docs/guides/ai-review.md` (todo) and adjust the
-# `working_directory` / `models_dir` to match your project layout.
+# Repository setup (see .github/SECURITY_ENVIRONMENTS.md):
+#   * ANTHROPIC_API_KEY is an environment secret, not a repository secret.
+#   * credentialed-pr-review requires a reviewer before secrets are released.
 
 on:
-  pull_request:
-    types: [labeled, opened, reopened, synchronize]
-    paths:
-      # Narrow to the playground POC the action targets — broader paths
-      # would still trigger the workflow but find nothing to review at the
-      # configured `working_directory`. Widen in lockstep with the action's
-      # working_directory if the self-test ever points at another POC.
-      - 'examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff/models/**'
-      - '.github/actions/rocky-ai-review/**'
-      - '.github/workflows/ai-review.yml'
+  pull_request_target:
+    types: [labeled, synchronize]
+    branches: [main]
 
-permissions:
-  contents: read
-  pull-requests: write
+# Every commit reaches the synchronize invalidation job. Do not add a paths
+# filter here: a commit outside the reviewed path must still revoke approval.
+permissions: {}
+
+concurrency:
+  group: rocky-ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
-  ai-review:
-    name: Rocky AI review
+  invalidate-approval:
+    name: Invalidate stale AI-review approval
+    if: >-
+      github.event.action == 'synchronize' &&
+      contains(github.event.pull_request.labels.*.name, 'ai-review')
     runs-on: ubuntu-latest
-    # Run only when the `ai-review` label is present on the PR. Skips
-    # `synchronize` events on un-labeled PRs (the common case) so iterating
-    # commits doesn't burn API tokens — the user re-applies the label when
-    # they want a fresh review.
-    if: contains(github.event.pull_request.labels.*.name, 'ai-review')
+    permissions:
+      issues: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Remove approval label after a head change
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
-          # Required for `git diff <base_ref>...HEAD` inside the action.
-          fetch-depth: 0
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            try {
+              await github.rest.issues.removeLabel({
+                owner,
+                repo,
+                issue_number,
+                name: 'ai-review',
+              });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              core.info('ai-review label was already absent');
+            }
 
-      - name: Run rocky AI review
-        uses: ./.github/actions/rocky-ai-review
+  context:
+    name: Build credential-free review context
+    if: >-
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'ai-review'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out trusted context tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          base_ref: ${{ github.event.pull_request.base.ref }}
-          working_directory: examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
-          models_dir: models
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          fetch-depth: 1
+          persist-credentials: false
+
+      # checkout v7 requires an explicit opt-in for a candidate checkout under
+      # pull_request_target. This isolated job has no protected environment,
+      # no secret references, a read-only token, and never shares its workspace
+      # with the credentialed job.
+      - name: Check out exact candidate head in the unprivileged job
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+
+      - name: Fetch exact base commit into candidate repository
+        env:
+          BASE_REPOSITORY: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git -C candidate remote add rocky-review-base "https://github.com/${BASE_REPOSITORY}.git"
+          git -C candidate fetch --no-tags rocky-review-base "$BASE_SHA"
+
+      # Git symlinks/submodules could redirect a parser outside candidate/.
+      # Reject them before any trusted tool consumes candidate-controlled data.
+      - name: Reject candidate filesystem indirection
+        run: |
+          if git -C candidate ls-files --stage \
+              | awk '$1 == "120000" || $1 == "160000" { print; found = 1 } END { exit !found }' \
+              > "$RUNNER_TEMP/unsafe-git-modes.txt"; then
+            echo "::error::AI-review input may not contain symlinks or submodules"
+            cat "$RUNNER_TEMP/unsafe-git-modes.txt"
+            exit 1
+          fi
+
+      # Both the installer and collector come from the immutable workflow checkout.
+      # Candidate files are parser input only; no candidate script/action is run.
+      - name: Install released Rocky binary with trusted installer
+        env:
+          ROCKY_INSTALL_DIR: ${{ runner.temp }}/rocky-bin
+        run: |
+          bash trusted/engine/install.sh
+          echo "$ROCKY_INSTALL_DIR" >> "$GITHUB_PATH"
+
+      - name: Collect bounded context with trusted collector
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_CONTEXT_PATH: ${{ runner.temp }}/rocky-ai-review-context/context.json
+        run: >-
+          python3 trusted/.github/scripts/collect_ai_review_context.py
+          --repository-root "$GITHUB_WORKSPACE/candidate"
+
+      - name: Upload untrusted context artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rocky-ai-review-context-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/rocky-ai-review-context/context.json
+          if-no-files-found: error
+          retention-days: 1
+
+  ai-review:
+    name: Rocky AI review (approved head)
+    needs: context
+    runs-on: ubuntu-latest
+    environment:
+      name: credentialed-pr-review
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Check out trusted review tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Revalidates the live PR after any environment-approval wait. Artifact
+      # selection is fixed to github.run_id, whose context producer is the
+      # required `needs: context` job. Claims in context.json are never used to
+      # select or authenticate an artifact; they are consistency-checked only.
+      - name: Fetch and validate current-run review context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVAL_LABEL: ai-review
+          APPROVED_BASE_REF: main
+          APPROVED_BASE_REPOSITORY: ${{ github.repository }}
+          APPROVED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          APPROVED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          APPROVED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          APPROVER_LOGIN: ${{ github.actor }}
+          CONTEXT_RUN_ID: ${{ github.run_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_CONTEXT_DIR: ${{ runner.temp }}/rocky-ai-review-context
+        run: |
+          python3 trusted/.github/scripts/fetch_ai_review_context.py \
+            --output-directory "$REVIEW_CONTEXT_DIR"
+
+      # The composite action performs one more live head/label check directly
+      # before the API-call step. It and every helper come from the workflow SHA.
+      - name: Run Rocky AI review
+        uses: ./trusted/.github/actions/rocky-ai-review
+        with:
+          approved_base_ref: main
+          approved_base_repository: ${{ github.repository }}
+          approved_base_sha: ${{ github.event.pull_request.base.sha }}
+          approved_head_repository: ${{ github.event.pull_request.head.repo.full_name }}
+          approved_head_sha: ${{ github.event.pull_request.head.sha }}
+          base_ref: ${{ github.event.pull_request.base.sha }}
+          context_directory: ${{ runner.temp }}/rocky-ai-review-context
+          pull_request_number: ${{ github.event.pull_request.number }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}

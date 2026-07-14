@@ -1,51 +1,63 @@
 name: rocky-preview
 
-# Self-test for the `.github/actions/rocky-preview` composite action.
-#
-# Triggers on PRs that touch any model under the playground POCs so the
-# action is exercised end-to-end on real (toy) pipelines without paying for
-# warehouse credits — the playground POCs run on DuckDB.
-#
-# This is also the canonical reference for users wiring the action into
-# their own repos: copy the snippet under `Setting up the GitHub Action` in
-# `docs/src/content/docs/guides/preview-a-pr.md` and adjust the path filter
-# to match where your `models/` directory lives.
-
+# Candidate configuration and SQL execute only under the ordinary pull-request
+# trust model. The bounded Markdown artifact is consumed by preview-comment.yml,
+# whose fresh workflow_run job never checks out or executes candidate code.
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    branches: [main]
     paths:
-      # Narrow to the specific POC the action targets — broader POC paths
-      # would still trigger the workflow but have nothing to diff at the
-      # configured `working_directory`. Widen in lockstep with the action's
-      # working_directory if the self-test ever points at another POC.
       - 'examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff/models/**'
       - '.github/actions/rocky-preview/**'
+      - '.github/scripts/preview_comment.py'
       - '.github/workflows/preview.yml'
 
 permissions:
   contents: read
-  pull-requests: write
+
+concurrency:
+  group: rocky-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
-  preview:
-    name: Rocky preview
+  context:
+    name: Build credential-free Rocky preview
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check out pull-request revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          # Required for `git diff <base_ref>...HEAD` inside the action.
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Run rocky preview
+      - name: Render Rocky preview
+        id: preview
         uses: ./.github/actions/rocky-preview
         with:
-          base_ref: ${{ github.event.pull_request.base.ref }}
+          base_ref: ${{ github.event.pull_request.base.sha }}
           branch_name: ${{ github.event.pull_request.head.ref }}
-          # The playground POC at `06-developer-experience/10-pr-preview-and-data-diff`
-          # is the canonical Phase-4 self-test fixture. Other POCs are
-          # path-filtered into the trigger but the action itself only acts
-          # on what lives at `working_directory/models_dir`.
           working_directory: examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
           models_dir: models
-          github_token: ${{ github.token }}
+
+      - name: Stage bounded preview artifact
+        env:
+          BASE_REPOSITORY: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BODY_PATH: ${{ steps.preview.outputs.body_path }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          WORKFLOW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          python3 .github/scripts/preview_comment.py stage
+          --source "$BODY_PATH"
+          --output-directory "$RUNNER_TEMP/rocky-preview-comment-upload"
+
+      - name: Upload bounded preview artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rocky-preview-comment
+          path: ${{ runner.temp }}/rocky-preview-comment-upload/
+          if-no-files-found: error
+          retention-days: 1
