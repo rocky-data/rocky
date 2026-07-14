@@ -160,11 +160,37 @@ fn cloud_provider(
 #[cfg(test)]
 mod test_support {
     use super::ObjectStoreProvider;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     thread_local! {
         static PROVIDER_OVERRIDE: RefCell<Option<ObjectStoreProvider>> =
             const { RefCell::new(None) };
+        /// One-shot fault: make the next object-store existence probe error.
+        static OBJECT_STORE_EXISTS_FAULT: Cell<bool> = const { Cell::new(false) };
+        /// One-shot fault: make the next Valkey download report a MISS.
+        static VALKEY_MISS_FAULT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Arm a one-shot fault so the next `probe_exists` returns `Err`. Consumed
+    /// (cleared) on read so it can't leak into a later leg/test on this thread.
+    pub(super) fn arm_object_store_exists_fault() {
+        OBJECT_STORE_EXISTS_FAULT.with(|c| c.set(true));
+    }
+
+    /// Read-and-clear the object-store existence fault.
+    pub(super) fn take_object_store_exists_fault() -> bool {
+        OBJECT_STORE_EXISTS_FAULT.with(|c| c.replace(false))
+    }
+
+    /// Arm a one-shot fault so the next `download_from_valkey` reports a MISS
+    /// (`Absent`) without touching a live Valkey peer.
+    pub(super) fn arm_valkey_miss_fault() {
+        VALKEY_MISS_FAULT.with(|c| c.set(true));
+    }
+
+    /// Read-and-clear the Valkey-miss fault.
+    pub(super) fn take_valkey_miss_fault() -> bool {
+        VALKEY_MISS_FAULT.with(|c| c.replace(false))
     }
 
     /// Install `provider` as the next provider [`super::cloud_provider`] hands
@@ -185,10 +211,12 @@ mod test_support {
         PROVIDER_OVERRIDE.with(|cell| cell.borrow().clone())
     }
 
-    /// Clear any installed override so it can't leak into a later test on the
-    /// same thread.
+    /// Clear any installed override and armed faults so nothing leaks into a
+    /// later test on the same worker thread.
     pub(super) fn clear() {
         PROVIDER_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        OBJECT_STORE_EXISTS_FAULT.with(|c| c.set(false));
+        VALKEY_MISS_FAULT.with(|c| c.set(false));
     }
 }
 
@@ -197,12 +225,42 @@ fn transfer_timeout(config: &StateConfig) -> Duration {
     Duration::from_secs(config.transfer_timeout_seconds)
 }
 
+/// Outcome of a remote-state download leg.
+///
+/// The distinction is load-bearing for the **tiered** backend: a Valkey
+/// [`Absent`][DownloadOutcome::Absent] (cache miss) must fall through to the
+/// durable S3 tier, whereas a [`Restored`][DownloadOutcome::Restored] (the leg
+/// wrote the local file) short-circuits. Deciding hit-vs-miss on an explicit
+/// return value — rather than the old `local_path.exists()` heuristic — is what
+/// stops a **pre-existing stale local file** from masquerading as a Valkey hit
+/// and starving the S3 fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadOutcome {
+    /// The leg found remote state and wrote it to the local path.
+    Restored,
+    /// No remote state existed for this key (a legit fresh start).
+    Absent,
+}
+
 /// Downloads state from remote storage to a local file before a run.
+///
+/// A missing remote object is **non-fatal** (`Ok(())`, a fresh start). A real
+/// download/existence-check *failure* is **propagated** as `Err` so the caller
+/// can fail closed — see [`download_from_object_store`].
 pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
+    download_state_inner(config, local_path).await.map(|_| ())
+}
+
+/// [`download_state`] retaining the hit/miss [`DownloadOutcome`] the tiered
+/// backend needs to decide whether to fall through to its durable tier.
+async fn download_state_inner(
+    config: &StateConfig,
+    local_path: &Path,
+) -> Result<DownloadOutcome, StateSyncError> {
     match config.backend {
         StateBackend::Local => {
             debug!("State backend: local (no sync needed)");
-            Ok(())
+            Ok(DownloadOutcome::Absent)
         }
         StateBackend::S3 => {
             let bucket = config.s3_bucket.as_deref().ok_or_else(|| {
@@ -222,7 +280,7 @@ pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(
         }
         StateBackend::Valkey => download_from_valkey(config, local_path).await,
         StateBackend::Tiered => {
-            // Try Valkey first (fast), fall back to S3 (durable)
+            // Try Valkey first (fast), fall back to S3 (durable).
             info!("State backend: tiered (Valkey → S3 fallback)");
             let valkey_config = StateConfig {
                 backend: StateBackend::Valkey,
@@ -233,14 +291,24 @@ pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(
                 ..config.clone()
             };
 
-            match Box::pin(download_state(&valkey_config, local_path)).await {
-                Ok(()) if local_path.exists() => {
+            // Only a genuine Valkey HIT (the leg wrote the file) short-circuits.
+            // A MISS (`Absent`) or an error both fall through to the durable S3
+            // tier. Crucially this no longer consults `local_path.exists()`: a
+            // stale local file left by a previous run must NOT be mistaken for a
+            // fresh Valkey hit (which would skip the S3 fallback and resume from
+            // stale state).
+            match Box::pin(download_state_inner(&valkey_config, local_path)).await {
+                Ok(DownloadOutcome::Restored) => {
                     debug!("State restored from Valkey");
-                    Ok(())
+                    Ok(DownloadOutcome::Restored)
                 }
-                _ => {
-                    debug!("Valkey miss or error, trying S3");
-                    Box::pin(download_state(&s3_config, local_path)).await
+                Ok(DownloadOutcome::Absent) => {
+                    debug!("Valkey miss, trying S3");
+                    Box::pin(download_state_inner(&s3_config, local_path)).await
+                }
+                Err(e) => {
+                    debug!(error = %e, "Valkey error, trying S3");
+                    Box::pin(download_state_inner(&s3_config, local_path)).await
                 }
             }
         }
@@ -528,17 +596,44 @@ fn apply_upload_failure_policy(
     }
 }
 
+/// Existence probe for a remote state object, isolated behind a test seam.
+///
+/// Production behaviour is exactly `provider.exists(key)`. Under `#[cfg(test)]`
+/// a fault can be armed (see [`test_support::arm_object_store_exists_fault`]) so
+/// a test can drive the failure arm of [`download_from_object_store`]
+/// deterministically without a live/flaky cloud endpoint — the in-memory
+/// provider never errors on `exists`, so this is the only in-crate way to prove
+/// the fail-closed propagation is RED before the fix and GREEN after it.
+async fn probe_exists(provider: &ObjectStoreProvider, key: &str) -> Result<bool, StateSyncError> {
+    #[cfg(test)]
+    if test_support::take_object_store_exists_fault() {
+        return Err(StateSyncError::S3Download(
+            "injected existence-check failure (test seam)".into(),
+        ));
+    }
+    provider.exists(key).await.map_err(StateSyncError::from)
+}
+
 /// Download `STATE_FILE` from an object store rooted at `<scheme>://<bucket>/<prefix>`.
 ///
-/// If the object doesn't exist, logs a message and returns Ok — rocky will
-/// start with a fresh state file.
+/// Returns [`DownloadOutcome::Restored`] when the object existed and was written
+/// locally, and [`DownloadOutcome::Absent`] when no object exists (a legit fresh
+/// start — non-fatal by design).
+///
+/// A *failed* existence check (network / auth / backend error) is **propagated
+/// as `Err`**, never swallowed. Previously this arm logged and returned `Ok`,
+/// which made a genuine download failure indistinguishable from an
+/// authoritative "no remote state yet": the caller (`rocky run`) would then
+/// treat a possibly-populated remote ledger as empty and lose its fail-closed
+/// signal. The absent case (`Ok(false)`) still returns `Absent` — a real fresh
+/// start must stay non-fatal.
 async fn download_from_object_store(
     scheme: &str,
     bucket: &str,
     prefix: &str,
     local_path: &Path,
     timeout: Duration,
-) -> Result<(), StateSyncError> {
+) -> Result<DownloadOutcome, StateSyncError> {
     let provider = cloud_provider(scheme, bucket, prefix)?;
     // Qualify the object key by schema version so a v7 pod and a v9 pod never
     // collide on the same object — `<prefix>/v9/state.redb`, not
@@ -557,7 +652,7 @@ async fn download_from_object_store(
         );
 
         with_transfer_timeout(timeout, async {
-            match provider.exists(&key).await {
+            match probe_exists(&provider, &key).await {
                 Ok(true) => {
                     provider.download_file(&key, local_path).await?;
                     info!(
@@ -565,15 +660,19 @@ async fn download_from_object_store(
                         outcome = "ok",
                         "state restored from object store"
                     );
-                    Ok(())
+                    Ok(DownloadOutcome::Restored)
                 }
                 Ok(false) => {
                     info!(outcome = "absent", "No existing state in object store — starting fresh");
-                    Ok(())
+                    Ok(DownloadOutcome::Absent)
                 }
+                // Fail closed: a real existence-check failure is NOT an
+                // authoritative "no remote state". Propagate so the caller can
+                // mark its local ledger non-authoritative instead of silently
+                // starting fresh over a populated remote.
                 Err(e) => {
-                    warn!(error = %e, outcome = "error_then_fresh", "state existence check failed (non-fatal, starting fresh)");
-                    Ok(())
+                    warn!(error = %e, outcome = "error", "state existence check failed; propagating (fail-closed)");
+                    Err(e)
                 }
             }
         })
@@ -671,7 +770,14 @@ where
 async fn download_from_valkey(
     config: &StateConfig,
     local_path: &Path,
-) -> Result<(), StateSyncError> {
+) -> Result<DownloadOutcome, StateSyncError> {
+    // Test seam: force a Valkey MISS without a live Valkey peer, so the tiered
+    // fall-through-to-S3 path (and the "stale local file is not a hit" fix) can
+    // be exercised deterministically. See [`test_support::arm_valkey_miss_fault`].
+    #[cfg(test)]
+    if test_support::take_valkey_miss_fault() {
+        return Ok(DownloadOutcome::Absent);
+    }
     let url = config
         .valkey_url
         .as_ref()
@@ -695,36 +801,38 @@ async fn download_from_valkey(
         with_transfer_timeout(timeout, async move {
             let key_for_task = key.clone();
             let local_for_task = local_path_owned.clone();
-            let join = tokio::task::spawn_blocking(move || -> Result<(), StateSyncError> {
-                let client =
-                    redis::Client::open(url).map_err(|e| StateSyncError::Valkey(e.to_string()))?;
-                let mut conn = client
-                    .get_connection()
-                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+            let join =
+                tokio::task::spawn_blocking(move || -> Result<DownloadOutcome, StateSyncError> {
+                    let client = redis::Client::open(url)
+                        .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                    let mut conn = client
+                        .get_connection()
+                        .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
 
-                let data: Option<Vec<u8>> = redis::cmd("GET")
-                    .arg(&key_for_task)
-                    .query(&mut conn)
-                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                    let data: Option<Vec<u8>> = redis::cmd("GET")
+                        .arg(&key_for_task)
+                        .query(&mut conn)
+                        .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
 
-                match data {
-                    Some(bytes) => {
-                        std::fs::write(&local_for_task, bytes)?;
-                        let size = std::fs::metadata(&local_for_task)
-                            .map(|m| m.len())
-                            .unwrap_or(0);
-                        info!(size, outcome = "ok", "state restored from Valkey");
+                    match data {
+                        Some(bytes) => {
+                            std::fs::write(&local_for_task, bytes)?;
+                            let size = std::fs::metadata(&local_for_task)
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            info!(size, outcome = "ok", "state restored from Valkey");
+                            Ok(DownloadOutcome::Restored)
+                        }
+                        None => {
+                            info!(
+                                outcome = "absent",
+                                "No existing state in Valkey — starting fresh"
+                            );
+                            Ok(DownloadOutcome::Absent)
+                        }
                     }
-                    None => {
-                        info!(
-                            outcome = "absent",
-                            "No existing state in Valkey — starting fresh"
-                        );
-                    }
-                }
-                Ok(())
-            })
-            .await;
+                })
+                .await;
             match join {
                 Ok(inner) => inner,
                 Err(e) => Err(StateSyncError::Valkey(format!(
@@ -1656,6 +1764,158 @@ mod tests {
         assert!(
             matches!(&err, StateSyncError::MissingConfig(backend, _) if backend == "s3"),
             "expected the S3 dispatch to be reached (MissingConfig for the bucket); got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S2 — a failed download must NOT be treated as authoritative-empty
+    // -----------------------------------------------------------------------
+
+    /// S2 (a): an injected existence-check failure makes `download_state` return
+    /// `Err`, not `Ok`. Pre-fix the `Err(e)` arm logged and returned `Ok(())`
+    /// ("non-fatal, starting fresh"), hiding a real download failure from the
+    /// caller's fail-closed machinery. The in-memory provider never errors on
+    /// `exists`, so we drive the arm through the `probe_exists` test seam — this
+    /// is the only in-crate way to make the assertion RED before the fix.
+    #[tokio::test]
+    async fn download_existence_failure_propagates_not_fresh_start() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        // Route object-store construction to an in-memory provider (so no live
+        // S3 client is built), then arm the existence-probe fault.
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+        test_support::arm_object_store_exists_fault();
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let result = download_state(&config, &local).await;
+        test_support::clear();
+
+        assert!(
+            matches!(result, Err(StateSyncError::S3Download(_))),
+            "a failed existence check must propagate as Err (fail-closed), not a silent \
+             fresh-start Ok; got {result:?}"
+        );
+        assert!(
+            !local.exists(),
+            "no local state file should be written when the download failed"
+        );
+    }
+
+    /// S2 (a'): the absent case stays non-fatal. An in-memory provider with no
+    /// object at the key returns `Ok(())` — a legit fresh start must not be
+    /// turned into an error by the fail-closed change above.
+    #[tokio::test]
+    async fn download_absent_object_is_non_fatal_fresh_start() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let result = download_state(&config, &local).await;
+        test_support::clear();
+
+        assert!(
+            result.is_ok(),
+            "an absent remote object must be a fresh start (Ok); got {result:?}"
+        );
+        assert!(
+            !local.exists(),
+            "nothing to restore, so no local file is written"
+        );
+    }
+
+    /// S2 (b): a Valkey MISS with a *stale* local file present must fall through
+    /// to the durable S3 tier, not short-circuit. Pre-fix the tiered dispatch
+    /// matched `Ok(()) if local_path.exists()` and counted the stale file as a
+    /// Valkey hit, starving the S3 fallback. Post-fix hit/miss is an explicit
+    /// `DownloadOutcome`, so the S3 tier restores authoritative state over the
+    /// stale bytes.
+    #[tokio::test]
+    async fn tiered_valkey_miss_with_stale_local_falls_through_to_s3() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        // Legacy global file → remote key `state.redb`.
+        let local = dir.path().join(".rocky-state.redb");
+        // A STALE local file left by a previous run — the exact bait the old
+        // `local_path.exists()` heuristic mistook for a Valkey hit.
+        std::fs::write(&local, b"STALE").unwrap();
+
+        // The durable S3 tier (in-memory) holds authoritative state at the
+        // schema-qualified key.
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let key = object_store_state_key(&remote_state_key(&local));
+        provider
+            .put(&key, Bytes::from_static(b"FRESH-FROM-S3"))
+            .await
+            .unwrap();
+
+        // Force the Valkey leg to MISS (no live peer needed).
+        test_support::arm_valkey_miss_fault();
+
+        let config = StateConfig {
+            backend: StateBackend::Tiered,
+            s3_bucket: Some("bucket".into()),
+            // valkey_url intentionally None: the miss fault short-circuits
+            // before URL resolution, proving the fall-through independently.
+            ..Default::default()
+        };
+        let outcome = download_state_inner(&config, &local).await.unwrap();
+        test_support::clear();
+
+        assert_eq!(
+            outcome,
+            DownloadOutcome::Restored,
+            "the S3 tier must have restored state after the Valkey miss"
+        );
+        assert_eq!(
+            std::fs::read(&local).unwrap(),
+            b"FRESH-FROM-S3",
+            "the stale local file must be replaced by the S3 tier's content — proving the \
+             tiered dispatch fell through instead of treating the stale file as a Valkey hit"
+        );
+    }
+
+    /// S2 (b'): with both tiers absent (Valkey miss + empty S3), the tiered
+    /// download resolves to `Absent` — a real fresh start — and writes no local
+    /// file. Complements (b): the fall-through does not manufacture a spurious
+    /// `Restored` when there is genuinely nothing to restore.
+    #[tokio::test]
+    async fn tiered_both_tiers_absent_stays_absent() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        // In-memory S3 tier installed but EMPTY (no object at the key).
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+        test_support::arm_valkey_miss_fault();
+
+        let config = StateConfig {
+            backend: StateBackend::Tiered,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let outcome = download_state_inner(&config, &local).await.unwrap();
+        test_support::clear();
+
+        assert_eq!(
+            outcome,
+            DownloadOutcome::Absent,
+            "both tiers absent ⇒ Absent (a real fresh start)"
+        );
+        assert!(
+            !local.exists(),
+            "nothing to restore, so no local file is written"
         );
     }
 }

@@ -18,7 +18,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use rocky_compiler::compile::{self, CompilerConfig};
 use rocky_core::config::{
-    ConfigError, PolicyCapability, PolicyConfig, PolicyEffect, PolicyPrincipal,
+    ConfigError, PolicyCapability, PolicyConfig, PolicyEffect, PolicyPrincipal, StateBackend,
 };
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::state::{PolicyDecisionRecord, StateStore};
@@ -331,6 +331,41 @@ fn serde_plain<T: serde::Serialize>(value: &T) -> String {
         .unwrap_or_default()
 }
 
+/// Run a state-sync future to completion from a **synchronous** command entry
+/// point.
+///
+/// `rocky policy freeze` is dispatched synchronously from within the CLI's async
+/// runtime, but `state_sync::{download,upload}_state` are async. We cannot make
+/// this function async without changing its (out-of-crate) call signature, and
+/// we cannot `block_on` the ambient runtime from one of its own worker threads
+/// (tokio's re-entrancy guard panics). So we drive the future on a dedicated OS
+/// thread with its own single-threaded runtime — correct whether or not there is
+/// an ambient runtime, and regardless of its flavor.
+fn block_on_state_sync<F>(fut: F) -> Result<(), rocky_core::state_sync::StateSyncError>
+where
+    F: std::future::Future<Output = Result<(), rocky_core::state_sync::StateSyncError>> + Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => return Err(rocky_core::state_sync::StateSyncError::Io(e)),
+                };
+                rt.block_on(fut)
+            })
+            .join()
+            .unwrap_or_else(|_| {
+                Err(rocky_core::state_sync::StateSyncError::Io(
+                    std::io::Error::other("state-sync worker thread panicked"),
+                ))
+            })
+    })
+}
+
 /// Execute `rocky policy freeze` — the kill switch.
 ///
 /// Flips every matched `(principal, scope)` to `deny` by recording a **freeze
@@ -341,6 +376,28 @@ fn serde_plain<T: serde::Serialize>(value: &T) -> String {
 /// `principal = None` freezes both principals (`agent` + `human`); `scope =
 /// None` freezes every model (`any`). The inverse (`lift = true`) records an
 /// unfreeze that supersedes a matching freeze — the normal way to lift one.
+///
+/// # Remote `[state]` integrity (S1, #1089)
+///
+/// The policy-decision ledger is one of the tables `rocky run` wholesale
+/// **downloads at start and uploads at end** when `[state]` is a remote backend.
+/// Left unsynced, a freeze recorded here would be silently reverted by the next
+/// run's start-download. So when the backend is remote we wrap the ledger write
+/// with a seam-scoped sync: **download-before-open** (pull the authoritative
+/// remote ledger, overwriting the local file, so we record on top of it) and
+/// **upload-after-commit** (push the freeze back). A remote-backend freeze
+/// therefore requires the backend to be reachable: a download failure aborts the
+/// command rather than recording a freeze that would be clobbered — for a kill
+/// switch, failing loudly beats appearing to engage and then silently
+/// disengaging.
+///
+/// KNOWN LIMITATION (concurrency): this closes only the *sequential*
+/// between-runs clobber. The remote state object is a whole-file blob with **no
+/// compare-and-swap**, so a concurrent writer — e.g. a `rocky run` whose
+/// start-download completed *before* this freeze — can still overwrite the
+/// freeze on its own end-upload (a cross-pod / concurrent-writer lost update).
+/// This does NOT make concurrent writes safe; it narrows the window, not closes
+/// it.
 pub fn run_policy_freeze(
     config_path: &Path,
     state_path: &Path,
@@ -365,6 +422,27 @@ pub fn run_policy_freeze(
     let notes = freeze_enforcement_notes(config_path, lift);
     for note in &notes {
         eprintln!("warning: {note}");
+    }
+
+    // Resolve the `[state]` backend. A missing/unreadable config degrades to the
+    // Local default (no remote sync) — freeze still records locally, matching
+    // the tolerant posture of `freeze_enforcement_notes` above.
+    let state_cfg = rocky_core::config::load_rocky_config(config_path)
+        .map(|cfg| cfg.state)
+        .unwrap_or_default();
+    let remote_state = !matches!(state_cfg.backend, StateBackend::Local);
+
+    // SEAM-SCOPED SYNC — download half. Pull the authoritative remote ledger
+    // (overwriting the local file) BEFORE opening the store, so the freeze is
+    // recorded on top of other pods' decisions rather than over an empty local.
+    if remote_state {
+        block_on_state_sync(rocky_core::state_sync::download_state(
+            &state_cfg, state_path,
+        ))
+        .with_context(|| {
+            "failed to download remote state before recording the policy freeze; \
+                 a remote-backend freeze requires the state backend to be reachable"
+        })?;
     }
 
     let store = StateStore::open(state_path)
@@ -418,6 +496,16 @@ pub fn run_policy_freeze(
             plan_id,
             reason,
         });
+    }
+
+    // SEAM-SCOPED SYNC — upload half. Push the freeze back to the remote backend
+    // so the next `rocky run`'s start-download inherits it instead of reverting
+    // it. Drop the store first to release the advisory lock and flush the file.
+    // Respects `[state] on_upload_failure` (default `skip` warns and continues).
+    drop(store);
+    if remote_state {
+        block_on_state_sync(rocky_core::state_sync::upload_state(&state_cfg, state_path))
+            .with_context(|| "failed to upload remote state after recording the policy freeze")?;
     }
 
     let output = PolicyFreezeOutput {
@@ -873,5 +961,66 @@ expcet = \"deny\"
         );
         let (_dir, path) = config_with(&body);
         assert!(run_policy_test(&path, true).is_err());
+    }
+
+    /// S1 (#1089): with a REMOTE `[state]` backend, the freeze wraps the ledger
+    /// write with a seam-scoped sync whose **download-before-open** half runs
+    /// first. A deliberately-misconfigured remote backend (`s3`, no bucket)
+    /// makes that download fail fast with `MissingConfig`, aborting the command
+    /// BEFORE the ledger is opened/written. This proves the download-before
+    /// half is wired and fatal: without it, freeze would record locally and
+    /// return Ok (only to be clobbered by the next run's start-download).
+    ///
+    /// (A faithful remote round-trip proving the *upload-after* half isn't
+    /// reachable from `rocky-cli`: the in-memory object-store seam is private to
+    /// `rocky-core`'s test build. The upload half is wired identically and
+    /// exercised by `rocky-core`'s `state_sync` round-trip tests.)
+    #[test]
+    fn freeze_remote_backend_download_before_is_wired_and_fatal() {
+        let body = format!("{POLICY}\n[state]\nbackend = \"s3\"\n");
+        let (dir, path) = config_with(&body);
+        let state = dir.path().join("state.redb");
+
+        let err = run_policy_freeze(
+            &path,
+            &state,
+            Some(PolicyPrincipal::Agent),
+            None,
+            false,
+            true,
+        )
+        .expect_err("a remote-backend freeze must abort when the backend is unreachable");
+        assert!(
+            err.to_string().contains("download remote state"),
+            "download-before-open must be wired and fatal on a remote backend: {err}"
+        );
+        assert!(
+            !state.exists(),
+            "no local state should be written when the download-before-open aborts"
+        );
+    }
+
+    /// S1 (#1089): the local (default) backend skips the remote-sync seam
+    /// entirely — the freeze records and exits Ok with no remote round-trip.
+    /// Paired with the test above (remote → attempted+fatal), this pins the
+    /// `!matches!(backend, Local)` guard branching both ways.
+    #[test]
+    fn freeze_local_backend_records_without_remote_sync() {
+        let body = format!("{POLICY}\n[state]\nbackend = \"local\"\n");
+        let (dir, path) = config_with(&body);
+        let state = dir.path().join("state.redb");
+
+        run_policy_freeze(
+            &path,
+            &state,
+            Some(PolicyPrincipal::Agent),
+            None,
+            false,
+            true,
+        )
+        .expect("a local-backend freeze must record without any remote round-trip");
+        let store = StateStore::open(&state).unwrap();
+        let freezes = policy::active_freezes(&store.list_policy_decisions().unwrap());
+        assert_eq!(freezes.len(), 1, "the freeze must be recorded locally");
     }
 }

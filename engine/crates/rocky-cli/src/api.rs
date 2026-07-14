@@ -924,6 +924,16 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
 }
 
 /// Persist a job record (brief open-write-close on the blocking pool).
+///
+/// Remote `[state]` integrity (S1, #1089): unlike the governance ledgers
+/// (`policy_decisions`, `tombstones`) — whose non-run write seams bracket
+/// themselves with a download-before / upload-after remote sync — the `jobs`
+/// table is deliberately **not** synced here. `serve` is long-running, so a
+/// per-job remote round-trip would be impractical, and a job launched on one
+/// pod is meaningless to another. `jobs` is therefore listed in
+/// [`rocky_core::state::LOCAL_ONLY_TABLE_NAMES`], so the periodic/end-of-run
+/// state upload strips it from the remote snapshot — this write stays
+/// node-local by design and is never reverted by another pod's run-download.
 async fn persist_job(state_path: std::path::PathBuf, job: PersistedJob) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let store = rocky_core::state::StateStore::open(&state_path)?;

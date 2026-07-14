@@ -65,7 +65,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tracing::warn;
 
-use rocky_core::config::{ConfigError, PolicyCapability, PolicyPrincipal, load_rocky_config};
+use rocky_core::config::{
+    ConfigError, PolicyCapability, PolicyPrincipal, StateBackend, load_rocky_config,
+};
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
 use rocky_core::state::{
     ArtifactRecord, EvictOutcome, ModelExecution, ProvenanceRecord, RunRecord, StateStore,
@@ -1548,9 +1550,46 @@ pub(crate) async fn run_gc_apply_in_with(
         );
     }
 
+    // SEAM-SCOPED SYNC (S1, #1089). The TOMBSTONES ledger `execute_gc_apply`
+    // writes is one of the tables `rocky run` wholesale downloads-at-start and
+    // uploads-at-end when `[state]` is remote. Left unsynced, an eviction
+    // recorded here would be silently reverted by the next run's start-download.
+    // So when the backend is remote we bracket the write: download the
+    // authoritative remote ledger BEFORE opening the store (overwriting the
+    // local file, so we tombstone on top of it), then upload AFTER the commit.
+    // A remote-backend `gc apply` therefore requires the backend reachable; a
+    // download failure aborts before evicting anything.
+    //
+    // KNOWN LIMITATION (concurrency): this closes only the *sequential*
+    // between-runs clobber. The remote state object is a whole-file blob with no
+    // compare-and-swap, so a concurrent writer (e.g. a `rocky run` whose
+    // start-download preceded this apply) can still overwrite these tombstones on
+    // its end-upload — a cross-pod lost update. Concurrency is NOT handled here.
+    let state_cfg = loaded_cfg
+        .as_ref()
+        .map(|cfg| cfg.state.clone())
+        .unwrap_or_default();
+    let remote_state = !matches!(state_cfg.backend, StateBackend::Local);
+    if remote_state {
+        rocky_core::state_sync::download_state(&state_cfg, state_path)
+            .await
+            .with_context(|| {
+                "failed to download remote state before gc apply; a remote-backend gc apply \
+                 requires the state backend to be reachable"
+            })?;
+    }
+
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     let output = execute_gc_apply(&store, oracle, plan_id, &plan, Utc::now()).await?;
+    // Drop the store to release the advisory lock / flush the file before upload.
+    drop(store);
+
+    if remote_state {
+        rocky_core::state_sync::upload_state(&state_cfg, state_path)
+            .await
+            .with_context(|| "failed to upload remote state after gc apply")?;
+    }
 
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -2663,6 +2702,62 @@ auto_create_schemas = true
         let store = StateStore::open(&state_path).unwrap();
         assert_eq!(store.list_tombstones().unwrap().len(), 1);
         assert_eq!(store.refcount_for_hash(HA).unwrap(), 0);
+    }
+
+    /// S1 (#1089): with a REMOTE `[state]` backend, `gc apply` brackets the
+    /// TOMBSTONES write with a seam-scoped sync whose **download-before-open**
+    /// half runs first. A deliberately-misconfigured remote backend (`s3`, no
+    /// bucket) makes that download fail fast with `MissingConfig`, aborting the
+    /// apply BEFORE any eviction. Proves the download-before half is wired and
+    /// fatal (and that no tombstone leaks past a failed sync); without it, the
+    /// eviction would proceed and be reverted by the next run's start-download.
+    #[tokio::test]
+    async fn gc_apply_downloads_remote_state_before_evicting() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let plan_id = {
+            let store = StateStore::open(&state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(dir.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+
+        // A rocky.toml with a REMOTE [state] backend, deliberately missing its
+        // bucket so the download-before step fails fast with MissingConfig.
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(&config, "[state]\nbackend = \"s3\"\n").unwrap();
+
+        // Satisfy the unconditional review gate so we reach the sync seam.
+        let marker = crate::commands::apply::review_marker_path(dir.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+
+        let oracle = FixedLivenessOracle::reclaimable();
+        let err = run_gc_apply_in_with(
+            dir.path(),
+            &config,
+            &plan_id,
+            &state_path,
+            PolicyPrincipal::Human,
+            true,
+            &oracle,
+        )
+        .await
+        .expect_err("a remote-backend gc apply must abort when the state backend is unreachable");
+        assert!(
+            err.to_string().contains("download remote state"),
+            "download-before-open must be wired and fatal: {err}"
+        );
+
+        // Nothing evicted — the download-before aborted before the store write.
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(
+            store.list_tombstones().unwrap().is_empty(),
+            "no tombstone should be written when the download-before-open aborts"
+        );
     }
 
     /// 🔴 DEFECT 1 (append-only data loss). The UniForm/Delta writer is
