@@ -55,7 +55,7 @@ edition = "2024"
 rust-version = "1.88"
 ```
 
-> Bumped 1.85.1 → 1.88 on 2026-05-24: the `rocky-mcp` crate's `rmcp 1.7` tree (`rmcp-macros` → `darling 0.23`, plus `time 0.3.47`) requires rustc 1.88, so the effective workspace MSRV was already 1.88.
+> Bumped 1.85.1 → 1.88 on 2026-05-24: the `rocky-mcp` crate's `rmcp` tree (`rmcp-macros` → `darling 0.23`, edition 2024) requires rustc 1.88, so the effective workspace MSRV was already 1.88. (The tree was `rmcp 1.7` at the bump; it is `rmcp 2.2` now — still `darling 0.23` / edition 2024, so the 1.88 floor is unchanged.)
 
 **Rules:**
 

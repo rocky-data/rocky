@@ -17,7 +17,7 @@
 //!
 //! ## schemars dual-major note
 //!
-//! rmcp 1.7 pulls schemars 1.x; the rest of the Rocky workspace uses
+//! rmcp 2.2 pulls schemars 1.x; the rest of the Rocky workspace uses
 //! schemars 0.8. The two `JsonSchema` traits are disjoint. Every result
 //! struct returned inside `Json<T>` therefore derives schemars **1.x** and is
 //! built from "pure" types only (`String`, `usize`, `bool`, `Vec<_>`, local

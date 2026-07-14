@@ -116,7 +116,9 @@ This is the same evaluator that gates `apply`, `promote`, and `propose`, so an a
 
 ## Structured errors
 
-Every failing tool call comes back as a tool-result error whose content is a stable envelope — `{ code, message, remediation_hint, policy_rule? }` — not a prose blob. `code` is a machine-matchable class (`invalid_argument`, `model_not_found`, `compile_failed`, `policy_denied`, `policy_review_required`, …); `remediation_hint` is a concrete next action; `policy_rule` names the deciding rule on a policy verdict. It is the tool-layer analog of Rocky's diagnostic codes: an agent branches on the `code` and acts on the `remediation_hint` without scraping text. A clean compile that reports error *diagnostics* is **not** an error envelope — it is a successful result with `has_errors: true`, so "the tool failed" and "the code has a problem" stay distinguishable.
+When a tool rejects a request it has parsed — an unknown model, a denied policy, a compile that can't run — the failure comes back as a tool-result error whose content is a stable envelope — `{ code, message, remediation_hint, policy_rule? }` — not a prose blob. `code` is a machine-matchable class (`invalid_argument`, `model_not_found`, `compile_failed`, `policy_denied`, `policy_review_required`, …); `remediation_hint` is a concrete next action; `policy_rule` names the deciding rule on a policy verdict. It is the tool-layer analog of Rocky's diagnostic codes: an agent branches on the `code` and acts on the `remediation_hint` without scraping text. A clean compile that reports error *diagnostics* is **not** an error envelope — it is a successful result with `has_errors: true`, so "the tool failed" and "the code has a problem" stay distinguishable.
+
+One boundary sits below the envelope: a request whose arguments fail to parse before the tool runs — a missing or mistyped field — also comes back as a tool-result error (never a transport-level failure), but its content is a plain message rather than the envelope. The input schema each tool publishes in `tools/list` is what keeps a well-behaved client from sending one.
 
 ## Egress discipline
 
