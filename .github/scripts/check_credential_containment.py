@@ -39,7 +39,7 @@ RUST_TOOLCHAIN_SOURCE = (
 RUST_CACHE_SOURCE = (
     "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
 )
-SETUP_UV_SOURCE = "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39"
+SETUP_UV_SOURCE = "astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990"
 SETUP_NODE_SOURCE = (
     "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e"
 )
