@@ -537,6 +537,34 @@ _GC_APPLY_JSON = json.dumps(
     }
 )
 
+# A ``restore`` plan's apply output — also ``command == "apply"``, but with
+# restore-specific markers. The shared ``refused`` field must not route it to gc.
+_RESTORE_APPLY_JSON = json.dumps(
+    {
+        "version": "1.64.0",
+        "command": "apply",
+        "plan_id": "b" * 64,
+        "restored": [
+            {
+                "model_name": "orders",
+                "run_id": "run-1",
+                "blake3_hash": "deadbeef",
+                "size_bytes": 2048,
+                "file_path": "s3://warehouse/orders.parquet",
+                "status": "restored",
+                "bytes_written": True,
+                "hash_verified": True,
+            }
+        ],
+        "refused": [],
+        "already_restored": [],
+        "restored_count": 1,
+        "refused_count": 0,
+        "bytes_restored": 2048,
+        "notes": ["rebuilt bytes verified before publication"],
+    }
+)
+
 
 def _run_apply(client: RockyClient, stdout: str):
     proc = _fake_popen(stdout=stdout, returncode=0)
@@ -569,6 +597,16 @@ def test_apply_gc_plan_returns_gc_apply_output():
     assert result.evicted_count == 1
     assert result.evicted[0].model_name == "stale_model"
     assert result.bytes_evicted == 2048
+
+
+def test_apply_restore_plan_returns_restore_apply_output():
+    from rocky_sdk.types import RestoreApplyOutput
+
+    result = _run_apply(_client(), _RESTORE_APPLY_JSON)
+    assert isinstance(result, RestoreApplyOutput)
+    assert result.restored_count == 1
+    assert result.restored[0].model_name == "orders"
+    assert result.bytes_restored == 2048
 
 
 def test_apply_unknown_shape_raises_named_parse_error():

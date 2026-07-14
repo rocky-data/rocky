@@ -100,7 +100,6 @@ _COMMAND_SCHEMA: dict[str, str] = {
     "validate-migration": "validate_migration.schema.json",
     "doctor": "doctor.schema.json",
     "dag": "dag.schema.json",
-    "apply": "gc_apply.schema.json",
     "compliance": "compliance.schema.json",
     "retention-status": "retention_status.schema.json",
     "catalog": "catalog.schema.json",
@@ -114,6 +113,8 @@ _COMMAND_SCHEMA: dict[str, str] = {
 # Client-only parse targets not routed by ``parse_rocky_output`` (their payloads
 # either carry no ``command`` key, or are shape-discriminated).
 _CLIENT_ONLY: dict[str, tuple[str, type]] = {
+    "apply-gc": ("gc_apply.schema.json", sdk_types.GcApplyOutput),
+    "apply-restore": ("restore_apply.schema.json", sdk_types.RestoreApplyOutput),
     "test-adapter": ("test_adapter.schema.json", sdk_types.ConformanceResult),
     "lineage-model": ("lineage.schema.json", sdk_types.ModelLineageResult),
     "lineage-column": ("column_lineage.schema.json", sdk_types.ColumnLineageResult),
