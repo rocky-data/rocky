@@ -1328,12 +1328,12 @@ async fn prompt_get_build_model_returns_authoring_loop() {
     // Flatten every text message into one haystack and assert on the key
     // workflow steps + the reconcile discipline + the user's intent — wording
     // is free to drift, but these anchors must survive copy edits.
-    use rmcp::model::PromptMessageContent;
+    use rmcp::model::ContentBlock;
     let haystack: String = result
         .messages
         .iter()
         .filter_map(|m| match &m.content {
-            PromptMessageContent::Text { text } => Some(text.as_str()),
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -1366,12 +1366,12 @@ async fn prompt_get_build_model_returns_authoring_loop() {
 
 /// Flatten a prompt result's text messages into one searchable haystack.
 fn prompt_text(result: &rmcp::model::GetPromptResult) -> String {
-    use rmcp::model::PromptMessageContent;
+    use rmcp::model::ContentBlock;
     result
         .messages
         .iter()
         .filter_map(|m| match &m.content {
-            PromptMessageContent::Text { text } => Some(text.as_str()),
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
