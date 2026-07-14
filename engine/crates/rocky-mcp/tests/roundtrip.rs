@@ -112,6 +112,43 @@ async fn tools_list_returns_expected_set() {
     client.cancel().await.unwrap();
 }
 
+/// Malformed tool arguments (wrong-typed or missing required fields) fail
+/// *inside rmcp's parameter extraction*, before the tool body runs. rmcp 2.x
+/// surfaces that as an `isError` tool result carrying a plain-text message —
+/// deliberately NOT Rocky's structured `{code, message, remediation_hint}`
+/// envelope, which is the tool layer's own validation of *well-typed* arguments
+/// (see the error-contract eval). This pins that boundary so a future rmcp bump
+/// can't silently turn a bad-argument call into a transport error or reshape it.
+#[tokio::test]
+async fn malformed_arguments_are_a_plain_is_error_not_the_structured_envelope() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // `lineage` requires `model: String`; pass a number so deserialization into
+    // the parameter struct fails before the tool ever runs.
+    let bad_type = serde_json::json!({ "model": 12345 })
+        .as_object()
+        .unwrap()
+        .clone();
+    let res = client
+        .call_tool(CallToolRequestParams::new("lineage").with_arguments(bad_type))
+        .await
+        .expect("a malformed call still returns a tool result, not a transport error");
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "malformed arguments surface as an isError tool result"
+    );
+    assert!(
+        res.structured_content.is_none(),
+        "a deserialization failure is a plain rmcp error, not Rocky's structured envelope"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn compile_returns_trimmed_shape() {
     let dir = TempDir::new().unwrap();
