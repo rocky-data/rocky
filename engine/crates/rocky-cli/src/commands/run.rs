@@ -11906,8 +11906,8 @@ merge_keys = ["id"]
         // exact way `execute_models` recomputes at the choke-point (compile +
         // surrogate/contract extras), so the two must agree.
         let no_mask = std::collections::BTreeMap::new();
-        let fp1 = exec_choke_fingerprint(&models, "cfg", "", &no_mask);
-        let fp2 = exec_choke_fingerprint(&models, "cfg", "", &no_mask);
+        let fp1 = exec_choke_fingerprint(&models, "cfg", "", "", &no_mask);
+        let fp2 = exec_choke_fingerprint(&models, "cfg", "", "", &no_mask);
         assert_eq!(
             fp1, fp2,
             "same bytes must fingerprint identically (stability)"
@@ -12041,6 +12041,7 @@ merge_keys = ["id"]
         models_dir: &std::path::Path,
         config_identity: &str,
         governance_identity: &str,
+        exec_control_identity: &str,
         resolved_mask: &std::collections::BTreeMap<String, rocky_ir::MaskStrategy>,
     ) -> String {
         use rocky_compiler::compile::{self, CompilerConfig};
@@ -12059,10 +12060,7 @@ merge_keys = ["id"]
             &result.project.models,
             config_identity,
             governance_identity,
-            // The exec-choke fingerprint helper models a project with no
-            // execution-control config bound (#1095) — the gates it feeds use an
-            // empty `exec_control_identity` too, so the two stay symmetric.
-            "",
+            exec_control_identity,
             &extras,
         )
         .unwrap()
@@ -12140,7 +12138,7 @@ merge_keys = ["id"]
 
         let db = dir.path().join("wh.duckdb");
         // Plan-time fingerprint binds the surrogate spec (columns = [id]).
-        let fp = exec_choke_fingerprint(&models, "cfg", "", &std::collections::BTreeMap::new());
+        let fp = exec_choke_fingerprint(&models, "cfg", "", "", &std::collections::BTreeMap::new());
         // (2) unchanged apply → no refuse.
         governed_apply(
             &models,
@@ -12190,7 +12188,7 @@ merge_keys = ["id"]
         .unwrap();
 
         let db = dir.path().join("wh.duckdb");
-        let fp = exec_choke_fingerprint(&models, "cfg", "", &std::collections::BTreeMap::new());
+        let fp = exec_choke_fingerprint(&models, "cfg", "", "", &std::collections::BTreeMap::new());
         governed_apply(
             &models,
             &db,
@@ -12266,7 +12264,7 @@ merge_keys = ["id"]
 
         let hash_mask = std::collections::BTreeMap::from([("pii".to_string(), MaskStrategy::Hash)]);
         // Baseline fp binds the EFFECTIVE mask {pii→hash}.
-        let fp = exec_choke_fingerprint(&models, "cfg", "", &hash_mask);
+        let fp = exec_choke_fingerprint(&models, "cfg", "", "", &hash_mask);
         governed_apply(&models, &db, "mask-ok", &fp, &hash_mask, true)
             .await
             .expect("unchanged effective mask must NOT refuse");
@@ -12396,7 +12394,7 @@ merge_keys = ["id"]
         // A scoped apply omits the mask, so the reviewed fingerprint is computed
         // with an EMPTY mask (over all compiled models).
         let empty_mask = std::collections::BTreeMap::new();
-        let fp = exec_choke_fingerprint(&models, "cfg", "", &empty_mask);
+        let fp = exec_choke_fingerprint(&models, "cfg", "", "", &empty_mask);
 
         // The gate still carries `b`'s (and `a`'s) resolved mask — but the scoped
         // choke-point must ignore it. A confidential→redact change on `b` must not
@@ -12557,7 +12555,13 @@ merge_keys = ["id"]
         let gov = crate::commands::apply::governance_policy_identity(&cfg);
         let resolved_mask: std::collections::BTreeMap<String, rocky_ir::MaskStrategy> =
             std::collections::BTreeMap::new();
-        let apply_fp = exec_choke_fingerprint(&models, &identity, &gov, &resolved_mask);
+        // Match the plan side (`compute_embedded_capabilities` → plan.rs), which
+        // binds the execution-control identity over the config's own directory.
+        let ec = crate::commands::apply::execution_control_identity(
+            &cfg,
+            config_path.parent().unwrap(),
+        );
+        let apply_fp = exec_choke_fingerprint(&models, &identity, &gov, &ec, &resolved_mask);
 
         assert_eq!(
             caps.models_fingerprint.as_deref(),
@@ -12615,7 +12619,13 @@ merge_keys = ["id"]
         let identity = crate::commands::apply::config_policy_identity(&cfg);
         let gov = crate::commands::apply::governance_policy_identity(&cfg);
         let resolved_mask = cfg.resolve_mask_for_env(None);
-        let apply_fp = exec_choke_fingerprint(&models, &identity, &gov, &resolved_mask);
+        // Match the plan side (`compute_embedded_capabilities` → plan.rs), which
+        // binds the execution-control identity over the config's own directory.
+        let ec = crate::commands::apply::execution_control_identity(
+            &cfg,
+            config_path.parent().unwrap(),
+        );
+        let apply_fp = exec_choke_fingerprint(&models, &identity, &gov, &ec, &resolved_mask);
         assert_eq!(
             caps.models_fingerprint.as_deref(),
             Some(apply_fp.as_str()),
