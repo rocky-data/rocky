@@ -11,7 +11,7 @@ import pytest
 from rocky_sdk import CiResult, CompileResult, DiscoverResult, TestResult, parse_rocky_output
 from rocky_sdk.client import _parse_rocky_json, _parse_run_or_apply
 from rocky_sdk.exceptions import RockyOutputParseError
-from rocky_sdk.types import CheckResult, RunResult
+from rocky_sdk.types import CheckResult, GcApplyOutput, RestoreApplyOutput, RunResult
 
 DISCOVER_JSON = '{"version": "1.0.0", "command": "discover", "sources": []}'
 
@@ -20,6 +20,35 @@ def test_parse_rocky_output_dispatches_discover():
     result = parse_rocky_output(DISCOVER_JSON)
     assert isinstance(result, DiscoverResult)
     assert result.sources == []
+
+
+@pytest.mark.parametrize(
+    ("marker", "counter", "extra", "model"),
+    [
+        ("restored", "restored_count", {}, RestoreApplyOutput),
+        ("evicted", "evicted_count", {"bytes_refused": 0}, GcApplyOutput),
+    ],
+)
+def test_parse_rocky_output_dispatches_apply_by_shape(marker, counter, extra, model):
+    payload = {
+        "version": "1.64.0",
+        "command": "apply",
+        "plan_id": "a" * 64,
+        marker: [],
+        "refused": [],
+        f"already_{marker}": [],
+        counter: 0,
+        "refused_count": 0,
+        f"bytes_{marker}": 0,
+        "notes": [],
+        **extra,
+    }
+    assert isinstance(parse_rocky_output(json.dumps(payload)), model)
+
+
+def test_parse_rocky_output_rejects_unknown_apply_shape():
+    with pytest.raises(ValueError, match="Unknown Rocky apply output shape"):
+        parse_rocky_output('{"command": "apply", "refused": []}')
 
 
 def test_parse_compile_surfaces_model_governance_tags():

@@ -75,6 +75,7 @@ from rocky_sdk.types import (
     OptimizeResult,
     PlanResult,
     PromotePlan,
+    RestoreApplyOutput,
     RetentionStatusOutput,
     RunResult,
     StateResult,
@@ -86,7 +87,12 @@ from rocky_sdk.types import (
 # emit a wrapping envelope — each plan kind prints its own output, so the parsed
 # result is a discriminated union over those shapes. See :func:`_parse_apply`.
 ApplyResult = (
-    RunResult | GcApplyOutput | CompactApplyOutput | ArchiveApplyOutput | BranchPromoteOutput
+    RunResult
+    | GcApplyOutput
+    | RestoreApplyOutput
+    | CompactApplyOutput
+    | ArchiveApplyOutput
+    | BranchPromoteOutput
 )
 
 # Default subprocess timeout for any single Rocky CLI invocation. One hour is
@@ -207,7 +213,9 @@ def _parse_apply(output: str) -> ApplyResult:
     * ``"compact apply"`` → :class:`CompactApplyOutput`.
     * ``"archive apply"`` → :class:`ArchiveApplyOutput`.
     * ``"branch promote"`` → :class:`BranchPromoteOutput`.
-    * ``"apply"`` with gc markers (``evicted`` / ``refused``) →
+    * ``"apply"`` with restore markers (``restored``) →
+      :class:`RestoreApplyOutput`.
+    * ``"apply"`` with gc markers (``evicted``) →
       :class:`GcApplyOutput`.
 
     Anything else raises :class:`RockyOutputParseError` naming the received
@@ -240,7 +248,9 @@ def _parse_apply(output: str) -> ApplyResult:
         return _validate_payload(payload, ArchiveApplyOutput, command="apply", raw=output)
     if command == "branch promote":
         return _validate_payload(payload, BranchPromoteOutput, command="apply", raw=output)
-    if command == "apply" and ("evicted" in payload or "refused" in payload):
+    if command == "apply" and "restored" in payload:
+        return _validate_payload(payload, RestoreApplyOutput, command="apply", raw=output)
+    if command == "apply" and "evicted" in payload:
         return _validate_payload(payload, GcApplyOutput, command="apply", raw=output)
 
     raise RockyOutputParseError(
@@ -248,7 +258,8 @@ def _parse_apply(output: str) -> ApplyResult:
         stdout=output or "",
         parse_error=(
             f"unrecognized apply output (command={command!r}); expected one of "
-            "'run' / 'compact apply' / 'archive apply' / 'branch promote' / gc apply"
+            "'run' / 'compact apply' / 'archive apply' / 'branch promote' / "
+            "restore apply / gc apply"
         ),
         kind="validation",
     )
@@ -856,9 +867,10 @@ class RockyClient:
         Reads ``.rocky/plans/<plan_id>.json`` and dispatches by kind. Each plan
         kind's apply path prints its OWN output (there is no wrapping envelope),
         so the return type is a discriminated union: run / replication /
-        ai_authored / backfill plans yield a :class:`RunResult`; a ``gc`` plan
-        yields a :class:`GcApplyOutput`; compact / archive / promote plans yield
-        their respective outputs. See :func:`_parse_apply`.
+        ai_authored / backfill plans yield a :class:`RunResult`; ``restore`` and
+        ``gc`` plans yield :class:`RestoreApplyOutput` and :class:`GcApplyOutput`,
+        respectively; compact / archive / promote plans yield their respective
+        outputs. See :func:`_parse_apply`.
         """
         return _parse_apply(self.run_cli(["apply", plan_id], allow_partial=True))
 
