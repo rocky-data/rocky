@@ -465,6 +465,25 @@ class ContextBoundaryTests(unittest.TestCase):
                 approver_login="trusted-reviewer",
             )
 
+    def test_current_run_mismatch_names_the_failing_field(self) -> None:
+        # A wrong pull_request_target run-object shape must fail closed and say
+        # which field mismatched, so the first live credentialed run is debuggable.
+        with self.assertRaisesRegex(ContextError, "metadata.*head_sha"):
+            authenticate_current_run(
+                {
+                    "id": 123,
+                    "event": "pull_request_target",
+                    "path": ".github/workflows/ai-review.yml@main",
+                    "head_sha": NEW_HEAD_SHA,
+                    "actor": {"login": "trusted-reviewer"},
+                    "head_repository": {"full_name": HEAD_REPOSITORY},
+                },
+                expected_run_id=123,
+                repository=HEAD_REPOSITORY,
+                approved_base_sha=BASE_SHA,
+                approver_login="trusted-reviewer",
+            )
+
     def test_artifact_body_cannot_change_the_approved_head(self) -> None:
         with self.assertRaisesRegex(ContextError, "body metadata"):
             validate_context(

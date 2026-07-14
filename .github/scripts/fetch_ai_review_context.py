@@ -62,18 +62,32 @@ def authenticate_current_run(
     head_repository_name = (
         head_repository.get("full_name") if isinstance(head_repository, dict) else None
     )
-    if (
-        payload.get("id") != expected_run_id
-        or payload.get("event") != "pull_request_target"
-        # The pinned REST API currently returns a suffixless path, while newer
-        # GitHub documentation shows `path@ref`. Accept only those exact trusted
-        # representations; every other workflow path or ref fails closed.
-        or run_path not in trusted_run_paths
-        or payload.get("head_sha") != approved_base_sha
-        or actor_login != approver_login
-        or head_repository_name != repository
-    ):
-        raise ContextError("current workflow-run metadata did not match the approval event")
+    # Each field fails closed independently, and the raised error names the exact
+    # mismatch. This keeps the first live pull_request_target run debuggable: that
+    # event's run object reports the base branch as head_sha/head_repository (the
+    # version of the workflow being run), which is the load-bearing assumption
+    # this repository has not yet exercised. The pinned REST API currently returns
+    # a suffixless path, while newer GitHub documentation shows `path@ref`; accept
+    # only those exact trusted representations and treat any other path or ref as
+    # a mismatch.
+    mismatches: list[str] = []
+    if payload.get("id") != expected_run_id:
+        mismatches.append("run id")
+    if payload.get("event") != "pull_request_target":
+        mismatches.append("event")
+    if run_path not in trusted_run_paths:
+        mismatches.append("workflow path")
+    if payload.get("head_sha") != approved_base_sha:
+        mismatches.append("head_sha (expected the approved PR base SHA)")
+    if actor_login != approver_login:
+        mismatches.append("actor login")
+    if head_repository_name != repository:
+        mismatches.append("head repository")
+    if mismatches:
+        raise ContextError(
+            "current workflow-run metadata did not match the approval event: "
+            + ", ".join(mismatches)
+        )
 
 
 def select_artifact(artifacts_payload: Any, *, expected_name: str) -> dict[str, Any]:
