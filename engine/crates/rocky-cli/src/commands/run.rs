@@ -1068,7 +1068,19 @@ pub(crate) fn refuse_governed_side_effects(
     governed: bool,
     hooks: &rocky_core::hooks::HooksConfig,
 ) -> Result<()> {
-    if governed && !(hooks.hooks.is_empty() && hooks.webhooks.is_empty()) {
+    use rocky_core::hooks::{HookConfigOrList, WebhookConfigOrList};
+    // Count NORMALIZED executable side effects, not map cardinality: an empty
+    // `[[hook.on_x]]` list registers zero hooks and fires nothing, so it must NOT
+    // refuse (red-team #9). Single ⇒ one; Multiple ⇒ the vector's length.
+    let has_shell_hook = hooks.hooks.values().any(|h| match h {
+        HookConfigOrList::Single(_) => true,
+        HookConfigOrList::Multiple(v) => !v.is_empty(),
+    });
+    let has_webhook = hooks.webhooks.values().any(|w| match w {
+        WebhookConfigOrList::Single(_) => true,
+        WebhookConfigOrList::Multiple(v) => !v.is_empty(),
+    });
+    if governed && (has_shell_hook || has_webhook) {
         anyhow::bail!(
             "refusing a governed apply that configures `[hook]`/`[hook.webhooks]`: hook \
              commands fire at pipeline-start, before the execution-fingerprint gate (and a \
@@ -1626,6 +1638,20 @@ pub async fn run(
     {
         Ok(()) => true,
         Err(e) => {
+            // #2 (red-team): a GOVERNED run whose remote-state download failed
+            // cannot see a cross-pod freeze/budget recorded by another pod. If a
+            // `[policy]` plane is configured (the in-run gate WILL consult
+            // POLICY_DECISIONS), fail-closed rather than evaluate the freeze from
+            // stale local state and fail OPEN. With no `[policy]` there is nothing
+            // to enforce, so continue — same as an ungoverned run, no availability
+            // regression (red-team #8's no-policy false-abort avoided).
+            if exec_fp_gate.is_some() && rocky_cfg.policy.is_some() {
+                anyhow::bail!(
+                    "refusing a governed run: remote state download failed ({e}), so a \
+                     cross-pod freeze/budget in the durable state ledger cannot be seen \
+                     (fail-closed). Retry once the `[state]` backend is reachable."
+                );
+            }
             warn!(error = %e, "state download failed, continuing with local state");
             false
         }
@@ -12125,6 +12151,18 @@ merge_keys = ["id"]
         assert!(super::refuse_governed_side_effects(false, &with_hook).is_ok());
         // Governed + no hooks → allowed.
         assert!(super::refuse_governed_side_effects(true, &empty).is_ok());
+        // #9: a governed run with an EMPTY `[[hook]]` list registers zero hooks
+        // and fires nothing → must NOT be refused (normalized count, not map key).
+        let empty_list = HooksConfig {
+            webhooks: Default::default(),
+            hooks: [(
+                "on_pipeline_start".to_string(),
+                HookConfigOrList::Multiple(vec![]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert!(super::refuse_governed_side_effects(true, &empty_list).is_ok());
     }
 
     /// Run one governed `execute_models` apply under a fixed gate and return the
