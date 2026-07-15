@@ -88,7 +88,10 @@ pub use ai::{
     SchemaBuckets, build_schema_context, run_ai, run_ai_explain, run_ai_sync, run_ai_test,
 };
 pub use ai_contract::run_ai_contract;
-pub use apply::{PolicyGate, evaluate_apply_policy, run_apply, run_apply_inline_for_run};
+pub use apply::{
+    PolicyGate, evaluate_apply_policy, evaluate_apply_policy_with_policy, run_apply,
+    run_apply_inline_for_run,
+};
 pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
 pub use audit::{
     compute_audit_for, compute_audit_scorecard, run_audit, run_audit_for, run_audit_scorecard,

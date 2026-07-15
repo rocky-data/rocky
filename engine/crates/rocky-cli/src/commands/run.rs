@@ -1819,7 +1819,10 @@ pub async fn run(
                     .flat_map(|t| shadow_gate_target_names(&t.name, shadow_config))
             })
             .collect();
-        ctx.gate_replication_targets(&replication_targets, &state_store)?;
+        // Finding 1: thread `run`'s single `rocky_cfg` snapshot into the in-run
+        // replication gate so it evaluates `[policy]` / models-dir from the config
+        // `run` executed against, not a reload a mid-run swap could redirect.
+        ctx.gate_replication_targets(&replication_targets, &state_store, &rocky_cfg)?;
     }
 
     // --- Sequential: catalog/schema setup + table collection ---

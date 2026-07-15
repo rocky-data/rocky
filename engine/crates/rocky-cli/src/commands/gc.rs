@@ -66,8 +66,8 @@ use chrono::{DateTime, Utc};
 use tracing::warn;
 
 use rocky_core::config::{
-    ConfigError, PolicyCapability, PolicyPrincipal, StateBackend, StateConfig,
-    StateUploadFailureMode, load_rocky_config,
+    PolicyCapability, PolicyPrincipal, StateBackend, StateConfig, StateUploadFailureMode,
+    load_rocky_config,
 };
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
 use rocky_core::state::{
@@ -75,7 +75,7 @@ use rocky_core::state::{
     TombstoneRecord,
 };
 
-use crate::commands::apply::{PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy};
+use crate::commands::apply::{PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy_with_policy};
 use crate::commands::replay::classify_model;
 use crate::commands::review::record_plan_review_escalation;
 use crate::output::{
@@ -1535,8 +1535,12 @@ pub(crate) async fn run_gc_apply_in_with(
             })?;
     }
 
-    let gate = evaluate_apply_policy(
-        config_path,
+    // Finding 1: gate on the SAME `loaded_cfg` snapshot used for the state
+    // backend + models-dir above, rather than reloading the config inside
+    // `evaluate_apply_policy` — a `rocky.toml` swap between the loads must not let
+    // the state-backend/download and the policy gate disagree.
+    let gate = evaluate_apply_policy_with_policy(
+        loaded_cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
         plan_record.enforcement_principal(runtime_principal),
         &touched,
@@ -1568,16 +1572,15 @@ pub(crate) async fn run_gc_apply_in_with(
     // typo alongside `physical_delete = true` — a missing env var, a validation
     // failure) is propagated (fail loud): a misconfigured `physical_delete`
     // must never silently degrade into "tombstone + retire" (finding 3).
-    let physical_delete = match load_rocky_config(config_path) {
-        Ok(cfg) => cfg.gc.physical_delete,
-        Err(ConfigError::FileNotFound { .. }) => false,
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context(
-                "failed to load config to resolve `[gc] physical_delete` — refusing to apply a \
-                 gc plan against an unreadable/malformed config (fail-closed)",
-            ));
-        }
-    };
+    //
+    // Finding 1: resolved from the SAME `loaded_cfg` snapshot loaded above — a
+    // genuine (non-FileNotFound) config error already bailed there, so `None`
+    // here is exactly the absent-config case → `physical_delete = false`. No
+    // second `load_rocky_config` that a `rocky.toml` swap could point elsewhere.
+    let physical_delete = loaded_cfg
+        .as_ref()
+        .map(|cfg| cfg.gc.physical_delete)
+        .unwrap_or(false);
     if physical_delete {
         bail!(
             "`[gc] physical_delete = true` is not supported: physical reclamation of \

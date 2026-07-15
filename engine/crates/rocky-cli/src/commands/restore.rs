@@ -878,6 +878,8 @@ pub(crate) async fn run_restore_apply_in(
         json,
         &S3RestoreStores,
         warehouse.as_ref(),
+        // Finding 1: reuse the SAME snapshot the adapter was built from.
+        Some(cfg),
     )
     .await
 }
@@ -895,6 +897,11 @@ pub(crate) async fn run_restore_apply_in_with(
     json: bool,
     stores: &dyn RestoreStores,
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    // Finding 1: the SAME config snapshot the caller already loaded (the outer
+    // `run_restore_apply_in` loaded it to build the recording-warehouse adapter).
+    // Threaded in so the freeze/policy gate + `[state]` sync read the config the
+    // adapter was built from, not a reload a `rocky.toml` swap could redirect.
+    loaded_cfg: Option<rocky_core::config::RockyConfig>,
 ) -> Result<()> {
     let plan_record = read_plan(root, plan_id)
         .with_context(|| format!("failed to read restore plan '{plan_id}'"))?;
@@ -922,21 +929,9 @@ pub(crate) async fn run_restore_apply_in_with(
         );
     }
 
-    // Policy can only tighten the gate. Fail-closed pre-check: a config-load
-    // ERROR would otherwise silently unenforce a possibly-configured
-    // `[policy]` block; a genuinely-missing config keeps NotConfigured.
-    let loaded_cfg = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => Some(cfg),
-        Err(rocky_core::config::ConfigError::FileNotFound { .. }) => None,
-        Err(e) => {
-            return Err(anyhow::anyhow!(e).context(format!(
-                "refusing to apply restore plan '{plan_id}': {} failed to load, so any \
-                 configured [policy] rules cannot be enforced (fail-closed). Fix the config and \
-                 re-run `rocky apply {plan_id}`.",
-                config_path.display()
-            )));
-        }
-    };
+    // Policy can only tighten the gate. `loaded_cfg` is the caller's single
+    // snapshot (finding 1) — a genuine config-load error already fails closed at
+    // the outer `run_restore_apply_in` before the adapter is built.
     let touched: BTreeMap<String, PolicyCapability> = plan
         .restorations
         .iter()
@@ -1540,6 +1535,7 @@ mod tests {
                 true,
                 &stores,
                 &fresh_duckdb(),
+                rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
             .unwrap();
@@ -1580,6 +1576,7 @@ mod tests {
                 true,
                 &stores,
                 &fresh_duckdb(),
+                rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
             .unwrap();
@@ -1677,6 +1674,7 @@ mod tests {
                 true,
                 &SharedStore(cas.clone()),
                 &fresh_duckdb(),
+                rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
             .unwrap();
@@ -1903,6 +1901,7 @@ mod tests {
                 true,
                 &SharedStore(cas.clone()),
                 &fresh_duckdb(),
+                rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
             .expect_err("apply must refuse an unreviewed restore plan");
@@ -1931,6 +1930,7 @@ mod tests {
                 true,
                 &SharedStore(cas.clone()),
                 &fresh_duckdb(),
+                rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
             .unwrap();

@@ -269,7 +269,12 @@ async fn run_apply_run_plan(
 
     // Resolve the post-apply verification checks *before* the run plan is moved
     // into execution (the run plan owns the models_dir the resolver reads).
-    let verify_checks = required_verify_after(config_path, principal, &touched, models_dir);
+    let verify_checks = required_verify_after(
+        cfg.as_ref().and_then(|c| c.policy.as_ref()),
+        principal,
+        &touched,
+        models_dir,
+    );
 
     // Finding 3 (pre-run half): the plain rule decision the gate just recorded
     // must survive `run`'s start-download, which REPLACES the local ledger from
@@ -972,7 +977,7 @@ pub fn evaluate_apply_policy(
 /// remote-state sync decision AND this evaluation, so a config that gains a
 /// `[policy]` block between the two can't make the guard skip the sync while this
 /// gate then reads stale local decisions (finding A).
-pub(crate) fn evaluate_apply_policy_with_policy(
+pub fn evaluate_apply_policy_with_policy(
     policy: Option<&rocky_core::config::PolicyConfig>,
     plan_id: &str,
     principal: PolicyPrincipal,
@@ -1044,14 +1049,17 @@ pub(crate) fn evaluate_apply_policy_with_policy(
 /// and the decision-row writes both go through the caller's already-open
 /// `ledger`, never a fresh open.
 pub(crate) fn evaluate_apply_policy_with_store(
-    config_path: &Path,
+    policy: Option<&rocky_core::config::PolicyConfig>,
     plan_id: &str,
     principal: PolicyPrincipal,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     ledger: &StateStore,
 ) -> PolicyGate {
-    let (policy, attrs_map) = match load_policy_and_attrs(config_path, touched, models_dir) {
+    // Finding 1: takes the SAME `[policy]` snapshot `run` already holds (its L1212
+    // `rocky_cfg`), not a reload — the in-run replication gate must evaluate the
+    // config `run` executed against, not one a mid-run `rocky.toml` swap points at.
+    let (policy, attrs_map) = match resolve_policy_and_attrs(policy, touched, models_dir) {
         Ok(pair) => pair,
         Err(gate) => return gate,
     };
@@ -1080,31 +1088,6 @@ pub(crate) fn evaluate_apply_policy_with_store(
             }
         },
     )
-}
-
-/// Load the `[policy]` block from `config_path` and compile the per-model
-/// attributes, or return an early [`PolicyGate`]. A thin wrapper over
-/// [`resolve_policy_and_attrs`] for callers that reach the gate through a
-/// config path rather than a held config snapshot (e.g.
-/// [`evaluate_apply_policy_with_store`]).
-fn load_policy_and_attrs(
-    config_path: &Path,
-    touched: &BTreeMap<String, PolicyCapability>,
-    models_dir: &Path,
-) -> std::result::Result<
-    (
-        rocky_core::config::PolicyConfig,
-        BTreeMap<String, ModelAttributes>,
-    ),
-    PolicyGate,
-> {
-    // A missing or malformed config leaves the policy plane unconfigured — the
-    // caller keeps its pre-policy-plane gate. (The run path re-loads and surfaces
-    // any real config error itself.)
-    let policy = rocky_core::config::load_rocky_config(config_path)
-        .ok()
-        .and_then(|cfg| cfg.policy);
-    resolve_policy_and_attrs(policy.as_ref(), touched, models_dir)
 }
 
 /// Given an ALREADY-RESOLVED `[policy]` block, compile the per-model attributes,
@@ -1241,35 +1224,6 @@ fn evaluate_apply_policy_core(
     }
 
     worst.unwrap_or(PolicyGate::Allow)
-}
-
-/// Fail-closed config probe for apply seams whose execution path does not
-/// itself require a loadable config (gc, backfill).
-///
-/// [`evaluate_apply_policy`] maps *any* config-load error to
-/// [`PolicyGate::NotConfigured`] — correct for the run path, which re-loads
-/// and surfaces the error itself before mutating anything. The gc and
-/// backfill applies have no such backstop: a malformed `rocky.toml` (which
-/// may carry the very `[policy]` block with the deny/freeze rules) would
-/// silently unenforce the policy plane while the apply still executes. This
-/// probe bails on a load **error** while keeping a genuinely-missing config
-/// file permitted (no file ⇒ no `[policy]` block to enforce ⇒ the
-/// NotConfigured posture is honest).
-pub(crate) fn bail_on_config_load_error(
-    config_path: &Path,
-    plan_kind: &str,
-    plan_id: &str,
-) -> Result<()> {
-    match rocky_core::config::load_rocky_config(config_path) {
-        Ok(_) => Ok(()),
-        Err(rocky_core::config::ConfigError::FileNotFound { .. }) => Ok(()),
-        Err(e) => Err(anyhow::Error::new(e).context(format!(
-            "refusing to apply {plan_kind} plan '{plan_id}': {} failed to load, so any \
-             configured [policy] rules cannot be enforced (fail-closed). Fix the config and \
-             re-run `rocky apply {plan_id}`.",
-            config_path.display()
-        ))),
-    }
 }
 
 /// Restrictiveness rank for aggregating per-model [`PolicyGate`]s.
@@ -1861,10 +1815,15 @@ impl GovernedRunContext<'_> {
     /// and records through it rather than re-opening (which would collide
     /// in-process and spuriously mark the snapshot unreadable → a bogus
     /// fail-closed deny for every agent replication).
+    /// `cfg` is the SAME immutable snapshot `run` loaded once (its L1212
+    /// `rocky_cfg`); the gate evaluates `[policy]` and resolves the models-dir
+    /// from it rather than reloading `rocky.toml`, so a mid-run swap can't change
+    /// the plane this gate enforces (finding 1).
     pub(crate) fn gate_replication_targets(
         &self,
         target_names: &BTreeSet<String>,
         ledger: &StateStore,
+        cfg: &rocky_core::config::RockyConfig,
     ) -> Result<()> {
         if target_names.is_empty() {
             return Ok(());
@@ -1878,9 +1837,9 @@ impl GovernedRunContext<'_> {
         // No compiled model dir for replication targets — evaluate against
         // bare-named attributes (a nonexistent dir yields an empty attr map, so
         // every target matches by name / the default posture).
-        let models_dir = resolve_config_models_dir(self.config_path);
+        let models_dir = resolve_config_models_dir(self.config_path, Some(cfg));
         let gate = evaluate_apply_policy_with_store(
-            self.config_path,
+            cfg.policy.as_ref(),
             self.plan_id,
             self.principal,
             &touched,
@@ -1912,7 +1871,7 @@ pub(crate) fn gate_promote_plan(
     // ONE config snapshot for the pre-gate sync decision AND the policy gate
     // (finding A — config-snapshot TOCTOU).
     let cfg = rocky_core::config::load_rocky_config(config_path).ok();
-    let promote_models_dir = resolve_config_models_dir(config_path);
+    let promote_models_dir = resolve_config_models_dir(config_path, cfg.as_ref());
     let touched = touched_models_for_promote(promote_plan, &promote_models_dir);
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
     // the gate reads it, so a cross-pod freeze is enforced. Placed inside the
@@ -1933,21 +1892,25 @@ pub(crate) fn gate_promote_plan(
     apply_policy_gate(root, plan_id, gate)
 }
 
-/// Resolve the models directory for the promote gate from the loaded config:
-/// the first transformation pipeline's `models` glob base (everything before
-/// the first wildcard), relative to the config file's parent. Falls back to
-/// `<project>/models` when the config does not load or declares no
+/// Resolve the models directory for the promote gate from an ALREADY-LOADED
+/// config snapshot: the first transformation pipeline's `models` glob base
+/// (everything before the first wildcard), relative to `config_path`'s parent.
+/// Falls back to `<project>/models` when the snapshot is `None` or declares no
 /// transformation pipeline. Mirrors the backfill/gc resolution.
-fn resolve_config_models_dir(config_path: &Path) -> std::path::PathBuf {
+///
+/// Finding 1: takes the snapshot rather than reloading `rocky.toml`, so a
+/// governed path resolves the models dir from the SAME config it gates on.
+fn resolve_config_models_dir(
+    config_path: &Path,
+    cfg: Option<&rocky_core::config::RockyConfig>,
+) -> std::path::PathBuf {
     let project_root = config_path.parent().unwrap_or(Path::new(""));
-    let glob = rocky_core::config::load_rocky_config(config_path)
-        .ok()
-        .and_then(|cfg| {
-            cfg.pipelines.values().find_map(|p| match p {
-                rocky_core::config::PipelineConfig::Transformation(t) => Some(t.models.clone()),
-                _ => None,
-            })
-        });
+    let glob = cfg.and_then(|cfg| {
+        cfg.pipelines.values().find_map(|p| match p {
+            rocky_core::config::PipelineConfig::Transformation(t) => Some(t.models.clone()),
+            _ => None,
+        })
+    });
     let base = glob
         .as_deref()
         .and_then(|g| g.split(&['*', '?', '['][..]).next())
@@ -2026,15 +1989,15 @@ fn apply_policy_gate(root: &Path, plan_id: &str, gate: PolicyGate) -> Result<()>
 /// empty when no `[policy]` block is configured or no matched rule carries a
 /// `verify_after` (the common case — no post-apply gate).
 fn required_verify_after(
-    config_path: &Path,
+    policy: Option<&rocky_core::config::PolicyConfig>,
     principal: PolicyPrincipal,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
 ) -> Vec<String> {
-    let Ok(cfg) = rocky_core::config::load_rocky_config(config_path) else {
-        return Vec::new();
-    };
-    let Some(policy) = cfg.policy else {
+    // Finding 1: takes the SAME `[policy]` snapshot the gate used, rather than
+    // reloading `rocky.toml` — a swap between the gate and this resolution could
+    // otherwise change the `verify_after` set the governed apply enforces.
+    let Some(policy) = policy else {
         return Vec::new();
     };
     let attrs_map = model_attributes(models_dir);
@@ -2051,7 +2014,7 @@ fn required_verify_after(
                 &owned
             }
         };
-        let decision = policy::evaluate(&policy, principal, *capability, attrs);
+        let decision = policy::evaluate(policy, principal, *capability, attrs);
         if decision.effect == PolicyEffect::Deny {
             continue;
         }
@@ -2294,7 +2257,12 @@ async fn run_apply_ai_authored_plan(
     }
 
     // Resolve the post-apply verification checks before the run plan is moved.
-    let verify_checks = required_verify_after(config_path, principal, &touched, models_dir);
+    let verify_checks = required_verify_after(
+        cfg.as_ref().and_then(|c| c.policy.as_ref()),
+        principal,
+        &touched,
+        models_dir,
+    );
 
     // Finding 3 (pre-run half): make the plain rule decision durable on remote
     // before `run`'s start-download replaces the local ledger — see the twin in
@@ -2392,13 +2360,26 @@ async fn run_apply_backfill_plan(
 
     // Policy can only tighten the gate: a `deny` hard-refuses even a reviewed
     // backfill. The marker above already satisfies any policy `require_review`.
-    // Fail-closed pre-check: the backfill execution path does not itself need the
-    // config to have loaded, so a config-load ERROR must bail here rather than
-    // silently unenforcing a possibly-configured `[policy]` block.
-    bail_on_config_load_error(config_path, "backfill", plan_id)?;
-    // ONE config snapshot for the pre-gate sync decision AND the policy gate, so
-    // the guard and gate can't disagree about `[policy]` presence (finding A).
-    let cfg = rocky_core::config::load_rocky_config(config_path).ok();
+    //
+    // Finding 1: ONE config snapshot for the entire backfill apply — the sync
+    // decision, the policy gate, the execute-from-owned routing verification, and
+    // `execute_backfill_set` all read THIS instance, so a `rocky.toml` swap can't
+    // point any of them at a different config. Fail-closed pre-check folded in: a
+    // config-load ERROR bails here (the execution path doesn't itself need the
+    // config, so an unenforced `[policy]` must fail loud); a genuinely absent
+    // config keeps the NotConfigured posture.
+    let cfg = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(c) => Some(c),
+        Err(rocky_core::config::ConfigError::FileNotFound { .. }) => None,
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "refusing to apply backfill plan '{plan_id}': {} failed to load, so any \
+                 configured [policy] rules cannot be enforced (fail-closed). Fix the config and \
+                 re-run `rocky apply {plan_id}`.",
+                config_path.display()
+            )));
+        }
+    };
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
     // A backfill's `models` list IS the authoritative rebuild closure the
     // engine composed and will execute (see `execute_backfill_set` below), not
@@ -2468,7 +2449,6 @@ async fn run_apply_backfill_plan(
 
     // Governed-apply TOCTOU gate (E) for the backfill path — an agent backfill
     // apply refuses if the compiled IR / config changed since the plan.
-    let backfill_cfg = rocky_core::config::load_rocky_config(config_path).ok();
     let governed = governed_run_context(
         &plan,
         plan.enforcement_principal(runtime_principal),
@@ -2483,7 +2463,9 @@ async fn run_apply_backfill_plan(
     // ‼️ Finding #2: a backfill ALWAYS executes models (its `model_set`) —
     // preflight the reviewed source-schema snapshot before any warehouse mutation.
     preflight_snapshot(governed.as_ref(), plan_id, true)?;
-    let exec_fp_gate = match (governed.as_ref(), backfill_cfg.as_ref()) {
+    // Finding 1: the routing verification below runs against the SAME `cfg`
+    // snapshot the gate/sync used — not a fresh `backfill_cfg` reload.
+    let exec_fp_gate = match (governed.as_ref(), cfg.as_ref()) {
         (Some(ctx), Some(cfg)) => {
             // Fail-closed (#4/#5): verify the routing identity before executing.
             ctx.verify_routing_identity(cfg)?;
@@ -2502,13 +2484,11 @@ async fn run_apply_backfill_plan(
         _ => None,
     };
 
-    // Execute-from-owned (finding B): hand the SAME verified `backfill_cfg`
-    // instance `verify_routing_identity` checked to `execute_backfill_set`,
-    // rather than have it reload — a timed `rocky.toml` swap between the gate and
-    // a reload would otherwise pick a different, unverified destination. A config
-    // that will not load cannot be executed against; bail (mirrors the old
-    // internal load error).
-    let rocky_cfg = backfill_cfg.with_context(|| {
+    // Execute-from-owned (finding B): hand the SAME verified `cfg` instance
+    // `verify_routing_identity` checked to `execute_backfill_set`, rather than a
+    // reload a timed `rocky.toml` swap could redirect. A config that will not load
+    // cannot be executed against; bail.
+    let rocky_cfg = cfg.with_context(|| {
         format!(
             "failed to load config from {} (required for backfill)",
             config_path.display()
@@ -3673,47 +3653,6 @@ effect = "deny"
         Ok(())
     }
 
-    /// 🔴 FIX 6 regression: a config-load ERROR must fail closed at the
-    /// gc/backfill apply seams. `evaluate_apply_policy` maps any load error to
-    /// `NotConfigured` (correct only for the run path, which re-surfaces the
-    /// error itself); the gc/backfill applies execute without needing the
-    /// config, so a malformed `rocky.toml` — which may carry the very
-    /// `[policy]` deny/freeze rules — would silently unenforce them.
-    #[test]
-    fn config_load_error_bails_fail_closed() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        // Malformed TOML → a load ERROR (not FileNotFound).
-        let bad = dir.path().join("rocky.toml");
-        std::fs::write(&bad, "this is = = not valid toml [[[")?;
-        let err = super::bail_on_config_load_error(&bad, "backfill", "plan_x").unwrap_err();
-        assert!(
-            err.to_string().contains("cannot be enforced"),
-            "a malformed config must fail closed: {err}"
-        );
-        Ok(())
-    }
-
-    /// A genuinely-missing config file is NOT an error — no file means no
-    /// `[policy]` block to enforce, so the NotConfigured posture is honest.
-    #[test]
-    fn missing_config_is_permitted_at_gc_backfill_seams() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("does-not-exist.toml");
-        assert!(super::bail_on_config_load_error(&missing, "gc", "plan_x").is_ok());
-    }
-
-    /// A well-formed config (with or without `[policy]`) loads cleanly → no bail.
-    #[test]
-    fn valid_config_passes_the_fail_closed_probe() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        std::fs::write(dir.path().join("rocky.toml"), NO_POLICY_TOML)?;
-        assert!(
-            super::bail_on_config_load_error(&dir.path().join("rocky.toml"), "gc", "plan_x")
-                .is_ok()
-        );
-        Ok(())
-    }
-
     #[test]
     fn evaluate_apply_policy_not_configured_without_block() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -4459,13 +4398,14 @@ auto_create_schemas = true
 "#,
         )
         .unwrap();
+        let loaded = rocky_core::config::load_rocky_config(&config).ok();
         assert_eq!(
-            super::resolve_config_models_dir(&config),
+            super::resolve_config_models_dir(&config, loaded.as_ref()),
             dir.path().join("custom_models")
         );
-        // Missing config → fallback to <project>/models.
+        // Missing config (None snapshot) → fallback to <project>/models.
         assert_eq!(
-            super::resolve_config_models_dir(&dir.path().join("missing.toml")),
+            super::resolve_config_models_dir(&dir.path().join("missing.toml"), None),
             dir.path().join("models")
         );
     }
@@ -4972,14 +4912,15 @@ effect = "deny"
             reviewed_source_schemas: None,
             expects_models: true,
         };
+        let loaded_cfg = rocky_core::config::load_rocky_config(&config)?;
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         let err = ctx
-            .gate_replication_targets(&targets, &ledger)
+            .gate_replication_targets(&targets, &ledger, &loaded_cfg)
             .expect_err("an agent replication under a deny rule must be refused");
         assert!(err.to_string().contains("DENIES"), "got: {err}");
 
         // An empty target set is a no-op (nothing executes).
-        ctx.gate_replication_targets(&BTreeSet::new(), &ledger)
+        ctx.gate_replication_targets(&BTreeSet::new(), &ledger, &loaded_cfg)
             .expect("no targets ⇒ nothing to gate");
         Ok(())
     }
@@ -5019,13 +4960,15 @@ effect = "allow"
             reviewed_source_schemas: None,
             expects_models: true,
         };
+        let loaded_cfg = rocky_core::config::load_rocky_config(&config)?;
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
 
         // Through the held handle → reads fine → allow (no spurious deny).
-        ctx.gate_replication_targets(&targets, &held).expect(
-            "the replication gate must read through the held handle and not spuriously deny \
-             under an `allow` rule",
-        );
+        ctx.gate_replication_targets(&targets, &held, &loaded_cfg)
+            .expect(
+                "the replication gate must read through the held handle and not spuriously deny \
+                 under an `allow` rule",
+            );
 
         // Contrast: the re-open path (evaluate_apply_policy via state_path)
         // DOES fail closed while the handle is held — which is exactly why the
@@ -5068,8 +5011,10 @@ effect = "allow"
             reviewed_source_schemas: None,
             expects_models: true,
         };
+        let loaded_cfg =
+            rocky_core::config::load_rocky_config(&dir.path().join("rocky.toml")).unwrap();
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
-        ctx.gate_replication_targets(&targets, &ledger)
+        ctx.gate_replication_targets(&targets, &ledger, &loaded_cfg)
             .expect("no [policy] block ⇒ replication gate is a no-op");
         Ok(())
     }

@@ -2384,13 +2384,18 @@ impl RockyMcpServer {
                 "Retry the propose; if it persists, verify the project compiles cleanly.",
             )
         })?;
+        // Finding 1: load the config ONCE and thread that snapshot into both the
+        // freeze-gate sync decision and the policy gate, so a `rocky.toml` swap
+        // between the two can't let the guard skip the sync while the gate then
+        // reads stale local decisions.
+        let cfg = rocky_core::config::load_rocky_config(&self.config_path).ok();
         // Finding 4: pull the authoritative remote freeze/budget ledger BEFORE
         // the policy gate reads it, so an active cross-pod freeze denies the
         // propose instead of persisting a plan a later apply would refuse.
         // Fail-closed, remote-only, and only when the gate will actually read the
         // ledger (a `[policy]` block + a non-empty touched set — otherwise the
         // gate short-circuits without a ledger read).
-        if let Ok(cfg) = rocky_core::config::load_rocky_config(&self.config_path)
+        if let Some(cfg) = &cfg
             && cfg.policy.is_some()
             && !touched.is_empty()
             && !matches!(cfg.state.backend, rocky_core::config::StateBackend::Local)
@@ -2405,8 +2410,8 @@ impl RockyMcpServer {
                     )
                 })?;
         }
-        let gate = rocky_cli::commands::evaluate_apply_policy(
-            &self.config_path,
+        let gate = rocky_cli::commands::evaluate_apply_policy_with_policy(
+            cfg.as_ref().and_then(|c| c.policy.as_ref()),
             &plan_id,
             rocky_core::config::PolicyPrincipal::Agent,
             &touched,
