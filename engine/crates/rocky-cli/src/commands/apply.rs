@@ -5267,6 +5267,88 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
+    /// Finding 6 (round-6 false-deny fix) — the true kill-check. Hold ONLY the
+    /// writer lock (not a full `StateStore`), so `open_read_only` still succeeds
+    /// (readable snapshot) while the ledger WRITE open fails — the real
+    /// cross-process contention shape. This isolates the per-winning-rule budget
+    /// scoping (a full `StateStore` would block the reader too and hit the separate
+    /// snapshot-unreadable fail-closed). Ordinary winner + unrelated budget rule
+    /// ⇒ NOT denied; budget winner whose row can't persist ⇒ fail-closed Deny.
+    #[test]
+    fn budget_fail_closed_scoped_to_winning_rule_under_writer_lock() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state.redb");
+        // Seed the store so `open_read_only` has a readable ledger, then release.
+        drop(StateStore::open(&state)?);
+        // Hold ONLY the advisory writer lock (a separate lockfile) — readers skip it.
+        let _lock = rocky_core::state::try_acquire_writer_lock(&state)?;
+        let models = dir.path().join("models");
+        let mut touched = BTreeMap::new();
+        touched.insert("orders".to_string(), PolicyCapability::Apply);
+
+        // (a) `orders` wins under the NON-budget `any` rule; the `payments` budget
+        // rule is unrelated → must NOT fail-closed-deny despite the write-lock.
+        let cfg_a = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { models = ["payments"] }
+effect = "allow"
+autonomy_budget = { failures = 3, window = "7d" }
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+"#,
+        )?;
+        let pol_a = rocky_core::config::load_rocky_config(&cfg_a)?.policy;
+        let gate_a = super::evaluate_apply_policy_with_policy(
+            pol_a.as_ref(),
+            "p",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models,
+            &state,
+        );
+        assert!(
+            !matches!(&gate_a, PolicyGate::Deny { reason, .. } if reason.contains("fail-closed")),
+            "a NON-budget winner must not be fail-closed-denied because an unrelated budget rule \
+             exists for a different target; got {gate_a:?}"
+        );
+
+        // (b) `orders` wins under a BUDGET `any` rule whose decision row can't be
+        // persisted (write-lock held) → fail-closed Deny (durability preserved).
+        let cfg_b = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+autonomy_budget = { failures = 3, window = "7d" }
+"#,
+        )?;
+        let pol_b = rocky_core::config::load_rocky_config(&cfg_b)?.policy;
+        let gate_b = super::evaluate_apply_policy_with_policy(
+            pol_b.as_ref(),
+            "p",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models,
+            &state,
+        );
+        assert!(
+            matches!(&gate_b, PolicyGate::Deny { reason, .. } if reason.contains("fail-closed")),
+            "a BUDGET winner whose decision row can't be persisted must fail closed; got {gate_b:?}"
+        );
+        Ok(())
+    }
+
     /// 🔴 D (DAG) regression: a governed (agent) `--dag` apply is REFUSED,
     /// because the DAG runner dispatches sub-runs with no governance context and
     /// would execute (incl. replication) ungated. Pre-fix an agent dag apply ran
