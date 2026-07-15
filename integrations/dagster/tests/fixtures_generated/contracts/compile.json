@@ -14,6 +14,14 @@
     },
     {
       "severity": "Error",
+      "code": "E012",
+      "message": "column 'order_id' must be non-nullable per contract, but is nullable",
+      "span": null,
+      "model": "broken_metrics",
+      "suggestion": "filter out NULLs (e.g. `WHERE order_id IS NOT NULL`) or COALESCE `order_id` to a default, or relax `nullable = true` in the contract"
+    },
+    {
+      "severity": "Error",
       "code": "E013",
       "message": "protected column 'customer_id' has been removed",
       "span": null,

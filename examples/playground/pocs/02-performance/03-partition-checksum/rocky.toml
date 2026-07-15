@@ -4,21 +4,22 @@
 # raw__orders.orders DuckDB table into a daily fct_daily_orders fact
 # via the @start_date / @end_date placeholder mechanism.
 #
-# The model reads directly from the raw DuckDB table seeded by
-# data/seed.sql, so replication isn't the subject of this demo. The
-# minimal replication pipeline below still runs on each `rocky run`
-# (it copies raw__orders into poc.staging__orders); the interesting
-# work is the transformation models executed via `--models models/`.
+# This POC has no replication step — the model reads directly from a
+# raw DuckDB table seeded by data/seed.sql. We declare a minimal
+# replication pipeline only because rocky.toml requires one; the demo
+# runs the transformation models via `rocky run --models models/`.
 
 [adapter]
 type = "duckdb"
 path = "poc.duckdb"
 
-# A trivial replication pipeline: it runs on each `rocky run` (copying
-# raw__orders into poc.staging__orders). The demo's focus is the
-# transformation models executed via `--models models/`.
+# A trivial replication pipeline. Not exercised by this POC's run.sh,
+# but rocky.toml currently requires a [pipeline.*] block.
 [pipeline.poc]
 strategy = "full_refresh"
+
+[pipeline.poc.source.discovery]
+adapter = "default"
 
 [pipeline.poc.source.schema_pattern]
 prefix = "raw__"

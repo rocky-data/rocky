@@ -14,6 +14,9 @@ path = "playground.duckdb"
 strategy = "full_refresh"
 timestamp_column = "_updated_at"
 
+[pipeline.playground.source.discovery]
+adapter = "default"
+
 [pipeline.playground.source.schema_pattern]
 prefix = "raw__"
 separator = "__"

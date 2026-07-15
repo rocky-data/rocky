@@ -6,6 +6,9 @@ path = "poc.duckdb"
 strategy = "incremental"
 timestamp_column = "occurred_at"
 
+[pipeline.poc.source.discovery]
+adapter = "default"
+
 [pipeline.poc.source.schema_pattern]
 prefix = "raw__"
 separator = "__"
