@@ -22,105 +22,113 @@ Both tools take a set of SQL transformations, organize them into a dependency gr
                      stg_users ───┘
 ```
 
-If you know dbt, the day-to-day loop in Rocky feels familiar: write a model, declare what it depends on, run the pipeline. The difference is what happens **before and during** the run.
+If you know dbt, the day-to-day loop in Rocky feels familiar: write a model, declare what it depends on, run the pipeline. The difference is what each tool understands about the SQL, and what that lets it catch, and when.
 
-## dbt Core: render, run, test afterwards
+## dbt Core: the SQL is rendered text
 
-dbt Core models are SQL strings with Jinja templating in them. dbt's job is to render the templates and submit the results in dependency order. Whether the rendered SQL is *correct* is the warehouse's problem, discovered at runtime:
+dbt Core parses your project before running anything: it resolves every `ref()`, builds the DAG, and fails fast on a reference to a model that doesn't exist. What it does *not* do is read the SQL inside each model. A model is a Jinja template that renders to a string, and whether that string is correct is discovered when the warehouse executes it:
 
 ```
  your SQL + Jinja
         │
         ▼
- ┌──────────────┐    "did the template render? ship it."
- │    render    │
- │   templates  │
- └──────┬───────┘
+ ┌──────────────┐    parse the project: resolve refs,
+ │   parse &    │    build the DAG. broken refs fail
+ │    render    │    here — but the SQL inside each
+ └──────┬───────┘    model stays opaque, rendered text
         ▼
- ┌──────────────┐    the warehouse finds the problems:
- │  run against │──▶ ✗ type mismatch, missing column,
- │   warehouse  │      broken ref — discovered mid-run
- └──────┬───────┘
+ ┌──────────────┐    the warehouse finds the SQL-level
+ │  run against │──▶ problems: ✗ misspelled column,
+ │   warehouse  │    ✗ type mismatch, ✗ silent
+ └──────┬───────┘    double-count — discovered mid-run
         ▼
- ┌──────────────┐
- │   dbt test   │──▶ the data is already built; tests
- │  (after the  │    inspect the damage after the fact
- │     fact)    │
- └──────────────┘
+ ┌──────────────┐    data tests run right after each
+ │     test     │    model builds and can skip its
+ │ (built data) │    downstream — but the bad table
+ └──────────────┘    itself is already materialized
 ```
 
-## Rocky: compile first, then run
+Two fairness notes. Since dbt 1.5, a model can declare an **enforced contract** (its output column names and types), checked when that model is built. And `dbt build` interleaves tests with models in DAG order, so an error-severity test failure stops downstream models from building. Both help; neither reads the SQL. A misspelled column, a type mismatch inside a join, or a `SELECT *` that pulls a column nobody designed for still surfaces in the warehouse, against data.
 
-Rocky parses your SQL (plain SQL, no Jinja) and builds a typed model of the entire pipeline: every model's columns, their types, and how each column flows into the next model. That whole program is checked before anything touches the warehouse:
+## Rocky: the SQL is a typed program
+
+Rocky reads the SQL itself. No Jinja: models are plain SQL, and the compiler parses each one, infers the columns and types it produces, and tracks how every column flows into the next model across the whole DAG. Statically detectable mistakes become compile errors before any model is materialized:
 
 ```
  your SQL (plain SQL, first-class)
         │
         ▼
- ┌──────────────┐    the compiler knows every model's
- │   compile    │    schema and types:
- │  the whole   │──▶ ✗ column renamed upstream?
- │   pipeline   │    ✗ type mismatch across models?
- └──────┬───────┘    ✗ contract violated?
-        │            caught here — nothing has run yet
-        │ only if everything checks out
+ ┌──────────────┐    the compiler reads the SQL and
+ │   compile    │    tracks columns + types across
+ │  the whole   │──▶ the DAG: ✗ misspelled column?
+ │   pipeline   │    ✗ type mismatch? ✗ contract
+ └──────┬───────┘    violated? caught here — no
+        │            model has been materialized
+        │ compile errors block the run
         ▼
- ┌──────────────┐
- │  run against │──▶ drift, quality checks, and cost
- │   warehouse  │    budgets enforced as gates during
- └──────────────┘    the run
+ ┌──────────────┐    during the run: replication drift
+ │  run against │    is handled, quality checks report
+ │   warehouse  │    into typed output, cost is recorded
+ └──────────────┘    per model
 ```
+
+The compiler is honest about its limits: a type it can't infer is tracked as `Unknown` rather than guessed, and what it can't prove statically still surfaces at runtime like anywhere else. See [The Compiler](/concepts/compiler/) for exactly what each pass checks.
 
 The mental model in one picture:
 
 ```
        dbt Core                      Rocky
  ┌───────────────────┐      ┌───────────────────┐
- │   SQL templates   │      │   typed program   │
+ │  rendered text    │      │   typed program   │
  │                   │      │                   │
- │  "trust me, run   │      │ "prove it works,  │
- │   it and we'll    │      │   then run it"    │
- │   test later"     │      │                   │
+ │  the graph is     │      │  the graph AND    │
+ │  understood; the  │      │  the SQL inside   │
+ │  SQL inside is    │      │  it are checked   │
+ │  trusted          │      │  before running   │
  └───────────────────┘      └───────────────────┘
-   errors surface at          errors surface at
-   RUNTIME, in your           COMPILE TIME, as
-   data                       diagnostics in CI
+   SQL-level errors           statically detectable
+   surface at RUNTIME,        errors surface at
+   in your data               COMPILE TIME, in CI
 ```
 
-## Example: a source column changes
+## Example: a source column changes type
 
-A source team renames `user_id` to `customer_id`, or an upstream loader changes a column's type. Nothing in your repo changed, so a code diff can't see it:
+An upstream loader changes a column: yesterday `order_id` was `INT`, today it arrives as `BIGINT` (or worse, `STRING`). Nothing in your repo changed, so a code diff can't see it:
 
 ```
  dbt Core:
-   source changes ──▶ pipeline runs ──▶ ✗ breaks mid-run, or worse:
-                                          silently builds wrong data
+   source changes ──▶ pipeline runs ──▶ ✗ fails mid-run, or quietly
+                                          builds on the changed type
 
- Rocky:
-   source changes ──▶ drift detected ──▶ ✋ handled at the gate:
-                                           safe widenings evolve in
-                                           place; unsafe changes get
-                                           a deliberate rebuild, not
-                                           a silent one
+ Rocky (replication pipelines):
+   source changes ──▶ drift check ──▶ safe widening (INT → BIGINT):
+                                      target evolved in place with
+                                      ALTER TABLE, data preserved
+
+                                      incompatible change (INT → STRING):
+                                      a deliberate, logged rebuild —
+                                      not a quiet divergence
 ```
 
-Rocky checks the warehouse's *actual* schema against what your models expect on every run. Safe type widenings (like `INT` to `BIGINT`) are evolved in place; unsafe changes trigger a controlled rebuild instead of a quiet divergence. See [Schema Drift](/concepts/schema-drift/) for the full graduated-evolution policy. None of the dbt engines detect this today (see the [drift table](/getting-started/comparison/#schema-drift-detection)).
+On replication runs, Rocky compares the source table's actual schema against the target table it maintains, and resolves mismatches with a graduated policy: safe type widenings are applied in place, incompatible changes trigger a controlled rebuild, and either way the action is recorded in the run output instead of happening silently. See [Schema Drift](/concepts/schema-drift/) for the policy details. None of the dbt engines detect this today (see the [drift table](/getting-started/comparison/#schema-drift-detection)).
 
 ## What about dbt Fusion?
 
 Fusion is dbt's Rust engine, and its SQL-comprehension layer genuinely closes part of the compile-time gap: in its opt-in `strict` mode it type-checks SQL and computes column-level lineage. Rocky does not claim those as differentiators against Fusion.
 
-The durable difference is what happens *around* the compiler. Rocky treats the run itself as something to enforce and record, not just execute:
+The durable difference is what happens *around* the compiler. Rocky treats the run itself as something to check, record, and optionally gate, not just execute:
 
 ```
              ┌────────────────────────────────────────┐
-   your ───▶ │ COMPILE  types · contracts · lineage · │──▶ ✗ fails CI
-   code      │          dialect-portability lint      │
+   your ───▶ │ COMPILE  types · contracts · lineage · │──▶ ✗ errors
+   code      │          dialect-portability lint      │      fail CI
              └───────────────────┬────────────────────┘
                                  ▼
              ┌────────────────────────────────────────┐
-             │ RUN      drift gate · quality checks · │──▶ ✗ blocks the
-             │          [budget] fails on overspend   │      build
+             │ RUN      drift handled · quality       │──▶ gates when
+             │          checks reported · [budget]    │    configured
+             │          overspend warns, or fails the │    to error
+             │          run with on_breach = "error"  │
              └───────────────────┬────────────────────┘
                                  ▼
              ┌────────────────────────────────────────┐
@@ -130,11 +138,11 @@ The durable difference is what happens *around* the compiler. Rocky treats the r
              └────────────────────────────────────────┘
 ```
 
-Concretely, on top of the compiler Rocky ships: cost budgets that fail the build (no dbt distribution fails a run on overspend), schema-drift detection, declarative governance as Apache-2.0 code (RBAC diffing, masking bound to classification tags), a dialect-portability lint, named branches as a first-class primitive, and a content-addressed record of every run. And there is no Jinja anywhere: your models stay plain SQL. The [Feature Comparison](/getting-started/comparison/) has the precise per-engine breakdown, including where Fusion and SQLMesh are ahead.
+Concretely, on top of the compiler Rocky ships: per-model cost on every run plus `[budget]` blocks that can fail the run on overspend (no dbt distribution fails a run on overspend), schema-drift detection, declarative governance as Apache-2.0 code (RBAC diffing, masking bound to classification tags, with `rocky compliance --fail-on exception` as the CI gate), a dialect-portability lint, named branches as a first-class primitive, and a content-addressed record of every run. Quality checks run inline during replication and land in the typed run output with a severity, so CI and orchestrators gate on them rather than re-deriving state from logs. And there is no Jinja anywhere: your models stay plain SQL. The [Feature Comparison](/getting-started/comparison/) has the precise per-engine breakdown, including where Fusion and SQLMesh are ahead.
 
 ## One binary, typed outputs
 
-dbt Core is a Python package; you install it into an environment and parse its logs and artifacts. Rocky is a single Rust binary whose every command emits versioned, typed JSON, which is what the surrounding tooling is built on:
+dbt Core is a Python package; you install it into an environment and parse its logs and artifacts. Rocky is a single Rust binary, and every command that supports `--output json` emits a typed, schema-backed payload, which is what the surrounding tooling is built on:
 
 ```
  ┌────────────┐  ┌───────────┐  ┌───────────┐
@@ -154,10 +162,10 @@ Startup is milliseconds and a 10,000-model project compiles in about a second; s
 
 ## The short version
 
-Same job: run SQL pipelines in dependency order. Different philosophy:
+Same job: run SQL pipelines in dependency order. Different unit of understanding:
 
-- **dbt Core** renders templates and lets problems surface in the warehouse, then tests the built data.
-- **Rocky** compiles the pipeline as a typed program, refuses to run what it can't verify, and enforces drift, quality, cost, and governance gates on the runs it does allow.
+- **dbt Core** understands your project's *graph* — refs, DAG order, and (since 1.5) per-model contract declarations — but the SQL inside each model is rendered text, so SQL-level problems surface in the warehouse, and tests catch them after the model is built.
+- **Rocky** understands the *SQL itself* — it compiles the pipeline as a typed program, blocks statically detectable errors before any model is materialized, handles source-schema drift on replication runs, and records checks and per-model cost on every run, with budgets and compliance gates you can configure to fail CI.
 
 Where to go next:
 
