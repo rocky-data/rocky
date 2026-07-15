@@ -171,7 +171,7 @@ Startup is milliseconds and a 10,000-model project compiles in about a second; s
 Same job: run SQL pipelines in dependency order. Different unit of understanding:
 
 - **dbt Core** understands your project's *graph* — refs, DAG order, and (since 1.5) per-model contract declarations — but the SQL inside each model is rendered text, so SQL-level problems surface in the warehouse, with tests catching what they're written to cover as models build.
-- **Rocky** understands the *SQL itself* — it compiles the pipeline as a typed program, blocks statically detectable errors before any model is materialized, detects source-schema drift on replication runs, and records checks and per-model cost on every run, with budgets and compliance gates you can configure to fail CI.
+- **Rocky** understands the *SQL itself* — it compiles the pipeline as a typed program, blocks statically detectable errors before any model is materialized, detects source-schema drift on replication runs, and records check results and per-model cost in the run output, with budgets and compliance gates you can configure to fail CI.
 
 Where to go next:
 
