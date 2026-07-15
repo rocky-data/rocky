@@ -75,7 +75,13 @@ fn install_aws_env(endpoint: &str) {
 
 fn write_stub_state(dir: &Path) -> std::path::PathBuf {
     let path = dir.join("state.redb");
-    std::fs::write(&path, b"stub state bytes for upload test").unwrap();
+    // A VALID redb state file (not arbitrary bytes): `upload_state` filters the
+    // local-only tables through a real redb copy before uploading, and that
+    // filter is fail-closed on a non-redb file. These tests exercise the upload
+    // *transport* (timeout / retry / success), so the payload must be a genuine
+    // state store — opening one creates the expected empty tables.
+    let store = rocky_core::state::StateStore::open(&path).expect("open stub state store");
+    drop(store);
     path
 }
 

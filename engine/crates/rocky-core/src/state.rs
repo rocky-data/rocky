@@ -174,6 +174,14 @@ const POLICY_DECISIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("pol
 /// serialized [`PersistedJob`]. Persisting job status here (rather than
 /// in-memory only) is what lets a killed-and-restarted sidecar report honest
 /// status for jobs it launched instead of a blank slate.
+///
+/// **Local-only** (listed in [`LOCAL_ONLY_TABLE_NAMES`], unlike the governance
+/// ledgers above): job records are ephemeral *per-node* server state, scoped to
+/// the lifetime of one `rocky serve` process and its restart sweep. `serve` is
+/// long-running, so per-job remote round-trips would be impractical, and a job
+/// launched on one pod is meaningless to another. Replicating it would let one
+/// server's stale `jobs` rows overwrite another's — so it is deliberately
+/// excluded from the remote state snapshot.
 const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
 /// Eviction custody ledger for `rocky gc` — one row per artifact retired
 /// from the [`OUTPUT_ARTIFACTS`] ledger.
@@ -203,7 +211,12 @@ const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 /// Kept alongside the table definitions so the replicate-posture decision
 /// travels with the table name — adding a new local-only table is a
 /// one-place edit instead of "grep the whole crate for replicate lists".
-pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
+///
+/// - `schema_cache` — machine-local cached warehouse types (a fresh clone must
+///   not inherit another machine's stale types).
+/// - `jobs` — ephemeral per-node `rocky serve` job records (see [`JOBS`]). Not
+///   a governance ledger; replicating it across pods would clobber peers.
+pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache", "jobs"];
 
 /// Schema version for the current set of state tables.
 ///
@@ -400,12 +413,57 @@ impl From<redb::TransactionError> for StateError {
     }
 }
 
+/// A held exclusive advisory writer lock on `<path>.redb.lock` — the SAME lock
+/// [`StateStore::open`] takes for the lifetime of a writer. Dropping it releases
+/// the lock.
+///
+/// Exposed so `state_sync::download_state` can serialize its atomic publish
+/// (rename of the state file into place) with StateStore writers and with a
+/// concurrent download's publish on the same namespace. The lock is a *separate*
+/// lockfile, never the state file itself, so renaming the state file while
+/// holding it is sound.
+pub struct StateWriterLock {
+    _file: File,
+}
+
+/// Try to acquire the exclusive advisory writer lock for the state file at
+/// `path`, WITHOUT blocking.
+///
+/// Returns [`StateError::LockHeldByOther`] if another writer (a live
+/// [`StateStore`] or a concurrent publish) already holds it. The flock is
+/// OS-level and cross-process, so a second process is genuinely serialized. The
+/// lock lives on `<path>.redb.lock` (never the state file), so the caller may
+/// atomically `rename` a new state file into `path` while holding this guard.
+pub fn try_acquire_writer_lock(path: &Path) -> Result<StateWriterLock, StateError> {
+    let lock_path = path.with_extension("redb.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| StateError::LockIo {
+            path: lock_path.display().to_string(),
+            source: e,
+        })?;
+    FileExt::try_lock(&file).map_err(|e| match e {
+        fs4::TryLockError::WouldBlock => StateError::LockHeldByOther {
+            path: path.display().to_string(),
+        },
+        fs4::TryLockError::Error(source) => StateError::LockIo {
+            path: lock_path.display().to_string(),
+            source,
+        },
+    })?;
+    Ok(StateWriterLock { _file: file })
+}
+
 /// Embedded state store backed by redb for tracking watermarks and run history.
 pub struct StateStore {
     db: Database,
-    // Held exclusive advisory lock on `<path>.lock`. `None` for read-only opens.
-    // Released automatically when the `File` is dropped.
-    _lock_file: Option<File>,
+    // Held exclusive advisory lock on `<path>.redb.lock`. `None` for read-only
+    // opens. Released automatically when the guard (and its `File`) is dropped.
+    _lock: Option<StateWriterLock>,
     // `true` when this store was opened against a forward-incompatible on-disk
     // schema under [`SchemaMismatchPolicy::Recreate`] and the local file was
     // bootstrapped fresh. The run path reads this via
@@ -435,6 +493,27 @@ enum InitOutcome {
     RecreateForwardIncompat { found: u32 },
 }
 
+/// How a store is being opened. Controls two coupled decisions in
+/// [`StateStore::open_inner`] / [`StateStore::init_db`]: whether to take the
+/// advisory write lock, and whether `init_db` may **stamp/upgrade** the
+/// `schema_version` metadata.
+///
+/// A [`ReadOnly`][OpenMode::ReadOnly] open (inspection commands, the LSP, server
+/// read APIs) must be side-effect-free with respect to the version stamp: it
+/// still materializes the tables the read methods require, but it must NOT bump
+/// a store written by an older binary forward to [`CURRENT_SCHEMA_VERSION`].
+/// Stamping on a read would let a `rocky state show` silently rewrite the very
+/// version it is reporting, and would defeat forward/backward-compat probes that
+/// depend on the on-disk version staying put until a real write occurs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    /// Read-write open: take the advisory lock and stamp/upgrade the version.
+    ReadWrite,
+    /// Read-only open: no advisory lock, and never stamp/upgrade the version
+    /// (tables are still created so read methods work).
+    ReadOnly,
+}
+
 impl StateStore {
     /// Opens or creates a state store at the given path for **writing**.
     ///
@@ -453,7 +532,7 @@ impl StateStore {
     /// binary (stored > current) an error is returned immediately so that the
     /// caller can surface a clear message rather than silently misreading data.
     pub fn open(path: &Path) -> Result<Self, StateError> {
-        Self::open_inner(path, true, SchemaMismatchPolicy::Fail)
+        Self::open_inner(path, OpenMode::ReadWrite, SchemaMismatchPolicy::Fail)
     }
 
     /// Opens or creates a state store for **writing** with an explicit
@@ -472,7 +551,7 @@ impl StateStore {
     /// `[state] on_schema_mismatch`); every other caller uses the hard-fail
     /// default via [`open`][Self::open].
     pub fn open_with_policy(path: &Path, policy: SchemaMismatchPolicy) -> Result<Self, StateError> {
-        Self::open_inner(path, true, policy)
+        Self::open_inner(path, OpenMode::ReadWrite, policy)
     }
 
     /// Opens an existing state store for **read-only** access.
@@ -492,7 +571,7 @@ impl StateStore {
     /// millisecond-scale collisions the LSP creates on every debounced
     /// keystroke.
     pub fn open_read_only(path: &Path) -> Result<Self, StateError> {
-        Self::open_inner(path, false, SchemaMismatchPolicy::Fail)
+        Self::open_inner(path, OpenMode::ReadOnly, SchemaMismatchPolicy::Fail)
     }
 
     /// Reads the schema version stamped in an on-disk state file **without**
@@ -551,44 +630,25 @@ impl StateStore {
 
     fn open_inner(
         path: &Path,
-        lock: bool,
+        mode: OpenMode,
         policy: SchemaMismatchPolicy,
     ) -> Result<Self, StateError> {
         // Acquire the advisory lock BEFORE opening the database — otherwise two
         // concurrent writers could both pass `Database::create` before either
-        // of them reaches the lock check.
-        let lock_file = if lock {
-            let lock_path = path.with_extension("redb.lock");
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&lock_path)
-                .map_err(|e| StateError::LockIo {
-                    path: lock_path.display().to_string(),
-                    source: e,
-                })?;
-            FileExt::try_lock(&file).map_err(|e| match e {
-                fs4::TryLockError::WouldBlock => StateError::LockHeldByOther {
-                    path: path.display().to_string(),
-                },
-                fs4::TryLockError::Error(source) => StateError::LockIo {
-                    path: lock_path.display().to_string(),
-                    source,
-                },
-            })?;
-            Some(file)
+        // of them reaches the lock check. Read-only opens skip the lock. Shared
+        // with `state_sync`'s publish path via [`try_acquire_writer_lock`].
+        let lock = if matches!(mode, OpenMode::ReadWrite) {
+            Some(try_acquire_writer_lock(path)?)
         } else {
             None
         };
 
         let db = open_redb_with_retry(path)?;
 
-        match Self::init_db(&db, path, policy)? {
+        match Self::init_db(&db, path, mode, policy)? {
             InitOutcome::Ready => Ok(StateStore {
                 db,
-                _lock_file: lock_file,
+                _lock: lock,
                 recreated_for_forward_incompat: false,
             }),
             InitOutcome::RecreateForwardIncompat { found } => {
@@ -627,10 +687,10 @@ impl StateStore {
                     });
                 }
                 let db = open_redb_with_retry(path)?;
-                match Self::init_db(&db, path, policy)? {
+                match Self::init_db(&db, path, mode, policy)? {
                     InitOutcome::Ready => Ok(StateStore {
                         db,
-                        _lock_file: lock_file,
+                        _lock: lock,
                         recreated_for_forward_incompat: true,
                     }),
                     // A file we just created cannot carry a newer schema version.
@@ -654,11 +714,20 @@ impl StateStore {
     /// when the on-disk version is newer than this binary supports **and** the
     /// policy is [`SchemaMismatchPolicy::Recreate`]; under
     /// [`SchemaMismatchPolicy::Fail`] the same condition returns
-    /// [`StateError::SchemaMismatch`]. Otherwise stamps/upgrades the version,
-    /// creates the tables, commits, and returns [`InitOutcome::Ready`].
+    /// [`StateError::SchemaMismatch`]. Otherwise creates the tables, commits,
+    /// and returns [`InitOutcome::Ready`].
+    ///
+    /// The `schema_version` stamp/upgrade is written **only** under
+    /// [`OpenMode::ReadWrite`]. A [`OpenMode::ReadOnly`] open still creates the
+    /// tables (read methods require them) but leaves the on-disk version
+    /// untouched — it never bumps an older store forward and never downgrades.
+    /// The forward-incompatible check (`found > CURRENT`) runs in **both** modes,
+    /// so a read-only open of a newer store still fails with
+    /// [`StateError::SchemaMismatch`] rather than silently misreading it.
     fn init_db(
         db: &Database,
         path: &Path,
+        mode: OpenMode,
         policy: SchemaMismatchPolicy,
     ) -> Result<InitOutcome, StateError> {
         let txn = db.begin_write()?;
@@ -692,14 +761,21 @@ impl StateStore {
                         };
                     }
                     // Upgrade stamp so future migrations can branch on
-                    // the actual version stored on disk.
-                    if found < CURRENT_SCHEMA_VERSION {
+                    // the actual version stored on disk. Read-only opens must
+                    // NOT bump the on-disk version — inspection is side-effect
+                    // free with respect to the stamp.
+                    if found < CURRENT_SCHEMA_VERSION && matches!(mode, OpenMode::ReadWrite) {
                         metadata.insert("schema_version", &*CURRENT_SCHEMA_VERSION.to_string())?;
                     }
                 }
                 None => {
-                    // Fresh database or pre-versioning database — stamp the version.
-                    metadata.insert("schema_version", &*CURRENT_SCHEMA_VERSION.to_string())?;
+                    // Fresh database or pre-versioning database — stamp the
+                    // version, but only on a read-write open. A read-only open
+                    // leaves an unversioned store unstamped (tables are still
+                    // created below so read methods work).
+                    if matches!(mode, OpenMode::ReadWrite) {
+                        metadata.insert("schema_version", &*CURRENT_SCHEMA_VERSION.to_string())?;
+                    }
                 }
             }
 
@@ -6879,6 +6955,46 @@ mod tests {
     /// and raced the opener's 5×50ms≈250ms budget; under uneven CI load the
     /// holder thread could be starved past the opener's last attempt, so the
     /// opener gave up with `Busy` and the test flaked.
+    /// Finding B: the advisory writer lock `state_sync::download_state` takes for
+    /// its publish is the SAME cross-acquire lock `StateStore::open` holds. A
+    /// second acquire fails while a live writer holds it (so a concurrent
+    /// download can't `rename` over a live writer's file), and the guard releases
+    /// the lock on drop.
+    #[test]
+    fn try_acquire_writer_lock_is_exclusive_and_releases() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+
+        // A live writer store holds the lock — a second acquire must fail.
+        let store = StateStore::open(&path).unwrap();
+        assert!(
+            matches!(
+                super::try_acquire_writer_lock(&path),
+                Err(StateError::LockHeldByOther { .. })
+            ),
+            "a second writer-lock acquire must fail while a live StateStore holds it"
+        );
+
+        // Released when the store drops → acquire succeeds.
+        drop(store);
+        let guard = super::try_acquire_writer_lock(&path)
+            .expect("the writer lock must be free once the store is dropped");
+
+        // The guard itself is exclusive while held, and frees the lock on drop.
+        assert!(
+            matches!(
+                super::try_acquire_writer_lock(&path),
+                Err(StateError::LockHeldByOther { .. })
+            ),
+            "the guard must hold the lock exclusively"
+        );
+        drop(guard);
+        assert!(
+            super::try_acquire_writer_lock(&path).is_ok(),
+            "the guard must release the lock on drop"
+        );
+    }
+
     #[test]
     fn open_read_only_retries_and_succeeds_after_brief_hold() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8023,6 +8139,79 @@ mod tests {
             "got {err:?}"
         );
         // The file still carries the newer stamp — Fail does not mutate it.
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION + 1)
+        );
+    }
+
+    /// R1: a **read-only** open must NOT bump the on-disk `schema_version` stamp.
+    /// Inspection commands (`rocky state`, LSP, server read APIs) route through
+    /// `open_read_only`; before the fix its `init_db` call stamped the store
+    /// forward to `CURRENT_SCHEMA_VERSION` in a write txn, silently rewriting the
+    /// very version a `rocky state show` reports. Post-fix the stamp is skipped
+    /// while the tables are still created so read methods work.
+    #[test]
+    fn open_read_only_does_not_bump_schema_version_stamp() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        // Create a real store (stamps CURRENT), then force it back to an OLDER
+        // version to simulate a store written by a previous binary.
+        drop(StateStore::open(&path).unwrap());
+        let older = (CURRENT_SCHEMA_VERSION - 1).to_string();
+        force_schema_version(&path, &older);
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION - 1),
+            "precondition: the store is stamped at the older version"
+        );
+
+        // Read-only open must leave the stamp untouched...
+        {
+            let store = StateStore::open_read_only(&path).unwrap();
+            // ...and read methods still work (tables exist).
+            assert!(
+                store.get_watermark("cat.sch.tbl").unwrap().is_none(),
+                "a read method must succeed against the read-only store (tables were created)"
+            );
+        }
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION - 1),
+            "read-only open must NOT bump the on-disk schema_version stamp"
+        );
+
+        // Contrast: a read-WRITE open still upgrades the stamp (no regression to
+        // the fresh-store / upgrade bootstrap).
+        drop(StateStore::open(&path).unwrap());
+        assert_eq!(
+            StateStore::peek_schema_version(&path).unwrap(),
+            Some(CURRENT_SCHEMA_VERSION),
+            "a read-write open must still upgrade an older stamp forward"
+        );
+    }
+
+    /// R1: a forward-incompatible store (found > CURRENT) opened read-only must
+    /// still fail with `SchemaMismatch` — skipping the stamp must not weaken the
+    /// forward-compat guard into silently misreading newer state.
+    #[test]
+    fn open_read_only_still_rejects_forward_incompat() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).unwrap());
+        let future = (CURRENT_SCHEMA_VERSION + 1).to_string();
+        force_schema_version(&path, &future);
+
+        let err = match StateStore::open_read_only(&path) {
+            Ok(_) => panic!("expected SchemaMismatch on a forward-incompatible read-only open"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, StateError::SchemaMismatch { found, expected, .. }
+                if found == CURRENT_SCHEMA_VERSION + 1 && expected == CURRENT_SCHEMA_VERSION),
+            "got {err:?}"
+        );
+        // Still not mutated.
         assert_eq!(
             StateStore::peek_schema_version(&path).unwrap(),
             Some(CURRENT_SCHEMA_VERSION + 1)

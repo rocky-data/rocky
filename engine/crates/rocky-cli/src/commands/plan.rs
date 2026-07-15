@@ -1027,6 +1027,13 @@ pub fn compute_embedded_capabilities(
         .as_ref()
         .map(crate::commands::apply::governance_policy_identity)
         .unwrap_or_default();
+    // Execution-control identity (#1095(a)): `[run]`/`[reuse]`/`[resilience]`,
+    // symmetric with the apply choke-point. (Hooks are refused under a governed
+    // apply, #1095(c), not bound here.)
+    let exec_control_identity = loaded_cfg
+        .as_ref()
+        .map(crate::commands::apply::execution_control_identity)
+        .unwrap_or_default();
     // The env-resolved mask (finding C): the extras restrict it to the executed
     // models' classification tags. `env` is the plan's `--env`, so apply resolves
     // the same masks the reviewed env will apply.
@@ -1108,6 +1115,7 @@ pub fn compute_embedded_capabilities(
         &head.project.models,
         &identity,
         &governance_identity,
+        &exec_control_identity,
         &extras,
     );
 

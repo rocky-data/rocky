@@ -160,11 +160,37 @@ fn cloud_provider(
 #[cfg(test)]
 mod test_support {
     use super::ObjectStoreProvider;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     thread_local! {
         static PROVIDER_OVERRIDE: RefCell<Option<ObjectStoreProvider>> =
             const { RefCell::new(None) };
+        /// One-shot fault: make the next object-store existence probe error.
+        static OBJECT_STORE_EXISTS_FAULT: Cell<bool> = const { Cell::new(false) };
+        /// One-shot fault: make the next Valkey download report a MISS.
+        static VALKEY_MISS_FAULT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Arm a one-shot fault so the next `probe_exists` returns `Err`. Consumed
+    /// (cleared) on read so it can't leak into a later leg/test on this thread.
+    pub(super) fn arm_object_store_exists_fault() {
+        OBJECT_STORE_EXISTS_FAULT.with(|c| c.set(true));
+    }
+
+    /// Read-and-clear the object-store existence fault.
+    pub(super) fn take_object_store_exists_fault() -> bool {
+        OBJECT_STORE_EXISTS_FAULT.with(|c| c.replace(false))
+    }
+
+    /// Arm a one-shot fault so the next `download_from_valkey` reports a MISS
+    /// (`Absent`) without touching a live Valkey peer.
+    pub(super) fn arm_valkey_miss_fault() {
+        VALKEY_MISS_FAULT.with(|c| c.set(true));
+    }
+
+    /// Read-and-clear the Valkey-miss fault.
+    pub(super) fn take_valkey_miss_fault() -> bool {
+        VALKEY_MISS_FAULT.with(|c| c.replace(false))
     }
 
     /// Install `provider` as the next provider [`super::cloud_provider`] hands
@@ -185,10 +211,12 @@ mod test_support {
         PROVIDER_OVERRIDE.with(|cell| cell.borrow().clone())
     }
 
-    /// Clear any installed override so it can't leak into a later test on the
-    /// same thread.
+    /// Clear any installed override and armed faults so nothing leaks into a
+    /// later test on the same worker thread.
     pub(super) fn clear() {
         PROVIDER_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        OBJECT_STORE_EXISTS_FAULT.with(|c| c.set(false));
+        VALKEY_MISS_FAULT.with(|c| c.set(false));
     }
 }
 
@@ -197,32 +225,395 @@ fn transfer_timeout(config: &StateConfig) -> Duration {
     Duration::from_secs(config.transfer_timeout_seconds)
 }
 
+/// Outcome of a remote-state download leg.
+///
+/// The distinction is load-bearing for the **tiered** backend: a Valkey
+/// [`Absent`][DownloadOutcome::Absent] (cache miss) must fall through to the
+/// durable S3 tier, whereas a [`Restored`][DownloadOutcome::Restored] (the leg
+/// wrote the local file) short-circuits. Deciding hit-vs-miss on an explicit
+/// return value — rather than the old `local_path.exists()` heuristic — is what
+/// stops a **pre-existing stale local file** from masquerading as a Valkey hit
+/// and starving the S3 fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadOutcome {
+    /// The leg found remote state and wrote it to the local path.
+    Restored,
+    /// No remote state existed for this key (a legit fresh start).
+    Absent,
+}
+
 /// Downloads state from remote storage to a local file before a run.
+///
+/// A missing remote object is **non-fatal** (`Ok(())`, a fresh start). A real
+/// download/existence-check *failure* is **propagated** as `Err` so the caller
+/// can fail closed — see [`download_from_object_store`].
+///
+/// # Local-only-preserving merge (findings 6 + 7)
+///
+/// A remote download REPLACES the replicated tables wholesale: a
+/// [`DownloadOutcome::Restored`] overwrites the file, and a
+/// [`DownloadOutcome::Absent`] would otherwise leave a *stale* local file
+/// authoritative. Neither may be allowed to disturb the machine-local tables in
+/// [`crate::state::LOCAL_ONLY_TABLE_NAMES`] (`jobs`, `schema_cache`), which are
+/// stripped from the remote copy on upload and so never travel back down:
+///
+/// - **Restored** — the local file is replaced by the remote (which carries the
+///   authoritative replicated tables but *no* local-only tables). The local-only
+///   tables are snapshotted **before** the download and spliced back in
+///   afterwards, so `jobs` / `schema_cache` survive a download that replaces the
+///   replicated tables.
+/// - **Absent** — no remote object exists for this key. For a REMOTE backend the
+///   replicated tables must become **fresh** (empty) — a switch to an empty
+///   prefix must not keep stale watermarks (finding 6) — while the local-only
+///   tables are preserved. The pre-download snapshot already holds *only* the
+///   local-only tables, so promoting it to the authoritative file both clears
+///   the replicated tables and keeps `jobs` / `schema_cache`.
+///
+/// The **Local** backend performs no transfer, so there is nothing to replace
+/// and nothing to preserve — it delegates straight to [`download_state_inner`].
+///
+/// ## Crash safety + fail-closed (finding 5)
+///
+/// The remote content is downloaded into a STAGING file beside `local_path`; the
+/// local-only tables are merged into that staging file, and only then is the
+/// COMPLETE merged db published to `local_path` with a single atomic `rename`.
+/// So `local_path` is never left holding remote content *without* its local-only
+/// tables — a crash before the rename leaves the prior local file fully intact.
+/// A merge / publish failure is **fail-closed** (propagated as `Err` after a
+/// bounded retry on transient redb open contention).
+///
+/// ## Publish serialization (finding B)
+///
+/// The download itself runs **without** any lock (it is network I/O). The
+/// snapshot-of-local-only + merge + atomic publish then run **while holding the
+/// same advisory writer lock [`StateStore::open`] takes**
+/// ([`crate::state::try_acquire_writer_lock`]), and the lock is released before
+/// this returns so the caller's `StateStore::open` can re-acquire it. This
+/// serializes the publish with any concurrent StateStore writer and with another
+/// download's publish on the same namespace, so a late `rename` can never clobber
+/// a live writer's file. Crucially, the local-only tables are re-read from the
+/// CURRENT local file *under the lock*, so a concurrent run's just-committed
+/// `jobs` are captured rather than lost.
 pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
+    let remote_key = remote_state_key(local_path);
+
+    // Local backend never replaces the file — nothing to stage, merge, or lock.
+    if matches!(config.backend, StateBackend::Local) {
+        download_state_inner(config, local_path, &remote_key).await?;
+        return Ok(());
+    }
+
+    // 1. Download the remote into a STAGING file (no lock). `local_path` is left
+    //    untouched; `Absent` leaves the staging file unwritten.
+    let scratch_dir = sibling_scratch_dir(local_path);
+    let staged = unique_scratch_path(&scratch_dir, "download");
+    let outcome = match download_state_inner(config, &staged, &remote_key).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e);
+        }
+    };
+
+    // 2. Acquire the StateStore writer lock so the snapshot + merge + publish
+    //    serialize with concurrent writers/publishes (finding B). Released on
+    //    drop, before this function returns.
+    let lock = match acquire_publish_lock(local_path).await {
+        Ok(lock) => lock,
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e);
+        }
+    };
+
+    // 3. Under the lock: re-read the CURRENT local-only tables, merge them into
+    //    the candidate db, and publish atomically.
+    let result = publish_merged(&staged, local_path, outcome).await;
+
+    drop(lock);
+    let _ = std::fs::remove_file(&staged);
+    result
+}
+
+/// Acquire the StateStore writer lock for `local_path` (the same lock
+/// `StateStore::open` takes), retrying briefly on contention before failing
+/// closed. Serializes the download's atomic publish with StateStore writers and
+/// with a concurrent download (finding B).
+async fn acquire_publish_lock(
+    local_path: &Path,
+) -> Result<crate::state::StateWriterLock, StateSyncError> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last: Option<crate::state::StateError> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match crate::state::try_acquire_writer_lock(local_path) {
+            Ok(lock) => return Ok(lock),
+            Err(e) => {
+                last = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(20 * u64::from(attempt))).await;
+                }
+            }
+        }
+    }
+    Err(StateSyncError::Io(std::io::Error::other(format!(
+        "could not acquire the state writer lock to publish downloaded state \
+         (another writer holds it): {}",
+        last.expect("retry loop runs at least once")
+    ))))
+}
+
+/// Build the merged candidate db and publish it to `local_path` with a single
+/// atomic `rename` — MUST be called while holding the writer lock (finding B).
+///
+/// The local-only tables are read from the CURRENT `local_path` here (not a
+/// pre-download snapshot), so a concurrent run's just-committed rows are captured.
+/// Fail-closed on any merge/publish error (finding 5b).
+async fn publish_merged(
+    staged: &Path,
+    local_path: &Path,
+    outcome: DownloadOutcome,
+) -> Result<(), StateSyncError> {
+    let local_exists = local_path.exists();
+    let tables = crate::state::LOCAL_ONLY_TABLE_NAMES;
+    match outcome {
+        DownloadOutcome::Restored => {
+            // `staged` holds the remote replicated tables. Overwrite its
+            // local-only tables from the current local file, or EMPTY them when
+            // there is none — a pre-this-patch remote snapshot can still carry
+            // another pod's `jobs` rows, which must NOT land locally (finding 6a).
+            if local_exists {
+                redb_op_retry(|| copy_named_tables(local_path, staged, tables)).await?;
+            } else {
+                redb_op_retry(|| clear_named_tables(staged, tables)).await?;
+            }
+            publish_atomically(staged, local_path)
+        }
+        DownloadOutcome::Absent if local_exists => {
+            // No remote object: the replicated tables must reset to fresh/empty
+            // (finding 6) while the local-only tables are preserved. Build a fresh
+            // db carrying ONLY the current local-only tables (`staged` was not
+            // written by an `Absent` download, so `copy_named_tables` creates it
+            // with just those tables → replicated tables are empty on next open).
+            redb_op_retry(|| copy_named_tables(local_path, staged, tables)).await?;
+            publish_atomically(staged, local_path)
+        }
+        DownloadOutcome::Absent => Ok(()),
+    }
+}
+
+/// Directory that should host the sibling scratch file for `local_path`, so an
+/// atomic `rename` publish stays on the same filesystem. Falls back to the
+/// current directory when `local_path` has no parent component.
+fn sibling_scratch_dir(local_path: &Path) -> PathBuf {
+    local_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// A process-unique scratch path in `dir` (PID + nanos + a monotonic sequence,
+/// so two scratch files taken in the same nanosecond never collide).
+fn unique_scratch_path(dir: &Path, tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!(
+        ".rocky-state-{tag}-{}-{}-{}.redb",
+        std::process::id(),
+        nanos,
+        seq
+    ))
+}
+
+/// Bounded async retry for a synchronous redb file operation. Retries a small,
+/// fixed number of times (dominated in practice by transient open contention — a
+/// concurrent handle briefly holding the file's advisory lock), sleeping briefly
+/// between attempts, then propagates the last error. **Fail-closed: never
+/// converts an error to `Ok`.**
+async fn redb_op_retry<T>(
+    mut op: impl FnMut() -> Result<T, StateSyncError>,
+) -> Result<T, StateSyncError> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last: Option<StateSyncError> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(15 * u64::from(attempt))).await;
+                }
+            }
+        }
+    }
+    Err(last.expect("retry loop runs at least once"))
+}
+
+/// Publish `src` to `dst` with a single atomic `rename` (same-filesystem by
+/// construction — `src` is a sibling of `dst`). Fail-closed.
+fn publish_atomically(src: &Path, dst: &Path) -> Result<(), StateSyncError> {
+    std::fs::rename(src, dst).map_err(StateSyncError::Io)
+}
+
+/// Delete the named tables from the redb at `dst` (leaving every other table
+/// untouched), so they reappear empty on the next `StateStore::open`. Used to
+/// scrub any remote-carried local-only rows on a `Restored` download with no
+/// prior local file (finding 6a).
+fn clear_named_tables(dst: &Path, tables: &[&str]) -> Result<(), StateSyncError> {
+    let io = |ctx: &str, e: &dyn std::fmt::Display| {
+        StateSyncError::Io(std::io::Error::other(format!("{ctx}: {e}")))
+    };
+    let db =
+        redb::Database::create(dst).map_err(|e| io("redb create dst for local-only clear", &e))?;
+    let txn = db
+        .begin_write()
+        .map_err(|e| io("redb begin_write for local-only clear", &e))?;
+    for name in tables {
+        let def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(name);
+        txn.delete_table(def)
+            .map_err(|e| io("redb delete_table for local-only clear", &e))?;
+    }
+    txn.commit()
+        .map_err(|e| io("redb commit for local-only clear", &e))?;
+    drop(db);
+    Ok(())
+}
+
+/// Copy the `tables` from the redb at `src` into the redb at `dst`, replacing
+/// exactly those tables in `dst` and leaving every OTHER table in `dst`
+/// untouched. `dst` is created if it does not exist.
+///
+/// Every table in [`crate::state::LOCAL_ONLY_TABLE_NAMES`] is a
+/// `TableDefinition<&str, &[u8]>` (opaque serialized blobs), so the copy is a
+/// faithful, bit-exact key/value replay over that shape. A table absent from
+/// `src` clears the corresponding table in `dst` (delete + no re-insert). If a
+/// future local-only table used a different key/value type, opening it here
+/// would surface a redb type error rather than silently mis-copying.
+fn copy_named_tables(src: &Path, dst: &Path, tables: &[&str]) -> Result<(), StateSyncError> {
+    // `iter()` lives on the `ReadableTable` trait — scope it locally.
+    use redb::ReadableTable;
+
+    let io = |ctx: &str, e: &dyn std::fmt::Display| {
+        StateSyncError::Io(std::io::Error::other(format!("{ctx}: {e}")))
+    };
+
+    // `src` and `dst` are independent redb databases, so a read transaction on
+    // one and a write transaction on the other coexist freely — stream each
+    // table's rows straight across without an intermediate buffer.
+    let src_db =
+        redb::Database::open(src).map_err(|e| io("redb open src for local-only copy", &e))?;
+    let read = src_db
+        .begin_read()
+        .map_err(|e| io("redb begin_read for local-only copy", &e))?;
+    let dst_db =
+        redb::Database::create(dst).map_err(|e| io("redb create dst for local-only copy", &e))?;
+    let txn = dst_db
+        .begin_write()
+        .map_err(|e| io("redb begin_write for local-only copy", &e))?;
+    for name in tables {
+        let def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(name);
+        // Replace, don't merge: drop any existing copy of this table in `dst`
+        // first, so a stale row can never survive.
+        txn.delete_table(def)
+            .map_err(|e| io("redb delete_table (dst) for local-only copy", &e))?;
+        match read.open_table(def) {
+            Ok(src_table) => {
+                let mut dst_table = txn
+                    .open_table(def)
+                    .map_err(|e| io("redb open_table (dst) for local-only copy", &e))?;
+                let iter = src_table
+                    .iter()
+                    .map_err(|e| io("redb iter for local-only copy", &e))?;
+                for entry in iter {
+                    let (k, v) = entry.map_err(|e| io("redb entry for local-only copy", &e))?;
+                    dst_table
+                        .insert(k.value(), v.value())
+                        .map_err(|e| io("redb insert (dst) for local-only copy", &e))?;
+                }
+                // `dst_table` (the write borrow on `txn`) is dropped at the end
+                // of the iteration, so `txn.commit()` has no outstanding borrow.
+            }
+            // A local-only table absent from `src` is a legitimate no-op — the
+            // destination table stays deleted (cleared) and is recreated empty
+            // on the next `StateStore::open`.
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(io("redb open_table (src) for local-only copy", &e)),
+        }
+    }
+    txn.commit()
+        .map_err(|e| io("redb commit (dst) for local-only copy", &e))?;
+    drop(dst_db);
+    drop(read);
+    drop(src_db);
+    Ok(())
+}
+
+/// [`download_state`] retaining the hit/miss [`DownloadOutcome`] the tiered
+/// backend needs to decide whether to fall through to its durable tier.
+///
+/// `dest_path` is where the downloaded bytes are written (a staging file, not
+/// necessarily `local_path`), and `remote_key` is the object key derived ONCE
+/// from the real local path by [`download_state`] — threaded explicitly (like
+/// the upload path) so writing to a differently-named staging file does not
+/// disturb namespaced key resolution.
+async fn download_state_inner(
+    config: &StateConfig,
+    dest_path: &Path,
+    remote_key: &str,
+) -> Result<DownloadOutcome, StateSyncError> {
     match config.backend {
         StateBackend::Local => {
             debug!("State backend: local (no sync needed)");
-            Ok(())
+            Ok(DownloadOutcome::Absent)
         }
         StateBackend::S3 => {
             let bucket = config.s3_bucket.as_deref().ok_or_else(|| {
                 StateSyncError::MissingConfig("s3".into(), "state.s3_bucket".into())
             })?;
             let prefix = config.s3_prefix.as_deref().unwrap_or(DEFAULT_S3_PREFIX);
-            download_from_object_store("s3", bucket, prefix, local_path, transfer_timeout(config))
-                .await
+            download_from_object_store(
+                "s3",
+                bucket,
+                prefix,
+                dest_path,
+                remote_key,
+                transfer_timeout(config),
+            )
+            .await
         }
         StateBackend::Gcs => {
             let bucket = config.gcs_bucket.as_deref().ok_or_else(|| {
                 StateSyncError::MissingConfig("gcs".into(), "state.gcs_bucket".into())
             })?;
             let prefix = config.gcs_prefix.as_deref().unwrap_or(DEFAULT_GCS_PREFIX);
-            download_from_object_store("gs", bucket, prefix, local_path, transfer_timeout(config))
-                .await
+            download_from_object_store(
+                "gs",
+                bucket,
+                prefix,
+                dest_path,
+                remote_key,
+                transfer_timeout(config),
+            )
+            .await
         }
-        StateBackend::Valkey => download_from_valkey(config, local_path).await,
+        StateBackend::Valkey => download_from_valkey(config, dest_path, remote_key).await,
         StateBackend::Tiered => {
-            // Try Valkey first (fast), fall back to S3 (durable)
+            // Try Valkey first (fast), fall back to S3 (durable).
+            //
+            // KNOWN LIMITATION — tiered cache coherence (finding 3): on the READ
+            // side a genuine Valkey HIT short-circuits the durable S3 tier below.
+            // If a freeze/decision was written to S3 but Valkey holds a STALE
+            // cached snapshot (or one written before the freeze), a policy gate
+            // reading through this path can see the stale Valkey copy and MISS
+            // the freeze. This is NOT fixed here; a correct fix needs
+            // cache-invalidation-on-write (bust/refresh the Valkey key when a
+            // governance ledger is written) or reading the durable tier directly
+            // for policy gates. Tracked as follow-up.
             info!("State backend: tiered (Valkey → S3 fallback)");
             let valkey_config = StateConfig {
                 backend: StateBackend::Valkey,
@@ -233,14 +624,24 @@ pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(
                 ..config.clone()
             };
 
-            match Box::pin(download_state(&valkey_config, local_path)).await {
-                Ok(()) if local_path.exists() => {
+            // Only a genuine Valkey HIT (the leg wrote the file) short-circuits.
+            // A MISS (`Absent`) or an error both fall through to the durable S3
+            // tier. Crucially this no longer consults `dest_path.exists()`: a
+            // stale local file left by a previous run must NOT be mistaken for a
+            // fresh Valkey hit (which would skip the S3 fallback and resume from
+            // stale state).
+            match Box::pin(download_state_inner(&valkey_config, dest_path, remote_key)).await {
+                Ok(DownloadOutcome::Restored) => {
                     debug!("State restored from Valkey");
-                    Ok(())
+                    Ok(DownloadOutcome::Restored)
                 }
-                _ => {
-                    debug!("Valkey miss or error, trying S3");
-                    Box::pin(download_state(&s3_config, local_path)).await
+                Ok(DownloadOutcome::Absent) => {
+                    debug!("Valkey miss, trying S3");
+                    Box::pin(download_state_inner(&s3_config, dest_path, remote_key)).await
+                }
+                Err(e) => {
+                    debug!(error = %e, "Valkey error, trying S3");
+                    Box::pin(download_state_inner(&s3_config, dest_path, remote_key)).await
                 }
             }
         }
@@ -344,13 +745,17 @@ pub async fn upload_state_with_excluded_tables(
             warn!(
                 error = %e,
                 outcome = "filter_failed",
-                "failed to build replicate-filtered state copy; uploading unfiltered local state"
+                "failed to build replicate-filtered state copy; refusing to upload unfiltered \
+                 local-only data (fail-closed, finding 6b)"
             );
-            // Fall back to the unfiltered local path so a transient filter
-            // failure doesn't block state durability. The filter is a
-            // correctness hedge, not a hard privacy boundary.
-            let result = dispatch_upload(config, local_path, &remote_key).await;
-            return apply_upload_failure_policy(config, result);
+            // Finding 6(b): NEVER fall back to uploading the unfiltered local
+            // file — that would leak the local-only tables (another pod's `jobs`,
+            // this machine's `schema_cache`) into the shared remote snapshot.
+            // Surface the filter failure as an upload error subject to
+            // `on_upload_failure`: `Skip` skips this upload in degraded mode (no
+            // unfiltered upload happens), `Fail` aborts. Either way, no
+            // unfiltered local-only data is ever uploaded.
+            return apply_upload_failure_policy(config, Err(e));
         }
     };
     let result = dispatch_upload(config, &scratch, &remote_key).await;
@@ -400,16 +805,22 @@ fn strip_local_only_tables(
     })?;
     for name in excluded_tables {
         let def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(name);
-        if let Err(e) = txn.delete_table(def) {
-            // Bubble up only genuine delete errors; a missing-table error
-            // (TableError::TableDoesNotExist) is a legitimate no-op and
-            // is represented by `Ok(false)` from the v2 API.
-            warn!(
-                table = name,
-                error = %e,
-                outcome = "delete_table_failed",
-                "filter could not drop table (continuing with remainder)"
-            );
+        // Finding C: a genuinely-absent table is a legitimate no-op — the v2 API
+        // returns `Ok(false)` for it (an older copy that never had `schema_cache`
+        // uploads cleanly). But a REAL `delete_table` error (e.g. a table with an
+        // incompatible definition on an otherwise-valid redb) must FAIL the
+        // filter — swallowing it would commit an UNFILTERED scratch and upload
+        // this pod's local-only rows (`jobs` / `schema_cache`) to shared remote
+        // state. `TableDoesNotExist` (if a redb version surfaces it as an error
+        // rather than `Ok(false)`) stays non-fatal; every other error propagates.
+        match txn.delete_table(def) {
+            Ok(_) => {}
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => {
+                return Err(StateSyncError::Io(std::io::Error::other(format!(
+                    "redb delete_table('{name}') for state filter failed: {e}"
+                ))));
+            }
         }
     }
     txn.commit().map_err(|e| {
@@ -494,6 +905,17 @@ async fn dispatch_upload(
             // outer `upload_state` owns that decision for the tiered leg
             // as a whole. The same `remote_key` flows to both legs so a
             // namespaced upload lands at `<ns>.redb` on Valkey and S3 alike.
+            //
+            // KNOWN LIMITATION — tiered cache coherence (finding 3): a Valkey
+            // upload failure here is SWALLOWED (only the durable S3 leg below is
+            // required), even under `on_upload_failure = Fail`. Combined with the
+            // read-side short-circuit (a Valkey HIT skips S3 — see
+            // `download_state_inner`'s Tiered arm), this means a freeze can be
+            // durably written to S3 while a STALE Valkey cache entry survives and
+            // shadows it on the next policy-gate read. This is NOT fixed here; a
+            // correct fix needs cache-invalidation-on-write (bust/refresh the
+            // Valkey key when a governance ledger is written) or reading the
+            // durable tier directly for policy gates. Tracked as follow-up.
             if let Err(e) = Box::pin(dispatch_upload(&valkey_config, local_path, remote_key)).await
             {
                 warn!(error = %e, "Valkey upload failed (non-fatal, S3 is durable)");
@@ -528,22 +950,51 @@ fn apply_upload_failure_policy(
     }
 }
 
+/// Existence probe for a remote state object, isolated behind a test seam.
+///
+/// Production behaviour is exactly `provider.exists(key)`. Under `#[cfg(test)]`
+/// a fault can be armed (see [`test_support::arm_object_store_exists_fault`]) so
+/// a test can drive the failure arm of [`download_from_object_store`]
+/// deterministically without a live/flaky cloud endpoint — the in-memory
+/// provider never errors on `exists`, so this is the only in-crate way to prove
+/// the fail-closed propagation is RED before the fix and GREEN after it.
+async fn probe_exists(provider: &ObjectStoreProvider, key: &str) -> Result<bool, StateSyncError> {
+    #[cfg(test)]
+    if test_support::take_object_store_exists_fault() {
+        return Err(StateSyncError::S3Download(
+            "injected existence-check failure (test seam)".into(),
+        ));
+    }
+    provider.exists(key).await.map_err(StateSyncError::from)
+}
+
 /// Download `STATE_FILE` from an object store rooted at `<scheme>://<bucket>/<prefix>`.
 ///
-/// If the object doesn't exist, logs a message and returns Ok — rocky will
-/// start with a fresh state file.
+/// Returns [`DownloadOutcome::Restored`] when the object existed and was written
+/// locally, and [`DownloadOutcome::Absent`] when no object exists (a legit fresh
+/// start — non-fatal by design).
+///
+/// A *failed* existence check (network / auth / backend error) is **propagated
+/// as `Err`**, never swallowed. Previously this arm logged and returned `Ok`,
+/// which made a genuine download failure indistinguishable from an
+/// authoritative "no remote state yet": the caller (`rocky run`) would then
+/// treat a possibly-populated remote ledger as empty and lose its fail-closed
+/// signal. The absent case (`Ok(false)`) still returns `Absent` — a real fresh
+/// start must stay non-fatal.
 async fn download_from_object_store(
     scheme: &str,
     bucket: &str,
     prefix: &str,
-    local_path: &Path,
+    dest_path: &Path,
+    remote_key: &str,
     timeout: Duration,
-) -> Result<(), StateSyncError> {
+) -> Result<DownloadOutcome, StateSyncError> {
     let provider = cloud_provider(scheme, bucket, prefix)?;
     // Qualify the object key by schema version so a v7 pod and a v9 pod never
     // collide on the same object — `<prefix>/v9/state.redb`, not
-    // `<prefix>/state.redb`.
-    let key = object_store_state_key(&remote_state_key(local_path));
+    // `<prefix>/state.redb`. `remote_key` is threaded from `download_state` so a
+    // staging `dest_path` does not change which object we read.
+    let key = object_store_state_key(remote_key);
     let span = info_span!(
         "state.download",
         backend = %provider.scheme(),
@@ -552,28 +1003,32 @@ async fn download_from_object_store(
     async {
         info!(
             uri = format!("{scheme}://{bucket}/{prefix}{key}"),
-            local = %local_path.display(),
+            local = %dest_path.display(),
             "downloading state from object store"
         );
 
         with_transfer_timeout(timeout, async {
-            match provider.exists(&key).await {
+            match probe_exists(&provider, &key).await {
                 Ok(true) => {
-                    provider.download_file(&key, local_path).await?;
+                    provider.download_file(&key, dest_path).await?;
                     info!(
-                        size = local_path.metadata().map(|m| m.len()).unwrap_or(0),
+                        size = dest_path.metadata().map(|m| m.len()).unwrap_or(0),
                         outcome = "ok",
                         "state restored from object store"
                     );
-                    Ok(())
+                    Ok(DownloadOutcome::Restored)
                 }
                 Ok(false) => {
                     info!(outcome = "absent", "No existing state in object store — starting fresh");
-                    Ok(())
+                    Ok(DownloadOutcome::Absent)
                 }
+                // Fail closed: a real existence-check failure is NOT an
+                // authoritative "no remote state". Propagate so the caller can
+                // mark its local ledger non-authoritative instead of silently
+                // starting fresh over a populated remote.
                 Err(e) => {
-                    warn!(error = %e, outcome = "error_then_fresh", "state existence check failed (non-fatal, starting fresh)");
-                    Ok(())
+                    warn!(error = %e, outcome = "error", "state existence check failed; propagating (fail-closed)");
+                    Err(e)
                 }
             }
         })
@@ -670,8 +1125,16 @@ where
 /// `transfer_timeout_seconds` budget the object-store paths use.
 async fn download_from_valkey(
     config: &StateConfig,
-    local_path: &Path,
-) -> Result<(), StateSyncError> {
+    dest_path: &Path,
+    remote_key: &str,
+) -> Result<DownloadOutcome, StateSyncError> {
+    // Test seam: force a Valkey MISS without a live Valkey peer, so the tiered
+    // fall-through-to-S3 path (and the "stale local file is not a hit" fix) can
+    // be exercised deterministically. See [`test_support::arm_valkey_miss_fault`].
+    #[cfg(test)]
+    if test_support::take_valkey_miss_fault() {
+        return Ok(DownloadOutcome::Absent);
+    }
     let url = config
         .valkey_url
         .as_ref()
@@ -685,8 +1148,10 @@ async fn download_from_valkey(
         .to_string();
     // Qualify by schema version: `rocky:state:v9:state.redb`, not
     // `rocky:state:state.redb`, so a v7 reader and a v9 writer never share a key.
-    let key = valkey_state_key(&prefix, &remote_state_key(local_path));
-    let local_path_owned = local_path.to_path_buf();
+    // `remote_key` is threaded from `download_state` so a staging `dest_path`
+    // does not change which key we read.
+    let key = valkey_state_key(&prefix, remote_key);
+    let local_path_owned = dest_path.to_path_buf();
     let timeout = transfer_timeout(config);
 
     let span = info_span!("state.download", backend = "valkey");
@@ -695,36 +1160,38 @@ async fn download_from_valkey(
         with_transfer_timeout(timeout, async move {
             let key_for_task = key.clone();
             let local_for_task = local_path_owned.clone();
-            let join = tokio::task::spawn_blocking(move || -> Result<(), StateSyncError> {
-                let client =
-                    redis::Client::open(url).map_err(|e| StateSyncError::Valkey(e.to_string()))?;
-                let mut conn = client
-                    .get_connection()
-                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+            let join =
+                tokio::task::spawn_blocking(move || -> Result<DownloadOutcome, StateSyncError> {
+                    let client = redis::Client::open(url)
+                        .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                    let mut conn = client
+                        .get_connection()
+                        .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
 
-                let data: Option<Vec<u8>> = redis::cmd("GET")
-                    .arg(&key_for_task)
-                    .query(&mut conn)
-                    .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+                    let data: Option<Vec<u8>> = redis::cmd("GET")
+                        .arg(&key_for_task)
+                        .query(&mut conn)
+                        .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
 
-                match data {
-                    Some(bytes) => {
-                        std::fs::write(&local_for_task, bytes)?;
-                        let size = std::fs::metadata(&local_for_task)
-                            .map(|m| m.len())
-                            .unwrap_or(0);
-                        info!(size, outcome = "ok", "state restored from Valkey");
+                    match data {
+                        Some(bytes) => {
+                            std::fs::write(&local_for_task, bytes)?;
+                            let size = std::fs::metadata(&local_for_task)
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            info!(size, outcome = "ok", "state restored from Valkey");
+                            Ok(DownloadOutcome::Restored)
+                        }
+                        None => {
+                            info!(
+                                outcome = "absent",
+                                "No existing state in Valkey — starting fresh"
+                            );
+                            Ok(DownloadOutcome::Absent)
+                        }
                     }
-                    None => {
-                        info!(
-                            outcome = "absent",
-                            "No existing state in Valkey — starting fresh"
-                        );
-                    }
-                }
-                Ok(())
-            })
-            .await;
+                })
+                .await;
             match join {
                 Ok(inner) => inner,
                 Err(e) => Err(StateSyncError::Valkey(format!(
@@ -1656,6 +2123,739 @@ mod tests {
         assert!(
             matches!(&err, StateSyncError::MissingConfig(backend, _) if backend == "s3"),
             "expected the S3 dispatch to be reached (MissingConfig for the bucket); got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S2 — a failed download must NOT be treated as authoritative-empty
+    // -----------------------------------------------------------------------
+
+    /// S2 (a): an injected existence-check failure makes `download_state` return
+    /// `Err`, not `Ok`. Pre-fix the `Err(e)` arm logged and returned `Ok(())`
+    /// ("non-fatal, starting fresh"), hiding a real download failure from the
+    /// caller's fail-closed machinery. The in-memory provider never errors on
+    /// `exists`, so we drive the arm through the `probe_exists` test seam — this
+    /// is the only in-crate way to make the assertion RED before the fix.
+    #[tokio::test]
+    async fn download_existence_failure_propagates_not_fresh_start() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        // Route object-store construction to an in-memory provider (so no live
+        // S3 client is built), then arm the existence-probe fault.
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+        test_support::arm_object_store_exists_fault();
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let result = download_state(&config, &local).await;
+        test_support::clear();
+
+        assert!(
+            matches!(result, Err(StateSyncError::S3Download(_))),
+            "a failed existence check must propagate as Err (fail-closed), not a silent \
+             fresh-start Ok; got {result:?}"
+        );
+        assert!(
+            !local.exists(),
+            "no local state file should be written when the download failed"
+        );
+    }
+
+    /// S2 (a'): the absent case stays non-fatal. An in-memory provider with no
+    /// object at the key returns `Ok(())` — a legit fresh start must not be
+    /// turned into an error by the fail-closed change above.
+    #[tokio::test]
+    async fn download_absent_object_is_non_fatal_fresh_start() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let result = download_state(&config, &local).await;
+        test_support::clear();
+
+        assert!(
+            result.is_ok(),
+            "an absent remote object must be a fresh start (Ok); got {result:?}"
+        );
+        assert!(
+            !local.exists(),
+            "nothing to restore, so no local file is written"
+        );
+    }
+
+    /// S2 (b): a Valkey MISS with a *stale* local file present must fall through
+    /// to the durable S3 tier, not short-circuit. Pre-fix the tiered dispatch
+    /// matched `Ok(()) if local_path.exists()` and counted the stale file as a
+    /// Valkey hit, starving the S3 fallback. Post-fix hit/miss is an explicit
+    /// `DownloadOutcome`, so the S3 tier restores authoritative state over the
+    /// stale bytes.
+    #[tokio::test]
+    async fn tiered_valkey_miss_with_stale_local_falls_through_to_s3() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        // Legacy global file → remote key `state.redb`.
+        let local = dir.path().join(".rocky-state.redb");
+        // A STALE local file left by a previous run — the exact bait the old
+        // `local_path.exists()` heuristic mistook for a Valkey hit.
+        std::fs::write(&local, b"STALE").unwrap();
+
+        // The durable S3 tier (in-memory) holds authoritative state at the
+        // schema-qualified key.
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let key = object_store_state_key(&remote_state_key(&local));
+        provider
+            .put(&key, Bytes::from_static(b"FRESH-FROM-S3"))
+            .await
+            .unwrap();
+
+        // Force the Valkey leg to MISS (no live peer needed).
+        test_support::arm_valkey_miss_fault();
+
+        let config = StateConfig {
+            backend: StateBackend::Tiered,
+            s3_bucket: Some("bucket".into()),
+            // valkey_url intentionally None: the miss fault short-circuits
+            // before URL resolution, proving the fall-through independently.
+            ..Default::default()
+        };
+        let outcome = download_state_inner(&config, &local, &remote_state_key(&local))
+            .await
+            .unwrap();
+        test_support::clear();
+
+        assert_eq!(
+            outcome,
+            DownloadOutcome::Restored,
+            "the S3 tier must have restored state after the Valkey miss"
+        );
+        assert_eq!(
+            std::fs::read(&local).unwrap(),
+            b"FRESH-FROM-S3",
+            "the stale local file must be replaced by the S3 tier's content — proving the \
+             tiered dispatch fell through instead of treating the stale file as a Valkey hit"
+        );
+    }
+
+    /// S2 (b'): with both tiers absent (Valkey miss + empty S3), the tiered
+    /// download resolves to `Absent` — a real fresh start — and writes no local
+    /// file. Complements (b): the fall-through does not manufacture a spurious
+    /// `Restored` when there is genuinely nothing to restore.
+    #[tokio::test]
+    async fn tiered_both_tiers_absent_stays_absent() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        // In-memory S3 tier installed but EMPTY (no object at the key).
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+        test_support::arm_valkey_miss_fault();
+
+        let config = StateConfig {
+            backend: StateBackend::Tiered,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let outcome = download_state_inner(&config, &local, &remote_state_key(&local))
+            .await
+            .unwrap();
+        test_support::clear();
+
+        assert_eq!(
+            outcome,
+            DownloadOutcome::Absent,
+            "both tiers absent ⇒ Absent (a real fresh start)"
+        );
+        assert!(
+            !local.exists(),
+            "nothing to restore, so no local file is written"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Findings 6 + 7 — local-only-preserving merge on download
+    // -----------------------------------------------------------------------
+
+    /// Seed `path` as a local state store with a STALE replicated watermark plus
+    /// the two LOCAL-ONLY tables populated (schema_cache + a jobs record), i.e.
+    /// exactly the machine-local state a run-start download must not wipe.
+    fn seed_local_with_local_only(path: &Path, replicated_wm: &str, job_id: &str) {
+        let now = chrono::Utc::now();
+        let store = StateStore::open(path).expect("open local seed store");
+        store
+            .set_watermark(
+                replicated_wm,
+                &rocky_ir::WatermarkState {
+                    last_value: now,
+                    updated_at: now,
+                },
+            )
+            .unwrap();
+        store
+            .write_schema_cache_entry(
+                &schema_cache_key("cat", "staging", "orders"),
+                &SchemaCacheEntry {
+                    columns: vec![StoredColumn {
+                        name: "id".into(),
+                        data_type: "BIGINT".into(),
+                        nullable: false,
+                    }],
+                    cached_at: now,
+                },
+            )
+            .unwrap();
+        store
+            .record_job(&crate::state::PersistedJob {
+                job_id: job_id.to_string(),
+                kind: "run".into(),
+                state: "running".into(),
+                submitted_at: now.to_rfc3339(),
+                started_at: None,
+                finished_at: None,
+                principal: None,
+                error: None,
+                result: None,
+            })
+            .unwrap();
+        drop(store);
+    }
+
+    /// Build the bytes of a REMOTE state object: a valid store carrying an
+    /// authoritative replicated watermark with the local-only tables STRIPPED —
+    /// exactly what `upload_state` leaves on the wire.
+    fn build_remote_object_bytes(dir: &Path, replicated_wm: &str) -> Vec<u8> {
+        let now = chrono::Utc::now();
+        let seed = dir.join("remote_seed.redb");
+        {
+            let store = StateStore::open(&seed).unwrap();
+            store
+                .set_watermark(
+                    replicated_wm,
+                    &rocky_ir::WatermarkState {
+                        last_value: now,
+                        updated_at: now,
+                    },
+                )
+                .unwrap();
+            drop(store);
+        }
+        let stripped = strip_local_only_tables(&seed, LOCAL_ONLY_TABLE_NAMES).unwrap();
+        let bytes = std::fs::read(&stripped).unwrap();
+        let _ = std::fs::remove_file(&stripped);
+        let _ = std::fs::remove_file(&seed);
+        bytes
+    }
+
+    /// Finding 7 (Restored): a download that wholesale-replaces the replicated
+    /// tables must PRESERVE the local-only tables (jobs, schema_cache), and
+    /// finding 6 (Restored half): the stale local replicated watermark is
+    /// replaced by the remote's authoritative one.
+    #[tokio::test]
+    async fn download_restored_replaces_replicated_keeps_local_only() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        seed_local_with_local_only(&local, "local.stale", "job-local-1");
+        let remote_bytes = build_remote_object_bytes(dir.path(), "remote.fresh");
+
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let key = object_store_state_key(&remote_state_key(&local));
+        provider.put(&key, Bytes::from(remote_bytes)).await.unwrap();
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        download_state(&config, &local)
+            .await
+            .expect("restored download should succeed");
+        test_support::clear();
+
+        let store = StateStore::open(&local).unwrap();
+        assert!(
+            store.get_watermark("remote.fresh").unwrap().is_some(),
+            "the remote's replicated watermark must be restored"
+        );
+        assert!(
+            store.get_watermark("local.stale").unwrap().is_none(),
+            "the stale local replicated watermark must be replaced by the remote copy"
+        );
+        assert_eq!(
+            store.list_schema_cache().unwrap().len(),
+            1,
+            "local-only schema_cache must survive a download that replaces the replicated tables"
+        );
+        let jobs = store.list_jobs().unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "local-only jobs must survive a download that replaces the replicated tables"
+        );
+        assert_eq!(jobs[0].job_id, "job-local-1");
+    }
+
+    /// Finding 6 (Absent): switching to an EMPTY remote prefix must reset the
+    /// replicated tables to fresh (no stale watermark survives) — while finding
+    /// 7 (Absent half) preserves the local-only tables.
+    #[tokio::test]
+    async fn download_absent_clears_replicated_keeps_local_only() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        seed_local_with_local_only(&local, "local.stale", "job-local-1");
+
+        // In-memory provider installed but EMPTY → the download resolves Absent.
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        download_state(&config, &local)
+            .await
+            .expect("an absent remote is a fresh start");
+        test_support::clear();
+
+        let store = StateStore::open(&local).unwrap();
+        assert!(
+            store.get_watermark("local.stale").unwrap().is_none(),
+            "an Absent download on a remote backend must reset the replicated tables to fresh — \
+             a stale watermark must NOT keep the run from re-reading source rows (finding 6)"
+        );
+        assert_eq!(
+            store.list_schema_cache().unwrap().len(),
+            1,
+            "Absent must keep the local-only schema_cache (finding 7)"
+        );
+        let jobs = store.list_jobs().unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "Absent must keep the local-only jobs (finding 7)"
+        );
+        assert_eq!(jobs[0].job_id, "job-local-1");
+    }
+
+    /// The copy primitive itself: it replaces ONLY the named (local-only) tables
+    /// in `dst`, leaves every replicated table in `dst` untouched, drags NO
+    /// replicated table across from `src`, and drops a stale `dst` row.
+    #[test]
+    fn copy_named_tables_replaces_only_named_tables() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.redb");
+        let dst = dir.path().join("dst.redb");
+        let now = chrono::Utc::now();
+
+        // src: a replicated watermark + the local-only tables populated.
+        seed_local_with_local_only(&src, "src.replicated", "j-src");
+
+        // dst: a DIFFERENT replicated watermark + a STALE local-only entry.
+        {
+            let store = StateStore::open(&dst).unwrap();
+            store
+                .set_watermark(
+                    "dst.replicated",
+                    &rocky_ir::WatermarkState {
+                        last_value: now,
+                        updated_at: now,
+                    },
+                )
+                .unwrap();
+            store
+                .write_schema_cache_entry(
+                    &schema_cache_key("stale", "stale", "stale"),
+                    &SchemaCacheEntry {
+                        columns: vec![],
+                        cached_at: now,
+                    },
+                )
+                .unwrap();
+            drop(store);
+        }
+
+        copy_named_tables(&src, &dst, LOCAL_ONLY_TABLE_NAMES).unwrap();
+
+        let store = StateStore::open(&dst).unwrap();
+        // dst's replicated table is untouched.
+        assert!(
+            store.get_watermark("dst.replicated").unwrap().is_some(),
+            "copy must not touch replicated tables in dst"
+        );
+        // src's replicated table did NOT leak across (copy is scoped to local-only).
+        assert!(
+            store.get_watermark("src.replicated").unwrap().is_none(),
+            "copy must not drag a replicated table across from src"
+        );
+        // dst's local-only tables were REPLACED by src's (stale row gone).
+        let sc = store.list_schema_cache().unwrap();
+        assert_eq!(
+            sc.len(),
+            1,
+            "the stale dst schema_cache entry must be replaced"
+        );
+        assert_eq!(sc[0].0, schema_cache_key("cat", "staging", "orders"));
+        let jobs = store.list_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, "j-src");
+    }
+
+    /// Finding 5 — the mechanism the fail-closed seam uploads rely on: a broken
+    /// upload (S3 with no bucket → `MissingConfig`) is SWALLOWED under the
+    /// default `Skip` policy but PROPAGATES under `Fail`. The freeze / gc-tombstone
+    /// seams force `Fail` so a state that commits locally but never reaches the
+    /// remote can never be reported as success.
+    #[tokio::test]
+    async fn upload_state_skip_swallows_but_fail_propagates() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("state.redb");
+        seed_watermark_and_cache(&src);
+
+        let skip = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: None,
+            on_upload_failure: StateUploadFailureMode::Skip,
+            ..Default::default()
+        };
+        assert!(
+            upload_state(&skip, &src).await.is_ok(),
+            "the default Skip policy must swallow an upload failure (degraded mode)"
+        );
+
+        let fail = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: None,
+            on_upload_failure: StateUploadFailureMode::Fail,
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                upload_state(&fail, &src).await,
+                Err(StateSyncError::MissingConfig(..))
+            ),
+            "the Fail policy the seams force must propagate the upload failure (abort)"
+        );
+    }
+
+    /// Finding 5(b) — fail-closed preserve. A PRESENT but unreadable local file
+    /// (not a redb) cannot be snapshotted, so the local-only tables cannot be
+    /// preserved. The download must FAIL CLOSED (Err) rather than silently
+    /// proceed and discard `jobs` / `schema_cache`; and the prior local file must
+    /// be left untouched (never replaced by remote-only content).
+    #[tokio::test]
+    async fn download_snapshot_failure_fails_closed() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        std::fs::write(&local, b"not a redb file").unwrap();
+
+        // A remote object exists, so the download itself would otherwise succeed.
+        let remote_bytes = build_remote_object_bytes(dir.path(), "remote.fresh");
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let key = object_store_state_key(&remote_state_key(&local));
+        provider.put(&key, Bytes::from(remote_bytes)).await.unwrap();
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let result = download_state(&config, &local).await;
+        test_support::clear();
+
+        assert!(
+            result.is_err(),
+            "an unreadable local file must fail the local-only snapshot CLOSED, never silently \
+             discard jobs / schema_cache"
+        );
+        assert_eq!(
+            std::fs::read(&local).unwrap(),
+            b"not a redb file",
+            "the prior local file must be left intact on a fail-closed download (never replaced \
+             by remote-only content)"
+        );
+    }
+
+    /// Finding 6(a) — on a `Restored` download with NO prior local file, the
+    /// remote's local-only rows must be SCRUBBED, not trusted. A pre-this-patch
+    /// remote snapshot (uploaded when only `schema_cache` was local-only) can
+    /// carry another pod's `jobs` rows; those must never land locally.
+    #[tokio::test]
+    async fn download_restored_no_local_file_scrubs_remote_local_only() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        assert!(!local.exists(), "precondition: no prior local file");
+
+        // Remote object carrying replicated + LOCAL-ONLY rows (UNstripped, as a
+        // pre-patch upload would have left them).
+        let remote_seed = dir.path().join("remote_seed.redb");
+        seed_local_with_local_only(&remote_seed, "remote.fresh", "job-from-other-pod");
+        let remote_bytes = std::fs::read(&remote_seed).unwrap();
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let key = object_store_state_key(&remote_state_key(&local));
+        provider.put(&key, Bytes::from(remote_bytes)).await.unwrap();
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        download_state(&config, &local)
+            .await
+            .expect("restored download should succeed");
+        test_support::clear();
+
+        let store = StateStore::open(&local).unwrap();
+        assert!(
+            store.get_watermark("remote.fresh").unwrap().is_some(),
+            "the remote's replicated watermark must be present"
+        );
+        assert!(
+            store.list_jobs().unwrap().is_empty(),
+            "a foreign pod's jobs carried by a stale remote must be scrubbed when there is no \
+             prior local file (finding 6a)"
+        );
+        assert!(
+            store.list_schema_cache().unwrap().is_empty(),
+            "a stale remote's schema_cache must be scrubbed when there is no prior local file"
+        );
+    }
+
+    /// Finding 6(b) — a local-only filter failure must NEVER fall back to
+    /// uploading the unfiltered local file: under `Fail` the upload aborts, and
+    /// NO object is written (the local-only rows never leak to the remote).
+    #[tokio::test]
+    async fn upload_filter_failure_does_not_upload_unfiltered() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        // Garbage: `strip_local_only_tables` copies it, then fails to open it as
+        // a redb → the filter fails.
+        std::fs::write(&local, b"not a redb file").unwrap();
+
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            on_upload_failure: StateUploadFailureMode::Fail,
+            ..Default::default()
+        };
+        let result = upload_state(&config, &local).await;
+        let key = object_store_state_key(&remote_state_key(&local));
+        let uploaded = provider.exists(&key).await.unwrap();
+        test_support::clear();
+
+        assert!(
+            result.is_err(),
+            "a local-only filter failure must abort under Fail, not upload unfiltered"
+        );
+        assert!(
+            !uploaded,
+            "no state object may be uploaded when the local-only filter fails (no leak)"
+        );
+    }
+
+    /// Finding B: a download must not publish over a LIVE writer. While a
+    /// `StateStore` holds the writer lock, `download_state` downloads to staging
+    /// but cannot acquire the lock to publish, so it fails closed and leaves the
+    /// live writer's file intact. Once the lock frees, a fresh download applies
+    /// the remote and preserves the local-only tables.
+    #[tokio::test]
+    async fn download_publish_fails_closed_when_writer_lock_held() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_local_with_local_only(&local, "local.wm", "job-1");
+
+        let remote_bytes = build_remote_object_bytes(dir.path(), "remote.fresh");
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let key = object_store_state_key(&remote_state_key(&local));
+        provider.put(&key, Bytes::from(remote_bytes)).await.unwrap();
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+
+        // Hold the writer lock, as a live `rocky run` would during execution.
+        let held = StateStore::open(&local).unwrap();
+
+        let result = download_state(&config, &local).await;
+        assert!(
+            result.is_err(),
+            "the publish must fail closed while another writer holds the lock (finding B)"
+        );
+        assert!(
+            held.get_watermark("local.wm").unwrap().is_some(),
+            "a concurrent download must not clobber the live writer's state"
+        );
+
+        // Release the lock; a fresh download now applies the remote + preserves
+        // the local-only `jobs`.
+        drop(held);
+        download_state(&config, &local)
+            .await
+            .expect("download should succeed once the writer lock is free");
+        test_support::clear();
+
+        let store = StateStore::open(&local).unwrap();
+        assert!(
+            store.get_watermark("remote.fresh").unwrap().is_some(),
+            "the remote replicated watermark is applied after the lock frees"
+        );
+        assert_eq!(
+            store.list_jobs().unwrap().len(),
+            1,
+            "local-only jobs preserved"
+        );
+    }
+
+    /// Finding C: a GENUINE `delete_table` error must FAIL the filter — not be
+    /// swallowed and let an UNFILTERED scratch upload this pod's local-only rows.
+    /// A `schema_cache` created as a MULTIMAP table makes the strip's regular
+    /// `delete_table` error (`TableIsMultimap`) rather than the benign
+    /// missing-table `Ok(false)`. `strip_local_only_tables` propagates it, and the
+    /// upload therefore aborts under `Fail` with nothing written.
+    #[tokio::test]
+    async fn upload_delete_table_error_fails_closed_no_unfiltered_upload() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        // A valid redb whose `schema_cache` is a MULTIMAP table, so the strip's
+        // regular `delete_table("schema_cache")` returns a genuine error instead
+        // of `Ok(false)`.
+        {
+            let db = redb::Database::create(&local).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let def: redb::MultimapTableDefinition<&str, &[u8]> =
+                    redb::MultimapTableDefinition::new("schema_cache");
+                let mut t = txn.open_multimap_table(def).unwrap();
+                t.insert("k", b"v".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        // Direct: the filter propagates the delete_table error.
+        assert!(
+            strip_local_only_tables(&local, LOCAL_ONLY_TABLE_NAMES).is_err(),
+            "a genuine delete_table error must fail the filter (finding C)"
+        );
+
+        // End-to-end: the upload aborts under Fail and writes NO object.
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            on_upload_failure: StateUploadFailureMode::Fail,
+            ..Default::default()
+        };
+        let result = upload_state(&config, &local).await;
+        let key = object_store_state_key(&remote_state_key(&local));
+        let uploaded = provider.exists(&key).await.unwrap();
+        test_support::clear();
+
+        assert!(
+            result.is_err(),
+            "the upload must abort on a delete_table filter error under Fail (finding C)"
+        );
+        assert!(
+            !uploaded,
+            "no unfiltered state object may be uploaded when the filter fails (finding C)"
+        );
+    }
+
+    /// Finding 3: the budget-burn decision PAIR (a plain rule-decision row + a
+    /// verify-after custody Deny for the same plan) must survive the remote
+    /// round-trip, so a later agent action on another pod burns the autonomy
+    /// budget. Pod A records the pair and uploads; pod B downloads a fresh copy;
+    /// `budget_failures_in_window` counts the failed plan.
+    #[tokio::test]
+    async fn budget_pair_survives_remote_round_trip_and_burns_budget() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+        use crate::state::PolicyDecisionRecord;
+
+        test_support::clear();
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+        let now = chrono::Utc::now();
+
+        // Pod A: a failed governed apply — the plain rule decision (winning rule
+        // 0) plus the verify-after custody Deny, both keyed to `plan-1`.
+        let dir_a = TempDir::new().unwrap();
+        let pod_a = dir_a.path().join(".rocky-state.redb");
+        {
+            let store = StateStore::open(&pod_a).unwrap();
+            store
+                .record_policy_decision(&PolicyDecisionRecord {
+                    timestamp: now,
+                    plan_id: "plan-1".into(),
+                    principal: PolicyPrincipal::Agent,
+                    capability: PolicyCapability::Apply,
+                    model: "m".into(),
+                    effect: PolicyEffect::Allow,
+                    rule_id: Some(0),
+                    reason: "plain rule decision".into(),
+                    verify_after: vec![],
+                    auto_apply: None,
+                })
+                .unwrap();
+            store
+                .record_policy_decision(&PolicyDecisionRecord {
+                    timestamp: now,
+                    plan_id: "plan-1".into(),
+                    principal: PolicyPrincipal::Agent,
+                    capability: PolicyCapability::Apply,
+                    model: "*".into(),
+                    effect: PolicyEffect::Deny,
+                    rule_id: None,
+                    reason: "verify_after FAILED".into(),
+                    verify_after: vec!["row_count".into()],
+                    auto_apply: None,
+                })
+                .unwrap();
+            drop(store);
+        }
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        upload_state(&config, &pod_a).await.unwrap();
+
+        // Pod B: a fresh pod downloads the remote state.
+        let dir_b = TempDir::new().unwrap();
+        let pod_b = dir_b.path().join(".rocky-state.redb");
+        download_state(&config, &pod_b).await.unwrap();
+        test_support::clear();
+
+        let store = StateStore::open(&pod_b).unwrap();
+        let decisions = store.list_policy_decisions().unwrap();
+        let burned = crate::policy::budget_failures_in_window(
+            &decisions,
+            0,
+            chrono::Duration::hours(24),
+            now + chrono::Duration::seconds(1),
+        );
+        assert_eq!(
+            burned, 1,
+            "the rule-decision + verify-custody pair must survive the remote round-trip so the \
+             failed apply burns rule 0's budget (finding 3)"
         );
     }
 }

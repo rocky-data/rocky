@@ -72,7 +72,7 @@ use rocky_iceberg::uniform_writer::{
 };
 use rocky_ir::ModelIr;
 
-use crate::commands::apply::{PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy};
+use crate::commands::apply::{PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy_with_policy};
 use crate::commands::gc::{check_recipe_produces_output, gc_models_dir};
 use crate::commands::review::record_plan_review_escalation;
 use crate::commands::run_content_addressed::{build_object_store, table_relative_add_path};
@@ -878,6 +878,8 @@ pub(crate) async fn run_restore_apply_in(
         json,
         &S3RestoreStores,
         warehouse.as_ref(),
+        // Finding 1: reuse the SAME snapshot the adapter was built from.
+        Some(cfg),
     )
     .await
 }
@@ -895,6 +897,11 @@ pub(crate) async fn run_restore_apply_in_with(
     json: bool,
     stores: &dyn RestoreStores,
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
+    // Finding 1: the SAME config snapshot the caller already loaded (the outer
+    // `run_restore_apply_in` loaded it to build the recording-warehouse adapter).
+    // Threaded in so the freeze/policy gate + `[state]` sync read the config the
+    // adapter was built from, not a reload a `rocky.toml` swap could redirect.
+    loaded_cfg: Option<rocky_core::config::RockyConfig>,
 ) -> Result<()> {
     let plan_record = read_plan(root, plan_id)
         .with_context(|| format!("failed to read restore plan '{plan_id}'"))?;
@@ -922,29 +929,30 @@ pub(crate) async fn run_restore_apply_in_with(
         );
     }
 
-    // Policy can only tighten the gate. Fail-closed pre-check: a config-load
-    // ERROR would otherwise silently unenforce a possibly-configured
-    // `[policy]` block; a genuinely-missing config keeps NotConfigured.
-    let loaded_cfg = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => Some(cfg),
-        Err(rocky_core::config::ConfigError::FileNotFound { .. }) => None,
-        Err(e) => {
-            return Err(anyhow::anyhow!(e).context(format!(
-                "refusing to apply restore plan '{plan_id}': {} failed to load, so any \
-                 configured [policy] rules cannot be enforced (fail-closed). Fix the config and \
-                 re-run `rocky apply {plan_id}`.",
-                config_path.display()
-            )));
-        }
-    };
+    // Policy can only tighten the gate. `loaded_cfg` is the caller's single
+    // snapshot (finding 1) — a genuine config-load error already fails closed at
+    // the outer `run_restore_apply_in` before the adapter is built.
     let touched: BTreeMap<String, PolicyCapability> = plan
         .restorations
         .iter()
         .map(|r| (r.model_name.clone(), PolicyCapability::Restore))
         .collect();
     let models_dir = gc_models_dir(loaded_cfg.as_ref(), config_path);
-    let gate = evaluate_apply_policy(
-        config_path,
+    // Finding 2a (download-before, UNCONDITIONAL): `rocky restore` reads the
+    // TOMBSTONES ledger from local state, so for a remote backend it must pull the
+    // authoritative remote state regardless of `[policy]` presence — the earlier
+    // policy-gated sync would let a no-`[policy]` restore read STALE local
+    // tombstones and falsely refuse a valid restore. This refresh also gives the
+    // freeze/budget gate below the current ledger. Fail-closed. Uses the SAME
+    // `loaded_cfg` snapshot the gate uses (finding A — config TOCTOU).
+    crate::commands::apply::download_remote_ledger_unconditional(
+        loaded_cfg.as_ref(),
+        state_path,
+        "restore apply",
+    )
+    .await?;
+    let gate = evaluate_apply_policy_with_policy(
+        loaded_cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
         plan_record.enforcement_principal(runtime_principal),
         &touched,
@@ -967,9 +975,27 @@ pub(crate) async fn run_restore_apply_in_with(
 
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    let output =
-        execute_restore_apply(&store, stores, warehouse, plan_id, &plan, Utc::now()).await?;
+    // Finding 5: restore MUTATES the object store + the local artifact/tombstone
+    // ledger as it executes, so a mid-run failure can still have committed state.
+    // CAPTURE the result (don't `?` it), release the store lock, ALWAYS run the
+    // fail-closed upload-after, THEN handle the captured result — a failure must
+    // not skip the durability upload (else the next run's start-download reverts
+    // the partial restoration).
+    let exec_result =
+        execute_restore_apply(&store, stores, warehouse, plan_id, &plan, Utc::now()).await;
+    // Drop the store to release the advisory lock / flush the file before upload.
+    drop(store);
 
+    // Finding 2b + 5 (upload-after, unconditional): push whatever restore wrote to
+    // local state to the remote backend (fail-closed) so it is durable.
+    crate::commands::apply::upload_remote_ledger_fail_closed(
+        loaded_cfg.as_ref(),
+        state_path,
+        "restore apply",
+    )
+    .await?;
+
+    let output = exec_result?;
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
@@ -1515,6 +1541,7 @@ mod tests {
                 true,
                 &stores,
                 &fresh_duckdb(),
+                rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
             .unwrap();
@@ -1555,6 +1582,7 @@ mod tests {
                 true,
                 &stores,
                 &fresh_duckdb(),
+                rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
             .unwrap();
@@ -1652,6 +1680,7 @@ mod tests {
                 true,
                 &SharedStore(cas.clone()),
                 &fresh_duckdb(),
+                rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
             .unwrap();
@@ -1878,6 +1907,7 @@ mod tests {
                 true,
                 &SharedStore(cas.clone()),
                 &fresh_duckdb(),
+                rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
             .expect_err("apply must refuse an unreviewed restore plan");
@@ -1906,6 +1936,7 @@ mod tests {
                 true,
                 &SharedStore(cas.clone()),
                 &fresh_duckdb(),
+                rocky_core::config::load_rocky_config(&config).ok(),
             )
             .await
             .unwrap();

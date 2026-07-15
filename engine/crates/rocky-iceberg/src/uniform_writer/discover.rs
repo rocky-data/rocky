@@ -1041,9 +1041,16 @@ fn canonical_key(raw: &str, table_bucket: &str, key_prefix: &str) -> Option<Stri
 ///   `minReaderVersion == 3`, `writerFeatures` appear **iff**
 ///   `minWriterVersion == 7` (real UniForm tables are reader v2 with no reader
 ///   features + writer v7 with writer features);
-/// - every listed feature is a string in [`SUPPORTED_TABLE_FEATURES`] — an
-///   unknown feature, a non-array feature field (`"writerFeatures":
-///   "deletionVectors"`), or `deletionVectors` all hold.
+/// - every listed feature is a string in its position's allowlist
+///   ([`SUPPORTED_READER_FEATURES`] / [`SUPPORTED_WRITER_FEATURES`]) — an unknown
+///   feature, a non-array feature field (`"writerFeatures": "deletionVectors"`),
+///   a wrongly-placed feature, or `deletionVectors` all hold;
+/// - reader+writer DUAL features (present in BOTH allowlists, e.g.
+///   `columnMapping`, `timestampNtz`) are correctly MIRRORED when both lists are
+///   present (reader v3 + writer v7): a dual feature declared in one list but not
+///   the other is an asymmetric, ill-formed protocol and holds. The real UniForm
+///   shape (reader v2 with NO `readerFeatures`) is unaffected — mirroring is only
+///   required once the reader side also uses table features.
 fn protocol_is_supported(protocol: &serde_json::Value) -> bool {
     use serde_json::Value;
     let Some(obj) = protocol.as_object() else {
@@ -1086,6 +1093,37 @@ fn protocol_is_supported(protocol: &serde_json::Value) -> bool {
             match f.as_str() {
                 Some(name) if allowlist.contains(&name) => {}
                 _ => return false, // unknown feature / wrong placement / non-string
+            }
+        }
+    }
+
+    // Cross-list mirroring for reader+writer DUAL features. A feature present in
+    // BOTH allowlists (`columnMapping`, `timestampNtz`) is a reader+writer table
+    // feature: when the table uses table features on BOTH sides — reader v3 +
+    // writer v7, so both lists are present — a conformant Delta writer lists it
+    // in BOTH `readerFeatures` and `writerFeatures`. A dual feature that appears
+    // in one list but not the other is an ill-formed, asymmetric protocol this
+    // reader will not reason about → hold. This is the principled generalization
+    // of the `v2Checkpoint` exclusion above: rather than drop each dual feature
+    // from the allowlists, require any dual feature to be correctly mirrored.
+    //
+    // Guarded on BOTH lists being present, so the real UniForm shape (reader v2
+    // with NO `readerFeatures` + `columnMapping` in `writerFeatures`) stays
+    // supported — mirroring is only required once the reader side ALSO uses
+    // table features (v3). Given the version/list consistency enforced above,
+    // "both present" ⟺ reader v3 AND writer v7.
+    if let (Some(reader_arr), Some(writer_arr)) = (
+        reader_feats.and_then(Value::as_array),
+        writer_feats.and_then(Value::as_array),
+    ) {
+        for &dual in SUPPORTED_READER_FEATURES {
+            if !SUPPORTED_WRITER_FEATURES.contains(&dual) {
+                continue; // pure-reader feature (none today), not a dual feature
+            }
+            let in_reader = reader_arr.iter().any(|v| v.as_str() == Some(dual));
+            let in_writer = writer_arr.iter().any(|v| v.as_str() == Some(dual));
+            if in_reader != in_writer {
+                return false; // dual feature in one list but not the other → hold
             }
         }
     }
@@ -1255,6 +1293,61 @@ mod tests {
             "minWriterVersion": 7,
             "readerFeatures": ["appendOnly"],
             "writerFeatures": ["appendOnly", "columnMapping"],
+        })));
+    }
+
+    #[test]
+    fn protocol_is_supported_requires_dual_feature_mirroring() {
+        use serde_json::json;
+        // A reader+writer DUAL feature (`columnMapping`, in BOTH allowlists) must
+        // be MIRRORED across the reader and writer lists once both lists are
+        // present (reader v3 + writer v7). A dual feature in one list but not the
+        // other is an asymmetric, ill-formed protocol → hold.
+
+        // In `readerFeatures` only (writer lists a pure-writer feature instead).
+        // Previously ACCEPTED — each list passed its own allowlist — now holds.
+        assert!(!protocol_is_supported(&json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["columnMapping"],
+            "writerFeatures": ["appendOnly"],
+        })));
+
+        // Reverse asymmetry: `columnMapping` in `writerFeatures` only, while the
+        // OTHER dual feature (`timestampNtz`) IS correctly mirrored — isolates the
+        // `columnMapping` asymmetry. Previously ACCEPTED, now holds.
+        assert!(!protocol_is_supported(&json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["timestampNtz"],
+            "writerFeatures": ["timestampNtz", "columnMapping", "appendOnly"],
+        })));
+
+        // `timestampNtz` is also a dual feature: reader-only placement (writer
+        // omits it, `columnMapping` mirrored) → hold. Previously ACCEPTED.
+        assert!(!protocol_is_supported(&json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["columnMapping", "timestampNtz"],
+            "writerFeatures": ["columnMapping", "appendOnly"],
+        })));
+
+        // Correctly mirrored dual features (in BOTH lists) → STILL supported.
+        assert!(protocol_is_supported(&json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["columnMapping", "timestampNtz"],
+            "writerFeatures": ["columnMapping", "timestampNtz", "appendOnly"],
+        })));
+
+        // The real UniForm shape is UNAFFECTED: reader v2 has NO `readerFeatures`,
+        // so the dual `columnMapping` may live in `writerFeatures` alone —
+        // mirroring is only required once the reader side ALSO uses table
+        // features (v3). Must remain supported.
+        assert!(protocol_is_supported(&json!({
+            "minReaderVersion": 2,
+            "minWriterVersion": 7,
+            "writerFeatures": ["columnMapping", "icebergCompatV2", "invariants", "appendOnly"],
         })));
     }
 

@@ -65,14 +65,17 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tracing::warn;
 
-use rocky_core::config::{ConfigError, PolicyCapability, PolicyPrincipal, load_rocky_config};
+use rocky_core::config::{
+    PolicyCapability, PolicyPrincipal, StateBackend, StateConfig, StateUploadFailureMode,
+    load_rocky_config,
+};
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
 use rocky_core::state::{
     ArtifactRecord, EvictOutcome, ModelExecution, ProvenanceRecord, RunRecord, StateStore,
     TombstoneRecord,
 };
 
-use crate::commands::apply::{PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy};
+use crate::commands::apply::{PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy_with_policy};
 use crate::commands::replay::classify_model;
 use crate::commands::review::record_plan_review_escalation;
 use crate::output::{
@@ -1495,8 +1498,49 @@ pub(crate) async fn run_gc_apply_in_with(
         .map(|e| (e.model_name.clone(), PolicyCapability::Gc))
         .collect();
     let models_dir = gc_models_dir(loaded_cfg.as_ref(), config_path);
-    let gate = evaluate_apply_policy(
-        config_path,
+
+    // SEAM-SCOPED SYNC (S1, #1089) — download half, BEFORE the policy gate.
+    // Two ledgers matter here and both are among the tables `rocky run`
+    // wholesale downloads-at-start / uploads-at-end when `[state]` is remote:
+    //   1. POLICY_DECISIONS — the freeze/budget ledger `evaluate_apply_policy`
+    //      reads. A freeze uploaded by another pod is invisible unless we pull
+    //      the authoritative remote ledger FIRST (finding 4-GC); otherwise the
+    //      gate would clear against a stale local snapshot and gc would proceed
+    //      through an active cross-pod freeze.
+    //   2. TOMBSTONES — the eviction ledger `execute_gc_apply` writes; left
+    //      unsynced an eviction would be silently reverted by the next run's
+    //      start-download.
+    // So when the backend is remote we download the authoritative remote state
+    // (overwriting the local file, preserving the local-only tables) BEFORE the
+    // policy gate reads it and before we tombstone on top of it, then upload
+    // AFTER the commit. A remote-backend `gc apply` therefore requires the
+    // backend reachable; a download failure aborts before gating or evicting.
+    //
+    // KNOWN LIMITATION (concurrency): this closes only the *sequential*
+    // between-runs clobber. The remote state object is a whole-file blob with no
+    // compare-and-swap, so a concurrent writer (e.g. a `rocky run` whose
+    // start-download preceded this apply) can still overwrite these tombstones on
+    // its end-upload — a cross-pod lost update. Concurrency is NOT handled here.
+    let state_cfg = loaded_cfg
+        .as_ref()
+        .map(|cfg| cfg.state.clone())
+        .unwrap_or_default();
+    let remote_state = !matches!(state_cfg.backend, StateBackend::Local);
+    if remote_state {
+        rocky_core::state_sync::download_state(&state_cfg, state_path)
+            .await
+            .with_context(|| {
+                "failed to download remote state before gc apply; a remote-backend gc apply \
+                 requires the state backend to be reachable"
+            })?;
+    }
+
+    // Finding 1: gate on the SAME `loaded_cfg` snapshot used for the state
+    // backend + models-dir above, rather than reloading the config inside
+    // `evaluate_apply_policy` — a `rocky.toml` swap between the loads must not let
+    // the state-backend/download and the policy gate disagree.
+    let gate = evaluate_apply_policy_with_policy(
+        loaded_cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
         plan_record.enforcement_principal(runtime_principal),
         &touched,
@@ -1528,16 +1572,15 @@ pub(crate) async fn run_gc_apply_in_with(
     // typo alongside `physical_delete = true` — a missing env var, a validation
     // failure) is propagated (fail loud): a misconfigured `physical_delete`
     // must never silently degrade into "tombstone + retire" (finding 3).
-    let physical_delete = match load_rocky_config(config_path) {
-        Ok(cfg) => cfg.gc.physical_delete,
-        Err(ConfigError::FileNotFound { .. }) => false,
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context(
-                "failed to load config to resolve `[gc] physical_delete` — refusing to apply a \
-                 gc plan against an unreadable/malformed config (fail-closed)",
-            ));
-        }
-    };
+    //
+    // Finding 1: resolved from the SAME `loaded_cfg` snapshot loaded above — a
+    // genuine (non-FileNotFound) config error already bailed there, so `None`
+    // here is exactly the absent-config case → `physical_delete = false`. No
+    // second `load_rocky_config` that a `rocky.toml` swap could point elsewhere.
+    let physical_delete = loaded_cfg
+        .as_ref()
+        .map(|cfg| cfg.gc.physical_delete)
+        .unwrap_or(false);
     if physical_delete {
         bail!(
             "`[gc] physical_delete = true` is not supported: physical reclamation of \
@@ -1551,6 +1594,24 @@ pub(crate) async fn run_gc_apply_in_with(
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     let output = execute_gc_apply(&store, oracle, plan_id, &plan, Utc::now()).await?;
+    // Drop the store to release the advisory lock / flush the file before upload.
+    drop(store);
+
+    // SEAM-SCOPED SYNC — upload half, FAIL-CLOSED. Durability is the whole point
+    // of the seam: an eviction that commits locally but never reaches the remote
+    // would be silently reverted by the next run's start-download while this
+    // command reported success. So the upload is forced to `Fail` regardless of
+    // the configured `on_upload_failure` (default `skip`) — a failed upload
+    // aborts (finding 5).
+    if remote_state {
+        let upload_cfg = StateConfig {
+            on_upload_failure: StateUploadFailureMode::Fail,
+            ..state_cfg.clone()
+        };
+        rocky_core::state_sync::upload_state(&upload_cfg, state_path)
+            .await
+            .with_context(|| "failed to upload remote state after gc apply")?;
+    }
 
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -2663,6 +2724,62 @@ auto_create_schemas = true
         let store = StateStore::open(&state_path).unwrap();
         assert_eq!(store.list_tombstones().unwrap().len(), 1);
         assert_eq!(store.refcount_for_hash(HA).unwrap(), 0);
+    }
+
+    /// S1 (#1089): with a REMOTE `[state]` backend, `gc apply` brackets the
+    /// TOMBSTONES write with a seam-scoped sync whose **download-before-open**
+    /// half runs first. A deliberately-misconfigured remote backend (`s3`, no
+    /// bucket) makes that download fail fast with `MissingConfig`, aborting the
+    /// apply BEFORE any eviction. Proves the download-before half is wired and
+    /// fatal (and that no tombstone leaks past a failed sync); without it, the
+    /// eviction would proceed and be reverted by the next run's start-download.
+    #[tokio::test]
+    async fn gc_apply_downloads_remote_state_before_evicting() {
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let plan_id = {
+            let store = StateStore::open(&state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(dir.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+
+        // A rocky.toml with a REMOTE [state] backend, deliberately missing its
+        // bucket so the download-before step fails fast with MissingConfig.
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(&config, "[state]\nbackend = \"s3\"\n").unwrap();
+
+        // Satisfy the unconditional review gate so we reach the sync seam.
+        let marker = crate::commands::apply::review_marker_path(dir.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+
+        let oracle = FixedLivenessOracle::reclaimable();
+        let err = run_gc_apply_in_with(
+            dir.path(),
+            &config,
+            &plan_id,
+            &state_path,
+            PolicyPrincipal::Human,
+            true,
+            &oracle,
+        )
+        .await
+        .expect_err("a remote-backend gc apply must abort when the state backend is unreachable");
+        assert!(
+            err.to_string().contains("download remote state"),
+            "download-before-open must be wired and fatal: {err}"
+        );
+
+        // Nothing evicted — the download-before aborted before the store write.
+        let store = StateStore::open(&state_path).unwrap();
+        assert!(
+            store.list_tombstones().unwrap().is_empty(),
+            "no tombstone should be written when the download-before-open aborts"
+        );
     }
 
     /// 🔴 DEFECT 1 (append-only data loss). The UniForm/Delta writer is

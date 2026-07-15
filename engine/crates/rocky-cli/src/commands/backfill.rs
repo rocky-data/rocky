@@ -225,6 +225,13 @@ pub(crate) fn run_backfill_in(
         .as_ref()
         .map(crate::commands::apply::governance_policy_identity)
         .unwrap_or_default();
+    // Execution-control identity (#1095(a)): `[run]`/`[reuse]`/`[resilience]`,
+    // symmetric with the apply choke-point. (Hooks are refused under a governed
+    // apply, #1095(c), not bound here.)
+    let exec_control_identity = backfill_cfg
+        .as_ref()
+        .map(crate::commands::apply::execution_control_identity)
+        .unwrap_or_default();
     // Finding #4: a backfill is selection-scoped (`model_set`) and reconciles
     // ONLY tags, never masks (run.rs `execute_backfill_set` → tags), so the mask
     // is NOT bound — matching the apply choke-point, which sees `model_set` and
@@ -267,6 +274,7 @@ pub(crate) fn run_backfill_in(
             &compiled.project.models,
             &identity,
             &governance_identity,
+            &exec_control_identity,
             &extras,
         ),
         config_identity,

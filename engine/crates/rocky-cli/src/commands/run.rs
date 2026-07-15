@@ -1055,6 +1055,56 @@ async fn apply_grants_with_catalog_client_fallback(
     }
 }
 
+/// #1095(c): a governed apply must not execute `[hook]` / `[hook.webhooks]`
+/// side effects. Hook commands fire at pipeline-start — BEFORE the
+/// execution-fingerprint choke-point — and a replication-only apply never
+/// reaches the gate at all, so binding hooks into the fingerprint could not
+/// prevent a post-review hook from running arbitrary shell commands. A governed
+/// run that configures any hook or webhook is therefore REFUSED before any hook
+/// is built or fired, rather than firing unreviewed side effects. A bare
+/// `rocky run` / human apply is ungoverned (`governed == false`) → hooks fire as
+/// before.
+pub(crate) fn refuse_governed_side_effects(
+    governed: bool,
+    hooks: &rocky_core::hooks::HooksConfig,
+) -> Result<()> {
+    use rocky_core::hooks::{HookConfigOrList, HookEvent, WebhookConfigOrList};
+    // Count NORMALIZED executable side effects EXACTLY as `HookRegistry::from_config`
+    // does (hooks/mod.rs): an entry fires only when its key resolves to a known
+    // `HookEvent` AND its list is non-empty. An unknown event key (a typo like
+    // `[hook.on_typ]`, which the registry skips) or an empty `[[hook.on_x]]` list
+    // registers and fires nothing → must NOT refuse (red-team #9).
+    let executable =
+        |key: &str, non_empty: bool| HookEvent::from_config_key(key).is_some() && non_empty;
+    let has_shell_hook = hooks.hooks.iter().any(|(event, h)| {
+        executable(
+            event,
+            match h {
+                HookConfigOrList::Single(_) => true,
+                HookConfigOrList::Multiple(v) => !v.is_empty(),
+            },
+        )
+    });
+    let has_webhook = hooks.webhooks.iter().any(|(event, w)| {
+        executable(
+            event,
+            match w {
+                WebhookConfigOrList::Single(_) => true,
+                WebhookConfigOrList::Multiple(v) => !v.is_empty(),
+            },
+        )
+    });
+    if governed && (has_shell_hook || has_webhook) {
+        anyhow::bail!(
+            "refusing a governed apply that configures `[hook]`/`[hook.webhooks]`: hook \
+             commands fire at pipeline-start, before the execution-fingerprint gate (and a \
+             replication-only apply never reaches it), so a post-plan hook edit would run \
+             unreviewed commands. Remove the hooks, or apply outside the agent-policy plane."
+        );
+    }
+    Ok(())
+}
+
 /// Execute `rocky run` — full pipeline.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run", fields(run_id))]
@@ -1214,6 +1264,11 @@ pub async fn run(
         config_path.display()
     ))?;
     let config_hash = crate::output::config_fingerprint(config_path);
+
+    // #1095(c): refuse a governed apply that configures `[hook]`/`[hook.webhooks]`
+    // BEFORE any hook is built or fired — hooks run outside (and before) the
+    // execution-fingerprint gate, so they cannot be enforced by fingerprint.
+    refuse_governed_side_effects(governed_ctx.is_some(), &rocky_cfg.hooks)?;
 
     // Governed-apply TOCTOU gate (E) — pairs the plan-authorized IR fingerprint
     // with THIS run's config identity; verified at the execution choke-point
@@ -1597,6 +1652,20 @@ pub async fn run(
     {
         Ok(()) => true,
         Err(e) => {
+            // #2 (red-team): a GOVERNED run whose remote-state download failed
+            // cannot see a cross-pod freeze/budget recorded by another pod. If a
+            // `[policy]` plane is configured (the in-run gate WILL consult
+            // POLICY_DECISIONS), fail-closed rather than evaluate the freeze from
+            // stale local state and fail OPEN. With no `[policy]` there is nothing
+            // to enforce, so continue — same as an ungoverned run, no availability
+            // regression (red-team #8's no-policy false-abort avoided).
+            if exec_fp_gate.is_some() && rocky_cfg.policy.is_some() {
+                anyhow::bail!(
+                    "refusing a governed run: remote state download failed ({e}), so a \
+                     cross-pod freeze/budget in the durable state ledger cannot be seen \
+                     (fail-closed). Retry once the `[state]` backend is reachable."
+                );
+            }
             warn!(error = %e, "state download failed, continuing with local state");
             false
         }
@@ -1750,7 +1819,10 @@ pub async fn run(
                     .flat_map(|t| shadow_gate_target_names(&t.name, shadow_config))
             })
             .collect();
-        ctx.gate_replication_targets(&replication_targets, &state_store)?;
+        // Finding 1: thread `run`'s single `rocky_cfg` snapshot into the in-run
+        // replication gate so it evaluates `[policy]` / models-dir from the config
+        // `run` executed against, not a reload a mid-run swap could redirect.
+        ctx.gate_replication_targets(&replication_targets, &state_store, &rocky_cfg)?;
     }
 
     // --- Sequential: catalog/schema setup + table collection ---
@@ -11906,8 +11978,8 @@ merge_keys = ["id"]
         // exact way `execute_models` recomputes at the choke-point (compile +
         // surrogate/contract extras), so the two must agree.
         let no_mask = std::collections::BTreeMap::new();
-        let fp1 = exec_choke_fingerprint(&models, "cfg", "", &no_mask);
-        let fp2 = exec_choke_fingerprint(&models, "cfg", "", &no_mask);
+        let fp1 = exec_choke_fingerprint(&models, "cfg", "", "", &no_mask);
+        let fp2 = exec_choke_fingerprint(&models, "cfg", "", "", &no_mask);
         assert_eq!(
             fp1, fp2,
             "same bytes must fingerprint identically (stability)"
@@ -11921,6 +11993,7 @@ merge_keys = ["id"]
             expected: Some(fp1.clone()),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
+            exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
@@ -12040,6 +12113,7 @@ merge_keys = ["id"]
         models_dir: &std::path::Path,
         config_identity: &str,
         governance_identity: &str,
+        exec_control_identity: &str,
         resolved_mask: &std::collections::BTreeMap<String, rocky_ir::MaskStrategy>,
     ) -> String {
         use rocky_compiler::compile::{self, CompilerConfig};
@@ -12058,9 +12132,71 @@ merge_keys = ["id"]
             &result.project.models,
             config_identity,
             governance_identity,
+            exec_control_identity,
             &extras,
         )
         .unwrap()
+    }
+
+    /// #1095(c): a governed run REFUSES when hooks/webhooks are configured (they
+    /// fire before the fingerprint gate), while a non-governed run and a governed
+    /// run with no hooks proceed.
+    #[test]
+    fn governed_run_refuses_configured_hooks() {
+        use rocky_core::hooks::{HookConfig, HookConfigOrList, HooksConfig};
+        let with_hook = HooksConfig {
+            webhooks: Default::default(),
+            hooks: [(
+                "on_pipeline_start".to_string(),
+                HookConfigOrList::Single(HookConfig {
+                    command: "scripts/notify.sh".to_string(),
+                    timeout_ms: 1000,
+                    on_failure: Default::default(),
+                    env: Default::default(),
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let empty = HooksConfig {
+            webhooks: Default::default(),
+            hooks: Default::default(),
+        };
+        // Governed + hooks → refuse (before any hook fires).
+        assert!(super::refuse_governed_side_effects(true, &with_hook).is_err());
+        // Non-governed + hooks → allowed (bare `rocky run` fires hooks as before).
+        assert!(super::refuse_governed_side_effects(false, &with_hook).is_ok());
+        // Governed + no hooks → allowed.
+        assert!(super::refuse_governed_side_effects(true, &empty).is_ok());
+        // #9: a governed run with an EMPTY `[[hook]]` list registers zero hooks
+        // and fires nothing → must NOT be refused (normalized count, not map key).
+        let empty_list = HooksConfig {
+            webhooks: Default::default(),
+            hooks: [(
+                "on_pipeline_start".to_string(),
+                HookConfigOrList::Multiple(vec![]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert!(super::refuse_governed_side_effects(true, &empty_list).is_ok());
+        // #9 (round 3): an UNKNOWN event key (a typo) is skipped by the registry
+        // and fires nothing → must NOT be refused, even with a command present.
+        let unknown_event = HooksConfig {
+            webhooks: Default::default(),
+            hooks: [(
+                "on_typo_not_an_event".to_string(),
+                HookConfigOrList::Single(HookConfig {
+                    command: "scripts/x.sh".to_string(),
+                    timeout_ms: 1000,
+                    on_failure: Default::default(),
+                    env: Default::default(),
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert!(super::refuse_governed_side_effects(true, &unknown_event).is_ok());
     }
 
     /// Run one governed `execute_models` apply under a fixed gate and return the
@@ -12079,6 +12215,7 @@ merge_keys = ["id"]
             expected: Some(expected_fp.to_string()),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
+            exec_control_identity: String::new(),
             resolved_mask: resolved_mask.clone(),
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
@@ -12134,7 +12271,7 @@ merge_keys = ["id"]
 
         let db = dir.path().join("wh.duckdb");
         // Plan-time fingerprint binds the surrogate spec (columns = [id]).
-        let fp = exec_choke_fingerprint(&models, "cfg", "", &std::collections::BTreeMap::new());
+        let fp = exec_choke_fingerprint(&models, "cfg", "", "", &std::collections::BTreeMap::new());
         // (2) unchanged apply → no refuse.
         governed_apply(
             &models,
@@ -12184,7 +12321,7 @@ merge_keys = ["id"]
         .unwrap();
 
         let db = dir.path().join("wh.duckdb");
-        let fp = exec_choke_fingerprint(&models, "cfg", "", &std::collections::BTreeMap::new());
+        let fp = exec_choke_fingerprint(&models, "cfg", "", "", &std::collections::BTreeMap::new());
         governed_apply(
             &models,
             &db,
@@ -12260,7 +12397,7 @@ merge_keys = ["id"]
 
         let hash_mask = std::collections::BTreeMap::from([("pii".to_string(), MaskStrategy::Hash)]);
         // Baseline fp binds the EFFECTIVE mask {pii→hash}.
-        let fp = exec_choke_fingerprint(&models, "cfg", "", &hash_mask);
+        let fp = exec_choke_fingerprint(&models, "cfg", "", "", &hash_mask);
         governed_apply(&models, &db, "mask-ok", &fp, &hash_mask, true)
             .await
             .expect("unchanged effective mask must NOT refuse");
@@ -12317,6 +12454,7 @@ merge_keys = ["id"]
             expected: None,
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
+            exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
             reviewed_source_schemas: Some(snapshot),
             plan_id: "p".to_string(),
@@ -12389,7 +12527,7 @@ merge_keys = ["id"]
         // A scoped apply omits the mask, so the reviewed fingerprint is computed
         // with an EMPTY mask (over all compiled models).
         let empty_mask = std::collections::BTreeMap::new();
-        let fp = exec_choke_fingerprint(&models, "cfg", "", &empty_mask);
+        let fp = exec_choke_fingerprint(&models, "cfg", "", "", &empty_mask);
 
         // The gate still carries `b`'s (and `a`'s) resolved mask — but the scoped
         // choke-point must ignore it. A confidential→redact change on `b` must not
@@ -12402,6 +12540,7 @@ merge_keys = ["id"]
             expected: Some(fp),
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
+            exec_control_identity: String::new(),
             resolved_mask: with_b_mask,
             reviewed_source_schemas: Some(std::collections::BTreeMap::new()),
             plan_id: "p".to_string(),
@@ -12456,6 +12595,7 @@ merge_keys = ["id"]
             expected: None,
             config_identity: "cfg".to_string(),
             governance_identity: String::new(),
+            exec_control_identity: String::new(),
             resolved_mask: std::collections::BTreeMap::new(),
             reviewed_source_schemas: None, // v2 governed plan MUST carry Some
             plan_id: "p".to_string(),
@@ -12548,7 +12688,10 @@ merge_keys = ["id"]
         let gov = crate::commands::apply::governance_policy_identity(&cfg);
         let resolved_mask: std::collections::BTreeMap<String, rocky_ir::MaskStrategy> =
             std::collections::BTreeMap::new();
-        let apply_fp = exec_choke_fingerprint(&models, &identity, &gov, &resolved_mask);
+        // Match the plan side (`compute_embedded_capabilities` → plan.rs), which
+        // binds the execution-control identity (run/reuse/resilience).
+        let ec = crate::commands::apply::execution_control_identity(&cfg);
+        let apply_fp = exec_choke_fingerprint(&models, &identity, &gov, &ec, &resolved_mask);
 
         assert_eq!(
             caps.models_fingerprint.as_deref(),
@@ -12606,7 +12749,10 @@ merge_keys = ["id"]
         let identity = crate::commands::apply::config_policy_identity(&cfg);
         let gov = crate::commands::apply::governance_policy_identity(&cfg);
         let resolved_mask = cfg.resolve_mask_for_env(None);
-        let apply_fp = exec_choke_fingerprint(&models, &identity, &gov, &resolved_mask);
+        // Match the plan side (`compute_embedded_capabilities` → plan.rs), which
+        // binds the execution-control identity (run/reuse/resilience).
+        let ec = crate::commands::apply::execution_control_identity(&cfg);
+        let apply_fp = exec_choke_fingerprint(&models, &identity, &gov, &ec, &resolved_mask);
         assert_eq!(
             caps.models_fingerprint.as_deref(),
             Some(apply_fp.as_str()),

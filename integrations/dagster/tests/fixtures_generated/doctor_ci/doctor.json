@@ -17,7 +17,7 @@
     {
       "name": "state_schema",
       "status": "healthy",
-      "message": "state schema v20 matches this binary",
+      "message": "no on-disk state schema (binary supports v20)",
       "duration_ms": 0
     },
     {
