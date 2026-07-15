@@ -6,7 +6,10 @@
 //! evaluates the `(principal, capability, model)` triple against the
 //! policy, and prints the resolved effect + winning rule + reason. The
 //! same evaluator is enforced at `apply`, `promote`, and the MCP write
-//! tools; `check` explains what they would decide.
+//! tools, but `check` reports the *static* base decision only — the live
+//! seams additionally project active freezes and autonomy-budget burn,
+//! which can only tighten the effect (an `allow` here can still be
+//! reviewed or denied at apply time; a `deny` stays a deny).
 //!
 //! `test` is the CI safety net: it runs the project's `[[policy.tests]]`
 //! scenarios through the *same* evaluator and fails (non-zero exit) if any

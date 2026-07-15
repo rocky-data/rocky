@@ -111,7 +111,7 @@ flowchart LR
 
 [POC: `04-governance/11-agent-policy`](examples/playground/pocs/04-governance/11-agent-policy/) drives this end to end, and the policy itself is regression-tested: `rocky policy test` runs pinned scenarios in CI and fails when an edit loosens a rule ([POC: `03-ai/07-policy`](examples/playground/pocs/03-ai/07-policy/)).
 
-Autonomy is earned rung by rung: retrying a proven-transient failure is free, a provably additive schema change can be allowed to flow under policy, and everything else waits for review unless you explicitly grant it. Budgets tighten on repeated failure and never widen on their own; `rocky policy freeze` is the kill switch. How an agent authors, proposes, and clears the gates is in [Operating Rocky with agents](https://rocky-data.dev/concepts/operating-rocky-with-agents/).
+Autonomy is earned rung by rung: retrying a proven-transient failure is free, a provably additive schema change can be allowed to flow under policy, and everything else waits for review unless you explicitly grant it. Budgets tighten on repeated failure and recover only as those failures age out of the configured window; `rocky policy freeze` is the kill switch. How an agent authors, proposes, and clears the gates is in [Operating Rocky with agents](https://rocky-data.dev/concepts/operating-rocky-with-agents/).
 
 ## Where Rocky is today
 
