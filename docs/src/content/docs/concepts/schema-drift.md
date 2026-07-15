@@ -40,7 +40,11 @@ ALTER TABLE acme_warehouse.staging__us_west__shopify.orders
 ALTER COLUMN amount TYPE DECIMAL(12, 2)
 ```
 
-The allowlist is per-dialect, matching what each warehouse's `ALTER COLUMN` can apply losslessly. The table above is the default (Databricks, DuckDB, Trino). Snowflake allows only `NUMBER(p,s)` precision widening and `VARCHAR` length widening — integer types all canonicalize to `NUMBER(38,0)` in its `DESCRIBE TABLE` output, so integer widening never surfaces as drift there. BigQuery allows only `INT64 → NUMERIC`, `INT64 → BIGNUMERIC`, and `NUMERIC → BIGNUMERIC`; numeric → `STRING` is **not** assignable on BigQuery and falls through to a full refresh.
+Classification is per-dialect. The table above is the engine's default allowlist, verified end-to-end on DuckDB. Snowflake and BigQuery override it with narrower rules matching exactly what their `ALTER COLUMN` accepts: Snowflake allows only `NUMBER(p,s)` precision widening and `VARCHAR` length widening (integer types all canonicalize to `NUMBER(38,0)` in its `DESCRIBE TABLE` output, so integer widening never surfaces as drift there), and BigQuery allows only `INT64 → NUMERIC`, `INT64 → BIGNUMERIC`, and `NUMERIC → BIGNUMERIC` — numeric → `STRING` is not assignable on BigQuery and falls through to a full refresh.
+
+:::caution[Databricks and Trino execution gaps]
+Databricks and Trino currently inherit the default allowlist, and their `ALTER` execution paths have known gaps: Delta tables reject `ALTER COLUMN ... TYPE` changes unless the type-widening table feature is enabled (Rocky does not set it) and never accept numeric → `STRING`, and Trino requires `SET DATA TYPE` syntax the default statement doesn't use. On those warehouses, a drift classified as a safe widening fails that table's run with the warehouse's error — loud, never a silent divergence — instead of evolving the column in place; Rocky does not yet fall back to a full refresh on a failed `ALTER`. Tracked in [#1115](https://github.com/rocky-data/rocky/issues/1115).
+:::
 
 ### Unsafe Type Changes
 

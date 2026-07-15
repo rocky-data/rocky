@@ -103,7 +103,8 @@ An upstream loader changes a column's type under you: yesterday `order_id` was `
  Rocky (replication pipelines):
    source changes ──▶ drift check ──▶ classified, then acted on:
 
-     widening (INT → BIGINT)       ──▶ ALTER TABLE in place,
+     widening (INT → BIGINT)       ──▶ ALTER TABLE in place where
+                                       the warehouse supports it,
                                        existing rows preserved
 
      narrowing (BIGINT → INT)      ──▶ target dropped and re-copied
@@ -115,7 +116,7 @@ An upstream loader changes a column's type under you: yesterday `order_id` was `
                                        target left untouched
 ```
 
-On replication runs where the target table already exists, Rocky compares the source's actual columns against the target's before copying, and classifies every mismatch. Type changes the warehouse can apply losslessly in place — widenings like `INT` to `BIGINT`, decided per warehouse dialect by what its `ALTER COLUMN` supports — are applied with an `ALTER TABLE`, preserving existing rows. Anything else (a narrowed type, an incompatible column family) drops the target and re-copies it from the current source — automatic and recorded in the run output, but still a rebuild: the new target holds only what the source holds today, so it is not lossless for targets that accumulate history the source has pruned. Teams that don't want automatic schema mutations opt into the drift-governance policy gate, which refuses any non-additive change and surfaces it for review instead of applying it. See [Schema Drift](/concepts/schema-drift/) for the classification rules. None of the dbt engines detect source-schema drift today (see the [drift table](/getting-started/comparison/#schema-drift-detection)).
+On replication runs where the target table already exists, Rocky compares the source's actual columns against the target's before copying, and classifies every mismatch. Changes classified as safe widenings — like `INT` to `BIGINT`; each dialect ships its own allowlist — are applied in place with an `ALTER TABLE`, preserving existing rows, where the warehouse supports that `ALTER` (support varies by adapter today; the [Schema Drift](/concepts/schema-drift/) page has the per-warehouse rules and the current gaps). Incompatible changes (a narrowed type, a changed column family) drop the target and re-copy it from the current source — automatic and recorded in the run output, but still a rebuild: the new target holds only what the source holds today, so it is not lossless for targets that accumulate history the source has pruned. Teams that don't want automatic schema mutations opt into the drift-governance policy gate, which refuses any non-additive change and surfaces it for review instead of applying it. The honest summary: drift is always *detected*, and the outcome is an in-place evolution, a logged rebuild, a policy refusal, or a loud error — never a silent divergence. None of the dbt engines detect source-schema drift at all today (see the [drift table](/getting-started/comparison/#schema-drift-detection)).
 
 ## What about dbt Fusion?
 
