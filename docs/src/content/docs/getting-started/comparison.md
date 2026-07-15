@@ -5,7 +5,7 @@ sidebar:
   order: 4.5
 ---
 
-A factual feature-by-feature comparison of the major SQL transformation tools. Features verified against official documentation and source code as of July 2026.
+A factual feature-by-feature comparison of the major SQL transformation tools. Features verified against official documentation and source code as of July 2026. If you'd rather start with the intuition than the tables, see [Rocky vs dbt, Visually](/getting-started/rocky-vs-dbt/).
 
 :::note[A note on "dbt"]
 In these tables, **dbt-core** is the dbt Core 1.x Python line, still the dominant deployment. On 2026-06-01 dbt Labs released **dbt Core v2.0** (currently alpha): the Fusion engine, relicensed from ELv2 to Apache 2.0 and developed on the `dbt-core` main branch. As of July 2026 that Apache-licensed tree includes the SQL-comprehension code (parser, type checking, column-level lineage). The **dbt-fusion** column tracks the v2.0 line plus the precompiled Fusion binary, which remains dbt's recommended distribution. Column-level lineage and data-type checking require opting into the `strict` static-analysis mode; the default `baseline` mode does lighter, warn-only analysis. Two adjacent 2026 developments worth knowing when you evaluate: Fivetran and dbt Labs completed their merger on 2026-06-01 (dbt and SQLMesh are now corporate siblings), and dbt previewed **dbt State**, a node-level result-reuse and caching layer bundled with Core as an opt-in but activated through the dbt platform.
