@@ -2384,6 +2384,27 @@ impl RockyMcpServer {
                 "Retry the propose; if it persists, verify the project compiles cleanly.",
             )
         })?;
+        // Finding 4: pull the authoritative remote freeze/budget ledger BEFORE
+        // the policy gate reads it, so an active cross-pod freeze denies the
+        // propose instead of persisting a plan a later apply would refuse.
+        // Fail-closed, remote-only, and only when the gate will actually read the
+        // ledger (a `[policy]` block + a non-empty touched set — otherwise the
+        // gate short-circuits without a ledger read).
+        if let Ok(cfg) = rocky_core::config::load_rocky_config(&self.config_path)
+            && cfg.policy.is_some()
+            && !touched.is_empty()
+            && !matches!(cfg.state.backend, rocky_core::config::StateBackend::Local)
+        {
+            rocky_core::state_sync::download_state(&cfg.state, &state_path)
+                .await
+                .map_err(|e| {
+                    ToolError::internal(
+                        format!("failed to download remote state before the policy gate: {e:#}"),
+                        "The remote [state] backend must be reachable so a cross-pod freeze is \
+                         enforced before proposing a plan.",
+                    )
+                })?;
+        }
         let gate = rocky_cli::commands::evaluate_apply_policy(
             &self.config_path,
             &plan_id,

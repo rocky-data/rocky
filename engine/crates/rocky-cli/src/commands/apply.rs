@@ -37,7 +37,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal, StateBackend};
+use rocky_core::config::{
+    PolicyCapability, PolicyEffect, PolicyPrincipal, StateBackend, StateConfig,
+    StateUploadFailureMode,
+};
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::schema::SchemaPattern;
 use rocky_core::state::{PolicyDecisionRecord, StateStore};
@@ -268,6 +271,17 @@ async fn run_apply_run_plan(
     // into execution (the run plan owns the models_dir the resolver reads).
     let verify_checks = required_verify_after(config_path, principal, &touched, models_dir);
 
+    // Finding 3 (pre-run half): the plain rule decision the gate just recorded
+    // must survive `run`'s start-download, which REPLACES the local ledger from
+    // remote. Push it to remote NOW so `run`'s download pulls it back — otherwise
+    // the budget-burn PAIR (rule decision + verify-after custody) never both reach
+    // remote and a failed apply doesn't burn the budget. Only when a verify-after
+    // requirement exists (the budget-relevant case).
+    if !verify_checks.is_empty() {
+        upload_remote_ledger_fail_closed(cfg.as_ref(), state_path, "governed rule decision")
+            .await?;
+    }
+
     // One unique id for this apply's run, threaded into execution and into the
     // post-apply gate so the gate reads exactly this run, not "latest".
     let apply_run_id = new_apply_run_id();
@@ -293,13 +307,21 @@ async fn run_apply_run_plan(
         governed.as_ref(),
     )
     .await?;
-    run_verify_after(
+    let verify_result = run_verify_after(
         plan_id,
         principal,
         &verify_checks,
         &apply_run_id,
         state_path,
-    )
+    );
+    // Finding 3 (post-verify half): the verify-after custody row `run_verify_after`
+    // just wrote lands AFTER `run`'s end-upload, so push it to remote (fail-closed)
+    // even when verification FAILED — the failure-custody row is the budget-burning
+    // half of the pair. Upload before propagating the verify result.
+    if !verify_checks.is_empty() {
+        upload_remote_ledger_fail_closed(cfg.as_ref(), state_path, "verify-after custody").await?;
+    }
+    verify_result
 }
 
 /// Build the [`GovernedRunContext`] for a two-step apply — `Some` only for an
@@ -832,6 +854,66 @@ fn sync_remote_ledger_before_gate_blocking(
          governed promote requires the state backend reachable so a cross-pod freeze/budget \
          decision is enforced"
     })?;
+    Ok(())
+}
+
+/// Download the remote `[state]` ledger UNCONDITIONALLY for a remote backend
+/// (fail-closed), regardless of `[policy]` presence.
+///
+/// Used by seams that read a REPLICATED ledger the policy guard does not cover —
+/// `restore` reads `TOMBSTONES`, `backfill` writes on top of the artifact/run
+/// ledger (finding 2). Gating the download behind the policy guard would make a
+/// no-`[policy]` restore read STALE local tombstones and falsely refuse. No-op
+/// for the Local backend or an unloadable config.
+pub(crate) async fn download_remote_ledger_unconditional(
+    cfg: Option<&rocky_core::config::RockyConfig>,
+    state_path: &Path,
+    context_label: &str,
+) -> Result<()> {
+    let Some(cfg) = cfg else {
+        return Ok(());
+    };
+    if matches!(cfg.state.backend, StateBackend::Local) {
+        return Ok(());
+    }
+    rocky_core::state_sync::download_state(&cfg.state, state_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to download remote state before {context_label}; a remote-backend \
+                 {context_label} requires the state backend reachable to read the authoritative \
+                 ledger"
+            )
+        })?;
+    Ok(())
+}
+
+/// Upload the local `[state]` ledger to a REMOTE backend, FAIL-CLOSED
+/// (`on_upload_failure = Fail`), so a governed ledger mutation is durable.
+///
+/// Used for the restore/backfill upload-after (finding 2) and to make the
+/// budget-burn decision pair (rule decision + verify-after custody) reach remote
+/// (finding 3). No-op for the Local backend or an unloadable config.
+pub(crate) async fn upload_remote_ledger_fail_closed(
+    cfg: Option<&rocky_core::config::RockyConfig>,
+    state_path: &Path,
+    context_label: &str,
+) -> Result<()> {
+    let Some(cfg) = cfg else {
+        return Ok(());
+    };
+    if matches!(cfg.state.backend, StateBackend::Local) {
+        return Ok(());
+    }
+    let upload_cfg = StateConfig {
+        on_upload_failure: StateUploadFailureMode::Fail,
+        ..cfg.state.clone()
+    };
+    rocky_core::state_sync::upload_state(&upload_cfg, state_path)
+        .await
+        .with_context(|| {
+            format!("failed to upload remote state after {context_label} (fail-closed)")
+        })?;
     Ok(())
 }
 
@@ -2214,6 +2296,14 @@ async fn run_apply_ai_authored_plan(
     // Resolve the post-apply verification checks before the run plan is moved.
     let verify_checks = required_verify_after(config_path, principal, &touched, models_dir);
 
+    // Finding 3 (pre-run half): make the plain rule decision durable on remote
+    // before `run`'s start-download replaces the local ledger — see the twin in
+    // `run_apply_run_plan`.
+    if !verify_checks.is_empty() {
+        upload_remote_ledger_fail_closed(cfg.as_ref(), state_path, "governed rule decision")
+            .await?;
+    }
+
     // One unique id for this apply's run, threaded into execution and into the
     // post-apply gate so the gate reads exactly this run, not "latest".
     let apply_run_id = new_apply_run_id();
@@ -2235,13 +2325,19 @@ async fn run_apply_ai_authored_plan(
         governed.as_ref(),
     )
     .await?;
-    run_verify_after(
+    let verify_result = run_verify_after(
         plan_id,
         principal,
         &verify_checks,
         &apply_run_id,
         state_path,
-    )
+    );
+    // Finding 3 (post-verify half): push the verify-after custody row to remote
+    // (fail-closed) even on failure — see the twin in `run_apply_run_plan`.
+    if !verify_checks.is_empty() {
+        upload_remote_ledger_fail_closed(cfg.as_ref(), state_path, "verify-after custody").await?;
+    }
+    verify_result
 }
 
 /// Apply a `PlanKind::Backfill` plan — a scoped, review-gated recovery run.
@@ -2308,12 +2404,12 @@ async fn run_apply_backfill_plan(
     // engine composed and will execute (see `execute_backfill_set` below), not
     // an informational hint — gate on it directly.
     let touched = touched_models_for_run(&plan, &run_plan.models);
-    // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
-    // the gate reads it, so a cross-pod freeze is enforced (fail-closed). Skipped
-    // when the gate won't read the ledger (no policy / empty touched — finding 8).
-    if let Some(cfg) = &cfg {
-        sync_remote_ledger_before_gate(cfg, state_path, &touched).await?;
-    }
+    // Finding 2c (download-before): a backfill writes on top of the artifact/run/
+    // provenance ledger, so pull the authoritative remote state UNCONDITIONALLY
+    // for a remote backend (fail-closed) — not gated on policy — so it neither
+    // reads stale local state nor clobbers newer remote state on the upload-after.
+    // This also refreshes the freeze ledger the gate reads.
+    download_remote_ledger_unconditional(cfg.as_ref(), state_path, "backfill apply").await?;
     let gate = evaluate_apply_policy_with_policy(
         cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
@@ -2430,7 +2526,13 @@ async fn run_apply_backfill_plan(
         output_json,
     )
     .await
-    .with_context(|| format!("rocky apply backfill plan '{plan_id}' failed"))
+    .with_context(|| format!("rocky apply backfill plan '{plan_id}' failed"))?;
+
+    // Finding 2c (upload-after): the backfill wrote artifact/run/provenance rows
+    // to local state; push them to the remote backend (fail-closed) so the next
+    // run's start-download does not silently revert the recovery. Runs only after
+    // a successful backfill.
+    upload_remote_ledger_fail_closed(Some(&rocky_cfg), state_path, "backfill apply").await
 }
 
 /// Apply a `PlanKind::Replication` plan by re-running discovery, asserting
@@ -3397,6 +3499,60 @@ default_agent_effect = "require_review"
 
         // (An unloadable config never reaches the guard: the governed paths load
         // the snapshot with `.ok()` and skip the guard when it is `None`.)
+        Ok(())
+    }
+
+    /// Findings 2 & 3: the ledger-seam helpers used by restore/backfill
+    /// (upload-after / unconditional download) and the verify-after budget-pair
+    /// uploads are REMOTE-ONLY (a Local backend / absent config is a no-op) and
+    /// FAIL-CLOSED (a remote transfer failure propagates as `Err`).
+    #[tokio::test]
+    async fn ledger_seam_helpers_are_remote_only_and_fail_closed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state.redb");
+        let load = |name: &str, body: String| -> anyhow::Result<rocky_core::config::RockyConfig> {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body)?;
+            Ok(rocky_core::config::load_rocky_config(&path)?)
+        };
+
+        // Local backend (no [state]) + absent config ⇒ both helpers no-op Ok.
+        let local_cfg = load("local.toml", NO_POLICY_TOML.to_string())?;
+        assert!(matches!(local_cfg.state.backend, StateBackend::Local));
+        for cfg in [Some(&local_cfg), None] {
+            super::download_remote_ledger_unconditional(cfg, &state, "test")
+                .await
+                .expect("Local/absent ⇒ download is a no-op");
+            super::upload_remote_ledger_fail_closed(cfg, &state, "test")
+                .await
+                .expect("Local/absent ⇒ upload is a no-op");
+        }
+
+        // Remote backend (S3, no bucket) ⇒ both helpers ATTEMPT the transfer
+        // unconditionally and FAIL CLOSED (the misconfigured S3 dispatch errors).
+        let remote_cfg = load(
+            "remote.toml",
+            format!("{NO_POLICY_TOML}\n[state]\nbackend = \"s3\"\n"),
+        )?;
+        assert!(matches!(remote_cfg.state.backend, StateBackend::S3));
+        assert!(
+            super::download_remote_ledger_unconditional(Some(&remote_cfg), &state, "test")
+                .await
+                .is_err(),
+            "the unconditional download must attempt (and fail closed) on a remote backend"
+        );
+        // The upload helper needs a local file to exist (else upload_state
+        // early-returns Ok before the backend is touched).
+        {
+            let s = StateStore::open(&state)?;
+            drop(s);
+        }
+        assert!(
+            super::upload_remote_ledger_fail_closed(Some(&remote_cfg), &state, "test")
+                .await
+                .is_err(),
+            "the fail-closed upload must propagate a remote failure (on_upload_failure = Fail)"
+        );
         Ok(())
     }
 

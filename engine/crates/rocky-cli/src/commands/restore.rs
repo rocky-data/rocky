@@ -72,10 +72,7 @@ use rocky_iceberg::uniform_writer::{
 };
 use rocky_ir::ModelIr;
 
-use crate::commands::apply::{
-    PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy_with_policy,
-    sync_remote_ledger_before_gate,
-};
+use crate::commands::apply::{PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy_with_policy};
 use crate::commands::gc::{check_recipe_produces_output, gc_models_dir};
 use crate::commands::review::record_plan_review_escalation;
 use crate::commands::run_content_addressed::{build_object_store, table_relative_add_path};
@@ -946,16 +943,19 @@ pub(crate) async fn run_restore_apply_in_with(
         .map(|r| (r.model_name.clone(), PolicyCapability::Restore))
         .collect();
     let models_dir = gc_models_dir(loaded_cfg.as_ref(), config_path);
-    // Finding 1: `rocky restore` mutates state, so a cross-pod freeze must gate
-    // it too. Pull the authoritative remote freeze/budget ledger BEFORE the gate
-    // reads it (fail-closed, remote-only), reusing the apply seam's guarded sync
-    // — skipped when the gate won't read the ledger (no policy / empty touched —
-    // finding 8). Downloading the fresh remote state also gives the restore its
-    // authoritative tombstone ledger to replay from. Both the sync decision and
-    // the gate use the SAME `loaded_cfg` snapshot (finding A — config TOCTOU).
-    if let Some(cfg) = &loaded_cfg {
-        sync_remote_ledger_before_gate(cfg, state_path, &touched).await?;
-    }
+    // Finding 2a (download-before, UNCONDITIONAL): `rocky restore` reads the
+    // TOMBSTONES ledger from local state, so for a remote backend it must pull the
+    // authoritative remote state regardless of `[policy]` presence — the earlier
+    // policy-gated sync would let a no-`[policy]` restore read STALE local
+    // tombstones and falsely refuse a valid restore. This refresh also gives the
+    // freeze/budget gate below the current ledger. Fail-closed. Uses the SAME
+    // `loaded_cfg` snapshot the gate uses (finding A — config TOCTOU).
+    crate::commands::apply::download_remote_ledger_unconditional(
+        loaded_cfg.as_ref(),
+        state_path,
+        "restore apply",
+    )
+    .await?;
     let gate = evaluate_apply_policy_with_policy(
         loaded_cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
@@ -982,6 +982,18 @@ pub(crate) async fn run_restore_apply_in_with(
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     let output =
         execute_restore_apply(&store, stores, warehouse, plan_id, &plan, Utc::now()).await?;
+    // Drop the store to release the advisory lock / flush the file before upload.
+    drop(store);
+
+    // Finding 2b (upload-after): restore reinstated the artifact ledger row +
+    // its tombstone locally; push them to the remote backend (fail-closed) so the
+    // next run's start-download does not silently erase the restoration.
+    crate::commands::apply::upload_remote_ledger_fail_closed(
+        loaded_cfg.as_ref(),
+        state_path,
+        "restore apply",
+    )
+    .await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);

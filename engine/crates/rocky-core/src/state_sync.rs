@@ -2779,4 +2779,83 @@ mod tests {
             "no unfiltered state object may be uploaded when the filter fails (finding C)"
         );
     }
+
+    /// Finding 3: the budget-burn decision PAIR (a plain rule-decision row + a
+    /// verify-after custody Deny for the same plan) must survive the remote
+    /// round-trip, so a later agent action on another pod burns the autonomy
+    /// budget. Pod A records the pair and uploads; pod B downloads a fresh copy;
+    /// `budget_failures_in_window` counts the failed plan.
+    #[tokio::test]
+    async fn budget_pair_survives_remote_round_trip_and_burns_budget() {
+        use crate::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+        use crate::state::PolicyDecisionRecord;
+
+        test_support::clear();
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+        let now = chrono::Utc::now();
+
+        // Pod A: a failed governed apply — the plain rule decision (winning rule
+        // 0) plus the verify-after custody Deny, both keyed to `plan-1`.
+        let dir_a = TempDir::new().unwrap();
+        let pod_a = dir_a.path().join(".rocky-state.redb");
+        {
+            let store = StateStore::open(&pod_a).unwrap();
+            store
+                .record_policy_decision(&PolicyDecisionRecord {
+                    timestamp: now,
+                    plan_id: "plan-1".into(),
+                    principal: PolicyPrincipal::Agent,
+                    capability: PolicyCapability::Apply,
+                    model: "m".into(),
+                    effect: PolicyEffect::Allow,
+                    rule_id: Some(0),
+                    reason: "plain rule decision".into(),
+                    verify_after: vec![],
+                    auto_apply: None,
+                })
+                .unwrap();
+            store
+                .record_policy_decision(&PolicyDecisionRecord {
+                    timestamp: now,
+                    plan_id: "plan-1".into(),
+                    principal: PolicyPrincipal::Agent,
+                    capability: PolicyCapability::Apply,
+                    model: "*".into(),
+                    effect: PolicyEffect::Deny,
+                    rule_id: None,
+                    reason: "verify_after FAILED".into(),
+                    verify_after: vec!["row_count".into()],
+                    auto_apply: None,
+                })
+                .unwrap();
+            drop(store);
+        }
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        upload_state(&config, &pod_a).await.unwrap();
+
+        // Pod B: a fresh pod downloads the remote state.
+        let dir_b = TempDir::new().unwrap();
+        let pod_b = dir_b.path().join(".rocky-state.redb");
+        download_state(&config, &pod_b).await.unwrap();
+        test_support::clear();
+
+        let store = StateStore::open(&pod_b).unwrap();
+        let decisions = store.list_policy_decisions().unwrap();
+        let burned = crate::policy::budget_failures_in_window(
+            &decisions,
+            0,
+            chrono::Duration::hours(24),
+            now + chrono::Duration::seconds(1),
+        );
+        assert_eq!(
+            burned, 1,
+            "the rule-decision + verify-custody pair must survive the remote round-trip so the \
+             failed apply burns rule 0's budget (finding 3)"
+        );
+    }
 }
