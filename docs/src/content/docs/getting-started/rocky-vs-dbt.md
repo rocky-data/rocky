@@ -8,7 +8,7 @@ sidebar:
 This page explains the difference between Rocky and dbt in pictures. If you want the full feature-by-feature tables, see the [Feature Comparison](/getting-started/comparison/); if you're ready to try a migration, see [Migrate from dbt](/guides/migrate-from-dbt/).
 
 :::note[A note on "dbt"]
-"dbt" is three things today: **dbt Core 1.x** (the Python line, still the dominant deployment), **dbt Fusion** (the Rust runtime open-sourced as dbt Core v2.0, plus a SQL-comprehension layer), and the commercial **dbt platform**. The diagrams below contrast Rocky with dbt Core 1.x first, because that's what most teams run. Fusion changes part of the picture, and gets its own section.
+"dbt" is three things today: **dbt Core 1.x** (the Python line, still the dominant deployment), **dbt Core v2.0 / Fusion** (the Apache-licensed Rust engine whose tree now includes SQL comprehension — parser, type checking, column-level lineage; the precompiled Fusion binary is its recommended distribution), and the commercial **dbt platform**. The diagrams below contrast Rocky with dbt Core 1.x first, because that's what most teams run. Fusion changes part of the picture, and gets its own section.
 :::
 
 ## The same job
@@ -26,7 +26,7 @@ If you know dbt, the day-to-day loop in Rocky feels familiar: write a model, dec
 
 ## dbt Core: the SQL is rendered text
 
-dbt Core parses your project before running anything: it resolves every `ref()`, builds the DAG, and fails fast on a reference to a model that doesn't exist. What it does *not* do is read the SQL inside each model. A model is a Jinja template that renders to a string, and whether that string is correct is discovered when the warehouse executes it:
+dbt Core parses your project before running anything: it resolves every `ref()` it can see at parse time, builds the DAG, and fails fast on a reference to a model that doesn't exist (Jinja that only evaluates at execution can still hide a dependency until runtime). What it does *not* do is read the SQL inside each model. A model is a Jinja template that renders to a string, and whether that string is correct is discovered when the warehouse executes it:
 
 ```
  your SQL + Jinja
@@ -48,7 +48,7 @@ dbt Core parses your project before running anything: it resolves every `ref()`,
  └──────────────┘    itself is already materialized
 ```
 
-Two fairness notes. Since dbt 1.5, a model can declare an **enforced contract** (its output column names and types), checked when that model is built. And `dbt build` interleaves tests with models in DAG order, so an error-severity test failure stops downstream models from building. Both help; neither reads the SQL. A misspelled column, a type mismatch inside a join, or a `SELECT *` that pulls a column nobody designed for still surfaces in the warehouse, against data.
+Three fairness notes. Since dbt 1.5, a model can declare an **enforced contract** (its output column names and types), checked when that model is built. Since dbt 1.8, explicitly authored **unit tests** can check a model's SQL against static fixtures before it materializes. And `dbt build` interleaves tests with models in DAG order, so an error-severity test failure stops downstream models from building. All three help; none of them read the SQL across the project. A misspelled column, a type mismatch inside a join, or a `SELECT *` that pulls a column nobody designed for is caught only where a test or contract was written to cover it — everywhere else it still surfaces in the warehouse, against real data.
 
 ## Rocky: the SQL is a typed program
 
@@ -120,7 +120,7 @@ On replication runs where the target table already exists, Rocky compares the so
 
 ## What about dbt Fusion?
 
-Fusion is dbt's Rust engine, and its SQL-comprehension layer genuinely closes part of the compile-time gap: in its opt-in `strict` mode it type-checks SQL and computes column-level lineage. Rocky does not claim those as differentiators against Fusion.
+Fusion is dbt's Rust engine (dbt Core v2.0), and its SQL comprehension genuinely closes part of the compile-time gap: in the opt-in `strict` mode it type-checks SQL and computes column-level lineage. Rocky does not claim those as differentiators against Fusion.
 
 The durable difference is what happens *around* the compiler. Rocky treats the run itself as something to check, record, and optionally gate, not just execute:
 
