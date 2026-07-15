@@ -90,7 +90,7 @@ See the [Roadmap](/getting-started/roadmap/) for the full breakdown.
 
 **Evaluating SQLMesh?** SQLMesh is the tool Rocky most resembles: it also analyzes SQL statically (via SQLGlot, no Jinja), and its virtual environments, plan/apply, and column-level lineage are mature primitives Rocky shares rather than beats. Rocky keeps SQL as the default (SQLMesh leans Python-first) and differentiates on the enforcement plane: declarative OSS governance and `[budget]` blocks that fail the build (neither in SQLMesh OSS), plus source-schema-drift detection and a dialect-portability lint at PR time (where SQLMesh instead transpiles dialects via SQLGlot). SQLMesh is more mature in years, funding, and adoption, and ships native Python models and an OSS CI/CD bot.
 
-Full side-by-side comparison: [features/comparison](/getting-started/comparison/).
+Full side-by-side comparison: [features/comparison](/getting-started/comparison/). For a diagram-first version of the dbt contrast, see [Rocky vs dbt, Visually](/getting-started/rocky-vs-dbt/).
 
 ## Design principles
 

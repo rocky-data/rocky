@@ -5,7 +5,7 @@ sidebar:
   order: 4.5
 ---
 
-A factual feature-by-feature comparison of the major SQL transformation tools. Features verified against official documentation and source code as of June 2026.
+A factual feature-by-feature comparison of the major SQL transformation tools. Features verified against official documentation and source code as of June 2026. If you'd rather start with the intuition than the tables, see [Rocky vs dbt, Visually](/getting-started/rocky-vs-dbt/).
 
 :::note[A note on "dbt"]
 In these tables, **dbt-core** is the dbt Core 1.x Python line, still the dominant deployment. On 2026-06-01 dbt Labs open-sourced the Fusion runtime as **dbt Core v2.0** (Rust, Apache 2.0, currently alpha); the **dbt-fusion** column tracks that v2.0 runtime plus Fusion's SQL-comprehension layer. SQL type-checking, column-level lineage, and the SQL linter live in that Fusion layer; the Apache-licensed dbt Core CLI itself does not ship them. In Fusion, column-level lineage and data-type checking require opting into the `strict` static-analysis mode; the default `baseline` mode does lighter, warn-only analysis.
