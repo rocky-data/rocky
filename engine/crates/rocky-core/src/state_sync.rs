@@ -274,85 +274,131 @@ enum DownloadOutcome {
 ///
 /// ## Crash safety + fail-closed (finding 5)
 ///
-/// The remote content is downloaded into a STAGING file beside `local_path` and
-/// the local-only tables are merged into that staging file; only then is the
+/// The remote content is downloaded into a STAGING file beside `local_path`; the
+/// local-only tables are merged into that staging file, and only then is the
 /// COMPLETE merged db published to `local_path` with a single atomic `rename`.
 /// So `local_path` is never left holding remote content *without* its local-only
 /// tables — a crash before the rename leaves the prior local file fully intact.
-/// A snapshot / merge / publish failure is **fail-closed** (propagated as `Err`
-/// after a bounded retry on transient redb open contention), distinct from a
-/// genuinely-absent local file (which is not an error — there is simply nothing
-/// to preserve).
+/// A merge / publish failure is **fail-closed** (propagated as `Err` after a
+/// bounded retry on transient redb open contention).
+///
+/// ## Publish serialization (finding B)
+///
+/// The download itself runs **without** any lock (it is network I/O). The
+/// snapshot-of-local-only + merge + atomic publish then run **while holding the
+/// same advisory writer lock [`StateStore::open`] takes**
+/// ([`crate::state::try_acquire_writer_lock`]), and the lock is released before
+/// this returns so the caller's `StateStore::open` can re-acquire it. This
+/// serializes the publish with any concurrent StateStore writer and with another
+/// download's publish on the same namespace, so a late `rename` can never clobber
+/// a live writer's file. Crucially, the local-only tables are re-read from the
+/// CURRENT local file *under the lock*, so a concurrent run's just-committed
+/// `jobs` are captured rather than lost.
 pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
     let remote_key = remote_state_key(local_path);
 
-    // Local backend never replaces the file — skip the whole preserve dance.
+    // Local backend never replaces the file — nothing to stage, merge, or lock.
     if matches!(config.backend, StateBackend::Local) {
         download_state_inner(config, local_path, &remote_key).await?;
         return Ok(());
     }
 
+    // 1. Download the remote into a STAGING file (no lock). `local_path` is left
+    //    untouched; `Absent` leaves the staging file unwritten.
     let scratch_dir = sibling_scratch_dir(local_path);
-
-    // Snapshot the local-only tables (jobs, schema_cache) BEFORE any download —
-    // the remote copy has them stripped, so this is their only source of truth.
-    // A genuinely-absent local file has nothing to preserve (`None`, not an
-    // error); a *present* but unreadable/contended file is FAIL-CLOSED after a
-    // bounded retry (finding 5b) — never silently discarded.
-    let preserved: Option<PathBuf> = if local_path.exists() {
-        Some(snapshot_local_only_tables(local_path, &scratch_dir).await?)
-    } else {
-        None
-    };
-
-    // Download the remote into a STAGING file, never `local_path` — so the local
-    // file is replaced exactly once, by a single atomic rename of a fully-merged
-    // db (finding 5a: no crash window where local-only tables are missing).
     let staged = unique_scratch_path(&scratch_dir, "download");
     let outcome = match download_state_inner(config, &staged, &remote_key).await {
         Ok(outcome) => outcome,
         Err(e) => {
             let _ = std::fs::remove_file(&staged);
-            if let Some(p) = &preserved {
-                let _ = std::fs::remove_file(p);
-            }
             return Err(e);
         }
     };
 
-    let result = match outcome {
-        DownloadOutcome::Restored => {
-            // `staged` holds the remote replicated tables. Always overwrite its
-            // local-only tables: from the prior local file when we have it, else
-            // EMPTY — a pre-this-patch remote snapshot (taken when only
-            // `schema_cache` was local-only) can still carry another pod's `jobs`
-            // rows, which must NOT land locally (finding 6a). Then publish
-            // atomically.
-            apply_local_only_and_publish(&staged, preserved.as_deref(), local_path).await
-        }
-        DownloadOutcome::Absent => {
-            // No remote object for this key. The replicated tables must reset to
-            // fresh/empty (finding 6) while the local-only tables are preserved.
-            // The pre-download snapshot already holds ONLY the local-only tables,
-            // so publishing it makes the replicated tables fresh and keeps
-            // `jobs` / `schema_cache`. With no prior local file it is a genuine
-            // fresh start — leave `local_path` absent.
+    // 2. Acquire the StateStore writer lock so the snapshot + merge + publish
+    //    serialize with concurrent writers/publishes (finding B). Released on
+    //    drop, before this function returns.
+    let lock = match acquire_publish_lock(local_path).await {
+        Ok(lock) => lock,
+        Err(e) => {
             let _ = std::fs::remove_file(&staged);
-            match preserved.as_deref() {
-                Some(snapshot) => publish_atomically(snapshot, local_path),
-                None => Ok(()),
-            }
+            return Err(e);
         }
     };
 
-    // Best-effort cleanup — a successful publish already consumed (renamed) its
-    // source file, so these are no-ops on the happy path and only mop up after a
-    // failure.
+    // 3. Under the lock: re-read the CURRENT local-only tables, merge them into
+    //    the candidate db, and publish atomically.
+    let result = publish_merged(&staged, local_path, outcome).await;
+
+    drop(lock);
     let _ = std::fs::remove_file(&staged);
-    if let Some(p) = &preserved {
-        let _ = std::fs::remove_file(p);
-    }
     result
+}
+
+/// Acquire the StateStore writer lock for `local_path` (the same lock
+/// `StateStore::open` takes), retrying briefly on contention before failing
+/// closed. Serializes the download's atomic publish with StateStore writers and
+/// with a concurrent download (finding B).
+async fn acquire_publish_lock(
+    local_path: &Path,
+) -> Result<crate::state::StateWriterLock, StateSyncError> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last: Option<crate::state::StateError> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match crate::state::try_acquire_writer_lock(local_path) {
+            Ok(lock) => return Ok(lock),
+            Err(e) => {
+                last = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(20 * u64::from(attempt))).await;
+                }
+            }
+        }
+    }
+    Err(StateSyncError::Io(std::io::Error::other(format!(
+        "could not acquire the state writer lock to publish downloaded state \
+         (another writer holds it): {}",
+        last.expect("retry loop runs at least once")
+    ))))
+}
+
+/// Build the merged candidate db and publish it to `local_path` with a single
+/// atomic `rename` — MUST be called while holding the writer lock (finding B).
+///
+/// The local-only tables are read from the CURRENT `local_path` here (not a
+/// pre-download snapshot), so a concurrent run's just-committed rows are captured.
+/// Fail-closed on any merge/publish error (finding 5b).
+async fn publish_merged(
+    staged: &Path,
+    local_path: &Path,
+    outcome: DownloadOutcome,
+) -> Result<(), StateSyncError> {
+    let local_exists = local_path.exists();
+    let tables = crate::state::LOCAL_ONLY_TABLE_NAMES;
+    match outcome {
+        DownloadOutcome::Restored => {
+            // `staged` holds the remote replicated tables. Overwrite its
+            // local-only tables from the current local file, or EMPTY them when
+            // there is none — a pre-this-patch remote snapshot can still carry
+            // another pod's `jobs` rows, which must NOT land locally (finding 6a).
+            if local_exists {
+                redb_op_retry(|| copy_named_tables(local_path, staged, tables)).await?;
+            } else {
+                redb_op_retry(|| clear_named_tables(staged, tables)).await?;
+            }
+            publish_atomically(staged, local_path)
+        }
+        DownloadOutcome::Absent if local_exists => {
+            // No remote object: the replicated tables must reset to fresh/empty
+            // (finding 6) while the local-only tables are preserved. Build a fresh
+            // db carrying ONLY the current local-only tables (`staged` was not
+            // written by an `Absent` download, so `copy_named_tables` creates it
+            // with just those tables → replicated tables are empty on next open).
+            redb_op_retry(|| copy_named_tables(local_path, staged, tables)).await?;
+            publish_atomically(staged, local_path)
+        }
+        DownloadOutcome::Absent => Ok(()),
+    }
 }
 
 /// Directory that should host the sibling scratch file for `local_path`, so an
@@ -406,58 +452,6 @@ async fn redb_op_retry<T>(
         }
     }
     Err(last.expect("retry loop runs at least once"))
-}
-
-/// Build a fresh redb **beside** `local_path` holding ONLY the
-/// [`crate::state::LOCAL_ONLY_TABLE_NAMES`] tables copied from it, returning the
-/// snapshot path (the caller owns its lifecycle: splice-into-staged then delete,
-/// or promote-by-rename on `Absent`).
-///
-/// The snapshot lives in `scratch_dir` (a sibling of `local_path`) precisely so
-/// the `Absent`-case promotion can `rename` it into place atomically on the same
-/// filesystem. Fail-closed with a bounded retry (finding 5b).
-async fn snapshot_local_only_tables(
-    local_path: &Path,
-    scratch_dir: &Path,
-) -> Result<PathBuf, StateSyncError> {
-    let snapshot = unique_scratch_path(scratch_dir, "localonly");
-    redb_op_retry(|| {
-        // Start each attempt from a clean file so a half-written scratch from a
-        // failed attempt cannot poison the next one.
-        let _ = std::fs::remove_file(&snapshot);
-        copy_named_tables(local_path, &snapshot, crate::state::LOCAL_ONLY_TABLE_NAMES)
-    })
-    .await
-    .inspect_err(|_| {
-        let _ = std::fs::remove_file(&snapshot);
-    })?;
-    Ok(snapshot)
-}
-
-/// Overwrite the [`crate::state::LOCAL_ONLY_TABLE_NAMES`] tables in `staged`
-/// (the freshly-downloaded remote db) — from `preserved` when a prior local file
-/// existed, else EMPTY (finding 6a) — then publish `staged` to `local_path` with
-/// a single atomic `rename`. Fail-closed (finding 5b).
-async fn apply_local_only_and_publish(
-    staged: &Path,
-    preserved: Option<&Path>,
-    local_path: &Path,
-) -> Result<(), StateSyncError> {
-    match preserved {
-        Some(snapshot) => {
-            redb_op_retry(|| {
-                copy_named_tables(snapshot, staged, crate::state::LOCAL_ONLY_TABLE_NAMES)
-            })
-            .await?;
-        }
-        None => {
-            // No prior local file: the remote's local-only rows (if any survived
-            // from a pre-patch upload) must be emptied, not trusted.
-            redb_op_retry(|| clear_named_tables(staged, crate::state::LOCAL_ONLY_TABLE_NAMES))
-                .await?;
-        }
-    }
-    publish_atomically(staged, local_path)
 }
 
 /// Publish `src` to `dst` with a single atomic `rename` (same-filesystem by
@@ -811,16 +805,22 @@ fn strip_local_only_tables(
     })?;
     for name in excluded_tables {
         let def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(name);
-        if let Err(e) = txn.delete_table(def) {
-            // Bubble up only genuine delete errors; a missing-table error
-            // (TableError::TableDoesNotExist) is a legitimate no-op and
-            // is represented by `Ok(false)` from the v2 API.
-            warn!(
-                table = name,
-                error = %e,
-                outcome = "delete_table_failed",
-                "filter could not drop table (continuing with remainder)"
-            );
+        // Finding C: a genuinely-absent table is a legitimate no-op — the v2 API
+        // returns `Ok(false)` for it (an older copy that never had `schema_cache`
+        // uploads cleanly). But a REAL `delete_table` error (e.g. a table with an
+        // incompatible definition on an otherwise-valid redb) must FAIL the
+        // filter — swallowing it would commit an UNFILTERED scratch and upload
+        // this pod's local-only rows (`jobs` / `schema_cache`) to shared remote
+        // state. `TableDoesNotExist` (if a redb version surfaces it as an error
+        // rather than `Ok(false)`) stays non-fatal; every other error propagates.
+        match txn.delete_table(def) {
+            Ok(_) => {}
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => {
+                return Err(StateSyncError::Io(std::io::Error::other(format!(
+                    "redb delete_table('{name}') for state filter failed: {e}"
+                ))));
+            }
         }
     }
     txn.commit().map_err(|e| {
@@ -2665,6 +2665,118 @@ mod tests {
         assert!(
             !uploaded,
             "no state object may be uploaded when the local-only filter fails (no leak)"
+        );
+    }
+
+    /// Finding B: a download must not publish over a LIVE writer. While a
+    /// `StateStore` holds the writer lock, `download_state` downloads to staging
+    /// but cannot acquire the lock to publish, so it fails closed and leaves the
+    /// live writer's file intact. Once the lock frees, a fresh download applies
+    /// the remote and preserves the local-only tables.
+    #[tokio::test]
+    async fn download_publish_fails_closed_when_writer_lock_held() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_local_with_local_only(&local, "local.wm", "job-1");
+
+        let remote_bytes = build_remote_object_bytes(dir.path(), "remote.fresh");
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let key = object_store_state_key(&remote_state_key(&local));
+        provider.put(&key, Bytes::from(remote_bytes)).await.unwrap();
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+
+        // Hold the writer lock, as a live `rocky run` would during execution.
+        let held = StateStore::open(&local).unwrap();
+
+        let result = download_state(&config, &local).await;
+        assert!(
+            result.is_err(),
+            "the publish must fail closed while another writer holds the lock (finding B)"
+        );
+        assert!(
+            held.get_watermark("local.wm").unwrap().is_some(),
+            "a concurrent download must not clobber the live writer's state"
+        );
+
+        // Release the lock; a fresh download now applies the remote + preserves
+        // the local-only `jobs`.
+        drop(held);
+        download_state(&config, &local)
+            .await
+            .expect("download should succeed once the writer lock is free");
+        test_support::clear();
+
+        let store = StateStore::open(&local).unwrap();
+        assert!(
+            store.get_watermark("remote.fresh").unwrap().is_some(),
+            "the remote replicated watermark is applied after the lock frees"
+        );
+        assert_eq!(
+            store.list_jobs().unwrap().len(),
+            1,
+            "local-only jobs preserved"
+        );
+    }
+
+    /// Finding C: a GENUINE `delete_table` error must FAIL the filter — not be
+    /// swallowed and let an UNFILTERED scratch upload this pod's local-only rows.
+    /// A `schema_cache` created as a MULTIMAP table makes the strip's regular
+    /// `delete_table` error (`TableIsMultimap`) rather than the benign
+    /// missing-table `Ok(false)`. `strip_local_only_tables` propagates it, and the
+    /// upload therefore aborts under `Fail` with nothing written.
+    #[tokio::test]
+    async fn upload_delete_table_error_fails_closed_no_unfiltered_upload() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        // A valid redb whose `schema_cache` is a MULTIMAP table, so the strip's
+        // regular `delete_table("schema_cache")` returns a genuine error instead
+        // of `Ok(false)`.
+        {
+            let db = redb::Database::create(&local).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let def: redb::MultimapTableDefinition<&str, &[u8]> =
+                    redb::MultimapTableDefinition::new("schema_cache");
+                let mut t = txn.open_multimap_table(def).unwrap();
+                t.insert("k", b"v".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        // Direct: the filter propagates the delete_table error.
+        assert!(
+            strip_local_only_tables(&local, LOCAL_ONLY_TABLE_NAMES).is_err(),
+            "a genuine delete_table error must fail the filter (finding C)"
+        );
+
+        // End-to-end: the upload aborts under Fail and writes NO object.
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            on_upload_failure: StateUploadFailureMode::Fail,
+            ..Default::default()
+        };
+        let result = upload_state(&config, &local).await;
+        let key = object_store_state_key(&remote_state_key(&local));
+        let uploaded = provider.exists(&key).await.unwrap();
+        test_support::clear();
+
+        assert!(
+            result.is_err(),
+            "the upload must abort on a delete_table filter error under Fail (finding C)"
+        );
+        assert!(
+            !uploaded,
+            "no unfiltered state object may be uploaded when the filter fails (finding C)"
         );
     }
 }

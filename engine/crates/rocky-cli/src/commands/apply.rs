@@ -229,12 +229,17 @@ async fn run_apply_run_plan(
     // v0). Enforcement uses the apply-time runtime principal, not the plan's
     // stored (tamperable) field. Absent `[policy]` this is a no-op.
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
+    // ONE config snapshot for the replication-only check, the pre-gate sync
+    // decision, AND the policy gate — so the guard and the gate can't disagree
+    // about `[policy]` presence if the on-disk file changes mid-apply (finding A).
+    let cfg = rocky_core::config::load_rocky_config(config_path).ok();
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list. Finding
     // #1: a replication-only plan runs NO models, so it gates none (fail-safe: a
     // config that will not load is NOT treated as replication-only → strict).
-    let executable = if rocky_core::config::load_rocky_config(config_path)
-        .map(|cfg| is_replication_only(&cfg, &run_plan))
+    let executable = if cfg
+        .as_ref()
+        .map(|cfg| is_replication_only(cfg, &run_plan))
         .unwrap_or(false)
     {
         Vec::new()
@@ -246,9 +251,11 @@ async fn run_apply_run_plan(
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
     // the gate reads it, so a cross-pod freeze is enforced (fail-closed). Skipped
     // when the gate won't read the ledger (no policy / empty touched — finding 8).
-    sync_remote_ledger_before_gate(config_path, state_path, &touched).await?;
-    let gate = evaluate_apply_policy(
-        config_path,
+    if let Some(cfg) = &cfg {
+        sync_remote_ledger_before_gate(cfg, state_path, &touched).await?;
+    }
+    let gate = evaluate_apply_policy_with_policy(
+        cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
         principal,
         &touched,
@@ -752,22 +759,19 @@ fn model_attributes(models_dir: &Path) -> BTreeMap<String, ModelAttributes> {
 /// regression for a valid human Run/Promote plan on a backend blip (finding 8) —
 /// so this returns `None` and the caller skips the download entirely.
 ///
-/// `None` is also returned when the config cannot be loaded — a genuine config
-/// error is surfaced by the seam's own fail-closed handling
-/// ([`bail_on_config_load_error`] on the gc/backfill paths, or the run path's
-/// re-load), so there is no remote object to pull in that case.
+/// Takes an ALREADY-LOADED config snapshot (finding A: the guard and the gate
+/// must see the SAME config, so the caller loads once and threads it into both).
 fn remote_state_backend_for_gate(
-    config_path: &Path,
+    cfg: &rocky_core::config::RockyConfig,
     touched: &BTreeMap<String, PolicyCapability>,
 ) -> Option<rocky_core::config::StateConfig> {
     // Empty touched set ⇒ the gate is a no-op Allow, no ledger read.
     if touched.is_empty() {
         return None;
     }
-    let cfg = rocky_core::config::load_rocky_config(config_path).ok()?;
     // No `[policy]` block ⇒ the gate returns NotConfigured, no ledger read.
     cfg.policy.as_ref()?;
-    let state_cfg = cfg.state;
+    let state_cfg = cfg.state.clone();
     (!matches!(state_cfg.backend, StateBackend::Local)).then_some(state_cfg)
 }
 
@@ -782,14 +786,17 @@ fn remote_state_backend_for_gate(
 /// actually read the ledger (see [`remote_state_backend_for_gate`] — finding 8).
 /// Fail-closed: when the sync IS warranted, a remote download failure aborts.
 ///
-/// `pub(crate)` so the `restore` seam reuses the exact same guarded, fail-closed
-/// pre-gate sync (finding 1).
+/// Takes the SAME `cfg` snapshot the caller passes to
+/// [`evaluate_apply_policy_with_policy`], so the sync decision and the gate can
+/// never disagree about `[policy]` presence (finding A). `pub(crate)` so the
+/// `restore` seam reuses the exact same guarded, fail-closed pre-gate sync
+/// (finding 1).
 pub(crate) async fn sync_remote_ledger_before_gate(
-    config_path: &Path,
+    cfg: &rocky_core::config::RockyConfig,
     state_path: &Path,
     touched: &BTreeMap<String, PolicyCapability>,
 ) -> Result<()> {
-    let Some(state_cfg) = remote_state_backend_for_gate(config_path, touched) else {
+    let Some(state_cfg) = remote_state_backend_for_gate(cfg, touched) else {
         return Ok(());
     };
     rocky_core::state_sync::download_state(&state_cfg, state_path)
@@ -808,12 +815,13 @@ pub(crate) async fn sync_remote_ledger_before_gate(
 /// download on a dedicated runtime inside the shared gate closes BOTH entry
 /// points without threading an async download through each caller. Same
 /// finding-8 guard: skips the download unless the gate will read the ledger.
+/// Takes the same `cfg` snapshot used for the gate (finding A).
 fn sync_remote_ledger_before_gate_blocking(
-    config_path: &Path,
+    cfg: &rocky_core::config::RockyConfig,
     state_path: &Path,
     touched: &BTreeMap<String, PolicyCapability>,
 ) -> Result<()> {
-    let Some(state_cfg) = remote_state_backend_for_gate(config_path, touched) else {
+    let Some(state_cfg) = remote_state_backend_for_gate(cfg, touched) else {
         return Ok(());
     };
     crate::commands::policy::block_on_state_sync(rocky_core::state_sync::download_state(
@@ -855,7 +863,42 @@ pub fn evaluate_apply_policy(
     models_dir: &Path,
     state_path: &Path,
 ) -> PolicyGate {
-    let (policy, attrs_map) = match load_policy_and_attrs(config_path, touched, models_dir) {
+    // Load the config here for callers that don't already hold a snapshot (gc,
+    // the MCP propose gate, tests). Governed apply/restore/promote paths call
+    // [`evaluate_apply_policy_with_policy`] with the SAME snapshot they used for
+    // the pre-gate sync decision, so the sync-guard and this gate can never
+    // disagree about whether `[policy]` is configured (finding A — config-snapshot
+    // TOCTOU).
+    let policy = rocky_core::config::load_rocky_config(config_path)
+        .ok()
+        .and_then(|cfg| cfg.policy);
+    evaluate_apply_policy_with_policy(
+        policy.as_ref(),
+        plan_id,
+        principal,
+        touched,
+        models_dir,
+        state_path,
+    )
+}
+
+/// [`evaluate_apply_policy`] over an ALREADY-RESOLVED `[policy]` block, rather
+/// than reloading the config from disk.
+///
+/// The governed paths (run-apply, ai-authored, backfill, promote, restore) load
+/// ONE immutable config snapshot and thread its `policy` into both the pre-gate
+/// remote-state sync decision AND this evaluation, so a config that gains a
+/// `[policy]` block between the two can't make the guard skip the sync while this
+/// gate then reads stale local decisions (finding A).
+pub(crate) fn evaluate_apply_policy_with_policy(
+    policy: Option<&rocky_core::config::PolicyConfig>,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    state_path: &Path,
+) -> PolicyGate {
+    let (policy, attrs_map) = match resolve_policy_and_attrs(policy, touched, models_dir) {
         Ok(pair) => pair,
         Err(gate) => return gate,
     };
@@ -957,9 +1000,11 @@ pub(crate) fn evaluate_apply_policy_with_store(
     )
 }
 
-/// Load the `[policy]` block and compile the per-model attributes, or return an
-/// early [`PolicyGate`] — `NotConfigured` when there is no loadable `[policy]`
-/// block, `Allow` when `touched` is empty (a genuine no-op executes nothing).
+/// Load the `[policy]` block from `config_path` and compile the per-model
+/// attributes, or return an early [`PolicyGate`]. A thin wrapper over
+/// [`resolve_policy_and_attrs`] for callers that reach the gate through a
+/// config path rather than a held config snapshot (e.g.
+/// [`evaluate_apply_policy_with_store`]).
 fn load_policy_and_attrs(
     config_path: &Path,
     touched: &BTreeMap<String, PolicyCapability>,
@@ -971,15 +1016,31 @@ fn load_policy_and_attrs(
     ),
     PolicyGate,
 > {
-    let policy = match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => match cfg.policy {
-            Some(p) => p,
-            None => return Err(PolicyGate::NotConfigured),
-        },
-        // A missing or malformed config leaves the policy plane unconfigured —
-        // the caller keeps its pre-policy-plane gate. (The run path re-loads and
-        // surfaces any real config error itself.)
-        Err(_) => return Err(PolicyGate::NotConfigured),
+    // A missing or malformed config leaves the policy plane unconfigured — the
+    // caller keeps its pre-policy-plane gate. (The run path re-loads and surfaces
+    // any real config error itself.)
+    let policy = rocky_core::config::load_rocky_config(config_path)
+        .ok()
+        .and_then(|cfg| cfg.policy);
+    resolve_policy_and_attrs(policy.as_ref(), touched, models_dir)
+}
+
+/// Given an ALREADY-RESOLVED `[policy]` block, compile the per-model attributes,
+/// or return an early [`PolicyGate`] — `NotConfigured` when there is no policy,
+/// `Allow` when `touched` is empty (a genuine no-op executes nothing).
+fn resolve_policy_and_attrs(
+    policy: Option<&rocky_core::config::PolicyConfig>,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+) -> std::result::Result<
+    (
+        rocky_core::config::PolicyConfig,
+        BTreeMap<String, ModelAttributes>,
+    ),
+    PolicyGate,
+> {
+    let Some(policy) = policy else {
+        return Err(PolicyGate::NotConfigured);
     };
     // An empty touched set means the plan executes no models (a genuine no-op).
     // A no-change-but-executing plan is never empty here — see the touched-set
@@ -987,7 +1048,7 @@ fn load_policy_and_attrs(
     if touched.is_empty() {
         return Err(PolicyGate::Allow);
     }
-    Ok((policy, model_attributes(models_dir)))
+    Ok((policy.clone(), model_attributes(models_dir)))
 }
 
 /// The per-model evaluation loop shared by [`evaluate_apply_policy`] and
@@ -1766,6 +1827,9 @@ pub(crate) fn gate_promote_plan(
     promote_plan: &PromotePlan,
     state_path: &Path,
 ) -> Result<()> {
+    // ONE config snapshot for the pre-gate sync decision AND the policy gate
+    // (finding A — config-snapshot TOCTOU).
+    let cfg = rocky_core::config::load_rocky_config(config_path).ok();
     let promote_models_dir = resolve_config_models_dir(config_path);
     let touched = touched_models_for_promote(promote_plan, &promote_models_dir);
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
@@ -1773,9 +1837,11 @@ pub(crate) fn gate_promote_plan(
     // shared gate so BOTH promote entry points (`rocky apply <promote>` and
     // `rocky branch promote --plan`) are covered. Fail-closed, but skipped when
     // the gate won't read the ledger (no policy / empty touched — finding 8).
-    sync_remote_ledger_before_gate_blocking(config_path, state_path, &touched)?;
-    let gate = evaluate_apply_policy(
-        config_path,
+    if let Some(cfg) = &cfg {
+        sync_remote_ledger_before_gate_blocking(cfg, state_path, &touched)?;
+    }
+    let gate = evaluate_apply_policy_with_policy(
+        cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
         principal,
         &touched,
@@ -2099,12 +2165,16 @@ async fn run_apply_ai_authored_plan(
     // AiAuthored gate. Absent a `[policy]` block the evaluator is never
     // constructed and the pre-policy-plane marker gate remains — byte-identical to today.
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
+    // ONE config snapshot for the replication-only check, the pre-gate sync
+    // decision, AND the policy gate (finding A — config-snapshot TOCTOU).
+    let cfg = rocky_core::config::load_rocky_config(config_path).ok();
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list. Finding
     // #1: a replication-only plan runs NO models, so it gates none (fail-safe: a
     // config that will not load is NOT treated as replication-only → strict).
-    let executable = if rocky_core::config::load_rocky_config(config_path)
-        .map(|cfg| is_replication_only(&cfg, &run_plan))
+    let executable = if cfg
+        .as_ref()
+        .map(|cfg| is_replication_only(cfg, &run_plan))
         .unwrap_or(false)
     {
         Vec::new()
@@ -2116,9 +2186,11 @@ async fn run_apply_ai_authored_plan(
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
     // the gate reads it, so a cross-pod freeze is enforced (fail-closed). Skipped
     // when the gate won't read the ledger (no policy / empty touched — finding 8).
-    sync_remote_ledger_before_gate(config_path, state_path, &touched).await?;
-    let gate = evaluate_apply_policy(
-        config_path,
+    if let Some(cfg) = &cfg {
+        sync_remote_ledger_before_gate(cfg, state_path, &touched).await?;
+    }
+    let gate = evaluate_apply_policy_with_policy(
+        cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
         principal,
         &touched,
@@ -2224,10 +2296,13 @@ async fn run_apply_backfill_plan(
 
     // Policy can only tighten the gate: a `deny` hard-refuses even a reviewed
     // backfill. The marker above already satisfies any policy `require_review`.
-    // Fail-closed pre-check: the backfill execution path does not itself need
-    // the config to have loaded, so a config-load ERROR must bail here rather
-    // than silently unenforcing a possibly-configured `[policy]` block.
+    // Fail-closed pre-check: the backfill execution path does not itself need the
+    // config to have loaded, so a config-load ERROR must bail here rather than
+    // silently unenforcing a possibly-configured `[policy]` block.
     bail_on_config_load_error(config_path, "backfill", plan_id)?;
+    // ONE config snapshot for the pre-gate sync decision AND the policy gate, so
+    // the guard and gate can't disagree about `[policy]` presence (finding A).
+    let cfg = rocky_core::config::load_rocky_config(config_path).ok();
     let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
     // A backfill's `models` list IS the authoritative rebuild closure the
     // engine composed and will execute (see `execute_backfill_set` below), not
@@ -2236,9 +2311,11 @@ async fn run_apply_backfill_plan(
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
     // the gate reads it, so a cross-pod freeze is enforced (fail-closed). Skipped
     // when the gate won't read the ledger (no policy / empty touched — finding 8).
-    sync_remote_ledger_before_gate(config_path, state_path, &touched).await?;
-    let gate = evaluate_apply_policy(
-        config_path,
+    if let Some(cfg) = &cfg {
+        sync_remote_ledger_before_gate(cfg, state_path, &touched).await?;
+    }
+    let gate = evaluate_apply_policy_with_policy(
+        cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
         plan.enforcement_principal(runtime_principal),
         &touched,
@@ -3266,8 +3343,9 @@ default_agent_effect = "require_review"
     /// Finding 8: the pre-gate remote sync must run ONLY when the gate will
     /// actually read the freeze/budget ledger — otherwise a backend blip would
     /// falsely abort a valid human Run/Promote plan. `remote_state_backend_for_gate`
-    /// returns `Some` (sync warranted) only for {non-empty touched} ∧ {policy
-    /// configured} ∧ {remote backend}; `None` (skip the download) otherwise.
+    /// (now over a single loaded config snapshot — finding A) returns `Some`
+    /// (sync warranted) only for {non-empty touched} ∧ {policy configured} ∧
+    /// {remote backend}; `None` (skip the download) otherwise.
     #[test]
     fn remote_state_backend_for_gate_only_syncs_when_ledger_is_read() -> anyhow::Result<()> {
         use std::collections::BTreeMap;
@@ -3278,10 +3356,17 @@ default_agent_effect = "require_review"
         let empty: BTreeMap<String, PolicyCapability> = BTreeMap::new();
 
         let state_s3 = "\n[state]\nbackend = \"s3\"\ns3_bucket = \"b\"\n";
+        let load = |name: &str, body: String| -> anyhow::Result<rocky_core::config::RockyConfig> {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body)?;
+            Ok(rocky_core::config::load_rocky_config(&path)?)
+        };
 
         // (1) policy + remote + non-empty touched ⇒ Some (sync warranted).
-        let remote_policy = dir.path().join("remote_policy.toml");
-        std::fs::write(&remote_policy, format!("{EMPTY_POLICY_TOML}{state_s3}"))?;
+        let remote_policy = load(
+            "remote_policy.toml",
+            format!("{EMPTY_POLICY_TOML}{state_s3}"),
+        )?;
         assert!(
             super::remote_state_backend_for_gate(&remote_policy, &touched).is_some(),
             "policy + remote backend + non-empty touched ⇒ pre-gate sync warranted"
@@ -3294,29 +3379,86 @@ default_agent_effect = "require_review"
         );
 
         // (2) remote backend but NO [policy] ⇒ None (gate returns NotConfigured).
-        let remote_nopolicy = dir.path().join("remote_nopolicy.toml");
-        std::fs::write(&remote_nopolicy, format!("{NO_POLICY_TOML}{state_s3}"))?;
+        let remote_nopolicy = load(
+            "remote_nopolicy.toml",
+            format!("{NO_POLICY_TOML}{state_s3}"),
+        )?;
         assert!(
             super::remote_state_backend_for_gate(&remote_nopolicy, &touched).is_none(),
             "no [policy] block ⇒ gate returns NotConfigured, reads no ledger ⇒ no sync (finding 8)"
         );
 
         // (3) policy but LOCAL backend (no [state]) ⇒ None (nothing to pull).
-        let local_policy = dir.path().join("local_policy.toml");
-        std::fs::write(&local_policy, EMPTY_POLICY_TOML)?;
+        let local_policy = load("local_policy.toml", EMPTY_POLICY_TOML.to_string())?;
         assert!(
             super::remote_state_backend_for_gate(&local_policy, &touched).is_none(),
             "local backend ⇒ nothing to download"
         );
 
-        // (4) unloadable config ⇒ None (the seam's own fail-closed handling owns
-        //     the config error; there is no remote object to pull).
-        let missing = dir.path().join("does_not_exist.toml");
+        // (An unloadable config never reaches the guard: the governed paths load
+        // the snapshot with `.ok()` and skip the guard when it is `None`.)
+        Ok(())
+    }
+
+    /// Finding A: `evaluate_apply_policy_with_policy` evaluates the PASSED policy
+    /// snapshot and never reloads the config from disk — so a governed path can
+    /// use the SAME snapshot for the pre-gate sync decision and the gate, closing
+    /// the config-snapshot TOCTOU. Proven by evaluating with a policy that has a
+    /// deny rule (⇒ Deny) vs `None` (⇒ NotConfigured), with no config file at the
+    /// gate's reach.
+    #[test]
+    fn evaluate_apply_policy_with_policy_uses_passed_snapshot_not_reload() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "deny"
+"#,
+        )?;
+        let policy = rocky_core::config::load_rocky_config(&config)?.policy;
         assert!(
-            super::remote_state_backend_for_gate(&missing, &touched).is_none(),
-            "unloadable config ⇒ no remote object to pull here"
+            policy.is_some(),
+            "the fixture config must carry a [policy] block"
         );
 
+        let mut touched = BTreeMap::new();
+        touched.insert("m".to_string(), PolicyCapability::Apply);
+        // Point the gate at a DIFFERENT directory that has no config file, so a
+        // reload would find nothing — only the passed policy can produce a Deny.
+        let elsewhere = tempfile::tempdir()?;
+        let models_dir = elsewhere.path().join("models");
+        let state = elsewhere.path().join("state.redb");
+
+        let gate = super::evaluate_apply_policy_with_policy(
+            policy.as_ref(),
+            "plan_a",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models_dir,
+            &state,
+        );
+        assert!(
+            matches!(gate, PolicyGate::Deny { .. }),
+            "the PASSED policy (deny rule) must produce Deny even with no config file at the \
+             gate's location; got {gate:?}"
+        );
+
+        let gate_none = super::evaluate_apply_policy_with_policy(
+            None,
+            "plan_a",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models_dir,
+            &state,
+        );
+        assert!(
+            matches!(gate_none, PolicyGate::NotConfigured),
+            "no policy passed ⇒ NotConfigured (no disk reload); got {gate_none:?}"
+        );
         Ok(())
     }
 

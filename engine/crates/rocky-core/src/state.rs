@@ -413,12 +413,57 @@ impl From<redb::TransactionError> for StateError {
     }
 }
 
+/// A held exclusive advisory writer lock on `<path>.redb.lock` — the SAME lock
+/// [`StateStore::open`] takes for the lifetime of a writer. Dropping it releases
+/// the lock.
+///
+/// Exposed so `state_sync::download_state` can serialize its atomic publish
+/// (rename of the state file into place) with StateStore writers and with a
+/// concurrent download's publish on the same namespace. The lock is a *separate*
+/// lockfile, never the state file itself, so renaming the state file while
+/// holding it is sound.
+pub struct StateWriterLock {
+    _file: File,
+}
+
+/// Try to acquire the exclusive advisory writer lock for the state file at
+/// `path`, WITHOUT blocking.
+///
+/// Returns [`StateError::LockHeldByOther`] if another writer (a live
+/// [`StateStore`] or a concurrent publish) already holds it. The flock is
+/// OS-level and cross-process, so a second process is genuinely serialized. The
+/// lock lives on `<path>.redb.lock` (never the state file), so the caller may
+/// atomically `rename` a new state file into `path` while holding this guard.
+pub fn try_acquire_writer_lock(path: &Path) -> Result<StateWriterLock, StateError> {
+    let lock_path = path.with_extension("redb.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| StateError::LockIo {
+            path: lock_path.display().to_string(),
+            source: e,
+        })?;
+    FileExt::try_lock(&file).map_err(|e| match e {
+        fs4::TryLockError::WouldBlock => StateError::LockHeldByOther {
+            path: path.display().to_string(),
+        },
+        fs4::TryLockError::Error(source) => StateError::LockIo {
+            path: lock_path.display().to_string(),
+            source,
+        },
+    })?;
+    Ok(StateWriterLock { _file: file })
+}
+
 /// Embedded state store backed by redb for tracking watermarks and run history.
 pub struct StateStore {
     db: Database,
-    // Held exclusive advisory lock on `<path>.lock`. `None` for read-only opens.
-    // Released automatically when the `File` is dropped.
-    _lock_file: Option<File>,
+    // Held exclusive advisory lock on `<path>.redb.lock`. `None` for read-only
+    // opens. Released automatically when the guard (and its `File`) is dropped.
+    _lock: Option<StateWriterLock>,
     // `true` when this store was opened against a forward-incompatible on-disk
     // schema under [`SchemaMismatchPolicy::Recreate`] and the local file was
     // bootstrapped fresh. The run path reads this via
@@ -590,29 +635,10 @@ impl StateStore {
     ) -> Result<Self, StateError> {
         // Acquire the advisory lock BEFORE opening the database — otherwise two
         // concurrent writers could both pass `Database::create` before either
-        // of them reaches the lock check. Read-only opens skip the lock.
-        let lock_file = if matches!(mode, OpenMode::ReadWrite) {
-            let lock_path = path.with_extension("redb.lock");
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&lock_path)
-                .map_err(|e| StateError::LockIo {
-                    path: lock_path.display().to_string(),
-                    source: e,
-                })?;
-            FileExt::try_lock(&file).map_err(|e| match e {
-                fs4::TryLockError::WouldBlock => StateError::LockHeldByOther {
-                    path: path.display().to_string(),
-                },
-                fs4::TryLockError::Error(source) => StateError::LockIo {
-                    path: lock_path.display().to_string(),
-                    source,
-                },
-            })?;
-            Some(file)
+        // of them reaches the lock check. Read-only opens skip the lock. Shared
+        // with `state_sync`'s publish path via [`try_acquire_writer_lock`].
+        let lock = if matches!(mode, OpenMode::ReadWrite) {
+            Some(try_acquire_writer_lock(path)?)
         } else {
             None
         };
@@ -622,7 +648,7 @@ impl StateStore {
         match Self::init_db(&db, path, mode, policy)? {
             InitOutcome::Ready => Ok(StateStore {
                 db,
-                _lock_file: lock_file,
+                _lock: lock,
                 recreated_for_forward_incompat: false,
             }),
             InitOutcome::RecreateForwardIncompat { found } => {
@@ -664,7 +690,7 @@ impl StateStore {
                 match Self::init_db(&db, path, mode, policy)? {
                     InitOutcome::Ready => Ok(StateStore {
                         db,
-                        _lock_file: lock_file,
+                        _lock: lock,
                         recreated_for_forward_incompat: true,
                     }),
                     // A file we just created cannot carry a newer schema version.
@@ -6929,6 +6955,46 @@ mod tests {
     /// and raced the opener's 5×50ms≈250ms budget; under uneven CI load the
     /// holder thread could be starved past the opener's last attempt, so the
     /// opener gave up with `Busy` and the test flaked.
+    /// Finding B: the advisory writer lock `state_sync::download_state` takes for
+    /// its publish is the SAME cross-acquire lock `StateStore::open` holds. A
+    /// second acquire fails while a live writer holds it (so a concurrent
+    /// download can't `rename` over a live writer's file), and the guard releases
+    /// the lock on drop.
+    #[test]
+    fn try_acquire_writer_lock_is_exclusive_and_releases() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+
+        // A live writer store holds the lock — a second acquire must fail.
+        let store = StateStore::open(&path).unwrap();
+        assert!(
+            matches!(
+                super::try_acquire_writer_lock(&path),
+                Err(StateError::LockHeldByOther { .. })
+            ),
+            "a second writer-lock acquire must fail while a live StateStore holds it"
+        );
+
+        // Released when the store drops → acquire succeeds.
+        drop(store);
+        let guard = super::try_acquire_writer_lock(&path)
+            .expect("the writer lock must be free once the store is dropped");
+
+        // The guard itself is exclusive while held, and frees the lock on drop.
+        assert!(
+            matches!(
+                super::try_acquire_writer_lock(&path),
+                Err(StateError::LockHeldByOther { .. })
+            ),
+            "the guard must hold the lock exclusively"
+        );
+        drop(guard);
+        assert!(
+            super::try_acquire_writer_lock(&path).is_ok(),
+            "the guard must release the lock on drop"
+        );
+    }
+
     #[test]
     fn open_read_only_retries_and_succeeds_after_brief_hold() {
         use std::sync::atomic::{AtomicUsize, Ordering};

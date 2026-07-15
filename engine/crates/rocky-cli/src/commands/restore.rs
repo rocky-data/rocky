@@ -73,7 +73,8 @@ use rocky_iceberg::uniform_writer::{
 use rocky_ir::ModelIr;
 
 use crate::commands::apply::{
-    PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy, sync_remote_ledger_before_gate,
+    PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy_with_policy,
+    sync_remote_ledger_before_gate,
 };
 use crate::commands::gc::{check_recipe_produces_output, gc_models_dir};
 use crate::commands::review::record_plan_review_escalation;
@@ -950,10 +951,13 @@ pub(crate) async fn run_restore_apply_in_with(
     // reads it (fail-closed, remote-only), reusing the apply seam's guarded sync
     // — skipped when the gate won't read the ledger (no policy / empty touched —
     // finding 8). Downloading the fresh remote state also gives the restore its
-    // authoritative tombstone ledger to replay from.
-    sync_remote_ledger_before_gate(config_path, state_path, &touched).await?;
-    let gate = evaluate_apply_policy(
-        config_path,
+    // authoritative tombstone ledger to replay from. Both the sync decision and
+    // the gate use the SAME `loaded_cfg` snapshot (finding A — config TOCTOU).
+    if let Some(cfg) = &loaded_cfg {
+        sync_remote_ledger_before_gate(cfg, state_path, &touched).await?;
+    }
+    let gate = evaluate_apply_policy_with_policy(
+        loaded_cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
         plan_record.enforcement_principal(runtime_principal),
         &touched,
