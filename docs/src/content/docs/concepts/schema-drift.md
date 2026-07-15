@@ -21,7 +21,7 @@ Schema drift in Rocky means **column type mismatches** between source and target
 4. Safe widenings are resolved with `ALTER TABLE ALTER COLUMN`
 5. Unsafe changes trigger `DROP TABLE IF EXISTS` followed by full refresh
 
-The check runs on every table the run copies. With the opt-in `prune_unchanged` optimization, a table whose source reports an unchanged change-marker since the last successful copy is skipped entirely — copy, drift check, and data checks — so drift is only re-evaluated once the source changes again.
+The check runs as part of each table's copy, whenever the target already exists. Two cases bypass it. With the opt-in `prune_unchanged` optimization, a table whose source reports an unchanged change-marker since the last successful copy is skipped entirely — copy, drift check, and data checks — so drift is only re-evaluated once the source changes again. And a failed `DESCRIBE TABLE` is swallowed rather than failing the run: an unreadable target is treated as absent and rebuilt with a full refresh, and an unreadable source produces no drift result for that run, so the copy proceeds unchecked.
 
 ## Graduated Evolution
 
