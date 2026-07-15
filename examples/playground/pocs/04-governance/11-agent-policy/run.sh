@@ -8,6 +8,11 @@
 #
 # The change-classification is computed against a git baseline, so the demo
 # runs inside a throwaway git repo in a temp dir (never the surrounding repo).
+#
+# The apply-side principal comes from ROCKY_PRINCIPAL: `plan --principal agent`
+# labels the plan-time evaluation, but `rocky apply` resolves who is applying
+# from its own environment — without ROCKY_PRINCIPAL=agent the apply runs as a
+# human, humans are never gated, and the deny below would not fire.
 set -euo pipefail
 
 export ROCKY_SUPPRESS_DEPRECATION=1
@@ -40,13 +45,20 @@ DENY_PLAN=$(rocky -c rocky.toml -o json plan \
 echo "plan_id (contracted change): $DENY_PLAN"
 
 echo "=== 2. rocky apply — expected DENIAL (contracted boundary) ==="
-if rocky -c rocky.toml apply "$DENY_PLAN" > "$HERE/expected/apply-deny.txt" 2>&1; then
+if ROCKY_PRINCIPAL=agent rocky -c rocky.toml apply "$DENY_PLAN" > "$HERE/expected/apply-deny.txt" 2>&1; then
     echo "FAIL: apply of a contracted-model change should have been DENIED"
     cat "$HERE/expected/apply-deny.txt"
     exit 1
 fi
+# A non-zero exit alone is not proof — the original version of this POC
+# passed on a missing-schema runtime error. Assert the policy denial itself.
+if ! grep -q "policy DENIES" "$HERE/expected/apply-deny.txt"; then
+    echo "FAIL: apply failed, but not with a policy denial:"
+    cat "$HERE/expected/apply-deny.txt"
+    exit 1
+fi
 echo "correctly denied:"
-grep -i "DENIES\|deny" "$HERE/expected/apply-deny.txt" || cat "$HERE/expected/apply-deny.txt"
+grep "policy DENIES" "$HERE/expected/apply-deny.txt"
 
 # Restore the contracted model to baseline before the allow scenario.
 git checkout -q -- models/fct_orders.sql
@@ -76,13 +88,24 @@ ALLOW_PLAN=$(rocky -c rocky.toml -o json plan \
 echo "plan_id (additive bronze): $ALLOW_PLAN"
 
 echo "=== 4. rocky apply — expected ALLOW (additive bronze, no review) ==="
-rocky -c rocky.toml apply "$ALLOW_PLAN" > "$HERE/expected/apply-allow.txt" 2>&1
+ROCKY_PRINCIPAL=agent rocky -c rocky.toml apply "$ALLOW_PLAN" > "$HERE/expected/apply-allow.txt" 2>&1
 echo "allowed and materialized:"
 cat "$HERE/expected/apply-allow.txt"
 
 echo "=== 5. rocky audit — the decision ledger records both ==="
 rocky -c rocky.toml -o json audit > "$HERE/expected/audit.json"
 rocky -c rocky.toml audit
+
+# Assert the ledger recorded both decisions with the right principal and
+# effect (each decision object lists principal three lines above effect).
+if ! grep -A3 '"principal": "agent"' "$HERE/expected/audit.json" | grep -q '"effect": "deny"'; then
+    echo "FAIL: audit ledger is missing the agent deny decision"
+    exit 1
+fi
+if ! grep -A3 '"principal": "agent"' "$HERE/expected/audit.json" | grep -q '"effect": "allow"'; then
+    echo "FAIL: audit ledger is missing the agent allow decision"
+    exit 1
+fi
 
 echo
 echo "POC complete: contracted change DENIED, additive bronze change ALLOWED, both recorded."

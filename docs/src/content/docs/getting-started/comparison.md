@@ -5,14 +5,14 @@ sidebar:
   order: 4.5
 ---
 
-A factual feature-by-feature comparison of the major SQL transformation tools. Features verified against official documentation and source code as of June 2026. If you'd rather start with the intuition than the tables, see [Rocky vs dbt, Visually](/getting-started/rocky-vs-dbt/).
+A factual feature-by-feature comparison of the major SQL transformation tools. Features verified against official documentation and source code as of July 2026. If you'd rather start with the intuition than the tables, see [Rocky vs dbt, Visually](/getting-started/rocky-vs-dbt/).
 
 :::note[A note on "dbt"]
-In these tables, **dbt-core** is the dbt Core 1.x Python line, still the dominant deployment. On 2026-06-01 dbt Labs open-sourced the Fusion runtime as **dbt Core v2.0** (Rust, Apache 2.0, currently alpha); the **dbt-fusion** column tracks that v2.0 runtime plus Fusion's SQL-comprehension layer. SQL type-checking, column-level lineage, and the SQL linter live in that Fusion layer; the Apache-licensed dbt Core CLI itself does not ship them. In Fusion, column-level lineage and data-type checking require opting into the `strict` static-analysis mode; the default `baseline` mode does lighter, warn-only analysis.
+In these tables, **dbt-core** is the dbt Core 1.x Python line, still the dominant deployment. On 2026-06-01 dbt Labs released **dbt Core v2.0** (currently alpha): the Fusion engine, relicensed from ELv2 to Apache 2.0 and developed on the `dbt-core` main branch. As of July 2026 that Apache-licensed tree includes the SQL-comprehension code (parser, type checking, column-level lineage). The **dbt-fusion** column tracks the v2.0 line plus the precompiled Fusion binary, which remains dbt's recommended distribution. Column-level lineage and data-type checking require opting into the `strict` static-analysis mode; the default `baseline` mode does lighter, warn-only analysis. Two adjacent 2026 developments worth knowing when you evaluate: Fivetran and dbt Labs completed their merger on 2026-06-01 (dbt and SQLMesh are now corporate siblings), and dbt previewed **dbt State**, a node-level result-reuse and caching layer bundled with Core as an opt-in but activated through the dbt platform.
 :::
 
 - **vs dbt Core.** dbt Core is the incumbent migration funnel, not the head-to-head competitor. Rocky's path is import-compatibility (`rocky import-dbt`) plus a step-change on failure modes dbt Core structurally can't catch: silent schema drift, compile-time contracts, column-level lineage at PR time, per-model cost. dbt Core remains the right choice for moderate-scale, low-blast-radius pipelines where Jinja templating is enough.
-- **vs dbt Fusion.** The Fusion runtime is now open source as dbt Core v2.0 (Rust, Apache 2.0, alpha); the precompiled **Fusion** binary, the distribution dbt recommends, extends that baseline with SQL comprehension: type-checking and column-level lineage (in its opt-in `strict` static-analysis mode; the default `baseline` mode is lighter and warn-only), a SQL linter, multi-dialect compilation, a real LSP, and ADBC drivers. Rocky does not claim those as differentiators. Where Rocky differs is the enforcement plane Fusion leaves open: a first-class named-branch primitive (`dbt clone` exists in both dbt engines, but dbt gives you the raw command, not a branch object); a content-addressed run record (not in Fusion); per-model cost on every run in the free CLI (warehouse-billed bytes on BigQuery, a duration × DBU-rate estimate on Databricks and Snowflake, zero on DuckDB), plus `[budget]` blocks that fail the build (no dbt distribution fails a run on overspend; dbt's Cost Insights does per-model cost but is paid-tier and visibility-only); a cross-warehouse dialect-portability lint (Fusion validates against one configured dialect); declarative governance: RBAC GRANT/REVOKE diffing plus masking bound to classification tags (deepest on Databricks), Apache 2.0 (dbt's native PII/PHI-tracking governance is "coming soon" and paid-platform-only; `grants` in OSS dbt is apply-only); and the `.rocky` DSL as a Jinja-free typed surface (Fusion still templates with Jinja). On contracts, both engines enforce per-model contracts in OSS; dbt additionally ships cross-project contracts via dbt Mesh (the seamless cross-project `ref` is Enterprise-gated). Rocky's contracts are intra-project today, so cross-team contracts are not a Rocky differentiator.
+- **vs dbt Fusion.** The Fusion engine is now open source as dbt Core v2.0 (Rust, Apache 2.0, alpha; as of July 2026 the comprehension code itself lives in the Apache-licensed tree); the precompiled **Fusion** binary, the distribution dbt recommends, packages that engine with SQL comprehension enabled: type-checking and column-level lineage (in its opt-in `strict` static-analysis mode; the default `baseline` mode is lighter and warn-only), a SQL linter, multi-dialect compilation, a real LSP, and ADBC drivers. Rocky does not claim those as differentiators. Where Rocky differs is the enforcement plane Fusion leaves open: a first-class named-branch primitive (`dbt clone` exists in both dbt engines, but dbt gives you the raw command, not a branch object); a content-addressed run record (not in Fusion); per-model cost on every run in the free CLI (warehouse-billed bytes on BigQuery, a duration × DBU-rate estimate on Databricks and Snowflake, zero on DuckDB), plus `[budget]` blocks that fail the build (no dbt distribution fails a run on overspend; dbt's Cost Insights does per-model cost but is paid-tier and visibility-only); a cross-warehouse dialect-portability lint (Fusion validates against one configured dialect); declarative governance: RBAC GRANT/REVOKE diffing plus masking bound to classification tags (deepest on Databricks), Apache 2.0 (dbt's native PII/PHI-tracking governance is "coming soon" and paid-platform-only; `grants` in OSS dbt is apply-only); and the `.rocky` DSL as a Jinja-free typed surface (Fusion still templates with Jinja). On contracts, both engines enforce per-model contracts in OSS; dbt additionally ships cross-project contracts via dbt Mesh (the seamless cross-project `ref` is Enterprise-gated). Rocky's contracts are intra-project today, so cross-team contracts are not a Rocky differentiator.
 - **vs SQLMesh.** SQLMesh is the tool Rocky most resembles: it also analyzes SQL statically (via SQLGlot, no Jinja), and it pioneered several primitives Rocky shares: virtual data environments (the reference design for branch-style isolation), plan/apply with breaking-change classification, and column-level lineage. Rocky does not claim those as differentiators. Where Rocky differs is a narrower enforcement plane: declarative OSS governance (RBAC / masking / classification, deepest on Databricks) and `[budget]` blocks that fail the build (neither of which SQLMesh ships in OSS), plus source-schema-drift detection (the out-of-band case a code-diff plan doesn't catch: a column type changing in the warehouse under a materialized model) and a dialect-portability lint (`P001`) that flags warehouse-specific constructs at PR time, where SQLMesh instead transpiles across dialects via SQLGlot (a different bet). All of it surfaces as greppable diagnostic codes in CI logs. SQLMesh is more mature in years, funding, and adoption, ships native Python models and an OSS CI/CD bot, and its virtual environments are more battle-tested than Rocky's schema-prefix branches. Rocky keeps SQL as the default surface; SQLMesh leans Python-first.
 - **vs warehouse-native pipelines (Databricks LakeFlow, Snowflake Dynamic Tables).** Those are warehouse-coupled and free with the platform. Rocky stays warehouse-neutral and ships a real compiler. If portability and serious tooling matter to you, Rocky wins; if they don't, the warehouse-native option may be "good enough." And adopting Rocky is never a one-way door: `rocky emit-sql` reduces your transformation models to plain runnable SQL in dependency order, so leaving is a one-command export rather than a rewrite. See [No lock-in](/guides/no-lock-in/).
 - **vs observability tools (Datafold, Monte Carlo, Anomalo).** Not competitors. Rocky prevents what these detect; they remain useful for the failure modes Rocky doesn't model. Integrate, don't replace.
@@ -22,7 +22,7 @@ In these tables, **dbt-core** is the dbt Core 1.x Python line, still the dominan
 | Feature | Rocky | dbt-core | dbt-fusion | SQLMesh | Coalesce | Dataform |
 |---|---|---|---|---|---|---|
 | **Language** | Rust | Python | Rust (Fusion) | Python (SQLGlot) | TypeScript | TypeScript |
-| **Open source** | Apache 2.0 | Apache 2.0 | Apache 2.0 runtime; binary free (partly closed) | Apache 2.0 (LF) | No (SaaS) | Partial |
+| **Open source** | Apache 2.0 | Apache 2.0 | Apache 2.0 (v2.0 line, alpha); Fusion binary free with registration | Apache 2.0 (LF) | No (SaaS) | Partial |
 | **Distribution** | Binary | pip | Binary | pip | Cloud SaaS | GCP managed |
 | **Config format** | TOML | YAML | YAML | YAML + Python | GUI | SQLX |
 | **Manifest** | None (in-memory) | JSON (can be 100+ MB) | Parquet + JSON (v2.0) | Snapshots | Cloud | Cloud |
@@ -146,6 +146,20 @@ In these tables, **dbt-core** is the dbt Core 1.x Python line, still the dominan
 | Workspace isolation | **Yes** | No | No | No |
 | Multi-tenant patterns | **Yes** | No | No | No |
 
+## Provenance & Agent Governance
+
+| Feature | Rocky | dbt-core | dbt-fusion | SQLMesh |
+|---|:---:|:---:|:---:|:---:|
+| Content-addressed run record | **Yes** | No | No | No |
+| Bit-exact replay of a recorded run (deterministic, content-addressed) | **Yes** | No | No | No |
+| Hash-verified restore of an evicted artifact | **Yes** | No | No | No |
+| Offline manifest verifier (no engine required) | **Yes** | No | No | No |
+| Policy plane for agent changes (allow / review / deny) | **Yes** | No | No | No |
+| Policy scenario tests in CI | **Yes** | No | No | No |
+| Custody audit trail (`audit`, `brief`, review queue) | **Yes** | No | No | No |
+
+Two honest boundaries on this table. First, dbt's v2.0 release notes announce `dbt-agent`, an authoring assistant; it is guidance-based (a prompt corpus that steers an agent), not a policy plane that enforces allow, require review, or deny at apply time, and its code is not in the public repo as of July 2026. Second, the warehouse platforms govern the adjacent layer: Databricks Unity AI Gateway and Snowflake Agent Identity control which systems an agent may *access* at runtime. Rocky governs what an agent may *change* in the transformation program, which is a different question; the two compose rather than compete.
+
 ## AI Features
 
 | Feature | Rocky | dbt-core | dbt-fusion | SQLMesh | Coalesce |
@@ -154,6 +168,7 @@ In these tables, **dbt-core** is the dbt Core 1.x Python line, still the dominan
 | Schema sync | **Yes** | No | No | No | No |
 | Code explanation | **Yes** | No | No | No | No |
 | Test generation | **Yes** | No | No | No | No |
+| Agent authoring surface | **MCP (28 tools)** | No | dbt-agent (announced) | No | No |
 
 ## CLI Commands
 

@@ -1,8 +1,10 @@
 # Policy-plane gallery — a runnable `[policy]` block over three tiny models.
 #
-# Explain-mode only: drive it with `rocky policy check` to see how the agent
-# policy plane resolves a `(principal, capability, model)` triple. Nothing is
-# enforced here — the decision is reported, not applied.
+# Drive it with `rocky policy check` to see how the agent policy plane
+# resolves a `(principal, capability, model)` triple. The check itself is
+# read-only; the same `[policy]` block is what `apply`, `promote`, and the
+# MCP write tools enforce, so what `check` reports here is the decision
+# those seams would act on.
 #
 #   rocky --config rocky.toml policy check \
 #     --principal agent --capability apply --model fct_orders --models models

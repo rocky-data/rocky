@@ -491,11 +491,16 @@ enum Command {
         models: PathBuf,
     },
 
-    /// Agent-authority policy plane (explain-mode in v0).
+    /// Agent-authority policy plane — declare, enforce, audit.
     ///
-    /// `rocky policy check` reports the effect the policy plane *would*
-    /// resolve for a `(principal, capability, model)` triple against the
-    /// project's `[policy]` block — it does not gate any real command yet.
+    /// A `[policy]` block grades what a principal may do (allow, require
+    /// review, or deny); the same evaluator is enforced at `apply`,
+    /// `promote`, and the MCP write tools, and decisions are recorded to
+    /// the audit ledger. `rocky policy check` explains the base decision a
+    /// `(principal, capability, model)` triple resolves to — the live
+    /// seams also project active freezes and autonomy-budget burn, which
+    /// only tighten it. `test` pins scenarios for CI, and `freeze` is the
+    /// kill switch.
     Policy {
         #[command(subcommand)]
         subcommand: PolicySubcommand,
@@ -2265,8 +2270,11 @@ enum PolicySubcommand {
     ///
     /// Compiles the project to read the model's attributes (tags,
     /// classifications, layer, contracted status), evaluates them against
-    /// the `[policy]` block, and prints the resolved effect + winning rule
-    /// + reason. Read-only — nothing is enforced.
+    /// the `[policy]` block, and prints the resolved effect, the winning
+    /// rule, and the reason. Read-only, and static: the enforcement seams
+    /// (`apply`, `promote`, the MCP write tools) start from this decision
+    /// and additionally project active freezes and autonomy-budget burn,
+    /// which can only tighten it.
     Check {
         /// The principal attempting the action.
         #[arg(long, value_enum)]

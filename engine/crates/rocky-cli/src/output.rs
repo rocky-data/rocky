@@ -6508,9 +6508,12 @@ pub struct ReviewQueueEntry {
 
 /// JSON output for `rocky policy check`.
 ///
-/// Explain-mode only: reports the effect the agent policy plane *would*
-/// resolve for a `(principal, capability, model)` triple, the winning rule
-/// (if any), and why. It does not gate any real command in v0.
+/// An explain surface: reports the *base* effect the agent policy plane
+/// resolves for a `(principal, capability, model)` triple, the winning
+/// rule (if any), and why. The check itself is read-only and static; the
+/// same evaluator is enforced at `apply`, `promote`, and the MCP write
+/// tools, where active freezes and autonomy-budget burn are also
+/// projected and can only tighten the effect reported here.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PolicyCheckOutput {
     pub version: String,
