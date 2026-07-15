@@ -244,8 +244,9 @@ async fn run_apply_run_plan(
     let touched = touched_models_for_run(&plan, &executable);
     let principal = plan.enforcement_principal(runtime_principal);
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
-    // the gate reads it, so a cross-pod freeze is enforced (fail-closed).
-    sync_remote_ledger_before_gate(config_path, state_path).await?;
+    // the gate reads it, so a cross-pod freeze is enforced (fail-closed). Skipped
+    // when the gate won't read the ledger (no policy / empty touched — finding 8).
+    sync_remote_ledger_before_gate(config_path, state_path, &touched).await?;
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
@@ -738,17 +739,35 @@ fn model_attributes(models_dir: &Path) -> BTreeMap<String, ModelAttributes> {
 }
 
 /// Resolve the `[state]` backend for a governed apply seam, returning the config
-/// ONLY when the backend is a REMOTE one whose authoritative ledger must be
-/// pulled before the freeze/budget gate reads the LOCAL state file.
+/// ONLY when the pre-gate remote sync is actually warranted — i.e. all of:
 ///
-/// `None` for the Local backend, or when the config cannot be loaded — a genuine
-/// config error is surfaced by the seam's own fail-closed handling
+/// - `touched` is **non-empty** (an empty set short-circuits
+///   [`evaluate_apply_policy`] to `Allow` with NO ledger read), AND
+/// - a `[policy]` block is configured (`cfg.policy.is_some()`; without one the
+///   gate returns `NotConfigured` and reads NO freeze ledger), AND
+/// - the backend is REMOTE (Local needs no transfer).
+///
+/// When the gate will not consult the `policy_decisions` ledger, pulling remote
+/// state buys nothing and its fail-closed abort would be a pure availability
+/// regression for a valid human Run/Promote plan on a backend blip (finding 8) —
+/// so this returns `None` and the caller skips the download entirely.
+///
+/// `None` is also returned when the config cannot be loaded — a genuine config
+/// error is surfaced by the seam's own fail-closed handling
 /// ([`bail_on_config_load_error`] on the gc/backfill paths, or the run path's
 /// re-load), so there is no remote object to pull in that case.
-fn remote_state_backend_for_gate(config_path: &Path) -> Option<rocky_core::config::StateConfig> {
-    let state_cfg = rocky_core::config::load_rocky_config(config_path)
-        .map(|cfg| cfg.state)
-        .ok()?;
+fn remote_state_backend_for_gate(
+    config_path: &Path,
+    touched: &BTreeMap<String, PolicyCapability>,
+) -> Option<rocky_core::config::StateConfig> {
+    // Empty touched set ⇒ the gate is a no-op Allow, no ledger read.
+    if touched.is_empty() {
+        return None;
+    }
+    let cfg = rocky_core::config::load_rocky_config(config_path).ok()?;
+    // No `[policy]` block ⇒ the gate returns NotConfigured, no ledger read.
+    cfg.policy.as_ref()?;
+    let state_cfg = cfg.state;
     (!matches!(state_cfg.backend, StateBackend::Local)).then_some(state_cfg)
 }
 
@@ -759,10 +778,18 @@ fn remote_state_backend_for_gate(config_path: &Path) -> Option<rocky_core::confi
 /// `policy_decisions` ledger that `rocky run` downloads at start and uploads at
 /// end. A governed apply gates BEFORE any such run-download, so without this a
 /// freeze recorded by another pod would be invisible and the gate would clear
-/// against a stale local snapshot (finding 4-apply). No-op for the Local
-/// backend. Fail-closed: a remote download failure aborts the apply.
-async fn sync_remote_ledger_before_gate(config_path: &Path, state_path: &Path) -> Result<()> {
-    let Some(state_cfg) = remote_state_backend_for_gate(config_path) else {
+/// against a stale local snapshot (finding 4-apply). No-op unless the gate will
+/// actually read the ledger (see [`remote_state_backend_for_gate`] — finding 8).
+/// Fail-closed: when the sync IS warranted, a remote download failure aborts.
+///
+/// `pub(crate)` so the `restore` seam reuses the exact same guarded, fail-closed
+/// pre-gate sync (finding 1).
+pub(crate) async fn sync_remote_ledger_before_gate(
+    config_path: &Path,
+    state_path: &Path,
+    touched: &BTreeMap<String, PolicyCapability>,
+) -> Result<()> {
+    let Some(state_cfg) = remote_state_backend_for_gate(config_path, touched) else {
         return Ok(());
     };
     rocky_core::state_sync::download_state(&state_cfg, state_path)
@@ -779,9 +806,14 @@ async fn sync_remote_ledger_before_gate(config_path: &Path, state_path: &Path) -
 /// gate ([`gate_promote_plan`]), which is reached from two async entry points
 /// (`rocky apply <promote>` and `rocky branch promote --plan`). Driving the
 /// download on a dedicated runtime inside the shared gate closes BOTH entry
-/// points without threading an async download through each caller.
-fn sync_remote_ledger_before_gate_blocking(config_path: &Path, state_path: &Path) -> Result<()> {
-    let Some(state_cfg) = remote_state_backend_for_gate(config_path) else {
+/// points without threading an async download through each caller. Same
+/// finding-8 guard: skips the download unless the gate will read the ledger.
+fn sync_remote_ledger_before_gate_blocking(
+    config_path: &Path,
+    state_path: &Path,
+    touched: &BTreeMap<String, PolicyCapability>,
+) -> Result<()> {
+    let Some(state_cfg) = remote_state_backend_for_gate(config_path, touched) else {
         return Ok(());
     };
     crate::commands::policy::block_on_state_sync(rocky_core::state_sync::download_state(
@@ -1734,13 +1766,14 @@ pub(crate) fn gate_promote_plan(
     promote_plan: &PromotePlan,
     state_path: &Path,
 ) -> Result<()> {
+    let promote_models_dir = resolve_config_models_dir(config_path);
+    let touched = touched_models_for_promote(promote_plan, &promote_models_dir);
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
     // the gate reads it, so a cross-pod freeze is enforced. Placed inside the
     // shared gate so BOTH promote entry points (`rocky apply <promote>` and
-    // `rocky branch promote --plan`) are covered. Fail-closed.
-    sync_remote_ledger_before_gate_blocking(config_path, state_path)?;
-    let promote_models_dir = resolve_config_models_dir(config_path);
-    let touched = touched_models_for_promote(promote_plan, &promote_models_dir);
+    // `rocky branch promote --plan`) are covered. Fail-closed, but skipped when
+    // the gate won't read the ledger (no policy / empty touched — finding 8).
+    sync_remote_ledger_before_gate_blocking(config_path, state_path, &touched)?;
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
@@ -2081,8 +2114,9 @@ async fn run_apply_ai_authored_plan(
     let touched = touched_models_for_run(&plan, &executable);
     let principal = plan.enforcement_principal(runtime_principal);
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
-    // the gate reads it, so a cross-pod freeze is enforced (fail-closed).
-    sync_remote_ledger_before_gate(config_path, state_path).await?;
+    // the gate reads it, so a cross-pod freeze is enforced (fail-closed). Skipped
+    // when the gate won't read the ledger (no policy / empty touched — finding 8).
+    sync_remote_ledger_before_gate(config_path, state_path, &touched).await?;
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
@@ -2200,8 +2234,9 @@ async fn run_apply_backfill_plan(
     // an informational hint — gate on it directly.
     let touched = touched_models_for_run(&plan, &run_plan.models);
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
-    // the gate reads it, so a cross-pod freeze is enforced (fail-closed).
-    sync_remote_ledger_before_gate(config_path, state_path).await?;
+    // the gate reads it, so a cross-pod freeze is enforced (fail-closed). Skipped
+    // when the gate won't read the ledger (no policy / empty touched — finding 8).
+    sync_remote_ledger_before_gate(config_path, state_path, &touched).await?;
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
@@ -3226,6 +3261,63 @@ default_agent_effect = "require_review"
         let path = dir.join("rocky.toml");
         std::fs::write(&path, toml)?;
         Ok(path)
+    }
+
+    /// Finding 8: the pre-gate remote sync must run ONLY when the gate will
+    /// actually read the freeze/budget ledger — otherwise a backend blip would
+    /// falsely abort a valid human Run/Promote plan. `remote_state_backend_for_gate`
+    /// returns `Some` (sync warranted) only for {non-empty touched} ∧ {policy
+    /// configured} ∧ {remote backend}; `None` (skip the download) otherwise.
+    #[test]
+    fn remote_state_backend_for_gate_only_syncs_when_ledger_is_read() -> anyhow::Result<()> {
+        use std::collections::BTreeMap;
+        let dir = tempfile::tempdir()?;
+
+        let mut touched = BTreeMap::new();
+        touched.insert("orders".to_string(), PolicyCapability::Apply);
+        let empty: BTreeMap<String, PolicyCapability> = BTreeMap::new();
+
+        let state_s3 = "\n[state]\nbackend = \"s3\"\ns3_bucket = \"b\"\n";
+
+        // (1) policy + remote + non-empty touched ⇒ Some (sync warranted).
+        let remote_policy = dir.path().join("remote_policy.toml");
+        std::fs::write(&remote_policy, format!("{EMPTY_POLICY_TOML}{state_s3}"))?;
+        assert!(
+            super::remote_state_backend_for_gate(&remote_policy, &touched).is_some(),
+            "policy + remote backend + non-empty touched ⇒ pre-gate sync warranted"
+        );
+
+        // (1b) same config, EMPTY touched ⇒ None (gate short-circuits to Allow).
+        assert!(
+            super::remote_state_backend_for_gate(&remote_policy, &empty).is_none(),
+            "empty touched ⇒ the gate reads no ledger ⇒ no pre-gate sync (finding 8)"
+        );
+
+        // (2) remote backend but NO [policy] ⇒ None (gate returns NotConfigured).
+        let remote_nopolicy = dir.path().join("remote_nopolicy.toml");
+        std::fs::write(&remote_nopolicy, format!("{NO_POLICY_TOML}{state_s3}"))?;
+        assert!(
+            super::remote_state_backend_for_gate(&remote_nopolicy, &touched).is_none(),
+            "no [policy] block ⇒ gate returns NotConfigured, reads no ledger ⇒ no sync (finding 8)"
+        );
+
+        // (3) policy but LOCAL backend (no [state]) ⇒ None (nothing to pull).
+        let local_policy = dir.path().join("local_policy.toml");
+        std::fs::write(&local_policy, EMPTY_POLICY_TOML)?;
+        assert!(
+            super::remote_state_backend_for_gate(&local_policy, &touched).is_none(),
+            "local backend ⇒ nothing to download"
+        );
+
+        // (4) unloadable config ⇒ None (the seam's own fail-closed handling owns
+        //     the config error; there is no remote object to pull).
+        let missing = dir.path().join("does_not_exist.toml");
+        assert!(
+            super::remote_state_backend_for_gate(&missing, &touched).is_none(),
+            "unloadable config ⇒ no remote object to pull here"
+        );
+
+        Ok(())
     }
 
     #[test]

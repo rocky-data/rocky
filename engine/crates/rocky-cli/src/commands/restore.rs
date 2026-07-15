@@ -72,7 +72,9 @@ use rocky_iceberg::uniform_writer::{
 };
 use rocky_ir::ModelIr;
 
-use crate::commands::apply::{PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy};
+use crate::commands::apply::{
+    PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy, sync_remote_ledger_before_gate,
+};
 use crate::commands::gc::{check_recipe_produces_output, gc_models_dir};
 use crate::commands::review::record_plan_review_escalation;
 use crate::commands::run_content_addressed::{build_object_store, table_relative_add_path};
@@ -943,6 +945,13 @@ pub(crate) async fn run_restore_apply_in_with(
         .map(|r| (r.model_name.clone(), PolicyCapability::Restore))
         .collect();
     let models_dir = gc_models_dir(loaded_cfg.as_ref(), config_path);
+    // Finding 1: `rocky restore` mutates state, so a cross-pod freeze must gate
+    // it too. Pull the authoritative remote freeze/budget ledger BEFORE the gate
+    // reads it (fail-closed, remote-only), reusing the apply seam's guarded sync
+    // — skipped when the gate won't read the ledger (no policy / empty touched —
+    // finding 8). Downloading the fresh remote state also gives the restore its
+    // authoritative tombstone ledger to replay from.
+    sync_remote_ledger_before_gate(config_path, state_path, &touched).await?;
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,

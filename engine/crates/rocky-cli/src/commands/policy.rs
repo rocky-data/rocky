@@ -397,13 +397,19 @@ where
 /// switch, failing loudly beats appearing to engage and then silently
 /// disengaging.
 ///
-/// KNOWN LIMITATION (concurrency): this closes only the *sequential*
-/// between-runs clobber. The remote state object is a whole-file blob with **no
+/// KNOWN LIMITATION — no-CAS concurrent overwrite (finding 4): this closes only
+/// the *sequential* between-runs clobber. The remote state object is a
+/// whole-file blob published with a plain last-writer-wins upload and **no
 /// compare-and-swap**, so a concurrent writer — e.g. a `rocky run` whose
 /// start-download completed *before* this freeze — can still overwrite the
 /// freeze on its own end-upload (a cross-pod / concurrent-writer lost update).
-/// This does NOT make concurrent writes safe; it narrows the window, not closes
-/// it.
+/// This narrows the window, it does NOT make concurrent writes safe. A
+/// **reliable cross-pod kill switch** cannot be built on whole-file
+/// last-writer-wins; it needs one of: an atomic **compare-and-swap** publish
+/// (conditional PUT / `If-Match`), a **separate monotonic freeze object** that a
+/// run-upload can never clobber (a freeze marker written to its own key and only
+/// ever OR-ed into the gate), or **serialization** of writers (a lease/lock).
+/// Tracked as a follow-up; out of scope here.
 pub fn run_policy_freeze(
     config_path: &Path,
     state_path: &Path,
@@ -430,12 +436,28 @@ pub fn run_policy_freeze(
         eprintln!("warning: {note}");
     }
 
-    // Resolve the `[state]` backend. A missing/unreadable config degrades to the
-    // Local default (no remote sync) — freeze still records locally, matching
-    // the tolerant posture of `freeze_enforcement_notes` above.
-    let state_cfg = rocky_core::config::load_rocky_config(config_path)
-        .map(|cfg| cfg.state)
-        .unwrap_or_default();
+    // Resolve the `[state]` backend (finding 7, fail-loud). Only a genuinely
+    // ABSENT config selects the Local default (no remote sync) — a freeze
+    // recorded with no config file is a legitimate local-only record. ANY OTHER
+    // config error (malformed TOML, an unknown key tripping `deny_unknown_fields`,
+    // a missing env var — including the very `[state]` block that would make this
+    // a remote freeze) must ABORT: `unwrap_or_default()` would otherwise silently
+    // pick the Local backend, record the freeze LOCAL-only, exit 0 with no upload,
+    // and let a later remote download overwrite it. Mirrors the `[gc]
+    // physical_delete` fail-loud pattern.
+    let state_cfg = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(cfg) => cfg.state,
+        Err(ConfigError::FileNotFound { .. }) => StateConfig::default(),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "refusing to record the policy freeze: {} failed to load, so the [state] backend \
+                 cannot be resolved — a malformed config must not silently record a LOCAL-only \
+                 freeze that a later remote download would overwrite (fail-closed). Fix the config \
+                 and re-run.",
+                config_path.display()
+            )));
+        }
+    };
     let remote_state = !matches!(state_cfg.backend, StateBackend::Local);
 
     // SEAM-SCOPED SYNC — download half. Pull the authoritative remote ledger
@@ -902,6 +924,37 @@ expect = \"deny\"
             "the freeze must be recorded in the ledger"
         );
         assert_eq!(freezes[0].principal, PolicyPrincipal::Agent);
+    }
+
+    /// Finding 7: a malformed config makes the `[state]` backend unresolvable.
+    /// The freeze must ABORT (fail-loud) rather than silently pick the Local
+    /// default and record a local-only freeze that a later remote download would
+    /// overwrite. (A genuinely ABSENT config still selects Local — covered by
+    /// `run_policy_freeze_records_and_succeeds_without_policy_block`.)
+    #[test]
+    fn run_policy_freeze_aborts_on_malformed_config() {
+        // A present-but-invalid config: `load_rocky_config` returns a
+        // non-FileNotFound error (unterminated string → TOML parse error).
+        let (dir, path) = config_with("x = \"unterminated\n");
+        let state = dir.path().join("state.redb");
+        let err = run_policy_freeze(
+            &path,
+            &state,
+            Some(PolicyPrincipal::Agent),
+            None,
+            false,
+            true,
+        )
+        .expect_err("a malformed config must abort the freeze, not record it local-only");
+        assert!(
+            err.to_string().contains("failed to load"),
+            "the abort must cite the config-load / [state]-resolution failure, got: {err}"
+        );
+        // The abort happens before the store is opened, so nothing is recorded.
+        assert!(
+            !state.exists(),
+            "a malformed-config freeze must not create/record a local-only freeze"
+        );
     }
 
     /// 🔴 FIX 7 regression: a scenario that sets an explicit `layer` (and no
