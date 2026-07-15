@@ -893,7 +893,7 @@ class PolicyCapability(StrEnum):
     read = "read"
 
 
-class PolicyCapability71(StrEnum):
+class PolicyCapability77(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -901,7 +901,7 @@ class PolicyCapability71(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability72(StrEnum):
+class PolicyCapability78(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -909,7 +909,7 @@ class PolicyCapability72(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability73(StrEnum):
+class PolicyCapability79(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -917,7 +917,7 @@ class PolicyCapability73(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability74(StrEnum):
+class PolicyCapability80(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -925,7 +925,7 @@ class PolicyCapability74(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability75(StrEnum):
+class PolicyCapability81(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -933,7 +933,15 @@ class PolicyCapability75(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability76(StrEnum):
+class PolicyCapability82(StrEnum):
+    """
+    Restore a gc-evicted artifact from its tombstone (rebuild + verify).
+    """
+
+    restore = "restore"
+
+
+class PolicyCapability83(StrEnum):
     """
     Retry a failed run.
     """
@@ -941,7 +949,7 @@ class PolicyCapability76(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability77(StrEnum):
+class PolicyCapability84(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -949,7 +957,7 @@ class PolicyCapability77(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability78(StrEnum):
+class PolicyCapability85(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -957,7 +965,7 @@ class PolicyCapability78(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability79(StrEnum):
+class PolicyCapability86(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -965,7 +973,7 @@ class PolicyCapability79(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability80(StrEnum):
+class PolicyCapability87(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -1069,16 +1077,17 @@ class PolicyTest(BaseModel):
     )
     capability: (
         PolicyCapability
-        | PolicyCapability71
-        | PolicyCapability72
-        | PolicyCapability73
-        | PolicyCapability74
-        | PolicyCapability75
-        | PolicyCapability76
         | PolicyCapability77
         | PolicyCapability78
         | PolicyCapability79
         | PolicyCapability80
+        | PolicyCapability81
+        | PolicyCapability82
+        | PolicyCapability83
+        | PolicyCapability84
+        | PolicyCapability85
+        | PolicyCapability86
+        | PolicyCapability87
     )
     """
     The capability being attempted.
@@ -2165,16 +2174,17 @@ class PolicyRule(BaseModel):
     """
     capability: (
         PolicyCapability
-        | PolicyCapability71
-        | PolicyCapability72
-        | PolicyCapability73
-        | PolicyCapability74
-        | PolicyCapability75
-        | PolicyCapability76
         | PolicyCapability77
         | PolicyCapability78
         | PolicyCapability79
         | PolicyCapability80
+        | PolicyCapability81
+        | PolicyCapability82
+        | PolicyCapability83
+        | PolicyCapability84
+        | PolicyCapability85
+        | PolicyCapability86
+        | PolicyCapability87
     )
     """
     Which capability this rule governs.
@@ -3697,7 +3707,7 @@ class RockyConfig(BaseModel):
     """
     policy: PolicyConfig | None = None
     """
-    Agent-authority policy plane (explain-mode in v0). Declares, per `(principal, capability, scope)`, whether an action is allowed, requires human review, or is denied. Absent `[policy]` block ⇒ no rules and the default posture applies (agents on mutating actions fall to `default_agent_effect`, humans are never gated). See [`PolicyConfig`] and [`crate::policy`] for the evaluator.
+    Agent-authority policy plane. Declares, per `(principal, capability, scope)`, whether an action is allowed, requires human review, or is denied; enforced at `apply`, `promote`, and the MCP write tools, with every decision recorded to the ledger. Absent `[policy]` block ⇒ no rules and the default posture applies (agents on mutating actions fall to `default_agent_effect`, humans are never gated). See [`PolicyConfig`] and [`crate::policy`] for the evaluator.
     """
     portability: PortabilityConfig | None = Field(
         {"allow": [], "target_dialect": None}, validate_default=True

@@ -44,396 +44,700 @@ top-level command structs that reference them are independent. The
 top-level package re-exports each shared type from one canonical module.
 """
 
-# AI commands
-from .ai_contract_schema import AiContractColumnProfile, AiContractOutput
-from .ai_explain_schema import AiExplainOutput, AiExplanation
-from .ai_schema import AiGenerateOutput
-from .ai_sync_schema import AiSyncOutput, AiSyncProposal
-from .ai_test_schema import AiTestAssertion, AiTestModelResult, AiTestOutput
+# NOTE: hand-maintained lazy barrel. The `codegen-sdk` recipe restores this
+# file from git after regenerating the per-command modules, so it is NOT
+# clobbered by codegen. Generated model classes are imported lazily via PEP
+# 562 module `__getattr__` on first attribute access, so `import rocky_sdk`
+# does not eagerly build every generated class across all modules — only the
+# subset actually referenced. Keep `_LAZY` and `__all__` in sync; the
+# `tests/test_barrel_completeness.py` guard asserts every `__all__` name
+# resolves through this barrel.
+from __future__ import annotations
 
-# CI command (re-uses Diagnostic / Severity / SourceSpan / TestFailure
-# defined canonically below)
-from .ci_schema import CiOutput
+import importlib
+from typing import TYPE_CHECKING
 
-# CI diff command — structural diff between git refs
-from .ci_diff_schema import CiDiffOutput, DiffResult, DiffSummary
+# Exported name -> (defining submodule, real attribute name). The real name
+# differs from the export when the generated class was imported `as` an alias.
+_LAZY: dict[str, tuple[str, str]] = {
+    "AiContractColumnProfile": ("ai_contract_schema", "AiContractColumnProfile"),
+    "AiContractOutput": ("ai_contract_schema", "AiContractOutput"),
+    "AiExplainOutput": ("ai_explain_schema", "AiExplainOutput"),
+    "AiExplanation": ("ai_explain_schema", "AiExplanation"),
+    "AiGenerateOutput": ("ai_schema", "AiGenerateOutput"),
+    "AiSyncOutput": ("ai_sync_schema", "AiSyncOutput"),
+    "AiSyncProposal": ("ai_sync_schema", "AiSyncProposal"),
+    "AiTestAssertion": ("ai_test_schema", "AiTestAssertion"),
+    "AiTestModelResult": ("ai_test_schema", "AiTestModelResult"),
+    "AiTestOutput": ("ai_test_schema", "AiTestOutput"),
+    "AnomalyOutput": ("run_schema", "AnomalyOutput"),
+    "ApplyOutput": ("apply_schema", "ApplyOutput"),
+    "ApprovalArtifact": ("branch_approve_schema", "ApprovalArtifact"),
+    "ApprovalSignature": ("branch_approve_schema", "ApprovalSignature"),
+    "ApproveOutput": ("branch_approve_schema", "ApproveOutput"),
+    "ApproverIdentity": ("branch_approve_schema", "ApproverIdentity"),
+    "ApproverSource": ("branch_approve_schema", "ApproverSource"),
+    "ArchiveApplyOutput": ("archive_apply_schema", "ArchiveApplyOutput"),
+    "ArchiveOutput": ("archive_schema", "ArchiveOutput"),
+    "AssetKind": ("catalog_schema", "AssetKind"),
+    "AuditChainBlastRadius": ("audit_for_schema", "AuditChainBlastRadius"),
+    "AuditChainDecisions": ("audit_for_schema", "AuditChainDecisions"),
+    "AuditChainPlan": ("audit_for_schema", "AuditChainPlan"),
+    "AuditChainRuns": ("audit_for_schema", "AuditChainRuns"),
+    "AuditChainVerify": ("audit_for_schema", "AuditChainVerify"),
+    "AuditDecisionEntry": ("audit_schema", "AuditDecisionEntry"),
+    "AuditEvent": ("branch_promote_schema", "AuditEvent"),
+    "AuditEventKind": ("branch_promote_schema", "AuditEventKind1"),
+    "AuditForOutput": ("audit_for_schema", "AuditForOutput"),
+    "AuditOutput": ("audit_schema", "AuditOutput"),
+    "AuditPlanChange": ("audit_for_schema", "AuditPlanChange"),
+    "AuditRunEntry": ("audit_for_schema", "AuditRunEntry"),
+    "AuditScorecardOutput": ("audit_scorecard_schema", "AuditScorecardOutput"),
+    "BackfillCostEstimate": ("backfill_schema", "BackfillCostEstimate"),
+    "BackfillModelCost": ("backfill_schema", "BackfillModelCost"),
+    "BackfillOutput": ("backfill_schema", "BackfillOutput"),
+    "BackfillPartitionScope": ("backfill_schema", "BackfillPartitionScope"),
+    "BisectionStatsOutput": ("preview_diff_schema", "BisectionStatsOutput"),
+    "BranchDeleteOutput": ("branch_delete_schema", "BranchDeleteOutput"),
+    "BranchEntry": ("branch_schema", "BranchEntry"),
+    "BranchListOutput": ("branch_list_schema", "BranchListOutput"),
+    "BranchOutput": ("branch_schema", "BranchOutput"),
+    "BranchPromoteOutput": ("branch_promote_schema", "BranchPromoteOutput"),
+    "BriefActiveFreeze": ("brief_schema", "BriefActiveFreeze"),
+    "BriefAgentActivitySection": ("brief_schema", "BriefAgentActivitySection"),
+    "BriefAutonomySection": ("brief_schema", "BriefAutonomySection"),
+    "BriefBudgetStatus": ("brief_schema", "BriefBudgetStatus"),
+    "BriefCostSection": ("brief_schema", "BriefCostSection"),
+    "BriefDecisionEntry": ("brief_schema", "BriefDecisionEntry"),
+    "BriefDegradedRule": ("brief_schema", "BriefDegradedRule"),
+    "BriefDriftEntry": ("brief_schema", "BriefDriftEntry"),
+    "BriefDriftSection": ("brief_schema", "BriefDriftSection"),
+    "BriefEscalationsSection": ("brief_schema", "BriefEscalationsSection"),
+    "BriefFailedModel": ("brief_schema", "BriefFailedModel"),
+    "BriefFreshnessEntry": ("brief_schema", "BriefFreshnessEntry"),
+    "BriefFreshnessSection": ("brief_schema", "BriefFreshnessSection"),
+    "BriefOutput": ("brief_schema", "BriefOutput"),
+    "BriefPrincipalActivity": ("brief_schema", "BriefPrincipalActivity"),
+    "BriefQualityEntry": ("brief_schema", "BriefQualityEntry"),
+    "BriefQualitySection": ("brief_schema", "BriefQualitySection"),
+    "BriefRunCost": ("brief_schema", "BriefRunCost"),
+    "BriefRunEntry": ("brief_schema", "BriefRunEntry"),
+    "BriefRunsSection": ("brief_schema", "BriefRunsSection"),
+    "BudgetBreachOutput": ("run_schema", "BudgetBreachOutput"),
+    "ByteCalibration": ("compact_dedup_schema", "ByteCalibration"),
+    "CatalogAsset": ("catalog_schema", "CatalogAsset"),
+    "CatalogColumn": ("catalog_schema", "CatalogColumn"),
+    "CatalogEdge": ("catalog_schema", "CatalogEdge"),
+    "CatalogOutput": ("catalog_schema", "CatalogOutput"),
+    "CatalogStats": ("catalog_schema", "CatalogStats"),
+    "ChecksConfigOutput": ("discover_schema", "ChecksConfigOutput"),
+    "CiDiffOutput": ("ci_diff_schema", "CiDiffOutput"),
+    "CiOutput": ("ci_schema", "CiOutput"),
+    "ClearSchemaCacheOutput": ("state_clear_schema_cache_schema", "ClearSchemaCacheOutput"),
+    "CollisionCandidateOutput": ("discover_schema", "CollisionCandidateOutput"),
+    "ColumnClassificationStatus": ("compliance_schema", "ColumnClassificationStatus"),
+    "ColumnLineageOutput": ("column_lineage_schema", "ColumnLineageOutput"),
+    "ColumnTrendPoint": ("metrics_schema", "ColumnTrendPoint"),
+    "CompactApplyOutput": ("compact_apply_schema", "CompactApplyOutput"),
+    "CompactDedupOutput": ("compact_dedup_schema", "CompactDedupOutput"),
+    "CompactOutput": ("compact_schema", "CompactOutput"),
+    "CompareOutput": ("compare_schema", "CompareOutput"),
+    "CompileOutput": ("compile_schema", "CompileOutput"),
+    "ComplianceException": ("compliance_schema", "ComplianceException"),
+    "ComplianceOutput": ("compliance_schema", "ComplianceOutput"),
+    "ComplianceSummary": ("compliance_schema", "ComplianceSummary"),
+    "ContainedModelOutput": ("run_schema", "ContainedModelOutput"),
+    "ContractResult": ("load_schema", "ContractResult"),
+    "ContractViolation": ("load_schema", "ContractViolation"),
+    "CostOutput": ("cost_schema", "CostOutput"),
+    "DagEdgeOutput": ("dag_schema", "DagEdgeOutput"),
+    "DagNodeOutput": ("dag_schema", "DagNodeOutput"),
+    "DagOutput": ("dag_schema", "DagOutput"),
+    "DagRunNodeOutput": ("dag_run_schema", "DagRunNodeOutput"),
+    "DagRunOutput": ("dag_run_schema", "DagRunOutput"),
+    "DagSummaryOutput": ("dag_schema", "DagSummaryOutput"),
+    "DeclarativeTestResult": ("test_schema", "DeclarativeTestResult"),
+    "DedupPair": ("compact_dedup_schema", "DedupPair"),
+    "DedupSummary": ("compact_dedup_schema", "DedupSummary"),
+    "Diagnostic": ("compile_schema", "Diagnostic"),
+    "DiffResult": ("ci_diff_schema", "DiffResult"),
+    "DiffSummary": ("ci_diff_schema", "DiffSummary"),
+    "DiscoverOutput": ("discover_schema", "DiscoverOutput"),
+    "DoctorOutput": ("doctor_schema", "DoctorOutput"),
+    "DriftActionOutput": ("drift_schema", "DriftActionOutput"),
+    "DriftOutput": ("drift_schema", "DriftOutput"),
+    "DriftSummary": ("drift_schema", "DriftSummary"),
+    "EdgeConfidence": ("catalog_schema", "EdgeConfidence"),
+    "EncodingRecommendationOutput": ("profile_storage_schema", "EncodingRecommendationOutput"),
+    "EnvMaskingStatus": ("compliance_schema", "EnvMaskingStatus"),
+    "ErrorEnvelope": ("error_envelope_schema", "ErrorEnvelope"),
+    "EstimateOutput": ("estimate_schema", "EstimateOutput"),
+    "ExcludedTableOutput": ("run_schema", "ExcludedTableOutput"),
+    "ExecutionSummary": ("run_schema", "ExecutionSummary"),
+    "FailedSourceOutput": ("discover_schema", "FailedSourceOutput"),
+    "FivetranColumnConfig": ("rocky_fivetran_state_schema", "FivetranColumnConfig"),
+    "FivetranConnectorStatus": ("rocky_fivetran_state_schema", "FivetranConnectorStatus"),
+    "FivetranConnectorSummary": ("rocky_fivetran_state_schema", "FivetranConnectorSummary"),
+    "FivetranDestination": ("rocky_fivetran_state_schema", "FivetranDestination"),
+    "FivetranSchemaConfig": ("rocky_fivetran_state_schema", "FivetranSchemaConfig"),
+    "FivetranSchemaEntry": ("rocky_fivetran_state_schema", "FivetranSchemaEntry"),
+    "FivetranStateEnvelope": ("rocky_fivetran_state_schema", "FivetranStateEnvelope"),
+    "FivetranStateEnvelopeVersion": ("rocky_fivetran_state_schema", "EnvelopeVersion"),
+    "FivetranTableConfig": ("rocky_fivetran_state_schema", "FivetranTableConfig"),
+    "FreshnessConfigOutput": ("discover_schema", "FreshnessConfigOutput"),
+    "GcApplyOutput": ("gc_apply_schema", "GcApplyOutput"),
+    "GcCandidateOutput": ("gc_schema", "GcCandidateOutput"),
+    "GcCheckOutput": ("gc_schema", "GcCheckOutput"),
+    "GcEvictedOutput": ("gc_apply_schema", "GcEvictedOutput"),
+    "GcPlanEviction": ("gc_plan_schema", "GcPlanEviction"),
+    "GcPlanOutput": ("gc_plan_schema", "GcPlanOutput"),
+    "GcRebuildCostOutput": ("gc_schema", "GcRebuildCostOutput"),
+    "GcRefusedOutput": ("gc_apply_schema", "GcRefusedOutput"),
+    "GcReportOutput": ("gc_schema", "GcReportOutput"),
+    "HealthCheck": ("doctor_schema", "HealthCheck"),
+    "HealthStatus": ("doctor_schema", "HealthStatus"),
+    "HistoryOutput": ("history_schema", "HistoryOutput"),
+    "HookEntry": ("hooks_list_schema", "HookEntry"),
+    "HooksListOutput": ("hooks_list_schema", "HooksListOutput"),
+    "HooksTestOutput": ("hooks_test_schema", "HooksTestOutput"),
+    "ImportDbtFailure": ("import_dbt_schema", "ImportDbtFailure"),
+    "ImportDbtHookKind": ("import_dbt_schema", "ImportDbtHookKind"),
+    "ImportDbtOutput": ("import_dbt_schema", "ImportDbtOutput"),
+    "ImportDbtWarning": ("import_dbt_schema", "ImportDbtWarning"),
+    "JobStatus": ("job_status_schema", "JobStatus"),
+    "LineageColumnChange": ("lineage_diff_schema", "LineageColumnChange"),
+    "LineageColumnDef": ("lineage_schema", "LineageColumnDef"),
+    "LineageDiffOutput": ("lineage_diff_schema", "LineageDiffOutput"),
+    "LineageDiffResult": ("lineage_diff_schema", "LineageDiffResult"),
+    "LineageEdgeRecord": ("lineage_schema", "LineageEdgeRecord"),
+    "LineageOutput": ("lineage_schema", "LineageOutput"),
+    "LineageQualifiedColumn": ("lineage_schema", "LineageQualifiedColumn"),
+    "LoadFileOutput": ("load_schema", "LoadFileOutput"),
+    "LoadOutput": ("load_schema", "LoadOutput"),
+    "MaterializationMetadata": ("run_schema", "MaterializationMetadata"),
+    "MaterializationOutput": ("run_schema", "MaterializationOutput"),
+    "MetaOutput": ("meta_schema", "MetaOutput"),
+    "MetricsAlert": ("metrics_schema", "MetricsAlert"),
+    "MetricsOutput": ("metrics_schema", "MetricsOutput"),
+    "MetricsSnapshot": ("run_schema", "MetricsSnapshot"),
+    "MetricsSnapshotEntry": ("metrics_schema", "MetricsSnapshotEntry"),
+    "ModelDecisionOutput": ("run_schema", "ModelDecisionOutput"),
+    "ModelDetail": ("compile_schema", "ModelDetail"),
+    "ModelEstimate": ("estimate_schema", "ModelEstimate"),
+    "ModelExecutionRecord": ("model_history_schema", "ModelExecutionRecord"),
+    "ModelFreshnessConfig": ("compile_schema", "ModelFreshnessConfig"),
+    "ModelHistoryOutput": ("model_history_schema", "ModelHistoryOutput"),
+    "ModelRetentionStatus": ("retention_status_schema", "ModelRetentionStatus"),
+    "ModelTestResult": ("test_schema", "ModelTestResult"),
+    "ModelValidationOutput": ("validate_migration_schema", "ModelValidationOutput"),
+    "NamedStatement": ("compact_schema", "NamedStatement"),
+    "OptimizeOutput": ("optimize_schema", "OptimizeOutput"),
+    "OptimizeRecommendation": ("optimize_schema", "OptimizeRecommendation"),
+    "OverrideWarningOutput": ("run_schema", "OverrideWarningOutput"),
+    "PartitionShapeOutput": ("dag_schema", "PartitionShapeOutput"),
+    "PerModelBudgetBreachOutput": ("preview_cost_schema", "PerModelBudgetBreachOutput"),
+    "PerModelCostHistorical": ("cost_schema", "PerModelCostHistorical"),
+    "PermissionSummary": ("run_schema", "PermissionSummary"),
+    "PhaseTimings": ("compile_schema", "PhaseTimings"),
+    "PlanOutput": ("plan_schema", "PlanOutput"),
+    "PlannedStatement": ("plan_schema", "PlannedStatement"),
+    "PolicyCheckOutput": ("policy_check_schema", "PolicyCheckOutput"),
+    "PolicyFreezeEntry": ("policy_freeze_schema", "PolicyFreezeEntry"),
+    "PolicyFreezeOutput": ("policy_freeze_schema", "PolicyFreezeOutput"),
+    "PolicyModelAttributes": ("policy_check_schema", "PolicyModelAttributes"),
+    "PolicyTestOutput": ("policy_test_schema", "PolicyTestOutput"),
+    "PolicyTestResult": ("policy_test_schema", "PolicyTestResult"),
+    "PreviewColumnTypeChange": ("preview_diff_schema", "PreviewColumnTypeChange"),
+    "PreviewCopiedModel": ("preview_create_schema", "PreviewCopiedModel"),
+    "PreviewCostOutput": ("preview_cost_schema", "PreviewCostOutput"),
+    "PreviewCostSummary": ("preview_cost_schema", "PreviewCostSummary"),
+    "PreviewCreateOutput": ("preview_create_schema", "PreviewCreateOutput"),
+    "PreviewDiffOutput": ("preview_diff_schema", "PreviewDiffOutput"),
+    "PreviewDiffSummary": ("preview_diff_schema", "PreviewDiffSummary"),
+    "PreviewModelCostDelta": ("preview_cost_schema", "PreviewModelCostDelta"),
+    "PreviewModelDiff": ("preview_diff_schema", "PreviewModelDiff"),
+    "PreviewPrunedModel": ("preview_create_schema", "PreviewPrunedModel"),
+    "PreviewRowSample": ("preview_diff_schema", "PreviewRowSample"),
+    "PreviewRowSampleChange": ("preview_diff_schema", "PreviewRowSampleChange"),
+    "PreviewRowsOutput": ("preview_rows_schema", "PreviewRowsOutput"),
+    "PreviewSampledRowDiff": ("preview_diff_schema", "PreviewSampledRowDiff"),
+    "PreviewSamplingWindow": ("preview_diff_schema", "PreviewSamplingWindow"),
+    "PreviewStructuralDiff": ("preview_diff_schema", "PreviewStructuralDiff"),
+    "ProfileColumnStats": ("profile_schema", "ProfileColumnStats"),
+    "ProfileOutput": ("profile_schema", "ProfileOutput"),
+    "ProfileStorageOutput": ("profile_storage_schema", "ProfileStorageOutput"),
+    "PromotePlan": ("plan_promote_schema", "PromotePlan"),
+    "PromoteTarget": ("branch_promote_schema", "PromoteTarget"),
+    "PromoteTargetPlan": ("plan_promote_schema", "PromoteTargetPlan"),
+    "QuarantineOutput": ("run_schema", "QuarantineOutput"),
+    "RecipeExecutionRecord": ("recipe_history_schema", "RecipeExecutionRecord"),
+    "RecipeHistoryOutput": ("recipe_history_schema", "RecipeHistoryOutput"),
+    "RejectedApproval": ("branch_promote_schema", "RejectedApproval"),
+    "ReplayCheckInputOutput": ("replay_check_schema", "ReplayCheckInputOutput"),
+    "ReplayCheckModelOutput": ("replay_check_schema", "ReplayCheckModelOutput"),
+    "ReplayCheckOutput": ("replay_check_schema", "ReplayCheckOutput"),
+    "ReplayExecuteModelOutput": ("replay_execute_schema", "ReplayExecuteModelOutput"),
+    "ReplayExecuteOutput": ("replay_execute_schema", "ReplayExecuteOutput"),
+    "ReplayModelOutput": ("replay_schema", "ReplayModelOutput"),
+    "ReplayOutput": ("replay_schema", "ReplayOutput"),
+    "ResolvedCheckNameOutput": ("discover_schema", "ResolvedCheckNameOutput"),
+    "RestoreApplyOutput": ("restore_apply_schema", "RestoreApplyOutput"),
+    "RestorePlanOutput": ("restore_plan_schema", "RestorePlanOutput"),
+    "RestorePlanRestoration": ("restore_plan_schema", "RestorePlanRestoration"),
+    "RestoreRefusedOutput": ("restore_apply_schema", "RestoreRefusedOutput"),
+    "RestoredOutput": ("restore_apply_schema", "RestoredOutput"),
+    "RetentionStatusOutput": ("retention_status_schema", "RetentionStatusOutput"),
+    "RetentionSweepOutput": ("state_retention_sweep_schema", "RetentionSweepOutput"),
+    "ReviewOutput": ("review_schema", "ReviewOutput"),
+    "ReviewQueueEntry": ("review_queue_schema", "ReviewQueueEntry"),
+    "ReviewQueueOutput": ("review_queue_schema", "ReviewQueueOutput"),
+    "RunHistoryRecord": ("history_schema", "RunHistoryRecord"),
+    "RunOutput": ("run_schema", "RunOutput"),
+    "ScorecardGroup": ("audit_scorecard_schema", "ScorecardGroup"),
+    "ScorecardUnavailableMetric": ("audit_scorecard_schema", "ScorecardUnavailableMetric"),
+    "SeedOutput": ("seed_schema", "SeedOutput"),
+    "SeedTableOutput": ("seed_schema", "SeedTableOutput"),
+    "Severity": ("compile_schema", "Severity"),
+    "SignatureAlgorithm": ("branch_approve_schema", "SignatureAlgorithm"),
+    "SourceOutput": ("discover_schema", "SourceOutput"),
+    "SourceSpan": ("compile_schema", "SourceSpan"),
+    "StateOutput": ("state_schema", "StateOutput"),
+    "StatementResult": ("compact_apply_schema", "StatementResult"),
+    "TableCheckOutput": ("run_schema", "TableCheckOutput"),
+    "TableCompareResult": ("compare_schema", "TableCompareResult"),
+    "TableDedupContribution": ("compact_dedup_schema", "TableDedupContribution"),
+    "TableErrorOutput": ("run_schema", "TableErrorOutput"),
+    "TableOutput": ("discover_schema", "TableOutput"),
+    "TestAdapterOutput": ("test_adapter_schema", "TestAdapterOutput"),
+    "TestAdapterTestResult": ("test_adapter_schema", "TestAdapterTestResult"),
+    "TestFailure": ("test_schema", "TestFailure"),
+    "TestOutput": ("test_schema", "TestOutput"),
+    "TraceModelEntry": ("trace_schema", "TraceModelEntry"),
+    "TraceOutput": ("trace_schema", "TraceOutput"),
+    "UnitTestResult": ("test_schema", "UnitTestResult"),
+    "ValidateAdapterStatus": ("validate_schema", "ValidateAdapterStatus"),
+    "ValidateMessage": ("validate_schema", "ValidateMessage"),
+    "ValidateMigrationOutput": ("validate_migration_schema", "ValidateMigrationOutput"),
+    "ValidateModelsStatus": ("validate_schema", "ValidateModelsStatus"),
+    "ValidateOutput": ("validate_schema", "ValidateOutput"),
+    "ValidatePipelineStatus": ("validate_schema", "ValidatePipelineStatus"),
+    "WatermarkEntry": ("state_schema", "WatermarkEntry"),
+}
 
-# Column lineage (per-column shape of `rocky lineage --column <col>`)
-from .column_lineage_schema import ColumnLineageOutput
 
-# serve HTTP API — structured error body + /meta feature-detection payload
-from .error_envelope_schema import ErrorEnvelope
-from .job_status_schema import JobStatus
-from .meta_schema import MetaOutput
+def __getattr__(name: str) -> object:
+    """Lazily import a generated model class on first access (PEP 562)."""
+    target = _LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module, real = target
+    obj = getattr(importlib.import_module(f".{module}", __name__), real)
+    globals()[name] = obj  # cache: subsequent access skips __getattr__
+    return obj
 
-# DAG command — unified pipeline DAG with enriched orchestration metadata
-from .dag_schema import (
-    DagEdgeOutput,
-    DagNodeOutput,
-    DagOutput,
-    DagSummaryOutput,
-    PartitionShapeOutput,
-)
 
-# Compile command — canonical source for shared compiler types
-from .compile_schema import (
-    CompileOutput,
-    Diagnostic,
-    ModelDetail,
-    ModelFreshnessConfig,
-    PhaseTimings,
-    Severity,
-    SourceSpan,
-)
+def __dir__() -> list[str]:
+    return sorted(__all__)
 
-# Discover command
-from .discover_schema import (
-    ChecksConfigOutput,
-    CollisionCandidateOutput,
-    DiscoverOutput,
-    FailedSourceOutput,
-    FreshnessConfigOutput,
-    ResolvedCheckNameOutput,
-    SourceOutput,
-    TableOutput,
-)
 
-# Doctor command
-from .doctor_schema import DoctorOutput, HealthCheck, HealthStatus
-
-# Drift command — canonical source for DriftSummary + DriftActionOutput
-from .drift_schema import DriftActionOutput, DriftOutput, DriftSummary
-
-# History (all-runs view) and ModelHistory (per-model view)
-from .history_schema import HistoryOutput, RunHistoryRecord
-from .model_history_schema import ModelExecutionRecord, ModelHistoryOutput
-
-# RecipeHistory (all executions of one exact program) — `rocky history --recipe`
-from .recipe_history_schema import RecipeExecutionRecord, RecipeHistoryOutput
-
-# Lineage (model-level shape)
-from .lineage_schema import (
-    LineageColumnDef,
-    LineageEdgeRecord,
-    LineageOutput,
-    LineageQualifiedColumn,
-)
-
-# LineageDiff (per-changed-column downstream blast-radius for PR review)
-from .lineage_diff_schema import (
-    LineageColumnChange,
-    LineageDiffOutput,
-    LineageDiffResult,
-)
-
-# Metrics command
-from .metrics_schema import (
-    ColumnTrendPoint,
-    MetricsAlert,
-    MetricsOutput,
-    MetricsSnapshotEntry,
-)
-
-# Optimize command
-from .optimize_schema import OptimizeOutput, OptimizeRecommendation
-
-# Plan command
-from .plan_schema import PlannedStatement, PlanOutput
-
-# Run command — canonical source for all the run-only nested types (including
-# the shared ``BudgetBreachOutput`` / ``ExcludedTableOutput`` also referenced by
-# preview_cost / discover).
-from .run_schema import (
-    AnomalyOutput,
-    BudgetBreachOutput,
-    ContainedModelOutput,
-    ExcludedTableOutput,
-    ExecutionSummary,
-    MaterializationMetadata,
-    MaterializationOutput,
-    MetricsSnapshot,
-    ModelDecisionOutput,
-    OverrideWarningOutput,
-    PermissionSummary,
-    QuarantineOutput,
-    RunOutput,
-    TableCheckOutput,
-    TableErrorOutput,
-)
-
-# State command
-from .state_schema import StateOutput, WatermarkEntry
-
-# State clear-schema-cache (Arc 7 wave 2 wave-2 PR 4)
-from .state_clear_schema_cache_schema import ClearSchemaCacheOutput
-
-# Test command — canonical source for TestFailure
-from .test_schema import (
-    DeclarativeTestResult,
-    ModelTestResult,
-    TestFailure,
-    TestOutput,
-    UnitTestResult,
-)
-
-# Compare command
-from .compare_schema import CompareOutput, TableCompareResult
-
-# Cost command (historical per-run cost attribution)
-from .cost_schema import CostOutput, PerModelCostHistorical
-
-# Backfill command (scoped, review-gated recovery plan)
-from .backfill_schema import (
-    BackfillCostEstimate,
-    BackfillModelCost,
-    BackfillOutput,
-    BackfillPartitionScope,
-)
-
-# Gc command (derivability inventory — dry-run reclamation report)
-from .gc_schema import (
-    GcCandidateOutput,
-    GcCheckOutput,
-    GcRebuildCostOutput,
-    GcReportOutput,
-)
-
-# Gc plan (`rocky gc --derivable`) + apply (`rocky apply <gc-plan>`)
-from .gc_apply_schema import (
-    GcApplyOutput,
-    GcEvictedOutput,
-    GcRefusedOutput,
-)
-from .gc_plan_schema import (
-    GcPlanEviction,
-    GcPlanOutput,
-)
-
-# Brief command (the governor's estate digest)
-from .brief_schema import (
-    BriefActiveFreeze,
-    BriefAgentActivitySection,
-    BriefAutonomySection,
-    BriefBudgetStatus,
-    BriefCostSection,
-    BriefDecisionEntry,
-    BriefDegradedRule,
-    BriefDriftEntry,
-    BriefDriftSection,
-    BriefEscalationsSection,
-    BriefFailedModel,
-    BriefFreshnessEntry,
-    BriefFreshnessSection,
-    BriefOutput,
-    BriefPrincipalActivity,
-    BriefQualityEntry,
-    BriefQualitySection,
-    BriefRunCost,
-    BriefRunEntry,
-    BriefRunsSection,
-)
-
-# Compact command — canonical source for NamedStatement (also used by archive)
-from .compact_schema import CompactOutput, NamedStatement
-
-# Archive command (re-uses NamedStatement from compact)
-from .archive_schema import ArchiveOutput
-
-# Compact apply command (Cluster 3 B Phase 1 — plan/apply spine for compact)
-from .compact_apply_schema import CompactApplyOutput, StatementResult
-
-# Archive apply command (Cluster 3 B Phase 1 — plan/apply spine for archive)
-from .archive_apply_schema import ArchiveApplyOutput
-
-# Apply command (Cluster 3 B Phase 2 — top-level plan/apply spine)
-from .apply_schema import ApplyOutput
-
-# Profile-storage command
-from .profile_storage_schema import EncodingRecommendationOutput, ProfileStorageOutput
-
-# Import-dbt command
-from .import_dbt_schema import (
-    ImportDbtFailure,
-    ImportDbtHookKind,
-    ImportDbtOutput,
-    ImportDbtWarning,
-)
-
-# Hooks list + test
-from .hooks_list_schema import HookEntry, HooksListOutput
-from .hooks_test_schema import HooksTestOutput
-
-# Validate-migration
-from .validate_migration_schema import ModelValidationOutput, ValidateMigrationOutput
-
-# Test-adapter
-from .test_adapter_schema import TestAdapterOutput, TestAdapterTestResult
-
-# Branch (schema-prefix virtual branches)
-from .branch_schema import BranchEntry, BranchOutput
-from .branch_list_schema import BranchListOutput
-from .branch_delete_schema import BranchDeleteOutput
-
-# Branch approval / promote — file-based approval gate for production writes
-from .branch_approve_schema import (
-    ApprovalArtifact,
-    ApprovalSignature,
-    ApproveOutput,
-    ApproverIdentity,
-)
-from .branch_approve_schema import ApproverSource as ApproverSource
-from .branch_approve_schema import SignatureAlgorithm as SignatureAlgorithm
-from .branch_promote_schema import (
-    AuditEvent,
-    BranchPromoteOutput,
-    PromoteTarget,
-    RejectedApproval,
-)
-from .branch_promote_schema import AuditEventKind1 as AuditEventKind
-
-# Plan promote (plan/apply spine for branch promotion)
-from .plan_promote_schema import PromotePlan, PromoteTargetPlan
-
-# Catalog (project-wide column-lineage snapshot)
-from .catalog_schema import (
-    AssetKind,
-    CatalogAsset,
-    CatalogColumn,
-    CatalogEdge,
-    CatalogOutput,
-    CatalogStats,
-    EdgeConfidence,
-)
-
-# Replay (inspection-only run record)
-from .replay_schema import ReplayModelOutput, ReplayOutput
-
-# Replay check (read-only replayability audit)
-from .replay_check_schema import (
-    ReplayCheckInputOutput,
-    ReplayCheckModelOutput,
-    ReplayCheckOutput,
-)
-
-# Replay execute (single-model re-execution + verify)
-from .replay_execute_schema import (
-    ReplayExecuteModelOutput,
-    ReplayExecuteOutput,
-)
-
-# Compliance — governance rollup over classification + masking policy
-from .compliance_schema import (
-    ColumnClassificationStatus,
-    ComplianceException,
-    ComplianceOutput,
-    ComplianceSummary,
-    EnvMaskingStatus,
-)
-
-# Retention status (per-model data retention report)
-from .retention_status_schema import ModelRetentionStatus, RetentionStatusOutput
-
-# Preview (PR-bundle: create branch, diff base vs branch, cost delta)
-from .preview_create_schema import (
-    PreviewCopiedModel,
-    PreviewCreateOutput,
-    PreviewPrunedModel,
-)
-from .preview_diff_schema import (
-    BisectionStatsOutput,
-    PreviewColumnTypeChange,
-    PreviewDiffOutput,
-    PreviewDiffSummary,
-    PreviewModelDiff,
-    PreviewRowSample,
-    PreviewRowSampleChange,
-    PreviewSampledRowDiff,
-    PreviewSamplingWindow,
-    PreviewStructuralDiff,
-)
-from .preview_cost_schema import (
-    PerModelBudgetBreachOutput,
-    PreviewCostOutput,
-    PreviewCostSummary,
-    PreviewModelCostDelta,
-)
-
-# Preview rows (`rocky preview rows`)
-from .preview_rows_schema import PreviewRowsOutput
-
-# Fivetran state envelope — canonical shape written by
-# `rocky discover --emit-fivetran-state-to <PATH>` and the contract
-# between Rocky and downstream consumers reading the Fivetran view.
-from .rocky_fivetran_state_schema import (
-    EnvelopeVersion as FivetranStateEnvelopeVersion,
-    FivetranColumnConfig,
-    FivetranConnectorStatus,
-    FivetranConnectorSummary,
-    FivetranDestination,
-    FivetranSchemaConfig,
-    FivetranSchemaEntry,
-    FivetranStateEnvelope,
-    FivetranTableConfig,
-)
-
-# Governor surface — audit ledger + scorecard + policy plane + review queue.
-from .audit_schema import AuditDecisionEntry, AuditOutput
-from .audit_for_schema import (
-    AuditChainBlastRadius,
-    AuditChainDecisions,
-    AuditChainPlan,
-    AuditChainRuns,
-    AuditChainVerify,
-    AuditForOutput,
-    AuditPlanChange,
-    AuditRunEntry,
-)
-from .audit_scorecard_schema import (
-    AuditScorecardOutput,
-    ScorecardGroup,
-    ScorecardUnavailableMetric,
-)
-from .policy_check_schema import PolicyCheckOutput, PolicyModelAttributes
-from .policy_test_schema import PolicyTestOutput, PolicyTestResult
-from .policy_freeze_schema import PolicyFreezeEntry, PolicyFreezeOutput
-from .review_schema import ReviewOutput
-from .review_queue_schema import ReviewQueueEntry, ReviewQueueOutput
-
-# Seed / load — file-ingest + seed commands.
-from .seed_schema import SeedOutput, SeedTableOutput
-from .load_schema import ContractResult, ContractViolation, LoadFileOutput, LoadOutput
-
-# Estimate / profile — warehouse-cost estimate + column profiler.
-from .estimate_schema import EstimateOutput, ModelEstimate
-from .profile_schema import ProfileColumnStats, ProfileOutput
-
-# Trace / validate — run-timeline trace + config validation.
-from .trace_schema import TraceModelEntry, TraceOutput
-from .validate_schema import (
-    ValidateAdapterStatus,
-    ValidateMessage,
-    ValidateModelsStatus,
-    ValidateOutput,
-    ValidatePipelineStatus,
-)
-
-# DAG run — DAG-mode run summary.
-from .dag_run_schema import DagRunNodeOutput, DagRunOutput
-
-# Compact-dedup — cross-table dedup report.
-from .compact_dedup_schema import (
-    ByteCalibration,
-    CompactDedupOutput,
-    DedupPair,
-    DedupSummary,
-    TableDedupContribution,
-)
-
-# State-retention sweep — scheduled state GC report.
-from .state_retention_sweep_schema import RetentionSweepOutput
+if TYPE_CHECKING:
+    # Eager imports for static analysers / IDEs only — never run at runtime.
+    from .ai_contract_schema import (
+        AiContractColumnProfile,
+        AiContractOutput,
+    )
+    from .ai_explain_schema import (
+        AiExplainOutput,
+        AiExplanation,
+    )
+    from .ai_schema import AiGenerateOutput
+    from .ai_sync_schema import (
+        AiSyncOutput,
+        AiSyncProposal,
+    )
+    from .ai_test_schema import (
+        AiTestAssertion,
+        AiTestModelResult,
+        AiTestOutput,
+    )
+    from .ci_schema import CiOutput
+    from .ci_diff_schema import (
+        CiDiffOutput,
+        DiffResult,
+        DiffSummary,
+    )
+    from .column_lineage_schema import ColumnLineageOutput
+    from .error_envelope_schema import ErrorEnvelope
+    from .job_status_schema import JobStatus
+    from .meta_schema import MetaOutput
+    from .dag_schema import (
+        DagEdgeOutput,
+        DagNodeOutput,
+        DagOutput,
+        DagSummaryOutput,
+        PartitionShapeOutput,
+    )
+    from .compile_schema import (
+        CompileOutput,
+        Diagnostic,
+        ModelDetail,
+        ModelFreshnessConfig,
+        PhaseTimings,
+        Severity,
+        SourceSpan,
+    )
+    from .discover_schema import (
+        ChecksConfigOutput,
+        CollisionCandidateOutput,
+        DiscoverOutput,
+        FailedSourceOutput,
+        FreshnessConfigOutput,
+        ResolvedCheckNameOutput,
+        SourceOutput,
+        TableOutput,
+    )
+    from .doctor_schema import (
+        DoctorOutput,
+        HealthCheck,
+        HealthStatus,
+    )
+    from .drift_schema import (
+        DriftActionOutput,
+        DriftOutput,
+        DriftSummary,
+    )
+    from .history_schema import (
+        HistoryOutput,
+        RunHistoryRecord,
+    )
+    from .model_history_schema import (
+        ModelExecutionRecord,
+        ModelHistoryOutput,
+    )
+    from .recipe_history_schema import (
+        RecipeExecutionRecord,
+        RecipeHistoryOutput,
+    )
+    from .lineage_schema import (
+        LineageColumnDef,
+        LineageEdgeRecord,
+        LineageOutput,
+        LineageQualifiedColumn,
+    )
+    from .lineage_diff_schema import (
+        LineageColumnChange,
+        LineageDiffOutput,
+        LineageDiffResult,
+    )
+    from .metrics_schema import (
+        ColumnTrendPoint,
+        MetricsAlert,
+        MetricsOutput,
+        MetricsSnapshotEntry,
+    )
+    from .optimize_schema import (
+        OptimizeOutput,
+        OptimizeRecommendation,
+    )
+    from .plan_schema import (
+        PlannedStatement,
+        PlanOutput,
+    )
+    from .run_schema import (
+        AnomalyOutput,
+        BudgetBreachOutput,
+        ContainedModelOutput,
+        ExcludedTableOutput,
+        ExecutionSummary,
+        MaterializationMetadata,
+        MaterializationOutput,
+        MetricsSnapshot,
+        ModelDecisionOutput,
+        OverrideWarningOutput,
+        PermissionSummary,
+        QuarantineOutput,
+        RunOutput,
+        TableCheckOutput,
+        TableErrorOutput,
+    )
+    from .state_schema import (
+        StateOutput,
+        WatermarkEntry,
+    )
+    from .state_clear_schema_cache_schema import ClearSchemaCacheOutput
+    from .test_schema import (
+        DeclarativeTestResult,
+        ModelTestResult,
+        TestFailure,
+        TestOutput,
+        UnitTestResult,
+    )
+    from .compare_schema import (
+        CompareOutput,
+        TableCompareResult,
+    )
+    from .cost_schema import (
+        CostOutput,
+        PerModelCostHistorical,
+    )
+    from .backfill_schema import (
+        BackfillCostEstimate,
+        BackfillModelCost,
+        BackfillOutput,
+        BackfillPartitionScope,
+    )
+    from .gc_schema import (
+        GcCandidateOutput,
+        GcCheckOutput,
+        GcRebuildCostOutput,
+        GcReportOutput,
+    )
+    from .gc_apply_schema import (
+        GcApplyOutput,
+        GcEvictedOutput,
+        GcRefusedOutput,
+    )
+    from .gc_plan_schema import (
+        GcPlanEviction,
+        GcPlanOutput,
+    )
+    from .brief_schema import (
+        BriefActiveFreeze,
+        BriefAgentActivitySection,
+        BriefAutonomySection,
+        BriefBudgetStatus,
+        BriefCostSection,
+        BriefDecisionEntry,
+        BriefDegradedRule,
+        BriefDriftEntry,
+        BriefDriftSection,
+        BriefEscalationsSection,
+        BriefFailedModel,
+        BriefFreshnessEntry,
+        BriefFreshnessSection,
+        BriefOutput,
+        BriefPrincipalActivity,
+        BriefQualityEntry,
+        BriefQualitySection,
+        BriefRunCost,
+        BriefRunEntry,
+        BriefRunsSection,
+    )
+    from .compact_schema import (
+        CompactOutput,
+        NamedStatement,
+    )
+    from .archive_schema import ArchiveOutput
+    from .compact_apply_schema import (
+        CompactApplyOutput,
+        StatementResult,
+    )
+    from .archive_apply_schema import ArchiveApplyOutput
+    from .apply_schema import ApplyOutput
+    from .profile_storage_schema import (
+        EncodingRecommendationOutput,
+        ProfileStorageOutput,
+    )
+    from .import_dbt_schema import (
+        ImportDbtFailure,
+        ImportDbtHookKind,
+        ImportDbtOutput,
+        ImportDbtWarning,
+    )
+    from .hooks_list_schema import (
+        HookEntry,
+        HooksListOutput,
+    )
+    from .hooks_test_schema import HooksTestOutput
+    from .validate_migration_schema import (
+        ModelValidationOutput,
+        ValidateMigrationOutput,
+    )
+    from .test_adapter_schema import (
+        TestAdapterOutput,
+        TestAdapterTestResult,
+    )
+    from .branch_schema import (
+        BranchEntry,
+        BranchOutput,
+    )
+    from .branch_list_schema import BranchListOutput
+    from .branch_delete_schema import BranchDeleteOutput
+    from .branch_approve_schema import (
+        ApprovalArtifact,
+        ApprovalSignature,
+        ApproveOutput,
+        ApproverIdentity,
+    )
+    from .branch_approve_schema import ApproverSource as ApproverSource
+    from .branch_approve_schema import SignatureAlgorithm as SignatureAlgorithm
+    from .branch_promote_schema import (
+        AuditEvent,
+        BranchPromoteOutput,
+        PromoteTarget,
+        RejectedApproval,
+    )
+    from .branch_promote_schema import AuditEventKind1 as AuditEventKind
+    from .plan_promote_schema import (
+        PromotePlan,
+        PromoteTargetPlan,
+    )
+    from .catalog_schema import (
+        AssetKind,
+        CatalogAsset,
+        CatalogColumn,
+        CatalogEdge,
+        CatalogOutput,
+        CatalogStats,
+        EdgeConfidence,
+    )
+    from .replay_schema import (
+        ReplayModelOutput,
+        ReplayOutput,
+    )
+    from .replay_check_schema import (
+        ReplayCheckInputOutput,
+        ReplayCheckModelOutput,
+        ReplayCheckOutput,
+    )
+    from .replay_execute_schema import (
+        ReplayExecuteModelOutput,
+        ReplayExecuteOutput,
+    )
+    from .restore_apply_schema import (
+        RestoreApplyOutput,
+        RestoredOutput,
+        RestoreRefusedOutput,
+    )
+    from .restore_plan_schema import (
+        RestorePlanOutput,
+        RestorePlanRestoration,
+    )
+    from .compliance_schema import (
+        ColumnClassificationStatus,
+        ComplianceException,
+        ComplianceOutput,
+        ComplianceSummary,
+        EnvMaskingStatus,
+    )
+    from .retention_status_schema import (
+        ModelRetentionStatus,
+        RetentionStatusOutput,
+    )
+    from .preview_create_schema import (
+        PreviewCopiedModel,
+        PreviewCreateOutput,
+        PreviewPrunedModel,
+    )
+    from .preview_diff_schema import (
+        BisectionStatsOutput,
+        PreviewColumnTypeChange,
+        PreviewDiffOutput,
+        PreviewDiffSummary,
+        PreviewModelDiff,
+        PreviewRowSample,
+        PreviewRowSampleChange,
+        PreviewSampledRowDiff,
+        PreviewSamplingWindow,
+        PreviewStructuralDiff,
+    )
+    from .preview_cost_schema import (
+        PerModelBudgetBreachOutput,
+        PreviewCostOutput,
+        PreviewCostSummary,
+        PreviewModelCostDelta,
+    )
+    from .preview_rows_schema import PreviewRowsOutput
+    from .rocky_fivetran_state_schema import (
+        EnvelopeVersion as FivetranStateEnvelopeVersion,
+        FivetranColumnConfig,
+        FivetranConnectorStatus,
+        FivetranConnectorSummary,
+        FivetranDestination,
+        FivetranSchemaConfig,
+        FivetranSchemaEntry,
+        FivetranStateEnvelope,
+        FivetranTableConfig,
+    )
+    from .audit_schema import (
+        AuditDecisionEntry,
+        AuditOutput,
+    )
+    from .audit_for_schema import (
+        AuditChainBlastRadius,
+        AuditChainDecisions,
+        AuditChainPlan,
+        AuditChainRuns,
+        AuditChainVerify,
+        AuditForOutput,
+        AuditPlanChange,
+        AuditRunEntry,
+    )
+    from .audit_scorecard_schema import (
+        AuditScorecardOutput,
+        ScorecardGroup,
+        ScorecardUnavailableMetric,
+    )
+    from .policy_check_schema import (
+        PolicyCheckOutput,
+        PolicyModelAttributes,
+    )
+    from .policy_test_schema import (
+        PolicyTestOutput,
+        PolicyTestResult,
+    )
+    from .policy_freeze_schema import (
+        PolicyFreezeEntry,
+        PolicyFreezeOutput,
+    )
+    from .review_schema import ReviewOutput
+    from .review_queue_schema import (
+        ReviewQueueEntry,
+        ReviewQueueOutput,
+    )
+    from .seed_schema import (
+        SeedOutput,
+        SeedTableOutput,
+    )
+    from .load_schema import (
+        ContractResult,
+        ContractViolation,
+        LoadFileOutput,
+        LoadOutput,
+    )
+    from .estimate_schema import (
+        EstimateOutput,
+        ModelEstimate,
+    )
+    from .profile_schema import (
+        ProfileColumnStats,
+        ProfileOutput,
+    )
+    from .trace_schema import (
+        TraceModelEntry,
+        TraceOutput,
+    )
+    from .validate_schema import (
+        ValidateAdapterStatus,
+        ValidateMessage,
+        ValidateModelsStatus,
+        ValidateOutput,
+        ValidatePipelineStatus,
+    )
+    from .dag_run_schema import (
+        DagRunNodeOutput,
+        DagRunOutput,
+    )
+    from .compact_dedup_schema import (
+        ByteCalibration,
+        CompactDedupOutput,
+        DedupPair,
+        DedupSummary,
+        TableDedupContribution,
+    )
+    from .state_retention_sweep_schema import RetentionSweepOutput
 
 __all__ = [
-    # ai
     "AiGenerateOutput",
     "AiSyncOutput",
     "AiSyncProposal",
@@ -444,25 +748,19 @@ __all__ = [
     "AiTestAssertion",
     "AiContractOutput",
     "AiContractColumnProfile",
-    # ci
     "CiOutput",
-    # ci-diff
     "CiDiffOutput",
     "DiffResult",
     "DiffSummary",
-    # column lineage
     "ColumnLineageOutput",
-    # serve HTTP API
     "ErrorEnvelope",
     "JobStatus",
     "MetaOutput",
-    # dag
     "DagEdgeOutput",
     "DagNodeOutput",
     "DagOutput",
     "DagSummaryOutput",
     "PartitionShapeOutput",
-    # compile (shared types)
     "CompileOutput",
     "Diagnostic",
     "ModelDetail",
@@ -470,45 +768,36 @@ __all__ = [
     "PhaseTimings",
     "Severity",
     "SourceSpan",
-    # discover
     "ChecksConfigOutput",
     "DiscoverOutput",
     "FailedSourceOutput",
     "FreshnessConfigOutput",
     "SourceOutput",
     "TableOutput",
-    # doctor
     "DoctorOutput",
     "HealthCheck",
     "HealthStatus",
-    # drift
     "DriftOutput",
     "DriftSummary",
     "DriftActionOutput",
-    # history
     "HistoryOutput",
     "RunHistoryRecord",
     "ModelHistoryOutput",
     "ModelExecutionRecord",
     "RecipeHistoryOutput",
     "RecipeExecutionRecord",
-    # lineage
     "LineageOutput",
     "LineageColumnDef",
     "LineageEdgeRecord",
     "LineageQualifiedColumn",
-    # metrics
     "MetricsOutput",
     "MetricsSnapshotEntry",
     "MetricsAlert",
     "ColumnTrendPoint",
-    # optimize
     "OptimizeOutput",
     "OptimizeRecommendation",
-    # plan
     "PlanOutput",
     "PlannedStatement",
-    # run
     "RunOutput",
     "MaterializationOutput",
     "MaterializationMetadata",
@@ -518,37 +807,33 @@ __all__ = [
     "AnomalyOutput",
     "TableErrorOutput",
     "MetricsSnapshot",
-    # state
     "StateOutput",
     "WatermarkEntry",
-    # state clear-schema-cache (Arc 7 wave 2 wave-2 PR 4)
     "ClearSchemaCacheOutput",
-    # test
     "TestOutput",
     "TestFailure",
-    # compare
     "CompareOutput",
     "TableCompareResult",
-    # cost
     "CostOutput",
     "PerModelCostHistorical",
-    # backfill
     "BackfillOutput",
     "BackfillCostEstimate",
     "BackfillModelCost",
     "BackfillPartitionScope",
-    # gc
     "GcCandidateOutput",
     "GcCheckOutput",
     "GcRebuildCostOutput",
     "GcReportOutput",
-    # gc plan + apply
     "GcApplyOutput",
     "GcEvictedOutput",
     "GcRefusedOutput",
     "GcPlanEviction",
     "GcPlanOutput",
-    # brief
+    "RestorePlanOutput",
+    "RestorePlanRestoration",
+    "RestoreApplyOutput",
+    "RestoredOutput",
+    "RestoreRefusedOutput",
     "BriefOutput",
     "BriefAgentActivitySection",
     "BriefPrincipalActivity",
@@ -569,42 +854,30 @@ __all__ = [
     "BriefAutonomySection",
     "BriefDegradedRule",
     "BriefActiveFreeze",
-    # compact (canonical source for NamedStatement)
     "CompactOutput",
     "NamedStatement",
-    # archive
     "ArchiveOutput",
-    # compact apply (Cluster 3 B Phase 1)
     "CompactApplyOutput",
     "StatementResult",
-    # archive apply (Cluster 3 B Phase 1)
     "ArchiveApplyOutput",
-    # apply (Cluster 3 B Phase 2 — top-level plan/apply spine)
     "ApplyOutput",
-    # profile-storage
     "ProfileStorageOutput",
     "EncodingRecommendationOutput",
-    # import-dbt
     "ImportDbtOutput",
     "ImportDbtWarning",
     "ImportDbtFailure",
     "ImportDbtHookKind",
-    # hooks
     "HooksListOutput",
     "HookEntry",
     "HooksTestOutput",
-    # validate-migration
     "ValidateMigrationOutput",
     "ModelValidationOutput",
-    # test-adapter
     "TestAdapterOutput",
     "TestAdapterTestResult",
-    # branch
     "BranchOutput",
     "BranchEntry",
     "BranchListOutput",
     "BranchDeleteOutput",
-    # branch approval / promote
     "ApproveOutput",
     "ApprovalArtifact",
     "ApprovalSignature",
@@ -616,10 +889,8 @@ __all__ = [
     "AuditEventKind",
     "PromoteTarget",
     "RejectedApproval",
-    # plan promote
     "PromotePlan",
     "PromoteTargetPlan",
-    # catalog
     "CatalogOutput",
     "CatalogAsset",
     "CatalogColumn",
@@ -627,7 +898,6 @@ __all__ = [
     "CatalogStats",
     "AssetKind",
     "EdgeConfidence",
-    # replay
     "ReplayOutput",
     "ReplayModelOutput",
     "ReplayCheckOutput",
@@ -635,16 +905,13 @@ __all__ = [
     "ReplayCheckInputOutput",
     "ReplayExecuteOutput",
     "ReplayExecuteModelOutput",
-    # compliance
     "ComplianceOutput",
     "ComplianceSummary",
     "ColumnClassificationStatus",
     "EnvMaskingStatus",
     "ComplianceException",
-    # retention status
     "RetentionStatusOutput",
     "ModelRetentionStatus",
-    # preview (PR-bundle)
     "PreviewCreateOutput",
     "PreviewCopiedModel",
     "PreviewPrunedModel",
@@ -660,7 +927,6 @@ __all__ = [
     "PreviewCostOutput",
     "PreviewCostSummary",
     "PreviewModelCostDelta",
-    # Fivetran state envelope
     "FivetranStateEnvelope",
     "FivetranStateEnvelopeVersion",
     "FivetranDestination",
@@ -670,30 +936,23 @@ __all__ = [
     "FivetranSchemaEntry",
     "FivetranTableConfig",
     "FivetranColumnConfig",
-    # lineage-diff (already imported above; add the missing __all__ entries)
     "LineageColumnChange",
     "LineageDiffOutput",
     "LineageDiffResult",
-    # discover (nested command-output types)
     "CollisionCandidateOutput",
     "ResolvedCheckNameOutput",
-    # run (nested command-output types; canonical for the shared
-    # BudgetBreachOutput / ExcludedTableOutput also referenced elsewhere)
     "BudgetBreachOutput",
     "ContainedModelOutput",
     "ExcludedTableOutput",
     "ModelDecisionOutput",
     "OverrideWarningOutput",
     "QuarantineOutput",
-    # test (per-model / declarative / unit test result shapes)
     "DeclarativeTestResult",
     "ModelTestResult",
     "UnitTestResult",
-    # preview (rows + diff/cost nested)
     "PreviewRowsOutput",
     "BisectionStatsOutput",
     "PerModelBudgetBreachOutput",
-    # governor — audit ledger
     "AuditOutput",
     "AuditDecisionEntry",
     "AuditForOutput",
@@ -707,7 +966,6 @@ __all__ = [
     "AuditScorecardOutput",
     "ScorecardGroup",
     "ScorecardUnavailableMetric",
-    # governor — policy plane
     "PolicyCheckOutput",
     "PolicyModelAttributes",
     "PolicyTestOutput",
@@ -717,19 +975,16 @@ __all__ = [
     "ReviewOutput",
     "ReviewQueueOutput",
     "ReviewQueueEntry",
-    # seed / load
     "SeedOutput",
     "SeedTableOutput",
     "LoadOutput",
     "LoadFileOutput",
     "ContractResult",
     "ContractViolation",
-    # estimate / profile
     "EstimateOutput",
     "ModelEstimate",
     "ProfileOutput",
     "ProfileColumnStats",
-    # trace / validate
     "TraceOutput",
     "TraceModelEntry",
     "ValidateOutput",
@@ -737,15 +992,12 @@ __all__ = [
     "ValidateMessage",
     "ValidateModelsStatus",
     "ValidatePipelineStatus",
-    # dag run
     "DagRunOutput",
     "DagRunNodeOutput",
-    # compact-dedup
     "CompactDedupOutput",
     "ByteCalibration",
     "DedupPair",
     "DedupSummary",
     "TableDedupContribution",
-    # state-retention sweep
     "RetentionSweepOutput",
 ]

@@ -1,52 +1,44 @@
 name: engine-evals
 
-# Runs only on PRs labeled "evals" — the agent conformance suite drives a live
-# model loop (billable, slower than unit tests), so it is opt-in the same way
-# engine-bench is gated on "perf". Add the label to trigger; pushing new commits
-# to a labeled PR re-runs it.
-#
-# The live loop needs a model key, supplied as the ANTHROPIC_API_KEY repository
-# secret. When the secret is absent (forks, or the secret is unset), the suite
-# SKIPS cleanly and the job stays green — the harness plumbing is still validated
-# creds-free via `--selftest`. CI success means "a valid scorecard (or a clean
-# skip) was produced", never "every scenario passed": scenario pass/fail and the
-# flake rate are recorded on the uploaded scorecard, not gated here.
+# Pull-request validation is intentionally credential-free. The workflow
+# runs under the ordinary pull-request event, with no environment or secret
+# references. Live model calls run only in engine-evals-live.yml on main.
 
 on:
   pull_request:
-    types: [labeled, synchronize]
+    types: [opened, reopened, synchronize]
+    branches: [main]
     paths:
       - 'engine/evals/**'
       - 'engine/crates/rocky-mcp/**'
       - '.github/workflows/engine-evals.yml'
 
-# CI only reads the repo; restrict the token to the minimum.
 permissions:
   contents: read
 
+concurrency:
+  group: engine-evals-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
-  evals:
-    name: Agent conformance evals
-    if: contains(github.event.pull_request.labels.*.name, 'evals')
+  eval-contract:
+    name: Agent eval harness and error contract (credential-free)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check out exact candidate head
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           workspaces: engine
-          key: evals
+          key: evals-pr
 
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: 22
-
-      # DuckDB C++ compilation needs swap on CI. ubuntu-latest ships an active
-      # /swapfile; disable and reallocate it before the release-ish debug build.
       - name: Configure swap
         run: |
           sudo swapoff /swapfile 2>/dev/null || true
@@ -60,48 +52,12 @@ jobs:
         working-directory: engine
         run: cargo build --bin rocky
 
-      # Pin to 1.5.3 to match the DuckDB version the engine bundles, so seeded
-      # .duckdb files round-trip through `rocky` (same step engine-weekly uses).
-      - name: Install the duckdb CLI
-        run: |
-          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.3/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip
-          sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
-          sudo chmod +x /usr/local/bin/duckdb
-          duckdb --version
-
-      - name: Install the Claude Code CLI
-        run: npm install -g @anthropic-ai/claude-code
-
-      # Creds-free: always validate the harness plumbing (parser + scoring +
-      # scorecard render) regardless of whether the secret is present.
       - name: Harness self-test
         working-directory: engine/evals
         run: uv run python run_evals.py --selftest
 
-      # Creds-free (needs only the `rocky` binary built above): assert the
-      # structured MCP error envelope on bad input. Unlike the live authoring
-      # scenarios, this is deterministic — a failure here is a real contract
-      # regression, so it gates the job.
       - name: Structured-error contract
         working-directory: engine/evals
         env:
           ROCKY_BIN: ${{ github.workspace }}/engine/target/debug/rocky
         run: uv run python run_evals.py --error-contract
-
-      - name: Run the agent conformance suite
-        working-directory: engine/evals
-        env:
-          ROCKY_BIN: ${{ github.workspace }}/engine/target/debug/rocky
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: uv run python run_evals.py --max-attempts 2
-
-      - name: Upload scorecard
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: agent-eval-scorecard
-          path: |
-            engine/evals/results/scorecard.json
-            engine/evals/results/scorecard.md
-            engine/evals/results/transcripts/
-          if-no-files-found: warn

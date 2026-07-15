@@ -51,7 +51,7 @@ Quality is more than the inline runtime gate. Models can also declare fixture-dr
 
 1. **SQL as a typed, compiled language.** Column-level type inference across the full DAG. 35+ diagnostic codes (`E###` errors, `W###` warnings, `P###` portability lints) with actionable suggestions. Not text macros, but a real compiler with a real LSP.
 2. **Compile-time column-level lineage.** Every column traced through every transformation, before execution. `rocky lineage-diff main` lists per-column downstream blast radius for PR review. That CI gate is impossible without a compiled engine.
-3. **Branches + a content-addressed run record.** Named branches as isolated schemas. `rocky branch create` / `rocky run --branch` / `rocky replay <run_id>`. Each run records per-model SQL hashes, row counts, and bytes, and content-addresses the written artifacts; `rocky replay` inspects that record against the ledger, and `rocky replay --execute --verify` re-runs a single self-contained model on a local DuckDB engine and checks the re-derived hash for bit-exactness. (Multi-model and warehouse-side re-execution from pinned inputs is on the roadmap.)
+3. **Branches + a content-addressed run record.** Named branches as isolated schemas. `rocky branch create` / `rocky run --branch` / `rocky replay <run_id>`. Each run records per-model SQL hashes, row counts, and bytes, and content-addresses the written artifacts; `rocky replay` inspects and verifies that record against the ledger, and `rocky replay --execute --verify` re-runs a deterministic content-addressed model to reproduce its output bit-for-bit — locally or, with `--warehouse`, on the live warehouse in an isolated replay schema.
 4. **Per-model cost attribution.** Cost is a column on every run record, not an afterthought dashboard. `[budget]` blocks fail the run on overspend; `budget_breach` fires the hook; `rocky preview cost` projects spend at PR time.
 5. **AI gated through the compiler.** Every AI suggestion type-checks before it lands. `rocky ai` generates, compiles, auto-fixes, and ships; the `Attempts: 2` retry loop is the signature feature. (The broader AI surface, like mass refactor or auto-migration on a column-type change, is on the [Roadmap](/getting-started/roadmap/).)
 6. **Dialect-divergence lint.** `P001` catches Snowflake-only constructs in a Databricks project, and the reverse. Useful the day you start a migration, essential the day you finish one.
@@ -86,11 +86,11 @@ See the [Roadmap](/getting-started/roadmap/) for the full breakdown.
 | Column-level lineage | Table-level (`dbt docs`); column-level needs Fusion or paid Catalog | Compile-time output, queryable per column |
 | Schema drift | Silent | Detected at run, rebuilt safely |
 | Cost attribution | — | Per-model, every run |
-| Replay | — | Content-addressed run record; `rocky replay --execute --verify` re-runs single models locally |
+| Replay | — | Content-addressed run record + re-execution (`replay --execute --verify`, local or `--warehouse`) for deterministic content-addressed models |
 
 **Evaluating SQLMesh?** SQLMesh is the tool Rocky most resembles: it also analyzes SQL statically (via SQLGlot, no Jinja), and its virtual environments, plan/apply, and column-level lineage are mature primitives Rocky shares rather than beats. Rocky keeps SQL as the default (SQLMesh leans Python-first) and differentiates on the enforcement plane: declarative OSS governance and `[budget]` blocks that fail the build (neither in SQLMesh OSS), plus source-schema-drift detection and a dialect-portability lint at PR time (where SQLMesh instead transpiles dialects via SQLGlot). SQLMesh is more mature in years, funding, and adoption, and ships native Python models and an OSS CI/CD bot.
 
-Full side-by-side comparison: [features/comparison](/getting-started/comparison/).
+Full side-by-side comparison: [features/comparison](/getting-started/comparison/). For a diagram-first version of the dbt contrast, see [Rocky vs dbt, Visually](/getting-started/rocky-vs-dbt/).
 
 ## Design principles
 

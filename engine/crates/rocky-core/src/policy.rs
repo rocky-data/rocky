@@ -1,10 +1,10 @@
-//! Agent-authority policy evaluator (explain-mode, v0).
+//! Agent-authority policy evaluator.
 //!
 //! Given a `(principal, capability, model)` triple and a project's
 //! `[policy]` block, [`evaluate`] returns the resolved [`PolicyEffect`],
 //! the matched rule (if any), and a human-readable reason. This is the
-//! *decision* half of the policy plane; v0 only explains decisions — it
-//! does not gate any real command.
+//! *decision* half of the policy plane; the enforcement seams (`apply`,
+//! `promote`, the MCP write tools) call it and act on the verdict.
 //!
 //! # Frozen semantics
 //!
@@ -115,7 +115,7 @@ pub fn classify_findings_by_model(
 /// The compiled attributes of one model that the policy matcher reads.
 ///
 /// Built from the compiled project (see the `rocky policy check` command):
-/// `contracted` and `layer` are best-effort in v0 — `contracted` is the
+/// `contracted` and `layer` are best-effort — `contracted` is the
 /// presence of a sibling `.contract.toml`, `layer` is the model's `layer`
 /// tag.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -383,7 +383,7 @@ pub fn evaluate(
             PolicyPrincipal::Human => PolicyDecision {
                 effect: PolicyEffect::Allow,
                 matched_rule: None,
-                reason: "no rule matched; humans are not gated in v0".to_string(),
+                reason: "no rule matched; humans are not gated".to_string(),
             },
             PolicyPrincipal::Agent => PolicyDecision {
                 effect: policy.default_agent_effect,

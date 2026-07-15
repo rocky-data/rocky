@@ -124,6 +124,149 @@ pub fn qualify_deferred_refs(
     Ok(statement.to_string())
 }
 
+/// Outcome of [`rewrite_upstream_refs`].
+#[derive(Debug)]
+pub struct UpstreamRewriteOutcome {
+    /// The statement re-serialized after rewriting.
+    pub sql: String,
+    /// The rename keys (lowercase `catalog.schema.table`) that matched at
+    /// least one relation and were rewritten. Callers that require *every*
+    /// upstream reference to be redirected compare this against the rename
+    /// key set and fail closed on any miss.
+    pub rewritten_keys: HashSet<String>,
+    /// Display strings of relations that matched **more than one** rename
+    /// key (a partially-qualified reference whose tail is shared by several
+    /// upstreams). Ambiguous references are left untouched — callers must
+    /// fail closed rather than guess.
+    pub ambiguous_refs: Vec<String>,
+}
+
+/// Rewrite references to known upstream tables — bare, `schema.table`, or
+/// `catalog.schema.table` — to a replacement [`DeferTarget`].
+///
+/// `renames` is keyed by the upstream's lowercase fully-qualified
+/// `catalog.schema.table` identity. A relation matches a key when every part
+/// it *does* spell agrees case-insensitively with the key's tail: a three-part
+/// reference must match catalog, schema, and table; a two-part reference
+/// schema and table; a bare name just the table (subject to CTE shadowing,
+/// exactly as [`qualify_deferred_refs`] resolves it). A relation whose tail
+/// matches several keys is ambiguous: it is left as parsed and reported in
+/// [`UpstreamRewriteOutcome::ambiguous_refs`] so the caller can refuse the
+/// rewrite instead of redirecting a reference to the wrong upstream.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when `sql` is not a single parseable statement.
+pub fn rewrite_upstream_refs(
+    sql: &str,
+    renames: &HashMap<String, DeferTarget>,
+) -> Result<UpstreamRewriteOutcome, ParseError> {
+    let mut statement = parse_single_statement(sql)?;
+
+    // Pre-split each rename key into (catalog, schema, table) parts once.
+    let split: Vec<(Vec<String>, &String, &DeferTarget)> = renames
+        .iter()
+        .map(|(key, target)| {
+            let parts: Vec<String> = key.split('.').map(str::to_ascii_lowercase).collect();
+            (parts, key, target)
+        })
+        .collect();
+
+    let mut rewriter = UpstreamRewriter {
+        renames: &split,
+        scopes: Vec::new(),
+        rewritten_keys: HashSet::new(),
+        ambiguous_refs: Vec::new(),
+    };
+    let _: ControlFlow<()> = statement.visit(&mut rewriter);
+
+    let UpstreamRewriter {
+        rewritten_keys,
+        ambiguous_refs,
+        ..
+    } = rewriter;
+    Ok(UpstreamRewriteOutcome {
+        sql: statement.to_string(),
+        rewritten_keys,
+        ambiguous_refs,
+    })
+}
+
+/// Scope-aware visitor behind [`rewrite_upstream_refs`]. Shares the CTE
+/// shadowing discipline with [`DeferRewriter`]: a bare name shadowed by a CTE
+/// in scope is a reference to that CTE, never to the upstream.
+struct UpstreamRewriter<'a> {
+    /// `(key parts, original key, replacement)` triples, key parts lowercase.
+    renames: &'a [(Vec<String>, &'a String, &'a DeferTarget)],
+    scopes: Vec<HashSet<String>>,
+    rewritten_keys: HashSet<String>,
+    ambiguous_refs: Vec<String>,
+}
+
+impl UpstreamRewriter<'_> {
+    fn is_shadowed(&self, name: &str) -> bool {
+        self.scopes.iter().any(|frame| frame.contains(name))
+    }
+}
+
+impl VisitorMut for UpstreamRewriter<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        let mut frame: HashSet<String> = HashSet::new();
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                frame.insert(cte.alias.name.value.clone());
+            }
+        }
+        self.scopes.push(frame);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+        self.scopes.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(&mut self, relation: &mut ObjectName) -> ControlFlow<Self::Break> {
+        // Extract the spelled parts — bail on anything that is not a plain
+        // identifier chain (e.g. a table function).
+        let mut original: Vec<&str> = Vec::with_capacity(relation.0.len());
+        for part in &relation.0 {
+            let Some(ident) = part.as_ident() else {
+                return ControlFlow::Continue(());
+            };
+            original.push(ident.value.as_str());
+        }
+        if original.is_empty() || original.len() > 3 {
+            return ControlFlow::Continue(());
+        }
+        // A bare name shadowed by a CTE in scope refers to the CTE.
+        if original.len() == 1 && self.is_shadowed(original[0]) {
+            return ControlFlow::Continue(());
+        }
+        let spelled: Vec<String> = original.iter().map(|p| p.to_ascii_lowercase()).collect();
+        // Tail-match the spelled parts against each rename key.
+        let matches: Vec<&(Vec<String>, &String, &DeferTarget)> = self
+            .renames
+            .iter()
+            .filter(|(key_parts, _, _)| {
+                key_parts.len() >= spelled.len()
+                    && key_parts[key_parts.len() - spelled.len()..] == spelled[..]
+            })
+            .collect();
+        match matches.as_slice() {
+            [] => {}
+            [(_, key, target)] => {
+                *relation = target.to_object_name();
+                self.rewritten_keys.insert((*key).clone());
+            }
+            _ => self.ambiguous_refs.push(relation.to_string()),
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// Scope-aware visitor that qualifies bare deferred-model references while
 /// honouring lexical CTE shadowing.
 ///
@@ -452,5 +595,101 @@ mod tests {
         let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
         let err = qualify_deferred_refs("NOT VALID SQL ;;;", &deferred);
         assert!(err.is_err());
+    }
+
+    // -- rewrite_upstream_refs ---------------------------------------------
+
+    fn renames_map(entries: &[(&str, DeferTarget)]) -> HashMap<String, DeferTarget> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn rewrites_fully_qualified_ref() {
+        let renames = renames_map(&[("cat.raw.orders", target("cat", "replay_ns", "raw__orders"))]);
+        let out = rewrite_upstream_refs("SELECT * FROM cat.raw.orders", &renames).unwrap();
+        assert_eq!(out.sql, "SELECT * FROM cat.replay_ns.raw__orders");
+        assert!(out.rewritten_keys.contains("cat.raw.orders"));
+        assert!(out.ambiguous_refs.is_empty());
+    }
+
+    #[test]
+    fn rewrites_two_part_and_bare_tails() {
+        let renames = renames_map(&[("cat.raw.orders", target("cat", "replay_ns", "raw__orders"))]);
+        let two = rewrite_upstream_refs("SELECT * FROM raw.orders", &renames).unwrap();
+        assert_eq!(two.sql, "SELECT * FROM cat.replay_ns.raw__orders");
+        let bare = rewrite_upstream_refs("SELECT * FROM orders", &renames).unwrap();
+        assert_eq!(bare.sql, "SELECT * FROM cat.replay_ns.raw__orders");
+        assert!(bare.rewritten_keys.contains("cat.raw.orders"));
+    }
+
+    #[test]
+    fn matches_case_insensitively() {
+        let renames = renames_map(&[("cat.raw.orders", target("cat", "replay_ns", "raw__orders"))]);
+        let out = rewrite_upstream_refs("SELECT * FROM CAT.Raw.ORDERS", &renames).unwrap();
+        assert_eq!(out.sql, "SELECT * FROM cat.replay_ns.raw__orders");
+    }
+
+    #[test]
+    fn ambiguous_tail_is_reported_not_rewritten() {
+        // Two upstreams share the `orders` table segment: a bare reference
+        // cannot be attributed to either — it must be reported, not guessed.
+        let renames = renames_map(&[
+            ("cat.raw.orders", target("cat", "replay_ns", "raw__orders")),
+            (
+                "cat.staging.orders",
+                target("cat", "replay_ns", "staging__orders"),
+            ),
+        ]);
+        let out = rewrite_upstream_refs("SELECT * FROM orders", &renames).unwrap();
+        assert_eq!(out.sql, "SELECT * FROM orders", "ambiguous ref untouched");
+        assert!(out.rewritten_keys.is_empty());
+        assert_eq!(out.ambiguous_refs, vec!["orders".to_string()]);
+        // A fully qualified reference disambiguates.
+        let fq = rewrite_upstream_refs("SELECT * FROM cat.staging.orders", &renames).unwrap();
+        assert_eq!(fq.sql, "SELECT * FROM cat.replay_ns.staging__orders");
+        assert!(fq.ambiguous_refs.is_empty());
+    }
+
+    #[test]
+    fn cte_shadowing_protects_bare_names_only_in_scope() {
+        let renames = renames_map(&[("cat.raw.orders", target("cat", "replay_ns", "raw__orders"))]);
+        let out = rewrite_upstream_refs(
+            "WITH orders AS (SELECT 1 AS id) SELECT * FROM orders",
+            &renames,
+        )
+        .unwrap();
+        assert!(
+            out.sql.contains("SELECT * FROM orders"),
+            "CTE-shadowed bare name untouched: {}",
+            out.sql
+        );
+        assert!(out.rewritten_keys.is_empty());
+    }
+
+    #[test]
+    fn unmatched_key_reported_via_rewritten_keys_absence() {
+        let renames = renames_map(&[("cat.raw.orders", target("cat", "replay_ns", "raw__orders"))]);
+        let out = rewrite_upstream_refs("SELECT * FROM cat.raw.customers", &renames).unwrap();
+        assert!(out.rewritten_keys.is_empty());
+        assert_eq!(out.sql, "SELECT * FROM cat.raw.customers");
+    }
+
+    #[test]
+    fn non_matching_relations_are_left_alone() {
+        let renames = renames_map(&[("cat.raw.orders", target("cat", "replay_ns", "raw__orders"))]);
+        let out = rewrite_upstream_refs(
+            "SELECT o.id FROM cat.raw.orders o JOIN other.schema.customers c ON o.id = c.id",
+            &renames,
+        )
+        .unwrap();
+        assert!(
+            out.sql.contains("cat.replay_ns.raw__orders o"),
+            "{}",
+            out.sql
+        );
+        assert!(out.sql.contains("other.schema.customers c"), "{}", out.sql);
     }
 }

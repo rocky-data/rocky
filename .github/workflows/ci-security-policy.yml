@@ -1,0 +1,31 @@
+name: ci-security-policy
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  credential-containment:
+    name: Credential containment policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out trusted policy tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Fetch exact candidate policy data
+        env:
+          CANDIDATE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 trusted/.github/scripts/fetch_policy_candidate.py "$GITHUB_WORKSPACE/candidate"
+      - name: Enforce credential-containment policy
+        run: >-
+          python3 trusted/.github/scripts/check_credential_containment.py
+          "$GITHUB_WORKSPACE/candidate"

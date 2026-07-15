@@ -111,6 +111,17 @@ pub enum PlanKind {
     /// tighten the gate — an agent-scoped `deny gc {…}` rule hard-refuses even a
     /// reviewed plan.
     Gc,
+    /// A `rocky restore <target>` plan. The payload is a `RestorePlan` naming
+    /// the gc tombstone(s) to consume: `rocky apply` re-derives each artifact
+    /// from its recorded recipe, asserts the recomputed blake3 equals the
+    /// tombstoned hash **before any write becomes visible**, re-materializes
+    /// the bytes at the tombstoned path (never overwriting mismatched bytes),
+    /// and reinstates the ledger row.
+    ///
+    /// Mirrors [`PlanKind::Gc`]'s symmetric-caution posture: a restore plan is
+    /// **unconditionally** review-gated (even a human restore goes through
+    /// `rocky review` → `rocky apply`), and policy may only tighten the gate.
+    Restore,
 }
 
 impl std::fmt::Display for PlanKind {
@@ -124,6 +135,7 @@ impl std::fmt::Display for PlanKind {
             PlanKind::AiAuthored => write!(f, "ai_authored"),
             PlanKind::Backfill => write!(f, "backfill"),
             PlanKind::Gc => write!(f, "gc"),
+            PlanKind::Restore => write!(f, "restore"),
         }
     }
 }
@@ -975,6 +987,7 @@ mod tests {
         assert_eq!(PlanKind::AiAuthored.to_string(), "ai_authored");
         assert_eq!(PlanKind::Backfill.to_string(), "backfill");
         assert_eq!(PlanKind::Gc.to_string(), "gc");
+        assert_eq!(PlanKind::Restore.to_string(), "restore");
     }
 
     /// A `gc` plan stamps the invoker principal (via `write_plan_with_principal`)

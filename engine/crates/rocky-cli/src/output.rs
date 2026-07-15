@@ -6508,9 +6508,12 @@ pub struct ReviewQueueEntry {
 
 /// JSON output for `rocky policy check`.
 ///
-/// Explain-mode only: reports the effect the agent policy plane *would*
-/// resolve for a `(principal, capability, model)` triple, the winning rule
-/// (if any), and why. It does not gate any real command in v0.
+/// An explain surface: reports the *base* effect the agent policy plane
+/// resolves for a `(principal, capability, model)` triple, the winning
+/// rule (if any), and why. The check itself is read-only and static; the
+/// same evaluator is enforced at `apply`, `promote`, and the MCP write
+/// tools, where active freezes and autonomy-budget burn are also
+/// projected and can only tighten the effect reported here.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PolicyCheckOutput {
     pub version: String,
@@ -7502,11 +7505,16 @@ pub struct ReplayCheckInputOutput {
 
 /// JSON output for `rocky replay --at <run_id> --execute [--verify]`.
 ///
-/// Re-execution surface (DuckDB). Each model's recipe is reconstructed from its
+/// Re-execution surface. Each model's recipe is reconstructed from its
 /// recorded [`rocky_core::state::ProvenanceRecord`] — never the working tree —
-/// re-executed on an in-memory DuckDB engine, and its output artifact's blake3
-/// re-derived. With `--verify` that digest is compared against the recorded
-/// output hash and a per-model verdict is emitted.
+/// re-executed, and its output artifact's blake3 re-derived. With `--verify`
+/// that digest is compared against the recorded output hash and a per-model
+/// verdict is emitted. Execution runs on an in-memory DuckDB engine by
+/// default; with `--warehouse` it runs on the configured live warehouse
+/// instead, materializing replayed outputs into an isolated replay schema
+/// (see `replay_schema`) and encoding the recomputed artifact with the live
+/// table's physical column mapping so the digest is directly comparable to
+/// what the content-addressed writer recorded.
 ///
 /// Two modes share this shape:
 ///
@@ -7521,9 +7529,10 @@ pub struct ReplayCheckInputOutput {
 ///   upstream not produced by any model in this run, or a mutable-source
 ///   watermark, is likewise `non_replayable` rather than substituted.
 ///
-/// Nothing is materialized to any warehouse schema: the entire in-memory engine
-/// is an ephemeral replay namespace, discarded after the run, so no production
-/// identity is ever touched.
+/// No production identity is ever touched in either mode: the local path's
+/// entire in-memory engine is an ephemeral replay namespace discarded after
+/// the run, and the warehouse path writes only into the isolated
+/// `replay_schema`, dropped after the run unless `--keep` is passed.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ReplayExecuteOutput {
     pub version: String,
@@ -7538,6 +7547,18 @@ pub struct ReplayExecuteOutput {
     /// Number of models whose re-execution reproduced the recorded output
     /// byte-for-byte. Always `0` when `--verify` was not requested.
     pub bit_exact_count: usize,
+    /// Isolated warehouse schema the replayed outputs were materialized
+    /// into (`--warehouse` only; absent on the local re-execution path).
+    /// Replay never writes to the production location of any recorded
+    /// target — every replayed table lands in this namespace, one schema
+    /// per catalog touched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_schema: Option<String>,
+    /// Whether the replay namespace was removed after the run
+    /// (`--warehouse` only). `true` when no replay schema remains on the
+    /// warehouse; `false` when `--keep` was passed or a drop failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_schema_dropped: Option<bool>,
     pub models: Vec<ReplayExecuteModelOutput>,
 }
 
@@ -7796,8 +7817,8 @@ pub struct GcPlanOutput {
     /// Always `true`: a `gc` plan is unconditionally review-gated before apply.
     pub review_required: bool,
     /// Operator caveats (e.g. re-verification at apply, scope). Each eviction
-    /// records what a restore will need; `rocky restore` itself is a planned
-    /// follow-up.
+    /// records everything `rocky restore <target>` needs to rebuild it
+    /// hash-exact.
     pub notes: Vec<String>,
     /// The proposed evictions.
     pub evictions: Vec<GcPlanEviction>,
@@ -7816,8 +7837,8 @@ pub struct GcEvictedOutput {
     pub tombstone_recorded: bool,
     /// `true` when the bytes were physically deleted through the object-store
     /// adapter; `false` when the physical delete was deferred or failed (a safe
-    /// leaked orphan — the tombstone still records everything a restore will
-    /// need; `rocky restore` itself is a planned follow-up).
+    /// leaked orphan — the tombstone still records everything
+    /// `rocky restore <target>` needs to rebuild and verify the artifact).
     pub physical_reclaimed: bool,
     /// Human-readable physical-reclamation outcome (`deleted`, `deferred: …`,
     /// or `failed: …`).
@@ -7867,8 +7888,158 @@ pub struct GcApplyOutput {
     /// Count of refused artifacts.
     pub refused_count: usize,
     /// Operator caveats (e.g. physical-reclamation reachability). Each
-    /// eviction's tombstone records what a restore will need; `rocky restore`
-    /// itself is a planned follow-up.
+    /// eviction's tombstone records everything `rocky restore <target>` needs
+    /// to rebuild the artifact and verify it hash-exact.
+    pub notes: Vec<String>,
+}
+
+/// One tombstoned artifact scheduled for restoration inside a persisted
+/// `rocky restore` plan ([`RestorePlan`]).
+///
+/// Captures the tombstone's full identity — enough to (a) re-locate the exact
+/// live tombstone at apply time (the plan is advisory; apply re-resolves
+/// against the live custody ledger), and (b) report the restoration to the
+/// reviewer. Identity is always the full `(run, model, path, hash)` tuple.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RestorePlanRestoration {
+    /// Model that produced the evicted artifact.
+    pub model_name: String,
+    /// Run that produced it — half of the provenance key the restore replays
+    /// from.
+    pub run_id: String,
+    /// Content hash (hex) of the evicted bytes — the identity the restore
+    /// re-computes and asserts equality against **before any write**.
+    pub blake3_hash: String,
+    /// Object-store path the restore re-materializes to (the tombstoned
+    /// location).
+    pub file_path: String,
+    /// Physical size of the evicted artifact in bytes.
+    pub size_bytes: u64,
+    /// Delta commit version the artifact was attached to, for correlation.
+    pub commit_version: u64,
+    /// When the artifact was evicted (RFC 3339) — with the hash, this is the
+    /// tombstone's ledger key.
+    pub evicted_at: String,
+    /// The `rocky gc` plan that authorized the eviction (custody back-link).
+    pub gc_plan_id: String,
+    /// Recipe-identity hash captured on the tombstone; `null` when unrecorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe_hash: Option<String>,
+    /// Input-closure hash captured on the tombstone; `null` when unrecorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_hash: Option<String>,
+    /// Input match-strength (`strong` / `heuristic`); `null` when unrecorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_proof_class: Option<String>,
+}
+
+/// The persisted payload of a `rocky restore <target>` plan
+/// ([`crate::plan_store::PlanKind::Restore`]).
+///
+/// Names the tombstone(s) the target resolved to — unambiguously, or the plan
+/// was never written. Apply re-resolves each against the live custody ledger
+/// and refuses anything that no longer matches at full identity.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RestorePlan {
+    /// Engine version that authored the plan.
+    pub version: String,
+    /// The user-supplied target the resolution matched (model name,
+    /// `model@recipe-prefix`, or a content-hash prefix).
+    pub target: String,
+    /// The tombstoned artifacts to restore.
+    pub restorations: Vec<RestorePlanRestoration>,
+}
+
+/// JSON output of `rocky restore <target>` (plan mode).
+///
+/// The plan has been written to the plan store; this reports its id and the
+/// resolved tombstone(s). Restoration is symmetric-caution gated like gc: the
+/// operator must `rocky review <plan-id> --approve` and then
+/// `rocky apply <plan-id>` — the plan itself writes nothing.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RestorePlanOutput {
+    pub version: String,
+    pub command: String,
+    /// The persisted plan id — pass to `rocky review` then `rocky apply`.
+    pub plan_id: String,
+    /// The user-supplied target the resolution matched.
+    pub target: String,
+    /// Number of tombstoned artifacts the plan restores.
+    pub restoration_count: usize,
+    /// Total tombstoned bytes the plan restores.
+    pub total_bytes: u64,
+    /// Always `true`: a restore plan is unconditionally review-gated.
+    pub review_required: bool,
+    /// Operator caveats (re-derivation source, hash-exactness gate,
+    /// no-overwrite rule).
+    pub notes: Vec<String>,
+    /// The resolved restorations.
+    pub restorations: Vec<RestorePlanRestoration>,
+}
+
+/// One artifact successfully restored by `rocky apply <restore-plan>` — the
+/// recomputed blake3 matched the tombstoned hash, the bytes are present at the
+/// tombstoned path, and the ledger row was reinstated.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RestoredOutput {
+    pub model_name: String,
+    pub run_id: String,
+    pub blake3_hash: String,
+    pub file_path: String,
+    pub size_bytes: u64,
+    /// Always `true` on this list: the rebuilt bytes' blake3 equalled the
+    /// tombstoned hash **before** any write became visible.
+    pub hash_verified: bool,
+    /// `true` when the restore physically wrote the rebuilt bytes to the
+    /// tombstoned path; `false` when verified bytes were already present
+    /// there (an idempotent "already present, verified" restore — the ledger
+    /// row was still reinstated if missing).
+    pub bytes_written: bool,
+    /// Human-readable restoration outcome.
+    pub status: String,
+}
+
+/// One artifact `rocky apply <restore-plan>` **refused** to restore — the
+/// fail-closed verification caught a mismatch, so nothing was written for it.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RestoreRefusedOutput {
+    pub model_name: String,
+    pub run_id: String,
+    pub blake3_hash: String,
+    pub size_bytes: u64,
+    /// Why the restoration was refused. A recomputed-hash mismatch is
+    /// surfaced honestly — it means the tombstone's rebuild claim failed,
+    /// which is itself a finding, never papered over.
+    pub reason: String,
+}
+
+/// JSON output of `rocky apply <restore-plan>`.
+///
+/// Reports the restoration outcome per planned tombstone: restored (rebuilt
+/// hash-exact, or verified already-present), refused (with the exact
+/// fail-closed reason), or already restored (idempotent no-op verified
+/// against the live bytes).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RestoreApplyOutput {
+    pub version: String,
+    pub command: String,
+    pub plan_id: String,
+    /// Artifacts restored — hash-verified bytes at the tombstoned path and a
+    /// reinstated ledger row.
+    pub restored: Vec<RestoredOutput>,
+    /// Artifacts refused by a fail-closed guard; nothing was written for them.
+    pub refused: Vec<RestoreRefusedOutput>,
+    /// Content hashes of plan entries whose tombstone was already consumed by
+    /// a prior restore and whose live bytes re-verified — idempotent no-ops.
+    pub already_restored: Vec<String>,
+    /// Count of restored artifacts.
+    pub restored_count: usize,
+    /// Count of refused artifacts.
+    pub refused_count: usize,
+    /// Total bytes restored (including verified-already-present bytes).
+    pub bytes_restored: u64,
+    /// Operator caveats (re-derivation engine, verification order, overwrite
+    /// rule).
     pub notes: Vec<String>,
 }
 

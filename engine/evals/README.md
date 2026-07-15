@@ -38,7 +38,7 @@ uv run python run_evals.py
 # One scenario, a specific model, with retries for flake measurement:
 uv run python run_evals.py --scenario completed_revenue --model claude-opus-4-1 --max-attempts 2
 
-# Creds-free plumbing check (CI runs this on the no-secret path):
+# Creds-free plumbing check (pull-request CI runs this):
 uv run python run_evals.py --selftest
 
 # Structured-error contract check (needs only the `rocky` binary — no key, no
@@ -148,12 +148,19 @@ their shipped guidance induce grounding, not spontaneous discipline.
 
 ## Cadence
 
-The suite is wired as a **label-gated CI job** (`engine-evals.yml`, add the
-`evals` label to a PR — mirrors `engine-bench.yml`). Running it before any
-`rocky-mcp`-touching release is a documented cadence; the per-release scorecard
-is published under `scorecards/` (the "Rocky vN completes X/Y authoring tasks
-unassisted" artifact). The live `results/` a run writes is gitignored; a run
-worth keeping is copied into `scorecards/<date>-<model>.{md,json}`.
+Pull-request CI (`engine-evals.yml`) runs only `--selftest` and
+`--error-contract`; it never receives a model key. The live suite runs from an
+exact trusted `main` revision in `engine-evals-live.yml`, behind the
+`credentialed-ci` environment, after relevant eval/MCP changes land. A manual
+dispatch is also accepted only for `refs/heads/main`. See
+`.github/SECURITY_ENVIRONMENTS.md` for the required secret scope and deployment
+restriction.
+
+Run the live suite before any `rocky-mcp`-touching release. The per-release
+scorecard is published under `scorecards/` (the "Rocky vN completes X/Y
+authoring tasks unassisted" artifact). The live `results/` a run writes is
+gitignored; a run worth keeping is copied into
+`scorecards/<date>-<model>.{md,json}`.
 
 ## Layout
 

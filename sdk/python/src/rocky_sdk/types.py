@@ -1297,6 +1297,7 @@ from .types_generated import (  # noqa: E402, F401
     RejectedApproval,
     ReplayModelOutput,
     ReplayOutput,
+    RestoreApplyOutput,
     RetentionStatusOutput,
     RunHistoryRecord,
     RunOutput,
@@ -1422,6 +1423,7 @@ RockyOutput = (
     | DoctorResult
     | DagResult
     | GcApplyOutput
+    | RestoreApplyOutput
     | ComplianceOutput
     | RetentionStatusOutput
     | CatalogOutput
@@ -1434,7 +1436,7 @@ RockyOutput = (
 
 
 # Maps the ``command`` field of a Rocky JSON payload to the model that should
-# parse it. Commands that need shape-based discrimination (lineage, history)
+# parse it. Commands that need shape-based discrimination (lineage, history, apply)
 # are handled separately below.
 _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "discover": DiscoverResult,
@@ -1459,12 +1461,6 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "validate-migration": ValidateMigrationResult,
     "doctor": DoctorResult,
     "dag": DagResult,
-    # ``rocky apply`` on a gc plan prints ``{command:"apply", ...}`` with gc
-    # markers (``evicted`` / ``refused``). Run-shaped apply prints
-    # ``command:"run"`` (→ ``RunResult``); compact / archive / promote apply
-    # print their own commands, already routed above. ``RockyClient.apply()``
-    # additionally disambiguates by shape.
-    "apply": GcApplyOutput,
     "compliance": ComplianceOutput,
     "retention-status": RetentionStatusOutput,
     "catalog": CatalogOutput,
@@ -1500,6 +1496,12 @@ def parse_rocky_output(json_str: str) -> RockyOutput:
         if "model" in data:
             return ModelHistoryResult.model_validate(data)
         return HistoryResult.model_validate(data)
+    if command == "apply":
+        if "restored" in data:
+            return RestoreApplyOutput.model_validate(data)
+        if "evicted" in data:
+            return GcApplyOutput.model_validate(data)
+        raise ValueError("Unknown Rocky apply output shape")
 
     if command in _SIMPLE_DISPATCH:
         return _SIMPLE_DISPATCH[command].model_validate(data)

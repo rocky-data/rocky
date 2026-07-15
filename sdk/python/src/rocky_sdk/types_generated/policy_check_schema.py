@@ -8,7 +8,7 @@ from enum import StrEnum
 from pydantic import BaseModel, conint
 
 
-class PolicyCapability34(StrEnum):
+class PolicyCapability37(StrEnum):
     """
     Read model output / metadata. Always allowed.
     """
@@ -16,7 +16,7 @@ class PolicyCapability34(StrEnum):
     read = "read"
 
 
-class PolicyCapability35(StrEnum):
+class PolicyCapability38(StrEnum):
     """
     Draft a plan for later review.
     """
@@ -24,7 +24,7 @@ class PolicyCapability35(StrEnum):
     propose = "propose"
 
 
-class PolicyCapability36(StrEnum):
+class PolicyCapability39(StrEnum):
     """
     Apply a plan against the warehouse.
     """
@@ -32,7 +32,7 @@ class PolicyCapability36(StrEnum):
     apply = "apply"
 
 
-class PolicyCapability37(StrEnum):
+class PolicyCapability40(StrEnum):
     """
     Promote a branch / environment.
     """
@@ -40,7 +40,7 @@ class PolicyCapability37(StrEnum):
     promote = "promote"
 
 
-class PolicyCapability38(StrEnum):
+class PolicyCapability41(StrEnum):
     """
     Backfill historical partitions.
     """
@@ -48,7 +48,7 @@ class PolicyCapability38(StrEnum):
     backfill = "backfill"
 
 
-class PolicyCapability39(StrEnum):
+class PolicyCapability42(StrEnum):
     """
     Garbage-collect / reclaim storage.
     """
@@ -56,7 +56,15 @@ class PolicyCapability39(StrEnum):
     gc = "gc"
 
 
-class PolicyCapability40(StrEnum):
+class PolicyCapability43(StrEnum):
+    """
+    Restore a gc-evicted artifact from its tombstone (rebuild + verify).
+    """
+
+    restore = "restore"
+
+
+class PolicyCapability44(StrEnum):
     """
     Retry a failed run.
     """
@@ -64,7 +72,7 @@ class PolicyCapability40(StrEnum):
     retry = "retry"
 
 
-class PolicyCapability41(StrEnum):
+class PolicyCapability45(StrEnum):
     """
     Quarantine a partition / model.
     """
@@ -72,7 +80,7 @@ class PolicyCapability41(StrEnum):
     quarantine = "quarantine"
 
 
-class PolicyCapability42(StrEnum):
+class PolicyCapability46(StrEnum):
     """
     An additive schema change (refinement of apply/promote).
     """
@@ -80,7 +88,7 @@ class PolicyCapability42(StrEnum):
     schema_change_additive = "schema_change.additive"
 
 
-class PolicyCapability43(StrEnum):
+class PolicyCapability47(StrEnum):
     """
     A breaking schema change (refinement of apply/promote).
     """
@@ -88,7 +96,7 @@ class PolicyCapability43(StrEnum):
     schema_change_breaking = "schema_change.breaking"
 
 
-class PolicyCapability44(StrEnum):
+class PolicyCapability48(StrEnum):
     """
     A value-only data change (refinement of apply/promote).
     """
@@ -171,14 +179,11 @@ class PolicyCheckOutput(BaseModel):
     """
     JSON output for `rocky policy check`.
 
-    Explain-mode only: reports the effect the agent policy plane *would* resolve for a `(principal, capability, model)` triple, the winning rule (if any), and why. It does not gate any real command in v0.
+    An explain surface: reports the *base* effect the agent policy plane resolves for a `(principal, capability, model)` triple, the winning rule (if any), and why. The check itself is read-only and static; the same evaluator is enforced at `apply`, `promote`, and the MCP write tools, where active freezes and autonomy-budget burn are also projected and can only tighten the effect reported here.
     """
 
     capability: (
-        PolicyCapability34
-        | PolicyCapability35
-        | PolicyCapability36
-        | PolicyCapability37
+        PolicyCapability37
         | PolicyCapability38
         | PolicyCapability39
         | PolicyCapability40
@@ -186,6 +191,10 @@ class PolicyCheckOutput(BaseModel):
         | PolicyCapability42
         | PolicyCapability43
         | PolicyCapability44
+        | PolicyCapability45
+        | PolicyCapability46
+        | PolicyCapability47
+        | PolicyCapability48
     )
     """
     The capability that was checked.

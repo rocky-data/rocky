@@ -251,6 +251,23 @@ def test_run_cli_hard_failure_carries_stderr_tail():
     assert "fatal: nope" in exc.value.stderr_tail
 
 
+def test_run_cli_stderr_tail_is_bounded_to_last_20_lines():
+    # A long verbose run must not retain the whole stderr stream — only the
+    # last 20 lines are ever surfaced, so the reader's sink is capped there.
+    client = _client()
+    noise = "".join(f"line {i}\n" for i in range(1000))
+    proc = _fake_popen(stdout="not json", stderr=noise, returncode=1)
+    with (
+        patch("rocky_sdk.client.subprocess.Popen", return_value=proc),
+        pytest.raises(RockyCommandError) as exc,
+    ):
+        client.run_cli(["discover"])
+    tail_lines = exc.value.stderr_tail.splitlines()
+    assert len(tail_lines) == 20
+    assert tail_lines[0] == "line 980"
+    assert tail_lines[-1] == "line 999"
+
+
 def test_run_cli_timeout_when_watchdog_kills():
     client = _client(timeout_seconds=0.05)
     with (
@@ -331,6 +348,19 @@ def test_run_cli_binary_not_found():
     client = _client()
     with (
         patch("rocky_sdk.client.subprocess.Popen", side_effect=FileNotFoundError),
+        pytest.raises(RockyBinaryNotFoundError),
+    ):
+        client.run_cli(["discover"])
+
+
+@pytest.mark.parametrize("exc", [PermissionError, NotADirectoryError])
+def test_run_cli_non_executable_binary_maps_to_typed_error(exc):
+    # RockyBinaryNotFoundError's contract is "could not be found *or executed*":
+    # a non-executable file (PermissionError) or a bad path component
+    # (NotADirectoryError) must surface as the typed error, not a raw OSError.
+    client = _client()
+    with (
+        patch("rocky_sdk.client.subprocess.Popen", side_effect=exc),
         pytest.raises(RockyBinaryNotFoundError),
     ):
         client.run_cli(["discover"])
@@ -507,6 +537,34 @@ _GC_APPLY_JSON = json.dumps(
     }
 )
 
+# A ``restore`` plan's apply output — also ``command == "apply"``, but with
+# restore-specific markers. The shared ``refused`` field must not route it to gc.
+_RESTORE_APPLY_JSON = json.dumps(
+    {
+        "version": "1.64.0",
+        "command": "apply",
+        "plan_id": "b" * 64,
+        "restored": [
+            {
+                "model_name": "orders",
+                "run_id": "run-1",
+                "blake3_hash": "deadbeef",
+                "size_bytes": 2048,
+                "file_path": "s3://warehouse/orders.parquet",
+                "status": "restored",
+                "bytes_written": True,
+                "hash_verified": True,
+            }
+        ],
+        "refused": [],
+        "already_restored": [],
+        "restored_count": 1,
+        "refused_count": 0,
+        "bytes_restored": 2048,
+        "notes": ["rebuilt bytes verified before publication"],
+    }
+)
+
 
 def _run_apply(client: RockyClient, stdout: str):
     proc = _fake_popen(stdout=stdout, returncode=0)
@@ -539,6 +597,16 @@ def test_apply_gc_plan_returns_gc_apply_output():
     assert result.evicted_count == 1
     assert result.evicted[0].model_name == "stale_model"
     assert result.bytes_evicted == 2048
+
+
+def test_apply_restore_plan_returns_restore_apply_output():
+    from rocky_sdk.types import RestoreApplyOutput
+
+    result = _run_apply(_client(), _RESTORE_APPLY_JSON)
+    assert isinstance(result, RestoreApplyOutput)
+    assert result.restored_count == 1
+    assert result.restored[0].model_name == "orders"
+    assert result.bytes_restored == 2048
 
 
 def test_apply_unknown_shape_raises_named_parse_error():

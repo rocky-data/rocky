@@ -26,6 +26,27 @@ let statusBarItem: vscode.StatusBarItem;
 let stateSubscription: vscode.Disposable | undefined;
 
 /**
+ * Workspace file watchers shared across client restarts. Created once (lazily)
+ * and reused, rather than re-created inline in every `launchClient()` call —
+ * the previous approach leaked 3 watchers per config-change / crash / manual
+ * restart. Each `LanguageClient` hooks and unhooks its own listeners on the
+ * shared watchers when it starts/stops, so sharing the underlying objects is
+ * safe; they are disposed only on full shutdown ({@link stopLspClient}).
+ */
+let sharedFileWatchers: vscode.FileSystemWatcher[] | undefined;
+
+function getSharedFileWatchers(): vscode.FileSystemWatcher[] {
+  if (!sharedFileWatchers) {
+    sharedFileWatchers = [
+      vscode.workspace.createFileSystemWatcher("**/*.rocky"),
+      vscode.workspace.createFileSystemWatcher("**/*.toml"),
+      vscode.workspace.createFileSystemWatcher("**/models/**/*.sql"),
+    ];
+  }
+  return sharedFileWatchers;
+}
+
+/**
  * `true` while we're deliberately stopping the client as part of a restart
  * or shutdown. Suppresses the crash handler so a normal Running→Stopped
  * transition doesn't flap the status bar into a "Failed" state.
@@ -283,11 +304,7 @@ async function launchClient(): Promise<void> {
       { scheme: "file", language: "sql", pattern: "**/models/**/*.sql" },
     ],
     synchronize: {
-      fileEvents: [
-        vscode.workspace.createFileSystemWatcher("**/*.rocky"),
-        vscode.workspace.createFileSystemWatcher("**/*.toml"),
-        vscode.workspace.createFileSystemWatcher("**/models/**/*.sql"),
-      ],
+      fileEvents: getSharedFileWatchers(),
     },
     initializationOptions: {
       inlayHints: { enabled: cfg.inlayHintsEnabled },
@@ -333,6 +350,23 @@ function handleStateChange(oldState: State, newState: State): void {
   // During a deliberate stop or restart we own the status bar text and
   // {@link setLspState}, so silently ignore the transition.
   if (expectedStop) return;
+
+  // Recovery: vscode-languageclient's default error handler auto-restarts a
+  // crashed server (Stopped→Starting→Running) WITHOUT going back through
+  // `launchClient()`, so nothing else clears the `Failed` state we set on the
+  // crash below. Left stuck at `Failed`, `driftDiagnostics.lspOwnsDiagnostics()`
+  // keeps the CLI-compile fallback running alongside the recovered server
+  // (duplicate diagnostics, wasted spawns). Reset to Ready on any →Running.
+  if (newState === State.Running) {
+    if (currentLspState.status !== "Ready") {
+      statusBarItem.text = `$(check) Rocky: Ready${buildSegmentSuffix()}`;
+      statusBarItem.backgroundColor = undefined;
+      statusBarItem.tooltip = buildStatusTooltip();
+      setLspState("Ready");
+    }
+    return;
+  }
+
   if (newState !== State.Stopped) return;
   if (oldState !== State.Running) return;
   // The startup-failure path already calls {@link setLspState}; don't
@@ -508,6 +542,10 @@ export async function stopLspClient(): Promise<void> {
   }
   stateSubscription?.dispose();
   stateSubscription = undefined;
+  for (const watcher of sharedFileWatchers ?? []) {
+    watcher.dispose();
+  }
+  sharedFileWatchers = undefined;
   client = undefined;
   setLspState("Stopped");
 }

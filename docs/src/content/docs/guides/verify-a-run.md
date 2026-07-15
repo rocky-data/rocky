@@ -262,10 +262,11 @@ Verifies, with the tools above and no `rocky` binary:
 - The output table's live schema and row count, checked against the warehouse directly.
 - On the content-addressed path, that the output bytes match the recorded hash exactly.
 - With `[reuse]` enabled, that an indexed build's declared inputs are internally consistent (recompute `skip_hash` from the embedded canonical IR, then recompute `input_hash` from the persisted `skip_hash` + target identity + `upstreams` and confirm it matches the recorded value), and that the recorded output bytes are exactly those bytes (`b3sum`, extendable one hop to each `strong` upstream's recorded bytes via its own record), each labelled `strong` or `heuristic`.
+- For a deterministic content-addressed model, that **re-executing** the recorded recipe reproduces the recorded output byte-for-byte. `rocky replay --execute --verify` reconstructs the recipe from provenance (never the working tree), re-runs it, and compares the re-derived BLAKE3 against the recorded hash; `--warehouse` runs that re-execution against the live warehouse in an isolated replay schema, encoding the recomputed artifact with the target table's own physical column mapping so the digest is directly comparable to what the writer recorded.
 
 Does **not** verify:
 
-- That re-running the SQL would reproduce the same output **for a general pipeline**. `rocky replay --execute --verify` does re-execute a recorded recipe on a local DuckDB engine and compare the re-derived BLAKE3 against the recorded hash (emitting a `bit_exact` / `diverged` / `non_replayable` verdict per model) — but only for single, self-contained models; multi-model pipelines and warehouse-native re-execution are not covered. The reuse provenance record makes an input-logic + byte-identity attestation; it is likewise **not** a general reproducibility claim.
+- That re-running an arbitrary model reproduces its output. Re-execution is scoped to deterministic, content-addressed models: a model that reads a mutable source is classified `non_replayable` rather than re-run against current data, a model with a non-deterministic recipe (`now()`, `random()`) is flagged and may legitimately `diverge`, and a plain DuckDB/Snowflake/BigQuery/Databricks target that is not content-addressed carries no whole-output hash to compare against. The verdict (`bit_exact` / `diverged` / `non_replayable`) is always a classification, never a fabricated success.
 - That the warehouse table was not mutated by something else after the run. The ledger records what Rocky wrote; a later out-of-band `UPDATE` is outside its scope (this is exactly why step 5 checks the live warehouse).
 
 ## Implementation honesty
@@ -275,8 +276,8 @@ Every load-bearing claim above, graded against what ships today:
 | Claim | Status |
 |---|---|
 | Ledger inspection: `run_history`, `sql_hash`, full audit trail | Shipped |
-| `rocky replay` surfaces the recorded run | Shipped (default inspection view) |
-| Recorded-recipe re-execution + hash verification (`rocky replay --execute --verify`) | Shipped — single, self-contained models only, on a local DuckDB engine; multi-model pipelines and warehouse-native re-execution not yet |
+| `rocky replay` surfaces the recorded run | Shipped |
+| Re-execution reproduces the output (`rocky replay --execute --verify`) | Shipped for deterministic content-addressed models — local DuckDB engine or, with `--warehouse`, the live warehouse in an isolated replay schema; mutable-source models are `non_replayable`, non-deterministic recipes flagged |
 | Content-addressed Parquet named by BLAKE3 + recorded in `output_artifacts` | Shipped, but on the S3 content-addressed path only — not what a general DuckDB/Snowflake/BigQuery/Databricks run produces |
 | `[reuse]` input-match index + provenance record (offline-recomputable `skip_hash` *and* `input_hash` over persisted `upstreams` + `b3sum` + `proof_class`) | Shipped — opt-in (`[reuse] enabled`, default-off), recorded on the content-addressed (S3/UniForm) write path only |
 | Reuse *decision*: actually reusing a prior run's bytes instead of re-executing | Shipped — opt-in (`[reuse] enabled`, default-off), a fail-closed point-to decision on the content-addressed (S3/UniForm) write path, live-verified; any doubt builds |

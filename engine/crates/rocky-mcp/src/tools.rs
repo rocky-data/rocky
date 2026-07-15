@@ -9,12 +9,8 @@ use rmcp::RoleServer;
 use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-// `GetPromptRequestParams`, `PaginatedRequestParams`, and `ListPromptsResult`
-// are referenced unqualified in the code the `#[prompt_handler]` macro emits,
-// so they must be in scope here even though this module names none of them.
 use rmcp::model::{
-    GetPromptRequestParams, GetPromptResult, Implementation, ListPromptsResult,
-    PaginatedRequestParams, PromptMessage, PromptMessageRole, ProtocolVersion, ServerCapabilities,
+    GetPromptResult, Implementation, PromptMessage, ProtocolVersion, Role, ServerCapabilities,
     ServerInfo,
 };
 use rmcp::service::RequestContext;
@@ -1919,7 +1915,9 @@ impl RockyMcpServer {
         // artifact — a draft the policy plane refuses must not linger on disk
         // (mirrors the propose gate's deny → no plan written). A drop-guard,
         // not a manual closure: unwinding restores too.
-        let rollback = DraftRollback::snapshot([&paths.sql_path, &paths.sidecar_path]);
+        let rollback =
+            DraftRollback::snapshot_async(vec![paths.sql_path.clone(), paths.sidecar_path.clone()])
+                .await;
 
         // Write the draft: the SQL body verbatim + a minimal sidecar that carries
         // the intent. Target/strategy resolve from the project's conventions
@@ -2093,7 +2091,7 @@ impl RockyMcpServer {
         // Snapshot so a policy DENY (or a write/compile failure, or a panic
         // before the verdict) rolls back to leave NO new artifact — mirrors
         // `draft_model` and the propose gate. Drop-guard: unwinding restores.
-        let rollback = DraftRollback::snapshot([&paths.contract_path]);
+        let rollback = DraftRollback::snapshot_async(vec![paths.contract_path.clone()]).await;
 
         if let Err(e) = std::fs::write(&paths.contract_path, ensure_trailing_newline(&spec)) {
             return Err(ToolError::internal(
@@ -2215,7 +2213,7 @@ impl RockyMcpServer {
         // verdict) restores the model's PRIOR sidecar (the name/intent
         // draft_model wrote), never deletes it — the check is what rolls back,
         // not the model. A model with no sidecar yet snapshots None.
-        let rollback = DraftRollback::snapshot([&paths.sidecar_path]);
+        let rollback = DraftRollback::snapshot_async(vec![paths.sidecar_path.clone()]).await;
 
         // Merge: append the `[[tests]]` block(s) to the existing sidecar, or seed
         // a minimal sidecar (`name = "<stem>"`) when the model is a bare `.sql`.
@@ -2828,14 +2826,14 @@ impl RockyMcpServer {
         let intent = args.intent.trim();
         let messages = vec![
             PromptMessage::new_text(
-                PromptMessageRole::Assistant,
+                Role::Assistant,
                 "I'll author this Rocky model SQL-first, grounding every decision in the \
                  real data, and stop at a proposed plan for you to review and apply. \
                  The substrate trusts my edits because the compiler checked them and you \
                  sign off the invariants — never because they merely compiled.",
             ),
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 format!(
                     "Build a Rocky model for this intent:\n\n  {intent}\n\n\
                      Follow Rocky's authoring loop, using the MCP tools at each step:\n\n\
@@ -2895,14 +2893,14 @@ impl RockyMcpServer {
     ) -> Result<GetPromptResult, McpError> {
         let messages = vec![
             PromptMessage::new_text(
-                PromptMessageRole::Assistant,
+                Role::Assistant,
                 "I'll find the models that carry no declarative tests, draft tests grounded in \
                  their real data, and stop at a proposed plan for you to review and apply. A model \
                  that compiles is not the same as a model that is checked — tests are what make \
                  the substrate trust a future run.",
             ),
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 "Find the untested models in this Rocky project and draft tests for them, using \
                  the MCP tools at each step:\n\n\
                  1. catalog — enumerate every model with its declared tests, checks, and \
@@ -2961,13 +2959,13 @@ impl RockyMcpServer {
         };
         let messages = vec![
             PromptMessage::new_text(
-                PromptMessageRole::Assistant,
+                Role::Assistant,
                 "I'll identify the primary-key and unique columns, draft uniqueness and not-null \
                  tests grounded in the real data, and stop at a proposed plan for you to review \
                  and apply. A declared key is a claim; the data is what proves it.",
             ),
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 format!(
                     "Add uniqueness + not-null tests to the key columns of {scope} in this Rocky \
                      project, using the MCP tools at each step:\n\n\
@@ -3017,12 +3015,12 @@ impl RockyMcpServer {
     ) -> Result<GetPromptResult, McpError> {
         let messages = vec![
             PromptMessage::new_text(
-                PromptMessageRole::Assistant,
+                Role::Assistant,
                 "I'll summarize this Rocky project from the catalog and lineage. This is a \
                  read-only orientation — I will not edit, propose, or apply anything.",
             ),
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 "Summarize this Rocky project, using only the read-only MCP tools:\n\n\
                  1. catalog — enumerate every model with its target table, materialization \
                  strategy, declared tests/checks, contract, and governance (classification / mask \
@@ -3065,14 +3063,14 @@ impl RockyMcpServer {
         };
         let messages = vec![
             PromptMessage::new_text(
-                PromptMessageRole::Assistant,
+                Role::Assistant,
                 "I'll run the tests, ground each failure in the real data before changing \
                  anything, and stop at a proposed fix for you to review and apply. A failing test \
                  is a signal — I will find out whether the test is wrong or the data is wrong \
                  before I touch either.",
             ),
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 format!(
                     "Diagnose and fix the failing tests in {scope}, using the MCP tools at each \
                      step:\n\n\
@@ -3632,6 +3630,18 @@ impl DraftRollback {
             entries,
             defused: false,
         }
+    }
+
+    /// Async wrapper over [`snapshot`](Self::snapshot) that runs the prior-bytes
+    /// reads on the blocking pool. The async draft handlers use this so the
+    /// snapshot reads don't block the tokio worker; the sync `snapshot` stays
+    /// for the `catch_unwind`-based restore-on-panic unit test.
+    async fn snapshot_async(paths: Vec<PathBuf>) -> Self {
+        // `snapshot` only ever reads with `.ok()`, so the closure can't panic
+        // and the `JoinError` arm is unreachable in practice.
+        tokio::task::spawn_blocking(move || Self::snapshot(paths))
+            .await
+            .expect("DraftRollback::snapshot does not panic")
     }
 
     /// The snapshotted prior bytes for `path` (`None` = the file did not

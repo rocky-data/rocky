@@ -1,6 +1,6 @@
 [project]
 name = "rocky-sdk"
-version = "0.6.0"
+version = "0.8.0"
 description = "Typed Python client for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"
@@ -19,7 +19,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "pydantic>=2.0",
+    # 2.10 narrowed the `model_`-prefixed protected-namespace rule; below it the
+    # SDK's `model_decisions` / `model_results` / `model_name` fields either
+    # crash import (2.0) or emit protected-namespace UserWarnings on every
+    # import (2.1–2.9). Floor at 2.10 so `import rocky_sdk` is clean everywhere.
+    "pydantic>=2.10",
 ]
 
 [project.urls]

@@ -5,8 +5,8 @@ needs a model API key. This module resolves the three external dependencies the
 live suite needs — the `rocky` binary, the `claude` CLI, an `ANTHROPIC_API_KEY`
 (plus the `duckdb` CLI used to seed the fixture) — and reports, precisely, which
 are missing so the runner can *skip cleanly* (exit 0 with a message) rather than
-fail when a contributor has no key. The label-gated CI job supplies the key as a
-repository secret; without it the job skips green.
+fail when a contributor has no key. Only the trusted-main live workflow supplies
+the protected-environment key; pull-request CI never receives one.
 """
 
 from __future__ import annotations

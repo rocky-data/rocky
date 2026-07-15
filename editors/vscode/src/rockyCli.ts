@@ -336,7 +336,7 @@ const inFlight = new Map<string, Promise<unknown>>();
 
 /** Stable cache key: the normalized cwd plus the full argument vector. */
 function cacheKey(args: readonly string[], cwd: string | undefined): string {
-  return `${cwd ?? ""} ${args.join(" ")}`;
+  return `${cwd ?? ""}\x00${args.join("\x00")}`;
 }
 
 /**

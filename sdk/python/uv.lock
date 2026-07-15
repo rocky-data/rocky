@@ -514,7 +514,7 @@ wheels = [
 
 [[package]]
 name = "rocky-sdk"
-version = "0.6.0"
+version = "0.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
@@ -528,7 +528,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pydantic", specifier = ">=2.0" }]
+requires-dist = [{ name = "pydantic", specifier = ">=2.10" }]
 
 [package.metadata.requires-dev]
 dev = [

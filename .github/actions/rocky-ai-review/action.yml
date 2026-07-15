@@ -7,9 +7,40 @@ description: >-
   deterministic `rocky-preview` action so AI cost is opt-in per repo.
 
 inputs:
+  approved_base_ref:
+    description: >-
+      Trusted pull-request target ref revalidated in precomputed-context mode.
+    required: false
+    default: ''
+  approved_base_repository:
+    description: >-
+      Trusted base repository revalidated in precomputed-context mode.
+    required: false
+    default: ''
+  approved_base_sha:
+    description: >-
+      Immutable PR base SHA used by credentialed precomputed-context mode.
+    required: false
+    default: ''
+  approved_head_repository:
+    description: >-
+      Full candidate repository name used to revalidate a credentialed review.
+    required: false
+    default: ''
+  approved_head_sha:
+    description: >-
+      Exact candidate SHA whose label/environment approval is being consumed.
+    required: false
+    default: ''
   base_ref:
     description: 'Git ref to compare against (e.g. main, the PR base branch).'
     required: true
+  context_directory:
+    description: >-
+      Trusted-consumer directory containing bounded precomputed context files.
+      When set, installation and candidate context collection are skipped.
+    required: false
+    default: ''
   working_directory:
     description: >-
       Directory containing `rocky.toml`. The action cd's here before
@@ -29,10 +60,9 @@ inputs:
     default: 'latest'
   anthropic_api_key:
     description: >-
-      Anthropic API key. Pass via a repo-level secret (e.g.
-      `${{ secrets.ANTHROPIC_API_KEY }}`). Required — the action no-ops
-      with a comment-only failure note if absent so a misconfigured
-      workflow doesn't fail the PR check.
+      Anthropic API key. For pull requests, pass only from a protected
+      environment after binding approval to an exact head SHA. Required —
+      the action no-ops with a comment-only failure note if absent.
     required: true
   model:
     description: >-
@@ -69,6 +99,11 @@ inputs:
       Required because composite actions cannot reference the github
       context in input defaults.
     required: true
+  pull_request_number:
+    description: >-
+      Pull-request number revalidated immediately before a credentialed API call.
+    required: false
+    default: ''
 
 outputs:
   comment_url:
@@ -86,38 +121,39 @@ runs:
   steps:
     # --- Step 1: install rocky ----------------------------------------------
     #
-    # Mirrors `.github/actions/rocky-preview` install logic. install.sh
-    # filters by `engine-v*` tag prefix and verifies SHA256 against the
-    # published checksums.
+    # The installer is loaded from this action's own immutable revision.
+    # install.sh filters by `engine-v*` and verifies release checksums.
     # `inputs.rocky_version` is routed through an `env:` block rather
     # than interpolated directly into the `run:` body. See the matching
     # rocky-preview action for the security rationale.
     - name: Install rocky (Linux/macOS)
-      if: runner.os != 'Windows'
+      if: inputs.context_directory == '' && runner.os != 'Windows'
       shell: bash
       env:
+        ROCKY_INSTALLER_PATH: ${{ github.action_path }}/../../../engine/install.sh
         ROCKY_VERSION_INPUT: ${{ inputs.rocky_version }}
       run: |
         set -euo pipefail
         export ROCKY_INSTALL_DIR="$HOME/.local/bin"
         mkdir -p "$ROCKY_INSTALL_DIR"
         if [ "$ROCKY_VERSION_INPUT" = "latest" ]; then
-          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
+          bash "$ROCKY_INSTALLER_PATH"
         else
-          curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash -s -- "$ROCKY_VERSION_INPUT"
+          bash "$ROCKY_INSTALLER_PATH" "$ROCKY_VERSION_INPUT"
         fi
         echo "$ROCKY_INSTALL_DIR" >> "$GITHUB_PATH"
 
     - name: Install rocky (Windows)
-      if: runner.os == 'Windows'
+      if: inputs.context_directory == '' && runner.os == 'Windows'
       shell: pwsh
       env:
+        ROCKY_INSTALLER_PATH: ${{ github.action_path }}/../../../engine/install.ps1
         ROCKY_VERSION_INPUT: ${{ inputs.rocky_version }}
       run: |
         if ($env:ROCKY_VERSION_INPUT -ne 'latest') {
           $env:ROCKY_VERSION = $env:ROCKY_VERSION_INPUT
         }
-        irm https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.ps1 | iex
+        & $env:ROCKY_INSTALLER_PATH
         Add-Content -Path $env:GITHUB_PATH -Value "$env:LOCALAPPDATA\rocky\bin"
 
     # --- Step 2: gather context for the LLM prompt --------------------------
@@ -137,6 +173,7 @@ runs:
     #      across the whole project (broader context the diff alone misses).
     - name: Collect Rocky context
       id: collect
+      if: inputs.context_directory == ''
       shell: bash
       env:
         # `working_directory` is routed via env: so the `cd` below
@@ -148,7 +185,7 @@ runs:
         ROCKY_WORKING_DIR: ${{ inputs.working_directory }}
       run: |
         set -uo pipefail
-        cd "$ROCKY_WORKING_DIR"
+        cd "$ROCKY_WORKING_DIR" || exit 1
 
         WORK="$RUNNER_TEMP/rocky-ai-review"
         mkdir -p "$WORK"
@@ -197,6 +234,61 @@ runs:
 
         echo "work_dir=$WORK" >> "$GITHUB_OUTPUT"
 
+    - name: Select validated context
+      id: context
+      shell: bash
+      env:
+        COLLECTED_CONTEXT: ${{ steps.collect.outputs.work_dir }}
+        PRECOMPUTED_CONTEXT: ${{ inputs.context_directory }}
+      run: |
+        set -euo pipefail
+        WORK="${PRECOMPUTED_CONTEXT:-$COLLECTED_CONTEXT}"
+        if [ -z "$WORK" ] || [ ! -d "$WORK" ]; then
+          echo "::error::AI-review context directory is missing"
+          exit 1
+        fi
+        if [ -n "$PRECOMPUTED_CONTEXT" ]; then
+          if [ -L "$WORK" ]; then
+            echo "::error::Precomputed context directory must not be a symlink"
+            exit 1
+          fi
+          RUNNER_TEMP_REAL="$(cd "$RUNNER_TEMP" && pwd -P)"
+          WORK_REAL="$(cd "$WORK" && pwd -P)"
+          case "$WORK_REAL" in
+            "$RUNNER_TEMP_REAL"/*) ;;
+            *)
+              echo "::error::Precomputed context must be below RUNNER_TEMP"
+              exit 1
+              ;;
+          esac
+          WORK="$WORK_REAL"
+          for file in diff.txt diff.err diff_failed compile.json compile.err \
+              compile_failed ci.json ci.err ci_failed lineage.json lineage.err \
+              lineage_failed; do
+            if [ ! -f "$WORK/$file" ] || [ -L "$WORK/$file" ]; then
+              echo "::error::Validated context file is missing or unsafe: $file"
+              exit 1
+            fi
+          done
+        fi
+        echo "work_dir=$WORK" >> "$GITHUB_OUTPUT"
+
+    # In credentialed precomputed-context mode, this is deliberately the last
+    # step before the one that receives ANTHROPIC_API_KEY.
+    - name: Revalidate approved PR head
+      if: inputs.context_directory != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        APPROVAL_LABEL: ai-review
+        APPROVED_BASE_REF: ${{ inputs.approved_base_ref }}
+        APPROVED_BASE_REPOSITORY: ${{ inputs.approved_base_repository }}
+        APPROVED_BASE_SHA: ${{ inputs.approved_base_sha }}
+        APPROVED_HEAD_REPOSITORY: ${{ inputs.approved_head_repository }}
+        APPROVED_HEAD_SHA: ${{ inputs.approved_head_sha }}
+        PR_NUMBER: ${{ inputs.pull_request_number }}
+      run: python3 "$GITHUB_ACTION_PATH/../../scripts/verify_pr_approval.py"
+
     # --- Step 3: call Anthropic API + render the review --------------------
     #
     # Single curl call. Retries are intentionally absent — a failed LLM
@@ -206,7 +298,7 @@ runs:
       id: run-ai-review
       shell: bash
       env:
-        WORK_DIR: ${{ steps.collect.outputs.work_dir }}
+        WORK_DIR: ${{ steps.context.outputs.work_dir }}
         BASE_REF: ${{ inputs.base_ref }}
         ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
         ANTHROPIC_MODEL: ${{ inputs.model }}
@@ -216,7 +308,7 @@ runs:
 
         if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
           echo "review_status=disabled" >> "$GITHUB_OUTPUT"
-          printf '_AI review disabled: `anthropic_api_key` input is empty. Set the `ANTHROPIC_API_KEY` repository secret and pass it through the workflow._\n' \
+          printf '_AI review disabled: `anthropic_api_key` input is empty. Configure it in the protected credential environment._\n' \
             > "$WORK_DIR/review.md"
           exit 0
         fi
@@ -356,7 +448,7 @@ runs:
       id: render
       shell: bash
       env:
-        WORK_DIR: ${{ steps.collect.outputs.work_dir }}
+        WORK_DIR: ${{ steps.context.outputs.work_dir }}
         BASE_REF: ${{ inputs.base_ref }}
         COMMENT_MARKER: ${{ inputs.comment_marker }}
         MODEL_NAME: ${{ inputs.model }}
@@ -381,7 +473,7 @@ runs:
     # --- Step 5: upsert the PR comment -------------------------------------
     - name: Upsert PR comment
       id: upsert-comment
-      if: github.event_name == 'pull_request'
+      if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
         BODY_PATH: ${{ steps.render.outputs.body_path }}

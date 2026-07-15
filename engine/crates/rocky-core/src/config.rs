@@ -2538,9 +2538,11 @@ pub struct RockyConfig {
     #[serde(default)]
     pub gc: GcConfig,
 
-    /// Agent-authority policy plane (explain-mode in v0). Declares, per
+    /// Agent-authority policy plane. Declares, per
     /// `(principal, capability, scope)`, whether an action is allowed,
-    /// requires human review, or is denied. Absent `[policy]` block ⇒ no
+    /// requires human review, or is denied; enforced at `apply`, `promote`,
+    /// and the MCP write tools, with every decision recorded to the
+    /// ledger. Absent `[policy]` block ⇒ no
     /// rules and the default posture applies (agents on mutating actions
     /// fall to `default_agent_effect`, humans are never gated). See
     /// [`PolicyConfig`] and [`crate::policy`] for the evaluator.
@@ -2716,6 +2718,8 @@ pub enum PolicyCapability {
     Backfill,
     /// Garbage-collect / reclaim storage.
     Gc,
+    /// Restore a gc-evicted artifact from its tombstone (rebuild + verify).
+    Restore,
     /// Retry a failed run.
     Retry,
     /// Quarantine a partition / model.

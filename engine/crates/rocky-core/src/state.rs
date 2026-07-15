@@ -328,7 +328,16 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache"];
 ///   existing tables are untouched. Empty until a `rocky gc --derivable` plan is
 ///   applied, so pre-existing state resumes unchanged. Guarded by
 ///   `test_v18_opens_and_creates_tombstones_table`.
-const CURRENT_SCHEMA_VERSION: u32 = 19;
+/// - **v20** — adds the serde-additive [`TombstoneRecord::restored_at`] +
+///   [`TombstoneRecord::restore_plan_id`] custody fields for `rocky restore`:
+///   a verified restore stamps the tombstone (rather than deleting it) so the
+///   evict → restore history stays auditable. Not a table change — the redb
+///   table set is unchanged (`EXPECTED_TABLES` is untouched). A v19 blob
+///   (which lacks the fields) forward-deserializes with both `None`, guarded
+///   by `test_v19_tombstone_forward_deserializes_restore_fields_none`. The
+///   bump tracks the record-shape addition so `[state] on_schema_mismatch`
+///   engages as usual; no blob walk.
+const CURRENT_SCHEMA_VERSION: u32 = 20;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -2959,8 +2968,8 @@ impl StateStore {
     ///
     /// Keys are `"{evicted_at_rfc3339}|{blake3_hash}"`, which sort
     /// chronologically, so a forward table scan yields evictions in the order
-    /// they occurred. Backs the `rocky gc` apply summary and (later) `rocky
-    /// restore` resolution.
+    /// they occurred. Backs the `rocky gc` apply summary and `rocky restore`
+    /// target resolution.
     pub fn list_tombstones(&self) -> Result<Vec<TombstoneRecord>, StateError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(TOMBSTONES)?;
@@ -2971,6 +2980,115 @@ impl StateStore {
             results.push(record);
         }
         Ok(results)
+    }
+
+    /// Atomically reinstate an evicted artifact's [`OUTPUT_ARTIFACTS`] row and
+    /// stamp its tombstone as restored, in a single write transaction — the
+    /// inverse of [`Self::evict_artifact`], with the same hash-guarded,
+    /// fail-closed posture.
+    ///
+    /// The caller has already **verified the bytes** (recomputed blake3 ==
+    /// `tombstone.blake3_hash`, and the object at `tombstone.file_path` holds
+    /// exactly those bytes); this method only ever mutates the ledger:
+    ///
+    /// - [`RestoreOutcome::Restored`] — no live row existed at the tombstone's
+    ///   `(run_id, model_name, file_path)` key: `artifact` is inserted and the
+    ///   tombstone is stamped (`restored_at` / `restore_plan_id`), committed
+    ///   together. The tombstone row is **kept** — history is never deleted.
+    /// - [`RestoreOutcome::AlreadyRestored`] — a live row already exists at
+    ///   the key **with the tombstone's hash** (a prior restore, or a crash
+    ///   between the ledger insert and the tombstone stamp). The tombstone
+    ///   stamp is (re-)written so the custody trail converges; the live row is
+    ///   untouched. Idempotent.
+    /// - [`RestoreOutcome::HashMismatch`] — a live row exists at the key with
+    ///   a **different** hash (the location was re-materialized to other bytes
+    ///   since the eviction). **Nothing is written** — reinstating the old
+    ///   record would corrupt the ledger's view of the live location.
+    /// - [`RestoreOutcome::TombstoneMissing`] — no tombstone row exists at
+    ///   `(evicted_at, blake3_hash)`. Nothing is written; the caller's view of
+    ///   the eviction is stale or hand-authored.
+    ///
+    /// `artifact` must carry the tombstone's identity (`run_id`, `model_name`,
+    /// `file_path`, `blake3_hash`); a mismatch returns
+    /// [`RestoreOutcome::TombstoneMissing`]-adjacent corruption errors from the
+    /// caller's own guards — this method additionally hard-refuses (returns
+    /// [`RestoreOutcome::HashMismatch`]) when `artifact.blake3_hash` differs
+    /// from the tombstone's, so a wired-wrong caller cannot reinstate a row
+    /// under the wrong identity.
+    pub fn restore_artifact(
+        &self,
+        tombstone: &TombstoneRecord,
+        artifact: &ArtifactRecord,
+        restore_plan_id: &str,
+        restored_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<RestoreOutcome, StateError> {
+        if artifact.blake3_hash != tombstone.blake3_hash
+            || artifact.run_id != tombstone.run_id
+            || artifact.model_name != tombstone.model_name
+            || artifact.file_path != tombstone.file_path
+        {
+            return Ok(RestoreOutcome::HashMismatch {
+                expected: tombstone.blake3_hash.clone(),
+                found: artifact.blake3_hash.clone(),
+            });
+        }
+        let art_key = artifact_key(&artifact.run_id, &artifact.model_name, &artifact.file_path);
+        let tomb_key = tombstone_key(&tombstone.evicted_at, &tombstone.blake3_hash);
+        let art_bytes = serde_json::to_vec(artifact)?;
+
+        let txn = self.db.begin_write()?;
+        let outcome;
+        {
+            let mut tombstones = txn.open_table(TOMBSTONES)?;
+            // The tombstone must still exist — it is the custody record the
+            // restore consumes. Read it live so the stamp preserves whatever
+            // the row holds now (not the caller's possibly-stale copy).
+            let live_tomb: Option<TombstoneRecord> = match tombstones.get(tomb_key.as_str())? {
+                Some(guard) => Some(serde_json::from_slice(guard.value())?),
+                None => None,
+            };
+            let Some(mut live_tomb) = live_tomb else {
+                drop(tombstones);
+                drop(txn);
+                return Ok(RestoreOutcome::TombstoneMissing);
+            };
+
+            let mut artifacts = txn.open_table(OUTPUT_ARTIFACTS)?;
+            let live_row: Option<ArtifactRecord> = match artifacts.get(art_key.as_str())? {
+                Some(guard) => Some(serde_json::from_slice(guard.value())?),
+                None => None,
+            };
+            outcome = match live_row {
+                Some(row) if row.blake3_hash != tombstone.blake3_hash => {
+                    RestoreOutcome::HashMismatch {
+                        expected: tombstone.blake3_hash.clone(),
+                        found: row.blake3_hash,
+                    }
+                }
+                Some(_) => {
+                    // Row already live with the right hash — converge the
+                    // custody stamp (a crash window, or an idempotent re-run).
+                    live_tomb.restored_at = Some(restored_at);
+                    live_tomb.restore_plan_id = Some(restore_plan_id.to_string());
+                    let tomb_bytes = serde_json::to_vec(&live_tomb)?;
+                    tombstones.insert(tomb_key.as_str(), tomb_bytes.as_slice())?;
+                    RestoreOutcome::AlreadyRestored
+                }
+                None => {
+                    artifacts.insert(art_key.as_str(), art_bytes.as_slice())?;
+                    live_tomb.restored_at = Some(restored_at);
+                    live_tomb.restore_plan_id = Some(restore_plan_id.to_string());
+                    let tomb_bytes = serde_json::to_vec(&live_tomb)?;
+                    tombstones.insert(tomb_key.as_str(), tomb_bytes.as_slice())?;
+                    RestoreOutcome::Restored
+                }
+            };
+        }
+        match outcome {
+            RestoreOutcome::Restored | RestoreOutcome::AlreadyRestored => txn.commit()?,
+            _ => drop(txn),
+        }
+        Ok(outcome)
     }
 
     // -----------------------------------------------------------------------
@@ -3655,6 +3773,19 @@ pub struct TombstoneRecord {
     /// eviction path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_delta_version: Option<u64>,
+    /// Wall clock when a `rocky restore` apply verified this eviction's bytes
+    /// were rebuilt hash-exact and reinstated the ledger row. `None` while the
+    /// eviction stands. The row is **never deleted** on restore — a consumed
+    /// tombstone stays in the custody ledger with this stamp so the
+    /// evict → restore history remains auditable. Serde-defaulted so a v19
+    /// tombstone forward-deserializes with it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The `rocky restore` plan that performed the verified restore (custody
+    /// pointer, mirroring [`Self::plan_id`] on the eviction side). `None`
+    /// while the eviction stands. Serde-defaulted like [`Self::restored_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_plan_id: Option<String>,
 }
 
 /// The result of [`StateStore::evict_artifact`] — an eviction attempt keyed by
@@ -3677,6 +3808,36 @@ pub enum EvictOutcome {
         /// The hash actually stored in the live ledger row.
         found: String,
     },
+}
+
+/// The result of [`StateStore::restore_artifact`] — a ledger reinstatement
+/// keyed by the tombstone's `(run_id, model_name, file_path)` and guarded by
+/// its content hash. The byte-level verification happens **before** this call;
+/// every arm here is about the ledger only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// No live row existed: the artifact row was reinstated and the tombstone
+    /// stamped restored, committed atomically. The tombstone row is retained
+    /// for audit.
+    Restored,
+    /// A live row with the tombstone's hash already existed — a prior restore
+    /// (or a crash between the row insert and the tombstone stamp). The stamp
+    /// was converged; the row was untouched. Idempotent no-op.
+    AlreadyRestored,
+    /// A live row exists at the key with a **different** hash — the location
+    /// was re-materialized to other bytes since the eviction. **Nothing was
+    /// written** (fail-closed): reinstating the old record would corrupt the
+    /// ledger's view of the live location.
+    HashMismatch {
+        /// The hash the tombstone claims.
+        expected: String,
+        /// The hash actually live at the key (or the caller's mismatched
+        /// artifact identity).
+        found: String,
+    },
+    /// No tombstone row exists at `(evicted_at, blake3_hash)` — the caller's
+    /// view of the eviction is stale or hand-authored. Nothing was written.
+    TombstoneMissing,
 }
 
 /// One row in the agent-policy decision ledger ([`POLICY_DECISIONS`]).
@@ -7333,6 +7494,8 @@ mod tests {
             plan_id: "plan-1".to_string(),
             physical_reclaimed: false,
             observed_delta_version: None,
+            restored_at: None,
+            restore_plan_id: None,
         }
     }
 
@@ -7461,6 +7624,141 @@ mod tests {
             survived.is_some(),
             "provenance must survive eviction so restore can replay"
         );
+    }
+
+    #[test]
+    fn test_v19_tombstone_forward_deserializes_restore_fields_none() {
+        // A v19 tombstone blob (no restore-custody fields) must read back with
+        // both `None` under the v20 binary — the serde-additive contract.
+        let record = make_tombstone("hA", "run-1", "orders", "s3://b/a.parquet", 500);
+        let mut value = serde_json::to_value(&record).expect("serialize record");
+        let obj = value.as_object_mut().expect("record is an object");
+        obj.remove("restored_at");
+        obj.remove("restore_plan_id");
+        let blob = serde_json::to_vec(&value).expect("reserialize without fields");
+
+        let read: TombstoneRecord =
+            serde_json::from_slice(&blob).expect("a v19 tombstone must forward-deserialize");
+        assert!(read.restored_at.is_none());
+        assert!(read.restore_plan_id.is_none());
+
+        // A v20 record carrying the stamps round-trips losslessly.
+        let mut stamped = record.clone();
+        stamped.restored_at = Some(chrono::Utc::now());
+        stamped.restore_plan_id = Some("restore-plan-1".to_string());
+        let round: TombstoneRecord =
+            serde_json::from_slice(&serde_json::to_vec(&stamped).unwrap()).unwrap();
+        assert_eq!(round.restored_at, stamped.restored_at);
+        assert_eq!(round.restore_plan_id, stamped.restore_plan_id);
+    }
+
+    #[test]
+    fn restore_artifact_reinstates_row_and_stamps_tombstone_atomically() {
+        // The inverse of evict: after a restore, the OUTPUT_ARTIFACTS row is
+        // live again (refcount 1) and the tombstone is retained WITH the
+        // restore stamp — history is never deleted.
+        let (store, _dir) = temp_store();
+        let art = make_artifact("run-1", "orders", "hA", "s3://b/a.parquet", 500);
+        store.record_artifact(&art).unwrap();
+        let tomb = make_tombstone("hA", "run-1", "orders", "s3://b/a.parquet", 500);
+        store
+            .evict_artifact(&tomb, "run-1", "orders", "s3://b/a.parquet")
+            .unwrap();
+        assert_eq!(store.refcount_for_hash("hA").unwrap(), 0);
+
+        let restored_at = chrono::Utc::now();
+        let outcome = store
+            .restore_artifact(&tomb, &art, "restore-plan-1", restored_at)
+            .unwrap();
+        assert_eq!(outcome, RestoreOutcome::Restored);
+        assert_eq!(store.refcount_for_hash("hA").unwrap(), 1);
+        assert_eq!(
+            store
+                .get_artifact("run-1", "orders", "s3://b/a.parquet")
+                .unwrap()
+                .as_ref(),
+            Some(&art)
+        );
+        let tombs = store.list_tombstones().unwrap();
+        assert_eq!(tombs.len(), 1, "the tombstone row is kept for audit");
+        assert_eq!(tombs[0].restored_at, Some(restored_at));
+        assert_eq!(tombs[0].restore_plan_id.as_deref(), Some("restore-plan-1"));
+
+        // Idempotent re-restore: the row is live with the right hash — no-op.
+        let again = store
+            .restore_artifact(&tomb, &art, "restore-plan-2", chrono::Utc::now())
+            .unwrap();
+        assert_eq!(again, RestoreOutcome::AlreadyRestored);
+        assert_eq!(store.refcount_for_hash("hA").unwrap(), 1, "no double row");
+    }
+
+    #[test]
+    fn restore_artifact_refuses_when_location_was_rematerialized() {
+        // 🔴 Fail-closed: the tombstoned location now holds a DIFFERENT live
+        // artifact (re-materialized since the eviction). Reinstating the old
+        // record would corrupt the ledger's view of the live location — the
+        // restore must refuse and write nothing.
+        let (store, _dir) = temp_store();
+        let old = make_artifact("run-1", "orders", "hOLD", "s3://b/a.parquet", 500);
+        store.record_artifact(&old).unwrap();
+        let tomb = make_tombstone("hOLD", "run-1", "orders", "s3://b/a.parquet", 500);
+        store
+            .evict_artifact(&tomb, "run-1", "orders", "s3://b/a.parquet")
+            .unwrap();
+        // The location is re-materialized to new bytes at the same key.
+        let newer = make_artifact("run-1", "orders", "hNEW", "s3://b/a.parquet", 600);
+        store.record_artifact(&newer).unwrap();
+
+        let outcome = store
+            .restore_artifact(&tomb, &old, "restore-plan-1", chrono::Utc::now())
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RestoreOutcome::HashMismatch {
+                expected: "hOLD".to_string(),
+                found: "hNEW".to_string(),
+            }
+        );
+        // The live row is untouched and the tombstone carries no restore stamp.
+        assert_eq!(
+            store
+                .get_artifact("run-1", "orders", "s3://b/a.parquet")
+                .unwrap()
+                .unwrap()
+                .blake3_hash,
+            "hNEW"
+        );
+        assert!(store.list_tombstones().unwrap()[0].restored_at.is_none());
+    }
+
+    #[test]
+    fn restore_artifact_refuses_missing_tombstone_and_mismatched_identity() {
+        let (store, _dir) = temp_store();
+        let art = make_artifact("run-1", "orders", "hA", "s3://b/a.parquet", 500);
+        let tomb = make_tombstone("hA", "run-1", "orders", "s3://b/a.parquet", 500);
+
+        // No tombstone row exists — nothing to consume; nothing written.
+        let outcome = store
+            .restore_artifact(&tomb, &art, "restore-plan-1", chrono::Utc::now())
+            .unwrap();
+        assert_eq!(outcome, RestoreOutcome::TombstoneMissing);
+        assert_eq!(store.refcount_for_hash("hA").unwrap(), 0);
+
+        // A caller wiring a row under the WRONG identity is hard-refused even
+        // before the transaction opens.
+        store.record_artifact(&art).unwrap();
+        store
+            .evict_artifact(&tomb, "run-1", "orders", "s3://b/a.parquet")
+            .unwrap();
+        let wrong = make_artifact("run-1", "orders", "hB", "s3://b/a.parquet", 500);
+        let outcome = store
+            .restore_artifact(&tomb, &wrong, "restore-plan-1", chrono::Utc::now())
+            .unwrap();
+        assert!(
+            matches!(outcome, RestoreOutcome::HashMismatch { .. }),
+            "a mismatched artifact identity must never reinstate: {outcome:?}"
+        );
+        assert_eq!(store.refcount_for_hash("hB").unwrap(), 0);
     }
 
     #[test]
@@ -7872,7 +8170,11 @@ mod tests {
         // v19 adds the `tombstones` table (`rocky gc` eviction custody) — a new
         // table, so it IS in EXPECTED_TABLES below; guarded by
         // `test_v18_opens_and_creates_tombstones_table`.
-        const EXPECTED_VERSION: u32 = 19;
+        // v20 adds `TombstoneRecord::restored_at` / `restore_plan_id` (`rocky
+        // restore` custody stamps), serde-additive fields — the redb table set
+        // is untouched, only the version moves; guarded by
+        // `test_v19_tombstone_forward_deserializes_restore_fields_none`.
+        const EXPECTED_VERSION: u32 = 20;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",

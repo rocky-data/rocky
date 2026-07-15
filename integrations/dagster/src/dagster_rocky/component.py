@@ -45,11 +45,16 @@ from dagster._core.storage.asset_check_execution_record import (
     AssetCheckExecutionRecordStatus,
 )
 from dagster._utils.env import using_dagster_dev
-from dagster.components.component.state_backed_component import StateBackedComponent
-from dagster.components.utils.defs_state import (
+
+# Prefer the public `dagster.components` re-exports over the deep private
+# module paths — same objects (identity-verified), far less churn risk across
+# Dagster upgrades. The remaining `dagster._core.*` / `dagster_shared.*` /
+# `dagster.components.utils.*` imports below have no public re-export yet.
+from dagster.components import (
     DefsStateConfig,
     DefsStateConfigArgs,
     ResolvedDefsStateConfig,
+    StateBackedComponent,
 )
 from dagster.components.utils.project_paths import get_local_state_path
 from dagster.components.utils.translation import TranslationFn, TranslationFnResolver
@@ -941,6 +946,10 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
         Schema-validation failures (``ValidationError``) propagate as
         ``dg.Failure`` — see ``_compile_payload`` for the rationale.
         """
+        if not Path(self.models_dir).is_dir():
+            # A replication-only project has no models dir; skip the spawn
+            # (mirrors _compile_payload — optimize has nothing to analyze).
+            return None
         try:
             return json.loads(rocky.optimize().model_dump_json(by_alias=True))
         except ValidationError as exc:
@@ -1345,11 +1354,23 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             partitions_def=tenant_partitions_def,
         )
 
+        # Bucket check specs by asset key once (O(checks)) instead of, per group,
+        # scanning the flat check_specs list with an inner `any(... for s in
+        # group.specs)` — that was O(checks × specs), ~70% of a large (2k-table)
+        # definitions build, paid on every code-server load and step
+        # reconstruction. Each asset key belongs to exactly one group, so a
+        # spec lands in one group's list.
+        check_specs_by_key: dict[dg.AssetKey, list[dg.AssetCheckSpec]] = defaultdict(list)
+        for cs in check_specs:
+            check_specs_by_key[cs.asset_key].append(cs)
+
         assets: list[dg.AssetsDefinition] = [
             _make_rocky_asset(
                 group=group,
                 check_specs=[
-                    cs for cs in check_specs if any(cs.asset_key == s.key for s in group.specs)
+                    cs
+                    for key in {s.key for s in group.specs}
+                    for cs in check_specs_by_key.get(key, ())
                 ],
                 rocky=rocky,
                 compile_state=compile_state,
@@ -2889,17 +2910,6 @@ def _run_filters(
             )
             break
     return results, cooldown_seconds
-
-
-def _has_quota_breach(result: RunResult) -> bool:
-    """True when ``result.errors`` contains a quota-exceeded entry.
-
-    Single source of truth for the storm signal so callers don't drift on
-    the wire string. See :data:`_QUOTA_EXCEEDED_FAILURE_KIND`. Used by
-    tests; runtime callers should prefer :func:`_quota_breach_cooldown`
-    which also returns the engine-supplied cooldown hint.
-    """
-    return any(err.failure_kind == _QUOTA_EXCEEDED_FAILURE_KIND for err in result.errors)
 
 
 def _quota_breach_cooldown(result: RunResult) -> int | None:

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bumped `rmcp` (the MCP SDK) 1.7 → 2.2, a breaking major that realigns MCP model types to spec 2025-11-25. The JSON wire format is unchanged — MCP clients see identical bytes — so the migration is Rust-API-only (`PromptMessageRole` → `Role`, `PromptMessageContent::Text` → `ContentBlock::Text`). The `rocky mcp` tool/prompt surface (28 tools, 5 prompts) is identical. Two inherited rmcp-2.x behaviors are wire-compatible and worth noting: `initialize` now negotiates the MCP protocol version (a client is echoed the version it requests when rmcp recognizes it, falling back to the configured `2024-11-05` otherwise), and a tool call whose arguments fail to deserialize returns an `isError` result rather than a JSON-RPC error — Rocky's structured tool-error envelope (body-level validation) is unchanged. (#1109)
+
+## [1.64.0] - 2026-07-12
+
+### Added
+
+- **`rocky replay --execute` warehouse path — re-execute a content-addressed run bit-exact.** Beyond the DuckDB-local path, a recorded content-addressed run can now be re-executed against the live warehouse and verified: each model's recipe is re-derived on the recording engine, the recomputed content hash is compared to the recorded artifact hash, and execution is isolated into a dropped-after `hcv2_replay_*` namespace — never the production target. DAG-order multi-model replay redirects each model's upstream reads to the replayed outputs (failing closed on an ambiguous reference). Verdicts (`bit_exact` / `diverged` / `non_replayable`) are classifications, not failures; a mutable-source model stays `non_replayable` and is never silently substituted with current data. The replay and auditor guides now describe re-execution (with the honest caveats) rather than inspection only. (#1102)
+- **`rocky restore` — rebuild a gc-evicted artifact from its tombstone, hash-exact.** A gc tombstone claims "these bytes can be rebuilt"; `rocky restore <target>` is the proof. It resolves the tombstone by model name, `model@<recipe-hash-prefix>`, or content hash (refusing an ambiguous target with the candidates listed, and distinguishing "never evicted" from "not found"), then writes a review-gated restore plan. `rocky apply <plan>` re-derives the artifact from the recorded recipe **on the recording engine** (the project's configured warehouse — a content-addressed artifact is only reproducible bit-for-bit on the engine that wrote it), verifies the recomputed content hash equals the tombstoned hash **before anything is written**, and only then re-materializes to the original path and reinstates the ledger row — the tombstone is kept, stamped with the restore for an auditable evict→restore history. Every failure mode is fail-closed: a recipe that no longer reproduces the exact bytes refuses and writes nothing, bytes already present with a different hash are never overwritten, and restore is symmetric-caution gated like gc (even a human restore goes through review; policy can only tighten). This closes the reclaim→replay loop that makes gc eviction safe. (#1103)
+
+### Changed
+
+- State schema `v19 → v20`: two serde-defaulted restore-custody fields on the tombstone record (`restored_at`, `restore_plan_id`) so a consumed tombstone records who restored it and when, without leaving the eviction ledger. Additive — older (v19) state opens forward-compatibly. As with prior bumps the schema-version-qualified **remote** state key rotates, so a `state_sync`-backed deployment starts a fresh remote copy at the new key on its first post-upgrade sync; local state migrates in place. (#1103)
+
+### Fixed
+
+- `rocky doctor` now fails closed on ambiguous health signals — an exit-3 sub-check, an unparseable check result, a skipped run, or an unknown severity is treated as a failure rather than silently passing. (#1096)
+- Validate the declared `data_type` of metadata columns projected in a `SELECT`, and escape backslashes when emitting Snowflake tag values. (#1094)
+- Corrected UI staleness/desync in the dashboard and made the request-stampede guard's tokens unique. (#1091)
+
+### Performance
+
+- Moved blocking `StateStore` (redb) access off the tokio worker threads on the concurrent run path, and moved the remaining blocking file I/O off the async workers in the adapter, LSP, and MCP paths, so long synchronous reads no longer stall the async runtime under concurrency. (#1097, #1099, #1100)
+
 ## [1.63.0] - 2026-07-10
 
 ### Added

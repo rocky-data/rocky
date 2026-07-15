@@ -21,7 +21,7 @@ export interface GcPlanOutput {
    */
   evictions: GcPlanEviction[];
   /**
-   * Operator caveats (e.g. re-verification at apply, scope). Each eviction records what a restore will need; `rocky restore` itself is a planned follow-up.
+   * Operator caveats (e.g. re-verification at apply, scope). Each eviction records everything `rocky restore <target>` needs to rebuild it hash-exact.
    */
   notes: string[];
   /**

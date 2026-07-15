@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-07-14
+
+### Fixed
+
+- **`rocky apply <restore-plan>` output now parses instead of failing as `GcApplyOutput`.** Restore-apply and gc-apply both print `command: "apply"` with a required `refused` field, so both SDK dispatch paths (which keyed on `refused`, or mapped `"apply"` unconditionally to `GcApplyOutput`) misclassified every restore result and rejected it with missing-field validation errors. `RockyClient.apply()` and `parse_rocky_output()` now discriminate on the disjoint, always-present markers `restored` (routing to `RestoreApplyOutput`) and `evicted` (routing to `GcApplyOutput`), and the generated `RestoreApplyOutput` (shipped in 0.7.0) is wired into the `ApplyResult` / `RockyOutput` unions. GC apply parsing is unchanged. (#1111, fixes #1110)
+
+## [0.7.0] — 2026-07-12
+
+### Added
+
+- **Generated types for the engine-v1.64.0 output surface** — `rocky replay --execute` (`replay_execute`) and `rocky restore` plan + apply (`restore_plan`, `restore_apply`), plus the new `restore` value on the policy-capability enum propagated across the embedding schemas. Additive — existing parses are unaffected.
+
+### Changed
+
+- Internal client efficiency and health-probe pass (no public API change). (#1101)
+
 ## [0.6.0] — 2026-07-10
 
 ### Added

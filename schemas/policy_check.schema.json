@@ -47,6 +47,13 @@
           "type": "string"
         },
         {
+          "description": "Restore a gc-evicted artifact from its tombstone (rebuild + verify).",
+          "enum": [
+            "restore"
+          ],
+          "type": "string"
+        },
+        {
           "description": "Retry a failed run.",
           "enum": [
             "retry"
@@ -181,7 +188,7 @@
       ]
     }
   },
-  "description": "JSON output for `rocky policy check`.\n\nExplain-mode only: reports the effect the agent policy plane *would* resolve for a `(principal, capability, model)` triple, the winning rule (if any), and why. It does not gate any real command in v0.",
+  "description": "JSON output for `rocky policy check`.\n\nAn explain surface: reports the *base* effect the agent policy plane resolves for a `(principal, capability, model)` triple, the winning rule (if any), and why. The check itself is read-only and static; the same evaluator is enforced at `apply`, `promote`, and the MCP write tools, where active freezes and autonomy-budget burn are also projected and can only tighten the effect reported here.",
   "properties": {
     "capability": {
       "allOf": [

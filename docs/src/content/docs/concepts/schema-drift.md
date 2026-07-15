@@ -5,7 +5,7 @@ sidebar:
   order: 10.7
 ---
 
-Rocky automatically detects schema drift between source and target tables and resolves it using **graduated evolution** -- safe type widenings are handled with `ALTER TABLE` (preserving data), while unsafe changes trigger a full refresh.
+Rocky automatically detects schema drift between source and target tables and resolves it using **graduated evolution** -- safe type widenings are handled with `ALTER TABLE` (preserving data) where the warehouse supports the change, while unsafe changes trigger a full refresh.
 
 ![Two rocky run invocations sandwiching an ALTER TABLE; the second run reports "Drift: 1/1 tables drifted"](/demo-drift-recover.gif)
 
@@ -21,6 +21,8 @@ Schema drift in Rocky means **column type mismatches** between source and target
 4. Safe widenings are resolved with `ALTER TABLE ALTER COLUMN`
 5. Unsafe changes trigger `DROP TABLE IF EXISTS` followed by full refresh
 
+The check runs as part of each table's copy, whenever the target already exists. Two cases bypass it. With the opt-in `prune_unchanged` optimization, a table whose source reports an unchanged change-marker since the last successful copy is skipped entirely — copy, drift check, and data checks — so drift is only re-evaluated once the source changes again. And a failed `DESCRIBE TABLE` is swallowed rather than failing the run: an unreadable target is treated as absent and rebuilt with a full refresh, and an unreadable source produces no drift result for that run, so the copy proceeds unchecked.
+
 ## Graduated Evolution
 
 ### Safe Type Widenings
@@ -29,15 +31,22 @@ These type changes preserve data and are handled with `ALTER TABLE` without a fu
 
 | From | To | Example |
 |---|---|---|
-| `INT` | `BIGINT` | Integer widening |
+| `INT` | `BIGINT` | Integer widening (also `TINYINT`/`SMALLINT` upward) |
 | `FLOAT` | `DOUBLE` | Float precision widening |
-| `DECIMAL(p1, s)` | `DECIMAL(p2, s)` | Decimal precision increase (p2 > p1) |
+| `DECIMAL(p1, s)` | `DECIMAL(p2, s)` | Decimal precision increase (p2 > p1, same scale) |
 | `VARCHAR(n1)` | `VARCHAR(n2)` | String length increase (n2 > n1) |
+| numeric / `BOOLEAN` | `STRING` | Representation change (lossless) |
 
 ```sql
 ALTER TABLE acme_warehouse.staging__us_west__shopify.orders
 ALTER COLUMN amount TYPE DECIMAL(12, 2)
 ```
+
+Classification is per-dialect. The table above is the engine's default allowlist, verified end-to-end on DuckDB. Snowflake and BigQuery override it with narrower rules aligned with what their `ALTER COLUMN` accepts: Snowflake allows only `NUMBER(p,s)` precision widening and `VARCHAR` length widening (integer types all canonicalize to `NUMBER(38,0)` in its `DESCRIBE TABLE` output, so integer widening never surfaces as drift there), and BigQuery allows only `INT64 → NUMERIC`, `INT64 → BIGNUMERIC`, and `NUMERIC → BIGNUMERIC` — numeric → `STRING` is not assignable on BigQuery and falls through to a full refresh.
+
+:::caution[Databricks and Trino execution gaps]
+Databricks and Trino currently inherit the default allowlist, and their `ALTER` execution paths have known gaps: Delta tables reject `ALTER COLUMN ... TYPE` changes unless the type-widening table feature is enabled (Rocky does not set it) and never accept numeric → `STRING`, and Trino requires `SET DATA TYPE` syntax the default statement doesn't use. On those warehouses, a drift classified as a safe widening fails that table's run with the warehouse's error — loud, never a silent divergence — instead of evolving the column in place; Rocky does not yet fall back to a full refresh on a failed `ALTER`. Tracked in [#1115](https://github.com/rocky-data/rocky/issues/1115).
+:::
 
 ### Unsafe Type Changes
 
@@ -52,12 +61,12 @@ Examples: `STRING` to `INT`, `BIGINT` to `INT` (narrowing), `DATE` to `TIMESTAMP
 
 ## What Is NOT Drift
 
-- **New columns in source** -- not a type mismatch, so not "drift" in the narrow sense, but still handled: Rocky issues `ALTER TABLE ADD COLUMN` for each before the next `INSERT ... SELECT *` (surfaced as the `add_columns` action). Without it, BigQuery / Snowflake / Databricks reject the INSERT.
+- **New columns in source** -- handled additively rather than as drift: the runtime issues `ALTER TABLE ADD COLUMN` for each (nullable, so historical rows stay `NULL`) before the copy, surfaced as an `add_columns` action
 - **Columns removed from source** -- extra columns in the target table are ignored
 
 ## Output
 
-Drift detection runs inline during `rocky run`; the actions taken are reported in the `drift` section of the run JSON output:
+Drift detection runs inline on replication runs; the actions taken are reported in the `drift` section of the run JSON output:
 
 ```json
 {
@@ -81,4 +90,6 @@ Use `rocky plan` to preview the SQL Rocky would emit (including any drop stateme
 rocky plan --filter client=acme --output json
 ```
 
-Three drift actions are surfaced in the run output: `drop_and_recreate` (unsafe type change -- the target is dropped and rebuilt from source), `alter_column_types` (every drifted column is a safe widening -- executed inline via `ALTER TABLE ALTER COLUMN`, preserving data), and `add_columns` (new source columns added via `ALTER TABLE ADD COLUMN` before the INSERT). Safe widenings are classified as `AlterColumnTypes` in `rocky-core` and applied during the run.
+Three actions are surfaced in the run output: `alter_column_types` (all drifted columns passed the safe-widening check and were altered in place), `drop_and_recreate` (at least one incompatible change; target rebuilt from the source), and `add_columns` (source-only columns added to the target).
+
+By default these mutations are applied automatically. With the opt-in drift-governance gate (`auto_apply_additive_drift` plus a `[policy]` grant for `schema_change.additive`), only provably additive, policy-allowed changes proceed; anything else is refused before it touches the target and surfaced as a require-review failure for that table.

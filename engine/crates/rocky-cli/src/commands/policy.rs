@@ -1,11 +1,15 @@
 //! `rocky policy` — explain a policy decision (`check`) and assert policy
 //! behaviour (`test`).
 //!
-//! `check` is explain-mode only (v0): loads the project's `[policy]` block,
-//! compiles the project to read the target model's attributes, evaluates the
-//! `(principal, capability, model)` triple against the policy, and prints
-//! the resolved effect + winning rule + reason. It does **not** gate any
-//! real command.
+//! `check` is a read-only explain surface: loads the project's `[policy]`
+//! block, compiles the project to read the target model's attributes,
+//! evaluates the `(principal, capability, model)` triple against the
+//! policy, and prints the resolved effect + winning rule + reason. The
+//! same evaluator is enforced at `apply`, `promote`, and the MCP write
+//! tools, but `check` reports the *static* base decision only — the live
+//! seams additionally project active freezes and autonomy-budget burn,
+//! which can only tighten the effect (an `allow` here can still be
+//! reviewed or denied at apply time; a `deny` stays a deny).
 //!
 //! `test` is the CI safety net: it runs the project's `[[policy.tests]]`
 //! scenarios through the *same* evaluator and fails (non-zero exit) if any
