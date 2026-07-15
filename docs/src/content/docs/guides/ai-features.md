@@ -348,10 +348,10 @@ rocky ai-test fct_daily_revenue --save
 Saved 3 tests for fct_daily_revenue
 ```
 
-Tests are saved to the `tests/` directory as SQL files that return 0 rows on success:
+Tests are saved to the `tests/` directory (a sibling of your models directory) as flat SQL files named `<model>_<assertion>.sql` that return 0 rows on success:
 
 ```sql
--- tests/fct_daily_revenue/grain_uniqueness.sql
+-- Test: grain_uniqueness
 -- No duplicate rows per date and category
 SELECT order_date, category, COUNT(*) as n
 FROM fct_daily_revenue
@@ -367,7 +367,7 @@ rocky ai-test --all --save --models models
 
 ### Run the generated tests
 
-Tests run with `rocky test` (DuckDB) and are included in `rocky ci`:
+The generated files are standalone SQL assertions — each returns 0 rows when it passes. `rocky test` and `rocky ci` do **not** pick them up automatically: `rocky test` executes your models on DuckDB and runs any `[[tests]]` declared in model TOML sidecars, but it does not read the saved `tests/` directory. Run the generated assertions yourself (for example against DuckDB), wire them into your own CI step, or translate them into `[[tests]]` blocks that `rocky test` executes:
 
 ```bash
 rocky test --models models
@@ -387,7 +387,6 @@ When using the [VS Code extension](/guides/ide-setup/), models with intent get e
 
 - **Hover**: Shows the intent description above the column list when hovering over a model name
 - **Document Symbols**: Intent appears as the first child of the model in the Outline panel
-- **Diagnostics**: The compiler warns when intent mentions columns that do not exist in the model's output schema
 
 ## 9. Best Practices for Intent Descriptions
 

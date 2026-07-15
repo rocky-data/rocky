@@ -46,8 +46,7 @@ table = "orders_summary"
 
 When intent is stored, Rocky can:
 
-- Detect when upstream schema changes might invalidate the model's purpose
-- Propose updates that preserve the original intent
+- Propose updates that preserve the original intent as models evolve
 - Generate test assertions that verify business requirements, not just technical correctness
 - Explain what a model does to new team members
 
@@ -76,7 +75,7 @@ Reads existing models and generates intent descriptions from the code. This is t
 
 ```bash
 # Explain a specific model
-rocky ai-explain --models models/ --model orders_summary
+rocky ai-explain --models models/ orders_summary
 
 # Explain all models that don't have intent yet
 rocky ai-explain --models models/ --all
@@ -89,7 +88,7 @@ When `--save` is used, Rocky writes the generated intent string into the model's
 
 ### rocky ai-sync
 
-Detects schema changes between compilations and proposes intent-guided updates to affected models:
+Proposes intent-guided updates to models that carry intent metadata:
 
 ```bash
 # Show proposed changes
@@ -105,12 +104,11 @@ rocky ai-sync --models models/ --model orders_summary
 The sync process:
 
 1. Compiles the project to build the current semantic graph and typed schemas
-2. Compares against the previous compilation (from the state store) to find schema changes
-3. For each model with intent that depends on changed upstream models, asks the LLM to propose an update that preserves the intent
-4. The proposed update goes through the compile-verify loop
-5. Changes are shown as diffs; `--apply` writes them to disk
+2. For each model that carries intent, asks the LLM to propose an update that preserves the declared intent
+3. The proposed update goes through the compile-verify loop
+4. Changes are shown as diffs; `--apply` writes them to disk
 
-Schema changes that sync detects include columns added, columns removed, columns renamed, and column type changes.
+Proposals are currently driven by each model's declared intent alone. Upstream schema-change detection (diffing added, removed, renamed, and type-changed columns against a persisted previous compilation) is designed but not yet wired: the state store does not yet snapshot prior compilation results, so `rocky ai-sync` prints a note that proposals are based on declared model intent only.
 
 ### rocky ai-test
 
@@ -118,7 +116,7 @@ Generates test assertions from a model's intent and schema:
 
 ```bash
 # Generate tests for a specific model
-rocky ai-test --models models/ --model orders_summary
+rocky ai-test --models models/ orders_summary
 
 # Generate tests for all models
 rocky ai-test --models models/ --all

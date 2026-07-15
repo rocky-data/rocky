@@ -65,7 +65,7 @@ are **never** swept regardless of configuration.
     history rows after 3 runs: 3
 
 ==> 'rocky state retention sweep --dry-run'  (plan only — no deletes)
-    plan: runs_deleted=2  runs_kept=1  domains=['history', 'lineage', 'audit']
+    plan: runs_deleted=2  runs_kept=1  domains=['history', 'lineage', 'audit']  duration_ms=0
     history rows after dry-run: 3  (unchanged — dry-run is a no-op)
 
 ==> 'rocky state retention sweep'  (apply)

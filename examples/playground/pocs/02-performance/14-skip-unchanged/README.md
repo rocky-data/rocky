@@ -99,6 +99,6 @@ POC complete: unchanged ⇒ skipped (#2), data changed ⇒ rebuilt (#3).
 
 ## Related
 
-- Source: `rocky/crates/rocky-cli/src/commands/skip_gate.rs` (the gate),
-  `rocky/crates/rocky-core/src/config.rs` (`[run]` config)
+- Source: `engine/crates/rocky-cli/src/commands/skip_gate.rs` (the gate),
+  `engine/crates/rocky-core/src/config.rs` (`[run]` config)
 - Companion POC: [`02-performance/01-incremental-watermark`](../01-incremental-watermark), for watermark state in incremental replication.

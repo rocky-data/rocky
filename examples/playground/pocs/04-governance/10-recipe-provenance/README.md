@@ -61,10 +61,11 @@ under a single `recipe_hash`.
     model=orders_clean
     recipe_hash      = 2148e619b51421f5...07453036
     input_hash       = 75ee2a328c52b236...c21b9c6  (proof_class=heuristic)
-    env_hash         = bbf2c204...991d92bd
+    env_hash         = 1df698e4...89abf00c
     hash_scheme      = v1
 
 === what produced this? rocky history --recipe <hash> ===
+    recipe_hash = 2148e619b51421f5...07453036
     executions of this exact program: 2
       run=run-...-341  model=orders_clean  status=success
       run=run-...-809  model=orders_clean  status=success

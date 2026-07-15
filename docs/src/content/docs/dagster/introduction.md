@@ -60,7 +60,8 @@ defs = dg.Definitions(assets=[acme_orders], resources={"rocky": rocky})
 
 ## Requirements
 
-- `dagster >= 1.13.0`
+- `dagster >= 1.13.8`
+- `rocky-sdk >= 0.6.0`
 - `pydantic >= 2.0`
 - `pygments >= 2.20.0`
 - The `rocky` binary must be available on `PATH` (or configured via `binary_path`). For deployment, you can vendor the binary under a `vendor/` directory and point `binary_path` to it.

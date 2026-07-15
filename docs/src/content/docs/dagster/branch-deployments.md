@@ -28,10 +28,12 @@ side-by-side without touching production data.
 import dagster as dg
 from dagster_rocky import (
     RockyResource,
-    RockyComponent,
+    load_rocky_assets,
     branch_deployment_info,
     branch_deploy_shadow_suffix,
 )
+
+rocky = RockyResource(config_path="rocky.toml")
 
 # Detect branch deployment context at load time
 info = branch_deployment_info()
@@ -41,11 +43,11 @@ if info.is_branch_deployment:
     print(f"Running in branch deployment {info.deployment_name} (PR {info.pr_number})")
     print(f"Shadow suffix: {shadow_suffix}")
     # Use the shadow suffix when invoking rocky run manually:
-    # rocky.run(filter="tenant=acme", shadow=True, shadow_suffix=shadow_suffix)
+    # rocky.run(filter="tenant=acme", shadow_suffix=shadow_suffix)
 
 defs = dg.Definitions(
-    assets=[RockyComponent(config_path="rocky.toml")],
-    resources={"rocky": RockyResource(config_path="rocky.toml")},
+    assets=load_rocky_assets(rocky),
+    resources={"rocky": rocky},
 )
 ```
 
@@ -71,9 +73,13 @@ Rocky's shadow mode:
 | Context | Returned suffix |
 |---|---|
 | Not a branch deployment | `None` |
-| PR-driven branch deploy | `"_dagster_pr_<pr_number>"` |
+| PR-driven branch deploy (numeric PR id) | `"_dagster_pr_<pr_number>"` |
 | API-driven branch deploy | `"_dagster_<sanitized_deployment_name>"` |
 | Branch deploy with no name | `"_dagster_branch"` |
+
+A non-numeric or malformed `DAGSTER_CLOUD_PULL_REQUEST_ID` is rejected and
+falls through to the `"_dagster_<sanitized_deployment_name>"` branch — the raw
+PR id is never interpolated into the suffix.
 
 Sanitization replaces SQL-unsafe characters (anything that isn't
 alphanumeric or underscore) with `_`. Rocky's identifier validation
@@ -102,19 +108,35 @@ and just rebroadcasts the asset diff Dagster+ already renders in the UI.
 Detection plus shadow-suffix derivation is the credential-free,
 host-agnostic piece worth shipping.
 
-## Future work
+## Resource-level auto-shadow
 
 `RockyResource.run()` accepts a `shadow_suffix` kwarg today, so manual
-wiring works end-to-end. A resource-level `shadow_mode="branch_deploy"`
-default that auto-derives the suffix on every call is still aspirational:
+wiring works end-to-end. To auto-derive the suffix on every `run()` /
+`run_streaming()` / `run_pipes()` call, wire the exported
+`shadow_suffix_resolver()` into the resource's `shadow_suffix_fn`:
 
 ```python
-# Future API (not yet shipped) — resource-level auto-shadow
+from dagster_rocky import RockyResource, shadow_suffix_resolver
+
+rocky = RockyResource(
+    config_path="rocky.toml",
+    shadow_suffix_fn=shadow_suffix_resolver(),  # auto-shadow in branch deploys
+)
+```
+
+The resolver calls `branch_deploy_shadow_suffix()` per run and fires only when
+the caller didn't pass an explicit `shadow_suffix`; outside a branch deployment
+it resolves to `None`, so production runs are unaffected.
+
+## Future work
+
+A config-string `shadow_mode="branch_deploy"` sugar over the `shadow_suffix_fn`
+wiring above is still aspirational:
+
+```python
+# Future API (not yet shipped) — config-string sugar over shadow_suffix_fn
 rocky = RockyResource(
     config_path="rocky.toml",
     shadow_mode="branch_deploy",  # auto-shadow when in branch deploy
 )
 ```
-
-For now, wire the detection + suffix derivation into each call site (or a
-RockyResource subclass).

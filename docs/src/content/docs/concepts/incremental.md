@@ -104,7 +104,7 @@ This catches scenarios that watermarks miss: backfills, late-arriving correction
 
 ## Column-level change propagation
 
-The compiler's semantic graph (see [The Rocky Compiler](/concepts/compiler)) tracks column-level lineage across the entire DAG. Rocky uses this lineage to skip downstream models that do not depend on any changed columns.
+The compiler's semantic graph (see [The Rocky Compiler](/concepts/compiler/)) tracks column-level lineage across the entire DAG. Rocky uses this lineage to skip downstream models that do not depend on any changed columns.
 
 ### Example
 
@@ -216,7 +216,7 @@ If the state store has no watermark for a table (the table is new, the state bac
 
 ## State store
 
-Watermarks and partition checksums are stored in an embedded key-value store backed by [redb](https://github.com/cberner/redb). See the [State Management](/concepts/state-management) page for details on the state store, remote persistence backends, and the state lifecycle.
+Watermarks and partition checksums are stored in an embedded key-value store backed by [redb](https://github.com/cberner/redb). See the [State Management](/concepts/state-management/) page for details on the state store, remote persistence backends, and the state lifecycle.
 
 The state store tracks:
 

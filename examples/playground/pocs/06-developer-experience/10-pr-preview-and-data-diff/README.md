@@ -7,38 +7,58 @@
 
 ## What it shows
 
-The end-to-end `rocky preview` workflow that turns a PR into a single
-review surface (changed rows, affected columns, cost delta, data diff) on a
-5-model DuckDB transformation pipeline:
+The three `rocky preview` subcommands and their JSON output schemas,
+driven end-to-end on a 5-model DuckDB transformation pipeline:
 
-1. **`rocky preview create --base <ref>`** — git-diff identifies changed
-   model files between `<ref>` and HEAD; the compiler IR computes a
-   **column-level prune set**; every model *not* in the prune set is
-   copied from the base schema via CTAS into a per-PR branch
-   schema; the prune set re-executes against the branch.
+1. **`rocky preview create --base <ref>`** — `git diff <ref>...HEAD`
+   identifies the model files that changed *between two committed refs*;
+   those changed models plus their transitive downstream form the
+   **prune set**; every model *not* in the prune set is copied from the
+   base schema via CTAS into a per-PR branch schema (`branch__<name>`);
+   the prune set re-executes against the branch.
 2. **`rocky preview diff`** — structural (column added/removed/type
    changed) plus row-level diff between branch and base for every
-   model in the prune set. Each per-model entry carries an
-   `algorithm` tagged enum picking which row-level technique ran:
-   `kind: "sampled"` (default: `LIMIT N` rows ordered by primary
-   key, with `sampling_window.coverage_warning`) or `kind:
-   "bisection"` (`--algorithm bisection`: exhaustive
-   checksum-bisection over a single-column integer / numeric
-   `unique_key`). The POC runs both invocations to demonstrate the
-   discriminator shape.
+   model in the prune set. A `--sample-size N` sampled row diff is the
+   default; `--algorithm bisection` switches on exhaustive
+   checksum-bisection for models declaring a single-column integer /
+   numeric `unique_key` on a `Merge` strategy. The POC runs both
+   invocations to demonstrate the two entry points.
 3. **`rocky preview cost`** — per-model bytes / duration / USD delta
-   versus the latest base-schema run. Copied models contribute to
-   `savings_from_copy_usd`; only re-run models contribute to
-   `delta_usd`. When `[budget]` is configured, surfaces
-   `projected_budget_breaches` so a reviewer (and the CI gate) sees
-   *"this PR would breach `max_usd` if merged"* before merge.
+   versus the latest base-schema run. Copied models contribute cost
+   savings; only re-run models contribute to the delta. When `[budget]`
+   is configured, the output surfaces projected budget breaches so a
+   reviewer (and the CI gate) sees *"this PR would breach `max_usd` if
+   merged"* before merge.
 
-The 5-model DAG (`raw_orders` + `raw_customers` → `stg_orders` +
-`dim_customers` → `fct_revenue`) gives the prune-set computation
-something non-trivial to chew on: a change to `fct_revenue` prunes
-exactly itself; a change to `raw_orders.amount` prunes `raw_orders →
-stg_orders → fct_revenue` and copies `raw_customers + dim_customers`
-from base.
+The 5-model DAG is `raw_orders` + `raw_customers` → `stg_orders` +
+`dim_customers` → `fct_revenue`. On a **real PR** — where the model
+change is a committed diff between `main` and the PR HEAD — a change to
+`fct_revenue` prunes exactly itself, and a change to `raw_orders` prunes
+`raw_orders → stg_orders → fct_revenue` while `raw_customers +
+dim_customers` are copied from base.
+
+### What the local `./run.sh` actually produces
+
+**Read this before comparing output to the narrative above.** The prune
+set is computed from a **committed** `git diff <base>...HEAD`, but
+`run.sh` applies its synthetic `fct_revenue` edit to the *working tree*
+without committing it (POCs don't create commits). So in a local run:
+
+- `git diff <base>...HEAD` sees **no** changed model files → the prune
+  set is **empty**.
+- With an empty prune set, `preview create` copies **all 5** models from
+  the base schema via CTAS (`copy_strategy: "ctas"`) and re-runs none;
+  `run_status` is `"planned"` with an empty `run_id`.
+- Because no model was re-run on the branch, there is no branch run in
+  the state store, so `preview diff` reports `models: []` (*"No paired
+  runs in the state store"*) and `preview cost` reports an empty
+  `branch_run_id` (*"No branch run yet"*).
+
+The local run therefore exercises the **CLI surface, branch
+registration, CTAS copy-from-base, and all three output schemas** — but
+the non-empty prune set, the row-level data diff, and the cost delta
+only light up when the change is a committed diff, which is how the
+composite GitHub Action drives `preview` in CI.
 
 ## Why it's distinctive
 
@@ -93,13 +113,17 @@ Compare:
 │   ├── dim_customers.sql     project customer attributes
 │   ├── fct_revenue.sql       join + group → total per customer
 │   └── fct_revenue.sql.changed   synthetic-PR variant (added WHERE)
-└── expected/
-    ├── compile.json                   from `rocky compile`
-    ├── run_main.json                  from `rocky run`
-    ├── preview_create.example.json    shape contract for `rocky preview create`
-    ├── preview_diff.example.json      shape contract for `rocky preview diff`
-    └── preview_cost.example.json      shape contract for `rocky preview cost`
+└── expected/                    generated by run.sh, gitignored
+    ├── compile.json                 from `rocky compile`
+    ├── run_main.json                from `rocky run`
+    ├── preview_create.json          from `rocky preview create`
+    ├── preview_diff.json            from `rocky preview diff` (sampled)
+    ├── preview_diff_bisection.json  from `rocky preview diff --algorithm bisection`
+    └── preview_cost.json            from `rocky preview cost`
 ```
+
+The `expected/` directory is regenerated on every run and is gitignored,
+so a fresh checkout ships none of these files until `./run.sh` runs.
 
 ## Note on model surfaces
 
@@ -118,9 +142,9 @@ handlers were still scaffolding; that scaffolding is gone, and the script
 now treats `preview create / diff / cost` like any other production CLI
 command (`set -e` enforces failure).
 
-The `expected/preview_*.example.json` files remain as the shape contract
-that the live `expected/preview_*.json` outputs should match modulo
-non-deterministic fields (timestamps, branch suffixes, hashes).
+The live `expected/preview_*.json` outputs are captured on each run for
+inspection; they are gitignored and vary in their non-deterministic
+fields (timestamps, branch schema, run ids) run to run.
 
 ## Prerequisites
 
@@ -142,15 +166,19 @@ cd examples/playground/pocs/06-developer-experience/10-pr-preview-and-data-diff
 4. Runs the pipeline on `main` state.
 5. Captures the current git HEAD as the `--base` ref (or a sentinel
    string when not in a git checkout).
-6. Swaps `models/fct_revenue.sql` for `fct_revenue.sql.changed`, adding a
-   `WHERE s.amount > 25` filter that produces a real row-level diff.
-7. `rocky preview create --base <ref> --name pr-preview-poc-10` —
-   materializes the per-PR branch schema and copies unchanged upstream
-   from the base via DuckDB CTAS.
-8. `rocky preview diff --name pr-preview-poc-10` — structural + sampled
+6. Swaps `models/fct_revenue.sql` for `fct_revenue.sql.changed` in the
+   working tree, adding a `WHERE s.amount > 25` filter. (This edit is
+   *uncommitted* — see "What the local `./run.sh` actually produces": the
+   prune set is computed from committed refs, so this working-tree swap
+   does not appear in the prune set.)
+7. `rocky preview create --base <ref> --name pr_preview_poc_10` —
+   registers the branch and, with an empty prune set, copies all 5
+   models from the base schema via DuckDB CTAS
+   (`copy_strategy: "ctas"`).
+8. `rocky preview diff --name pr_preview_poc_10` — structural + sampled
    row diff between branch and base. Re-invoked with `--algorithm
-   bisection` to demonstrate the tagged-enum output shape.
-9. `rocky preview cost --name pr-preview-poc-10` — per-model bytes /
+   bisection`. Both report no paired branch run in a local run.
+9. `rocky preview cost --name pr_preview_poc_10` — per-model bytes /
    duration / USD delta vs. the latest base run.
 10. Reverts the synthetic change (`trap`-protected, idempotent).
 

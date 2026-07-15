@@ -34,7 +34,7 @@ Each primitive below is tied to its real CLI surface or diagnostic code. The inl
 
 ### Compile-time types and diagnostics
 
-Rocky infers column-level types across the whole DAG and surfaces problems as diagnostic codes you can grep in CI logs. The codes run from `E001` through `E027` for errors, with `W` warnings and `P` lints alongside. Compilation fails on any error-level diagnostic, which is the entire point: the failure mode becomes a non-zero exit code at PR time rather than a wrong number in production.
+Rocky infers column-level types across the whole DAG and surfaces problems as diagnostic codes you can grep in CI logs. The codes run from `E001` through `E035` for errors, with `W` warnings and `P` lints alongside. Compilation fails on any error-level diagnostic, which is the entire point: the failure mode becomes a non-zero exit code at PR time rather than a wrong number in production.
 
 **Shipped.** This is the foundation the other primitives build on.
 
@@ -56,9 +56,9 @@ The branch isolation you get today is schema-prefix isolation, not a warehouse-n
 
 ### Per-model cost
 
-Rocky records per-model cost on every run, which makes cost a property of a model rather than a line on an invoice. On BigQuery, bytes-scanned maps directly to billing, so the figure is billing-exact. On Databricks and Snowflake it is a duration × DBU-rate estimate (warehouse-reported bytes plumbing is a follow-up); on DuckDB it is zero.
+Rocky records per-model cost on every run, which makes cost a property of a model rather than a line on an invoice. On BigQuery, bytes-scanned maps directly to billing, so the figure is billing-exact. On Databricks and Snowflake the cost figure is a duration × DBU-rate estimate; Databricks already reports warehouse-scanned bytes (surfaced for observability, since it is DBU-priced rather than bytes-priced), while Snowflake's bytes plumbing is still a follow-up. On DuckDB it is zero.
 
-**Partial.** Per-model cost populates on every run; it is billing-exact on BigQuery and a duration-based estimate on Databricks/Snowflake until their bytes plumbing lands.
+**Partial.** Per-model cost populates on every run; it is billing-exact on BigQuery and a duration-based estimate on Databricks/Snowflake (Databricks surfaces scanned bytes for observability; Snowflake's bytes plumbing is the follow-up).
 
 ### Compile-time contracts
 
@@ -71,21 +71,22 @@ A `.contract.toml` declares what a model must produce, and the compiler checks t
 
 Any of these fails compilation, so a broken contract is a red CI check, not a production surprise.
 
-These contracts are intra-project. They validate a model against a contract inside the same Rocky project. There is no cross-project or cross-team contract-enforcement mechanism in Rocky today. A team publishing a contract that another team's separate project must honor, enforced at compile time across that boundary, is something Rocky is shaped to support but does not yet ship.
+The `E010`–`E013` codes are intra-project: they validate a model against a contract inside the same Rocky project. Cross-team enforcement across a project boundary also ships, through a vendored-snapshot mechanism. A producer runs `rocky publish-ir` to publish a snapshot of its compiled IR; a consumer vendors that snapshot and declares an `[imports.<name>]` block (with `baseline`, `snapshot`, and an optional `pin`), maintained via `rocky imports update [--check]`. The consumer's `rocky compile` then diffs baseline against snapshot and fails on a producer's breaking change: `E030` (a column the consumer reads was dropped), `E031` (its type narrowed), `E032` (nullable tightened to NOT NULL), `E033` (snapshot drifted from the pinned recipe hash), and `E034` (snapshot format newer than this build), with `W030`/`W031` for non-breaking additions and widenings. See [Cross-Team Contracts](/concepts/cross-team-contracts/) for the full workflow.
 
-**Shipped intra-project (`E010`–`E013`). Cross-team / cross-project contract enforcement is not yet.**
+**Shipped.** Intra-project (`E010`–`E013`) and cross-team via published-IR snapshots (`E030`–`E034`, enforced at the consumer's compile).
 
 ### Declarative governance
 
 Rocky models governance as code through a `GovernanceAdapter`: tag management, grant and revoke, workspace bindings, column tags, masking policies bound to classification tags, and role-graph reconciliation. How much of that surface is real depends entirely on the warehouse.
 
 - **Databricks** implements the full surface through Unity Catalog.
-- **Snowflake** and **BigQuery** support `GRANT` and `REVOKE` reconciliation, not the deeper tag and masking surface.
+- **Snowflake** reconciles object tags (`ALTER … SET TAG`) and `GRANT`/`REVOKE` role grants, plus retention policy; workspace binding and masking are not driven.
+- **BigQuery** reconciles tags as labels (`ALTER … SET OPTIONS(labels=…)`); grants map to IAM, so `apply_grants`/`revoke_grants` currently log and no-op — actual IAM integration is a follow-up.
 - **DuckDB** is a no-op, since it has no governance model to drive.
 
 So declarative governance at depth is a Databricks capability today. The skeleton is warehouse-neutral; the depth is not yet portable.
 
-**Partial.** Full on Databricks; `GRANT`/`REVOKE` only on Snowflake and BigQuery; no-op on DuckDB.
+**Partial.** Full on Databricks; tags + `GRANT`/`REVOKE` on Snowflake; label-based tagging only on BigQuery (grants no-op, IAM follow-up); no-op on DuckDB.
 
 ### Schema drift handling
 
@@ -113,9 +114,9 @@ Content-addressed materialization itself ships for single-writer Delta and UniFo
 
 ### VS Code trust overlays
 
-The VS Code extension renders the lineage graph and overlays four trust signals onto it, each backed by a real CLI command:
+The VS Code extension renders the lineage graph and overlays four trust signals onto it, each backed by CLI output:
 
-1. **Drift**: schema drift against the live warehouse.
+1. **Drift**: schema drift against the warehouse. The overlay expects a dedicated drift command; there is no standalone `rocky drift` subcommand yet (drift is detected inside `rocky run`/`rocky plan`), so this overlay degrades gracefully to unavailable until that surface lands.
 2. **Breaking**: breaking changes from the semantic CI diff.
 3. **Replay**: the last recorded run for each model.
 4. **Governance**: compliance and masking status.
@@ -137,9 +138,9 @@ Every load-bearing claim, in one table. The partial and not-yet rows are where t
 | Branches | Partial | Schema-prefix isolation with signed approval/promotion; no warehouse-native zero-copy clones yet. |
 | Replay | Partial | Deterministic recording + ledger verification, plus re-execution (`rocky replay --execute --verify`, local or `--warehouse`) for deterministic content-addressed models; mutable-source models are `non_replayable`, non-deterministic recipes flagged. |
 | Content-addressed writes | Partial | Single-writer Delta/UniForm; no multi-writer, broad schema evolution, or deletion vectors yet. |
-| Per-model cost | Partial | Billing-exact on BigQuery; a duration × DBU-rate estimate on Databricks and Snowflake; zero on DuckDB. Warehouse-reported-bytes plumbing on the non-BigQuery adapters is the follow-up. |
-| Declarative governance | Partial | Full on Databricks (Unity Catalog); `GRANT`/`REVOKE` only on Snowflake and BigQuery; no-op on DuckDB. |
-| Cross-team / cross-project contract enforcement | Not yet | Contracts are intra-project today; cross-boundary enforcement is the shape Rocky is built toward, not a current capability. |
+| Per-model cost | Partial | Billing-exact on BigQuery; a duration × DBU-rate estimate on Databricks and Snowflake; zero on DuckDB. Databricks surfaces scanned bytes for observability; Snowflake's warehouse-reported-bytes plumbing is the follow-up. |
+| Declarative governance | Partial | Full on Databricks (Unity Catalog); tags + `GRANT`/`REVOKE` on Snowflake; label-based tagging only on BigQuery (grants no-op, IAM follow-up); no-op on DuckDB. |
+| Cross-team / cross-project contract enforcement | Shipped | Producer `rocky publish-ir` → consumer `[imports.<name>]` vendored snapshot → `E030`–`E034` enforced at the consumer's `rocky compile`. |
 
 ## What to lead with
 

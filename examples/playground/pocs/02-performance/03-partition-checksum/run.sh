@@ -39,7 +39,7 @@ duckdb poc.duckdb -c \
 
 # ---------------------------------------------------------------------------
 # Step 2 — Backfill the entire range 2026-04-04 → 2026-04-08.
-# Expected: 6 output rows total (one per (date, customer) pair across the
+# Expected: 7 output rows total (one per (date, customer) pair across the
 # 5 days). 04-07 is recomputed and produces the same 2 rows as Step 1.
 # ---------------------------------------------------------------------------
 rocky -c rocky.toml -o json run \
@@ -94,7 +94,7 @@ fi
 echo
 echo "✓ POC complete: time_interval handled the late correction cleanly."
 echo "  - Step 1: ran partition 2026-04-07 in isolation (2 rows)"
-echo "  - Step 2: backfilled 2026-04-04 → 2026-04-08 (6 rows total)"
+echo "  - Step 2: backfilled 2026-04-04 → 2026-04-08 (7 rows total)"
 echo "  - Step 3: re-ran 2026-04-07 after late insert → customer 3 picked up"
 echo
 echo "Inspect expected/*.json and expected/state-*.txt for the captured output."

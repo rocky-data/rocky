@@ -12,6 +12,12 @@ duckdb poc.duckdb < data/seed.sql
 rocky validate
 
 echo "=== Configured webhooks ==="
+# NOTE: `rocky hooks list --output json` currently reports shell-command hooks
+# only; the five webhook presets configured in rocky.toml are validated by
+# `rocky validate` above but do not appear here (the JSON entries have no
+# webhook representation). The `total: 0` below is expected until the engine
+# surfaces webhooks in `hooks list` — the presets are still parsed and fire
+# during pipeline execution. See README "Why does hooks list show total: 0?".
 rocky -c rocky.toml -o json hooks list > expected/hooks_list.json 2>&1 || true
 cat expected/hooks_list.json 2>/dev/null | head -40 || echo "(hooks list output)"
 

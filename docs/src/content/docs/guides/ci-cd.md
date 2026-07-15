@@ -76,7 +76,7 @@ This is **reporting-only**: the verdict never gates the plan, and `breaking_verd
 The breaking-change classifier compares the typed **output schema** of each model (columns, types, nullability, materialization keys, masks, target). It is **blind to schema-stable value changes**: a `WHERE` / `JOIN`-key / `CASE` rewrite that changes every output row but leaves the column list and types untouched produces **no finding**. An empty `breaking_verdict.findings` therefore means "no output-schema change was detected"; it is **not** a completeness or safety signal that the data is unchanged. The verdict carries this statement verbatim in its `caveat` field so a JSON-only consumer can't miss it. To see whether values moved, pair it with [`rocky preview`](/guides/preview-a-pr/) (row-level diff on real data).
 :::
 
-The hard gate lives on `rocky plan promote` + `rocky apply`. When promoting a branch to production, Rocky runs the same classifier against `--base-ref` (default `main`); any finding with `severity == "breaking"` blocks the promote at plan time and the apply step refuses to execute the plan. To override (e.g. a planned breaking release with downstream consumers already migrated), pass `--allow-breaking` at plan time. The override emits a `breaking_changes_allowed` audit event so the bypass leaves a paper trail.
+The hard gate lives on `rocky plan promote` + `rocky apply`. When promoting a branch to production, Rocky runs the same classifier against `--base` (default `main`); any finding with `severity == "breaking"` blocks the promote **at plan time**. The gate fires once: a blocked promote never produces a `plan_id`, so there is nothing for `rocky apply` to run. The gate results are captured in the persisted plan and are **not** re-evaluated at apply time — `rocky apply` replays the recorded verdict rather than re-running the classifier. To override (e.g. a planned breaking release with downstream consumers already migrated), pass `--allow-breaking` at plan time. The override emits a `breaking_changes_allowed` audit event so the bypass leaves a paper trail.
 
 ```bash
 # PR-time: detect (informational)
@@ -205,6 +205,7 @@ Parse the JSON output to post a summary comment on the PR:
 rocky-ci:
   image: python:3.13-slim
   before_script:
+    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
     - curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
     - export PATH="$HOME/.local/bin:$PATH"
   script:
@@ -229,6 +230,7 @@ rocky-compile:
   stage: compile
   image: python:3.13-slim
   before_script:
+    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
     - curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
     - export PATH="$HOME/.local/bin:$PATH"
   script:
@@ -243,13 +245,11 @@ rocky-test:
   image: python:3.13-slim
   needs: [rocky-compile]
   before_script:
+    - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
     - curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
     - export PATH="$HOME/.local/bin:$PATH"
   script:
     - rocky test --models models --contracts contracts
-  artifacts:
-    reports:
-      junit: test-report.xml
   rules:
     - changes:
         - models/**
@@ -293,12 +293,12 @@ rocky ai-explain --all --save --models models
 rocky ai-test --all --save --models models
 ```
 
-This creates test files in the `tests/` directory. Commit them to your repository. They run as part of `rocky ci` and `rocky test` on every PR.
+This writes one `.sql` file per assertion into the `tests/` directory (a sibling of `models/`). These are standalone SQL assertion files — `rocky ci` and `rocky test` do **not** pick them up automatically (those commands execute your models and any `[[test]]` sidecar blocks, not loose `tests/*.sql` files). Commit them and run them yourself as a dedicated CI step (execute each assertion against DuckDB), or use declarative `[[tests]]` in model sidecars with `rocky test --declarative` for gating that Rocky runs directly.
 
 ### Generate tests for a single model
 
 ```bash
-rocky ai-test --model revenue_summary --save --models models
+rocky ai-test revenue_summary --save --models models
 ```
 
 ### CI workflow with AI test generation
@@ -412,15 +412,15 @@ All CI-related commands produce structured JSON for programmatic consumption.
   "has_errors": true,
   "diagnostics": [
     {
-      "severity": "error",
+      "severity": "Error",
       "code": "E001",
       "model": "fct_revenue",
       "message": "unknown column 'nonexistent'",
-      "span": { "file": "models/fct_revenue.sql", "line": 5, "column": 9 },
+      "span": { "file": "models/fct_revenue.sql", "line": 5, "col": 9 },
       "suggestion": "did you mean 'revenue'?"
     }
   ],
-  "compile_timings": { "load_ms": 5, "resolve_ms": 1, "typecheck_ms": 12 }
+  "compile_timings": { "project_load_ms": 5, "semantic_graph_ms": 1, "typecheck_ms": 12, "typecheck_join_keys_ms": 3, "contracts_ms": 2, "total_ms": 23 }
 }
 ```
 
@@ -446,5 +446,5 @@ Parse with `jq` for custom CI reporting:
 rocky ci -o json | jq -e '.tests_failed == 0'
 
 # Extract error messages
-rocky compile -o json | jq '.diagnostics[] | select(.severity == "error") | .message'
+rocky compile -o json | jq '.diagnostics[] | select(.severity == "Error") | .message'
 ```

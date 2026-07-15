@@ -1,19 +1,20 @@
 -- Seed data for 12-replication-table-overrides POC.
 --
 -- Two source schemas:
---   raw__orders   — matched by Rules 1–4 (connector-level and table-level overrides)
---   raw__events   — matched by Rules 5–6 (glob + incremental override)
+--   raw__orders   — matched by Rules 1–3 (connector-level, table-level, glob overrides)
+--   raw__events   — matched by Rules 4–5 (glob disable + incremental override)
 --
--- Tables that Rule 4 / 5 will disable (enabled = false):
---   raw__orders._diagnostics_sync  ← matches glob _diagnostics_*
---   raw__events.user_01            ← matches glob user_?? in raw__events
---   raw__events.user_02            ← matches glob user_?? in raw__events
+-- Tables that Rule 3 / 4 will disable (enabled = false):
+--   raw__orders._diagnostics_sync  ← matches glob _diagnostics_* (Rule 3)
+--   raw__events.user_01            ← matches glob user_?? in raw__events (Rule 4)
+--   raw__events.user_02            ← matches glob user_?? in raw__events (Rule 4)
 
 -- ── raw__orders ─────────────────────────────────────────────────────────────
 
 CREATE SCHEMA IF NOT EXISTS raw__orders;
 
--- orders: Rule 2 sets strategy = "merge", merge_keys = ["order_id"] (from Rule 1)
+-- orders: Rule 2 sets strategy = "incremental", timestamp_column = "ordered_at";
+--         merge_keys = ["order_id"] inherited from Rule 1
 CREATE OR REPLACE TABLE raw__orders.orders AS
 SELECT
     CAST(i AS BIGINT)                                    AS order_id,
@@ -26,7 +27,8 @@ SELECT
         + (INTERVAL '10 minutes' * (i - 1))             AS ordered_at
 FROM generate_series(1, 50) AS t(i);
 
--- order_items: Rule 3 sets strategy = "incremental", timestamp_column = "created_at"
+-- order_items: no strategy override — keeps the full_refresh pipeline default;
+--              inherits merge_keys = ["order_id"] from Rule 1
 CREATE OR REPLACE TABLE raw__orders.order_items AS
 SELECT
     CAST(i AS BIGINT)                                    AS item_id,
@@ -38,7 +40,7 @@ SELECT
         + (INTERVAL '8 minutes' * (i - 1))              AS created_at
 FROM generate_series(1, 100) AS t(i);
 
--- _diagnostics_sync: Rule 4 (glob `*`) disables this table — never replicated
+-- _diagnostics_sync: Rule 3 (glob `*`) disables this table — never replicated
 CREATE OR REPLACE TABLE raw__orders._diagnostics_sync AS
 SELECT
     CAST(i AS BIGINT)                              AS sync_id,
@@ -51,7 +53,7 @@ FROM generate_series(1, 5) AS t(i);
 
 CREATE SCHEMA IF NOT EXISTS raw__events;
 
--- events: Rule 6 sets strategy = "incremental", timestamp_column = "occurred_at"
+-- events: Rule 5 sets strategy = "incremental", timestamp_column = "occurred_at"
 CREATE OR REPLACE TABLE raw__events.events AS
 SELECT
     CAST(i AS BIGINT)                                    AS event_id,
@@ -64,7 +66,7 @@ SELECT
         + (INTERVAL '5 minutes' * (i - 1))              AS occurred_at
 FROM generate_series(1, 80) AS t(i);
 
--- user_01, user_02: Rule 5 (glob `??`) disables both — never replicated
+-- user_01, user_02: Rule 4 (glob `??`) disables both — never replicated
 CREATE OR REPLACE TABLE raw__events.user_01 AS
 SELECT 1 AS user_id, 'alice' AS username, TIMESTAMP '2026-05-01' AS created_at;
 

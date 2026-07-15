@@ -33,5 +33,6 @@ truncate_first = true
 type = "transformation"
 depends_on = ["ingest"]
 
+# transformation pipelines require a [target] block; the per-model schema is set
+# in each model's sidecar .toml, so this stays empty (adapter defaults to "default").
 [pipeline.route.target]
-adapter = "default"

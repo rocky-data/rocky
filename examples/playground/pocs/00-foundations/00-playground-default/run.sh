@@ -2,13 +2,12 @@
 # 00-playground-default — runnable, inspectable transformation pipeline.
 set -euo pipefail
 
-export ROCKY_SUPPRESS_DEPRECATION=1
-
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
 mkdir -p expected
-rm -f .rocky-state.redb playground.duckdb
+rm -f .rocky-state.redb .rocky-state.redb.lock playground.duckdb
+rm -f models/.rocky-state.redb models/.rocky-state.redb.lock
 
 echo "=== seed ==="
 duckdb playground.duckdb < data/seed.sql

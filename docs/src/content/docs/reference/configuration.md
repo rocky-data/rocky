@@ -114,7 +114,7 @@ Each `[adapter.NAME]` block defines one adapter instance. The `name` is arbitrar
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `type` | string | Yes | Adapter type. One of `"databricks"`, `"snowflake"`, `"duckdb"`, `"fivetran"`, `"manual"`. |
+| `type` | string | Yes | Adapter type. One of `"databricks"`, `"snowflake"`, `"duckdb"`, `"bigquery"`, `"trino"`, `"fivetran"`, `"airbyte"`, `"iceberg"`, `"manual"`. An unrecognized value is a hard error. |
 | `retry` | table | No | Retry policy (see [`[adapter.NAME.retry]`](#adapternameretry)). |
 | `extra` | table | No | Escape hatch for adapter-specific keys Rocky's typed config doesn't model (see below). |
 
@@ -124,7 +124,7 @@ The top-level adapter fields are strictly validated: an unrecognized key (a typo
 
 ```toml
 [adapter.my_warehouse]
-type = "process"
+type = "trino"
 
 [adapter.my_warehouse.extra]
 default_schema = "analytics"
@@ -584,7 +584,7 @@ Parallelism and error handling.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `concurrency` | integer | `8` | Maximum number of tables processed in parallel. |
+| `concurrency` | string \| integer | `"adaptive"` | Max tables processed in parallel. `"adaptive"` (default) uses an AIMD throttle starting at 32 and adjusting to rate-limit signals — best for remote warehouses. A fixed integer (e.g. `8`) pins concurrency; `1` is serial. |
 | `fail_fast` | bool | `false` | Abort all remaining tables on first error. |
 | `error_rate_abort_pct` | integer | `50` | Abort if error rate exceeds this percentage (0–100). Set to 0 to disable. |
 | `table_retries` | integer | `1` | Times to retry failed tables after the initial parallel phase. Set to 0 to disable. |
@@ -972,7 +972,7 @@ on_breach = "error"
 
 All three limits are independent and composed with all-OR: any single dimension breach trips the `budget_breach` event (and, with `on_breach = "error"`, fails the run). They evaluate once per run against observed totals; per-model budgets are a follow-up. Subscribe to `on_budget_breach` under `[hook.*]` to route breaches into a notification system.
 
-Each [`BudgetBreachOutput`](./json-output) carries a `limit_type` tag (`"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"`) so consumers can branch on the breached dimension without string-matching the human message.
+Each [`BudgetBreachOutput`](/reference/json-output/) carries a `limit_type` tag (`"max_usd"`, `"max_duration_ms"`, or `"max_bytes_scanned"`) so consumers can branch on the breached dimension without string-matching the human message.
 
 ---
 
@@ -1258,46 +1258,53 @@ schema_template = "analytics"
 Configure shell scripts and webhooks to run at pipeline lifecycle events.
 
 ```toml
-# Shell hooks — run a command, pipe JSON context to stdin
-[[hook.pipeline_start]]
+# Shell hooks — run a command, pipe JSON context to stdin.
+# Event keys are always the `on_<event>` form; a key without the
+# `on_` prefix is treated as unknown and silently ignored.
+[[hook.on_pipeline_start]]
 command = "bash scripts/notify.sh"
 timeout_ms = 5000
 on_failure = "warn"    # abort | warn | ignore
 
-[[hook.materialize_error]]
+[[hook.on_materialize_error]]
 command = "bash scripts/pagerduty.sh"
 on_failure = "ignore"
 
 # Webhooks — HTTP POST with template body
-[hook.webhooks.pipeline_complete]
+[hook.webhooks.on_pipeline_complete]
 url = "https://hooks.slack.com/services/T.../B.../xxx"
 preset = "slack"
 secret = "${WEBHOOK_SECRET}"
 
-[hook.webhooks.materialize_error]
+[hook.webhooks.on_materialize_error]
 url = "https://events.pagerduty.com/v2/enqueue"
 preset = "pagerduty"
 ```
 
 ### Hook Events
 
-| Event | Trigger |
+Use each event's config key (the `on_<event>` form) as the `[hook.*]` / `[hook.webhooks.*]` table name.
+
+| Config key | Trigger |
 |-------|---------|
-| `pipeline_start` | Pipeline execution begins |
-| `discover_complete` | Source discovery finishes |
-| `compile_complete` | Compilation finishes |
-| `pipeline_complete` | Pipeline execution succeeds |
-| `pipeline_error` | Pipeline execution fails |
-| `before_materialize` | Before a table is materialized |
-| `after_materialize` | After a table is materialized |
-| `materialize_error` | Table materialization fails |
-| `before_model_run` | Before a compiled model runs |
-| `after_model_run` | After a compiled model runs |
-| `model_error` | Compiled model execution fails |
-| `check_result` | A quality check completes |
-| `drift_detected` | Schema drift detected |
-| `anomaly_detected` | Row count anomaly detected |
-| `state_synced` | State store sync completes |
+| `on_pipeline_start` | Pipeline execution begins |
+| `on_discover_complete` | Source discovery finishes |
+| `on_compile_complete` | Compilation finishes |
+| `on_pipeline_complete` | Pipeline execution succeeds |
+| `on_pipeline_error` | Pipeline execution fails |
+| `on_before_materialize` | Before a table is materialized |
+| `on_after_materialize` | After a table is materialized |
+| `on_materialize_error` | Table materialization fails |
+| `on_before_model_run` | Before a compiled model runs |
+| `on_after_model_run` | After a compiled model runs |
+| `on_model_error` | Compiled model execution fails |
+| `on_before_checks` | Before a table's quality checks run |
+| `on_check_result` | A quality check completes |
+| `on_after_checks` | After a table's quality checks run |
+| `on_drift_detected` | Schema drift detected |
+| `on_anomaly_detected` | Row count anomaly detected |
+| `on_state_synced` | State store sync completes |
+| `on_budget_breach` | A run-level budget limit is breached |
 
 ### Hook Config Fields
 
@@ -1318,8 +1325,8 @@ preset = "pagerduty"
 | `headers` | object | {} | Additional HTTP headers |
 | `body_template` | string | — | Mustache-style template (`{{event}}`, `{{model}}`, `{{error}}`) |
 | `secret` | string | — | HMAC-SHA256 signing key |
-| `timeout_ms` | number | 5000 | Request timeout |
-| `async_mode` | boolean | false | Fire-and-forget (don't wait for response) |
+| `timeout_ms` | number | 10000 | Request timeout |
+| `async` | boolean | false | Fire-and-forget (don't wait for response) |
 | `on_failure` | string | `"warn"` | Behavior on failure |
 | `retry_count` | number | 0 | Number of retries |
 | `retry_delay_ms` | number | 1000 | Delay between retries |

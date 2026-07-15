@@ -301,8 +301,8 @@ Rocky CI Pipeline
 | Code | Meaning |
 |------|---------|
 | 0 | All checks passed |
-| 1 | Compilation failed (type errors, contract violations) |
-| 2 | Tests failed (models failed to execute locally) |
+| 1 | Compilation or tests failed (type errors, contract violations, or models that failed to execute locally) |
+| 4 | Compiled and tested clean, but advisory warnings were emitted |
 
 ### JSON output
 
@@ -323,7 +323,7 @@ Rocky CI Pipeline
 
 ## AI-generated tests
 
-Rocky can generate test assertions from a model's intent and schema using `rocky ai-test`. See the [AI and Intent](/concepts/ai-intent) page for the full AI workflow.
+Rocky can generate test assertions from a model's intent and schema using `rocky ai-test`. See the [AI and Intent](/concepts/ai-intent/) page for the full AI workflow.
 
 Each generated assertion is a SQL query that returns 0 rows when the assertion holds:
 

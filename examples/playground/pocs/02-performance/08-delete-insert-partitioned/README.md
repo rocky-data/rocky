@@ -50,14 +50,20 @@ This is ideal for late-arriving data, daily/regional aggregates, and scenarios w
 ## Expected output
 
 ```text
-Compiled model:
+=== Compiled model ===
   regional_sales — delete_insert (partition_by: [region])
 
 Delete+Insert strategy:
   1. DELETE FROM target WHERE region IN (affected partitions)
   2. INSERT INTO target SELECT ... FROM source WHERE region IN (...)
-POC complete.
+  This avoids MERGE overhead and prevents duplicates from late-arriving data.
+
+POC complete: delete_insert strategy parsed and compiled.
 ```
+
+> `rocky compile` also emits an `I002` info diagnostic (`4 column(s) have unknown types`)
+> because the model reads from a raw seed table with no declared source schema — the
+> aggregate still compiles cleanly (`has_errors: false`).
 
 ## What happened
 

@@ -38,7 +38,7 @@ Clone the monorepo and launch the extension in VS Code's Extension Development H
 
 ```bash
 git clone https://github.com/rocky-data/rocky.git
-cd rocky-data/editors/vscode
+cd rocky/editors/vscode
 npm install
 npm run compile
 ```
@@ -50,7 +50,7 @@ Open the `editors/vscode` folder in VS Code, then press **F5**. This launches a 
 Build a `.vsix` package and install it directly:
 
 ```bash
-cd rocky-data/editors/vscode
+cd rocky/editors/vscode
 npm install
 npm run compile
 npx vsce package
@@ -69,7 +69,7 @@ Or open VS Code, go to **Extensions** > **...** (three dots menu) > **Install fr
 If you are iterating on the extension frequently, symlink the compiled output into VS Code's extensions directory:
 
 ```bash
-cd rocky-data/editors/vscode
+cd rocky/editors/vscode
 npm install
 npm run compile
 

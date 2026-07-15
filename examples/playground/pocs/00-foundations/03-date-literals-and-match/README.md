@@ -42,5 +42,6 @@ The Rocky DSL supports two ergonomic features that make business logic more read
 ## What happened
 
 `tiered_orders.rocky` filters orders to those after `@2025-06-01` and tags
-each one with a tier using `match`. The compiled SQL contains a `CAST(...)` for
-the date literal and a `CASE WHEN` cascade for the match expression.
+each one with a tier using `match`. The compiled SQL contains a
+`DATE '2025-06-01'` literal for the date and a `CASE WHEN` cascade for the
+match expression.

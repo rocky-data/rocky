@@ -1,0 +1,8 @@
+intent = "Per-customer revenue rollup. One row per customer_id. revenue sums each customer's order amounts; n_orders counts their orders."
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "poc"
+schema = "demo"

@@ -1,4 +1,4 @@
-# 09-cross-source-overlap — the same data arriving via two sources
+# 08-cross-source-overlap — the same data arriving via two sources
 
 > **Category:** 01-quality
 > **Credentials:** none (DuckDB)

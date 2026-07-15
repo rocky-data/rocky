@@ -53,10 +53,13 @@ Each preset provides sensible defaults (headers, body format); you only need to 
 ## Expected output
 
 ```text
-Configured webhooks:
-  5 hooks registered
+=== Configured webhooks ===
+{
+  "hooks": [],
+  "total": 0
+}
 
-Webhook presets configured:
+=== Webhook presets configured ===
   on_pipeline_complete  → Slack     (formatted blocks)
   on_pipeline_error     → Teams     (adaptive card, 3 retries)
   on_materialize_error  → PagerDuty (incident trigger)
@@ -64,12 +67,24 @@ Webhook presets configured:
   on_anomaly_detected   → Generic   (custom JSON template)
 
 POC complete: 5 webhook presets configured across different event types.
+(Webhooks fire during pipeline execution — URLs are placeholders for this demo.)
 ```
+
+> **Why does `hooks list` show `total: 0`?** `rocky hooks list --output json`
+> currently enumerates **shell-command** hooks only (`[hook.on_<event>] command = …`);
+> its JSON entries have no representation for webhook presets, so a webhook-only
+> config reports an empty list. The five webhooks *are* parsed, preset-resolved,
+> and validated — `rocky validate` succeeds — and they fire during pipeline
+> execution. The sibling [`02-webhook-slack-preset`](../02-webhook-slack-preset/)
+> POC documents the same limitation.
 
 ## What happened
 
-1. `rocky validate` parsed the config including all 5 webhook definitions
-2. `rocky hooks list` enumerated the registered hooks with their presets
+1. `rocky validate` parsed the config including all 5 webhook definitions and
+   resolved each preset to its default HTTP headers and body template
+2. `rocky hooks list --output json` reported `total: 0` — it surfaces
+   shell-command hooks only, not webhook presets (see the note above), so the
+   `run.sh` output lists the five presets from a static echo, not from the CLI
 3. Each preset provides default HTTP headers and body templates:
    - **Slack:** Slack Block Kit JSON with `text` field
    - **Teams:** Adaptive Card JSON payload

@@ -19,4 +19,4 @@ schema_template = "staging__{source}"
 [hook.webhooks.on_pipeline_complete]
 url = "https://webhook.site/00000000-0000-0000-0000-000000000000"
 preset = "slack"
-# hmac_secret = "${SLACK_HMAC}"   # optional signing
+# secret = "${SLACK_HMAC}"   # optional HMAC-SHA256 signing (field is `secret`)

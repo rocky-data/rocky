@@ -48,25 +48,46 @@ Rocky's snapshot pipeline type is a dedicated SCD Type 2 slowly-changing dimensi
 
 ```text
 Source v1: 3 customers
+(validate: config syntax valid, snapshot pipeline customer_history resolved)
 Snapshot run 1 (initial)
-    history rows: 3
+    history rows: 0
 Source v2: Alice upgraded, Charlie deleted, Dave added
     source rows: 3
 Snapshot run 2 (changes detected)
 History table:
-    customer_id | name    | tier     | valid_from          | valid_to
-    1           | Alice   | gold     | 2026-01-15 10:00:00 | 2026-04-01 08:00:00
-    1           | Alice   | platinum | 2026-04-01 08:00:00 | NULL
-    2           | Bob     | silver   | 2026-02-01 09:30:00 | NULL
-    3           | Charlie | bronze   | 2026-03-10 14:00:00 | 2026-04-01 ...
-    4           | Dave    | bronze   | 2026-04-05 11:00:00 | NULL
-POC complete.
+    (empty)
+POC complete: snapshot SCD-2 pipeline configured and validated.
 ```
 
-## What happened
+The config **validates** cleanly and the snapshot pipeline resolves, but the
+history table stays **empty** on the local DuckDB path — see the known limitation
+below.
+
+## Known limitation (local DuckDB path)
+
+On the local DuckDB execution path the engine currently emits invalid MERGE SQL
+for snapshots, so neither run populates `snapshots.customers_history`
+(`history rows: 0`, empty history table). Both `rocky run` invocations exit
+non-zero and are intentionally tolerated with `|| true` in `run.sh` so the demo
+still walks through the full validate → run → inspect flow. The captured
+`expected/run1.json` / `expected/run2.json` show the two underlying DuckDB
+errors:
+
+- `Parser Error: syntax error at or near "*"` on
+  `... WHEN NOT MATCHED THEN INSERT (*) VALUES (source.*, CURRENT_TIMESTAMP, NULL)`
+- `Binder Error: Referenced table "target" not found!` in the hard-delete
+  invalidation subquery (`WHERE target.customer_id = source.customer_id`)
+
+The `[pipeline.customer_history]` config (`unique_key`, `updated_at`,
+`invalidate_hard_deletes`, explicit source/target refs) is the declarative
+SCD-2 surface this POC demonstrates; end-to-end SCD-2 history is exercised
+against a real warehouse adapter (Databricks/Snowflake), not the local DuckDB
+snapshot path.
+
+## What it would produce (once the DuckDB snapshot path is fixed)
 
 1. **Run 1:** All 3 source rows inserted as new snapshot records with `valid_from = updated_at`, `valid_to = NULL`
-2. **Run 2:** Rocky compared source vs latest snapshot:
+2. **Run 2:** Rocky compares source vs latest snapshot:
    - **Alice** (customer_id=1): `updated_at` changed → old record closed (`valid_to` set), new record inserted
    - **Bob** (customer_id=2): unchanged → no action
    - **Charlie** (customer_id=3): missing from source + `invalidate_hard_deletes = true` → record closed

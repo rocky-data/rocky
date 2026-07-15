@@ -39,6 +39,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rocky_adapter_sdk::{
     AdapterCapabilities, AdapterError, AdapterManifest, AdapterResult, ColumnInfo,
     ColumnSelection, MetadataColumn, QueryResult, SqlDialect, TableRef, WarehouseAdapter,
@@ -294,13 +295,22 @@ impl SqlDialect for SkeletonDialect {
         Ok(format!("{base}, {extras}"))
     }
 
-    fn watermark_where(&self, timestamp_col: &str, target_ref: &str) -> AdapterResult<String> {
+    fn watermark_where(
+        &self,
+        timestamp_col: &str,
+        last_watermark: Option<&DateTime<Utc>>,
+    ) -> AdapterResult<String> {
         validate_ident(timestamp_col)?;
-        // Standard incremental pattern: only pick up rows newer than the
-        // current max in target. ClickHouse evaluates the subquery once.
-        Ok(format!(
-            "`{timestamp_col}` > (SELECT max(`{timestamp_col}`) FROM {target_ref})"
-        ))
+        // The runtime supplies the previous run's max source timestamp as a
+        // literal read from its state store; the dialect formats it as a
+        // warehouse-native timestamp literal. `None` (first run or after
+        // `delete_watermark`) yields the 1970-01-01 sentinel so the whole
+        // source is scanned. ClickHouse accepts the ANSI `TIMESTAMP '...'`
+        // literal with sub-second precision via chrono's `%.f` directive.
+        let literal = last_watermark
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+        Ok(format!("WHERE `{timestamp_col}` > TIMESTAMP '{literal}'"))
     }
 
     fn insert_overwrite_partition(

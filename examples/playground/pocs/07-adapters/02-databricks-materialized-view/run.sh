@@ -10,6 +10,6 @@ mkdir -p expected
 
 rocky validate
 rocky compile --models models > expected/compile.json
-rocky -c rocky.toml -o json run --models models --filter source=orders > expected/run.json
 
-echo "POC complete: materialized_view strategy executed against Databricks."
+echo
+echo "POC complete: materialized_view strategy parsed; live execution requires the Databricks adapter."

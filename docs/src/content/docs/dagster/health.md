@@ -71,7 +71,7 @@ Dagster+ supports custom health endpoints for code locations. Wire the
 healthcheck into your code location startup:
 
 ```python
-from dagster_rocky import rocky_healthcheck
+from dagster_rocky import RockyResource, rocky_healthcheck
 
 def is_code_location_healthy() -> bool:
     rocky = RockyResource(config_path="rocky.toml")
@@ -80,6 +80,41 @@ def is_code_location_healthy() -> bool:
 
 If `is_code_location_healthy()` returns `False`, Dagster+ marks the code
 location as unhealthy and routes traffic away from it.
+
+## State-backend health
+
+Alongside `rocky_healthcheck`, `dagster-rocky` ships `state_health()` (also
+available as `RockyResource.state_health()`), a live snapshot of Rocky's
+state backend suited to sensors, schedules, and asset checks:
+
+```python
+from dagster_rocky import RockyResource, state_health
+
+rocky = RockyResource(config_path="rocky.toml")
+health = state_health(rocky, probe_write=True)
+
+print(health.backend)            # configured [state] backend (defaults to "local")
+print(health.last_run_status)    # normalized status of the most recent run, or None
+print(health.probe_outcome)      # "ok" / failure reason when probe_write=True, else None
+```
+
+`state_health` returns a `StateHealthResult` with these fields:
+
+| Field | Meaning |
+|---|---|
+| `backend` | Configured `[state] backend` from `rocky.toml` (`"local"` fallback) |
+| `last_run_status` | Normalized status of the most recent run, or `None` |
+| `last_run_at` | Timestamp of the most recent run, or `None` |
+| `probe_outcome` | `state_rw` probe result when `probe_write=True`, else `None` |
+| `probe_duration_ms` | Probe duration when `probe_write=True`, else `None` |
+| `probe_error` | Probe error message on failure, else `None` |
+
+The cheap path (`probe_write=False`, the default) reads the config plus the
+most recent run from history. With `probe_write=True` it additionally runs
+`rocky doctor --check state_rw` to exercise a put/get/delete round-trip
+against the backend. It is tolerant of a missing binary or unreadable store —
+fields degrade to `None` rather than raising, so it's safe to call every
+sensor tick.
 
 ## Why a wrapper, not a method on `RockyResource`?
 

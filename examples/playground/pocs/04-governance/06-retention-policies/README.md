@@ -45,7 +45,7 @@ compiled model set (no warehouse probe).
 
 `rocky run` on DuckDB resolves the governance adapter to
 `NoopGovernanceAdapter`. Its `apply_retention_policy` impl returns
-`Ok(())` unconditionally (see `rocky-core/src/traits.rs:811-821`): **no
+`Ok(())` unconditionally (see `rocky-core/src/traits.rs:1660-1670`): **no
 warning, no error, silently skipped.** The POC still exercises the
 full parse-and-wire path:
 
@@ -59,12 +59,14 @@ full parse-and-wire path:
 4. `rocky retention-status` — JSON report (default output).
 5. `rocky retention-status --model ledger_archive_1y -o table` — scoped
    to a single model.
-6. `rocky retention-status --drift -o table` — `--drift` is accepted
-   for forward-compat but the warehouse probe is deferred to v2. The
-   command filters to models with a declared policy and prints
-   `note: --drift probe is deferred to v2; warehouse_days will be null.`
-   to stderr. `warehouse_days` stays `None` in JSON (schema is stable,
-   `Option<u32>`, so v2 can slot in without a wire break).
+6. `rocky retention-status --drift -o table` — `--drift` filters the
+   report to models with a declared policy and probes the warehouse via
+   the governance adapter. On DuckDB the adapter resolves to
+   `NoopGovernanceAdapter`, whose `read_retention_days` returns
+   `Ok(None)`, so `warehouse_days` stays `None` and no note is printed.
+   The schema is stable (`warehouse_days: Option<u32>`), so a
+   probe-capable target (Databricks / Snowflake) populates the same
+   field without a wire break.
 
 ## Apply retention for real on Databricks / Snowflake
 
@@ -125,7 +127,6 @@ ledger_archive_1y                        365 days         -                no
 page_views_30d                           30 days          -                no
 
 --- rocky retention-status --drift -o table ---
-note: --drift probe is deferred to v2; warehouse_days will be null.
 MODEL                                    CONFIGURED       WAREHOUSE        IN SYNC
 ----------------------------------------------------------------------------------
 ledger_archive_1y                        365 days         -                no
@@ -136,7 +137,7 @@ JSON output (default `-o json`):
 
 ```json
 {
-  "version": "1.16.0",
+  "version": "1.63.0",
   "command": "retention-status",
   "models": [
     { "model": "ephemeral_summary", "in_sync": true },

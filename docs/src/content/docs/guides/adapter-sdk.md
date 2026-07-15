@@ -13,7 +13,7 @@ This guide walks a Rust developer from "I want a ClickHouse adapter" to a compil
 
 The adapter SDK is the right tool when:
 
-- The warehouse you need is not in [the in-tree adapter list](/concepts/adapters/) (Databricks, Snowflake, BigQuery, DuckDB).
+- The warehouse you need is not in [the in-tree adapter list](/concepts/adapters/) (Databricks, Snowflake, BigQuery, DuckDB, Trino).
 - You need a forked variant of an existing adapter (e.g. Databricks Serverless on top of `rocky-databricks`).
 - You want to embed Rocky in a tool that owns its own warehouse client and would rather wrap it than spawn `rocky` as a subprocess.
 
@@ -144,7 +144,7 @@ Methods worth thinking carefully about:
 The SDK ships an optional `AuthProvider` trait that composes the `Authorization` header with any extra mandatory headers your warehouse requires, such as a user-identity header alongside a bearer token. A `StaticAuthProvider` covers the fixed-credential case. Adapters with bespoke needs can still wire their own; the two patterns worth copying are in-tree:
 
 - **`engine/crates/rocky-databricks/src/auth.rs`**: PAT-first, OAuth M2M fallback. Reads `${DATABRICKS_TOKEN}`; if absent, falls through to the `client_credentials` flow with `${DATABRICKS_CLIENT_ID}` / `${DATABRICKS_CLIENT_SECRET}`. The auto-detection logic is roughly twenty lines.
-- **`engine/crates/rocky-snowflake/src/auth.rs`**: multi-method priority: pre-supplied OAuth bearer wins, then RS256 key-pair JWT, then password. Each method reads from a distinct `${SNOWFLAKE_*}` variable so config files never carry secrets.
+- **`engine/crates/rocky-snowflake/src/auth.rs`**: multi-method priority: a Programmatic Access Token wins, then pre-supplied OAuth bearer, then RS256 key-pair JWT, then password. Each method reads from a distinct `${SNOWFLAKE_*}` variable so config files never carry secrets.
 
 Two rules that apply to every adapter regardless of method:
 
@@ -185,7 +185,7 @@ For adapters that talk to a REST API, the in-tree pattern is `wiremock`-based; s
 
 ### The conformance harness
 
-`rocky-adapter-sdk::conformance::run_conformance(&manifest, Some(adapter.dialect()))` returns a `ConformanceResult` describing which tests apply (based on declared capabilities) and which were skipped. When a live dialect is supplied, the harness exercises one real trait call, `SqlDialect::format_table_ref`, as the first incremental step toward live execution. Pass `None` when no live adapter is available (for example, `rocky test-adapter --builtin <name>`, which validates the test plan without a warehouse), and dialect-category checks are reported as skipped rather than run against a stub. The remaining checks are still plan entries rather than warehouse calls, so treat the result as a checklist of behaviors your unit tests should cover while broader trait execution lands in future SDK releases.
+`rocky-adapter-sdk::conformance::run_conformance(&manifest, Some(adapter.dialect()))` returns a `ConformanceResult` describing which tests apply (based on declared capabilities) and which were skipped. When a live dialect is supplied, the harness exercises one real trait call, `SqlDialect::format_table_ref`, as the first incremental step toward live execution. Pass `None` when no live adapter is available (for example, `rocky test-adapter --adapter <name>`, which validates the test plan without a warehouse), and dialect-category checks are reported as skipped rather than run against a stub. The remaining checks are still plan entries rather than warehouse calls, so treat the result as a checklist of behaviors your unit tests should cover while broader trait execution lands in future SDK releases.
 
 ## Distributing your adapter
 

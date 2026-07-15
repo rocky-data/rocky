@@ -49,8 +49,24 @@ verifies the row counts diverge when NULL values are present.
 ## Expected output
 
 Both filters target the same `raw_orders` table. The DSL filter (`filter_dsl`)
-keeps NULL-status rows; the SQL filter (`filter_sql`) drops them. The run.sh
-script executes both and reports the row count delta.
+keeps NULL-status rows; the SQL filter (`filter_sql`) drops them.
+
+`run.sh` first prints the SQL Rocky actually lowered `filter_dsl` to (captured
+from `rocky compile --expand-macros`, so it reads `IS DISTINCT FROM`, not a
+hand-written copy) and fails loudly if that lowering ever regresses. It then
+builds both DuckDB tables from Rocky's own compiled SQL and reports the row
+count delta:
+
+```
+Rocky lowered the DSL filter (filter_dsl) to:
+    SELECT * FROM raw_orders WHERE status IS DISTINCT FROM 'cancelled'
++-------------------------+------+
+| query                   | rows |
++-------------------------+------+
+| filter_dsl (NULL-safe)  | 87   |
+| filter_sql (NULL-blind) | 77   |
++-------------------------+------+
+```
 
 ## Related
 

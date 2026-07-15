@@ -45,18 +45,51 @@ A transformation pipeline materialises two models into a target schema (`poc.mar
 
 ```text
 === precondition — 'mart' schema does NOT exist in DuckDB ===
-  (expected: empty result — no 'poc.mart' schema yet)
++-------------+
+| schema_name |
++-------------+
+| main        |
+| raw__orders |
++-------------+
+  (expected: only 'main' + 'raw__orders' — no 'mart' schema yet)
 
 === run — pipeline creates 'poc.mart' before materializing the two models ===
   2 model(s) materialized:
-    - poc.mart.stg_orders: 6 rows
-    - poc.mart.order_revenue_by_customer: 4 rows
+    - poc.mart.stg_orders (full_refresh): ok
+    - poc.mart.order_revenue_by_customer (full_refresh): ok
 
 === postcondition — 'mart' schema now exists, and both models live in it ===
-mart
-order_revenue_by_customer
-stg_orders
+  -- schemas in catalog 'poc' (now includes 'mart'):
++-------------+
+| schema_name |
++-------------+
+| main        |
+| mart        |
+| raw__orders |
++-------------+
+  -- tables in poc.mart:
++---------------------------+------------+
+| table_name                | table_type |
++---------------------------+------------+
+| order_revenue_by_customer | BASE TABLE |
+| stg_orders                | BASE TABLE |
++---------------------------+------------+
+  -- poc.mart.order_revenue_by_customer:
++-------------+-------------+--------------------+
+| customer_id | order_count | total_revenue      |
++-------------+-------------+--------------------+
+| 101         | 2           | 44.239999999999995 |
+| 102         | 1           | 49.5               |
+| 103         | 2           | 238.5              |
+| 104         | 1           | 9.99               |
++-------------+-------------+--------------------+
 ```
+
+> The `run` step reports `ok` rather than a row count: transformation-pipeline
+> materializations don't populate `rows_copied` (that field is for the
+> replication path). `stg_orders` still keeps 6 of 8 rows and
+> `order_revenue_by_customer` aggregates to 4 customers, as the revenue table
+> above confirms.
 
 ## What happened
 

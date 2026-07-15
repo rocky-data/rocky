@@ -91,7 +91,7 @@ List `run_history` and pick the run by its timestamp. Each row is one `RunRecord
   "trigger": "Ci",
   "config_hash": "a54e8a0fa524b6a2",
   "triggering_identity": "data-eng@example.com",
-  "session_source": "ci",
+  "session_source": "cli",
   "git_commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
   "git_branch": "main",
   "target_catalog": "analytics_prod",
@@ -101,7 +101,7 @@ List `run_history` and pick the run by its timestamp. Each row is one `RunRecord
 }
 ```
 
-The `run_id` is Rocky's `run-<UTC-date>-<UTC-time>-<millis>` form. The `status` and `trigger` values are the capitalized enum forms as they serialize on disk (`"Success"`, `"Ci"` / `"Manual"`); `session_source` serializes lowercase (`"cli"`, `"ci"`, ...).
+The `run_id` is Rocky's `run-<UTC-date>-<UTC-time>-<millis>` form. The `status` and `trigger` values are the capitalized enum forms as they serialize on disk (`"Success"`, `"Ci"` / `"Manual"`); `session_source` serializes lowercase (`"cli"`, `"dagster"`, `"lsp"`, `"http_api"`; a CI runner records `"cli"`).
 
 That single row answers *who* (`triggering_identity` + `git_commit`), *when* (`started_at` / `finished_at`), and *under what config* (`config_hash`). The `git_commit` is the anchor for the next step.
 

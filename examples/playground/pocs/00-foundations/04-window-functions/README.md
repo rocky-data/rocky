@@ -43,3 +43,17 @@ avoid the verbosity of `OVER (PARTITION BY ... ORDER BY ... DESC ROWS BETWEEN ..
 ```bash
 ./run.sh
 ```
+
+## Expected output
+
+`rocky validate` prints its JSON report (config valid, 2 models, DAG valid),
+then the script ends with:
+
+```text
+POC complete: window functions compile and execute.
+```
+
+`rocky compile` and `rocky test` write their JSON to `expected/compile.json` and
+`expected/test.json` rather than printing a text summary — `test.json` reports
+`"total": 2, "passed": 2, "failed": 0` (both `raw_orders` and the window model
+`window_demo` execute against in-memory DuckDB).

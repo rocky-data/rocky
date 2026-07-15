@@ -1,9 +1,10 @@
 # Materialize as a Snowflake Dynamic Table.
 # Snowflake auto-refreshes the table to keep it within target_lag.
+# The compute warehouse is not a strategy field — it is read from
+# [adapter.snowflake].warehouse in rocky.toml.
 [strategy]
 type = "dynamic_table"
 target_lag = "1 hour"
-warehouse = "ANALYTICS_WH"
 
 [target]
 catalog = "ANALYTICS"

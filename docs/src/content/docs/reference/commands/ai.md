@@ -31,11 +31,12 @@ rocky ai <intent> [flags]
 | `--models <PATH>` | `string` | `models` | Models directory. Used both to ground the prompt in real schemas and as the destination directory for the emitted body + sidecar. |
 | `--materialization <STRATEGY>` | `string` | `full_refresh` | Materialization strategy written into the sidecar `[strategy]` block. One of `full_refresh`, `incremental`, `merge`, `ephemeral`. |
 | `--watermark <COLUMN>` | `string` | | Watermark column for `--materialization=incremental`. Maps to `[strategy].timestamp_column` in the sidecar. Required when materialization is `incremental`; ignored otherwise. |
+| `--unique-key <COLUMNS>` | `string` | | Upsert key for `--materialization=merge`. Maps to `[strategy].unique_key` (an array) in the sidecar. Accepts a comma-separated list (`--unique-key id,created_at`) or repeated flags. Required when materialization is `merge`; the emitted sidecar is incomplete without it. |
 | `--target <FQN>` | `string` | `generated.ai.<name>` | Target table coordinates as `catalog.schema.table`. Written into the sidecar `[target]` block. |
 | `--overwrite` | `bool` | `false` | Overwrite an existing body or sidecar file at the destination. Without this flag, the command fails loudly rather than silently clobber user-authored models. |
 
-:::note[Merge limitation]
-`--materialization merge` v1 is incomplete: there is no `--unique-key` flag yet, so the emitted sidecar is missing the merge key and must be hand-edited before `rocky apply` will accept it. `time_interval`, `delete_insert`, `microbatch`, `materialized_view`, `dynamic_table`, and `content_addressed` are intentionally not exposed by `--materialization`: they need richer flag plumbing or live in the IR-only surface.
+:::note[Merge requires `--unique-key`]
+Pass `--unique-key <columns>` alongside `--materialization merge` to write the upsert key into the sidecar's `[strategy].unique_key`. Omitting it emits an incomplete sidecar that `rocky run` rejects until you fill in `unique_key` by hand. `time_interval`, `delete_insert`, `microbatch`, `materialized_view`, `dynamic_table`, and `content_addressed` are intentionally not exposed by `--materialization`: they need richer flag plumbing or live in the IR-only surface.
 :::
 
 ### Examples

@@ -17,15 +17,29 @@ components = ["source"]
 catalog_template = "poc"
 schema_template = "staging__{source}"
 
+# Create the target catalog/schema on the fly so the demo copies data
+# without a manual bootstrap step.
+[pipeline.poc.target.governance]
+auto_create_catalogs = true
+auto_create_schemas = true
+
 [pipeline.poc.execution]
 concurrency = 4
 
-# Tiered state backend — local redb + Valkey for cross-instance coordination
-# (Note: a top-level `[cache]` block was removed — `CacheConfig` is defined
-# but not yet wired into `RockyConfig`. The Valkey caching surface is the
-# `tiered` state backend below; standalone metadata caching is tracked
-# separately.)
+# Distributed schema-metadata cache. The schema (DESCRIBE-result) cache lives
+# in the local state store; `replicate = true` ships it through `state_sync`
+# to the remote state backend below, so multiple Rocky instances share
+# warehouse type stamps instead of each re-DESCRIBE-ing on every compile.
+[cache.schemas]
+enabled = true
+ttl_seconds = 3600
+replicate = true
+
+# Valkey state backend — local redb is the working store; Valkey is the shared
+# remote used for cross-instance coordination of watermarks AND the replicated
+# schema cache. (A `tiered` backend layers S3 durability on top of Valkey and
+# additionally requires `s3_bucket`; this POC stays Valkey-only.)
 [state]
-backend = "tiered"
+backend = "valkey"
 valkey_url = "${VALKEY_URL:-redis://localhost:6379}"
 valkey_prefix = "rocky:state:poc:"

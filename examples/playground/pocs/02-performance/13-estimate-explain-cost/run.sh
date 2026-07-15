@@ -8,7 +8,7 @@ rm -f .rocky-state.redb .rocky-state.redb.lock poc.duckdb
 rm -f models/.rocky-state.redb models/.rocky-state.redb.lock
 mkdir -p expected
 
-echo "==> 0. Seed raw__sales (5000 orders, 200 customers) — read by EXPLAIN, never written by estimate"
+echo "==> 0. Seed raw__sales (1000 orders, 200 customers) — read by EXPLAIN, never written by estimate"
 duckdb poc.duckdb < data/seed.sql
 
 echo

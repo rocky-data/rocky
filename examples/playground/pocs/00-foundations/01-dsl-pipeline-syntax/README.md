@@ -1,9 +1,9 @@
-# 01-dsl-pipeline-syntax — Every Rocky DSL operator in one model
+# 01-dsl-pipeline-syntax — Core Rocky DSL operators in one model
 
 > **Category:** 00-foundations
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 5s
-> **Rocky features:** `from`, `where`, `derive`, `group`, `select`, `sort`, `take`
+> **Rocky features:** `from`, `where`, `group`, `sort`, `take`
 
 ## What it shows
 
@@ -46,8 +46,8 @@ you can read both side-by-side.
 3. `top_customers.rocky` walks the DSL pipeline:
    - `from raw_orders` — start from the upstream model
    - `where status != "cancelled"` — drop cancelled rows (NULL-safe)
-   - `derive { ... }` — add computed columns without dropping existing
-   - `group customer_id { ... }` — aggregate by key
+   - `group customer_id { ... }` — aggregate by key, with computed
+     aggregates (`total_revenue`, `order_count`, `avg_order_value`)
    - `where total_revenue > 100` — HAVING-style filter after aggregation
    - `sort total_revenue desc` — ORDER BY
    - `take 10` — LIMIT
@@ -55,5 +55,5 @@ you can read both side-by-side.
 
 ## Related
 
-- DSL spec: `rocky/docs/src/content/docs/concepts/rocky-dsl.md`
-- Compiler: `rocky/crates/rocky-lang/`
+- DSL spec: `docs/src/content/docs/concepts/rocky-dsl.md`
+- Compiler: `engine/crates/rocky-lang/`

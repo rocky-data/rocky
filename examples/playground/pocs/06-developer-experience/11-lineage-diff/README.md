@@ -17,7 +17,7 @@ The POC sets up a self-contained scratch repo at `/tmp/rocky-poc-lineage-diff` w
 - adds a derived `stg_orders.tax_amount_usd`,
 - renames `fct_revenue.total` → `total_revenue` and adds `total_tax`.
 
-A single `rocky lineage-diff main` lists all five column changes across both modified models.
+A single `rocky lineage-diff main` lists all six column changes (three per modified model — two adds and one removal each) across both modified models.
 
 ## Why it's distinctive
 
@@ -63,7 +63,20 @@ Rocky Lineage Diff (main...HEAD)
 | `total` | removed | Unknown | - | _(removed; not traceable on HEAD)_ |
 
 </details>
+
+<details>
+<summary><b>stg_orders</b> — modified (3 column changes)</summary>
+
+| Column | Change | Old Type | New Type | Downstream consumers |
+|--------|--------|----------|----------|----------------------|
+| `amount_usd` | added | - | Unknown | `fct_revenue.total_revenue` |
+| `tax_amount_usd` | added | - | Unknown | `fct_revenue.total_tax` |
+| `amount` | removed | Unknown | - | _(removed; not traceable on HEAD)_ |
+
+</details>
 ```
+
+`fct_revenue` is a leaf model, so its new columns have no downstream consumers (`_none_`); the renamed-upstream `stg_orders` columns each name the `fct_revenue` column that consumes them — the blast radius a reviewer wants to see.
 
 JSON is captured at `expected/lineage_diff.json` for CI shape-contract pinning.
 

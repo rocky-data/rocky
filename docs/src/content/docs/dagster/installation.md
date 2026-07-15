@@ -15,7 +15,8 @@ uv add dagster-rocky
 
 The package requires:
 
-- `dagster >= 1.13.0`
+- `rocky-sdk >= 0.6.0` (the typed result models and `RockyClient` live here; `dagster-rocky` is a thin adapter over it)
+- `dagster >= 1.13.8`
 - `pydantic >= 2.0`
 - `pygments >= 2.20.0`
 

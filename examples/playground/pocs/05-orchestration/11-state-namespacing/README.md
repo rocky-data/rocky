@@ -93,6 +93,6 @@ POC complete: two namespaces ⇒ two independent state files; default ⇒ shared
 
 ## Related
 
-- Source: `rocky/crates/rocky-core/src/state.rs` (`resolve_state_path`,
-  `STATE_NAMESPACE_DIR`), `rocky/crates/rocky-core/src/config.rs` (`[state] namespacing`)
+- Source: `engine/crates/rocky-core/src/state.rs` (`resolve_state_path`,
+  `resolve_state_path_ns`, `STATE_NAMESPACE_DIR`), `engine/crates/rocky-core/src/config.rs` (`[state] namespacing`)
 - Companion POC: [`05-orchestration/09-idempotency-key`](../09-idempotency-key) — another state-store coordination primitive.

@@ -63,7 +63,7 @@ Using the parsed components:
 - `warehouse` is a static catalog name (no variable substitution)
 - `stage__{source}` resolves to `stage__shopify`
 
-So `fivetran_catalog.src__shopify.orders` is copied to `warehouse.stage__shopify.orders`.
+So `fivetran_catalog.src__acme__us_west__shopify.orders` is copied to `warehouse.stage__shopify.orders`.
 
 For multi-tenant setups where each tenant gets its own catalog, see [Schema Patterns](/concepts/schema-patterns/) for the `{tenant}_warehouse` + `components = ["tenant", "regions...", "source"]` pattern.
 
@@ -83,7 +83,7 @@ Catalogs are tagged (e.g., `managed_by = "rocky"`) so Rocky can later discover w
 On the first run (no watermark), Rocky performs a full refresh. On subsequent runs, it only copies rows where the timestamp column exceeds the last known watermark:
 
 ```sql
-INSERT INTO acme_warehouse.staging__us_west__shopify.orders
+INSERT INTO warehouse.stage__shopify.orders
 SELECT *, CAST(NULL AS STRING) AS _loaded_by
 FROM fivetran_catalog.src__acme__us_west__shopify.orders
 WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'
@@ -91,7 +91,7 @@ WHERE _fivetran_synced > TIMESTAMP '2026-04-17 09:30:00'
 
 The watermark literal is the previous run's `MAX(_fivetran_synced)`, which Rocky stores in its state store and threads into the query — it does not read it back from the target with a subquery. The `_fivetran_synced` column is Fivetran's built-in timestamp that records when each row was synced. Rocky uses it as the watermark column by default (configurable via `timestamp_column`).
 
-If schema drift is detected (column type mismatch between source and target), Rocky falls back to a full refresh: it drops the target table and recreates it.
+If schema drift is detected, Rocky applies a graduated response: safe type widenings become `ALTER COLUMN TYPE`, newly added columns become `ALTER TABLE ADD COLUMN`, and only unsafe type changes fall back to a full refresh (dropping and recreating the target table).
 
 ## Metadata columns
 

@@ -50,12 +50,13 @@ Each script exits 0 on success after dropping its target dataset.
 
 ## Project-ID templating
 
-Model sidecar TOMLs (and the time-interval / merge / cost-cross-check
-model SQL, which references source tables by 3-part name) need a
-project-qualified reference. Model files don't honor `${VAR}` env
-substitution today (only `rocky.toml` does; see finding 2 below), so
-each driver writes a `__GCP_PROJECT__` placeholder into its committed
-files and substitutes it at runtime by staging the config + models
+The time-interval / merge / cost-cross-check model SQL references
+source tables by 3-part `project.dataset.table` name and so needs a
+project-qualified reference. Model **SQL bodies** don't honor `${VAR}`
+env substitution today — only `rocky.toml` and model `.toml` sidecars
+do (see finding 2 below) — so each driver writes a `__GCP_PROJECT__`
+placeholder into its committed files (SQL, plus the sidecars for
+staging uniformity) and substitutes it at runtime by staging the config + models
 into a temp dir, running `sed -i "s|__GCP_PROJECT__|${GCP_PROJECT_ID}|g"`
 across the staged copy, and pointing `rocky -c` at the temp
 `live.rocky.toml`. The repo therefore contains no project IDs; each
@@ -75,18 +76,24 @@ Adapter-side gaps to revisit separately:
    supports both `WarehouseAdapter` and `DiscoveryAdapter` traits;
    `adapter_capability.rs` reports `BOTH`. Replication-from-BQ
    pipelines work end-to-end (see `discover/run.sh`).
-2. **Model-sidecar TOMLs skip env substitution.** `rocky.toml` is piped
-   through `substitute_env_vars` at parse time but model `.toml` files
-   are read raw (`engine/crates/rocky-core/src/models.rs:642`). The
-   existing parent-POC sidecars use `${GCP_PROJECT_ID}` expecting it to
-   work; it doesn't.
-3. **`auto_create_schemas` is unwired in the transformation run path.**
-   `engine/crates/rocky-cli/src/commands/run_local.rs::run_transformation`
-   never reads `pipeline.target.governance.auto_create_schemas`; only
-   the replication path (`run.rs:1350`) does. As a result, `rocky run`
-   on a transformation pipeline errors with 404 unless the dataset
-   already exists. The drivers pre-create the dataset via `bq mk` to
-   work around it.
+2. **Model SQL bodies skip env substitution — sidecar TOMLs don't.**
+   Both `rocky.toml` and model `.toml` sidecars are piped through
+   `substitute_env_vars` at parse time
+   (`engine/crates/rocky-core/src/models.rs:1387`), so `${VAR}` resolves
+   in the sidecar. But the model **SQL file** is read raw
+   (`models.rs:1377`) with no substitution, so the 3-part source
+   references in the merge / time-interval / cost SQL bodies still need
+   the `__GCP_PROJECT__` placeholder + runtime `sed`.
+3. **Transformation runs need the target dataset unless
+   `auto_create_schemas = true`.** The transformation run path now reads
+   `pipeline.target.governance.auto_create_schemas`
+   (`run_local.rs:132` → `execute_models`, which emits `CREATE SCHEMA`
+   at `run.rs:5507`; covered by the
+   `transformation_auto_create_schemas_materializes_fresh_schema` test).
+   It defaults to `false` and these drivers don't opt in, so `rocky run`
+   errors with 404 unless the dataset exists — the drivers pre-create it
+   via `bq mk`. Setting `auto_create_schemas = true` in `live.rocky.toml`
+   would let the run create it instead.
 4. **Time-interval `time_column` must be TIMESTAMP on BigQuery.** The
    runtime emits the partition filter as `'YYYY-MM-DD HH:MM:SS'`
    string literals (`sql_gen.rs:239`). BigQuery refuses to coerce a

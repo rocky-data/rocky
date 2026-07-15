@@ -59,8 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Generate an incremental WHERE clause and an insert overwrite plan
     //    so the example covers the dialect surface a real ClickHouse
-    //    adapter would care about.
-    let where_clause = adapter.dialect().watermark_where("ts", &target)?;
+    //    adapter would care about. `None` = no prior watermark (first run),
+    //    which yields the 1970-01-01 sentinel so the whole source is scanned;
+    //    the runtime passes the recorded max source timestamp on later runs.
+    let where_clause = adapter.dialect().watermark_where("ts", None)?;
     let select = adapter.dialect().select_clause(
         &ColumnSelection::Explicit(vec!["id".into(), "ts".into()]),
         &[],
@@ -68,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stmts = adapter.dialect().insert_overwrite_partition(
         &target,
         "`day` = '2026-01-01'",
-        &format!("SELECT {select} FROM `default`.`events` WHERE {where_clause}"),
+        &format!("SELECT {select} FROM `default`.`events` {where_clause}"),
     )?;
 
     for s in &stmts {

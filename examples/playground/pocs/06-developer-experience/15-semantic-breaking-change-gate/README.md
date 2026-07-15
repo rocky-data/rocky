@@ -31,6 +31,13 @@ to `--models` (default `models`). Replication-only branches with no
 transformation models compile to an empty IR; the diff is empty and the
 gate is a clean no-op.
 
+> **Note:** the direct `rocky branch promote <name>` path shown here (no
+> `--plan`) is deprecated — the CLI prints a deprecation notice on stderr
+> pointing at `rocky plan promote <name>` + `rocky apply <plan-id>`, which
+> run the same gates but let you inspect findings before any production
+> data is touched. This POC keeps the one-shot form to demonstrate the
+> gate's veto/override behavior in a single command.
+
 ## Why it's distinctive
 
 - **Typed-IR semantics, not text diff.** A column rename + retype is

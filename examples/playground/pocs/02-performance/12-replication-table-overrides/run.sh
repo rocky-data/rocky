@@ -34,7 +34,7 @@ for m in msgs:
 
 echo ""
 echo "=== discover — both source schemas found ==="
-ROCKY_SUPPRESS_DEPRECATION=1 rocky discover --output json 2>/dev/null > expected/discover.json
+rocky discover --output json 2>/dev/null > expected/discover.json
 python3 -c "
 import json
 d = json.load(open('expected/discover.json'))
@@ -45,7 +45,7 @@ for s in d['sources']:
 
 echo ""
 echo "=== run #1 — first materialization (full_refresh bootstrap for all tables) ==="
-ROCKY_SUPPRESS_DEPRECATION=1 rocky run --output json 2>/dev/null > expected/run1.json
+rocky run --output json 2>/dev/null > expected/run1.json
 python3 -c "
 import json
 d = json.load(open('expected/run1.json'))
@@ -66,7 +66,7 @@ echo "        user_01, user_02 excluded by Rule 4 (glob user_?? in raw__events)"
 
 echo ""
 echo "=== run #2 — watermarks set; per-table overrides kick in ==="
-ROCKY_SUPPRESS_DEPRECATION=1 rocky run --output json 2>/dev/null > expected/run2.json
+rocky run --output json 2>/dev/null > expected/run2.json
 python3 -c "
 import json
 d = json.load(open('expected/run2.json'))
@@ -86,7 +86,7 @@ echo "  Default:       order_items -> full_refresh (no strategy override)"
 
 echo ""
 echo "=== --filter table=orders — replicate only the orders table across all connectors ==="
-ROCKY_SUPPRESS_DEPRECATION=1 rocky run --filter table=orders --output json 2>/dev/null > expected/run_filter_orders.json
+rocky run --filter table=orders --output json 2>/dev/null > expected/run_filter_orders.json
 python3 -c "
 import json
 d = json.load(open('expected/run_filter_orders.json'))

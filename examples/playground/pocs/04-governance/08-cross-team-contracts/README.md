@@ -74,7 +74,7 @@ Step 2 (before the drop) compiles clean. Step 4 (after the producer drops
 ```
 --- Step 4: consumer recompiles — expect E030 (contract gate fires)
     PASS: compile failed with E030 (exit 1):
-      "message":"model 'shipments' references column 'shipped_at' which the imported producer 'orders' (shop.core.orders) no longer outputs"
+      "message": "model 'shipments' references column 'shipped_at' which the imported producer 'orders' (shop.core.orders) no longer outputs"
 
 Cross-team contract enforced: the producer's breaking change was
 caught at the consumer's compile, before any SQL ran.

@@ -77,7 +77,7 @@ By default, the component stores its state on the local filesystem. The `defs_st
 - **Fast reloads** -- Assets are visible in the Dagster UI instantly on code location reload, with no API calls.
 - **Resilience** -- If an external API is temporarily unavailable, the cached state ensures assets remain visible.
 - **Scalability** -- Works well with large numbers of sources and tables without adding latency to code location startup.
-- **Auditable plan artifacts** -- Materializations dispatched through `RockyResource.run_streaming()` inherit the plan-then-apply chain automatically, writing `.rocky/plans/<plan-id>.json` per materialization. See [observability](./observability/#plan-artifact-per-materialization).
+- **Auditable plan artifacts** -- Materializations dispatched through `RockyResource.run_pipes()` keep the two-step `rocky plan` + `rocky apply <plan-id>` chain, persisting `.rocky/plans/<plan-id>.json` per materialization. The default `run()` / `run_streaming()` path is a fused `rocky run` and does not write a plan file. See [observability](/dagster/observability/#plan-artifact-per-materialization).
 
 ## DAG mode
 
@@ -100,7 +100,7 @@ With `dag_mode`, the asset graph automatically shows:
 - **Model → Model** edges from model `depends_on` in TOML sidecars
 - **Freshness policies** auto-mapped from model sidecar `[freshness]`
 - **Partition definitions** auto-mapped from `time_interval` strategies
-- **Column-level lineage** when `--column-lineage` is enabled
+- **Column-level lineage** fetched automatically (the component invokes `rocky dag --column-lineage`; no extra flag needed)
 
 Materialization dispatches to the right Rocky command per node kind:
 - Transformation nodes → `rocky run --model <name>`
@@ -111,4 +111,4 @@ Override key derivation by subclassing `RockyDagsterTranslator` and implementing
 
 ## Refreshing state
 
-To update the cached state with the latest discovery results, call `write_state_to_path()`. This is typically done as part of a scheduled job or a manual refresh operation, separate from the normal code location reload cycle.
+To update the cached state with the latest discovery results, trigger a state refresh — the framework `dg defs state refresh` workflow (or a scheduled job that resolves the state path via the `defs_state` config) calls `write_state_to_path(state_path)` for you. This runs separate from the normal code location reload cycle.

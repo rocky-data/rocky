@@ -31,15 +31,12 @@ threshold_seconds = 86400  # 24 hours
 
 The `RockyComponent` reads `discover.checks.freshness` automatically and attaches
 a matching `FreshnessPolicy` to every source-replication asset. No additional
-configuration needed:
+configuration needed -- wire it up via `defs.yaml`:
 
-```python
-import dagster as dg
-from dagster_rocky import RockyComponent
-
-defs = dg.Definitions(
-    assets=[RockyComponent(config_path="rocky.toml")],
-)
+```yaml
+type: dagster_rocky.RockyComponent
+attributes:
+  config_path: rocky.toml
 ```
 
 The functional API works the same way:
@@ -71,7 +68,7 @@ schema = "marts"
 table = "fct_daily_orders"
 
 [freshness]
-max_lag_seconds = 3600  # 1 hour — overrides the pipeline default
+expected_lag_seconds = 3600  # 1 hour — overrides the pipeline default (max_lag_seconds is accepted as a legacy alias)
 ```
 
 The compiler emits this in the JSON output for `rocky compile` (via the new

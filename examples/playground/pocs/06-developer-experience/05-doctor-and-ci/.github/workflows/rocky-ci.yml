@@ -13,9 +13,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rocky
-        run: |
-          curl -sSL https://github.com/rocky-data/rocky/releases/latest/download/rocky-linux-x86_64 -o /usr/local/bin/rocky
-          chmod +x /usr/local/bin/rocky
+        run: curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | ROCKY_INSTALL_DIR=/usr/local/bin bash
 
       - name: rocky doctor
         run: rocky doctor

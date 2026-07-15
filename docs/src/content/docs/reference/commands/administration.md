@@ -43,8 +43,8 @@ rocky history
       "run_id": "run_20260401_143022",
       "started_at": "2026-04-01T14:30:22Z",
       "duration_ms": 45200,
-      "status": "success",
-      "trigger": "cli",
+      "status": "Success",
+      "trigger": "Manual",
       "models_executed": 14,
       "models": [
         { "model_name": "stg_orders",  "duration_ms": 1200, "rows_affected": 150000, "status": "success" },
@@ -55,8 +55,8 @@ rocky history
       "run_id": "run_20260401_080015",
       "started_at": "2026-04-01T08:00:15Z",
       "duration_ms": 52100,
-      "status": "partial",
-      "trigger": "cli",
+      "status": "PartialFailure",
+      "trigger": "Manual",
       "models_executed": 13,
       "models": [ /* per-model records */ ]
     }
@@ -104,11 +104,13 @@ rocky -o table history --since 2026-04-01
 ```
 
 ```
-run_id                   | started_at            | duration  | copied | failed | status
--------------------------+-----------------------+-----------+--------+--------+--------
-run_20260401_143022      | 2026-04-01T14:30:22Z  | 45.2s     | 20     | 0      | success
-run_20260401_080015      | 2026-04-01T08:00:15Z  | 52.1s     | 19     | 1      | partial
+RUN ID       STARTED                  STATUS     MODELS   TRIGGER
+------------------------------------------------------------------
+run_2026040  2026-04-01 14:30:22      Success    14       Manual
+run_2026040  2026-04-01 08:00:15      Failure    13       Manual
 ```
+
+The `RUN ID` column is truncated to 11 characters and the timestamp is rendered without the `T`/`Z` separators.
 
 ### Audit trail
 
@@ -140,7 +142,7 @@ rocky history --audit
       "started_at": "2026-04-23T14:30:22Z",
       "duration_ms": 45200,
       "status": "Success",
-      "trigger": "Cli",
+      "trigger": "Manual",
       "models_executed": 14,
       "models": [ /* per-model records */ ],
       "triggering_identity": "alice@acme.io",
@@ -344,12 +346,13 @@ Same `recommendations` shape, single entry. When compile-time incrementality ana
 Generate `OPTIMIZE` and `VACUUM` SQL for storage compaction on Delta tables. Combines small files, removes old versions, and optionally targets a specific file size.
 
 ```bash
-rocky compact <model> [flags]
+rocky compact <model> [flags]            # generate + persist a compaction plan
 rocky compact --catalog <name> [flags]   # every Rocky-managed table in the catalog
 rocky compact --measure-dedup [flags]    # experimental, project-wide scope
+rocky compact apply <plan-id> [flags]    # execute a previously-generated plan
 ```
 
-Exactly one scope is required: a fully-qualified `<model>`, `--catalog <name>`, or `--measure-dedup`. The three forms are mutually exclusive.
+Exactly one scope is required for plan generation: a fully-qualified `<model>`, `--catalog <name>`, or `--measure-dedup`. The three forms are mutually exclusive. `rocky compact apply <plan-id>` is a separate subcommand that executes a plan persisted by an earlier generate run.
 
 ### Arguments
 
@@ -371,7 +374,7 @@ Exactly one scope is required: a fully-qualified `<model>`, `--catalog <name>`, 
 
 ### Examples
 
-`rocky compact` generates SQL; it doesn't execute. Pipe the output of `rocky -o table compact ... --dry-run` to your warehouse once you're happy with the plan, or drop `--dry-run` and let Rocky run the statements in sequence.
+`rocky compact` generates SQL and persists it as a plan under `.rocky/plans/<plan-id>.json`; it does not execute against the warehouse. The plan id is printed in text output and returned as `plan_id` in JSON. Pipe the SQL to your warehouse yourself once you're happy with it, or execute the persisted plan with `rocky compact apply <plan-id>`.
 
 Compact a table (dry run):
 
@@ -385,10 +388,10 @@ rocky compact acme_warehouse.staging__us_west__shopify.orders --dry-run
   "command": "compact",
   "model": "acme_warehouse.staging__us_west__shopify.orders",
   "dry_run": true,
-  "target_size_mb": 0,
+  "target_size_mb": 256,
   "statements": [
-    { "purpose": "optimize", "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders" },
-    { "purpose": "vacuum",   "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" }
+    { "purpose": "compact small files",      "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders WHERE true\n  -- target file size: 256MB" },
+    { "purpose": "remove stale data files",  "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" }
   ]
 }
 ```
@@ -399,7 +402,7 @@ With a target file size:
 rocky compact acme_warehouse.staging__us_west__shopify.orders --target-size 256MB
 ```
 
-The generated SQL uses the Delta `ZORDER` / file-size hints; `target_size_mb` echoes the parsed value (e.g. `256` for `256MB`).
+The generated `OPTIMIZE` carries the target file size as a trailing `-- target file size: <N>MB` comment; `target_size_mb` echoes the parsed value (e.g. `256` for `256MB`). When `--target-size` is omitted it defaults to `256`.
 
 #### Catalog-scoped compaction
 
@@ -418,22 +421,22 @@ rocky compact --catalog acme_warehouse --target-size 256MB --dry-run
   "dry_run": true,
   "target_size_mb": 256,
   "statements": [
-    { "purpose": "optimize", "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders" },
-    { "purpose": "vacuum",   "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" },
-    { "purpose": "optimize", "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.events" },
-    { "purpose": "vacuum",   "sql": "VACUUM acme_warehouse.staging__us_west__shopify.events RETAIN 168 HOURS" }
+    { "purpose": "compact small files",     "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders WHERE true\n  -- target file size: 256MB" },
+    { "purpose": "remove stale data files", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" },
+    { "purpose": "compact small files",     "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.events WHERE true\n  -- target file size: 256MB" },
+    { "purpose": "remove stale data files", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.events RETAIN 168 HOURS" }
   ],
   "tables": {
     "acme_warehouse.staging__us_west__shopify.events": {
       "statements": [
-        { "purpose": "optimize", "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.events" },
-        { "purpose": "vacuum",   "sql": "VACUUM acme_warehouse.staging__us_west__shopify.events RETAIN 168 HOURS" }
+        { "purpose": "compact small files",     "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.events WHERE true\n  -- target file size: 256MB" },
+        { "purpose": "remove stale data files", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.events RETAIN 168 HOURS" }
       ]
     },
     "acme_warehouse.staging__us_west__shopify.orders": {
       "statements": [
-        { "purpose": "optimize", "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders" },
-        { "purpose": "vacuum",   "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" }
+        { "purpose": "compact small files",     "sql": "OPTIMIZE acme_warehouse.staging__us_west__shopify.orders WHERE true\n  -- target file size: 256MB" },
+        { "purpose": "remove stale data files", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 168 HOURS" }
       ]
     }
   },
@@ -533,8 +536,9 @@ rocky profile-storage acme_warehouse.staging__us_west__shopify.orders
 Archive old data partitions by moving them to cold storage or deleting them based on an age threshold. Supports dry-run mode for previewing which partitions would be affected.
 
 ```bash
-rocky archive [flags]
+rocky archive [flags]                    # generate + persist an archive plan
 rocky archive --catalog <name> [flags]   # every Rocky-managed table in the catalog
+rocky archive apply <plan-id> [flags]    # execute a previously-generated plan
 ```
 
 ### Flags
@@ -548,7 +552,7 @@ rocky archive --catalog <name> [flags]   # every Rocky-managed table in the cata
 
 ### Examples
 
-Like `compact`, `archive` is SQL-generating: it builds `DELETE ... WHERE partition_key < cutoff` (or `COPY TO` for cold-storage workflows) and either prints them (`--dry-run`) or executes them in order.
+Like `compact`, `archive` generates SQL and persists it as a plan under `.rocky/plans/<plan-id>.json`; it does not execute against the warehouse. It builds a Delta-flavoured `DELETE FROM <target> WHERE _fivetran_synced < DATEADD(DAY, -<N>, CURRENT_TIMESTAMP())` plus a trailing `VACUUM`. Pipe the SQL to your warehouse yourself, or execute the persisted plan with `rocky archive apply <plan-id>`. The generator is gated to Delta-on-Databricks targets and errors on other dialects.
 
 Preview archival for data older than 90 days:
 
@@ -556,37 +560,33 @@ Preview archival for data older than 90 days:
 rocky archive --older-than 90d --dry-run
 ```
 
+Without `--model` or `--catalog`, the target resolves to a `*` wildcard placeholder — pass `--model <fqn>` (below) or `--catalog <name>` to emit concrete per-table SQL:
+
 ```json
 {
   "version": "1.6.0",
   "command": "archive",
-  "dry_run": true,
   "older_than": "90d",
   "older_than_days": 90,
+  "dry_run": true,
   "statements": [
-    {
-      "purpose": "archive:orders",
-      "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.orders WHERE order_date < '2026-01-02'"
-    },
-    {
-      "purpose": "archive:events",
-      "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.events WHERE event_date < '2026-01-02'"
-    }
+    { "purpose": "delete rows older than 90 days", "sql": "DELETE FROM *\nWHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())" },
+    { "purpose": "reclaim storage after deletion", "sql": "VACUUM * RETAIN 0 HOURS" }
   ]
 }
 ```
 
-Archive a specific model's old data (omitting `--dry-run` executes the statements):
+Archive a specific model's old data. The persisted plan is executed later with `rocky archive apply <plan-id>`:
 
 ```bash
 rocky archive --older-than 6m --model acme_warehouse.staging__us_west__shopify.events
 ```
 
-Same output shape: `model` is set when `--model` filters the run. `older_than_days` is the parsed duration (`6m` → `180`), which lets orchestrators compute retention windows without re-parsing the string.
+Same output shape: `model` is set when `--model` filters the run, and `<target>` in the `DELETE`/`VACUUM` becomes the fully-qualified table. `older_than_days` is the parsed duration (`6m` → `180`), which lets orchestrators compute retention windows without re-parsing the string.
 
 #### Catalog-scoped archival
 
-`--catalog <name>` mirrors `rocky compact --catalog`: it resolves every Rocky-managed table in the catalog from the pipeline config and aggregates per-table DELETE SQL into a single envelope keyed by FQN. The flat `statements` list still carries every statement across every table.
+`--catalog <name>` mirrors `rocky compact --catalog`: it resolves every Rocky-managed table in the catalog from the pipeline config and aggregates per-table DELETE + VACUUM SQL into a single envelope keyed by FQN. The flat `statements` list still carries every statement across every table.
 
 ```bash
 rocky archive --older-than 90d --catalog acme_warehouse --dry-run
@@ -602,22 +602,26 @@ rocky archive --older-than 90d --catalog acme_warehouse --dry-run
   "older_than_days": 90,
   "dry_run": true,
   "statements": [
-    { "purpose": "archive:orders", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.orders WHERE order_date < '2026-01-02'" },
-    { "purpose": "archive:events", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.events WHERE event_date < '2026-01-02'" }
+    { "purpose": "delete rows older than 90 days", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.orders\nWHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())" },
+    { "purpose": "reclaim storage after deletion", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 0 HOURS" },
+    { "purpose": "delete rows older than 90 days", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.events\nWHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())" },
+    { "purpose": "reclaim storage after deletion", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.events RETAIN 0 HOURS" }
   ],
   "tables": {
     "acme_warehouse.staging__us_west__shopify.events": {
       "statements": [
-        { "purpose": "archive:events", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.events WHERE event_date < '2026-01-02'" }
+        { "purpose": "delete rows older than 90 days", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.events\nWHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())" },
+        { "purpose": "reclaim storage after deletion", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.events RETAIN 0 HOURS" }
       ]
     },
     "acme_warehouse.staging__us_west__shopify.orders": {
       "statements": [
-        { "purpose": "archive:orders", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.orders WHERE order_date < '2026-01-02'" }
+        { "purpose": "delete rows older than 90 days", "sql": "DELETE FROM acme_warehouse.staging__us_west__shopify.orders\nWHERE _fivetran_synced < DATEADD(DAY, -90, CURRENT_TIMESTAMP())" },
+        { "purpose": "reclaim storage after deletion", "sql": "VACUUM acme_warehouse.staging__us_west__shopify.orders RETAIN 0 HOURS" }
       ]
     }
   },
-  "totals": { "table_count": 2, "statement_count": 2 }
+  "totals": { "table_count": 2, "statement_count": 4 }
 }
 ```
 

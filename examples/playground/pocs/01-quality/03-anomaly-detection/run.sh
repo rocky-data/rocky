@@ -14,8 +14,18 @@ done
 
 # Simulate an incident: source is suddenly truncated to 5 rows.
 duckdb poc.duckdb < data/seed_truncated.sql
-rocky -c rocky.toml run --filter source=events --output json > expected/run-incident.json
+rocky -c rocky.toml run --filter source=events --output json \
+    > expected/run-incident.json 2> expected/run-incident.log
 echo "Incident run: ok"
+
+# Assert the anomaly actually fired — the whole point of the POC.
+if grep -q "row count anomaly detected" expected/run-incident.log; then
+    echo "Anomaly detected as expected:"
+    grep -o '"reason":"[^"]*"' expected/run-incident.log | head -1
+else
+    echo "ERROR: expected a row count anomaly warning but none fired" >&2
+    exit 1
+fi
 
 echo
 echo "=== Run history ==="

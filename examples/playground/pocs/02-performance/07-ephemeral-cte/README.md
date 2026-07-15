@@ -51,14 +51,32 @@ The `ephemeral` materialization strategy is a model that is never persisted as a
 ## Expected output
 
 ```text
-Compiled models:
-  stg_events     — ephemeral (CTE, not materialized)
-  user_metrics   — full_refresh (CREATE OR REPLACE TABLE)
+=== Compiled models ===
+{
+  "version": "1.63.0",
+  "command": "compile",
+  "models": 2,
+  "execution_layers": 2,
+  "diagnostics": [],
+  "has_errors": false,
+  ...
+  "models_detail": [
+    {
+      "name": "stg_events",
+      "strategy": {
+        "type": "ephemeral"
+      },
+      ...
 
 Key point: stg_events (ephemeral) is NOT materialized as a table.
 It is inlined as a CTE inside user_metrics.
-POC complete.
+
+POC complete: ephemeral model compiled and inlined as CTE.
 ```
+
+`run.sh` prints the first 30 lines of `expected/compile.json`; the `models_detail`
+array carries each model's `strategy` (`ephemeral` for `stg_events`,
+`full_refresh` for `user_metrics`).
 
 ## What happened
 

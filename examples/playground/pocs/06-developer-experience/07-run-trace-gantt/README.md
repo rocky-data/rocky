@@ -51,8 +51,8 @@ platform's existing OpenTelemetry collector already consumes.
 ## What happened
 
 1. Seed two source tables.
-2. Run the pipeline twice (once per source) so the state store has
-   two runs to inspect.
+2. Run the pipeline once — both sources copy concurrently, so the
+   single run record holds two models on two concurrency lanes.
 3. `rocky trace latest` — renders the recorded run as a timeline
    (per-model offsets, duration bars, concurrency lanes), read from the
    run record `rocky run` persists to the state store.

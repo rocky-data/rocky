@@ -46,21 +46,14 @@ name = "amount"
 type = "Float64"
 ```
 
-3. Tell `RockyComponent` where to find contracts:
+3. Tell `RockyComponent` where to find contracts in your `defs.yaml`:
 
-```python
-import dagster as dg
-from dagster_rocky import RockyComponent
-
-defs = dg.Definitions(
-    assets=[
-        RockyComponent(
-            config_path="rocky.toml",
-            models_dir="models",
-            contracts_dir="contracts",  # ← enables contract checks
-        ),
-    ],
-)
+```yaml
+type: dagster_rocky.RockyComponent
+attributes:
+  config_path: rocky.toml
+  models_dir: models
+  contracts_dir: contracts  # ← enables contract checks
 ```
 
 After deployment, every model with a contract file shows up to three new
@@ -135,16 +128,14 @@ expected, even on a fresh deployment.
 
 `RockyComponent` matches contracts to assets by **table name**: a
 contract file `orders.contract.toml` attaches to any asset whose key
-ends with `orders`. Today this means:
+ends with `orders`. This applies to:
 
-- Source-replication tables whose table name happens to match a
-  contract file get the wiring (uncommon).
-- Once derived models are surfaced as their own assets (a future
-  release), every model with a contract file gets the wiring
-  automatically.
-
-The wiring is correct for both cases; today there just aren't many
-derived-model assets to attach to.
+- **Derived-model assets** — set `surface_derived_models: true` (or
+  `dag_mode: true`) and every silver-layer model is surfaced as its own
+  asset, so each model with a contract file gets the contract checks
+  automatically. See [Derived models](/dagster/derived-models/).
+- **Source-replication tables** whose table name happens to match a
+  contract file — the fallback when derived models are not surfaced.
 
 ## Defensive parsing
 

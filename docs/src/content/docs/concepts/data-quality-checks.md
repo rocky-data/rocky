@@ -136,7 +136,7 @@ filter = "region = 'US'"
 | `not_in_future` | row | — (sugar for `col <= CURRENT_TIMESTAMP()`) | Timestamp column cannot contain future values. NULLs pass. |
 | `older_than_n_days` | row | `days: u32` | Every timestamp must be at least `days` old. NULLs pass. Dialect-aware. |
 
-Row-level assertions are **quarantinable** (see below). Set-based and table-level assertions (`unique`, `unique_expr`, `composite`, `row_count_range`, `aggregate`) are evaluated post-hoc and cannot be quarantined.
+Most row-level assertions are **quarantinable** (see below): `not_null`, `accepted_values`, `expression`, `in_range`, `regex_match`, `not_in_future`, `older_than_n_days`. Set-based, table-level, and referential assertions (`unique`, `unique_expr`, `composite`, `row_count_range`, `aggregate`, `relationships`) are evaluated post-hoc and cannot be quarantined — `relationships` needs a join, not a per-row predicate.
 
 ### Severity and `fail_on_error`
 
@@ -217,16 +217,17 @@ Row-level assertions can quarantine failing rows instead of just reporting a cou
 
 ```toml
 [pipeline.silver.checks.quarantine]
+enabled = true
 mode = "split"   # or "tag" or "drop"
 ```
 
 | Mode | Behavior |
 |---|---|
-| `split` | Rocky materializes two tables: `<target>` with passing rows, `<target>__quarantine` with failing rows. Downstream models see only the clean table. |
-| `tag` | A `__dqx_valid` boolean column is added to `<target>`; failing rows stay in the table with `__dqx_valid = FALSE`. Useful for observation without rewiring downstream. |
-| `drop` | Failing rows are dropped from `<target>`. Quarantine count is still reported in `check_results[]`. |
+| `split` | Rocky materializes two new tables: `<target>__valid` with the passing rows and `<target>__quarantine` with the failing rows (plus per-assertion `_error_<name>` label columns marking which assertion each row failed). The original `<target>` is left untouched; point downstream models at `<target>__valid`. |
+| `tag` | Rocky rewrites `<target>` in place, adding a per-assertion `_error_<name>` column populated on failing rows (NULL on passing rows). Every row stays in the table. Useful for observation without a second table — rewrites the source, so use with care on a raw replication target. |
+| `drop` | Only `<target>__valid` (the passing rows) is written; failing rows are discarded. Quarantine count is still reported in `check_results[]`. |
 
-Set-based and table-level assertions are not quarantinable; they run as post-hoc checks regardless of mode.
+Set-based, table-level, and referential assertions are not quarantinable; they run as post-hoc checks regardless of mode.
 
 The quarantine predicate is built from every quarantinable assertion, combined with AND. Filters compose via `CASE WHEN (filter) THEN base_valid_pred ELSE TRUE END`, so out-of-scope rows stay on the valid side even when the base predicate would fail them.
 
@@ -236,14 +237,16 @@ Every assertion produces a `check_results[]` entry in the `rocky apply` JSON out
 
 ```json
 {
-  "name": "orders.order_id.not_null",
+  "name": "not_null:order_id",
   "passed": false,
   "severity": "error",
-  "failing_count": 3,
-  "quarantined": true,
-  "sql": "SELECT COUNT(*) FROM orders WHERE order_id IS NULL"
+  "kind": "not_null",
+  "column": "order_id",
+  "failing_rows": 3
 }
 ```
+
+The `name` is the assertion's explicit `name` when set, else a synthesized `"{kind}:{column}"`. The type-specific detail fields (`kind`, `column`, `failing_rows`) are flattened onto the result, consistent with every other check.
 
 Consumers (dagster-rocky, the VS Code lineage view, custom scripts) parse this shape via the generated Pydantic / TypeScript bindings (see the [JSON Output](/reference/json-output/) reference).
 

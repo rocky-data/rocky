@@ -56,7 +56,7 @@ See [authoring with MCP](/concepts/mcp-authoring/) for the tool surface and [ope
 `rocky serve` starts an HTTP server that holds a compiled graph in memory and answers requests under `/api/v1`. This is the pattern for a long-lived service: the compile happens once at startup, reads are served warm, and mutating work is submitted as a background job.
 
 ```bash
-rocky serve --config rocky.toml --port 8080
+rocky --config rocky.toml serve --port 8080
 ```
 
 The canonical read routes return the same payloads as the matching CLI command, byte for byte. `GET /api/v1/models/{name}/lineage` returns exactly what `rocky lineage <name> --output json` prints, and `GET /api/v1/compile` matches `rocky compile --output json`. A consumer on the HTTP API and a consumer on the SDK see identical data.

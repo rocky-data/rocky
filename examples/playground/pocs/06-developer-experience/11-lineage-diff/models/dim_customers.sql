@@ -3,4 +3,4 @@ SELECT
     customer_name,
     segment,
     region
-FROM poc.demo.raw_customers
+FROM raw_customers

@@ -6,7 +6,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
 # Clean state from previous runs
-rm -rf .rocky_state poc.duckdb expected
+rm -rf .rocky-state.redb .rocky-state.redb.lock models/.rocky-state.redb models/.rocky-state.redb.lock poc.duckdb expected
 mkdir -p expected
 
 echo "=== validate ==="

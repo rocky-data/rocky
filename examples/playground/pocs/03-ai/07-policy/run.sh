@@ -33,14 +33,14 @@ echo "==> using rocky: $ROCKY"
 
 echo
 echo "==> 1. Green: the policy matches every pinned scenario"
-"$ROCKY" -c rocky.toml policy test
+"$ROCKY" -c rocky.toml policy test --output table
 "$ROCKY" -c rocky.toml policy test --output json > expected/policy-test.json
 
 echo
 echo "==> 2. Red: a careless edit loosened the contract-boundary deny to allow"
 echo "    (rocky-hole.toml — the scenarios are unchanged; the policy is not)"
 hole_exit=0
-"$ROCKY" -c rocky-hole.toml policy test > expected/policy-test-hole.log 2>&1 || hole_exit=$?
+"$ROCKY" -c rocky-hole.toml policy test --output table > expected/policy-test-hole.log 2>&1 || hole_exit=$?
 if [ "$hole_exit" -eq 0 ]; then
     echo "    UNEXPECTED: the hole was not caught — failing the POC"
     cat expected/policy-test-hole.log

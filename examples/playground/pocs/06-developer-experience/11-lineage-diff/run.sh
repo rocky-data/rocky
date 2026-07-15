@@ -56,7 +56,7 @@ SELECT
     amount * 0.20 AS tax_amount_usd,
     status,
     order_date
-FROM poc.demo.raw_orders
+FROM raw_orders
 WHERE status != 'cancelled'
 EOF
 
@@ -67,8 +67,8 @@ SELECT
     c.region,
     SUM(s.amount_usd) AS total_revenue,
     SUM(s.tax_amount_usd) AS total_tax
-FROM poc.demo.stg_orders s
-JOIN poc.demo.dim_customers c USING (customer_id)
+FROM stg_orders s
+JOIN dim_customers c USING (customer_id)
 GROUP BY s.customer_id, c.segment, c.region
 EOF
 

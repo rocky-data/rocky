@@ -36,7 +36,7 @@ my-project/
 The default template is `quickstart` (3 models). Two larger templates are available for exploring more features:
 
 ```bash
-rocky playground my-project --template ecommerce   # 11 models, sources/staging/marts
+rocky playground my-project --template ecommerce   # 10 models, sources/staging/intermediate/marts
 rocky playground my-project --template showcase    # ecommerce + Rocky DSL + extra contracts
 ```
 
@@ -73,7 +73,7 @@ concurrency = 4
 
 This is a `transformation` pipeline: the unnamed `[adapter]` block auto-wraps as the default adapter, and `models = "models/**"` builds the model DAG from the `models/` directory.
 
-The same `playground.duckdb` file backs the whole run. `rocky test` ignores `path` and runs models against an in-memory database; `rocky run` materializes them into the file. Both auto-load `data/seed.sql`, so the playground works end-to-end with no manual seeding step.
+The same `playground.duckdb` file backs the whole run. `rocky test` ignores `path` and runs models against an in-memory database, auto-loading `data/seed.sql` on the fly. `rocky run` materializes models into the file -- which `rocky playground` already seeded at creation time -- so the playground works end-to-end with no manual seeding step. (Re-seed the file at any time with `duckdb playground.duckdb < data/seed.sql`.)
 
 ### raw_orders.sql + raw_orders.toml
 
@@ -170,16 +170,16 @@ protected = ["customer_id"]
 
 The contract declares two rules:
 - **required**: These columns must exist with the specified types. The compiler fails if they are missing or have the wrong type.
-- **protected**: These columns cannot be removed in future changes. The compiler warns if a protected column disappears from the model's output.
+- **protected**: These columns cannot be removed in future changes. The compiler fails compilation (error `E013`) if a protected column disappears from the model's output.
 
 The columns are marked `nullable = true` (the TOML comment above explains why). A strict-contract walkthrough that pins types and nullability lives in the dedicated POCs.
 
 ## 3. Compile the Models
 
-Run the compiler to type-check all models, resolve dependencies, and validate contracts:
+Run the compiler to type-check all models, resolve dependencies, and validate contracts. Pass `--contracts contracts` to check the model output against the contract files (plain `rocky compile` skips contract validation):
 
 ```bash
-rocky compile
+rocky compile --contracts contracts
 ```
 
 Expected output:
@@ -199,32 +199,28 @@ The compiler performs several checks:
 
 ### Try introducing an error
 
-Edit `revenue_summary.sql` and reference a column that does not exist:
+Edit `revenue_summary.sql` and drop a required column -- remove the `order_count` line from the SELECT:
 
 ```sql
 SELECT
     customer_id,
-    nonexistent_column,    -- does not exist in customer_orders
-    order_count
+    total_revenue,
+    total_revenue / order_count AS avg_order_value,
+    first_order
 FROM customer_orders
+WHERE order_count >= 2
 ```
 
-Run `rocky compile` again:
+Run `rocky compile --contracts contracts` again:
 
 ```
   ✓ raw_orders (6 columns)
   ✓ customer_orders (4 columns)
   ✗ revenue_summary
+  x error[E010]: required column 'order_count' missing from model output
+  help: add `order_count` to the SELECT, or remove it from `[rules] required`
 
-  error[E0001]: unknown column 'nonexistent_column'
-    --> models/revenue_summary.sql:3:5
-    |
-  3 |     nonexistent_column,
-    |     ^^^^^^^^^^^^^^^^^^ not found in customer_orders
-    |
-    = available columns: customer_id, total_revenue, order_count, first_order
-
-  Compiled: 3 models, 1 error, 0 warnings
+  Compiled: 3 models, 1 errors, 0 warnings
 ```
 
 Revert the change before continuing.
@@ -250,7 +246,7 @@ Testing 3 models...
 The test runner:
 1. Compiles all models
 2. Executes each model's SQL against DuckDB in dependency order
-3. Validates contract assertions against actual output
+3. Validates contract assertions against the actual output (when run with `--contracts contracts`)
 4. Reports pass/fail for each model
 
 ### Test a single model
@@ -273,23 +269,26 @@ Upstream: customer_orders
 Downstream:
 
 Columns:
-  customer_id <- customer_orders.customer_id (Direct)
-  total_revenue <- customer_orders.total_revenue (Direct)
-  order_count <- customer_orders.order_count (Direct)
-  avg_order_value <- customer_orders.total_revenue, customer_orders.order_count (Derived)
-  first_order <- customer_orders.first_order (Direct)
+  customer_id <- customer_orders.customer_id (direct)
+  total_revenue <- customer_orders.total_revenue (direct)
+  order_count <- customer_orders.order_count (direct)
+  avg_order_value (no lineage)
+  first_order <- customer_orders.first_order (direct)
 ```
+
+`avg_order_value` shows `(no lineage)`: it is a computed expression (`total_revenue / order_count`), and the column tracer only follows columns that pass through directly or via an aggregation.
 
 ### Trace a single column through the entire chain
 
 ```bash
-rocky lineage revenue_summary --column avg_order_value
+rocky lineage revenue_summary --column total_revenue
 ```
 
 ```
-Column trace: revenue_summary.avg_order_value
-  <- customer_orders.total_revenue (Derived)
-  <- customer_orders.order_count (Derived)
+Column trace: revenue_summary.total_revenue
+  <- customer_orders.total_revenue (direct)
+    <- raw_orders.amount (aggregation: sum)
+      <- raw__orders.orders.amount (direct)
 ```
 
 ### Generate Graphviz output
@@ -304,8 +303,6 @@ digraph lineage {
   "customer_orders.customer_id" -> "revenue_summary.customer_id";
   "customer_orders.total_revenue" -> "revenue_summary.total_revenue";
   "customer_orders.order_count" -> "revenue_summary.order_count";
-  "customer_orders.total_revenue" -> "revenue_summary.avg_order_value";
-  "customer_orders.order_count" -> "revenue_summary.avg_order_value";
   "customer_orders.first_order" -> "revenue_summary.first_order";
 }
 ```

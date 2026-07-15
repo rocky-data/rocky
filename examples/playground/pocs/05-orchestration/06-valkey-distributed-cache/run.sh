@@ -21,12 +21,11 @@ duckdb poc.duckdb < data/seed.sql
 rocky validate
 
 echo
-echo "=== Cache configuration ==="
-echo "  [cache]  valkey_url  → schema/metadata caching in Valkey"
-echo "  [state]  backend     → tiered (local redb + Valkey)"
-echo "  Tier 1: In-process LRU (memory.rs) — sub-millisecond"
-echo "  Tier 2: Valkey (valkey.rs) — shared across instances"
-echo "  Tier 3: Source API — warehouse/connector queries"
+echo "=== Distributed schema/metadata cache ==="
+echo "  [cache.schemas] replicate=true  → schema (DESCRIBE) cache replicated to remote state"
+echo "  [state] backend=valkey          → local redb (working) + Valkey (shared remote)"
+echo "  Watermarks and the replicated schema cache are shared across Rocky"
+echo "  instances via Valkey, so peers skip redundant warehouse DESCRIBE calls."
 
 echo
 echo "=== Run pipeline (cache-enabled) ==="
@@ -41,5 +40,5 @@ if command -v docker >/dev/null && docker compose ps --status running 2>/dev/nul
 fi
 
 echo
-echo "POC complete: Valkey cache + tiered state backend configured."
+echo "POC complete: replicated schema cache + Valkey state backend configured."
 echo "To clean up: docker compose down"

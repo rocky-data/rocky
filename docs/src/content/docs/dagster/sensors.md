@@ -109,6 +109,7 @@ Every `RunRequest` is tagged with:
 
 - `rocky/source_id` (per_source) or `rocky/group` (per_group)
 - `rocky/sync_at`: the ISO timestamp that triggered the run
+- `rocky/sensor`: the emitting sensor's name (used by the backlog cap's self-scoping)
 
 These show up in the Dagster run history view so you can audit which Fivetran
 sync triggered which materialization.

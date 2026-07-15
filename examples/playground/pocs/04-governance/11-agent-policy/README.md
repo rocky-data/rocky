@@ -59,7 +59,9 @@ $ ./run.sh
 Error: policy DENIES plan '…': model 'fct_orders' (rule 0) — denied by rule 0
        (deny overrides). A deny cannot be satisfied by review; …
 === 4. rocky apply — expected ALLOW (additive bronze, no review) ===
-allowed and materialized: poc.main.bronze_metrics
+allowed and materialized:
+{ … "status": "Success", "materializations":
+    [ { "asset_key": ["poc", "main", "bronze_metrics"], … } ] … }
 === 5. rocky audit — the decision ledger records both ===
   agent/schema_change.breaking fct_orders   … [deny via rule 0]
   agent/schema_change.additive bronze_metrics … [allow via rule 1]

@@ -11,7 +11,7 @@ warnings to first-class Dagster primitives:
 - **Schema drift** → `dg.AssetObservation` events on the asset timeline
 - **Row-count anomalies** → `dg.AssetCheckResult` with severity `WARN`
 - **Optimization recommendations** → `AssetSpec.metadata` (load-time)
-- **Plan artifact trail** → `.rocky/plans/<plan-id>.json` per materialization
+- **Plan artifact trail** → `.rocky/plans/<plan-id>.json` per `run_pipes` materialization
 
 Drift and anomaly emission is **automatic** when using `RockyComponent`;
 nothing to wire up. Standalone helpers are also exported for users with
@@ -19,10 +19,12 @@ hand-rolled multi_assets.
 
 ## Plan artifact per materialization
 
-Every `RockyResource.run()`, `run_streaming()`, and `run_pipes()` call
-chains `rocky plan` + `rocky apply <plan-id>` under the hood (as of
-`dagster-rocky` v1.30), and each invocation writes the typed plan to
-`.rocky/plans/<plan-id>.json` before the apply phase runs. That file is
+Only `RockyResource.run_pipes()` (and `RockyComponent` with
+`execution_mode="pipes"`) chains `rocky plan` + `rocky apply <plan-id>`
+under the hood, writing the typed plan to `.rocky/plans/<plan-id>.json`
+before the apply phase runs. `run()` and `run_streaming()` (the default
+`execution_mode="streaming"`) instead spawn a single fused `rocky run`
+subprocess and do **not** write a plan artifact. That plan file is
 the audit record of *exactly what Rocky tried to apply*: the materialization
 list, governance plan, drift actions, and (for compact / archive plans)
 the typed IR that the apply path regenerates SQL from; see
@@ -32,9 +34,11 @@ For `run_pipes`, the plan id is also attached as `extras={"plan_id":
 plan_id}` so Dagster surfaces it as run metadata in the run viewer; one
 click from a failed materialization back to the plan that produced it.
 
-Replication-only projects (no `models/` directory) fall back to the
-legacy single-subprocess `rocky run` path and do not write a plan
-artifact for now.
+Every project shape — including replication-only projects (no `models/`
+directory) — content-addresses a plan under engine `v1.34+`, so
+`run_pipes` always writes a `.rocky/plans/<plan-id>.json` artifact. If the
+engine emits no `plan_id`, `run_pipes` raises `dg.Failure` rather than
+falling back to `rocky run`.
 
 ## Drift events as `AssetObservation`
 

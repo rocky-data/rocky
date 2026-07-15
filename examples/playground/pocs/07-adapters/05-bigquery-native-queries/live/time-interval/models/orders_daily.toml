@@ -8,8 +8,9 @@ granularity = "day"
 lookback = 0
 first_partition = "2026-04-01"
 
-# Hardcoded to the Rocky BQ sandbox project — model sidecar TOMLs don't
-# honor ${VAR} env substitution today (see live/README.md for context).
+# `catalog` carries a __GCP_PROJECT__ placeholder that run.sh sed-substitutes
+# at runtime; sidecar TOMLs do honor ${VAR}, but the SQL body (read raw) does
+# not, so the placeholder keeps staging uniform (see live/README.md).
 [target]
 catalog = "__GCP_PROJECT__"
 schema = "poc_step1_live_ti"

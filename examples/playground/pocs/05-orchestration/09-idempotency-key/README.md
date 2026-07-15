@@ -4,7 +4,7 @@
 > **Credentials:** none (DuckDB)
 > **Runtime:** < 5s
 > **Rocky features:** `--idempotency-key`, `[state.idempotency]` block,
-> `status = "skipped_idempotent"`, `skipped_by_run_id`
+> `status = "SkippedIdempotent"`, `skipped_by_run_id`
 
 ## What it shows
 
@@ -14,7 +14,7 @@ below whatever driver pressed "go":
 1. First invocation with a new key runs normally and stamps the key →
    `run_id` mapping in the state store on success.
 2. Second invocation with the same key short-circuits, returning
-   `status: "skipped_idempotent"` and `skipped_by_run_id: <prior_run_id>`
+   `status: "SkippedIdempotent"` and `skipped_by_run_id: <prior_run_id>`
    without touching the warehouse.
 3. A different key starts fresh.
 
@@ -57,8 +57,8 @@ cd examples/playground/pocs/05-orchestration/09-idempotency-key
 ./run.sh
 ```
 
-You should see three JSON outputs showing `status = "success"` →
-`status = "skipped_idempotent"` → `status = "success"` (with a new key).
+You should see three JSON outputs showing `status = "Success"` →
+`status = "SkippedIdempotent"` → `status = "Success"` (with a new key).
 
 ## Key decisions (matching the plan)
 

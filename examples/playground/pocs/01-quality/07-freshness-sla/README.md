@@ -96,5 +96,5 @@ the model's sidecar.
 
 ## Related
 
-- Source: `rocky/crates/rocky-compiler/src/typecheck.rs` (`check_freshness_coverage`), `rocky/crates/rocky-core/src/config.rs` (`ProjectFreshnessConfig`), `rocky/crates/rocky-core/src/models.rs` (`ModelFreshnessConfig`), `rocky/crates/rocky-server/src/lsp.rs` (W005 + AI fix)
+- Source: `engine/crates/rocky-compiler/src/typecheck.rs` (`check_freshness_coverage`), `engine/crates/rocky-core/src/config.rs` (`ProjectFreshnessConfig`), `engine/crates/rocky-core/src/models.rs` (`ModelFreshnessConfig`), `engine/crates/rocky-server/src/lsp.rs` (W005 + AI fix)
 - Companion: [`02-inline-checks`](../02-inline-checks/) for the runtime freshness *check* (vs. this compile-time *coverage* diagnostic)

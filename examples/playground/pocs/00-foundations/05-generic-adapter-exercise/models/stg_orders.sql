@@ -1,6 +1,6 @@
 -- Reads `raw__orders` directly so `rocky test` (in-memory DuckDB) finds the
--- table via `data/seed.sql`. The replication step in run.sh exercises the
--- separate raw__→staging__ flow but isn't a dependency of this model.
+-- table via `data/seed.sql`. run.sh only *plans* the separate raw__→staging__
+-- replication flow (`rocky plan`); it isn't a dependency of this model.
 SELECT
     order_id,
     customer_id,

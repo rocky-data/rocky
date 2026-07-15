@@ -1,6 +1,14 @@
 [adapter.snowflake]
 type = "snowflake"
-# Snowflake adapter fields are picked up from env vars by the connector
+# Account comes from the SNOWFLAKE_ACCOUNT env var (guarded in run.sh).
+# Auth (key-pair JWT / OAuth / password) is resolved by the Snowflake
+# connector at run time — the offline validate/compile smoke never connects.
+account = "${SNOWFLAKE_ACCOUNT:-demo_account}"
+# Compute warehouse for the dynamic-table refresh. The adapter exposes this
+# via WarehouseAdapter::warehouse_name; SQL gen threads it into the
+# CREATE OR REPLACE DYNAMIC TABLE ... WAREHOUSE = ... DDL. It is NOT a model
+# sidecar field — the warehouse lives on the adapter, the target_lag on the model.
+warehouse = "ANALYTICS_WH"
 
 # Discovery adapter — Snowflake is data-only, so we declare a
 # manual discovery adapter to satisfy the pipeline's discovery

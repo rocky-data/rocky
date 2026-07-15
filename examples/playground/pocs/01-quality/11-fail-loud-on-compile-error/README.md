@@ -56,7 +56,7 @@ The broken run exits non-zero and the script asserts every claim:
 ==== 3. assert: the run exited NON-ZERO ====
 OK: run exited 2 (non-zero) instead of silently succeeding
 
-==== 4. assert: status is partial_failure with a compile-error on daily_revenue ====
+==== 4. assert: status is PartialFailure with a compile-error on daily_revenue ====
 status: PartialFailure
 errors recorded by the run:
   - daily_revenue: failure_kind=compile-error :: [E020] time_column 'order_date' is not in the output schema of model 'daily_revenue'
@@ -70,7 +70,7 @@ poc.main.stg_orders rows: 30
 OK: the clean model materialized 30 rows despite the sibling failure
 
 ==== 7. apply the one-line fix and re-run — the same pipeline goes green ====
-fixed run status: success (tables_failed: 0)
+fixed run status: Success (tables_failed: 0)
 OK: with the compile error fixed, the same pipeline runs green and builds daily_revenue
 
 PASS: rocky run failed loud on the compile error ...

@@ -7,7 +7,7 @@ sidebar:
 
 Two functions convert Rocky execution results into Dagster events that appear in the Dagster UI.
 
-## `emit_materializations(result, translator?) -> list[AssetMaterialization]`
+## `emit_materializations(result) -> list[AssetMaterialization]`
 
 Converts Rocky materializations into Dagster `AssetMaterialization` events.
 
@@ -18,7 +18,7 @@ Each materialization includes metadata:
 - `rows_copied` -- number of rows copied
 - `watermark` -- the new high watermark value
 
-Pass an optional `translator` to control asset key mapping so it matches how assets were discovered via `load_rocky_assets()`.
+Asset keys come verbatim from `result.materializations[].asset_key`.
 
 ## `emit_check_results(result) -> list[AssetCheckResult]`
 
@@ -31,13 +31,15 @@ Handles every Rocky check type, both pipeline-level and model-level:
 - **column_match** -- validates columns exist in both source and target
 - **freshness** -- validates data is within a staleness threshold
 - **null_rate** -- validates null rates are below a threshold
-- **anomaly** -- row count deviation from historical baselines
+- **cross_source_overlap** -- detects the same business key across sibling sources feeding a shared target
 - **custom** -- any user-defined SQL check
 
-**Model-level assertions (DQX parity):**
-`not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`. Each carries a `severity` (`error` / `warning`) and an optional `filter` predicate; row-level assertions also surface `quarantined = true/false` when `[quarantine]` is configured on the pipeline.
+Anomalies are not part of `check_results` -- they live on `RunResult.anomalies` and are converted by the separate `anomaly_check_results()` helper (see the observability page).
 
-Severity maps to Dagster's `AssetCheckSeverity` (`ERROR` / `WARN`). Warnings never fail the asset check, even when the underlying assertion returned `passed = false`. All check metadata (SQL fingerprint, failing row count, quarantine state, filter used) is propagated to the Dagster event for full observability.
+**Model-level assertions (DQX parity):**
+`not_null`, `unique`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, `not_in_future`, `older_than_n_days`. Each carries a `severity` (`error` / `warning`).
+
+Severity maps to Dagster's `AssetCheckSeverity` (`ERROR` / `WARN`). A failing warning-severity check still reports `passed = false`, but at severity `WARN` it does not degrade asset health or trigger `ASSET_HEALTH_DEGRADED` alerts. The metadata attached to each Dagster event is whatever the check populated: `source_count` / `target_count`, `missing_columns` / `extra_columns`, `lag_seconds` / `threshold_seconds`, `column` / `null_rate` / `threshold`, `query` / `result_value`, and a `severity` marker when the check is advisory.
 
 ## Example
 

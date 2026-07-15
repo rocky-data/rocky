@@ -1,7 +1,7 @@
 [[columns]]
 name = "order_id"
 type = "Int64"
-nullable = true
+nullable = false
 
 [[columns]]
 name = "customer_id"

@@ -13,10 +13,13 @@ Embed it into custom dashboards or IDE plugins via the REST API.
 
 ## Endpoints
 
-- `GET /api/health` — health check
-- `GET /api/models` — list compiled models
-- `GET /api/lineage/:model` — lineage for one model
-- `GET /api/dag` — full DAG
+All routes are served under the `/api/v1` prefix:
+
+- `GET /api/v1/health` — health check
+- `GET /api/v1/models` — list compiled models
+- `GET /api/v1/models/:model/lineage` — lineage for one model
+- `GET /api/v1/dag` — full DAG
+- `GET /api/v1/meta` — list every route this build serves
 
 ## Run
 

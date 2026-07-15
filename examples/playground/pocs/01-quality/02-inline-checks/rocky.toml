@@ -5,9 +5,6 @@ path = "poc.duckdb"
 [pipeline.poc]
 strategy = "full_refresh"
 
-[pipeline.poc.source.discovery]
-adapter = "default"
-
 [pipeline.poc.source.schema_pattern]
 prefix = "raw__"
 separator = "__"

@@ -63,21 +63,16 @@ Events are organized into five phases:
 |-------|------|----------|
 | `budget_breach` | Observed run cost or duration exceeds a limit declared in [`[budget]`](/reference/configuration/#budget) | Page oncall on overspend; gate downstream runs on `on_breach = "error"` |
 
-### Adapter resilience phase
-
-| Event | When | Use case |
-|-------|------|----------|
-| `circuit_breaker_tripped` | Adapter circuit breaker moves `Closed → Open` after consecutive transient failures | Mute retries; notify oncall that a warehouse endpoint is unhealthy |
-| `circuit_breaker_recovered` | Half-open trial request succeeds and the breaker closes | Clear the alert; record recovery latency |
-
-Circuit-breaker behaviour is configured per-adapter via [`[adapter.NAME.retry]`](/reference/configuration/#adapternameretry): `circuit_breaker_threshold` sets the failure count that trips it, and `circuit_breaker_recovery_timeout_secs` enables timed auto-recovery through the half-open state.
+:::note[Event names carry an `on_` prefix in config]
+The bare names above (`pipeline_start`, `budget_breach`, …) are what Rocky writes into the `event` field of the JSON context. When you **reference** an event — as a `[hook.*]` config key or as the `rocky hooks test` argument — prefix it with `on_`: `on_pipeline_start`, `on_budget_breach`, and so on. An unknown/unprefixed key is ignored with a warning rather than firing.
+:::
 
 ## Shell hooks
 
 Shell hooks execute a command and pipe the event context as JSON to stdin:
 
 ```toml
-[[hook.pipeline_complete]]
+[[hook.on_pipeline_complete]]
 command = "bash scripts/slack-notify.sh"
 timeout_ms = 5000
 on_failure = "warn"
@@ -89,11 +84,11 @@ The script receives JSON like:
 {
   "event": "pipeline_complete",
   "run_id": "run_20260402",
+  "pipeline": "raw",
   "timestamp": "2026-04-02T14:30:00Z",
   "duration_ms": 45200,
   "metadata": {
-    "tables_copied": "20",
-    "tables_failed": "0"
+    "table_count": 20
   }
 }
 ```
@@ -119,7 +114,7 @@ Still, **never build a hook `command` by string-formatting untrusted input** (a 
 Webhooks send HTTP requests instead of running shell commands:
 
 ```toml
-[hook.webhooks.pipeline_error]
+[hook.webhooks.on_pipeline_error]
 url = "https://hooks.slack.com/services/T.../B.../xxx"
 preset = "slack"
 secret = "${WEBHOOK_SECRET}"
@@ -169,7 +164,7 @@ Validate your hook configuration without running a real pipeline:
 rocky hooks list
 
 # Fire a test event
-rocky hooks test pipeline_start
+rocky hooks test on_pipeline_start
 ```
 
 The test command sends a synthetic event context to verify scripts execute correctly.

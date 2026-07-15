@@ -7,9 +7,6 @@ path = "poc.duckdb"
 [pipeline.transform]
 type = "transformation"
 
-[pipeline.transform.target]
-adapter = "default"
-
 # Lets `rocky run` auto-create poc.staging and poc.demo on first invocation
 # so the POC needs no manual `CREATE SCHEMA` step (added in PR #448).
 [pipeline.transform.target.governance]

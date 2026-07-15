@@ -56,10 +56,11 @@ rocky retention-status --models models --model ledger_archive_1y -o table \
   | tee expected/retention_status_scoped.txt
 echo
 
-# --- 6. --drift is v2. Pair with -o table so the deferred-note lands
-#     on stderr. With JSON output the note is suppressed by design
-#     (retention_status.rs:65-67).
-echo "--- rocky retention-status --drift -o table (v2 probe deferred) ------"
+# --- 6. --drift filters to models with a declared policy and probes the
+#     warehouse via the governance adapter. On DuckDB the adapter is
+#     NoopGovernanceAdapter, whose read_retention_days returns Ok(None),
+#     so WAREHOUSE stays "-" and no note is printed (retention_status.rs).
+echo "--- rocky retention-status --drift -o table (DuckDB: no warehouse probe) ------"
 rocky retention-status --models models --drift -o table 2>&1 \
   | tee expected/retention_status_drift.txt
 echo

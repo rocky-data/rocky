@@ -31,8 +31,10 @@ strategy.
 
 ## Status — what works, what doesn't
 
-The adapter is marked `is_experimental: true`; the runtime logs a
-warning when it's selected. v0 coverage:
+The adapter registers as a standard `WarehouseAdapter` — it is not
+gated behind `is_experimental` (the trait default `false` applies, and
+`rocky-trino`'s `is_not_experimental` test pins it), so no startup
+warning fires. v0 coverage:
 
 - **Works:** `full_refresh` (CTAS), `incremental` (INSERT + watermark
   WHERE), `DESCRIBE`-based drift, double-quoted three-part identifiers

@@ -196,14 +196,14 @@ COMMIT;
 ## State store
 
 Per-partition state lives in a dedicated `PARTITIONS` table in the redb
-state store at `~/.rocky/state.db`. One row per `(model_name,
-partition_key)`:
+state store (`<models>/.rocky-state.redb` by default). One row per
+`(model_name, partition_key)`:
 
 ```rust
 PartitionRecord {
     model_name: String,
     partition_key: String,
-    status: PartitionStatus,   // Computed | Failed | InProgress
+    status: PartitionStatus,   // Computed | Failed | InProgress | Interrupted
     computed_at: DateTime<Utc>,
     row_count: u64,
     duration_ms: u64,

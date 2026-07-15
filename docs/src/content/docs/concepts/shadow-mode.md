@@ -44,7 +44,7 @@ Compares the number of rows between shadow and production:
 shadow:     148,203 rows
 production: 148,205 rows
 diff:       -2 rows (-0.001%)
-verdict:    PASS (within 0.01% threshold)
+verdict:    PASS (within 1% warn threshold)
 ```
 
 ### Schema diff

@@ -25,7 +25,7 @@ These flags apply to all commands.
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--config <PATH>` | `-c` | `rocky.toml` | Path to the pipeline configuration file. |
-| `--output <FORMAT>` | `-o` | `json` | Output format. Accepted values: `json`, `table`. |
+| `--output <FORMAT>` | `-o` | terminal-aware | Output format. Accepted values: `json`, `table` (plus `md`, which only `rocky brief` renders distinctly — every other command treats it as `table`). When unset, Rocky picks `table` if stdout is an interactive terminal and `json` otherwise, so piped consumers (Dagster, the LSP, CI) still receive JSON. |
 | `--state-path <PATH>` | | resolved (see below) | Path to the embedded state store. When omitted, Rocky resolves to `<models>/.rocky-state.redb` (canonical) or a legacy CWD `.rocky-state.redb` (deprecated, warns on stderr). Passing the flag explicitly is always a hard override. See [`rocky state`](/reference/commands/administration/#rocky-state). |
 | `--cache-ttl <SECONDS>` | | `[cache.schemas] ttl_seconds` or `86400` | Override the `DESCRIBE TABLE` schema-cache TTL for this invocation. Precedence: `--cache-ttl` > `rocky.toml` > `86400` (24 h). `--cache-ttl 0` treats every entry as instantly stale. To disable the cache entirely, set `[cache.schemas] enabled = false` in `rocky.toml`. Applies to the CLI read path only (`rocky compile`, `rocky plan`, `rocky apply`, `rocky run`, …); `rocky lsp` / `rocky serve` keep the config-derived TTL. |
 
@@ -86,7 +86,7 @@ rocky validate
 | Check | Description |
 |-------|-------------|
 | TOML syntax | The config file parses without errors as v2 (named adapters + named pipelines). |
-| Adapters | Each `[adapter.NAME]` is a recognized type (`databricks`, `snowflake`, `duckdb`, `fivetran`, `manual`) with the required fields populated. |
+| Adapters | Each `[adapter.NAME]` is a recognized type (`databricks`, `snowflake`, `duckdb`, `bigquery`, `trino`, `fivetran`, `airbyte`, `iceberg`, `manual`) with the required fields populated. |
 | Pipelines | Each `[pipeline.NAME]` references existing adapters for source, target, and (optional) discovery, and its `schema_pattern` parses. |
 | DAG validation | If `models/` exists, loads all models and checks for dependency cycles. |
 
@@ -382,25 +382,25 @@ Load static reference data from CSV files into the target warehouse. Rocky's equ
 ```bash
 rocky seed                           # Load all seeds from seeds/
 rocky seed --seeds data/seeds/       # Custom seeds directory
-rocky seed --filter name=dim_date    # Load specific seed
+rocky seed --filter dim_date         # Load a specific seed by name
 ```
 
 Seeds are `.csv` files in the `seeds/` directory. Rocky infers column types (STRING, BIGINT, DOUBLE, BOOLEAN, TIMESTAMP) from the data and creates/replaces the target tables. Optional `.toml` sidecars can override inferred types.
 
 **Sidecar example** (`seeds/dim_date.toml`):
 ```toml
+# SQL run on the warehouse around the load (root-level keys, before any table)
+pre_hook  = ["CREATE SCHEMA IF NOT EXISTS warehouse.reference"]
+post_hook = ["ANALYZE warehouse.reference.dim_date"]
+
 [target]
 catalog = "warehouse"
 schema = "reference"
 table = "dim_date"
 
-[[columns]]
-name = "date_key"
-data_type = "DATE"
-
-# SQL run on the warehouse around the load
-pre_hook  = ["CREATE SCHEMA IF NOT EXISTS warehouse.reference"]
-post_hook = ["ANALYZE warehouse.reference.dim_date"]
+# Override inferred column types (column name -> SQL type string)
+[column_types]
+date_key = "DATE"
 ```
 
 **Seed hooks.** `pre_hook` and `post_hook` are lists of SQL statements the seed runs against the target warehouse, in order. Each `pre_hook` statement runs **before** the seed writes anything; each `post_hook` runs **after** the table loads successfully. A failing `pre_hook` aborts the seed before any data is written, so a guard like `pre_hook = ["SELECT 1 / COUNT(*) FROM warehouse.reference.dim_date"]` (which errors on an empty source) stops the load rather than replacing the table with bad data. These are seed-scoped relatives of the pipeline lifecycle [hooks](/concepts/hooks/), which fire shell commands and webhooks on run events rather than SQL around a single seed.
@@ -614,7 +614,7 @@ Generate project documentation as a single-page HTML catalog. Discovers models f
 
 ```bash
 rocky docs                                        # Generate to docs/catalog.html
-rocky docs --models models/ --output site/api.html  # Custom paths
+rocky docs --models models/ --output-path site/api.html  # Custom paths
 ```
 
 **Flags:**
@@ -622,7 +622,7 @@ rocky docs --models models/ --output site/api.html  # Custom paths
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--models <PATH>` | `models` | Models directory to scan. |
-| `--output <PATH>` | `docs/catalog.html` | Output HTML file path. |
+| `--output-path <PATH>` | `docs/catalog.html` | Output HTML file path. |
 
 **Behavior:**
 

@@ -22,13 +22,14 @@ The [Playground](/guides/playground/) runs the same flow against a local DuckDB 
    cd my-pipeline
    ```
 
-   This creates `rocky.toml` and an empty `models/` directory.
+   This scaffolds a runnable DuckDB starter project: a `rocky.toml`, a `models/` directory with `_defaults.toml` and a sample `stg_orders` model, and a `seeds/seed.sql`. Step 2 replaces the generated `rocky.toml` with the Fivetran → Databricks config below.
 
 2. **Configure a source, a target, and the pipeline that wires them together.**
 
    ```toml
    [adapter.fivetran]
    type = "fivetran"
+   kind = "discovery"
    destination_id = "${FIVETRAN_DESTINATION_ID}"
    api_key = "${FIVETRAN_API_KEY}"
    api_secret = "${FIVETRAN_API_SECRET}"
@@ -45,6 +46,9 @@ The [Playground](/guides/playground/) runs the same flow against a local DuckDB 
    timestamp_column = "_fivetran_synced"
 
    [pipeline.bronze.source]
+   adapter = "prod"
+
+   [pipeline.bronze.source.discovery]
    adapter = "fivetran"
 
    [pipeline.bronze.source.schema_pattern]

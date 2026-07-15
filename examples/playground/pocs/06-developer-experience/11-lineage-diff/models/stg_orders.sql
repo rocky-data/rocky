@@ -4,5 +4,5 @@ SELECT
     amount,
     status,
     order_date
-FROM poc.demo.raw_orders
+FROM raw_orders
 WHERE status != 'cancelled'

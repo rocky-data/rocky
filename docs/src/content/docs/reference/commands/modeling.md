@@ -227,6 +227,7 @@ rocky lineage fct_revenue --column revenue_amount
   "command": "lineage",
   "model": "fct_revenue",
   "column": "revenue_amount",
+  "direction": "upstream",
   "trace": [ /* LineageEdgeRecord entries, same shape as edges above */ ]
 }
 ```
@@ -290,7 +291,7 @@ Upstream output has `"direction": "upstream"` (the default shape, unchanged). Th
 
 ## `rocky catalog`
 
-Emit a project-wide column-level lineage snapshot to disk. Walks every model in the SemanticGraph and serializes the result as a single JSON artifact so downstream consumers (BI tools, governance dashboards, AI review bots) can query lineage without re-invoking the engine.
+Emit a project-wide column-level lineage snapshot to disk. Walks every model in the SemanticGraph and serializes the result as persisted catalog artifacts (a `catalog.json` front door plus `edges.parquet` / `assets.parquet`) so downstream consumers (BI tools, governance dashboards, AI review bots) can query lineage without re-invoking the engine.
 
 ```bash
 rocky catalog [flags]
@@ -301,11 +302,13 @@ rocky catalog [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing `.sql` and `.toml` model files. |
-| `--out <PATH>` | `PathBuf` | `.rocky/catalog/` | Output directory. The JSON file is always written to `<out>/catalog.json`. |
+| `--out <PATH>` | `PathBuf` | `.rocky/catalog/` | Output directory. `catalog.json` is written to `<out>/catalog.json`; the Parquet artifacts to `<out>/edges.parquet` and `<out>/assets.parquet`. |
+| `--format <FORMAT>` | `json` \| `parquet` \| `both` | `both` | Which artefact family to emit. `json` writes only `catalog.json`; `parquet` writes only `edges.parquet` + `assets.parquet`; `both` writes all three. |
+| `--catalog <NAME>` | `string` | | Scope the snapshot to a single warehouse catalog. Only assets whose FQN sits in the named catalog are emitted, and edges referencing dropped assets are pruned. |
 
 ### Behaviour
 
-`rocky catalog` always writes `<out>/catalog.json`. The CLI's stdout is a one-line summary in the default `--output table` mode, or the same JSON payload mirrored to stdout in `--output json` mode.
+By default (`--format both`) `rocky catalog` writes `<out>/catalog.json`, `<out>/edges.parquet`, and `<out>/assets.parquet`; pass `--format json` to write only the JSON front door. The CLI's stdout is a short summary in the default `--output table` mode, or the same JSON payload mirrored to stdout in `--output json` mode.
 
 The artifact contains:
 
@@ -328,7 +331,9 @@ rocky catalog
   assets:           3
   columns:          13
   edges:            13
-  json:             .rocky/catalog/catalog.json
+  wrote:            .rocky/catalog/catalog.json
+  wrote:            .rocky/catalog/edges.parquet
+  wrote:            .rocky/catalog/assets.parquet
   duration:         12ms
 ```
 
@@ -344,10 +349,9 @@ Write to a custom directory (for example, when building a per-PR artifact):
 rocky catalog --out build/catalog
 ```
 
-### Limitations (PR-1)
+### Limitations
 
-- JSON only. Parquet output (`edges.parquet` + `assets.parquet`) lands in a follow-up release.
-- `last_run_id` and `last_materialized_at` are unset. State-store enrichment lands in a follow-up release.
+- Per-asset `last_run_id` and `last_materialized_at` are populated from the state store when a matching successful run exists; they stay `null` for assets that have never been materialized (or built before the run history was captured).
 - Lineage extraction inherits the existing extractor's coverage: window functions, CTEs, set operations, `CASE WHEN` projections, and join keys are not yet surfaced as edges. Asset-level partial lineage is flagged via `stats.assets_with_star`.
 
 ### Related Commands
@@ -781,7 +785,7 @@ Sampled row-level diff plus structural (column-level) diff for every model in th
 |------|------|---------|-------------|
 | `--name <NAME>` | `string` | **(required)** | Branch name created by `preview create`. |
 | `--base <REF>` | `string` | `main` | Git ref to compare against. Must match what `preview create` was invoked with. |
-| `--sample-size <N>` | `usize` | `1000` | Number of rows to sample per model for row-level diffing. Larger windows reduce false-negative risk; see [coverage warning](/concepts/preview-internals/#sampling-correctness-ceiling). |
+| `--sample-size <N>` | `usize` | `1000` | Number of rows to sample per model for row-level diffing. Larger windows reduce false-negative risk; see [coverage warning](/concepts/preview-internals/#coverage-warning-roll-up). |
 
 **Example.** Render a Markdown report ready to post on a PR:
 

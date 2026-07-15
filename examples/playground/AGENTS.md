@@ -28,6 +28,8 @@ data/          # seed.sql — CSV / SQL sample data, keep ≤1000 rows
 expected/      # Captured golden output from run.sh (gitignored)
 ```
 
+`rocky.toml` is required only for POCs that exercise the pipeline path (`rocky -c rocky.toml run/plan/discover`). A handful of POCs that only drive the models/compile path — e.g. `import-dbt`-based POCs and compile-only adapter smokes — legitimately ship no top-level `rocky.toml`.
+
 Use the scaffolder:
 
 ```bash
@@ -50,7 +52,7 @@ Use these idioms:
 | Type-check models without warehouse | `rocky compile --models models/ --contracts contracts/` |
 | Run model tests against in-memory DuckDB (auto-loads `data/seed.sql`) | `rocky test --models models/ --contracts contracts/` |
 | CI pipeline (compile + test) | `rocky ci --models models/ --contracts contracts/` |
-| Validate the pipeline config | `rocky validate -c rocky.toml` |
+| Validate the pipeline config | `rocky -c rocky.toml validate` |
 | Discover sources from local DuckDB | `rocky -c rocky.toml discover` |
 | Preview replication SQL | `rocky -c rocky.toml plan --filter source=<name>` |
 | Execute the pipeline | `rocky -c rocky.toml run --filter source=<name>` |
@@ -108,7 +110,7 @@ POCs should cover features those examples don't show: incremental, drift, contra
 ```bash
 cd pocs/<cat>/<id>-<name>
 ./run.sh                                    # Should exit 0
-rocky validate -c rocky.toml                # If POC uses pipeline path
+rocky -c rocky.toml validate                # If POC uses pipeline path
 ```
 
 For the catalog as a whole:

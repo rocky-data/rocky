@@ -76,14 +76,14 @@ Open http://localhost:3000 and verify:
 
    [source          ] ingest (source)
    [load            ] ingest (load) <- ['source:ingest']
-   [transformation  ] stg_orders <- ['load:ingest']
    [transformation  ] fct_customer_revenue <- ['transformation:stg_orders']
+   [transformation  ] stg_orders <- ['load:ingest']
 
 4. Compiling models...
    Models: 2
    Layers: 2
-   - stg_orders (full_refresh)
    - fct_customer_revenue (full_refresh) depends_on=['stg_orders']
+   - stg_orders (full_refresh)
 ```
 
 ## What happened

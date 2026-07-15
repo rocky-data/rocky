@@ -73,5 +73,10 @@ Schedules and sensors complement each other:
 - **Sensors** fire when upstream state changes, useful for pipelines that
   should kick off as soon as Fivetran completes a sync.
 
-Both can target the same asset selection. Dagster will deduplicate
-materializations via `run_key` so simultaneous triggers don't double-execute.
+Both can target the same asset selection. Note that Dagster's `run_key`
+deduplication is per-instigator: the sensor's `run_key` only stops that same
+sensor from re-emitting the same `(source, sync)` pair on a later tick.
+`build_rocky_schedule` sets no `run_key` at all, so a schedule fire concurrent
+with a sensor fire on the same selection will launch two runs — Dagster does not
+dedupe across a schedule and a sensor. Rocky's incremental, idempotent execution
+keeps the cost of the redundant run low, but both runs do execute.

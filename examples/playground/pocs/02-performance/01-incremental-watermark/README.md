@@ -41,7 +41,17 @@ inserts the delta. `rocky state` confirms the watermark advances.
 ## What happened
 
 1. `seed_initial.sql` → 500 rows in `raw__events.events` with timestamps from `2026-04-01`.
-2. Run 1: `rocky run` → full refresh, watermark = max(occurred_at) ≈ `2026-04-02T...`.
-3. `seed_delta.sql` → appends 25 rows with later timestamps.
+2. Run 1: `rocky run` → full refresh, watermark = max(occurred_at) = `2026-04-01T08:20:00Z`.
+3. `seed_delta.sql` → appends 25 rows with later timestamps (`2026-05-01`).
 4. Run 2: `rocky run` → INSERT INTO ... WHERE occurred_at > watermark → 25 new rows only.
-5. `rocky state` → watermark advanced to the new max.
+5. `rocky state` → watermark advanced to the new max (`2026-05-01T00:25:00Z`).
+
+## Expected output
+
+- After `seed_initial.sql`: source has **500** rows.
+- Run 1 (initial, full refresh): target `staging__events.events` → **500** rows;
+  `rocky state` watermark `last_value = 2026-04-01T08:20:00Z`.
+- After `seed_delta.sql`: source has **525** rows.
+- Run 2 (incremental): target → **525** rows (only the 25-row delta is copied);
+  `rocky state` watermark advances to `last_value = 2026-05-01T00:25:00Z`.
+- `run.sh` asserts both the 500 and 525 target counts and exits non-zero if either regresses.

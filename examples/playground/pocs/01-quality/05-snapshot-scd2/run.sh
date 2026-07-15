@@ -14,7 +14,11 @@ echo "=== Source v1: $(duckdb poc.duckdb 'SELECT COUNT(*) FROM raw__crm.customer
 # Validate the snapshot pipeline
 rocky validate
 
-# Run 1: initial snapshot — all rows are new, valid_from = updated_at, valid_to = NULL
+# Run 1: initial snapshot — all rows are new, valid_from = updated_at, valid_to = NULL.
+# NOTE: on the local DuckDB path the engine currently emits invalid snapshot MERGE
+# SQL, so `rocky run` exits non-zero and the history table stays empty. `|| true`
+# keeps the demo walking the full validate → run → inspect flow; see README's
+# "Known limitation" section and expected/run1.json for the underlying DuckDB errors.
 echo
 echo "=== Snapshot run 1 (initial) ==="
 rocky -c rocky.toml -o json run > expected/run1.json 2>&1 || true
@@ -34,7 +38,7 @@ rocky -c rocky.toml -o json run > expected/run2.json 2>&1 || true
 
 echo
 echo "=== History table ==="
-duckdb poc.duckdb "SELECT * FROM snapshots.customers_history ORDER BY customer_id, valid_from" 2>/dev/null || echo "(snapshot execution not yet wired for local DuckDB — config validates correctly)"
+duckdb poc.duckdb "SELECT * FROM snapshots.customers_history ORDER BY customer_id, valid_from" 2>/dev/null || echo "(history table empty — snapshot MERGE SQL is invalid on the local DuckDB path; see README)"
 
 echo
 echo "POC complete: snapshot SCD-2 pipeline configured and validated."

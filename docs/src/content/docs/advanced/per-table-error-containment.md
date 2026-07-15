@@ -15,7 +15,7 @@ The per-table loop in `commands/run.rs` dispatches every table through `process_
 - **Adapter error** (`Ok((idx, Err(e)))`) -- the error is classified into a [`FailureKind`](#failure_kind-taxonomy) **before** stringification (so the typed connector variant is preserved), then a `TableError { asset_key, error, failure_kind }` is pushed onto `table_errors`. The loop continues with the remaining tables.
 - **Task panic** (`Err(JoinError)`) -- the panic message is captured into a `TableError` with `failure_kind = "unknown"`. The loop continues.
 
-The only path that aborts the run early is `--fail-fast` (which calls `JoinSet::abort_all()` on the first error). Otherwise the run finishes with a non-zero exit code so callers can distinguish partial success from clean success, while the JSON output stays well-formed.
+Two paths abort the run early, both calling `JoinSet::abort_all()`: `[execution] fail_fast = true` (config, not a CLI flag — default `false`) aborts on the first error, and the adaptive error-rate circuit `[execution] error_rate_abort_pct` (default `50`, set to `0` to disable) aborts once more than that percentage of completed tables have failed, checked after at least 4 tables complete. Otherwise the run finishes with a non-zero exit code so callers can distinguish partial success from clean success, while the JSON output stays well-formed.
 
 This is true for every adapter (Databricks, Snowflake, BigQuery, DuckDB) -- the loop is adapter-agnostic and catches `anyhow::Error` from any source, including connector errors, schema-drift failures, governance reconciliation errors, and worker-task panics.
 
@@ -71,9 +71,9 @@ Map each variant to one of four actions:
 | **Don't retry; alert the model owner** | `auth-failed`, `query-rejected`, `not-found`, `compile-error` |
 | **Surface raw `error` for triage** | `unknown` |
 
-Note that since engine 1.58.0 the run loop already retries proven-transient failures in-run, on by default (`[resilience] transient_max_retries`, default 2 — see [Classified retry](./failure-modes#classified-retry)). A `transient` entry that reaches your `errors[*]` has therefore already exhausted its in-run retry budget: "retry with backoff" at the orchestrator level should mean a *delayed* re-run or `--resume-latest`, not an immediate tight-loop retry that doubles the engine's own attempts.
+Note that since engine 1.58.0 the run loop already retries proven-transient failures in-run, on by default (`[resilience] transient_max_retries`, default 2 — see [Classified retry](/advanced/failure-modes/#classified-retry)). A `transient` entry that reaches your `errors[*]` has therefore already exhausted its in-run retry budget: "retry with backoff" at the orchestrator level should mean a *delayed* re-run or `--resume-latest`, not an immediate tight-loop retry that doubles the engine's own attempts.
 
-Treat `connection-failed` as retry-safe even though the warehouse never saw the request: `reqwest::is_connect()` is the discriminator, which fires on actual TCP / TLS / DNS failures, not on credentials issues (which land on `auth-failed` instead).
+Treat `connection-failed` as retry-safe even though the warehouse never saw the request: `reqwest::is_connect()` is the primary signal (it fires on actual TCP / TLS / DNS failures), and other non-timeout transport errors also classify as `connection-failed`. Timeouts classify as `transient` instead, and credential issues land on `auth-failed` (via the typed `Auth` variant / 401 / 403), never here.
 
 ## Consuming from Dagster
 
@@ -87,7 +87,9 @@ RETRY_KINDS = {"transient", "connection-failed", "quota-exceeded"}
 ALERT_KINDS = {"auth-failed", "query-rejected", "not-found", "compile-error"}
 
 
-@dg.asset
+@dg.asset(
+    retry_policy=dg.RetryPolicy(max_retries=3, delay=30, backoff=dg.Backoff.EXPONENTIAL),
+)
 def replicated_tables(
     context: dg.AssetExecutionContext,
     rocky: RockyResource,
@@ -126,13 +128,11 @@ def replicated_tables(
     )
 ```
 
-Pair the asset with a Dagster `RetryPolicy` to back off on `dg.Failure`:
+The `retry_policy=` set on the `@dg.asset` decorator above backs the asset off on `dg.Failure`. Wire it into your `Definitions`:
 
 ```python
 defs = dg.Definitions(
-    assets=[replicated_tables.with_retry_policy(
-        dg.RetryPolicy(max_retries=3, delay=30, backoff=dg.Backoff.EXPONENTIAL),
-    )],
+    assets=[replicated_tables],
     resources={"rocky": RockyResource(config_path="rocky.toml")},
 )
 ```
@@ -142,7 +142,7 @@ Requires engine `v1.34+` (which emits the discriminator on the wire) and `dagste
 For non-Dagster consumers, `rocky run --output json | jq` gives the same shape:
 
 ```bash
-rocky run --output json --config rocky.toml \
+rocky --config rocky.toml run --output json \
   | jq -r '.errors[] | "\(.failure_kind)\t\(.asset_key | join("/"))\t\(.error)"'
 ```
 
@@ -159,6 +159,6 @@ Treat `unknown` as a surface-and-triage signal, never as silently retry-safe.
 
 ## See also
 
-- [Failure modes](./failure-modes) -- the nine-category taxonomy and recovery playbook for every kind of Rocky failure.
+- [Failure modes](/advanced/failure-modes/) -- the nine-category taxonomy and recovery playbook for every kind of Rocky failure.
 - [JSON output](../../reference/json-output) -- the full versioned schema for `rocky run` and every other command.
 - [`rocky plan --resume-latest`](../../reference/cli) -- resume a failed run from its last checkpoint; per-table progress is recorded for every success and every classified failure.

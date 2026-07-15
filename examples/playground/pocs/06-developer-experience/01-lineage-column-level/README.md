@@ -9,7 +9,7 @@
 
 ## What it shows
 
-A 4-model branching DAG with `rocky lineage` exporting:
+A 3-model linear DAG (`seeds.orders` → `raw_orders` → `stg_orders` → `fct_revenue`) with `rocky lineage` exporting:
 
 - Full model lineage as JSON
 - A specific column's lineage trace via `--column`

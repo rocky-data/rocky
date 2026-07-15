@@ -15,7 +15,7 @@ type = "trino"
 host = "${TRINO_HOST:-http://localhost:8080}"
 # Default catalog routed through `X-Trino-Catalog`. `database` is the
 # AdapterConfig field the registry repurposes for Trino's catalog
-# (registry.rs::327).
+# (registry.rs, the `"trino"` arm — `with_default_catalog`).
 database = "memory"
 # Single-node `trinodb/trino` ships with no password-authenticator
 # configured, so any user/password is accepted. Dummy credentials keep

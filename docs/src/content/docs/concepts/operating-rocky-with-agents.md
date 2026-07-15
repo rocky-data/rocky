@@ -26,7 +26,7 @@ The read-only tools at steps 1 and 2 are the reconcile discipline in tool form. 
 
 The write surface splits cleanly, and the prefixes tell you which is which.
 
-The **`ai_*` generators** call an LLM under your own `ANTHROPIC_API_KEY` and hand back a draft. `ai_contract` drafts a `.contract.toml` from a table's aggregate profile; `ai_test` drafts SQL assertions from a model's intent and schema; `explain_model` drafts an intent description. They mutate nothing — they propose text. Without a key set they return an empty result rather than failing, so the rest of the surface keeps working. Their names match the `rocky ai-*` CLI verbs.
+The **`ai_*` generators** call an LLM under your own `ANTHROPIC_API_KEY` and hand back a draft. `ai_contract` drafts a `.contract.toml` from a table's aggregate profile; `ai_test` drafts SQL assertions from a model's intent and schema; `explain_model` drafts an intent description. They mutate nothing — they propose text. Without a key set they return an empty result rather than failing, so the rest of the surface keeps working. Each maps to a `rocky ai-*` CLI verb — `ai-contract`, `ai-test`, and `ai-explain` respectively.
 
 The **`draft_*` write tools** write content into the project and compile it, gated by the policy plane. `draft_model` writes a model; `draft_contract` writes `models/<model>.contract.toml`; `draft_check` merges declarative `[[tests]]` checks into a model's sidecar. The content can be an agent's own work or a generator's output — the write tool does not care where it came from, only that it compiles and clears policy.
 

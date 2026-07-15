@@ -12,10 +12,10 @@
 The four primitives that make up Rocky's branch / replay / lineage
 surface, all on a single 3-model DuckDB pipeline:
 
-1. **Named branches** — `rocky branch create fix-revenue` registers a
+1. **Named branches** — `rocky branch create fix_revenue` registers a
    virtual branch in the state store; runs written against the branch
    land in a prefixed schema, leaving `main` untouched.
-2. **Branch-scoped runs** — `rocky run --branch fix-revenue` is the
+2. **Branch-scoped runs** — `rocky run --branch fix_revenue` is the
    persistent analogue of `--shadow`. Warehouse-native zero-copy clones
    slot into the same API: Databricks emits `SHALLOW CLONE` and BigQuery
    emits `CREATE TABLE … COPY` (both metadata-only) via the
@@ -75,8 +75,10 @@ surface, all on a single 3-model DuckDB pipeline:
 
 1. **Compile** — semantic graph for 3 models; column schemas propagated
    from `raw_orders` through to `fct_revenue`.
-2. **Run on main** — writes to `poc.demo.*`, records a `RunRecord`.
-3. **Create branch `fix-revenue`** — state-store entry, no warehouse
+2. **Run on main** — the replication copies `raw__orders.orders` into
+   `poc.staging__orders.orders` and records a `RunRecord`. (The 3 models
+   are only compiled in step 1, not materialized.)
+3. **Create branch `fix_revenue`** — state-store entry, no warehouse
    side effects.
 4. **Run on the branch** — writes to a prefixed schema, separate
    `RunRecord`.

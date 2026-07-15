@@ -75,11 +75,10 @@ After scaffolding, the README guides users through:
 
 ```bash
 # Install the rocky binary (once)
-curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
+curl -sSL https://github.com/rocky-data/rocky/releases/latest/download/install.sh | sh
 
 # Validate the pipeline locally (DuckDB, no credentials required)
-plan_id=$(rocky --config rocky.toml plan --output json | jq -r .plan_id)
-rocky apply "$plan_id"
+rocky run --config rocky.toml
 
 # Launch the Dagster UI
 dg dev
