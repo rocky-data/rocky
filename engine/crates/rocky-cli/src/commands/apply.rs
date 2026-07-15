@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal};
+use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal, StateBackend};
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::schema::SchemaPattern;
 use rocky_core::state::{PolicyDecisionRecord, StateStore};
@@ -243,6 +243,9 @@ async fn run_apply_run_plan(
     };
     let touched = touched_models_for_run(&plan, &executable);
     let principal = plan.enforcement_principal(runtime_principal);
+    // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
+    // the gate reads it, so a cross-pod freeze is enforced (fail-closed).
+    sync_remote_ledger_before_gate(config_path, state_path).await?;
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
@@ -732,6 +735,64 @@ fn model_attributes(models_dir: &Path) -> BTreeMap<String, ModelAttributes> {
         );
     }
     out
+}
+
+/// Resolve the `[state]` backend for a governed apply seam, returning the config
+/// ONLY when the backend is a REMOTE one whose authoritative ledger must be
+/// pulled before the freeze/budget gate reads the LOCAL state file.
+///
+/// `None` for the Local backend, or when the config cannot be loaded — a genuine
+/// config error is surfaced by the seam's own fail-closed handling
+/// ([`bail_on_config_load_error`] on the gc/backfill paths, or the run path's
+/// re-load), so there is no remote object to pull in that case.
+fn remote_state_backend_for_gate(config_path: &Path) -> Option<rocky_core::config::StateConfig> {
+    let state_cfg = rocky_core::config::load_rocky_config(config_path)
+        .map(|cfg| cfg.state)
+        .ok()?;
+    (!matches!(state_cfg.backend, StateBackend::Local)).then_some(state_cfg)
+}
+
+/// Download the authoritative remote `[state]` ledger before a governed policy
+/// gate reads it (async caller sites).
+///
+/// The freeze/budget decisions [`evaluate_apply_policy`] consults live in the
+/// `policy_decisions` ledger that `rocky run` downloads at start and uploads at
+/// end. A governed apply gates BEFORE any such run-download, so without this a
+/// freeze recorded by another pod would be invisible and the gate would clear
+/// against a stale local snapshot (finding 4-apply). No-op for the Local
+/// backend. Fail-closed: a remote download failure aborts the apply.
+async fn sync_remote_ledger_before_gate(config_path: &Path, state_path: &Path) -> Result<()> {
+    let Some(state_cfg) = remote_state_backend_for_gate(config_path) else {
+        return Ok(());
+    };
+    rocky_core::state_sync::download_state(&state_cfg, state_path)
+        .await
+        .with_context(|| {
+            "failed to download remote state before the agent-policy gate; a remote-backend \
+             governed apply requires the state backend reachable so a cross-pod freeze/budget \
+             decision is enforced"
+        })?;
+    Ok(())
+}
+
+/// Blocking sibling of [`sync_remote_ledger_before_gate`] for the SYNC promote
+/// gate ([`gate_promote_plan`]), which is reached from two async entry points
+/// (`rocky apply <promote>` and `rocky branch promote --plan`). Driving the
+/// download on a dedicated runtime inside the shared gate closes BOTH entry
+/// points without threading an async download through each caller.
+fn sync_remote_ledger_before_gate_blocking(config_path: &Path, state_path: &Path) -> Result<()> {
+    let Some(state_cfg) = remote_state_backend_for_gate(config_path) else {
+        return Ok(());
+    };
+    crate::commands::policy::block_on_state_sync(rocky_core::state_sync::download_state(
+        &state_cfg, state_path,
+    ))
+    .with_context(|| {
+        "failed to download remote state before the promote policy gate; a remote-backend \
+         governed promote requires the state backend reachable so a cross-pod freeze/budget \
+         decision is enforced"
+    })?;
+    Ok(())
 }
 
 /// Evaluate the agent-policy plane over a plan's touched `(model, capability)`
@@ -1673,6 +1734,11 @@ pub(crate) fn gate_promote_plan(
     promote_plan: &PromotePlan,
     state_path: &Path,
 ) -> Result<()> {
+    // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
+    // the gate reads it, so a cross-pod freeze is enforced. Placed inside the
+    // shared gate so BOTH promote entry points (`rocky apply <promote>` and
+    // `rocky branch promote --plan`) are covered. Fail-closed.
+    sync_remote_ledger_before_gate_blocking(config_path, state_path)?;
     let promote_models_dir = resolve_config_models_dir(config_path);
     let touched = touched_models_for_promote(promote_plan, &promote_models_dir);
     let gate = evaluate_apply_policy(
@@ -2014,6 +2080,9 @@ async fn run_apply_ai_authored_plan(
     };
     let touched = touched_models_for_run(&plan, &executable);
     let principal = plan.enforcement_principal(runtime_principal);
+    // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
+    // the gate reads it, so a cross-pod freeze is enforced (fail-closed).
+    sync_remote_ledger_before_gate(config_path, state_path).await?;
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
@@ -2130,6 +2199,9 @@ async fn run_apply_backfill_plan(
     // engine composed and will execute (see `execute_backfill_set` below), not
     // an informational hint — gate on it directly.
     let touched = touched_models_for_run(&plan, &run_plan.models);
+    // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
+    // the gate reads it, so a cross-pod freeze is enforced (fail-closed).
+    sync_remote_ledger_before_gate(config_path, state_path).await?;
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,

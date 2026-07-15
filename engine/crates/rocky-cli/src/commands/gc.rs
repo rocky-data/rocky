@@ -66,7 +66,8 @@ use chrono::{DateTime, Utc};
 use tracing::warn;
 
 use rocky_core::config::{
-    ConfigError, PolicyCapability, PolicyPrincipal, StateBackend, load_rocky_config,
+    ConfigError, PolicyCapability, PolicyPrincipal, StateBackend, StateConfig,
+    StateUploadFailureMode, load_rocky_config,
 };
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
 use rocky_core::state::{
@@ -1497,6 +1498,43 @@ pub(crate) async fn run_gc_apply_in_with(
         .map(|e| (e.model_name.clone(), PolicyCapability::Gc))
         .collect();
     let models_dir = gc_models_dir(loaded_cfg.as_ref(), config_path);
+
+    // SEAM-SCOPED SYNC (S1, #1089) — download half, BEFORE the policy gate.
+    // Two ledgers matter here and both are among the tables `rocky run`
+    // wholesale downloads-at-start / uploads-at-end when `[state]` is remote:
+    //   1. POLICY_DECISIONS — the freeze/budget ledger `evaluate_apply_policy`
+    //      reads. A freeze uploaded by another pod is invisible unless we pull
+    //      the authoritative remote ledger FIRST (finding 4-GC); otherwise the
+    //      gate would clear against a stale local snapshot and gc would proceed
+    //      through an active cross-pod freeze.
+    //   2. TOMBSTONES — the eviction ledger `execute_gc_apply` writes; left
+    //      unsynced an eviction would be silently reverted by the next run's
+    //      start-download.
+    // So when the backend is remote we download the authoritative remote state
+    // (overwriting the local file, preserving the local-only tables) BEFORE the
+    // policy gate reads it and before we tombstone on top of it, then upload
+    // AFTER the commit. A remote-backend `gc apply` therefore requires the
+    // backend reachable; a download failure aborts before gating or evicting.
+    //
+    // KNOWN LIMITATION (concurrency): this closes only the *sequential*
+    // between-runs clobber. The remote state object is a whole-file blob with no
+    // compare-and-swap, so a concurrent writer (e.g. a `rocky run` whose
+    // start-download preceded this apply) can still overwrite these tombstones on
+    // its end-upload — a cross-pod lost update. Concurrency is NOT handled here.
+    let state_cfg = loaded_cfg
+        .as_ref()
+        .map(|cfg| cfg.state.clone())
+        .unwrap_or_default();
+    let remote_state = !matches!(state_cfg.backend, StateBackend::Local);
+    if remote_state {
+        rocky_core::state_sync::download_state(&state_cfg, state_path)
+            .await
+            .with_context(|| {
+                "failed to download remote state before gc apply; a remote-backend gc apply \
+                 requires the state backend to be reachable"
+            })?;
+    }
+
     let gate = evaluate_apply_policy(
         config_path,
         plan_id,
@@ -1550,43 +1588,24 @@ pub(crate) async fn run_gc_apply_in_with(
         );
     }
 
-    // SEAM-SCOPED SYNC (S1, #1089). The TOMBSTONES ledger `execute_gc_apply`
-    // writes is one of the tables `rocky run` wholesale downloads-at-start and
-    // uploads-at-end when `[state]` is remote. Left unsynced, an eviction
-    // recorded here would be silently reverted by the next run's start-download.
-    // So when the backend is remote we bracket the write: download the
-    // authoritative remote ledger BEFORE opening the store (overwriting the
-    // local file, so we tombstone on top of it), then upload AFTER the commit.
-    // A remote-backend `gc apply` therefore requires the backend reachable; a
-    // download failure aborts before evicting anything.
-    //
-    // KNOWN LIMITATION (concurrency): this closes only the *sequential*
-    // between-runs clobber. The remote state object is a whole-file blob with no
-    // compare-and-swap, so a concurrent writer (e.g. a `rocky run` whose
-    // start-download preceded this apply) can still overwrite these tombstones on
-    // its end-upload — a cross-pod lost update. Concurrency is NOT handled here.
-    let state_cfg = loaded_cfg
-        .as_ref()
-        .map(|cfg| cfg.state.clone())
-        .unwrap_or_default();
-    let remote_state = !matches!(state_cfg.backend, StateBackend::Local);
-    if remote_state {
-        rocky_core::state_sync::download_state(&state_cfg, state_path)
-            .await
-            .with_context(|| {
-                "failed to download remote state before gc apply; a remote-backend gc apply \
-                 requires the state backend to be reachable"
-            })?;
-    }
-
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
     let output = execute_gc_apply(&store, oracle, plan_id, &plan, Utc::now()).await?;
     // Drop the store to release the advisory lock / flush the file before upload.
     drop(store);
 
+    // SEAM-SCOPED SYNC — upload half, FAIL-CLOSED. Durability is the whole point
+    // of the seam: an eviction that commits locally but never reaches the remote
+    // would be silently reverted by the next run's start-download while this
+    // command reported success. So the upload is forced to `Fail` regardless of
+    // the configured `on_upload_failure` (default `skip`) — a failed upload
+    // aborts (finding 5).
     if remote_state {
-        rocky_core::state_sync::upload_state(&state_cfg, state_path)
+        let upload_cfg = StateConfig {
+            on_upload_failure: StateUploadFailureMode::Fail,
+            ..state_cfg.clone()
+        };
+        rocky_core::state_sync::upload_state(&upload_cfg, state_path)
             .await
             .with_context(|| "failed to upload remote state after gc apply")?;
     }

@@ -19,6 +19,7 @@ use anyhow::{Context, Result, bail};
 use rocky_compiler::compile::{self, CompilerConfig};
 use rocky_core::config::{
     ConfigError, PolicyCapability, PolicyConfig, PolicyEffect, PolicyPrincipal, StateBackend,
+    StateConfig, StateUploadFailureMode,
 };
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::state::{PolicyDecisionRecord, StateStore};
@@ -341,7 +342,12 @@ fn serde_plain<T: serde::Serialize>(value: &T) -> String {
 /// (tokio's re-entrancy guard panics). So we drive the future on a dedicated OS
 /// thread with its own single-threaded runtime — correct whether or not there is
 /// an ambient runtime, and regardless of its flavor.
-fn block_on_state_sync<F>(fut: F) -> Result<(), rocky_core::state_sync::StateSyncError>
+///
+/// Exposed to the sibling `apply` module so the SYNC promote gate
+/// ([`crate::commands::apply::gate_promote_plan`]) — reached from two async
+/// entry points — can pull remote state before it reads the freeze ledger,
+/// without threading an async download through each caller.
+pub(crate) fn block_on_state_sync<F>(fut: F) -> Result<(), rocky_core::state_sync::StateSyncError>
 where
     F: std::future::Future<Output = Result<(), rocky_core::state_sync::StateSyncError>> + Send,
 {
@@ -498,14 +504,25 @@ pub fn run_policy_freeze(
         });
     }
 
-    // SEAM-SCOPED SYNC — upload half. Push the freeze back to the remote backend
-    // so the next `rocky run`'s start-download inherits it instead of reverting
-    // it. Drop the store first to release the advisory lock and flush the file.
-    // Respects `[state] on_upload_failure` (default `skip` warns and continues).
+    // SEAM-SCOPED SYNC — upload half, FAIL-CLOSED. Push the freeze back to the
+    // remote backend so the next `rocky run`'s start-download inherits it instead
+    // of reverting it. Drop the store first to release the advisory lock and
+    // flush the file. Durability is the whole point of a kill switch, so the
+    // upload is forced to `Fail` regardless of the configured `on_upload_failure`
+    // (default `skip`): a freeze that commits locally but never reaches the
+    // remote — while the command reports success — would leave every other pod
+    // unfrozen. A failed upload aborts (finding 5).
     drop(store);
     if remote_state {
-        block_on_state_sync(rocky_core::state_sync::upload_state(&state_cfg, state_path))
-            .with_context(|| "failed to upload remote state after recording the policy freeze")?;
+        let upload_cfg = StateConfig {
+            on_upload_failure: StateUploadFailureMode::Fail,
+            ..state_cfg.clone()
+        };
+        block_on_state_sync(rocky_core::state_sync::upload_state(
+            &upload_cfg,
+            state_path,
+        ))
+        .with_context(|| "failed to upload remote state after recording the policy freeze")?;
     }
 
     let output = PolicyFreezeOutput {

@@ -247,8 +247,217 @@ enum DownloadOutcome {
 /// A missing remote object is **non-fatal** (`Ok(())`, a fresh start). A real
 /// download/existence-check *failure* is **propagated** as `Err` so the caller
 /// can fail closed — see [`download_from_object_store`].
+///
+/// # Local-only-preserving merge (findings 6 + 7)
+///
+/// A remote download REPLACES the replicated tables wholesale: a
+/// [`DownloadOutcome::Restored`] overwrites the file, and a
+/// [`DownloadOutcome::Absent`] would otherwise leave a *stale* local file
+/// authoritative. Neither may be allowed to disturb the machine-local tables in
+/// [`crate::state::LOCAL_ONLY_TABLE_NAMES`] (`jobs`, `schema_cache`), which are
+/// stripped from the remote copy on upload and so never travel back down:
+///
+/// - **Restored** — the local file is replaced by the remote (which carries the
+///   authoritative replicated tables but *no* local-only tables). The local-only
+///   tables are snapshotted **before** the download and spliced back in
+///   afterwards, so `jobs` / `schema_cache` survive a download that replaces the
+///   replicated tables.
+/// - **Absent** — no remote object exists for this key. For a REMOTE backend the
+///   replicated tables must become **fresh** (empty) — a switch to an empty
+///   prefix must not keep stale watermarks (finding 6) — while the local-only
+///   tables are preserved. The pre-download snapshot already holds *only* the
+///   local-only tables, so promoting it to the authoritative file both clears
+///   the replicated tables and keeps `jobs` / `schema_cache`.
+///
+/// The **Local** backend performs no transfer, so there is nothing to replace
+/// and nothing to preserve — it delegates straight to [`download_state_inner`].
 pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
-    download_state_inner(config, local_path).await.map(|_| ())
+    // Local backend never replaces the file — skip the whole preserve dance.
+    if matches!(config.backend, StateBackend::Local) {
+        download_state_inner(config, local_path).await?;
+        return Ok(());
+    }
+
+    // Snapshot the local-only tables BEFORE the download overwrites the file.
+    // Best-effort: an unreadable local db (corrupt / absent) means there is
+    // nothing durable to preserve, so we proceed without the snapshot rather
+    // than blocking the run — the download's own fail-closed semantics for a
+    // *remote* error are untouched.
+    let preserved = if local_path.exists() {
+        match snapshot_local_only_tables(local_path) {
+            Ok(snapshot) => Some(snapshot),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    outcome = "preserve_snapshot_failed",
+                    "could not snapshot local-only state tables before download; \
+                     proceeding without preservation (jobs / schema_cache may reset)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let outcome = match download_state_inner(config, local_path).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // Download failed (fail-closed). Drop the snapshot and surface the
+            // error; the local file is whatever the inner path left behind.
+            if let Some(snapshot) = preserved {
+                let _ = std::fs::remove_file(&snapshot);
+            }
+            return Err(e);
+        }
+    };
+
+    match (outcome, preserved) {
+        (DownloadOutcome::Restored, Some(snapshot)) => {
+            // `local_path` is now the remote replicated tables (local-only
+            // stripped on upload). Splice the preserved local-only tables back
+            // in — a single redb write transaction, atomic at commit. Replicated
+            // tables are left exactly as the remote wrote them.
+            if let Err(e) =
+                copy_named_tables(&snapshot, local_path, crate::state::LOCAL_ONLY_TABLE_NAMES)
+            {
+                warn!(
+                    error = %e,
+                    outcome = "preserve_splice_failed",
+                    "could not restore local-only tables after download; they reset this run"
+                );
+            }
+            let _ = std::fs::remove_file(&snapshot);
+        }
+        (DownloadOutcome::Restored, None) => {
+            // No prior local-only tables to preserve — the restored replicated
+            // state stands alone (local-only tables start empty).
+        }
+        (DownloadOutcome::Absent, Some(snapshot)) => {
+            // No remote object for this key. The pre-download snapshot holds
+            // ONLY the local-only tables, so promoting it to the authoritative
+            // file resets the replicated tables to fresh/empty (finding 6) while
+            // preserving `jobs` / `schema_cache` (finding 7). The rename is
+            // atomic because the snapshot is a sibling of `local_path`.
+            if let Err(e) = std::fs::rename(&snapshot, local_path) {
+                warn!(
+                    error = %e,
+                    outcome = "preserve_promote_failed",
+                    "could not reset replicated tables on an absent remote; \
+                     leaving prior local state in place"
+                );
+                let _ = std::fs::remove_file(&snapshot);
+            }
+        }
+        (DownloadOutcome::Absent, None) => {
+            // No prior local file and no remote object — a genuine fresh start.
+        }
+    }
+
+    Ok(())
+}
+
+/// Directory that should host the sibling scratch file for `local_path`, so an
+/// `Absent`-promotion rename stays on the same filesystem (and is therefore
+/// atomic). Falls back to the current directory when `local_path` has no parent
+/// component.
+fn sibling_scratch_dir(local_path: &Path) -> PathBuf {
+    local_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Build a fresh redb **beside** `local_path` holding ONLY the
+/// [`crate::state::LOCAL_ONLY_TABLE_NAMES`] tables copied from it. Returns the
+/// snapshot path; the caller owns its lifecycle (splice-then-delete, or
+/// promote-by-rename).
+///
+/// The snapshot is a sibling of `local_path` (not under `std::env::temp_dir()`)
+/// precisely so the `Absent`-case promotion can `rename` it into place
+/// atomically on the same filesystem.
+fn snapshot_local_only_tables(local_path: &Path) -> Result<PathBuf, StateSyncError> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let snapshot = sibling_scratch_dir(local_path).join(format!(
+        ".rocky-state-localonly-{}-{}.redb",
+        std::process::id(),
+        nanos
+    ));
+    copy_named_tables(local_path, &snapshot, crate::state::LOCAL_ONLY_TABLE_NAMES)?;
+    Ok(snapshot)
+}
+
+/// Copy the `tables` from the redb at `src` into the redb at `dst`, replacing
+/// exactly those tables in `dst` and leaving every OTHER table in `dst`
+/// untouched. `dst` is created if it does not exist.
+///
+/// Every table in [`crate::state::LOCAL_ONLY_TABLE_NAMES`] is a
+/// `TableDefinition<&str, &[u8]>` (opaque serialized blobs), so the copy is a
+/// faithful, bit-exact key/value replay over that shape. A table absent from
+/// `src` clears the corresponding table in `dst` (delete + no re-insert). If a
+/// future local-only table used a different key/value type, opening it here
+/// would surface a redb type error rather than silently mis-copying.
+fn copy_named_tables(src: &Path, dst: &Path, tables: &[&str]) -> Result<(), StateSyncError> {
+    // `iter()` lives on the `ReadableTable` trait — scope it locally.
+    use redb::ReadableTable;
+
+    let io = |ctx: &str, e: &dyn std::fmt::Display| {
+        StateSyncError::Io(std::io::Error::other(format!("{ctx}: {e}")))
+    };
+
+    // `src` and `dst` are independent redb databases, so a read transaction on
+    // one and a write transaction on the other coexist freely — stream each
+    // table's rows straight across without an intermediate buffer.
+    let src_db =
+        redb::Database::open(src).map_err(|e| io("redb open src for local-only copy", &e))?;
+    let read = src_db
+        .begin_read()
+        .map_err(|e| io("redb begin_read for local-only copy", &e))?;
+    let dst_db =
+        redb::Database::create(dst).map_err(|e| io("redb create dst for local-only copy", &e))?;
+    let txn = dst_db
+        .begin_write()
+        .map_err(|e| io("redb begin_write for local-only copy", &e))?;
+    for name in tables {
+        let def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(name);
+        // Replace, don't merge: drop any existing copy of this table in `dst`
+        // first, so a stale row can never survive.
+        txn.delete_table(def)
+            .map_err(|e| io("redb delete_table (dst) for local-only copy", &e))?;
+        match read.open_table(def) {
+            Ok(src_table) => {
+                let mut dst_table = txn
+                    .open_table(def)
+                    .map_err(|e| io("redb open_table (dst) for local-only copy", &e))?;
+                let iter = src_table
+                    .iter()
+                    .map_err(|e| io("redb iter for local-only copy", &e))?;
+                for entry in iter {
+                    let (k, v) = entry.map_err(|e| io("redb entry for local-only copy", &e))?;
+                    dst_table
+                        .insert(k.value(), v.value())
+                        .map_err(|e| io("redb insert (dst) for local-only copy", &e))?;
+                }
+                // `dst_table` (the write borrow on `txn`) is dropped at the end
+                // of the iteration, so `txn.commit()` has no outstanding borrow.
+            }
+            // A local-only table absent from `src` is a legitimate no-op — the
+            // destination table stays deleted (cleared) and is recreated empty
+            // on the next `StateStore::open`.
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(io("redb open_table (src) for local-only copy", &e)),
+        }
+    }
+    txn.commit()
+        .map_err(|e| io("redb commit (dst) for local-only copy", &e))?;
+    drop(dst_db);
+    drop(read);
+    drop(src_db);
+    Ok(())
 }
 
 /// [`download_state`] retaining the hit/miss [`DownloadOutcome`] the tiered
@@ -1916,6 +2125,273 @@ mod tests {
         assert!(
             !local.exists(),
             "nothing to restore, so no local file is written"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Findings 6 + 7 — local-only-preserving merge on download
+    // -----------------------------------------------------------------------
+
+    /// Seed `path` as a local state store with a STALE replicated watermark plus
+    /// the two LOCAL-ONLY tables populated (schema_cache + a jobs record), i.e.
+    /// exactly the machine-local state a run-start download must not wipe.
+    fn seed_local_with_local_only(path: &Path, replicated_wm: &str, job_id: &str) {
+        let now = chrono::Utc::now();
+        let store = StateStore::open(path).expect("open local seed store");
+        store
+            .set_watermark(
+                replicated_wm,
+                &rocky_ir::WatermarkState {
+                    last_value: now,
+                    updated_at: now,
+                },
+            )
+            .unwrap();
+        store
+            .write_schema_cache_entry(
+                &schema_cache_key("cat", "staging", "orders"),
+                &SchemaCacheEntry {
+                    columns: vec![StoredColumn {
+                        name: "id".into(),
+                        data_type: "BIGINT".into(),
+                        nullable: false,
+                    }],
+                    cached_at: now,
+                },
+            )
+            .unwrap();
+        store
+            .record_job(&crate::state::PersistedJob {
+                job_id: job_id.to_string(),
+                kind: "run".into(),
+                state: "running".into(),
+                submitted_at: now.to_rfc3339(),
+                started_at: None,
+                finished_at: None,
+                principal: None,
+                error: None,
+                result: None,
+            })
+            .unwrap();
+        drop(store);
+    }
+
+    /// Build the bytes of a REMOTE state object: a valid store carrying an
+    /// authoritative replicated watermark with the local-only tables STRIPPED —
+    /// exactly what `upload_state` leaves on the wire.
+    fn build_remote_object_bytes(dir: &Path, replicated_wm: &str) -> Vec<u8> {
+        let now = chrono::Utc::now();
+        let seed = dir.join("remote_seed.redb");
+        {
+            let store = StateStore::open(&seed).unwrap();
+            store
+                .set_watermark(
+                    replicated_wm,
+                    &rocky_ir::WatermarkState {
+                        last_value: now,
+                        updated_at: now,
+                    },
+                )
+                .unwrap();
+            drop(store);
+        }
+        let stripped = strip_local_only_tables(&seed, LOCAL_ONLY_TABLE_NAMES).unwrap();
+        let bytes = std::fs::read(&stripped).unwrap();
+        let _ = std::fs::remove_file(&stripped);
+        let _ = std::fs::remove_file(&seed);
+        bytes
+    }
+
+    /// Finding 7 (Restored): a download that wholesale-replaces the replicated
+    /// tables must PRESERVE the local-only tables (jobs, schema_cache), and
+    /// finding 6 (Restored half): the stale local replicated watermark is
+    /// replaced by the remote's authoritative one.
+    #[tokio::test]
+    async fn download_restored_replaces_replicated_keeps_local_only() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        seed_local_with_local_only(&local, "local.stale", "job-local-1");
+        let remote_bytes = build_remote_object_bytes(dir.path(), "remote.fresh");
+
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let key = object_store_state_key(&remote_state_key(&local));
+        provider.put(&key, Bytes::from(remote_bytes)).await.unwrap();
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        download_state(&config, &local)
+            .await
+            .expect("restored download should succeed");
+        test_support::clear();
+
+        let store = StateStore::open(&local).unwrap();
+        assert!(
+            store.get_watermark("remote.fresh").unwrap().is_some(),
+            "the remote's replicated watermark must be restored"
+        );
+        assert!(
+            store.get_watermark("local.stale").unwrap().is_none(),
+            "the stale local replicated watermark must be replaced by the remote copy"
+        );
+        assert_eq!(
+            store.list_schema_cache().unwrap().len(),
+            1,
+            "local-only schema_cache must survive a download that replaces the replicated tables"
+        );
+        let jobs = store.list_jobs().unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "local-only jobs must survive a download that replaces the replicated tables"
+        );
+        assert_eq!(jobs[0].job_id, "job-local-1");
+    }
+
+    /// Finding 6 (Absent): switching to an EMPTY remote prefix must reset the
+    /// replicated tables to fresh (no stale watermark survives) — while finding
+    /// 7 (Absent half) preserves the local-only tables.
+    #[tokio::test]
+    async fn download_absent_clears_replicated_keeps_local_only() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        seed_local_with_local_only(&local, "local.stale", "job-local-1");
+
+        // In-memory provider installed but EMPTY → the download resolves Absent.
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        download_state(&config, &local)
+            .await
+            .expect("an absent remote is a fresh start");
+        test_support::clear();
+
+        let store = StateStore::open(&local).unwrap();
+        assert!(
+            store.get_watermark("local.stale").unwrap().is_none(),
+            "an Absent download on a remote backend must reset the replicated tables to fresh — \
+             a stale watermark must NOT keep the run from re-reading source rows (finding 6)"
+        );
+        assert_eq!(
+            store.list_schema_cache().unwrap().len(),
+            1,
+            "Absent must keep the local-only schema_cache (finding 7)"
+        );
+        let jobs = store.list_jobs().unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "Absent must keep the local-only jobs (finding 7)"
+        );
+        assert_eq!(jobs[0].job_id, "job-local-1");
+    }
+
+    /// The copy primitive itself: it replaces ONLY the named (local-only) tables
+    /// in `dst`, leaves every replicated table in `dst` untouched, drags NO
+    /// replicated table across from `src`, and drops a stale `dst` row.
+    #[test]
+    fn copy_named_tables_replaces_only_named_tables() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.redb");
+        let dst = dir.path().join("dst.redb");
+        let now = chrono::Utc::now();
+
+        // src: a replicated watermark + the local-only tables populated.
+        seed_local_with_local_only(&src, "src.replicated", "j-src");
+
+        // dst: a DIFFERENT replicated watermark + a STALE local-only entry.
+        {
+            let store = StateStore::open(&dst).unwrap();
+            store
+                .set_watermark(
+                    "dst.replicated",
+                    &rocky_ir::WatermarkState {
+                        last_value: now,
+                        updated_at: now,
+                    },
+                )
+                .unwrap();
+            store
+                .write_schema_cache_entry(
+                    &schema_cache_key("stale", "stale", "stale"),
+                    &SchemaCacheEntry {
+                        columns: vec![],
+                        cached_at: now,
+                    },
+                )
+                .unwrap();
+            drop(store);
+        }
+
+        copy_named_tables(&src, &dst, LOCAL_ONLY_TABLE_NAMES).unwrap();
+
+        let store = StateStore::open(&dst).unwrap();
+        // dst's replicated table is untouched.
+        assert!(
+            store.get_watermark("dst.replicated").unwrap().is_some(),
+            "copy must not touch replicated tables in dst"
+        );
+        // src's replicated table did NOT leak across (copy is scoped to local-only).
+        assert!(
+            store.get_watermark("src.replicated").unwrap().is_none(),
+            "copy must not drag a replicated table across from src"
+        );
+        // dst's local-only tables were REPLACED by src's (stale row gone).
+        let sc = store.list_schema_cache().unwrap();
+        assert_eq!(
+            sc.len(),
+            1,
+            "the stale dst schema_cache entry must be replaced"
+        );
+        assert_eq!(sc[0].0, schema_cache_key("cat", "staging", "orders"));
+        let jobs = store.list_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, "j-src");
+    }
+
+    /// Finding 5 — the mechanism the fail-closed seam uploads rely on: a broken
+    /// upload (S3 with no bucket → `MissingConfig`) is SWALLOWED under the
+    /// default `Skip` policy but PROPAGATES under `Fail`. The freeze / gc-tombstone
+    /// seams force `Fail` so a state that commits locally but never reaches the
+    /// remote can never be reported as success.
+    #[tokio::test]
+    async fn upload_state_skip_swallows_but_fail_propagates() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("state.redb");
+        seed_watermark_and_cache(&src);
+
+        let skip = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: None,
+            on_upload_failure: StateUploadFailureMode::Skip,
+            ..Default::default()
+        };
+        assert!(
+            upload_state(&skip, &src).await.is_ok(),
+            "the default Skip policy must swallow an upload failure (degraded mode)"
+        );
+
+        let fail = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: None,
+            on_upload_failure: StateUploadFailureMode::Fail,
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                upload_state(&fail, &src).await,
+                Err(StateSyncError::MissingConfig(..))
+            ),
+            "the Fail policy the seams force must propagate the upload failure (abort)"
         );
     }
 }

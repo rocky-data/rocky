@@ -931,9 +931,15 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
 /// table is deliberately **not** synced here. `serve` is long-running, so a
 /// per-job remote round-trip would be impractical, and a job launched on one
 /// pod is meaningless to another. `jobs` is therefore listed in
-/// [`rocky_core::state::LOCAL_ONLY_TABLE_NAMES`], so the periodic/end-of-run
-/// state upload strips it from the remote snapshot — this write stays
-/// node-local by design and is never reverted by another pod's run-download.
+/// [`rocky_core::state::LOCAL_ONLY_TABLE_NAMES`], which keeps it node-local on
+/// BOTH sync legs: the end-of-run/periodic upload strips it from the remote
+/// snapshot, and the run-start download (`state_sync::download_state`)
+/// explicitly PRESERVES the local-only tables across the wholesale file replace
+/// — snapshotting them before the download and splicing them back afterward.
+/// So this write stays node-local and is not reverted by another pod's
+/// run-download. (Merely being stripped on upload would NOT be enough on its
+/// own: without the download-side preservation, a run-download's wholesale file
+/// replace would still wipe the local `jobs` rows.)
 async fn persist_job(state_path: std::path::PathBuf, job: PersistedJob) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let store = rocky_core::state::StateStore::open(&state_path)?;
