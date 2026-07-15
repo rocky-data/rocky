@@ -1055,6 +1055,30 @@ async fn apply_grants_with_catalog_client_fallback(
     }
 }
 
+/// #1095(c): a governed apply must not execute `[hook]` / `[hook.webhooks]`
+/// side effects. Hook commands fire at pipeline-start — BEFORE the
+/// execution-fingerprint choke-point — and a replication-only apply never
+/// reaches the gate at all, so binding hooks into the fingerprint could not
+/// prevent a post-review hook from running arbitrary shell commands. A governed
+/// run that configures any hook or webhook is therefore REFUSED before any hook
+/// is built or fired, rather than firing unreviewed side effects. A bare
+/// `rocky run` / human apply is ungoverned (`governed == false`) → hooks fire as
+/// before.
+pub(crate) fn refuse_governed_side_effects(
+    governed: bool,
+    hooks: &rocky_core::hooks::HooksConfig,
+) -> Result<()> {
+    if governed && !(hooks.hooks.is_empty() && hooks.webhooks.is_empty()) {
+        anyhow::bail!(
+            "refusing a governed apply that configures `[hook]`/`[hook.webhooks]`: hook \
+             commands fire at pipeline-start, before the execution-fingerprint gate (and a \
+             replication-only apply never reaches it), so a post-plan hook edit would run \
+             unreviewed commands. Remove the hooks, or apply outside the agent-policy plane."
+        );
+    }
+    Ok(())
+}
+
 /// Execute `rocky run` — full pipeline.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run", fields(run_id))]
@@ -1214,6 +1238,11 @@ pub async fn run(
         config_path.display()
     ))?;
     let config_hash = crate::output::config_fingerprint(config_path);
+
+    // #1095(c): refuse a governed apply that configures `[hook]`/`[hook.webhooks]`
+    // BEFORE any hook is built or fired — hooks run outside (and before) the
+    // execution-fingerprint gate, so they cannot be enforced by fingerprint.
+    refuse_governed_side_effects(governed_ctx.is_some(), &rocky_cfg.hooks)?;
 
     // Governed-apply TOCTOU gate (E) — pairs the plan-authorized IR fingerprint
     // with THIS run's config identity; verified at the execution choke-point
@@ -12066,6 +12095,38 @@ merge_keys = ["id"]
         .unwrap()
     }
 
+    /// #1095(c): a governed run REFUSES when hooks/webhooks are configured (they
+    /// fire before the fingerprint gate), while a non-governed run and a governed
+    /// run with no hooks proceed.
+    #[test]
+    fn governed_run_refuses_configured_hooks() {
+        use rocky_core::hooks::{HookConfig, HookConfigOrList, HooksConfig};
+        let with_hook = HooksConfig {
+            webhooks: Default::default(),
+            hooks: [(
+                "on_pipeline_start".to_string(),
+                HookConfigOrList::Single(HookConfig {
+                    command: "scripts/notify.sh".to_string(),
+                    timeout_ms: 1000,
+                    on_failure: Default::default(),
+                    env: Default::default(),
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let empty = HooksConfig {
+            webhooks: Default::default(),
+            hooks: Default::default(),
+        };
+        // Governed + hooks → refuse (before any hook fires).
+        assert!(super::refuse_governed_side_effects(true, &with_hook).is_err());
+        // Non-governed + hooks → allowed (bare `rocky run` fires hooks as before).
+        assert!(super::refuse_governed_side_effects(false, &with_hook).is_ok());
+        // Governed + no hooks → allowed.
+        assert!(super::refuse_governed_side_effects(true, &empty).is_ok());
+    }
+
     /// Run one governed `execute_models` apply under a fixed gate and return the
     /// `Result` — the shared driver for the extras kill-checks below.
     #[cfg(feature = "duckdb")]
@@ -12556,11 +12617,8 @@ merge_keys = ["id"]
         let resolved_mask: std::collections::BTreeMap<String, rocky_ir::MaskStrategy> =
             std::collections::BTreeMap::new();
         // Match the plan side (`compute_embedded_capabilities` → plan.rs), which
-        // binds the execution-control identity over the config's own directory.
-        let ec = crate::commands::apply::execution_control_identity(
-            &cfg,
-            config_path.parent().unwrap(),
-        );
+        // binds the execution-control identity (run/reuse/resilience).
+        let ec = crate::commands::apply::execution_control_identity(&cfg);
         let apply_fp = exec_choke_fingerprint(&models, &identity, &gov, &ec, &resolved_mask);
 
         assert_eq!(
@@ -12620,11 +12678,8 @@ merge_keys = ["id"]
         let gov = crate::commands::apply::governance_policy_identity(&cfg);
         let resolved_mask = cfg.resolve_mask_for_env(None);
         // Match the plan side (`compute_embedded_capabilities` → plan.rs), which
-        // binds the execution-control identity over the config's own directory.
-        let ec = crate::commands::apply::execution_control_identity(
-            &cfg,
-            config_path.parent().unwrap(),
-        );
+        // binds the execution-control identity (run/reuse/resilience).
+        let ec = crate::commands::apply::execution_control_identity(&cfg);
         let apply_fp = exec_choke_fingerprint(&models, &identity, &gov, &ec, &resolved_mask);
         assert_eq!(
             caps.models_fingerprint.as_deref(),

