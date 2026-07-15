@@ -1,9 +1,10 @@
 # Agent-policy plane — ENFORCED at apply time.
 #
 # Three tiny models plus a `[policy]` block that gates what an agent-authored
-# plan may do. Unlike the explain-only `policy-gallery`, this POC drives the
-# real enforcement seam: `rocky apply` consults the policy plane and refuses a
-# denied change before touching the warehouse.
+# plan may do. Unlike the check-driven `policy-gallery` (which explains
+# decisions with `rocky policy check`), this POC drives the real enforcement
+# seam: `rocky apply` consults the policy plane and refuses a denied change
+# before touching the warehouse.
 #
 #   fct_orders   — contracted (sibling .contract.toml), layer=gold  -> DENY apply
 #   dim_customer — layer=silver, column `email` classified pii

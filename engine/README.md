@@ -34,11 +34,12 @@ Rocky turns each of these into a compile error or a blocked PR before it ships: 
 
 1. **SQL as a typed, compiled language.** Real type inference, diagnostic codes (`E###` errors, `W###` warnings, `P###` portability lints), and a real LSP, not text macros or runtime checks.
 2. **Compile-time column-level lineage.** Rocky knows every column's lineage before a row is written, so `rocky lineage-diff main` can block a PR when a downstream contract breaks.
-3. **Branches and an inspectable run ledger.** `rocky branch create`, `rocky run --branch`, and `rocky replay <run_id>`: branches are isolated schemas, and every run is recorded in an auditable ledger (who ran it, the commit, the per-model SQL hash, and row counts). On the content-addressed materialization path, output files are named by the hash of their bytes, so an auditor can confirm the recorded output is exactly what shipped.
+3. **Branches and a replayable run ledger.** `rocky branch create`, `rocky run --branch`, and `rocky replay`: branches are isolated schemas, and every run is recorded in an auditable ledger (who ran it, the commit, the per-model SQL hash, and row counts). On the content-addressed materialization path, output files are named by the hash of their bytes, and `rocky replay --execute --verify` re-runs a recorded recipe and checks the output reproduces bit-for-bit, locally or on the live warehouse in an isolated replay schema. A standalone `rocky-verify` binary checks a run's manifest offline, with no engine installed.
 4. **Per-model cost attribution.** Cost is a column on every run record. `[budget]` blocks fail the run, `budget_breach` fires a hook, and `rocky preview cost` projects spend at PR time.
 5. **AI gated through the compiler.** Every AI suggestion is type-checked before it lands. The `Attempts: 2` retry on `rocky ai` is the loop: generate, type-check, auto-fix, then land.
 6. **Dialect-divergence lint.** Cross-warehouse teams write SQL once, and `P001` catches Snowflake-only constructs in a Databricks project at compile time.
 7. **Declarative governance.** RBAC as code with GRANT/REVOKE diffing, Unity Catalog tags, workspace isolation, and masking strategies bound to classification tags, so compliance becomes a CI check.
+8. **An agent policy plane.** A `[policy]` block in `rocky.toml` grades what a principal (a person, CI, or an AI agent) may do, by capability and scope: allow, require review, or deny. Enforcement runs at `apply`, `promote`, and the MCP write tools; blast-radius ceilings and `verify_after` gates fail closed; every decision lands in a ledger you query with `rocky audit` and read each morning with `rocky brief`. AI-authored plans stop for human review by default; only an explicit `[policy]` rule you wrote can let one through.
 
 ## Quick start
 
@@ -59,6 +60,9 @@ The playground is self-contained: sample models, contracts, and a DuckDB backend
 |----------|-------------|
 | **Compiler** | Type checking, column-level lineage, data contracts, DAG resolution, diagnostics with suggestions |
 | **Branches** | `rocky branch create`/`delete`/`list`/`show`, `rocky run --branch`, `rocky replay <run_id>` |
+| **Agent governance** | `[policy]` rules (allow / require review / deny), blast-radius ceilings, `verify_after` gates, autonomy budgets + `rocky policy freeze`, `rocky policy test` scenario runner, decision ledger (`rocky audit`, `rocky brief`, `rocky review --queue`) |
+| **Reproducibility** | Content-addressed run records with recipe identity, `rocky replay --execute --verify` bit-exact re-execution, `rocky gc --derivable` + hash-verified `rocky restore`, offline `rocky-verify` manifests |
+| **Resilience** | Classified retry of proven-transient failures, opt-in failure containment with honest partial results, review-gated `rocky backfill` plans |
 | **Cost** | Per-model cost attribution on every run, `[budget]` blocks, `budget_breach` hook event |
 | **Observability** | `rocky trace` Gantt output, OpenTelemetry OTLP export, structured JSON events |
 | **Portability** | Dialect-divergence lint across Databricks / Snowflake / BigQuery / DuckDB |
@@ -84,6 +88,15 @@ rocky state          # Inspect stored watermarks
 rocky ai "<intent>"  # Generate a model from natural language
 rocky lineage        # Trace column-level lineage
 rocky lineage-diff   # Per-changed-column downstream blast-radius for PR review
+rocky replay         # Verify a recorded run; --execute re-runs deterministic content-addressed models bit-exact
+rocky policy check   # Explain what a policy allows, requires review for, or denies
+rocky policy test    # Run pinned policy scenarios through the real evaluator (CI)
+rocky review         # Approve plans; --queue ranks pending escalations
+rocky audit          # Query the decision ledger; --for walks a custody chain
+rocky brief          # Estate digest with every line cited to the ledger
+rocky gc             # Inventory provably-rebuildable artifacts; eviction behind review
+rocky restore        # Rebuild an evicted artifact, hash-verified, or refuse
+rocky mcp            # Model Context Protocol server for AI agents (28 tools)
 rocky doctor         # Aggregate health checks
 rocky serve          # HTTP API + live watch
 rocky lsp            # Language Server Protocol for IDEs

@@ -8,6 +8,11 @@
 #
 # The change-classification is computed against a git baseline, so the demo
 # runs inside a throwaway git repo in a temp dir (never the surrounding repo).
+#
+# The apply-side principal comes from ROCKY_PRINCIPAL: `plan --principal agent`
+# labels the plan-time evaluation, but `rocky apply` resolves who is applying
+# from its own environment — without ROCKY_PRINCIPAL=agent the apply runs as a
+# human, humans are never gated, and the deny below would not fire.
 set -euo pipefail
 
 export ROCKY_SUPPRESS_DEPRECATION=1
@@ -40,7 +45,7 @@ DENY_PLAN=$(rocky -c rocky.toml -o json plan \
 echo "plan_id (contracted change): $DENY_PLAN"
 
 echo "=== 2. rocky apply — expected DENIAL (contracted boundary) ==="
-if rocky -c rocky.toml apply "$DENY_PLAN" > "$HERE/expected/apply-deny.txt" 2>&1; then
+if ROCKY_PRINCIPAL=agent rocky -c rocky.toml apply "$DENY_PLAN" > "$HERE/expected/apply-deny.txt" 2>&1; then
     echo "FAIL: apply of a contracted-model change should have been DENIED"
     cat "$HERE/expected/apply-deny.txt"
     exit 1
@@ -76,7 +81,7 @@ ALLOW_PLAN=$(rocky -c rocky.toml -o json plan \
 echo "plan_id (additive bronze): $ALLOW_PLAN"
 
 echo "=== 4. rocky apply — expected ALLOW (additive bronze, no review) ==="
-rocky -c rocky.toml apply "$ALLOW_PLAN" > "$HERE/expected/apply-allow.txt" 2>&1
+ROCKY_PRINCIPAL=agent rocky -c rocky.toml apply "$ALLOW_PLAN" > "$HERE/expected/apply-allow.txt" 2>&1
 echo "allowed and materialized:"
 cat "$HERE/expected/apply-allow.txt"
 

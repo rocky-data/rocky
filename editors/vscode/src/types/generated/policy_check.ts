@@ -39,7 +39,7 @@ export type PolicyPrincipal = "human" | "agent";
 /**
  * JSON output for `rocky policy check`.
  *
- * Explain-mode only: reports the effect the agent policy plane *would* resolve for a `(principal, capability, model)` triple, the winning rule (if any), and why. It does not gate any real command in v0.
+ * An explain surface: reports the effect the agent policy plane resolves for a `(principal, capability, model)` triple, the winning rule (if any), and why. The check itself is read-only; the same evaluator is enforced at `apply`, `promote`, and the MCP write tools.
  */
 export interface PolicyCheckOutput {
   /**

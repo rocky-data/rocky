@@ -115,6 +115,51 @@ EOF
             $git_commit commit -q -m "rename amount->amount_usd; add tax columns"
         )
         ;;
+    policy-enforce)
+        # The apply-time enforcement seam, end to end: an agent-authored
+        # change to a contracted model is refused by `rocky apply` with the
+        # rule named, and the decision lands in the ledger. Needs a git
+        # baseline for the change classification.
+        cp -r "$POCS/04-governance/11-agent-policy/." "$scratch/"
+        clean_state "$scratch"
+        rm -rf "$scratch/expected"
+        (
+            cd "$scratch"
+            git init -q -b main .
+            git -c user.email=poc@rocky.dev -c user.name=rocky-poc add -A
+            git -c user.email=poc@rocky.dev -c user.name=rocky-poc commit -q -m "baseline: three models under a [policy] block"
+        )
+        ;;
+    policy-deny)
+        cp -r "$POCS/03-ai/07-policy/." "$scratch/"
+        clean_state "$scratch"
+        # `rocky policy check` compiles the project to read the target
+        # model's attributes, so the scenario's contracted model needs a
+        # real (tiny) model + sibling contract on disk. The POC itself only
+        # ships `[[policy.tests]]` scenarios, which carry their attributes
+        # inline and need no models.
+        mkdir -p "$scratch/models"
+        cat > "$scratch/models/fct_revenue.sql" <<'SQL'
+SELECT 1 AS order_id, 100.0 AS amount
+SQL
+        cat > "$scratch/models/fct_revenue.toml" <<'TOML'
+name = "fct_revenue"
+
+[target]
+catalog = "poc"
+schema = "gold"
+table = "fct_revenue"
+TOML
+        cat > "$scratch/models/fct_revenue.contract.toml" <<'TOML'
+[[columns]]
+name = "amount"
+type = "Float64"
+nullable = true
+
+[rules]
+required = ["amount"]
+TOML
+        ;;
     *)
         echo "prepare.sh: unknown demo '$demo'" >&2
         exit 1
