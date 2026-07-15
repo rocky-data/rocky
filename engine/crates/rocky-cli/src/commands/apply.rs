@@ -990,20 +990,6 @@ pub fn evaluate_apply_policy_with_policy(
         Err(gate) => return gate,
     };
 
-    // Finding 6: when the policy uses autonomy budgets or `verify_after`, the
-    // decision rows are durability-CRITICAL — the plain rule decision written here
-    // pairs with the later verify-after custody row to burn the budget
-    // (`policy::budget_failures_in_window` needs BOTH). A silently-dropped decision
-    // row (write-handle unavailable under advisory-lock contention, or a write
-    // error) means a failed apply never burns the budget and a later agent action
-    // auto-allows. For such policies the ledger open + write are FAIL-CLOSED. For
-    // ordinary policies (no budget / no verify_after) the write stays best-effort,
-    // so an audit-row hiccup never blocks an apply (no availability regression).
-    let budget_relevant = policy
-        .rules
-        .iter()
-        .any(|r| r.autonomy_budget.is_some() || !r.verify_after.is_empty());
-
     // Snapshot the decision ledger *before* this apply writes any rows, so the
     // dynamic breakers (autonomy-budget burn, active freezes) reflect only
     // prior history. The snapshot is taken through `open_read_only` FIRST:
@@ -1016,23 +1002,13 @@ pub fn evaluate_apply_policy_with_policy(
         .ok()
         .and_then(|reader| reader.list_policy_decisions().ok());
 
-    // Ledger write handle. For a budget-relevant policy the handle MUST be
-    // obtainable — retry briefly on transient advisory-lock contention, then fail
-    // closed (Deny) if still unavailable. Otherwise best-effort (a failed open
-    // just skips the audit write).
-    let ledger = if budget_relevant {
-        match open_ledger_with_retry(state_path) {
-            Ok(store) => Some(store),
-            Err(e) => {
-                return fail_closed_budget_gate(
-                    touched,
-                    &format!("the decision ledger could not be opened for writing ({e})"),
-                );
-            }
-        }
-    } else {
-        StateStore::open(state_path).ok()
-    };
+    // Ledger write handle, opened with a bounded retry on transient advisory-lock
+    // contention. Finding 6 (scoped, red-team round 6): budget / `verify_after`
+    // durability is enforced PER WINNING RULE in the record sink below — a dropped
+    // decision row for a rule that actually governs a touched target fails closed,
+    // while an ordinary audit-row hiccup never blocks the apply. So an UNRELATED
+    // budget rule for a different target no longer forces a false-deny.
+    let ledger = open_ledger_with_retry(state_path).ok();
 
     // Rare fallback: the read-only open lost a transient redb open race but a
     // write handle succeeded — snapshot through it rather than reading nothing.
@@ -1055,10 +1031,20 @@ pub fn evaluate_apply_policy_with_policy(
         &prior_decisions,
         snapshot_unreadable,
         |record| {
+            // Durability is critical only when THIS record's WINNING rule uses an
+            // autonomy budget or `verify_after` — its decision row pairs with a
+            // later custody row to burn the budget. A rule that did not win for any
+            // touched target produces no record here, so an unrelated budget rule
+            // never forces fail-closed handling (fixes the round-6 false-deny).
+            let rec_budget_relevant = record
+                .rule_id
+                .and_then(|idx| policy.rules.get(idx))
+                .map(|r| r.autonomy_budget.is_some() || !r.verify_after.is_empty())
+                .unwrap_or(false);
             match &ledger {
                 Some(store) => {
                     if let Err(e) = store.record_policy_decision(record) {
-                        if budget_relevant {
+                        if rec_budget_relevant {
                             budget_write_failed.set(true);
                             warn!(
                                 target: "rocky::policy",
@@ -1074,15 +1060,15 @@ pub fn evaluate_apply_policy_with_policy(
                         }
                     }
                 }
-                // A budget-relevant policy with no write handle is impossible here
-                // (we fail closed above), but guard defensively.
-                None if budget_relevant => budget_write_failed.set(true),
+                // No write handle: fail closed only if this winning rule is
+                // itself budget / verify_after-relevant.
+                None if rec_budget_relevant => budget_write_failed.set(true),
                 None => {}
             }
         },
     );
 
-    if budget_relevant && budget_write_failed.get() {
+    if budget_write_failed.get() {
         return fail_closed_budget_gate(
             touched,
             "a budget-relevant decision row could not be persisted",
@@ -1096,16 +1082,27 @@ pub fn evaluate_apply_policy_with_policy(
 /// Mirrors the download-publish lock retry. Fail-closed: propagates the last
 /// error after the retries are exhausted.
 fn open_ledger_with_retry(state_path: &Path) -> Result<StateStore, rocky_core::state::StateError> {
+    use rocky_core::state::StateError;
     const MAX_ATTEMPTS: u32 = 5;
-    let mut last: Option<rocky_core::state::StateError> = None;
+    let mut last: Option<StateError> = None;
     for attempt in 1..=MAX_ATTEMPTS {
         match StateStore::open(state_path) {
             Ok(store) => return Ok(store),
             Err(e) => {
+                // Only retry TRANSIENT advisory-lock contention (a concurrent
+                // writer briefly holding the lock). A permanent error (schema
+                // mismatch, version parse, lock I/O, a corrupt file, …) is returned
+                // immediately — retrying it merely delays the correct failure
+                // (red-team round 6).
+                let transient = matches!(
+                    e,
+                    StateError::LockHeldByOther { .. } | StateError::Busy { .. }
+                );
                 last = Some(e);
-                if attempt < MAX_ATTEMPTS {
-                    std::thread::sleep(std::time::Duration::from_millis(20 * u64::from(attempt)));
+                if !transient || attempt == MAX_ATTEMPTS {
+                    break;
                 }
+                std::thread::sleep(std::time::Duration::from_millis(20 * u64::from(attempt)));
             }
         }
     }
