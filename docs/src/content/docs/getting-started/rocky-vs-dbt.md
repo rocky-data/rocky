@@ -8,7 +8,7 @@ sidebar:
 This page explains the difference between Rocky and dbt in pictures. If you want the full feature-by-feature tables, see the [Feature Comparison](/getting-started/comparison/); if you're ready to try a migration, see [Migrate from dbt](/guides/migrate-from-dbt/).
 
 :::note[A note on "dbt"]
-"dbt" is three things today: **dbt Core 1.x** (the Python line, still the dominant deployment), **dbt Core v2.0 / Fusion** (the Apache-licensed Rust engine whose tree now includes SQL comprehension — parser, type checking, column-level lineage; the precompiled Fusion binary is its recommended distribution), and the commercial **dbt platform**. The diagrams below contrast Rocky with dbt Core 1.x first, because that's what most teams run. Fusion changes part of the picture, and gets its own section.
+"dbt" is three things today: **dbt Core 1.x** (the Python line, still the dominant deployment), **dbt Fusion** (the Rust engine — open-sourced as Apache-2.0 **dbt Core v2.0**, with SQL comprehension in that tree; the precompiled Fusion binary dbt recommends is a free-with-registration distribution of it, not itself Apache-licensed), and the commercial **dbt platform**. The diagrams below contrast Rocky with dbt Core 1.x first, because that's what most teams run. Fusion changes part of the picture, and gets its own section.
 :::
 
 ## The same job
@@ -120,7 +120,7 @@ On replication runs where the target table already exists, Rocky compares the so
 
 ## What about dbt Fusion?
 
-Fusion is dbt's Rust engine (dbt Core v2.0), and its SQL comprehension genuinely closes part of the compile-time gap: in the opt-in `strict` mode it type-checks SQL and computes column-level lineage. Rocky does not claim those as differentiators against Fusion.
+Fusion is dbt's Rust engine — open-sourced as Apache-2.0 dbt Core v2.0, and shipped to most users as the free-with-registration precompiled Fusion binary. Its SQL comprehension genuinely closes part of the compile-time gap: in the opt-in `strict` mode it type-checks SQL and computes column-level lineage. Rocky does not claim those as differentiators against Fusion.
 
 The durable difference is what happens *around* the compiler. Rocky treats the run itself as something to check, record, and optionally gate, not just execute:
 
