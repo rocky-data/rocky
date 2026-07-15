@@ -29,15 +29,18 @@ These type changes preserve data and are handled with `ALTER TABLE` without a fu
 
 | From | To | Example |
 |---|---|---|
-| `INT` | `BIGINT` | Integer widening |
+| `INT` | `BIGINT` | Integer widening (also `TINYINT`/`SMALLINT` upward) |
 | `FLOAT` | `DOUBLE` | Float precision widening |
-| `DECIMAL(p1, s)` | `DECIMAL(p2, s)` | Decimal precision increase (p2 > p1) |
+| `DECIMAL(p1, s)` | `DECIMAL(p2, s)` | Decimal precision increase (p2 > p1, same scale) |
 | `VARCHAR(n1)` | `VARCHAR(n2)` | String length increase (n2 > n1) |
+| numeric / `BOOLEAN` | `STRING` | Representation change (lossless) |
 
 ```sql
 ALTER TABLE acme_warehouse.staging__us_west__shopify.orders
 ALTER COLUMN amount TYPE DECIMAL(12, 2)
 ```
+
+The allowlist is per-dialect, matching what each warehouse's `ALTER COLUMN` can apply losslessly. The table above is the default (Databricks, DuckDB, Trino). Snowflake allows only `NUMBER(p,s)` precision widening and `VARCHAR` length widening — integer types all canonicalize to `NUMBER(38,0)` in its `DESCRIBE TABLE` output, so integer widening never surfaces as drift there. BigQuery allows only `INT64 → NUMERIC`, `INT64 → BIGNUMERIC`, and `NUMERIC → BIGNUMERIC`; numeric → `STRING` is **not** assignable on BigQuery and falls through to a full refresh.
 
 ### Unsafe Type Changes
 

@@ -93,7 +93,7 @@ The mental model in one picture:
 
 ## Example: a source column changes type
 
-An upstream loader changes a column: yesterday `order_id` was `INT`, today it arrives as `BIGINT` (or worse, `STRING`). Nothing in your repo changed, so a code diff can't see it:
+An upstream loader changes a column's type under you: yesterday `order_id` was `INT`, today it arrives as something else. Nothing in your repo changed, so a code diff can't see it:
 
 ```
  dbt Core:
@@ -103,10 +103,10 @@ An upstream loader changes a column: yesterday `order_id` was `INT`, today it ar
  Rocky (replication pipelines):
    source changes ──▶ drift check ──▶ classified, then acted on:
 
-     safe widening (INT → BIGINT)  ──▶ ALTER TABLE in place,
+     widening (INT → BIGINT)       ──▶ ALTER TABLE in place,
                                        existing rows preserved
 
-     incompatible (INT → STRING)   ──▶ target dropped and re-copied
+     narrowing (BIGINT → INT)      ──▶ target dropped and re-copied
                                        from the source — automatic,
                                        and logged in the run output
 
@@ -115,7 +115,7 @@ An upstream loader changes a column: yesterday `order_id` was `INT`, today it ar
                                        target left untouched
 ```
 
-On replication runs where the target table already exists, Rocky compares the source's actual columns against the target's before copying, and classifies every mismatch. Safe type widenings (like `INT` to `BIGINT`) are applied in place with an `ALTER TABLE`, preserving existing rows. Anything else drops the target and re-copies it from the current source — automatic and recorded in the run output, but still a rebuild: the new target holds only what the source holds today, so it is not lossless for targets that accumulate history the source has pruned. Teams that don't want automatic schema mutations opt into the drift-governance policy gate, which refuses any non-additive change and surfaces it for review instead of applying it. See [Schema Drift](/concepts/schema-drift/) for the classification rules. None of the dbt engines detect source-schema drift today (see the [drift table](/getting-started/comparison/#schema-drift-detection)).
+On replication runs where the target table already exists, Rocky compares the source's actual columns against the target's before copying, and classifies every mismatch. Type changes the warehouse can apply losslessly in place — widenings like `INT` to `BIGINT`, decided per warehouse dialect by what its `ALTER COLUMN` supports — are applied with an `ALTER TABLE`, preserving existing rows. Anything else (a narrowed type, an incompatible column family) drops the target and re-copies it from the current source — automatic and recorded in the run output, but still a rebuild: the new target holds only what the source holds today, so it is not lossless for targets that accumulate history the source has pruned. Teams that don't want automatic schema mutations opt into the drift-governance policy gate, which refuses any non-additive change and surfaces it for review instead of applying it. See [Schema Drift](/concepts/schema-drift/) for the classification rules. None of the dbt engines detect source-schema drift today (see the [drift table](/getting-started/comparison/#schema-drift-detection)).
 
 ## What about dbt Fusion?
 
