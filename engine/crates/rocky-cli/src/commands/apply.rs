@@ -990,6 +990,20 @@ pub fn evaluate_apply_policy_with_policy(
         Err(gate) => return gate,
     };
 
+    // Finding 6: when the policy uses autonomy budgets or `verify_after`, the
+    // decision rows are durability-CRITICAL — the plain rule decision written here
+    // pairs with the later verify-after custody row to burn the budget
+    // (`policy::budget_failures_in_window` needs BOTH). A silently-dropped decision
+    // row (write-handle unavailable under advisory-lock contention, or a write
+    // error) means a failed apply never burns the budget and a later agent action
+    // auto-allows. For such policies the ledger open + write are FAIL-CLOSED. For
+    // ordinary policies (no budget / no verify_after) the write stays best-effort,
+    // so an audit-row hiccup never blocks an apply (no availability regression).
+    let budget_relevant = policy
+        .rules
+        .iter()
+        .any(|r| r.autonomy_budget.is_some() || !r.verify_after.is_empty());
+
     // Snapshot the decision ledger *before* this apply writes any rows, so the
     // dynamic breakers (autonomy-budget burn, active freezes) reflect only
     // prior history. The snapshot is taken through `open_read_only` FIRST:
@@ -1002,11 +1016,23 @@ pub fn evaluate_apply_policy_with_policy(
         .ok()
         .and_then(|reader| reader.list_policy_decisions().ok());
 
-    // Best-effort ledger handle for the decision-row writes. A failure to open
-    // for writing (e.g. a concurrent writer's advisory lock) must not fail the
-    // apply — the decision is computed regardless; only the audit write is
-    // skipped.
-    let ledger = StateStore::open(state_path).ok();
+    // Ledger write handle. For a budget-relevant policy the handle MUST be
+    // obtainable — retry briefly on transient advisory-lock contention, then fail
+    // closed (Deny) if still unavailable. Otherwise best-effort (a failed open
+    // just skips the audit write).
+    let ledger = if budget_relevant {
+        match open_ledger_with_retry(state_path) {
+            Ok(store) => Some(store),
+            Err(e) => {
+                return fail_closed_budget_gate(
+                    touched,
+                    &format!("the decision ledger could not be opened for writing ({e})"),
+                );
+            }
+        }
+    } else {
+        StateStore::open(state_path).ok()
+    };
 
     // Rare fallback: the read-only open lost a transient redb open race but a
     // write handle succeeded — snapshot through it rather than reading nothing.
@@ -1016,7 +1042,11 @@ pub fn evaluate_apply_policy_with_policy(
     let snapshot_unreadable = prior_snapshot.is_none();
     let prior_decisions: Vec<PolicyDecisionRecord> = prior_snapshot.unwrap_or_default();
 
-    evaluate_apply_policy_core(
+    // Tracks a failed budget-relevant decision-row write so we can fail closed
+    // after the evaluation loop (the record sink returns `()`).
+    let budget_write_failed = std::cell::Cell::new(false);
+
+    let gate = evaluate_apply_policy_core(
         &policy,
         plan_id,
         principal,
@@ -1025,17 +1055,81 @@ pub fn evaluate_apply_policy_with_policy(
         &prior_decisions,
         snapshot_unreadable,
         |record| {
-            if let Some(store) = &ledger
-                && let Err(e) = store.record_policy_decision(record)
-            {
-                warn!(
-                    target: "rocky::policy",
-                    error = %e,
-                    "failed to record policy decision to the ledger (continuing)"
-                );
+            match &ledger {
+                Some(store) => {
+                    if let Err(e) = store.record_policy_decision(record) {
+                        if budget_relevant {
+                            budget_write_failed.set(true);
+                            warn!(
+                                target: "rocky::policy",
+                                error = %e,
+                                "fail-closed: could not persist a budget-relevant decision row"
+                            );
+                        } else {
+                            warn!(
+                                target: "rocky::policy",
+                                error = %e,
+                                "failed to record policy decision to the ledger (continuing)"
+                            );
+                        }
+                    }
+                }
+                // A budget-relevant policy with no write handle is impossible here
+                // (we fail closed above), but guard defensively.
+                None if budget_relevant => budget_write_failed.set(true),
+                None => {}
             }
         },
-    )
+    );
+
+    if budget_relevant && budget_write_failed.get() {
+        return fail_closed_budget_gate(
+            touched,
+            "a budget-relevant decision row could not be persisted",
+        );
+    }
+    gate
+}
+
+/// Open the decision ledger for writing with a bounded retry on transient
+/// advisory-lock contention (a concurrent run briefly holding the writer lock).
+/// Mirrors the download-publish lock retry. Fail-closed: propagates the last
+/// error after the retries are exhausted.
+fn open_ledger_with_retry(state_path: &Path) -> Result<StateStore, rocky_core::state::StateError> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last: Option<rocky_core::state::StateError> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match StateStore::open(state_path) {
+            Ok(store) => return Ok(store),
+            Err(e) => {
+                last = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * u64::from(attempt)));
+                }
+            }
+        }
+    }
+    Err(last.expect("retry loop runs at least once"))
+}
+
+/// A fail-closed `Deny` for a budget-relevant decision whose ledger row could
+/// not be durably persisted — the autonomy-budget / verify_after pair must be
+/// durable, so the mutation is refused rather than proceeding with an incomplete
+/// budget trail (finding 6).
+fn fail_closed_budget_gate(touched: &BTreeMap<String, PolicyCapability>, why: &str) -> PolicyGate {
+    PolicyGate::Deny {
+        model: touched
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "*".to_string()),
+        rule_id: None,
+        reason: format!(
+            "fail-closed: {why} — the autonomy-budget / verify_after decision pair must be \
+             durable so a failed apply burns the budget, so this mutation is refused. Retry when \
+             the state store is not contended."
+        ),
+    }
 }
 
 /// Ledger-through-a-held-handle variant of [`evaluate_apply_policy`].
@@ -1514,6 +1608,28 @@ impl ExecutionExtras {
 /// [`governance_policy_identity`], hashed into the execution fingerprint only —
 /// never here — so an env-var-templated advisory value cannot cause a
 /// cross-process routing false-refuse (finding #5).
+///
+/// # KNOWN LIMITATION — config-swap TOCTOU (findings 1–4, tracked follow-up)
+///
+/// `config_policy_identity` binds only **adapters + pipelines** (routing/
+/// destination). It does **not** bind `[policy]` or `[state]`. Meanwhile the
+/// governed `run` / `promote` / `propose` EXECUTION paths **re-read `rocky.toml`
+/// from disk** (see the seam note on [`GovernedRunContext::verify_routing_identity`]
+/// and `commands::run::run`'s L1212 snapshot): the apply-time freeze/policy gate
+/// reads the config once, and execution reads it again. An attacker with
+/// filesystem write access who swaps the on-disk `[policy]` / `[state]` block
+/// **between** the apply gate and execution can therefore bypass a freeze or a
+/// deny rule (or redirect the `[state]` backend) for those paths — the swap moves
+/// fields that are NOT in this routing identity, so the fingerprint gate does not
+/// catch it. The single-snapshot threading in this crate closes the swap **within
+/// each governed decision function** (the gate + guard + `verify_after` +
+/// models-dir all read one snapshot), but does not yet extend that snapshot
+/// through the `run()` execution engine. The sound fix — execute every governed
+/// mutation from the apply-verified config snapshot (thread the `&RockyConfig`
+/// through `execute_run_plan` → `run()`), or bind `[policy]`/`[state]` into the
+/// pre-mutation execution identity — is a tracked design follow-up, out of scope
+/// here. Mitigating factor: the threat requires local filesystem write access to
+/// `rocky.toml` during the apply window.
 pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> String {
     let adapters: BTreeMap<&str, serde_json::Value> = cfg
         .adapters
@@ -1781,6 +1897,16 @@ impl GovernedRunContext<'_> {
     /// `a.duckdb`→`b.duckdb`) is refused before a single DDL executes. A
     /// genuinely-legacy plan (`!require` and no stored identity) is allowed
     /// through; a NEW plan with a missing identity is refused (#7).
+    ///
+    /// KNOWN LIMITATION — config-swap TOCTOU (findings 1–4, tracked follow-up):
+    /// this gate binds ROUTING only ([`config_policy_identity`] = adapters +
+    /// pipelines), not `[policy]` / `[state]`. This governed EXECUTION seam
+    /// re-reads `rocky.toml` (the `cfg` here is `run`'s own re-read snapshot, not
+    /// the apply-time gate's), so an on-disk `[policy]`/`[state]` swap performed
+    /// between the apply gate and here is NOT caught — see the full note on
+    /// [`config_policy_identity`]. Closing it fully (execute from the
+    /// apply-verified snapshot, or fingerprint `[policy]`/`[state]`) is a tracked
+    /// design follow-up.
     pub(crate) fn verify_routing_identity(
         &self,
         cfg: &rocky_core::config::RockyConfig,
@@ -1846,7 +1972,29 @@ impl GovernedRunContext<'_> {
             &models_dir,
             ledger,
         );
-        apply_policy_gate(self.root, self.plan_id, gate)
+        apply_policy_gate(self.root, self.plan_id, gate)?;
+
+        // Finding 7: replication pipelines have NO post-run check substrate — a
+        // replication apply supplies no `verify_after` run id and nothing runs or
+        // records the named checks. A rule's required `verify_after` checks are
+        // contractually fail-closed (an absent check halts), so silently ALLOWING
+        // an unverified replication mutation under a rule that demands checks is a
+        // policy bypass. Refuse instead: if the matched allow-rule(s) for these
+        // targets require any `verify_after`, fail closed with a clear message.
+        let required =
+            required_verify_after(cfg.policy.as_ref(), self.principal, &touched, &models_dir);
+        if !required.is_empty() {
+            bail!(
+                "refusing governed replication apply for plan '{}': the matched policy rule \
+                 requires verify_after checks [{}], but `verify_after` is NOT supported for \
+                 replication pipelines — there is no post-run check substrate to run or record \
+                 them, so the mutation could not be verified. Remove `verify_after` from the \
+                 matching rule, or move these targets to a transformation pipeline.",
+                self.plan_id,
+                required.join(", ")
+            );
+        }
+        Ok(())
     }
 }
 
@@ -2070,7 +2218,11 @@ fn run_verify_after(
         return Ok(());
     }
 
-    let store = StateStore::open(state_path)
+    // Finding 6: `run_verify_after` only runs when checks are required, so its
+    // custody row is ALWAYS budget/verify-relevant. Open the ledger fail-closed
+    // with a bounded retry on advisory-lock contention (rather than a single
+    // best-effort open) so the custody half of the budget-burn pair is durable.
+    let store = open_ledger_with_retry(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
     // Resolve *this apply's own* run by id (not "latest"). `None` means no run
@@ -2138,13 +2290,16 @@ fn run_verify_after(
         verify_after: required.to_vec(),
         auto_apply: None,
     };
-    if let Err(e) = store.record_policy_decision(&record) {
-        warn!(
-            target: "rocky::policy",
-            error = %e,
-            "failed to record verify_after custody entry to the ledger (continuing)"
-        );
-    }
+    // Finding 6: FAIL-CLOSED — the verify custody row is the budget-burning half
+    // of the pair, so a write failure must abort (not warn-and-continue) rather
+    // than silently leave the failed apply un-burnable.
+    store.record_policy_decision(&record).with_context(|| {
+        format!(
+            "fail-closed: could not persist the verify_after custody row for plan '{plan_id}' — \
+             the autonomy-budget pair would be incomplete, so a later agent action could \
+             auto-allow. Retry when the state store is not contended."
+        )
+    })?;
 
     if passed {
         eprintln!(
@@ -2495,7 +2650,13 @@ async fn run_apply_backfill_plan(
         )
     })?;
 
-    crate::commands::run::execute_backfill_set(
+    // Finding 5: a backfill MUTATES the warehouse + local ledger (run/artifact/
+    // provenance rows) as it executes, so a mid-run failure can still have
+    // committed state. CAPTURE the result (don't `?` it) and ALWAYS run the
+    // fail-closed upload-after before returning — otherwise a failed backfill
+    // leaves its partial mutations local-only, and the next run's start-download
+    // silently reverts them. The upload is not gated on success.
+    let exec_result = crate::commands::run::execute_backfill_set(
         config_path,
         &rocky_cfg,
         state_path,
@@ -2506,13 +2667,13 @@ async fn run_apply_backfill_plan(
         output_json,
     )
     .await
-    .with_context(|| format!("rocky apply backfill plan '{plan_id}' failed"))?;
+    .with_context(|| format!("rocky apply backfill plan '{plan_id}' failed"));
 
-    // Finding 2c (upload-after): the backfill wrote artifact/run/provenance rows
-    // to local state; push them to the remote backend (fail-closed) so the next
-    // run's start-download does not silently revert the recovery. Runs only after
-    // a successful backfill.
-    upload_remote_ledger_fail_closed(Some(&rocky_cfg), state_path, "backfill apply").await
+    // Finding 2c + 5 (upload-after, unconditional): push whatever the backfill
+    // wrote to local state to the remote backend (fail-closed) so it is durable.
+    upload_remote_ledger_fail_closed(Some(&rocky_cfg), state_path, "backfill apply").await?;
+
+    exec_result
 }
 
 /// Apply a `PlanKind::Replication` plan by re-running discovery, asserting
@@ -5016,6 +5177,96 @@ effect = "allow"
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         ctx.gate_replication_targets(&targets, &ledger, &loaded_cfg)
             .expect("no [policy] block ⇒ replication gate is a no-op");
+        Ok(())
+    }
+
+    /// Finding 7: replication pipelines have NO post-run verify substrate, so a
+    /// governed replication apply whose matched allow-rule requires `verify_after`
+    /// must be REFUSED (not silently allowed as an unverified mutation).
+    #[test]
+    fn replication_gate_refuses_verify_after() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // An `allow` rule that ALSO demands a post-apply check.
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+verify_after = ["row_count"]
+"#,
+        )?;
+        let loaded_cfg = rocky_core::config::load_rocky_config(&config)?;
+        let state = dir.path().join("state.redb");
+        let ledger = StateStore::open(&state)?;
+        let ctx = super::GovernedRunContext {
+            principal: PolicyPrincipal::Agent,
+            plan_id: "plan_x",
+            root: dir.path(),
+            config_path: &config,
+            expected_ir_fingerprint: None,
+            expected_config_identity: None,
+            require_fingerprint: false,
+            reviewed_source_schemas: None,
+            expects_models: true,
+        };
+        let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
+        let err = ctx
+            .gate_replication_targets(&targets, &ledger, &loaded_cfg)
+            .expect_err(
+                "a replication apply under a verify_after rule must be refused (finding 7)",
+            );
+        assert!(
+            err.to_string()
+                .contains("verify_after` is NOT supported for replication"),
+            "the refusal must name the replication verify_after limitation; got: {err}"
+        );
+        Ok(())
+    }
+
+    /// Finding 6: for a budget-relevant policy (a rule with `autonomy_budget` or
+    /// `verify_after`), the decision-row write is FAIL-CLOSED — if the ledger
+    /// write handle is unavailable (a concurrent writer holds the advisory lock),
+    /// the gate DENIES rather than silently dropping the budget-pair row.
+    #[test]
+    fn budget_relevant_decision_write_is_fail_closed_under_contention() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+autonomy_budget = { failures = 3, window = "7d" }
+"#,
+        )?;
+        let policy = rocky_core::config::load_rocky_config(&config)?.policy;
+        let state = dir.path().join("state.redb");
+        let mut touched = BTreeMap::new();
+        touched.insert("m".to_string(), PolicyCapability::Apply);
+
+        // Hold the writer lock, as a concurrent run would — the decision-row write
+        // handle is unavailable, so the budget-pair row cannot be persisted.
+        let held = StateStore::open(&state)?;
+        let gate = super::evaluate_apply_policy_with_policy(
+            policy.as_ref(),
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &touched,
+            &dir.path().join("models"),
+            &state,
+        );
+        drop(held);
+        assert!(
+            matches!(&gate, PolicyGate::Deny { reason, .. }
+                if reason.contains("fail-closed") && reason.contains("budget")),
+            "a budget-relevant decision whose row can't be persisted must fail closed with a \
+             budget-pair reason; got {gate:?}"
+        );
         Ok(())
     }
 

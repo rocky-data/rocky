@@ -975,14 +975,19 @@ pub(crate) async fn run_restore_apply_in_with(
 
     let store = StateStore::open(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    let output =
-        execute_restore_apply(&store, stores, warehouse, plan_id, &plan, Utc::now()).await?;
+    // Finding 5: restore MUTATES the object store + the local artifact/tombstone
+    // ledger as it executes, so a mid-run failure can still have committed state.
+    // CAPTURE the result (don't `?` it), release the store lock, ALWAYS run the
+    // fail-closed upload-after, THEN handle the captured result — a failure must
+    // not skip the durability upload (else the next run's start-download reverts
+    // the partial restoration).
+    let exec_result =
+        execute_restore_apply(&store, stores, warehouse, plan_id, &plan, Utc::now()).await;
     // Drop the store to release the advisory lock / flush the file before upload.
     drop(store);
 
-    // Finding 2b (upload-after): restore reinstated the artifact ledger row +
-    // its tombstone locally; push them to the remote backend (fail-closed) so the
-    // next run's start-download does not silently erase the restoration.
+    // Finding 2b + 5 (upload-after, unconditional): push whatever restore wrote to
+    // local state to the remote backend (fail-closed) so it is durable.
     crate::commands::apply::upload_remote_ledger_fail_closed(
         loaded_cfg.as_ref(),
         state_path,
@@ -990,6 +995,7 @@ pub(crate) async fn run_restore_apply_in_with(
     )
     .await?;
 
+    let output = exec_result?;
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
