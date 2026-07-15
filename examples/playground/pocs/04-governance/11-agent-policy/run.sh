@@ -50,8 +50,15 @@ if ROCKY_PRINCIPAL=agent rocky -c rocky.toml apply "$DENY_PLAN" > "$HERE/expecte
     cat "$HERE/expected/apply-deny.txt"
     exit 1
 fi
+# A non-zero exit alone is not proof — the original version of this POC
+# passed on a missing-schema runtime error. Assert the policy denial itself.
+if ! grep -q "policy DENIES" "$HERE/expected/apply-deny.txt"; then
+    echo "FAIL: apply failed, but not with a policy denial:"
+    cat "$HERE/expected/apply-deny.txt"
+    exit 1
+fi
 echo "correctly denied:"
-grep -i "DENIES\|deny" "$HERE/expected/apply-deny.txt" || cat "$HERE/expected/apply-deny.txt"
+grep "policy DENIES" "$HERE/expected/apply-deny.txt"
 
 # Restore the contracted model to baseline before the allow scenario.
 git checkout -q -- models/fct_orders.sql
@@ -88,6 +95,17 @@ cat "$HERE/expected/apply-allow.txt"
 echo "=== 5. rocky audit — the decision ledger records both ==="
 rocky -c rocky.toml -o json audit > "$HERE/expected/audit.json"
 rocky -c rocky.toml audit
+
+# Assert the ledger recorded both decisions with the right principal and
+# effect (each decision object lists principal three lines above effect).
+if ! grep -A3 '"principal": "agent"' "$HERE/expected/audit.json" | grep -q '"effect": "deny"'; then
+    echo "FAIL: audit ledger is missing the agent deny decision"
+    exit 1
+fi
+if ! grep -A3 '"principal": "agent"' "$HERE/expected/audit.json" | grep -q '"effect": "allow"'; then
+    echo "FAIL: audit ledger is missing the agent allow decision"
+    exit 1
+fi
 
 echo
 echo "POC complete: contracted change DENIED, additive bronze change ALLOWED, both recorded."
