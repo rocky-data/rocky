@@ -3707,7 +3707,7 @@ class RockyConfig(BaseModel):
     """
     policy: PolicyConfig | None = None
     """
-    Agent-authority policy plane (explain-mode in v0). Declares, per `(principal, capability, scope)`, whether an action is allowed, requires human review, or is denied. Absent `[policy]` block ⇒ no rules and the default posture applies (agents on mutating actions fall to `default_agent_effect`, humans are never gated). See [`PolicyConfig`] and [`crate::policy`] for the evaluator.
+    Agent-authority policy plane. Declares, per `(principal, capability, scope)`, whether an action is allowed, requires human review, or is denied; enforced at `apply`, `promote`, and the MCP write tools, with every decision recorded to the ledger. Absent `[policy]` block ⇒ no rules and the default posture applies (agents on mutating actions fall to `default_agent_effect`, humans are never gated). See [`PolicyConfig`] and [`crate::policy`] for the evaluator.
     """
     portability: PortabilityConfig | None = Field(
         {"allow": [], "target_dialect": None}, validate_default=True

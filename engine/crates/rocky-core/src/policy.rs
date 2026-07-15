@@ -1,10 +1,10 @@
-//! Agent-authority policy evaluator (explain-mode, v0).
+//! Agent-authority policy evaluator.
 //!
 //! Given a `(principal, capability, model)` triple and a project's
 //! `[policy]` block, [`evaluate`] returns the resolved [`PolicyEffect`],
 //! the matched rule (if any), and a human-readable reason. This is the
-//! *decision* half of the policy plane; v0 only explains decisions — it
-//! does not gate any real command.
+//! *decision* half of the policy plane; the enforcement seams (`apply`,
+//! `promote`, the MCP write tools) call it and act on the verdict.
 //!
 //! # Frozen semantics
 //!
