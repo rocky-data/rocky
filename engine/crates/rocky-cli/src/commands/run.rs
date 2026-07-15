@@ -1068,17 +1068,32 @@ pub(crate) fn refuse_governed_side_effects(
     governed: bool,
     hooks: &rocky_core::hooks::HooksConfig,
 ) -> Result<()> {
-    use rocky_core::hooks::{HookConfigOrList, WebhookConfigOrList};
-    // Count NORMALIZED executable side effects, not map cardinality: an empty
-    // `[[hook.on_x]]` list registers zero hooks and fires nothing, so it must NOT
-    // refuse (red-team #9). Single ⇒ one; Multiple ⇒ the vector's length.
-    let has_shell_hook = hooks.hooks.values().any(|h| match h {
-        HookConfigOrList::Single(_) => true,
-        HookConfigOrList::Multiple(v) => !v.is_empty(),
+    use rocky_core::hooks::{HookConfigOrList, HookEvent, WebhookConfigOrList};
+    // Count NORMALIZED executable side effects EXACTLY as `HookRegistry::from_config`
+    // does (hooks/mod.rs): an entry fires only when its key resolves to a known
+    // `HookEvent` AND its list is non-empty. An unknown event key (a typo like
+    // `[hook.on_typ]`, which the registry skips) or an empty `[[hook.on_x]]` list
+    // registers and fires nothing → must NOT refuse (red-team #9).
+    let executable = |key: &str, non_empty: bool| {
+        HookEvent::from_config_key(key).is_some() && non_empty
+    };
+    let has_shell_hook = hooks.hooks.iter().any(|(event, h)| {
+        executable(
+            event,
+            match h {
+                HookConfigOrList::Single(_) => true,
+                HookConfigOrList::Multiple(v) => !v.is_empty(),
+            },
+        )
     });
-    let has_webhook = hooks.webhooks.values().any(|w| match w {
-        WebhookConfigOrList::Single(_) => true,
-        WebhookConfigOrList::Multiple(v) => !v.is_empty(),
+    let has_webhook = hooks.webhooks.iter().any(|(event, w)| {
+        executable(
+            event,
+            match w {
+                WebhookConfigOrList::Single(_) => true,
+                WebhookConfigOrList::Multiple(v) => !v.is_empty(),
+            },
+        )
     });
     if governed && (has_shell_hook || has_webhook) {
         anyhow::bail!(
@@ -12163,6 +12178,23 @@ merge_keys = ["id"]
             .collect(),
         };
         assert!(super::refuse_governed_side_effects(true, &empty_list).is_ok());
+        // #9 (round 3): an UNKNOWN event key (a typo) is skipped by the registry
+        // and fires nothing → must NOT be refused, even with a command present.
+        let unknown_event = HooksConfig {
+            webhooks: Default::default(),
+            hooks: [(
+                "on_typo_not_an_event".to_string(),
+                HookConfigOrList::Single(HookConfig {
+                    command: "scripts/x.sh".to_string(),
+                    timeout_ms: 1000,
+                    on_failure: Default::default(),
+                    env: Default::default(),
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert!(super::refuse_governed_side_effects(true, &unknown_event).is_ok());
     }
 
     /// Run one governed `execute_models` apply under a fixed gate and return the
