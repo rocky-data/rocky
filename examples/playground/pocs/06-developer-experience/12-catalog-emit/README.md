@@ -64,6 +64,7 @@ self-contained, machine-consumable lineage artefact under
 - `rocky` ≥ 1.25.0 on PATH
 - `duckdb` CLI (only used in the demo to read back the Parquet file)
 - `python3` (used to pretty-print the JSON in `run.sh`)
+- `jq` (used to filter the per-column descriptions out of `catalog.json`)
 
 ## Run
 

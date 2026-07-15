@@ -1,7 +1,7 @@
 # 01-unity-catalog-grants — Declarative GRANT/REVOKE on Databricks
 
 > **Category:** 04-governance
-> **Credentials:** `DATABRICKS_HOST` + `DATABRICKS_TOKEN` (or OAuth M2M) required
+> **Credentials:** `DATABRICKS_HOST` + `DATABRICKS_TOKEN` + `DATABRICKS_HTTP_PATH` required
 > **Runtime:** depends on Databricks API
 > **Rocky features:** `[[governance.grants]]`, `[[governance.schema_grants]]`, `SHOW GRANTS` reconciliation
 
@@ -22,5 +22,17 @@ diff (`GRANT` and `REVOKE` statements) to converge to the desired state.
 ```bash
 export DATABRICKS_HOST="https://your-workspace.cloud.databricks.com"
 export DATABRICKS_TOKEN="dapi..."
+export DATABRICKS_HTTP_PATH="/sql/1.0/warehouses/<warehouse-id>"
 ./run.sh
 ```
+
+## Expected output
+
+`run.sh` writes golden JSON to `expected/`:
+
+- `expected/plan.json` — the reconciliation plan (dry-run): the `GRANT`/`REVOKE`
+  statements Rocky would emit to converge Unity Catalog to the desired state.
+- `expected/run.json` — the executed result; inspect its `permissions` block to
+  see the grants that were applied.
+
+A second `./run.sh` is a no-op on the permissions block if nothing changed.

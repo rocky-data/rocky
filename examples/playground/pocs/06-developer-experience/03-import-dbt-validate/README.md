@@ -37,8 +37,11 @@ imports `manifest.unit_tests` entries onto Rocky `[[test]]` sidecars.
 │   ├── dbt_project.yml
 │   └── models/
 │       ├── stg_orders.sql
-│       └── fct_revenue.sql
-└── imported/           Output dir (regenerated each run)
+│       ├── fct_revenue.sql
+│       ├── schema.yml       Column tests (canonical four + dbt_utils.accepted_range)
+│       └── sources.yml      raw.orders source
+├── expected/           Captured golden logs (gitignored, regenerated each run)
+└── imported/           Emitted Rocky repo (regenerated each run)
 ```
 
 ## Run

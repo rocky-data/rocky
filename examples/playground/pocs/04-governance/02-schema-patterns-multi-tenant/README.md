@@ -31,3 +31,16 @@ export FIVETRAN_API_SECRET="..."
 export FIVETRAN_DESTINATION_ID="..."
 ./run.sh
 ```
+
+## Expected output
+
+`run.sh` validates the config, then writes golden JSON to `expected/`:
+
+- `expected/discover.json` — the connectors and tables discovered via the
+  Fivetran adapter, with each source schema parsed into its
+  `{tenant}__{regions...}__{source}` components.
+- `expected/plan_acme.json` — the replication plan (dry-run) filtered to
+  `--filter tenant=acme`, showing how `acme` sources route to the
+  `acme_warehouse` catalog and `staging__{regions}__{source}` schemas.
+
+The final line prints `POC complete: discovered + planned for tenant=acme.`

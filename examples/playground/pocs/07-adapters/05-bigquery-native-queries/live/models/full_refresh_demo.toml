@@ -1,10 +1,10 @@
 [strategy]
 type = "full_refresh"
 
-# Hardcoded to the Rocky BQ sandbox project. Model sidecar TOMLs don't
-# honor ${VAR} env substitution today (rocky.toml does), so this live
-# demo is sandbox-specific by construction. Patch both fields if running
-# against a different project.
+# `catalog` carries a __GCP_PROJECT__ placeholder that run.sh sed-substitutes
+# at runtime from $GCP_PROJECT_ID, so no project ID is committed. Sidecar
+# TOMLs do honor ${VAR} env substitution (models.rs:1387); the placeholder is
+# kept for staging uniformity with the driver SQL bodies, which are read raw.
 [target]
 catalog = "__GCP_PROJECT__"
 schema = "poc_step1_live"

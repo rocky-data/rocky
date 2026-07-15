@@ -11,9 +11,8 @@ mkdir -p expected
 echo "==> 1. Seed two tables (orders + customers) so the DAG has concurrency to render"
 duckdb poc.duckdb < data/seed.sql
 
-echo "==> 2. Run two pipeline stages concurrently"
-rocky -c rocky.toml -o json run --filter source=orders > expected/run_orders.json
-rocky -c rocky.toml -o json run --filter source=customers > expected/run_customers.json
+echo "==> 2. Run both sources in one execution so the DAG has concurrency to render"
+rocky -c rocky.toml -o json run > expected/run.json
 
 echo "==> 3. 'rocky trace latest' — render the persisted run record as a Gantt timeline"
 rocky trace latest > expected/trace_latest.json 2>&1 || true

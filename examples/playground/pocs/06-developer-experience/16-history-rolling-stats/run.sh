@@ -65,9 +65,11 @@ assert rs["window"] == 5, f"unexpected window: {rs['window']}"
 assert rs["samples"] >= 1, f"unexpected samples: {rs['samples']}"
 assert 0.0 <= rs["health_score"] <= 1.0, f"health_score out of range: {rs['health_score']}"
 print(f"    samples={rs['samples']}  window={rs['window']}  health_score={rs['health_score']}")
+lz = rs['duration_ms'].get('latest_z_score')
+lz_str = f"{lz:.2f}" if isinstance(lz, (int, float)) else "n/a"
 print(f"    duration_ms.mean={rs['duration_ms']['mean']:.2f}  "
       f"std_dev={rs['duration_ms']['std_dev']:.2f}  "
-      f"latest_z={rs['duration_ms'].get('latest_z_score', 'n/a')}")
+      f"latest_z={lz_str}")
 PY
 
 echo

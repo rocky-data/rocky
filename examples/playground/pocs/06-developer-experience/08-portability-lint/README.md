@@ -26,8 +26,10 @@ Three escape hatches:
 ## Why it's distinctive
 
 - **AST-based, not regex.** `NVL(x, y)` inside a string literal doesn't
-  trip the lint; a real function-call does. The same walker can point
-  at the construct's exact byte range for editor squiggles.
+  trip the lint; a real function-call does. The same AST walker is what
+  a future editor integration would hook for squiggles. (Today the
+  diagnostic reports a file-level span — `line: 1` — since per-construct
+  byte offsets aren't tracked yet.)
 - **Polyglot correctness at compile time.** dbt packages you hope
   travel; Rocky rejects the non-portable construct at compile-time
   with a targeted suggestion, before the warehouse sees it.

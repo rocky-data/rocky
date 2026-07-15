@@ -23,7 +23,7 @@ FROM information_schema.schemata
 WHERE catalog_name = 'poc'
 ORDER BY schema_name;
 SQL
-echo "  (expected: empty result — no 'poc.mart' schema yet)"
+echo "  (expected: only 'main' + 'raw__orders' — no 'mart' schema yet)"
 
 echo ""
 echo "=== validate ==="
@@ -61,23 +61,12 @@ PY
 
 echo ""
 echo "=== postcondition — 'mart' schema now exists, and both models live in it ==="
-duckdb poc.duckdb <<'SQL'
-SELECT schema_name
-FROM information_schema.schemata
-WHERE catalog_name = 'poc'
-ORDER BY schema_name;
-
-.print
-SELECT table_name, table_type
-FROM information_schema.tables
-WHERE table_catalog = 'poc' AND table_schema = 'mart'
-ORDER BY table_name;
-
-.print
-SELECT customer_id, order_count, total_revenue
-FROM poc.mart.order_revenue_by_customer
-ORDER BY customer_id;
-SQL
+echo "  -- schemas in catalog 'poc' (now includes 'mart'):"
+duckdb poc.duckdb -c "SELECT schema_name FROM information_schema.schemata WHERE catalog_name = 'poc' ORDER BY schema_name;"
+echo "  -- tables in poc.mart:"
+duckdb poc.duckdb -c "SELECT table_name, table_type FROM information_schema.tables WHERE table_catalog = 'poc' AND table_schema = 'mart' ORDER BY table_name;"
+echo "  -- poc.mart.order_revenue_by_customer:"
+duckdb poc.duckdb -c "SELECT customer_id, order_count, total_revenue FROM poc.mart.order_revenue_by_customer ORDER BY customer_id;"
 
 echo ""
 echo "POC complete. auto_create_schemas honoured on the transformation path (engine v1.29.0)."

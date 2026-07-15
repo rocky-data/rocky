@@ -90,5 +90,5 @@ POC complete: only the selected model built locally; its ref resolved to prod.
 
 ## Related
 
-- Source: `rocky/crates/rocky-cli/src/commands/run.rs` (`--defer` / `--defer-to`)
+- Source: `engine/crates/rocky-cli/src/commands/run.rs` (`--defer` / `--defer-to`)
 - Companion POC: [`06-developer-experience/13-run-watch-inner-loop`](../13-run-watch-inner-loop) — the other half of the inner loop.

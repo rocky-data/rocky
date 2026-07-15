@@ -44,7 +44,7 @@ for model in sorted(set(no_seed) | set(with_seed)):
 PY
 
 echo
-echo "==> 4. Blast-radius lint on orders_star.sql (SELECT * hits the semantic-graph-aware check)"
+echo "==> 4. SELECT * lint on orders_star.sql (leaf trips the always-on I001; P002 blast-radius stays quiet — no downstream consumer)"
 python3 - <<'PY'
 import json
 d = json.load(open("expected/compile_with_seed.json"))

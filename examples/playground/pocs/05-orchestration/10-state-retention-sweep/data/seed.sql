@@ -1,4 +1,5 @@
--- Bootstrap raw__orders.orders. run.sh refreshes the row count between runs.
+-- Bootstrap raw__orders.orders. run.sh seeds this once, then replays six
+-- full-refresh replication runs against it to exercise the sweep paths.
 CREATE SCHEMA IF NOT EXISTS raw__orders;
 
 CREATE OR REPLACE TABLE raw__orders.orders AS

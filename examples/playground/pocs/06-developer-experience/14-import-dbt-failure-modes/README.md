@@ -77,7 +77,7 @@ before pointing it at a real codebase.
 ## Expected output
 
 ```
-=== rocky import-dbt (regex path, edge-case inputs) ===
+=== rocky import-dbt (regex path, deliberately bad inputs) ===
 {
   "version": "...",
   "command": "import-dbt",
@@ -91,16 +91,16 @@ before pointing it at a real codebase.
   "tests_skipped": 0,
   "warning_details": [
     {
-      "model": "stg_orders",
-      "category": "JinjaControlFlow",
-      "message": "contains Jinja control flow ({% if %}) — emitted with TODO markers; the conditional body is applied unconditionally, so review the result",
-      "suggestion": "use the manifest import path (`dbt compile`) for faithful Jinja resolution"
-    },
-    {
       "model": "stg_variables",
       "category": "MappedConstruct",
       "message": "contains {{ var() }} — mapped to Rocky's `@var()` per-run variable marker",
       "suggestion": "supply values at run time with `rocky run --var name=value`, or rely on an inline default `@var(name, default)`"
+    },
+    {
+      "model": "stg_orders",
+      "category": "JinjaControlFlow",
+      "message": "contains Jinja control flow ({% if %}) — emitted with TODO markers; the conditional body is applied unconditionally, so review the result",
+      "suggestion": "use the manifest import path (`dbt compile`) for faithful Jinja resolution"
     }
   ],
   "failed_details": [
@@ -117,11 +117,10 @@ before pointing it at a real codebase.
 - **dbt generic tests outside the canonical four** ...
 - **Singular tests** in `tests/` (custom SQL) — copy and rewrite manually.
 - **dbt macros / `dbt_packages/`** — Rocky has no Jinja runtime. ...
-- **`{% if %}`** — emitted with a TODO marker (the body applies unconditionally — review it).
-- **`{% for %}` / `{% set %}`** — **refused** (listed under "Failed models") rather than half-rendered into broken SQL; `stg_loop` here demonstrates the refusal. Re-run after `dbt compile`.
+- **`{% if %}` / `{% for %}` / `{{ var() }}`** outside of `is_incremental()` — the body is emitted verbatim with `# TODO: dbt-jinja-not-translated` comments flagging the lines you need to revisit.
 ## Warnings
-- `stg_orders` — JinjaControlFlow: ...
 - `stg_variables` — MappedConstruct: {{ var() }} mapped to `@var()` ...
+- `stg_orders` — JinjaControlFlow: ...
 ## Failed models
 - `stg_loop` — contains unsupported Jinja control flow ({% for %} or {% set %}) ...
 
@@ -132,6 +131,11 @@ FROM raw.orders
 /* TODO: unsupported Jinja block */
 WHERE updated_at >= '2026-01-01'
 /* TODO: unsupported Jinja block */
+
+=== Emitted models/stg_variables.sql ({{ var() }} mapped to @var()) ===
+SELECT ...
+FROM raw.orders
+WHERE customer_id > @var(cutoff)
 
 === Assertions ===
 ok  All assertions passed.

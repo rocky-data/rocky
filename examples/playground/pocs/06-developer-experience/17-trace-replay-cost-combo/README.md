@@ -65,16 +65,25 @@ project from the same `RunRecord`:
 
 ```text
 ==> 4. 'rocky cost latest' — per-model warehouse spend over the SAME RunRecord
-run: run-20260514-220020-755
+run: run-20260712-122851-046
 status: success
+trigger: manual
+started_at: 2026-07-12T12:28:51.046082182+00:00
+finished_at: 2026-07-12T12:28:51.117358845+00:00
+duration_ms: 71
 adapter_type: duckdb
 
 models (3):
-  model        duration   rows  bytes_scan  bytes_write   cost_usd  status
-  orders             6      -           -            -   $0.000000  success
-  events             7      -           -            -   $0.000000  success
-  customers          8      -           -            -   $0.000000  success
+  model                               duration          rows      bytes_scan     bytes_write      cost_usd  status
+  customers                                  7             -               -               -     $0.000000  success
+  events                                    11             -               -               -     $0.000000  success
+  orders                                    17             -               -               -     $0.000000  success
+
+total_duration_ms: 35
+total_cost_usd: $0.000000
 ```
+
+(Run id, timestamps, and per-model durations vary per run; the shape is stable.)
 
 DuckDB doesn't publish per-statement byte/cost telemetry, so those
 columns are empty in this POC. The same command against a Databricks /
@@ -104,6 +113,7 @@ regardless of adapter.
 - Sibling POC: [`00-foundations/06-branches-replay-lineage`](../../00-foundations/06-branches-replay-lineage/),
   the branches + replay primitives.
 - Engine source: `engine/crates/rocky-cli/src/commands/{cost,trace,replay}.rs`
-- OpenTelemetry export: `engine/crates/rocky-cli/src/otlp.rs`
-  (feature-gated; the same `RunRecord` flows as OTel spans to any
-  collector).
+- OpenTelemetry export: `engine/crates/rocky-cli/src/otel_guard.rs`
+  plus `engine/crates/rocky-observe/src/otel.rs` (gated behind the
+  `otel` feature; the same `RunRecord` flows as OTel spans/metrics to
+  any collector).

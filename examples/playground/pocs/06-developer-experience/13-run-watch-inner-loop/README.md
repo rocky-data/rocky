@@ -14,7 +14,7 @@ watcher, so an interactive editor session re-materialises the pipeline
 on every save. The POC runs non-interactively by:
 
 1. Launching `rocky run --watch` in the background, redirected to a log.
-2. Waiting for the first run to land (`"command":"run"` in the log).
+2. Waiting for the first run to land (`[watch] run completed` in the log).
 3. Touching `rocky.toml`, the same shape as a `:w` from vim or a save in
    VSCode.
 4. Waiting for the second run to land.

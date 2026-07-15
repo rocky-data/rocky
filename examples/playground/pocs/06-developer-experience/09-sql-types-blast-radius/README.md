@@ -3,7 +3,7 @@
 > **Category:** 06-developer-experience
 > **Credentials:** none (DuckDB, ephemeral)
 > **Runtime:** < 2s
-> **Rocky features:** `rocky compile --with-seed`, semantic-graph-aware `SELECT *` lint
+> **Rocky features:** `rocky compile --with-seed`, `SELECT *` lints (`I001` info / `P002` blast-radius)
 
 ## What it shows
 
@@ -15,11 +15,13 @@ Raw `.sql` models become first-class in Rocky's semantic graph.
    models that read from `raw__*` tables go from `Unknown` columns to
    concrete types, which cascades into incrementality hints, cost
    estimates, and downstream type inference.
-2. **Semantic-graph-aware blast-radius lint** — `SELECT *` from a
-   table inside the project's DAG triggers a diagnostic with the
-   construct's byte-span, so VS Code can squiggle it. Downstream
-   models pin a column list; upstream schema drift cascades silently
-   without this lint.
+2. **`SELECT *` lint** — the `orders_star` leaf trips the always-on
+   `I001` (Info) `SELECT *` lint, which carries a source span so VS
+   Code can flag it. The stronger `P002` blast-radius lint (Warning) is
+   a separate, semantic-graph-aware check: it fires only when a
+   `SELECT *` model has a downstream consumer that pins specific
+   columns, so an upstream schema change would silently propagate. This
+   leaf has no such consumer, so `P002` correctly stays quiet.
 
 ## Why it's distinctive
 
@@ -27,9 +29,11 @@ Raw `.sql` models become first-class in Rocky's semantic graph.
   strings; Rocky parses it with `sqlparser-rs`, types it against real
   schemas, and makes the result first-class. The DSL is one surface
   over the same semantic graph; `.sql` is not a second-class citizen.
-- **The lint is semantic-graph aware.** A `SELECT *` from a CTE with a
-  fully-determined shape wouldn't fire; only `SELECT *` from a table
-  inside the DAG, where blast radius is real, will.
+- **Two tiers of `SELECT *` diagnostic.** `I001` (Info) always fires on
+  any `SELECT *` as a style nudge. `P002` (Warning) is semantic-graph
+  aware: it fires only when the star has a downstream consumer that pins
+  columns, where the blast radius of an upstream schema change is real.
+  A leaf `SELECT *` like `orders_star` trips only `I001`.
 
 ## Layout
 
@@ -59,13 +63,16 @@ Raw `.sql` models become first-class in Rocky's semantic graph.
    ran `data/seed.sql`, introspected `information_schema`, and fed
    those columns into the semantic graph. `orders_typed` now reports
    `confidence = high`, signals include the actual integer type.
-3. **Blast-radius lint** — `orders_star.sql` fires `I001 SELECT *`
-   with the byte-span from the parser (editor-integration ready).
+3. **`SELECT *` lint** — `orders_star.sql` fires `I001` (Info,
+   "SELECT * used…") with a source span pointing at the model file
+   (editor-integration ready). The `P002` blast-radius lint stays quiet
+   because this leaf has no downstream consumer.
 
 ## Related
 
 - Engine source: `engine/crates/rocky-cli/src/commands/compile.rs`
-  (`--with-seed`), `engine/crates/rocky-compiler/src/lints/select_star.rs`
+  (`--with-seed`), `engine/crates/rocky-compiler/src/typecheck.rs` (`I001`),
+  `engine/crates/rocky-compiler/src/blast_radius.rs` (`P002`)
 - Companion POC: [`08-portability-lint/`](../08-portability-lint/)
   covers the P001 portability lint (sibling compile-time gate).
 - Future: Arc 7 wave 2 ships cached `DESCRIBE TABLE` so real warehouses

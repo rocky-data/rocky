@@ -48,15 +48,24 @@ real `$PATH`.
 
 ```text
 === 2. Discover it through the engine (the rocky-<name> PATH convention) ===
---- rocky adapter list (table) ---
+--- rocky adapter list ---
 NAME    VERSION  DIALECT  PATH
 sqlite  0.1.0    sqlite   /tmp/.../rocky-sqlite
 
 --- rocky adapter info sqlite ---
-{ ...AdapterManifest... }
+name:          sqlite
+path:          /tmp/.../rocky-sqlite
+version:       0.1.0
+sdk_version:   0.1.0
+dialect:       sqlite
+auth_methods:
+capabilities:
+  warehouse       = true
+  discovery       = false
+  ...
 ```
 
 ## Related
 
 - Wire protocol reference + bundled reference adapter: `engine/examples/process-adapter-echo/` (`PROTOCOL.md` + `rocky-echo`)
-- Source: `rocky/crates/rocky-adapter-sdk/src/process.rs` (`ProcessAdapter`), `rocky/crates/rocky-cli` (`rocky adapter list/info`)
+- Source: `engine/crates/rocky-adapter-sdk/src/process.rs` (`ProcessAdapter`), `engine/crates/rocky-cli` (`rocky adapter list/info`)

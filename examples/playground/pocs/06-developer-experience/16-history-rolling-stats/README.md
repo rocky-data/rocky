@@ -56,7 +56,7 @@ with real variance, then queries the rolling-stats block.
 ```text
 ==> rocky history --model orders --rolling-stats --window 5
     samples=5  window=5  health_score=1.0
-    duration_ms.mean=0.80  std_dev=0.40  latest_z=0.50
+    duration_ms.mean=4.80  std_dev=0.40  latest_z=0.50
 
 ==> Compare bare history vs rolling-stats (block only appears with --rolling-stats)
     bare output: rolling_stats absent (correct)
@@ -71,7 +71,7 @@ The full `rolling_stats` JSON block looks like:
   "samples": 5,
   "rows_affected": { "mean": 0.0, "std_dev": 0.0 },
   "duration_ms": {
-    "mean": 0.8,
+    "mean": 4.8,
     "std_dev": 0.4,
     "latest_z_score": 0.5
   },
@@ -79,10 +79,14 @@ The full `rolling_stats` JSON block looks like:
 }
 ```
 
-`rows_affected` reads as zero on the playground's full-refresh
-replication path; the same block populates real values when the run
-records carry row counts (transformation pipelines, incremental
-strategies, etc.).
+The `duration_ms` figures are wall-clock timings, so the exact `mean`
+(and, to a lesser extent, `std_dev` / `latest_z_score`) vary by machine
+— the numbers above are illustrative from one run, not byte-stable
+goldens. Only `window`, `samples`, `health_score`, and the zero-valued
+`rows_affected` block are reproducible. `rows_affected` reads as zero on
+the playground's full-refresh replication path; the same block populates
+real values when the run records carry row counts (transformation
+pipelines, incremental strategies, etc.).
 
 ## What happened
 
