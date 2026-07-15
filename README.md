@@ -87,9 +87,9 @@ The Rocky Inspector shows a model's columns, where each came from, its tests, co
 Core features are production-ready on Databricks: the checker, named branches, replay, column lineage, rule enforcement, per-model cost. Everything else is in progress.
 
 - **Databricks is the 2026 focus.** Snowflake, BigQuery, and Trino work for the core loop but aren't as thorough yet. [Talk to us](https://github.com/rocky-data/rocky/discussions) if you need them in production now.
-- **AI features are early.** Generate → check → fix is shipped. Mass refactoring, auto-migration on type changes, and assertion generation are on the roadmap.
-- **Replay records and verifies; it doesn't re-execute yet.** Every run leaves a content-addressed record that `rocky replay` inspects and verifies against the ledger. Re-executing a past run from that record is on the roadmap.
-- **Iceberg.** Reading from a catalog is Beta. Writing straight to Iceberg is planned for 2026.
+- **AI features are early.** Generate → check → fix is shipped, and `rocky ai-test` writes assertions for a model from its intent. Mass refactoring and auto-migration on type changes are on the roadmap.
+- **Replay re-executes, with honest scoping.** Every run leaves a content-addressed record that `rocky replay` inspects and verifies against the ledger. For deterministic content-addressed models, `rocky replay --execute --verify` re-runs the recorded recipe and checks the output reproduces bit-for-bit, locally or on the live warehouse in an isolated replay schema. A model that reads a mutable source or uses nondeterministic SQL is classified as non-replayable instead of being silently re-run against current data.
+- **Iceberg.** Reading from a REST catalog is Beta. Content-addressed writes land as Iceberg-readable tables through Delta UniForm today; native Iceberg writes without the Delta intermediate are on the roadmap.
 - **No built-in metrics layer.** Use Cube, the dbt Semantic Layer, or whatever you have.
 - **Dagster is the one built-in scheduler integration** ([`dagster-rocky`](integrations/dagster/)). For anything else, use the [`rocky-sdk`](sdk/python/) Python client or `rocky serve`.
 
