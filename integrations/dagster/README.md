@@ -7,10 +7,10 @@ tables as materializable Dagster assets. Compile-time contracts, column-level li
 detection, quality check results, and per-model cost surface as native Dagster events, so the
 guarantees Rocky enforces at compile time appear directly in the Dagster asset graph.
 
-Two behaviors worth knowing: Rocky's per-check severity maps to Dagster's, so a failing
-advisory check emits `WARN` instead of paging anyone, and when the engine's failure containment
-is enabled, models withheld behind a failed upstream surface as `AssetObservation` events with
-the blocking model named, so a partial run reads honestly in the asset graph.
+Two behaviors worth knowing. Rocky's per-check severity maps to Dagster's, so a failing
+advisory check emits `WARN` instead of paging anyone. And when the engine's failure containment
+is enabled, the models Rocky withholds behind a failed upstream appear as `AssetObservation`
+events naming the blocking model, so a partial run reads honestly in the asset graph.
 
 ## Install
 

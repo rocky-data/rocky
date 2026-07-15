@@ -115,6 +115,21 @@ EOF
             $git_commit commit -q -m "rename amount->amount_usd; add tax columns"
         )
         ;;
+    policy-enforce)
+        # The apply-time enforcement seam, end to end: an agent-authored
+        # change to a contracted model is refused by `rocky apply` with the
+        # rule named, and the decision lands in the ledger. Needs a git
+        # baseline for the change classification.
+        cp -r "$POCS/04-governance/11-agent-policy/." "$scratch/"
+        clean_state "$scratch"
+        rm -rf "$scratch/expected"
+        (
+            cd "$scratch"
+            git init -q -b main .
+            git -c user.email=poc@rocky.dev -c user.name=rocky-poc add -A
+            git -c user.email=poc@rocky.dev -c user.name=rocky-poc commit -q -m "baseline: three models under a [policy] block"
+        )
+        ;;
     policy-deny)
         cp -r "$POCS/03-ai/07-policy/." "$scratch/"
         clean_state "$scratch"

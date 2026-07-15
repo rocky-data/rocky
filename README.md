@@ -85,7 +85,7 @@ The Rocky Inspector shows a model's columns, where each came from, its tests, co
 
 ## When an AI agent writes your pipelines
 
-Agents already author real pipeline changes, and the failure mode is no longer hypothetical: an over-trusted agent with production access can destroy real data in seconds. Rocky treats an agent as a first-class operator with a governed path to production. Every change it drafts is type-checked on write, becomes a plan that never auto-applies, clears a policy you declared, and lands in a ledger you can query.
+Agents already author real pipeline changes, and the failure mode is no longer hypothetical: an over-trusted agent with production access can destroy real data in seconds. Rocky treats an agent as a first-class operator with a governed path to production. Every change an agent drafts is type-checked on write. What comes out is a plan, and a plan never auto-applies: it clears the policy you declared, then lands in a ledger you can query.
 
 ```mermaid
 flowchart LR
@@ -100,16 +100,18 @@ flowchart LR
 ```
 
 - **A policy plane in `rocky.toml`.** `[policy]` rules grade what a principal may do by capability and scope: allow, require review, or deny. A blast-radius ceiling degrades an allow back to review when a change touches too many downstream models, or when the radius can't be computed. Policies are themselves testable: `[[policy.tests]]` scenarios run through the real evaluator, so `rocky policy test` in CI catches a careless edit that would have opened a hole.
-- **AI-authored plans always stop for a human.** An agent proposes; `rocky apply` refuses an unapproved AI-authored plan at the engine level, not by convention.
-- **A queryable custody trail.** `rocky audit --for <table>` answers who changed what, under whose authority, with what verification. `rocky review --queue` ranks what's waiting on you. `rocky brief` is the morning digest, every line cited to the ledger.
-- **Whatever an agent materializes is provably rebuildable.** `rocky gc --derivable` inventories artifacts whose recorded recipe demonstrably reproduces them, eviction is review-gated and leaves a tombstone, and `rocky restore` rebuilds the exact bytes or refuses.
+- **AI-authored plans stop for a human by default.** An agent proposes; unless a `[policy]` rule you wrote explicitly grants that scope, `rocky apply` refuses an unapproved AI-authored plan at the engine level, not by convention.
+- **A queryable custody chain.** `rocky audit --for <table>` answers who changed what, under whose authority, with what verification. `rocky review --queue` ranks what's waiting on you. `rocky brief` is the morning digest, every line cited to the ledger.
+- **What an agent materializes on the content-addressed path is provably rebuildable.** `rocky gc --derivable` inventories artifacts whose recorded recipe reproduces them, eviction is review-gated and leaves a tombstone, and `rocky restore` rebuilds the exact bytes or refuses.
 - **The agent surface is MCP.** `rocky mcp` exposes 28 tools: schema and data grounding, draft tools that compile in the same call, and propose. A denied draft leaves nothing on disk.
 
 <p align="center">
-  <img src="docs/public/demo-policy-deny.gif" alt="rocky policy check denies an agent apply on a contracted model, rocky policy test passes the pinned scenarios, then catches a loosened rule in a bad config and exits non-zero" width="900" />
+  <img src="docs/public/demo-policy-enforce.gif" alt="an agent's change to a contracted model is planned, rocky apply run as the agent principal is denied by the policy plane with the rule named, and rocky audit shows the recorded decision" width="900" />
 </p>
 
-Autonomy is earned rung by rung: retrying a proven-transient failure is free, a provably additive schema change can be allowed to flow under policy, and everything else waits for review. Budgets tighten on repeated failure and never widen on their own; `rocky policy freeze` is the kill switch. The full model is in [Operating Rocky with agents](https://rocky-data.dev/concepts/operating-rocky-with-agents/).
+[POC: `04-governance/11-agent-policy`](examples/playground/pocs/04-governance/11-agent-policy/) drives this end to end, and the policy itself is regression-tested: `rocky policy test` runs pinned scenarios in CI and fails when an edit loosens a rule ([POC: `03-ai/07-policy`](examples/playground/pocs/03-ai/07-policy/)).
+
+Autonomy is earned rung by rung: retrying a proven-transient failure is free, a provably additive schema change can be allowed to flow under policy, and everything else waits for review unless you explicitly grant it. Budgets tighten on repeated failure and never widen on their own; `rocky policy freeze` is the kill switch. How an agent authors, proposes, and clears the gates is in [Operating Rocky with agents](https://rocky-data.dev/concepts/operating-rocky-with-agents/).
 
 ## Where Rocky is today
 
@@ -117,7 +119,7 @@ Core features are production-ready on Databricks: the checker, named branches, r
 
 - **Databricks is the 2026 focus.** Snowflake, BigQuery, and Trino work for the core loop but aren't as thorough yet. [Talk to us](https://github.com/rocky-data/rocky/discussions) if you need them in production now.
 - **AI features are early.** Generate → check → fix is shipped, and `rocky ai-test` writes assertions for a model from its intent. Mass refactoring and auto-migration on type changes are on the roadmap.
-- **Replay re-executes, with honest scoping.** Every run leaves a content-addressed record that `rocky replay` inspects and verifies against the ledger. For deterministic content-addressed models, `rocky replay --execute --verify` re-runs the recorded recipe and checks the output reproduces bit-for-bit, locally or on the live warehouse in an isolated replay schema. A model that reads a mutable source or uses nondeterministic SQL is classified as non-replayable instead of being silently re-run against current data.
+- **Replay re-executes, with honest scoping.** Every run leaves a content-addressed record that `rocky replay` inspects and verifies against the ledger. For deterministic content-addressed models, `rocky replay --execute --verify` re-runs the recorded recipe and checks the output reproduces bit-for-bit, locally or on the live warehouse in an isolated replay schema. A model that reads a mutable source is classified as non-replayable instead of being silently re-run against current data, and nondeterministic SQL is flagged so its divergence is reported as expected rather than passed off as a failure.
 - **Iceberg.** Reading from a REST catalog is Beta. Content-addressed writes land as Iceberg-readable tables through Delta UniForm today; native Iceberg writes without the Delta intermediate are on the roadmap.
 - **No built-in metrics layer.** Use Cube, the dbt Semantic Layer, or whatever you have.
 - **Dagster is the one built-in scheduler integration** ([`dagster-rocky`](integrations/dagster/)). For anything else, use the [`rocky-sdk`](sdk/python/) Python client or `rocky serve`.

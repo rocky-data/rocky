@@ -34,12 +34,12 @@ Rocky turns each of these into a compile error or a blocked PR before it ships: 
 
 1. **SQL as a typed, compiled language.** Real type inference, diagnostic codes (`E###` errors, `W###` warnings, `P###` portability lints), and a real LSP, not text macros or runtime checks.
 2. **Compile-time column-level lineage.** Rocky knows every column's lineage before a row is written, so `rocky lineage-diff main` can block a PR when a downstream contract breaks.
-3. **Branches and a replayable run ledger.** `rocky branch create`, `rocky run --branch`, and `rocky replay`: branches are isolated schemas, and every run is recorded in an auditable ledger (who ran it, the commit, the per-model SQL hash, and row counts). On the content-addressed materialization path, output files are named by the hash of their bytes, and `rocky replay --execute --verify` re-runs a recorded recipe and checks the output reproduces bit-for-bit — locally, or on the live warehouse in an isolated replay schema. A standalone `rocky-verify` binary checks a run's manifest offline, with no engine installed.
+3. **Branches and a replayable run ledger.** `rocky branch create`, `rocky run --branch`, and `rocky replay`: branches are isolated schemas, and every run is recorded in an auditable ledger (who ran it, the commit, the per-model SQL hash, and row counts). On the content-addressed materialization path, output files are named by the hash of their bytes, and `rocky replay --execute --verify` re-runs a recorded recipe and checks the output reproduces bit-for-bit, locally or on the live warehouse in an isolated replay schema. A standalone `rocky-verify` binary checks a run's manifest offline, with no engine installed.
 4. **Per-model cost attribution.** Cost is a column on every run record. `[budget]` blocks fail the run, `budget_breach` fires a hook, and `rocky preview cost` projects spend at PR time.
 5. **AI gated through the compiler.** Every AI suggestion is type-checked before it lands. The `Attempts: 2` retry on `rocky ai` is the loop: generate, type-check, auto-fix, then land.
 6. **Dialect-divergence lint.** Cross-warehouse teams write SQL once, and `P001` catches Snowflake-only constructs in a Databricks project at compile time.
 7. **Declarative governance.** RBAC as code with GRANT/REVOKE diffing, Unity Catalog tags, workspace isolation, and masking strategies bound to classification tags, so compliance becomes a CI check.
-8. **An agent policy plane.** A `[policy]` block in `rocky.toml` grades what a principal — a person, CI, or an AI agent — may do, by capability and scope: allow, require review, or deny. Enforcement runs at `apply`, `promote`, and the MCP surface; blast-radius ceilings and `verify_after` gates fail closed; every decision lands in a ledger you query with `rocky audit` and read each morning with `rocky brief`. AI-authored plans always stop for human review at the engine level.
+8. **An agent policy plane.** A `[policy]` block in `rocky.toml` grades what a principal (a person, CI, or an AI agent) may do, by capability and scope: allow, require review, or deny. Enforcement runs at `apply`, `promote`, and the MCP write tools; blast-radius ceilings and `verify_after` gates fail closed; every decision lands in a ledger you query with `rocky audit` and read each morning with `rocky brief`. AI-authored plans stop for human review by default; only an explicit `[policy]` rule you wrote can let one through.
 
 ## Quick start
 
@@ -88,7 +88,7 @@ rocky state          # Inspect stored watermarks
 rocky ai "<intent>"  # Generate a model from natural language
 rocky lineage        # Trace column-level lineage
 rocky lineage-diff   # Per-changed-column downstream blast-radius for PR review
-rocky replay         # Verify a recorded run; --execute --verify re-runs it bit-exact
+rocky replay         # Verify a recorded run; --execute re-runs deterministic content-addressed models bit-exact
 rocky policy check   # Explain what a policy allows, requires review for, or denies
 rocky policy test    # Run pinned policy scenarios through the real evaluator (CI)
 rocky review         # Approve plans; --queue ranks pending escalations
