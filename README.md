@@ -65,6 +65,7 @@ Compare two versions of your project and get a list of which downstream tables a
 - [Data contracts](examples/playground/pocs/01-quality/01-data-contracts-strict/): missing required columns, dropped protected columns, or unsafe type changes surface as errors (`E010`, `E011`, `E013`) before a row is written.
 - [BigQuery cost to the byte](examples/playground/pocs/07-adapters/05-bigquery-native-queries/): `bytes_scanned` in the run receipt matches BigQuery's billing number exactly (requires credentials).
 - [Named branches + replay](examples/playground/pocs/00-foundations/06-branches-replay-lineage/): run against an isolated schema copy, inspect, then drop or promote.
+- [Agent policy](examples/playground/pocs/03-ai/07-policy/): a `[policy]` block grades what an agent may do on its own; pinned scenarios catch a loosened rule in CI.
 - [Column lineage](examples/playground/pocs/06-developer-experience/01-lineage-column-level/): trace a column in a downstream model back to its source.
 - [Incremental loads](examples/playground/pocs/02-performance/01-incremental-watermark/): set `strategy = "incremental"` and Rocky only processes new rows each run.
 - [Data masking](examples/playground/pocs/04-governance/05-classification-masking-compliance/): tag PII columns, set masking per environment, fail the check if anything goes out unmasked.
@@ -81,6 +82,34 @@ The Rocky Inspector shows a model's columns, where each came from, its tests, co
 </p>
 
 [Install the VS Code extension →](https://marketplace.visualstudio.com/items?itemName=rocky-data.rocky)
+
+## When an AI agent writes your pipelines
+
+Agents already author real pipeline changes, and the failure mode is no longer hypothetical: an over-trusted agent with production access can destroy real data in seconds. Rocky treats an agent as a first-class operator with a governed path to production. Every change it drafts is type-checked on write, becomes a plan that never auto-applies, clears a policy you declared, and lands in a ledger you can query.
+
+```mermaid
+flowchart LR
+    A[agent drafts] --> B[compiler<br/>types + contracts]
+    B --> C[plan<br/>never auto-applies]
+    C --> D{policy plane}
+    D -->|allow| E[apply]
+    D -->|require review| F[human approves] --> E
+    D -->|deny| G[refused,<br/>write rolled back]
+    E --> H[verify-after checks]
+    H --> I[(custody ledger<br/>rocky audit · rocky brief)]
+```
+
+- **A policy plane in `rocky.toml`.** `[policy]` rules grade what a principal may do by capability and scope: allow, require review, or deny. A blast-radius ceiling degrades an allow back to review when a change touches too many downstream models, or when the radius can't be computed. Policies are themselves testable: `[[policy.tests]]` scenarios run through the real evaluator, so `rocky policy test` in CI catches a careless edit that would have opened a hole.
+- **AI-authored plans always stop for a human.** An agent proposes; `rocky apply` refuses an unapproved AI-authored plan at the engine level, not by convention.
+- **A queryable custody trail.** `rocky audit --for <table>` answers who changed what, under whose authority, with what verification. `rocky review --queue` ranks what's waiting on you. `rocky brief` is the morning digest, every line cited to the ledger.
+- **Whatever an agent materializes is provably rebuildable.** `rocky gc --derivable` inventories artifacts whose recorded recipe demonstrably reproduces them, eviction is review-gated and leaves a tombstone, and `rocky restore` rebuilds the exact bytes or refuses.
+- **The agent surface is MCP.** `rocky mcp` exposes 28 tools: schema and data grounding, draft tools that compile in the same call, and propose. A denied draft leaves nothing on disk.
+
+<p align="center">
+  <img src="docs/public/demo-policy-deny.gif" alt="rocky policy check denies an agent apply on a contracted model, rocky policy test passes the pinned scenarios, then catches a loosened rule in a bad config and exits non-zero" width="900" />
+</p>
+
+Autonomy is earned rung by rung: retrying a proven-transient failure is free, a provably additive schema change can be allowed to flow under policy, and everything else waits for review. Budgets tighten on repeated failure and never widen on their own; `rocky policy freeze` is the kill switch. The full model is in [Operating Rocky with agents](https://rocky-data.dev/concepts/operating-rocky-with-agents/).
 
 ## Where Rocky is today
 
