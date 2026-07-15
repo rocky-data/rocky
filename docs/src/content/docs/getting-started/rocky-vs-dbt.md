@@ -67,9 +67,9 @@ Rocky reads the SQL itself. No Jinja: models are plain SQL, and the compiler par
         │ compile errors block the run
         ▼
  ┌──────────────┐    during the run: replication drift
- │  run against │    is handled, quality checks report
- │   warehouse  │    into typed output, cost is recorded
- └──────────────┘    per model
+ │  run against │    is checked and acted on, quality
+ │   warehouse  │    checks report into typed output,
+ └──────────────┘    cost is recorded per model
 ```
 
 The compiler is honest about its limits: a type it can't infer is tracked as `Unknown` rather than guessed, and what it can't prove statically still surfaces at runtime like anywhere else. See [The Compiler](/concepts/compiler/) for exactly what each pass checks.
@@ -101,16 +101,21 @@ An upstream loader changes a column: yesterday `order_id` was `INT`, today it ar
                                           builds on the changed type
 
  Rocky (replication pipelines):
-   source changes ──▶ drift check ──▶ safe widening (INT → BIGINT):
-                                      target evolved in place with
-                                      ALTER TABLE, data preserved
+   source changes ──▶ drift check ──▶ classified, then acted on:
 
-                                      incompatible change (INT → STRING):
-                                      a deliberate, logged rebuild —
-                                      not a quiet divergence
+     safe widening (INT → BIGINT)  ──▶ ALTER TABLE in place,
+                                       existing rows preserved
+
+     incompatible (INT → STRING)   ──▶ target dropped and re-copied
+                                       from the source — automatic,
+                                       and logged in the run output
+
+     with the governance opt-in    ──▶ non-additive changes refused
+                                       and surfaced for review;
+                                       target left untouched
 ```
 
-On replication runs, Rocky compares the source table's actual schema against the target table it maintains, and resolves mismatches with a graduated policy: safe type widenings are applied in place, incompatible changes trigger a controlled rebuild, and either way the action is recorded in the run output instead of happening silently. See [Schema Drift](/concepts/schema-drift/) for the policy details. None of the dbt engines detect this today (see the [drift table](/getting-started/comparison/#schema-drift-detection)).
+On replication runs where the target table already exists, Rocky compares the source's actual columns against the target's before copying, and classifies every mismatch. Safe type widenings (like `INT` to `BIGINT`) are applied in place with an `ALTER TABLE`, preserving existing rows. Anything else drops the target and re-copies it from the current source — automatic and recorded in the run output, but still a rebuild: the new target holds only what the source holds today, so it is not lossless for targets that accumulate history the source has pruned. Teams that don't want automatic schema mutations opt into the drift-governance policy gate, which refuses any non-additive change and surfaces it for review instead of applying it. See [Schema Drift](/concepts/schema-drift/) for the classification rules. None of the dbt engines detect source-schema drift today (see the [drift table](/getting-started/comparison/#schema-drift-detection)).
 
 ## What about dbt Fusion?
 
@@ -125,7 +130,7 @@ The durable difference is what happens *around* the compiler. Rocky treats the r
              └───────────────────┬────────────────────┘
                                  ▼
              ┌────────────────────────────────────────┐
-             │ RUN      drift handled · quality       │──▶ gates when
+             │ RUN      drift checked · quality       │──▶ gates when
              │          checks reported · [budget]    │    configured
              │          overspend warns, or fails the │    to error
              │          run with on_breach = "error"  │
@@ -165,7 +170,7 @@ Startup is milliseconds and a 10,000-model project compiles in about a second; s
 Same job: run SQL pipelines in dependency order. Different unit of understanding:
 
 - **dbt Core** understands your project's *graph* — refs, DAG order, and (since 1.5) per-model contract declarations — but the SQL inside each model is rendered text, so SQL-level problems surface in the warehouse, and tests catch them after the model is built.
-- **Rocky** understands the *SQL itself* — it compiles the pipeline as a typed program, blocks statically detectable errors before any model is materialized, handles source-schema drift on replication runs, and records checks and per-model cost on every run, with budgets and compliance gates you can configure to fail CI.
+- **Rocky** understands the *SQL itself* — it compiles the pipeline as a typed program, blocks statically detectable errors before any model is materialized, detects source-schema drift on replication runs, and records checks and per-model cost on every run, with budgets and compliance gates you can configure to fail CI.
 
 Where to go next:
 

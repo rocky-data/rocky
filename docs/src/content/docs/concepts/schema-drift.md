@@ -52,12 +52,12 @@ Examples: `STRING` to `INT`, `BIGINT` to `INT` (narrowing), `DATE` to `TIMESTAMP
 
 ## What Is NOT Drift
 
-- **New columns in source** -- these are picked up automatically by `SELECT *` and do not require special handling
+- **New columns in source** -- handled additively rather than as drift: the runtime issues `ALTER TABLE ADD COLUMN` for each (nullable, so historical rows stay `NULL`) before the copy, surfaced as an `add_columns` action
 - **Columns removed from source** -- extra columns in the target table are ignored
 
 ## Output
 
-Drift detection runs inline during `rocky apply`; the actions taken are reported in the `drift` section of the run JSON output:
+Drift detection runs inline on replication runs; the actions taken are reported in the `drift` section of the run JSON output:
 
 ```json
 {
@@ -81,4 +81,6 @@ Use `rocky plan` to preview the SQL Rocky would emit (including any drop stateme
 rocky plan --filter client=acme --output json
 ```
 
-Today, only `drop_and_recreate` and `add_column` actions are surfaced in the run output. The engine also classifies all-safe type widenings as `AlterColumnTypes` in `rocky-core`, but the `ALTER TABLE ALTER COLUMN` execution path isn't wired through `rocky apply` yet, so safe-widening drift currently falls through without action.
+Three actions are surfaced in the run output: `alter_column_types` (all drifted columns passed the safe-widening check and were altered in place), `drop_and_recreate` (at least one incompatible change; target rebuilt from the source), and `add_columns` (source-only columns added to the target).
+
+By default these mutations are applied automatically. With the opt-in drift-governance gate (`auto_apply_additive_drift` plus a `[policy]` grant for `schema_change.additive`), only provably additive, policy-allowed changes proceed; anything else is refused before it touches the target and surfaced as a require-review failure for that table.
