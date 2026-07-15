@@ -2268,9 +2268,10 @@ enum PolicySubcommand {
     ///
     /// Compiles the project to read the model's attributes (tags,
     /// classifications, layer, contracted status), evaluates them against
-    /// the `[policy]` block, and prints the resolved effect + winning rule
-    /// + reason. Read-only: it explains the decision the enforcement seams
-    /// (`apply`, `promote`, the MCP write tools) would act on.
+    /// the `[policy]` block, and prints the resolved effect, the winning
+    /// rule, and the reason. Read-only: it explains the decision the
+    /// enforcement seams (`apply`, `promote`, the MCP write tools) would
+    /// act on.
     Check {
         /// The principal attempting the action.
         #[arg(long, value_enum)]
