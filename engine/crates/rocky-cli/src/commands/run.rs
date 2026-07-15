@@ -1074,9 +1074,8 @@ pub(crate) fn refuse_governed_side_effects(
     // `HookEvent` AND its list is non-empty. An unknown event key (a typo like
     // `[hook.on_typ]`, which the registry skips) or an empty `[[hook.on_x]]` list
     // registers and fires nothing → must NOT refuse (red-team #9).
-    let executable = |key: &str, non_empty: bool| {
-        HookEvent::from_config_key(key).is_some() && non_empty
-    };
+    let executable =
+        |key: &str, non_empty: bool| HookEvent::from_config_key(key).is_some() && non_empty;
     let has_shell_hook = hooks.hooks.iter().any(|(event, h)| {
         executable(
             event,
