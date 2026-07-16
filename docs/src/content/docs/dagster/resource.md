@@ -141,13 +141,15 @@ Runs `rocky state` and returns the current watermark state for all tracked table
 
 ### `compile(model_filter=None) -> CompileResult`
 
-Runs `rocky compile` and returns compiler diagnostics (errors, warnings, info). When `server_url` is configured, fetches from the HTTP API instead of spawning a subprocess.
+Runs `rocky compile` and returns compiler diagnostics (errors, warnings, info). When `server_url` is
+configured, fetches from the HTTP API instead of spawning a subprocess. The HTTP endpoint compiles
+the whole project only; passing `model_filter` raises `ValueError` rather than silently ignoring it.
 
 **Wraps**: `rocky compile --models <models_dir> --output json` or `GET /api/v1/compile`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `model_filter` | `str \| None` | `None` | Optional model name to filter diagnostics |
+| `model_filter` | `str \| None` | `None` | Optional model name to filter diagnostics (CLI mode only) |
 
 ### `lineage(target, column=None) -> ModelLineageResult | ColumnLineageResult`
 
