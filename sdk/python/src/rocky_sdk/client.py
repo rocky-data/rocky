@@ -311,7 +311,8 @@ class RockyClient:
             ``state_namespace``.
         state_namespace: Optional per-namespace state key (engine
             ``--state-namespace``). When set, ``--state-path`` is omitted.
-        models_dir: Directory containing model files (compile/lineage/test/ci).
+        models_dir: Directory containing model files for model-aware commands,
+            including compile, lineage, test, CI, AI, and compliance.
         contracts_dir: Optional directory containing contract files.
         server_url: Optional ``rocky serve`` URL. When set, ``compile``,
             ``lineage`` and ``metrics`` use the HTTP API instead of a subprocess.
@@ -1306,7 +1307,7 @@ class RockyClient:
         )
 
     def compliance(self, *, env: str | None = None) -> ComplianceOutput:
-        """Run ``rocky compliance`` and return the governance rollup."""
+        """Run ``rocky compliance`` against ``models_dir`` and return the governance rollup."""
         args = ["compliance", "--output", "json", "--models", self.models_dir]
         if env is not None:
             args.extend(["--env", env])

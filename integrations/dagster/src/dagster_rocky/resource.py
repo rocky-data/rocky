@@ -483,7 +483,8 @@ class RockyResource(dg.ConfigurableResource):
         binary_path: Path to the ``rocky`` binary. Defaults to ``"rocky"`` (on PATH).
         config_path: Path to the ``rocky.toml`` config file.
         state_path: Path to the state store file.
-        models_dir: Directory containing model files (compile/lineage/test/ci).
+        models_dir: Directory containing model files for model-aware commands,
+            including compile, lineage, test, CI, AI, and compliance.
         contracts_dir: Optional directory containing contract files.
         server_url: Optional URL for a running ``rocky serve`` instance. When set,
             ``compile()``, ``lineage()`` and ``metrics()`` use the HTTP API.

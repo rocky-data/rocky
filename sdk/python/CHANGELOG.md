@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`RockyClient.compliance()` now honors the configured `models_dir`.** The SDK forwards
+  `--models <models_dir>` instead of allowing the engine to silently scan its default `models/`
+  directory, preventing false empty compliance reports in custom-layout projects. (#1128)
+
 ## [0.8.1] — 2026-07-16
 
 ### Fixed
