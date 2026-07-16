@@ -2313,7 +2313,7 @@ def test_doctor_with_check_kwarg_forwards_arbitrary_id():
 
 
 def test_compliance_builds_argv_without_env(compliance_json: str):
-    """Default ``compliance()`` call emits ``compliance --output json``."""
+    """Default ``compliance()`` call forwards the default models directory."""
     rocky = RockyResource()
     captured: list[list[str]] = []
 
@@ -2324,7 +2324,7 @@ def test_compliance_builds_argv_without_env(compliance_json: str):
     with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         result = rocky.compliance()
 
-    assert captured[0] == ["compliance", "--output", "json"]
+    assert captured[0] == ["compliance", "--output", "json", "--models", "models"]
     assert result.command == "compliance"
     assert len(result.exceptions) == 2
 
@@ -2340,7 +2340,15 @@ def test_compliance_forwards_env_flag(compliance_json: str):
     with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.compliance(env="prod")
 
-    assert captured[0] == ["compliance", "--output", "json", "--env", "prod"]
+    assert captured[0] == [
+        "compliance",
+        "--output",
+        "json",
+        "--models",
+        "models",
+        "--env",
+        "prod",
+    ]
 
 
 def test_retention_status_builds_argv_without_env(retention_status_json: str):

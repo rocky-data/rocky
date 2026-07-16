@@ -15,7 +15,7 @@ sidebar:
 | `config_path` | `str` | `"rocky.toml"` | Path to the pipeline config file. |
 | `state_path` | `str` | `".rocky-state.redb"` | Path to the state store file. |
 | `state_namespace` | `str \| None` | `None` | Optional per-namespace state file (engine `--state-namespace`). Mutually exclusive with `state_path`: when set, `--state-namespace` is sent and `--state-path` is omitted, so independent fan-out runs don't serialize on a single writer lock. |
-| `models_dir` | `str` | `"models"` | Path to the directory containing `.rocky` model files. Used by `compile`, `lineage`, `test`, `ci`, `ai_sync`, `ai_explain`, and `ai_test`. |
+| `models_dir` | `str` | `"models"` | Path to the directory containing `.rocky` model files. Used by `compile`, `lineage`, `test`, `ci`, `compliance`, `ai_sync`, `ai_explain`, and `ai_test`. |
 | `contracts_dir` | `str \| None` | `None` | Optional directory containing contract files. Passed to `compile`, `test`, and `ci` when set. |
 | `server_url` | `str \| None` | `None` | Optional URL for a running `rocky serve` instance. When set, `compile()`, `lineage()`, and `metrics()` use the HTTP API instead of spawning a subprocess. |
 | `timeout_seconds` | `int` | `3600` | Subprocess timeout for any single CLI invocation (in seconds). |
@@ -282,6 +282,12 @@ Analyze materialization strategies and return cost optimization recommendations.
 Run health checks on the Rocky installation and configuration.
 
 **Wraps**: `rocky doctor --output json`
+
+### `compliance(*, env=None) -> ComplianceOutput`
+
+Runs the governance compliance rollup against the resource's configured `models_dir`.
+
+**Wraps**: `rocky compliance --models <models_dir> --output json [--env <env>]`
 
 ### `validate_migration(dbt_project, rocky_project=None, *, sample_size=None) -> ValidateMigrationResult`
 
