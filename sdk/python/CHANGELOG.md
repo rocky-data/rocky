@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`RockyClient.metrics()` no longer silently ignores options in server mode.** Passing
   CLI-only `trend`, `column`, or `alerts` options when `server_url` is set now raises a
   clear `ValueError` before making an HTTP request. (#1122)
+- **`RockyClient.compile()` no longer silently ignores `model_filter` in server mode.** Passing
+  `model_filter` when `server_url` is set now raises a clear `ValueError` before making an HTTP
+  request, instead of returning unfiltered whole-project diagnostics. (#1124)
 
 ## [0.8.0] — 2026-07-14
 

@@ -480,6 +480,28 @@ def test_http_metrics_rejects_cli_only_options(kwargs):
     http_get.assert_not_called()
 
 
+def test_http_compile_uses_default_endpoint():
+    client = _client(server_url="http://localhost:8080")
+    body = (
+        '{"version":"1","command":"compile","models":0,'
+        '"execution_layers":0,"diagnostics":[],"has_errors":false}'
+    )
+    with patch.object(client, "_http_get", return_value=body) as http_get:
+        result = client.compile()
+    http_get.assert_called_once_with("/api/v1/compile")
+    assert result.command == "compile"
+
+
+def test_http_compile_rejects_model_filter():
+    client = _client(server_url="http://localhost:8080")
+    with (
+        patch.object(client, "_http_get") as http_get,
+        pytest.raises(ValueError, match="not supported when server_url is set"),
+    ):
+        client.compile("orders")
+    http_get.assert_not_called()
+
+
 # --------------------------------------------------------------------------- #
 # apply() — dispatch by real wire shape (there is NO wrapping envelope)
 # --------------------------------------------------------------------------- #

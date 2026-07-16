@@ -1056,7 +1056,14 @@ class RockyClient:
     # ------------------------------------------------------------------ #
 
     def compile(self, model_filter: str | None = None) -> CompileResult:
-        """Run ``rocky compile`` (or the HTTP API when ``server_url`` is set)."""
+        """Run ``rocky compile`` (or the HTTP API when ``server_url`` is set).
+
+        Raises:
+            ValueError: ``model_filter`` is used with ``server_url`` (the HTTP
+                compile endpoint compiles the whole project only).
+        """
+        if self.server_url is not None and model_filter is not None:
+            raise ValueError("model_filter is not supported when server_url is set")
         if self.server_url is not None:
             return _parse_rocky_json(
                 self._http_get("/api/v1/compile"), CompileResult, command="compile"
