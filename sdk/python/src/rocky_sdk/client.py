@@ -1307,7 +1307,7 @@ class RockyClient:
 
     def compliance(self, *, env: str | None = None) -> ComplianceOutput:
         """Run ``rocky compliance`` and return the governance rollup."""
-        args = ["compliance", "--output", "json"]
+        args = ["compliance", "--output", "json", "--models", self.models_dir]
         if env is not None:
             args.extend(["--env", env])
         return _parse_rocky_json(self.run_cli(args), ComplianceOutput, command="compliance")

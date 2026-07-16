@@ -141,6 +141,24 @@ def test_build_plan_args_mirrors_run_with_plan_verb():
     assert run[1:] == plan[1:]
 
 
+def test_compliance_threads_models_dir():
+    client = _client(models_dir="custom-models")
+    output = json.dumps(
+        {
+            "version": "1.64.0",
+            "command": "compliance",
+            "summary": {"total_classified": 0, "total_exceptions": 0, "total_masked": 0},
+            "per_column": [],
+            "exceptions": [],
+        }
+    )
+    with patch.object(client, "run_cli", return_value=output) as run_cli:
+        client.compliance(env="prod")
+    run_cli.assert_called_once_with(
+        ["compliance", "--output", "json", "--models", "custom-models", "--env", "prod"]
+    )
+
+
 # --------------------------------------------------------------------------- #
 # version gate
 # --------------------------------------------------------------------------- #
