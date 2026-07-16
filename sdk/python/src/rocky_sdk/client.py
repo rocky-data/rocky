@@ -1028,8 +1028,14 @@ class RockyClient:
     def branch_promote(
         self, name: str, *, filter: str | None = None, skip_approval: bool = False
     ) -> BranchPromoteOutput:
-        """Run ``rocky branch promote <name>`` and return the parsed result."""
-        args = ["branch", "promote", name]
+        """Run ``rocky branch promote <name>`` and return the parsed result.
+
+        Forwards ``--models`` so the semantic breaking-change gate runs against
+        the configured layout. Without it the engine defaults to ``models/`` and,
+        for a custom ``models_dir``, the gate silently skips (missing directory)
+        — promoting potentially-breaking changes unchecked.
+        """
+        args = ["branch", "promote", name, "--models", self.models_dir]
         if filter is not None:
             args.extend(["--filter", filter])
         if skip_approval:
@@ -1044,8 +1050,12 @@ class RockyClient:
         allow_breaking: bool = False,
         filter: str | None = None,
     ) -> PromotePlan:
-        """Run ``rocky plan promote <name>`` — gates at plan time, persists a plan."""
-        args = ["plan", "promote", name, "--base", base]
+        """Run ``rocky plan promote <name>`` — gates at plan time, persists a plan.
+
+        Forwards ``--models`` so the hard breaking-change gate runs against the
+        configured layout (see :meth:`branch_promote`).
+        """
+        args = ["plan", "promote", name, "--base", base, "--models", self.models_dir]
         if allow_breaking:
             args.append("--allow-breaking")
         if filter is not None:
@@ -1204,9 +1214,16 @@ class RockyClient:
     # ------------------------------------------------------------------ #
 
     def ai(self, intent: str, format: str = "rocky") -> AiResult:
-        """Generate a model from a natural-language intent."""
+        """Generate a model from a natural-language intent.
+
+        Forwards ``--models`` so the engine grounds the prompt on — and writes the
+        generated model into — the configured ``models_dir`` rather than the
+        default ``models/``.
+        """
         return _parse_rocky_json(
-            self.run_cli(["ai", intent, "--format", format]), AiResult, command="ai"
+            self.run_cli(["ai", intent, "--format", format, "--models", self.models_dir]),
+            AiResult,
+            command="ai",
         )
 
     def ai_sync(

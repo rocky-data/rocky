@@ -11,18 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`RockyClient.optimize()` now forwards the configured `models_dir`.** Without
-  `--models` the engine defaulted to `models/` and, for a custom layout, silently
-  reported `downstream_references: 0` for every model — misclassifying the
-  recommended materialization strategy (a model with 2+ consumers never routes to
-  the "materialize once (table)" branch). `optimize()` now passes
-  `--models <models_dir>`, matching the other model-aware methods.
-- **`RockyClient.retention_status()` now forwards `models_dir` and rejects the
-  unsupported `env` option.** It passes `--models <models_dir>` (compliance
-  parity — a custom layout previously failed with `NoModels`), and raises a clear
-  `ValueError` when `env` is set. `rocky retention-status` has no `--env` flag
-  (unlike `compliance`), so the option hard-errored at the CLI before; the guard
-  surfaces it in-process without a subprocess round-trip. (Latent since #874.)
+- **Model-aware commands now forward the configured `models_dir`.** An audit of
+  every `RockyClient` method's argv against the engine CLI found several methods
+  that accept `--models` but never received it, so a custom `models_dir` was
+  silently ignored (the engine fell back to its default `models/`):
+  - **`optimize()`** — a custom layout silently reported `downstream_references: 0`
+    for every model (the engine's model-DAG scan degrades to empty on a missing
+    dir), misclassifying the recommended materialization strategy: a model with
+    2+ consumers never routed to the "materialize once (table)" branch.
+  - **`branch_promote()` / `plan_promote()`** — the semantic breaking-change gate
+    silently **skipped** when the default `models/` was absent, promoting
+    potentially-breaking changes unchecked. It now runs against the real layout.
+  - **`ai()`** — the engine grounds the prompt on, and writes the generated model
+    into, `models_dir`; without `--models` a custom-layout client generated
+    against and wrote the new model into the wrong directory.
+  - **`retention_status()`** — a custom layout previously failed with `NoModels`;
+    it now scans the configured directory (compliance parity).
+- **`retention_status()` rejects the unsupported `env` option.** `rocky
+  retention-status` has no `--env` flag (unlike `compliance`), so passing `env`
+  hard-errored at the CLI. It now raises a clear `ValueError` before spawning a
+  subprocess. (Latent since #874.)
 
 ### Changed
 
