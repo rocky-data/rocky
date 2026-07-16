@@ -2324,7 +2324,7 @@ def test_compliance_builds_argv_without_env(compliance_json: str):
     with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         result = rocky.compliance()
 
-    assert captured[0] == ["compliance", "--output", "json", "--models", "models"]
+    assert captured[0] == ["compliance", "--models", "models"]
     assert result.command == "compliance"
     assert len(result.exceptions) == 2
 
@@ -2340,19 +2340,11 @@ def test_compliance_forwards_env_flag(compliance_json: str):
     with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         rocky.compliance(env="prod")
 
-    assert captured[0] == [
-        "compliance",
-        "--output",
-        "json",
-        "--models",
-        "models",
-        "--env",
-        "prod",
-    ]
+    assert captured[0] == ["compliance", "--models", "models", "--env", "prod"]
 
 
-def test_retention_status_builds_argv_without_env(retention_status_json: str):
-    """Default ``retention_status()`` call emits ``retention-status --output json``."""
+def test_retention_status_builds_argv_with_models(retention_status_json: str):
+    """Default ``retention_status()`` forwards ``--models`` (compliance parity)."""
     rocky = RockyResource()
     captured: list[list[str]] = []
 
@@ -2363,23 +2355,23 @@ def test_retention_status_builds_argv_without_env(retention_status_json: str):
     with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
         result = rocky.retention_status()
 
-    assert captured[0] == ["retention-status", "--output", "json"]
+    assert captured[0] == ["retention-status", "--models", "models"]
     assert result.command == "retention-status"
     assert len(result.models) == 3
 
 
-def test_retention_status_forwards_env_flag(retention_status_json: str):
+def test_retention_status_rejects_env():
+    """``rocky retention-status`` has no ``--env`` flag, so passing env raises a
+    ``ValueError`` in-process instead of hard-erroring at the CLI."""
     rocky = RockyResource()
-    captured: list[list[str]] = []
 
-    def fake_run(self, args, *, allow_partial=False, log_callback=None):
-        captured.append(args)
-        return retention_status_json
-
-    with patch.object(RockyClient, "run_cli", autospec=True, side_effect=fake_run):
+    with (
+        patch.object(RockyClient, "run_cli", autospec=True) as run_cli,
+        pytest.raises(ValueError, match="env is not supported by retention-status"),
+    ):
         rocky.retention_status(env="prod")
 
-    assert captured[0] == ["retention-status", "--output", "json", "--env", "prod"]
+    run_cli.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

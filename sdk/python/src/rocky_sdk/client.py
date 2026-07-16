@@ -1028,8 +1028,14 @@ class RockyClient:
     def branch_promote(
         self, name: str, *, filter: str | None = None, skip_approval: bool = False
     ) -> BranchPromoteOutput:
-        """Run ``rocky branch promote <name>`` and return the parsed result."""
-        args = ["branch", "promote", name]
+        """Run ``rocky branch promote <name>`` and return the parsed result.
+
+        Forwards ``--models`` so the semantic breaking-change gate runs against
+        the configured layout. Without it the engine defaults to ``models/`` and,
+        for a custom ``models_dir``, the gate silently skips (missing directory)
+        — promoting potentially-breaking changes unchecked.
+        """
+        args = ["branch", "promote", name, "--models", self.models_dir]
         if filter is not None:
             args.extend(["--filter", filter])
         if skip_approval:
@@ -1044,8 +1050,12 @@ class RockyClient:
         allow_breaking: bool = False,
         filter: str | None = None,
     ) -> PromotePlan:
-        """Run ``rocky plan promote <name>`` — gates at plan time, persists a plan."""
-        args = ["plan", "promote", name, "--base", base]
+        """Run ``rocky plan promote <name>`` — gates at plan time, persists a plan.
+
+        Forwards ``--models`` so the hard breaking-change gate runs against the
+        configured layout (see :meth:`branch_promote`).
+        """
+        args = ["plan", "promote", name, "--base", base, "--models", self.models_dir]
         if allow_breaking:
             args.append("--allow-breaking")
         if filter is not None:
@@ -1182,8 +1192,15 @@ class RockyClient:
         return _parse_rocky_json(self.run_cli(args), MetricsResult, command="metrics")
 
     def optimize(self, model: str | None = None) -> OptimizeResult:
-        """Run ``rocky optimize`` and return materialization recommendations."""
-        args: list[str] = ["optimize"]
+        """Run ``rocky optimize`` and return materialization recommendations.
+
+        Forwards ``--models`` so the engine can build the model DAG and compute
+        each model's ``downstream_references`` accurately. Without it the engine
+        defaults to ``models/`` and, for a custom ``models_dir``, silently reports
+        ``downstream_references: 0`` for every model — skewing the recommended
+        materialization strategy (table vs view vs ephemeral).
+        """
+        args: list[str] = ["optimize", "--models", self.models_dir]
         if model is not None:
             args.extend(["--model", model])
         return _parse_rocky_json(self.run_cli(args), OptimizeResult, command="optimize")
@@ -1197,9 +1214,16 @@ class RockyClient:
     # ------------------------------------------------------------------ #
 
     def ai(self, intent: str, format: str = "rocky") -> AiResult:
-        """Generate a model from a natural-language intent."""
+        """Generate a model from a natural-language intent.
+
+        Forwards ``--models`` so the engine grounds the prompt on — and writes the
+        generated model into — the configured ``models_dir`` rather than the
+        default ``models/``.
+        """
         return _parse_rocky_json(
-            self.run_cli(["ai", intent, "--format", format]), AiResult, command="ai"
+            self.run_cli(["ai", intent, "--format", format, "--models", self.models_dir]),
+            AiResult,
+            command="ai",
         )
 
     def ai_sync(
@@ -1308,16 +1332,27 @@ class RockyClient:
 
     def compliance(self, *, env: str | None = None) -> ComplianceOutput:
         """Run ``rocky compliance`` against ``models_dir`` and return the governance rollup."""
-        args = ["compliance", "--output", "json", "--models", self.models_dir]
+        args = ["compliance", "--models", self.models_dir]
         if env is not None:
             args.extend(["--env", env])
         return _parse_rocky_json(self.run_cli(args), ComplianceOutput, command="compliance")
 
     def retention_status(self, *, env: str | None = None) -> RetentionStatusOutput:
-        """Run ``rocky retention-status`` and return per-model retention status."""
-        args = ["retention-status", "--output", "json"]
+        """Run ``rocky retention-status`` against ``models_dir`` and return per-model status.
+
+        Forwards ``--models`` (like :meth:`compliance`) so a custom ``models_dir``
+        is honored; without it the engine defaults to ``models/`` and a
+        custom-layout project errors with ``NoModels``.
+
+        Raises:
+            ValueError: ``env`` is set. ``rocky retention-status`` has no
+                ``--env`` flag (unlike ``compliance``) — retention is not
+                environment-scoped, so passing ``env`` would hard-error at the
+                CLI. Raised in-process instead of paying a subprocess round-trip.
+        """
         if env is not None:
-            args.extend(["--env", env])
+            raise ValueError("env is not supported by retention-status (the CLI has no --env flag)")
+        args = ["retention-status", "--models", self.models_dir]
         return _parse_rocky_json(
             self.run_cli(args), RetentionStatusOutput, command="retention-status"
         )

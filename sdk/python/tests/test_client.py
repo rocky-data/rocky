@@ -154,8 +154,106 @@ def test_compliance_threads_models_dir():
     )
     with patch.object(client, "run_cli", return_value=output) as run_cli:
         client.compliance(env="prod")
+    # ``--output json`` is supplied globally by ``_build_cmd``; the method must
+    # not append a second redundant copy.
+    run_cli.assert_called_once_with(["compliance", "--models", "custom-models", "--env", "prod"])
+
+
+def test_optimize_threads_models_dir():
+    client = _client(models_dir="custom-models")
+    output = json.dumps(
+        {
+            "version": "1.64.0",
+            "command": "optimize",
+            "recommendations": [],
+            "total_models_analyzed": 0,
+        }
+    )
+    with patch.object(client, "run_cli", return_value=output) as run_cli:
+        client.optimize(model="fct_orders")
+    # ``--models`` must be forwarded so downstream_references is computed against
+    # the configured layout, not the engine's default ``models/``.
     run_cli.assert_called_once_with(
-        ["compliance", "--output", "json", "--models", "custom-models", "--env", "prod"]
+        ["optimize", "--models", "custom-models", "--model", "fct_orders"]
+    )
+
+
+def test_retention_status_threads_models_dir():
+    client = _client(models_dir="custom-models")
+    output = json.dumps({"version": "1.64.0", "command": "retention-status", "models": []})
+    with patch.object(client, "run_cli", return_value=output) as run_cli:
+        client.retention_status()
+    # ``--models`` forwarded (compliance parity); no redundant ``--output json``.
+    run_cli.assert_called_once_with(["retention-status", "--models", "custom-models"])
+
+
+def test_retention_status_rejects_env():
+    # ``rocky retention-status`` has no ``--env`` flag (unlike ``compliance``);
+    # passing env must raise before any subprocess spawns, not hard-error at clap.
+    client = _client()
+    with (
+        patch.object(client, "run_cli") as run_cli,
+        pytest.raises(ValueError, match="env is not supported by retention-status"),
+    ):
+        client.retention_status(env="prod")
+    run_cli.assert_not_called()
+
+
+def test_branch_promote_threads_models_dir():
+    # --models must reach the breaking-change gate; without it a custom layout
+    # silently skips the gate (missing default ``models/``).
+    client = _client(models_dir="custom-models")
+    with (
+        patch.object(client, "run_cli", return_value="{}") as run_cli,
+        patch("rocky_sdk.client._parse_rocky_json"),
+    ):
+        client.branch_promote("feature-x", filter="client=acme", skip_approval=True)
+    run_cli.assert_called_once_with(
+        [
+            "branch",
+            "promote",
+            "feature-x",
+            "--models",
+            "custom-models",
+            "--filter",
+            "client=acme",
+            "--skip-approval",
+        ]
+    )
+
+
+def test_plan_promote_threads_models_dir():
+    client = _client(models_dir="custom-models")
+    with (
+        patch.object(client, "run_cli", return_value="{}") as run_cli,
+        patch("rocky_sdk.client._parse_rocky_json"),
+    ):
+        client.plan_promote("feature-x", base="main", allow_breaking=True)
+    run_cli.assert_called_once_with(
+        [
+            "plan",
+            "promote",
+            "feature-x",
+            "--base",
+            "main",
+            "--models",
+            "custom-models",
+            "--allow-breaking",
+        ]
+    )
+
+
+def test_ai_threads_models_dir():
+    # ``rocky ai`` grounds on and *writes into* models_dir, so a custom layout
+    # must forward --models or the generated model lands in the wrong directory.
+    client = _client(models_dir="custom-models")
+    with (
+        patch.object(client, "run_cli", return_value="{}") as run_cli,
+        patch("rocky_sdk.client._parse_rocky_json"),
+    ):
+        client.ai("build a daily revenue model")
+    run_cli.assert_called_once_with(
+        ["ai", "build a daily revenue model", "--format", "rocky", "--models", "custom-models"]
     )
 
 
