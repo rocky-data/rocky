@@ -1151,7 +1151,13 @@ class RockyClient:
         column: str | None = None,
         alerts: bool = False,
     ) -> MetricsResult:
-        """Run ``rocky metrics`` (or the HTTP API when ``server_url`` is set)."""
+        """Run ``rocky metrics`` (or the HTTP API when ``server_url`` is set).
+
+        Raises:
+            ValueError: A CLI-only metrics option is used with ``server_url``.
+        """
+        if self.server_url is not None and (trend or column is not None or alerts):
+            raise ValueError("trend, column, and alerts are not supported when server_url is set")
         if self.server_url is not None:
             return _parse_rocky_json(
                 self._http_get(f"/api/v1/models/{model}/metrics"),
