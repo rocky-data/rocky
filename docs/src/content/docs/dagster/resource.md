@@ -346,6 +346,8 @@ When `server_url` is configured, the following methods use the `rocky serve` HTT
 - `lineage()` -- `GET /api/v1/models/<target>/lineage[/<column>]`
 - `metrics()` -- `GET /api/v1/models/<model>/metrics`
 
+These endpoints serve each command's default output. `lineage`'s `column` is supported (it has a dedicated route), but `compile`'s `model_filter` and `metrics`'s `trend`, `column`, or `alerts` raise `ValueError` rather than being silently ignored.
+
 This is useful when a Rocky server is already running (e.g., in a development environment or alongside the LSP).
 
 ## Example

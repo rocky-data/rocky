@@ -92,7 +92,7 @@ except RockyCommandError as exc:
 - **Governance and branches:** `compliance`, `retention_status`, `branch_approve`, `branch_promote`, `plan_promote`
 - **Diagnostics:** `doctor`, `validate_migration`, `test_adapter`, `hooks_list`, `hooks_test`
 
-`run()` accepts a `log_callback` that receives the engine's stderr line by line, so you can stream progress wherever you want. Setting `server_url` routes `compile`, `lineage`, and `metrics` through a running `rocky serve` instead of a subprocess.
+`run()` accepts a `log_callback` that receives the engine's stderr line by line, so you can stream progress wherever you want. Setting `server_url` routes `compile`, `lineage`, and `metrics` through a running `rocky serve` instead of a subprocess. Those endpoints serve each command's default output, so `compile`'s `model_filter` and `metrics`'s `trend`, `column`, or `alerts` raise `ValueError` in server mode, while `lineage`'s `column` is supported.
 
 Each method's full signature, parameters, and return type are in the [`RockyResource` reference](/dagster/resource/) — `RockyClient` exposes the same methods and configuration, since the Dagster resource delegates to it. Output model shapes are in the [JSON output reference](/reference/json-output/), and the `filter=` syntax in [Filters](/reference/filters/).
 

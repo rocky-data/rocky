@@ -64,7 +64,10 @@ lower-level `run_cli(args, allow_partial=False)`, which raises
 
 For repeated read-only calls, point the client at a running `rocky serve` instead
 of spawning a subprocess per call. Only `compile`, `lineage`, and `metrics` honor
-`server_url`; `run()` and the write paths always use a subprocess.
+`server_url`; `run()` and the write paths always use a subprocess. These endpoints
+serve each command's default output: `lineage`'s `column` is supported, but
+`compile`'s `model_filter` and `metrics`'s `trend`, `column`, or `alerts` raise
+`ValueError` rather than being silently ignored.
 
 ```python
 client = RockyClient(config_path="rocky.toml", server_url="http://localhost:8080")
