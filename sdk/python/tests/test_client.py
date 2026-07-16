@@ -460,6 +460,26 @@ def test_http_error_raises_server_error():
         client.compile()
 
 
+def test_http_metrics_uses_default_endpoint():
+    client = _client(server_url="http://localhost:8080")
+    body = '{"version":"1","command":"metrics","model":"orders","snapshots":[],"count":0}'
+    with patch.object(client, "_http_get", return_value=body) as http_get:
+        result = client.metrics("orders")
+    http_get.assert_called_once_with("/api/v1/models/orders/metrics")
+    assert result.model == "orders"
+
+
+@pytest.mark.parametrize("kwargs", [{"trend": True}, {"column": "email"}, {"alerts": True}])
+def test_http_metrics_rejects_cli_only_options(kwargs):
+    client = _client(server_url="http://localhost:8080")
+    with (
+        patch.object(client, "_http_get") as http_get,
+        pytest.raises(ValueError, match="not supported when server_url is set"),
+    ):
+        client.metrics("orders", **kwargs)
+    http_get.assert_not_called()
+
+
 # --------------------------------------------------------------------------- #
 # apply() — dispatch by real wire shape (there is NO wrapping envelope)
 # --------------------------------------------------------------------------- #

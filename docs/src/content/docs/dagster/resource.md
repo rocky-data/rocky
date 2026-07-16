@@ -248,7 +248,9 @@ Retrieve pipeline run history. Returns `ModelHistoryResult` when filtered to a s
 
 ### `metrics(model, *, trend=False, column=None, alerts=False) -> MetricsResult`
 
-Retrieve quality metrics for a model. When `server_url` is configured, fetches from the HTTP API instead.
+Retrieve quality metrics for a model. When `server_url` is configured, fetches from the HTTP API
+instead. The HTTP endpoint supports default metrics only; passing `trend`, `column`, or `alerts`
+raises `ValueError` rather than silently ignoring the option.
 
 **Wraps**: `rocky metrics <model> --output json` or `GET /api/v1/models/<model>/metrics`
 
