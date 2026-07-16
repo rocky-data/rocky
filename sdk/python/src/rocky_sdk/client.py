@@ -1182,8 +1182,15 @@ class RockyClient:
         return _parse_rocky_json(self.run_cli(args), MetricsResult, command="metrics")
 
     def optimize(self, model: str | None = None) -> OptimizeResult:
-        """Run ``rocky optimize`` and return materialization recommendations."""
-        args: list[str] = ["optimize"]
+        """Run ``rocky optimize`` and return materialization recommendations.
+
+        Forwards ``--models`` so the engine can build the model DAG and compute
+        each model's ``downstream_references`` accurately. Without it the engine
+        defaults to ``models/`` and, for a custom ``models_dir``, silently reports
+        ``downstream_references: 0`` for every model — skewing the recommended
+        materialization strategy (table vs view vs ephemeral).
+        """
+        args: list[str] = ["optimize", "--models", self.models_dir]
         if model is not None:
             args.extend(["--model", model])
         return _parse_rocky_json(self.run_cli(args), OptimizeResult, command="optimize")
@@ -1308,16 +1315,27 @@ class RockyClient:
 
     def compliance(self, *, env: str | None = None) -> ComplianceOutput:
         """Run ``rocky compliance`` against ``models_dir`` and return the governance rollup."""
-        args = ["compliance", "--output", "json", "--models", self.models_dir]
+        args = ["compliance", "--models", self.models_dir]
         if env is not None:
             args.extend(["--env", env])
         return _parse_rocky_json(self.run_cli(args), ComplianceOutput, command="compliance")
 
     def retention_status(self, *, env: str | None = None) -> RetentionStatusOutput:
-        """Run ``rocky retention-status`` and return per-model retention status."""
-        args = ["retention-status", "--output", "json"]
+        """Run ``rocky retention-status`` against ``models_dir`` and return per-model status.
+
+        Forwards ``--models`` (like :meth:`compliance`) so a custom ``models_dir``
+        is honored; without it the engine defaults to ``models/`` and a
+        custom-layout project errors with ``NoModels``.
+
+        Raises:
+            ValueError: ``env`` is set. ``rocky retention-status`` has no
+                ``--env`` flag (unlike ``compliance``) — retention is not
+                environment-scoped, so passing ``env`` would hard-error at the
+                CLI. Raised in-process instead of paying a subprocess round-trip.
+        """
         if env is not None:
-            args.extend(["--env", env])
+            raise ValueError("env is not supported by retention-status (the CLI has no --env flag)")
+        args = ["retention-status", "--models", self.models_dir]
         return _parse_rocky_json(
             self.run_cli(args), RetentionStatusOutput, command="retention-status"
         )

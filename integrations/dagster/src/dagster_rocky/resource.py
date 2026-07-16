@@ -1437,7 +1437,11 @@ class RockyResource(dg.ConfigurableResource):
             return self._get_client().compliance(env=env)
 
     def retention_status(self, *, env: str | None = None) -> RetentionStatusOutput:
-        """Run ``rocky retention-status`` and return per-model retention status."""
+        """Run ``rocky retention-status`` and return per-model retention status.
+
+        Raises ``ValueError`` if ``env`` is set — ``rocky retention-status`` has
+        no ``--env`` flag (retention is not environment-scoped).
+        """
         with _translating():
             return self._get_client().retention_status(env=env)
 

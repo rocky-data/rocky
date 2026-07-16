@@ -154,9 +154,49 @@ def test_compliance_threads_models_dir():
     )
     with patch.object(client, "run_cli", return_value=output) as run_cli:
         client.compliance(env="prod")
-    run_cli.assert_called_once_with(
-        ["compliance", "--output", "json", "--models", "custom-models", "--env", "prod"]
+    # ``--output json`` is supplied globally by ``_build_cmd``; the method must
+    # not append a second redundant copy.
+    run_cli.assert_called_once_with(["compliance", "--models", "custom-models", "--env", "prod"])
+
+
+def test_optimize_threads_models_dir():
+    client = _client(models_dir="custom-models")
+    output = json.dumps(
+        {
+            "version": "1.64.0",
+            "command": "optimize",
+            "recommendations": [],
+            "total_models_analyzed": 0,
+        }
     )
+    with patch.object(client, "run_cli", return_value=output) as run_cli:
+        client.optimize(model="fct_orders")
+    # ``--models`` must be forwarded so downstream_references is computed against
+    # the configured layout, not the engine's default ``models/``.
+    run_cli.assert_called_once_with(
+        ["optimize", "--models", "custom-models", "--model", "fct_orders"]
+    )
+
+
+def test_retention_status_threads_models_dir():
+    client = _client(models_dir="custom-models")
+    output = json.dumps({"version": "1.64.0", "command": "retention-status", "models": []})
+    with patch.object(client, "run_cli", return_value=output) as run_cli:
+        client.retention_status()
+    # ``--models`` forwarded (compliance parity); no redundant ``--output json``.
+    run_cli.assert_called_once_with(["retention-status", "--models", "custom-models"])
+
+
+def test_retention_status_rejects_env():
+    # ``rocky retention-status`` has no ``--env`` flag (unlike ``compliance``);
+    # passing env must raise before any subprocess spawns, not hard-error at clap.
+    client = _client()
+    with (
+        patch.object(client, "run_cli") as run_cli,
+        pytest.raises(ValueError, match="env is not supported by retention-status"),
+    ):
+        client.retention_status(env="prod")
+    run_cli.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #

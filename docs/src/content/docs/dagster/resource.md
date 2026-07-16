@@ -267,7 +267,11 @@ raises `ValueError` rather than silently ignoring the option.
 
 Analyze materialization strategies and return cost optimization recommendations.
 
-**Wraps**: `rocky optimize --output json`
+**Wraps**: `rocky optimize --models <models_dir> --output json`
+
+`--models` is forwarded so the engine computes each model's `downstream_references`
+against the configured layout; without it a custom `models_dir` silently yields
+`downstream_references: 0` for every model and skews the recommendation.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -288,6 +292,16 @@ Run health checks on the Rocky installation and configuration.
 Runs the governance compliance rollup against the resource's configured `models_dir`.
 
 **Wraps**: `rocky compliance --models <models_dir> --output json [--env <env>]`
+
+### `retention_status(*, env=None) -> RetentionStatusOutput`
+
+Reports which models declare a `retention` sidecar value, scanned against the
+resource's configured `models_dir`.
+
+**Wraps**: `rocky retention-status --models <models_dir> --output json`
+
+Passing `env` raises `ValueError` — `rocky retention-status` has no `--env` flag
+(unlike `compliance`); retention is not environment-scoped.
 
 ### `validate_migration(dbt_project, rocky_project=None, *, sample_size=None) -> ValidateMigrationResult`
 

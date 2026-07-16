@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3] — 2026-07-17
+
+### Fixed
+
+- **`RockyClient.optimize()` now forwards the configured `models_dir`.** Without
+  `--models` the engine defaulted to `models/` and, for a custom layout, silently
+  reported `downstream_references: 0` for every model — misclassifying the
+  recommended materialization strategy (a model with 2+ consumers never routes to
+  the "materialize once (table)" branch). `optimize()` now passes
+  `--models <models_dir>`, matching the other model-aware methods.
+- **`RockyClient.retention_status()` now forwards `models_dir` and rejects the
+  unsupported `env` option.** It passes `--models <models_dir>` (compliance
+  parity — a custom layout previously failed with `NoModels`), and raises a clear
+  `ValueError` when `env` is set. `rocky retention-status` has no `--env` flag
+  (unlike `compliance`), so the option hard-errored at the CLI before; the guard
+  surfaces it in-process without a subprocess round-trip. (Latent since #874.)
+
+### Changed
+
+- **`compliance()` / `retention_status()` no longer emit a redundant `--output
+  json`.** The shared argv builder already supplies the global `--output json`;
+  the duplicated per-method copy is removed. No behavior change.
+
 ## [0.8.2] — 2026-07-16
 
 ### Fixed

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`RockyResource.optimize()` / `retention_status()` now scan the configured
+  `models_dir`** (via `rocky-sdk` — forward `--models`). A custom-layout project
+  previously got silently-zeroed `downstream_references` from `optimize` and a
+  `NoModels` error from `retention_status`. `retention_status(env=...)` now raises
+  a clear `ValueError` (`rocky retention-status` has no `--env` flag). Requires
+  `rocky-sdk>=0.8.3`.
+
 ## [1.60.0] — 2026-07-12
 
 ### Changed
