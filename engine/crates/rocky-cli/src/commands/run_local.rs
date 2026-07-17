@@ -151,27 +151,27 @@ pub async fn run_transformation(
 
         match exec_result {
             // Finding #1: only when the model phase is CLEAN (no new soft
-            // failures) — a soft failure returns `Ok(())`.
-            Ok(()) if output.tables_failed == failures_before => {
+            // failures) — a soft failure returns `Ok`.
+            Ok(snapshot) if output.tables_failed == failures_before => {
                 // --- Governance: per-model `[governance.tags]` ---
                 //
                 // After every model materializes, apply each model's
                 // `[governance.tags]` to its target securable. `None` filter:
                 // the full-DAG path builds every model, so every model is
                 // tagged. Best-effort; no-op on DuckDB's Noop adapter.
+                // #1093: reads the snapshot `execute_models` captured at the
+                // fingerprint gate, never a fresh disk compile.
                 let governance_adapter =
                     adapter_registry.governance_adapter(&pipeline.target.adapter);
                 super::run::apply_model_governance_tags(
-                    &models_dir,
+                    &snapshot,
                     governance_adapter.as_ref(),
-                    rocky_cfg,
-                    run_vars,
                     None,
                 )
                 .await;
             }
             // Soft model failure — skip governance, fall through.
-            Ok(()) => {}
+            Ok(_) => {}
             Err(e) => {
                 // A runtime model failure (warehouse rejected the SQL, an
                 // unresolved upstream, ...) surfaces here as `Err`. Record it

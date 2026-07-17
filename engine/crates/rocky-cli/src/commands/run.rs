@@ -1558,20 +1558,20 @@ pub async fn run(
         // `run_status_exit_result` below.
         match exec_result {
             // Finding #1: only when the model phase is CLEAN (no new failures) —
-            // a soft compile/runtime failure returns `Ok(())`, so `Ok` alone is
+            // a soft compile/runtime failure returns `Ok`, so `Ok` alone is
             // not enough to authorize governance/manifest writes.
-            Ok(()) if output.tables_failed == failures_before => {
+            Ok(snapshot) if output.tables_failed == failures_before => {
                 // Per-model `[governance.tags]` apply (scoped to the built
                 // model). The model-only path is one of the entry points the
                 // SDK / Dagster drive; without this its tags were silently
                 // dropped. Best-effort; no-op on DuckDB's Noop adapter.
+                // #1093: reads the snapshot `execute_models` captured at the
+                // fingerprint gate, never a fresh disk compile.
                 let governance_adapter =
                     adapter_registry.governance_adapter(&target_adapter_name);
                 apply_model_governance_tags(
-                    mdir,
+                    &snapshot,
                     governance_adapter.as_ref(),
-                    rocky_cfg,
-                    run_vars,
                     Some(target_model),
                 )
                 .await;
@@ -1581,10 +1581,10 @@ pub async fn run(
                 // recomputes it.
                 write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
             }
-            // Finding #1: a SOFT model failure (`Ok(())` but a new failure was
+            // Finding #1: a SOFT model failure (`Ok` but a new failure was
             // recorded) — skip governance/manifest, fall through to the failure
             // payload.
-            Ok(()) => {}
+            Ok(_) => {}
             Err(e) => {
                 output.tables_failed += 1;
                 output.errors.push(crate::output::TableErrorOutput {
@@ -4243,7 +4243,11 @@ pub async fn run(
             // line 1520 and partial-failure bail! below — already
             // fire. Wrap both calls so subscribers see
             // `pipeline_error` before the error reaches the caller.
-            let exec_result: Result<()> = async {
+            // #1093: the block's `Ok` payload is the `GovernanceSnapshot`
+            // `execute_models` captured at the fingerprint gate — threaded out
+            // so the governance reconcile below applies the gated set, never a
+            // fresh disk compile.
+            let exec_result: Result<GovernanceSnapshot> = async {
                 let warehouse = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
                 execute_models(
                     mdir,
@@ -4278,8 +4282,7 @@ pub async fn run(
                     // Finding #4: THE mask-reconciling path — bind the mask.
                     true,
                 )
-                .await?;
-                Ok(())
+                .await
             }
             .await;
             // ‼️ Governance runs ONLY when the model phase completed cleanly
@@ -4294,27 +4297,32 @@ pub async fn run(
             // below, falling through to the failure payload + non-zero exit.
             let exec_ok = model_phase_ok(&exec_result, failures_before, output.tables_failed);
             model_phase_clean = exec_ok;
-            if let Err(e) = exec_result {
-                // Record the runtime model failure as a table error and fall
-                // through to the terminal emit instead of returning raw `Err`.
-                // `execute_models` stops at the first failing model, having
-                // already recorded the earlier successes in `output`; returning
-                // `Err` here skipped `print_json` + `persist_run_record`, so
-                // `--output json` stdout was empty and the process exited 1
-                // instead of the PartialFailure sentinel (exit 2). Routing
-                // through `table_errors` lets the existing merge + terminal
-                // machinery report it like any other partial failure (the
-                // copy-failure block below fires `pipeline_error` + drains
-                // webhooks once for the accumulated failures), mirroring the
-                // model-only path.
-                table_errors.push(TableError {
-                    asset_key: vec![pipeline_name.to_string()],
-                    error: format!("{e:#}"),
-                    task_index: None,
-                    failure_kind: crate::output::FailureKind::Unknown,
-                    cooldown_seconds: None,
-                });
-            }
+            let governance_snapshot = match exec_result {
+                // #1093: keep the gated snapshot for the reconcile below.
+                Ok(snapshot) => Some(snapshot),
+                Err(e) => {
+                    // Record the runtime model failure as a table error and fall
+                    // through to the terminal emit instead of returning raw `Err`.
+                    // `execute_models` stops at the first failing model, having
+                    // already recorded the earlier successes in `output`; returning
+                    // `Err` here skipped `print_json` + `persist_run_record`, so
+                    // `--output json` stdout was empty and the process exited 1
+                    // instead of the PartialFailure sentinel (exit 2). Routing
+                    // through `table_errors` lets the existing merge + terminal
+                    // machinery report it like any other partial failure (the
+                    // copy-failure block below fires `pipeline_error` + drains
+                    // webhooks once for the accumulated failures), mirroring the
+                    // model-only path.
+                    table_errors.push(TableError {
+                        asset_key: vec![pipeline_name.to_string()],
+                        error: format!("{e:#}"),
+                        task_index: None,
+                        failure_kind: crate::output::FailureKind::Unknown,
+                        cooldown_seconds: None,
+                    });
+                    None
+                }
+            };
 
             // Governance: column classification + masking reconcile (§1.1 + §1.2).
             // Walks the model set after a successful DAG run and applies
@@ -4323,132 +4331,35 @@ pub async fn run(
             // schema grants above. Best-effort: failures warn but never abort,
             // mirroring the `apply_grants` semantics earlier in this path.
             //
+            // #1093: the reconcile iterates the `GovernanceSnapshot` that
+            // `execute_models` captured at the fingerprint gate — the fresh
+            // disk compile that used to run here is gone, so a post-execution
+            // sidecar edit cannot change what governance is applied. The
+            // env-resolved mask mapping is deliberately NOT part of the
+            // snapshot: it derives from `rocky_cfg`, the one owned config
+            // instance threaded through this run (swap-immune post-#1120), so
+            // it stays computed HERE at the reconcile site — the snapshot
+            // carries only the disk-sourced per-model sidecar inputs.
+            // (Surfacing parity: the removed compile's diagnostics were
+            // discarded — the old site pattern-matched `Some(Ok(..))` and read
+            // only `project.models` — so nothing previously surfaced is lost.)
+            //
             // `env` threads the caller's `--env <name>` into
             // `resolve_mask_for_env` so `[mask.<env>]` overrides win over
             // the workspace `[mask]` defaults. `None` preserves the
             // pre-1.16 behavior of resolving defaults only.
-            // `exec_ok.then(...)` (finding #1): a failed execution skips even the
-            // governance compile — no reconcile is attempted when the gated set
-            // did not fully execute.
-            let governance_compile = exec_ok.then(|| {
-                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
-                    models_dir: mdir.to_path_buf(),
-                    contracts_dir: None,
-                    source_schemas: std::collections::HashMap::new(),
-                    source_column_info: std::collections::HashMap::new(),
-                    // W004 completeness check: surface classification tags
-                    // that aren't mapped to a masking strategy as warnings
-                    // on the governance compile path too — cheap, and
-                    // keeps parity with `rocky compile`'s diagnostic set.
-                    mask: rocky_cfg.mask.clone(),
-                    allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
-                    project_freshness_default: rocky_cfg.freshness.has_default(),
-                    // Resolve `@var()` on the governance compile too, so this
-                    // second compile of the same models doesn't re-read raw
-                    // `@var()` tokens from disk and spuriously report every
-                    // variable as missing (or leave placeholders in the SQL
-                    // the masking/tag reconcile inspects).
-                    run_vars: run_vars.clone(),
-                })
-            });
-            if let Some(Ok(gov_compile)) = governance_compile {
+            // `exec_ok` gating (finding #1): a failed execution skips the
+            // reconcile entirely — no governance is attempted when the gated
+            // set did not fully execute (a soft failure leaves the snapshot
+            // `Some` but `exec_ok` false, so the guard still holds).
+            if exec_ok && let Some(snapshot) = &governance_snapshot {
                 let tag_to_strategy = rocky_cfg.resolve_mask_for_env(env);
-                for model in &gov_compile.project.models {
-                    let table_ref = TableRef {
-                        catalog: model.config.target.catalog.clone(),
-                        schema: model.config.target.schema.clone(),
-                        table: model.config.target.table.clone(),
-                    };
-
-                    // --- Classification tags + masking (Wave A) ---
-                    if !model.config.classification.is_empty() {
-                        let mut column_tags: BTreeMap<String, BTreeMap<String, String>> =
-                            BTreeMap::new();
-                        for (col, tag) in &model.config.classification {
-                            let mut m = BTreeMap::new();
-                            m.insert("classification".to_string(), tag.clone());
-                            column_tags.insert(col.clone(), m);
-                        }
-                        if let Err(e) = governance_adapter
-                            .apply_column_tags(&table_ref, &column_tags)
-                            .await
-                        {
-                            warn!(
-                                model = %model.config.name,
-                                error = %e,
-                                "apply column classification tags failed"
-                            );
-                        }
-
-                        let mut column_strategies: BTreeMap<String, MaskStrategy> =
-                            BTreeMap::new();
-                        for (col, tag) in &model.config.classification {
-                            if let Some(strategy) = tag_to_strategy.get(tag) {
-                                column_strategies.insert(col.clone(), *strategy);
-                            }
-                        }
-                        if !column_strategies.is_empty() {
-                            let policy = MaskingPolicy { column_strategies };
-                            if let Err(e) = governance_adapter
-                                .apply_masking_policy(&table_ref, &policy, "default")
-                                .await
-                            {
-                                warn!(
-                                    model = %model.config.name,
-                                    error = %e,
-                                    "apply column masking policy failed"
-                                );
-                            }
-                        }
-                    }
-
-                    // --- Data retention policy (Wave C-2) ---
-                    //
-                    // Sidecar `retention = "<N>[dy]"` resolved to a typed
-                    // RetentionPolicy at parse time. Forward to the
-                    // governance adapter; best-effort — failure warns
-                    // but does not abort the run, matching the
-                    // classification/masking contract above.
-                    if let Some(retention) = model.config.retention
-                        && let Err(e) = governance_adapter
-                            .apply_retention_policy(&table_ref, &retention)
-                            .await
-                        {
-                            warn!(
-                                model = %model.config.name,
-                                duration_days = retention.duration_days,
-                                error = %e,
-                                "apply retention policy failed"
-                            );
-                        }
-
-                    // --- Per-model governance tags ---
-                    //
-                    // Apply each model's `[governance.tags]` to its target
-                    // securable, reusing the governance compile already in
-                    // scope. The `--all`/`--models` path is one of the entry
-                    // points the SDK / Dagster drive; without this its tags
-                    // were silently dropped (only the full-DAG transformation
-                    // path applied them). Strategy-aware dispatch mirrors
-                    // [`apply_model_governance_tags`]; best-effort — a failure
-                    // warns but never aborts. No-op on DuckDB's Noop adapter.
-                    let tags = &model.config.governance.tags;
-                    if !tags.is_empty() {
-                        let tag_target = governance_tag_target(
-                            &model.config.strategy,
-                            &model.config.target.catalog,
-                            &model.config.target.schema,
-                            &model.config.target.table,
-                        );
-                        if let Err(e) = governance_adapter.set_tags(&tag_target, tags).await {
-                            warn!(
-                                model = %model.config.name,
-                                error = %e,
-                                "apply model governance tags failed"
-                            );
-                        }
-                    }
-                }
+                reconcile_model_governance(
+                    snapshot,
+                    governance_adapter.as_ref(),
+                    &tag_to_strategy,
+                )
+                .await;
             }
 
             // Governance: role-graph reconcile (§1.1 + §1.2 Wave C-1).
@@ -5309,8 +5220,8 @@ fn apply_defer_rewrite(
 /// having detected it. This holds for BOTH a governed agent apply and a bare
 /// `rocky run` (governance is skipped on a partial failure either way). It is the
 /// exact condition the run-path evaluates at the replication `--all` site.
-pub(crate) fn model_phase_ok(
-    exec_result: &anyhow::Result<()>,
+pub(crate) fn model_phase_ok<T>(
+    exec_result: &anyhow::Result<T>,
     failures_before: usize,
     failures_after: usize,
 ) -> bool {
@@ -5510,16 +5421,19 @@ pub(crate) async fn execute_backfill_set(
 
         match exec_result {
             // Finding #1: only when the model phase is CLEAN (no new soft failures).
-            Ok(()) if output.tables_failed == failures_before => {
+            Ok(snapshot) if output.tables_failed == failures_before => {
                 // Re-apply each rebuilt model's `[governance.tags]`, scoped to the
                 // closure so unrelated models are untouched.
+                // #1093: every iteration reuses the ONE snapshot captured at
+                // the fingerprint gate inside `execute_models` — the old
+                // signature fresh-compiled the whole project from disk once
+                // PER model in the closure (N recompiles), and each of those
+                // compiles could pick up a post-execution sidecar edit.
                 let governance_adapter = adapter_registry.governance_adapter(&target_adapter_name);
                 for model in model_set {
                     apply_model_governance_tags(
-                        models_dir,
+                        &snapshot,
                         governance_adapter.as_ref(),
-                        rocky_cfg,
-                        &run_vars,
                         Some(model.as_str()),
                     )
                     .await;
@@ -5527,7 +5441,7 @@ pub(crate) async fn execute_backfill_set(
                 write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
             }
             // Soft model failure — skip governance/manifest, fall through.
-            Ok(()) => {}
+            Ok(_) => {}
             Err(e) => {
                 output.tables_failed += 1;
                 output.errors.push(crate::output::TableErrorOutput {
@@ -5583,6 +5497,198 @@ pub(crate) async fn execute_backfill_set(
         .await
         .with_context(|| "failed to upload remote state after backfill apply (fail-closed)")?;
     exec_result
+}
+
+/// Per-model governance inputs captured from the fingerprint-gated compile
+/// inside [`execute_models`] (#1093).
+///
+/// Mirrors EXACTLY what the post-execution governance reconcile sites read
+/// off `model.config` (the TOML-sourced sidecar config on the compiler's
+/// `Project` models): the three-part target ref, the strategy (which routes
+/// `[governance.tags]` to `ALTER TABLE` vs `ALTER VIEW` via
+/// [`governance_tag_target`]), the per-column `[classification]` map, the
+/// resolved `retention` policy, and the model-level `[governance.tags]`.
+/// Nothing else — the reconcile sites never read SQL, lineage, or IR, so the
+/// snapshot stays a small owned value that can be threaded out of the
+/// execution choke-point.
+#[derive(Debug, Clone)]
+pub(crate) struct GovernedModelGovernance {
+    /// `model.config.name` — drives the `only_model` scoping and warn logs.
+    pub name: String,
+    /// `model.config.target.catalog`.
+    pub target_catalog: String,
+    /// `model.config.target.schema`.
+    pub target_schema: String,
+    /// `model.config.target.table`.
+    pub target_table: String,
+    /// `model.config.strategy` — view-format models tag via `ALTER VIEW`.
+    pub strategy: rocky_core::models::StrategyConfig,
+    /// `model.config.classification` — column → classification tag.
+    pub classification: BTreeMap<String, String>,
+    /// `model.config.retention` — resolved day-count policy, if declared.
+    pub retention: Option<rocky_core::retention::RetentionPolicy>,
+    /// `model.config.governance.tags` — model-level `[governance.tags]`.
+    pub governance_tags: BTreeMap<String, String>,
+}
+
+/// The governance inputs of the exact compiled set [`execute_models`]
+/// executed, captured at the fingerprint-gate position (#1093).
+///
+/// The post-execution reconcile sites (the replication/DAG classification +
+/// masking + retention + tags reconcile, and [`apply_model_governance_tags`]
+/// on the model-only / backfill / transformation paths) iterate THIS snapshot
+/// instead of fresh-compiling the models from disk — so a post-execution edit
+/// to a `.sql`/`.toml` sidecar can no longer change what governance is
+/// applied out from under the fingerprint that gated execution.
+///
+/// Deliberately carries only the disk-sourced per-model sidecar inputs. The
+/// env-resolved mask mapping (`resolve_mask_for_env`) is NOT captured here:
+/// it derives from the `rocky.toml` config, which is already swap-immune at
+/// the reconcile sites post-#1120 (one owned config instance threads the whole
+/// run), so it stays computed at the reconcile site from that threaded config.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GovernanceSnapshot {
+    /// One entry per compiled model, in the compiler's model order.
+    pub models: Vec<GovernedModelGovernance>,
+}
+
+impl GovernanceSnapshot {
+    /// Capture the governance inputs of `models` — the compiled set the
+    /// fingerprint gate verified (when governed), before defer mutates SQL.
+    pub(crate) fn capture(models: &[rocky_core::models::Model]) -> Self {
+        Self {
+            models: models
+                .iter()
+                .map(|model| GovernedModelGovernance {
+                    name: model.config.name.clone(),
+                    target_catalog: model.config.target.catalog.clone(),
+                    target_schema: model.config.target.schema.clone(),
+                    target_table: model.config.target.table.clone(),
+                    strategy: model.config.strategy.clone(),
+                    classification: model.config.classification.clone(),
+                    retention: model.config.retention,
+                    governance_tags: model.config.governance.tags.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Post-execution governance reconcile over the gated snapshot — the
+/// classification-tag + masking + retention + `[governance.tags]` loop the
+/// full-replication/DAG path runs after a clean model phase (§1.1 + §1.2).
+///
+/// #1093: iterates the [`GovernanceSnapshot`] captured inside
+/// [`execute_models`] at the fingerprint gate — never a fresh disk compile —
+/// with the SAME adapter calls in the SAME order the recompile-driven loop
+/// made: `apply_column_tags` → `apply_masking_policy` →
+/// `apply_retention_policy` → `set_tags`, per model, in compiled model order.
+/// `tag_to_strategy` is the env-resolved `[mask]`/`[mask.<env>]` mapping,
+/// resolved by the caller from the THREADED config (swap-immune post-#1120 —
+/// see [`GovernanceSnapshot`]); the snapshot carries only the disk-sourced
+/// sidecar inputs.
+///
+/// Surfacing parity with the removed recompile: the old site pattern-matched
+/// `Some(Ok(gov_compile))` and read only `project.models` — every diagnostic
+/// (and any compile `Err`) was discarded, so reading off the snapshot
+/// surfaces nothing that was previously surfaced. Best-effort throughout:
+/// failures warn but never abort, mirroring the `apply_grants` semantics.
+pub(crate) async fn reconcile_model_governance(
+    snapshot: &GovernanceSnapshot,
+    governance_adapter: &dyn GovernanceAdapter,
+    tag_to_strategy: &BTreeMap<String, rocky_ir::MaskStrategy>,
+) {
+    for model in &snapshot.models {
+        let table_ref = TableRef {
+            catalog: model.target_catalog.clone(),
+            schema: model.target_schema.clone(),
+            table: model.target_table.clone(),
+        };
+
+        // --- Classification tags + masking (Wave A) ---
+        if !model.classification.is_empty() {
+            let mut column_tags: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+            for (col, tag) in &model.classification {
+                let mut m = BTreeMap::new();
+                m.insert("classification".to_string(), tag.clone());
+                column_tags.insert(col.clone(), m);
+            }
+            if let Err(e) = governance_adapter
+                .apply_column_tags(&table_ref, &column_tags)
+                .await
+            {
+                warn!(
+                    model = %model.name,
+                    error = %e,
+                    "apply column classification tags failed"
+                );
+            }
+
+            let mut column_strategies: BTreeMap<String, MaskStrategy> = BTreeMap::new();
+            for (col, tag) in &model.classification {
+                if let Some(strategy) = tag_to_strategy.get(tag) {
+                    column_strategies.insert(col.clone(), *strategy);
+                }
+            }
+            if !column_strategies.is_empty() {
+                let policy = MaskingPolicy { column_strategies };
+                if let Err(e) = governance_adapter
+                    .apply_masking_policy(&table_ref, &policy, "default")
+                    .await
+                {
+                    warn!(
+                        model = %model.name,
+                        error = %e,
+                        "apply column masking policy failed"
+                    );
+                }
+            }
+        }
+
+        // --- Data retention policy (Wave C-2) ---
+        //
+        // Sidecar `retention = "<N>[dy]"` resolved to a typed
+        // RetentionPolicy at parse time. Forward to the governance
+        // adapter; best-effort — failure warns but does not abort the
+        // run, matching the classification/masking contract above.
+        if let Some(retention) = model.retention
+            && let Err(e) = governance_adapter
+                .apply_retention_policy(&table_ref, &retention)
+                .await
+        {
+            warn!(
+                model = %model.name,
+                duration_days = retention.duration_days,
+                error = %e,
+                "apply retention policy failed"
+            );
+        }
+
+        // --- Per-model governance tags ---
+        //
+        // Apply each model's `[governance.tags]` to its target securable.
+        // The `--all`/`--models` path is one of the entry points the SDK /
+        // Dagster drive; without this its tags were silently dropped (only
+        // the full-DAG transformation path applied them). Strategy-aware
+        // dispatch mirrors [`apply_model_governance_tags`]; best-effort — a
+        // failure warns but never aborts. No-op on DuckDB's Noop adapter.
+        let tags = &model.governance_tags;
+        if !tags.is_empty() {
+            let tag_target = governance_tag_target(
+                &model.strategy,
+                &model.target_catalog,
+                &model.target_schema,
+                &model.target_table,
+            );
+            if let Err(e) = governance_adapter.set_tags(&tag_target, tags).await {
+                warn!(
+                    model = %model.name,
+                    error = %e,
+                    "apply model governance tags failed"
+                );
+            }
+        }
+    }
 }
 
 #[tracing::instrument(skip_all, name = "execute_models")]
@@ -5673,7 +5779,7 @@ pub(crate) async fn execute_models(
     // that path never masks would falsely refuse. The plan side computes the same
     // value from the resolved pipeline type, keeping the fingerprint symmetric.
     reconciles_masks: bool,
-) -> Result<()> {
+) -> Result<GovernanceSnapshot> {
     info!(models_dir = %models_dir.display(), "compiling and executing transformation models");
 
     // Build the run-scoped classified-retry plan once. The budget + breaker
@@ -5757,11 +5863,15 @@ pub(crate) async fn execute_models(
             // A whole-project compile failure (couldn't even produce a
             // result — bad models dir, unparseable project) means nothing
             // can execute. Surface it as a first-class run failure instead
-            // of returning `Ok(())`: record an error entry + bump
+            // of returning a bare `Ok`: record an error entry + bump
             // `tables_failed` so `derive_run_status()` yields `Failure`,
             // the caller emits the JSON, and the process exits non-zero.
             // Without this a broken project reported `status: "Success"`,
-            // exit 0, with zero data materialized.
+            // exit 0, with zero data materialized. The default (empty)
+            // snapshot is correct here: nothing compiled, so there is
+            // nothing for a caller to reconcile — and every caller
+            // additionally gates governance on a CLEAN model phase, which
+            // the `tables_failed` bump above already vetoes.
             warn!(error = %e, "model compilation failed — no models can execute");
             output.tables_failed += 1;
             output.errors.push(crate::output::TableErrorOutput {
@@ -5770,7 +5880,7 @@ pub(crate) async fn execute_models(
                 failure_kind: crate::output::FailureKind::CompileError,
                 cooldown_seconds: None,
             });
-            return Ok(());
+            return Ok(GovernanceSnapshot::default());
         }
     };
 
@@ -5815,6 +5925,16 @@ pub(crate) async fn execute_models(
         );
         gate.verify(&compile_result.project.models, &extras)?;
     }
+
+    // #1093: capture the governance snapshot HERE — position-keyed to the
+    // fingerprint gate above (the verify runs only on governed paths; this
+    // capture is unconditional at this position) and BEFORE the `--defer`
+    // rewrite below mutates any SQL — so the snapshot reflects the exact
+    // gated, pre-defer compiled set. The post-execution reconcile sites
+    // consume THIS value instead of fresh-compiling from disk, so a
+    // post-execution `.sql`/`.toml` edit cannot change what governance is
+    // applied out from under the fingerprint that gated execution.
+    let governance_snapshot = GovernanceSnapshot::capture(&compile_result.project.models);
 
     // Per-model compile errors are first-class run failures, not silent
     // skips. Each model that fails to type-check (e.g. E020 — a
@@ -7086,7 +7206,7 @@ pub(crate) async fn execute_models(
     }
 
     info!(models = models_executed, "model execution complete");
-    Ok(())
+    Ok(governance_snapshot)
 }
 
 /// Build the static `read-identity → target catalog.schema.table` lookup the
@@ -7653,66 +7773,51 @@ fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static 
 /// succeeds, so this is a reachable no-op there.
 ///
 /// Best-effort: a tag failure warns but never aborts the run, mirroring the
-/// classification/retention governance posture on the replication path. The
-/// model set is re-compiled here (mirroring the classification/masking
-/// reconcile idiom) rather than threading resolved configs out of
-/// [`execute_models`], keeping that hot path's signature unchanged.
+/// classification/retention governance posture on the replication path.
+///
+/// #1093: reads the [`GovernanceSnapshot`] the caller's [`execute_models`]
+/// captured at the fingerprint gate — the internal recompile this function
+/// used to run is gone, so a post-execution sidecar edit cannot change which
+/// tags are applied. The old compile inputs (`models_dir`, the config's
+/// mask/classification/freshness sections, `run_vars`) fed only that deleted
+/// compile, so they drop out of the signature. Surfacing parity holds: the
+/// old `Err` arm warn-and-dropped the compile error and the `Ok` arm read
+/// only `project.models` (this function has no `output` parameter, so it
+/// never could surface diagnostics) — snapshot-driven, the `Err` arm simply
+/// disappears and nothing previously surfaced is lost.
 ///
 /// `only_model` scopes application to a single built model: `Some(name)` for
 /// the `rocky run --model <X>` path (which builds only `X`, so tagging
-/// unrelated, unbuilt models would target tables this run never created),
-/// `None` for the full-DAG transformation and replication `--all`/`--models`
-/// paths (which build every model).
+/// unrelated, unbuilt models would target tables this run never created) and
+/// the per-model backfill loop, `None` for the full-DAG transformation and
+/// replication `--all`/`--models` paths (which build every model).
 pub(crate) async fn apply_model_governance_tags(
-    models_dir: &Path,
+    snapshot: &GovernanceSnapshot,
     governance_adapter: &dyn GovernanceAdapter,
-    rocky_cfg: &rocky_core::config::RockyConfig,
-    run_vars: &rocky_core::run_vars::RunVars,
     only_model: Option<&str>,
 ) {
-    let governance_compile =
-        rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
-            models_dir: models_dir.to_path_buf(),
-            contracts_dir: None,
-            source_schemas: std::collections::HashMap::new(),
-            source_column_info: std::collections::HashMap::new(),
-            mask: rocky_cfg.mask.clone(),
-            allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
-            project_freshness_default: rocky_cfg.freshness.has_default(),
-            // Resolve `@var()` on the governance reconcile compile too, so it
-            // doesn't re-read raw markers and spuriously report every variable
-            // as missing.
-            run_vars: run_vars.clone(),
-        });
-    match governance_compile {
-        Ok(gov_compile) => {
-            for model in &gov_compile.project.models {
-                if let Some(name) = only_model
-                    && model.config.name != name
-                {
-                    continue;
-                }
-                let tags = &model.config.governance.tags;
-                if tags.is_empty() {
-                    continue;
-                }
-                let target = governance_tag_target(
-                    &model.config.strategy,
-                    &model.config.target.catalog,
-                    &model.config.target.schema,
-                    &model.config.target.table,
-                );
-                if let Err(e) = governance_adapter.set_tags(&target, tags).await {
-                    warn!(
-                        model = %model.config.name,
-                        error = %e,
-                        "apply model governance tags failed"
-                    );
-                }
-            }
+    for model in &snapshot.models {
+        if let Some(name) = only_model
+            && model.name != name
+        {
+            continue;
         }
-        Err(e) => {
-            warn!(error = %e, "governance compile failed; skipping model tag application");
+        let tags = &model.governance_tags;
+        if tags.is_empty() {
+            continue;
+        }
+        let target = governance_tag_target(
+            &model.strategy,
+            &model.target_catalog,
+            &model.target_schema,
+            &model.target_table,
+        );
+        if let Err(e) = governance_adapter.set_tags(&target, tags).await {
+            warn!(
+                model = %model.name,
+                error = %e,
+                "apply model governance tags failed"
+            );
         }
     }
 }
@@ -12246,12 +12351,27 @@ merge_keys = ["id"]
     }
 
     /// Counting [`GovernanceAdapter`] test double — records the table/view
-    /// name of every `set_tags` call so a test can assert exactly which
-    /// models were tagged. Every other trait method is an inert `Ok`.
+    /// name of every `set_tags` call (`tagged`) so a test can assert exactly
+    /// which models were tagged, plus an ordered `calls` transcript of every
+    /// governance-relevant call WITH its payload (tags, per-column
+    /// classifications, mask strategies, retention days), so the #1093
+    /// snapshot tests can assert both the exact values applied and the exact
+    /// call sequence. Every other trait method is an inert `Ok`.
     #[cfg(feature = "duckdb")]
     #[derive(Default)]
     struct CountingGovernance {
         tagged: std::sync::Mutex<Vec<String>>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    /// Render a `BTreeMap<String, String>` as a stable `k=v,...` payload for
+    /// the [`CountingGovernance`] call transcript (BTreeMap ⇒ deterministic).
+    #[cfg(feature = "duckdb")]
+    fn fmt_str_map(map: &std::collections::BTreeMap<String, String>) -> String {
+        map.iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     #[cfg(feature = "duckdb")]
@@ -12260,7 +12380,7 @@ merge_keys = ["id"]
         async fn set_tags(
             &self,
             target: &TagTarget,
-            _tags: &std::collections::BTreeMap<String, String>,
+            tags: &std::collections::BTreeMap<String, String>,
         ) -> rocky_core::traits::AdapterResult<()> {
             let name = match target {
                 TagTarget::Table { table, .. } => table.clone(),
@@ -12268,7 +12388,59 @@ merge_keys = ["id"]
                 TagTarget::Catalog(catalog) => catalog.clone(),
                 TagTarget::Schema { schema, .. } => schema.clone(),
             };
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_tags:{name}:{}", fmt_str_map(tags)));
             self.tagged.lock().unwrap().push(name);
+            Ok(())
+        }
+        async fn apply_column_tags(
+            &self,
+            table: &TableRef,
+            column_tags: &std::collections::BTreeMap<
+                String,
+                std::collections::BTreeMap<String, String>,
+            >,
+        ) -> rocky_core::traits::AdapterResult<()> {
+            let payload = column_tags
+                .iter()
+                .map(|(col, tags)| format!("{col}:[{}]", fmt_str_map(tags)))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("column_tags:{}:{payload}", table.table));
+            Ok(())
+        }
+        async fn apply_masking_policy(
+            &self,
+            table: &TableRef,
+            policy: &MaskingPolicy,
+            env: &str,
+        ) -> rocky_core::traits::AdapterResult<()> {
+            let payload = policy
+                .column_strategies
+                .iter()
+                .map(|(col, strategy)| format!("{col}={strategy:?}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("mask:{}:{env}:{payload}", table.table));
+            Ok(())
+        }
+        async fn apply_retention_policy(
+            &self,
+            table: &TableRef,
+            retention: &rocky_core::retention::RetentionPolicy,
+        ) -> rocky_core::traits::AdapterResult<()> {
+            self.calls.lock().unwrap().push(format!(
+                "retention:{}:{}",
+                table.table, retention.duration_days
+            ));
             Ok(())
         }
         async fn get_grants(
@@ -12306,6 +12478,21 @@ merge_keys = ["id"]
         }
     }
 
+    /// Compile `models_dir` and capture a [`super::GovernanceSnapshot`] from
+    /// the compiled set — the same `capture` the production gate position in
+    /// `execute_models` runs, so snapshot-level tests exercise the real
+    /// sidecar-parse → capture path rather than hand-built structs.
+    #[cfg(feature = "duckdb")]
+    fn capture_snapshot(models_dir: &std::path::Path) -> super::GovernanceSnapshot {
+        let compile_result =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir: models_dir.to_path_buf(),
+                ..Default::default()
+            })
+            .expect("compile test project");
+        super::GovernanceSnapshot::capture(&compile_result.project.models)
+    }
+
     /// `apply_model_governance_tags` reaches the apply loop and applies each
     /// tagged model's `[governance.tags]` — and the `only_model` filter scopes
     /// application to the single built model, never the whole project. This is
@@ -12322,21 +12509,14 @@ merge_keys = ["id"]
         write_tagged_model(&models, "beta", "SELECT 2 AS id");
         write_plain_model(&models, "gamma", "SELECT 3 AS id");
 
-        // Minimal config — the helper only reads `mask`, `classifications`,
-        // and `freshness`, which a bare DuckDB config leaves at defaults.
-        std::fs::write(
-            dir.path().join("rocky.toml"),
-            "[adapter]\ntype = \"duckdb\"\npath = \"t.duckdb\"\n",
-        )
-        .unwrap();
-        let cfg = rocky_core::config::parse_rocky_config(&dir.path().join("rocky.toml"))
-            .expect("parse minimal config");
-        let vars = rocky_core::run_vars::RunVars::new();
+        // #1093: the snapshot captured from the gated compile is the ONLY
+        // model-set input — the function no longer takes a models dir/config.
+        let snapshot = capture_snapshot(&models);
 
         // `None` (full-DAG / replication `--all`): every tagged model is
         // tagged; the untagged one is skipped.
         let gov = CountingGovernance::default();
-        super::apply_model_governance_tags(&models, &gov, &cfg, &vars, None).await;
+        super::apply_model_governance_tags(&snapshot, &gov, None).await;
         let mut tagged = gov.tagged.lock().unwrap().clone();
         tagged.sort();
         assert_eq!(
@@ -12348,7 +12528,7 @@ merge_keys = ["id"]
         // `Some(alpha)`: exactly one `set_tags`, for alpha only — beta must
         // NOT be tagged even though it carries tags (it isn't built this run).
         let gov = CountingGovernance::default();
-        super::apply_model_governance_tags(&models, &gov, &cfg, &vars, Some("alpha")).await;
+        super::apply_model_governance_tags(&snapshot, &gov, Some("alpha")).await;
         assert_eq!(
             *gov.tagged.lock().unwrap(),
             vec!["alpha".to_string()],
@@ -12357,10 +12537,305 @@ merge_keys = ["id"]
 
         // `Some(gamma)`: gamma has no tags, so zero `set_tags`.
         let gov = CountingGovernance::default();
-        super::apply_model_governance_tags(&models, &gov, &cfg, &vars, Some("gamma")).await;
+        super::apply_model_governance_tags(&snapshot, &gov, Some("gamma")).await;
         assert!(
             gov.tagged.lock().unwrap().is_empty(),
             "an untagged target issues no set_tags"
+        );
+    }
+
+    /// 🔴 #1093 KILL-CHECK: a sidecar edit AFTER the snapshot capture does NOT
+    /// change what governance is applied — the reconcile reads the gated
+    /// snapshot, never a fresh disk compile.
+    ///
+    /// Layer: `apply_model_governance_tags` driven directly with a snapshot
+    /// captured before the edit (a full run with a mid-run edit is racy; this
+    /// function is the exact consumer all three production paths call after
+    /// `execute_models` returns). RED before this stage — verified against
+    /// the pre-change code with an inverted assertion: the old
+    /// `(models_dir, cfg, run_vars)` signature fresh-compiled from disk and
+    /// the adapter received `domain=post_edit`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn post_gate_edit_does_not_change_applied_governance() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        write_tagged_model(&models, "alpha", "SELECT 1 AS id");
+
+        // Capture at the gate position (pre-edit): domain=finance.
+        let snapshot = capture_snapshot(&models);
+
+        // Post-execution sidecar edit: swap the tag value AND add a
+        // classification — the old code would have applied both.
+        std::fs::write(
+            models.join("alpha.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n\n[classification]\nid = \"pii\"\n\n[governance.tags]\ndomain = \"post_edit\"\n",
+        )
+        .unwrap();
+
+        let gov = CountingGovernance::default();
+        super::apply_model_governance_tags(&snapshot, &gov, None).await;
+        let calls = gov.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec!["set_tags:alpha:domain=finance".to_string()],
+            "the adapter must receive the PRE-edit gated values — a fresh disk \
+             compile would have applied domain=post_edit"
+        );
+    }
+
+    /// Write a model exercising the FULL governance surface: per-column
+    /// `[classification]`, a `retention` policy, and `[governance.tags]`.
+    #[cfg(feature = "duckdb")]
+    fn write_governed_model(dir: &std::path::Path, name: &str, sql: &str) {
+        std::fs::write(dir.join(format!("{name}.sql")), format!("{sql}\n"))
+            .expect("write model sql");
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            "retention = \"90d\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n\n[classification]\nemail = \"pii\"\nnote = \"internal\"\n\n[governance.tags]\ndomain = \"finance\"\ntier = \"gold\"\n",
+        )
+        .expect("write model toml");
+    }
+
+    /// 🔴 #1093 golden parity: on a clean project (no mid-run edit), the
+    /// snapshot-driven reconcile issues EXACTLY the adapter call sequence the
+    /// removed recompile-driven reconcile issued — classification column tags,
+    /// masking policies, retention, and `[governance.tags]`, per model, in
+    /// order.
+    ///
+    /// Golden method: the OLD code path shape is replicated in-test — a fresh
+    /// `rocky_compiler` compile of the same project followed by the verbatim
+    /// per-model loop the pre-#1093 reconcile ran over `model.config` — and
+    /// its recorded transcript is the golden the snapshot-driven
+    /// [`super::reconcile_model_governance`] must equal.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn snapshot_reconcile_golden_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        write_governed_model(&models, "pii_users", "SELECT 'a' AS email, 'n' AS note");
+        write_tagged_model(&models, "fct_orders", "SELECT 1 AS id");
+        write_plain_model(&models, "untagged", "SELECT 2 AS id");
+
+        // The env-resolved `[mask]` mapping — computed at the reconcile site
+        // from the threaded config in production; fixed here so both drivers
+        // see the identical mapping. `internal` is deliberately unmapped so
+        // the strategy-filtering leg (classification tag without a mask) is
+        // exercised.
+        let tag_to_strategy: std::collections::BTreeMap<String, rocky_ir::MaskStrategy> =
+            [("pii".to_string(), rocky_ir::MaskStrategy::Hash)]
+                .into_iter()
+                .collect();
+
+        // GOLDEN: the recompile-driven sequence — the verbatim pre-#1093 loop
+        // over a fresh compile's `model.config`.
+        let golden_gov = CountingGovernance::default();
+        let gov_compile =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir: models.to_path_buf(),
+                ..Default::default()
+            })
+            .expect("governance compile");
+        for model in &gov_compile.project.models {
+            let table_ref = TableRef {
+                catalog: model.config.target.catalog.clone(),
+                schema: model.config.target.schema.clone(),
+                table: model.config.target.table.clone(),
+            };
+            if !model.config.classification.is_empty() {
+                let mut column_tags: std::collections::BTreeMap<
+                    String,
+                    std::collections::BTreeMap<String, String>,
+                > = std::collections::BTreeMap::new();
+                for (col, tag) in &model.config.classification {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert("classification".to_string(), tag.clone());
+                    column_tags.insert(col.clone(), m);
+                }
+                golden_gov
+                    .apply_column_tags(&table_ref, &column_tags)
+                    .await
+                    .unwrap();
+                let mut column_strategies: std::collections::BTreeMap<
+                    String,
+                    rocky_ir::MaskStrategy,
+                > = std::collections::BTreeMap::new();
+                for (col, tag) in &model.config.classification {
+                    if let Some(strategy) = tag_to_strategy.get(tag) {
+                        column_strategies.insert(col.clone(), *strategy);
+                    }
+                }
+                if !column_strategies.is_empty() {
+                    let policy = MaskingPolicy { column_strategies };
+                    golden_gov
+                        .apply_masking_policy(&table_ref, &policy, "default")
+                        .await
+                        .unwrap();
+                }
+            }
+            if let Some(retention) = model.config.retention {
+                golden_gov
+                    .apply_retention_policy(&table_ref, &retention)
+                    .await
+                    .unwrap();
+            }
+            let tags = &model.config.governance.tags;
+            if !tags.is_empty() {
+                let tag_target = super::governance_tag_target(
+                    &model.config.strategy,
+                    &model.config.target.catalog,
+                    &model.config.target.schema,
+                    &model.config.target.table,
+                );
+                golden_gov.set_tags(&tag_target, tags).await.unwrap();
+            }
+        }
+        let golden = golden_gov.calls.lock().unwrap().clone();
+        assert!(
+            golden.iter().any(|c| c.starts_with("column_tags:"))
+                && golden.iter().any(|c| c.starts_with("mask:"))
+                && golden.iter().any(|c| c.starts_with("retention:"))
+                && golden.iter().any(|c| c.starts_with("set_tags:")),
+            "golden must cover all four adapter surfaces, got: {golden:?}"
+        );
+
+        // NEW: the snapshot-driven reconcile over the captured gated set.
+        let snapshot = capture_snapshot(&models);
+        let snapshot_gov = CountingGovernance::default();
+        super::reconcile_model_governance(&snapshot, &snapshot_gov, &tag_to_strategy).await;
+        assert_eq!(
+            *snapshot_gov.calls.lock().unwrap(),
+            golden,
+            "the snapshot-driven reconcile must issue the exact recompile-driven sequence"
+        );
+    }
+
+    /// 🔴 #1093 KILL-CHECK (the replication/DAG reconcile site): a sidecar
+    /// edit after the gated capture does not change what the full reconcile
+    /// (classification + masking + retention + tags) applies.
+    ///
+    /// Layer: [`super::reconcile_model_governance`] — the factored-out loop
+    /// the `--all`/DAG path now calls with the snapshot threaded out of
+    /// `execute_models` (the pre-#1093 site inline-compiled from disk at this
+    /// exact position; RED before via the same disk-compile mechanism the
+    /// pre-change drill demonstrated).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn replication_reconcile_uses_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        write_governed_model(&models, "pii_users", "SELECT 'a' AS email, 'n' AS note");
+
+        let snapshot = capture_snapshot(&models);
+
+        // Post-execution sidecar edit: different classification set, longer
+        // retention, different tag — everything the reconcile applies.
+        std::fs::write(
+            models.join("pii_users.toml"),
+            "retention = \"365d\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n\n[classification]\nemail = \"internal\"\n\n[governance.tags]\ndomain = \"post_edit\"\n",
+        )
+        .unwrap();
+
+        let tag_to_strategy: std::collections::BTreeMap<String, rocky_ir::MaskStrategy> =
+            [("pii".to_string(), rocky_ir::MaskStrategy::Hash)]
+                .into_iter()
+                .collect();
+        let gov = CountingGovernance::default();
+        super::reconcile_model_governance(&snapshot, &gov, &tag_to_strategy).await;
+        assert_eq!(
+            *gov.calls.lock().unwrap(),
+            vec![
+                "column_tags:pii_users:email:[classification=pii],note:[classification=internal]"
+                    .to_string(),
+                "mask:pii_users:default:email=Hash".to_string(),
+                "retention:pii_users:90".to_string(),
+                "set_tags:pii_users:domain=finance,tier=gold".to_string(),
+            ],
+            "the reconcile must apply the PRE-edit gated values — a fresh disk \
+             compile would have applied the edited classification/retention/tags"
+        );
+    }
+
+    /// 🔴 #1093 backfill: the per-model loop reuses the ONE snapshot captured
+    /// at the gate — the adapter sees BOTH closure models' pre-edit tags, and
+    /// (implicitly) no per-model recompile happens: the pre-#1093 signature
+    /// fresh-compiled the project once per closure model, and any of those
+    /// compiles would have picked up the post-execution edits below.
+    ///
+    /// Layer: the exact loop shape `execute_backfill_set`'s captured block
+    /// runs — `for model in model_set { apply_model_governance_tags(&snapshot,
+    /// …, Some(model)) }` — driven directly with a snapshot captured before
+    /// the edits.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn backfill_reconcile_single_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        write_tagged_model(&models, "alpha", "SELECT 1 AS id");
+        write_tagged_model(&models, "beta", "SELECT 2 AS id");
+
+        let snapshot = capture_snapshot(&models);
+
+        // Post-execution edits to BOTH sidecars.
+        for name in ["alpha", "beta"] {
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n\n[governance.tags]\ndomain = \"post_edit\"\n",
+            )
+            .unwrap();
+        }
+
+        let model_set: std::collections::BTreeSet<String> =
+            ["alpha".to_string(), "beta".to_string()]
+                .into_iter()
+                .collect();
+        let gov = CountingGovernance::default();
+        for model in &model_set {
+            super::apply_model_governance_tags(&snapshot, &gov, Some(model.as_str())).await;
+        }
+        assert_eq!(
+            *gov.calls.lock().unwrap(),
+            vec![
+                "set_tags:alpha:domain=finance".to_string(),
+                "set_tags:beta:domain=finance".to_string(),
+            ],
+            "both closure models must receive their PRE-edit tags off the one snapshot"
+        );
+    }
+
+    /// #1093: the whole-project compile-failure early return in
+    /// `execute_models` yields `Ok` with the DEFAULT (empty) snapshot — and
+    /// the callers' clean-phase gating is unchanged: the recorded compile
+    /// failure makes [`super::model_phase_ok`] read false, so no governance
+    /// would be applied off the empty snapshot anyway.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn execute_models_early_returns_yield_default_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately nonexistent models dir → whole-project compile failure.
+        let missing = dir.path().join("no_such_models");
+        let db_path = dir.path().join("t.duckdb");
+        let (output, result) = run_models_against_duckdb(&missing, &db_path, false, 1).await;
+
+        let snapshot = result.expect("compile failure is carried in output, not Err");
+        assert!(
+            snapshot.models.is_empty(),
+            "the early return must yield the default (empty) snapshot"
+        );
+        assert_eq!(output.tables_failed, 1, "compile failure recorded");
+        assert_eq!(
+            output.errors[0].asset_key,
+            vec!["<compile>".to_string()],
+            "the whole-project compile failure entry is recorded"
+        );
+        // Callers gate governance on a CLEAN phase — unchanged.
+        assert!(
+            !super::model_phase_ok(&Ok::<_, anyhow::Error>(snapshot), 0, output.tables_failed),
+            "the recorded failure keeps the governance gate closed"
         );
     }
 
@@ -12374,7 +12849,7 @@ merge_keys = ["id"]
         db_path: &std::path::Path,
         concurrent_adapter: bool,
         parallel: u32,
-    ) -> (RunOutput, Result<()>) {
+    ) -> (RunOutput, Result<super::GovernanceSnapshot>) {
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
         let adapter = DuckDbWarehouseAdapter::open(db_path)
@@ -12669,7 +13144,7 @@ merge_keys = ["id"]
         expected_fp: &str,
         resolved_mask: &std::collections::BTreeMap<String, rocky_ir::MaskStrategy>,
         reconciles_masks: bool,
-    ) -> Result<()> {
+    ) -> Result<super::GovernanceSnapshot> {
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
         let gate = crate::commands::apply::ExecFingerprintGate {
             expected: Some(expected_fp.to_string()),
@@ -13240,7 +13715,7 @@ merge_keys = ["id"]
     async fn run_models_with_containment(
         models_dir: &std::path::Path,
         db_path: &std::path::Path,
-    ) -> (RunOutput, Result<()>) {
+    ) -> (RunOutput, Result<super::GovernanceSnapshot>) {
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
         let adapter = DuckDbWarehouseAdapter::open(db_path).expect("open duckdb");
@@ -13284,7 +13759,7 @@ merge_keys = ["id"]
         models_dir: &std::path::Path,
         db_path: &std::path::Path,
         opts: &PartitionRunOptions,
-    ) -> (RunOutput, Result<()>) {
+    ) -> (RunOutput, Result<super::GovernanceSnapshot>) {
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
         let adapter = DuckDbWarehouseAdapter::open(db_path).expect("open duckdb");
@@ -13327,7 +13802,7 @@ merge_keys = ["id"]
         models_dir: &std::path::Path,
         db_path: &std::path::Path,
         parallel: u32,
-    ) -> (RunOutput, Result<()>) {
+    ) -> (RunOutput, Result<super::GovernanceSnapshot>) {
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
         let adapter = DuckDbWarehouseAdapter::open(db_path)

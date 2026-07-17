@@ -184,7 +184,7 @@ PR-C (consistent snapshot) and PR-D (CAS) hook `finalize` and read the base-`Gen
 - **No freeze marker.** `require_synced` fail-closes on `Indeterminate` and the ledger `POLICY_DECISIONS` freeze row is still the read source — the rollout-independent add-wins marker is **PR-F**. An erasable-kill-switch window remains until PR-F.
 - **`Drop` is a resource net, not durability.** A panic between mutation and `finalize` skips the upload; only `restore` and backfill carry explicit upload-on-failure.
 - **#1093 is scoped to the governance-reconcile compiles.** `execute_models` becomes a governance-capture, not the broader within-apply provenance rework — the deferred `#1093` "provenance within apply" residual stays open.
-- **The Load state-path divergence** (`.rocky_state` vs `models/.rocky-state.redb`) is flagged, not unified.
+- ~~**The Load state-path divergence** (`.rocky_state` vs `models/.rocky-state.redb`) is flagged, not unified.~~ **Superseded during implementation:** PR-B ships the unification — `run_load` sessions against the canonical threaded `state_path` and performs the idempotent logical `loaded_files` import from the legacy `<config_dir>/.rocky_state` (selected pipeline's rows only; legacy file left in place with a one-time warn), exactly per the Load insertion-point decision above.
 
 ---
 
