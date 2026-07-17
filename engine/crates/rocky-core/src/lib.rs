@@ -20,6 +20,8 @@ pub mod dedup_analysis;
 pub mod docs;
 pub mod drift;
 pub mod failure_class;
+#[cfg(any(test, feature = "test-support"))]
+pub mod fault_store;
 pub mod hooks;
 pub mod idempotency;
 pub mod imports;
@@ -52,6 +54,8 @@ pub mod source;
 pub mod sql_gen;
 pub mod state;
 pub mod state_sync;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_harness;
 pub mod tests;
 pub mod traits;
 pub mod unified_dag;

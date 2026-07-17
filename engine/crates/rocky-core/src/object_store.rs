@@ -192,6 +192,29 @@ impl ObjectStoreProvider {
         }
     }
 
+    /// Construct a provider around an existing [`ObjectStore`] instance.
+    ///
+    /// Lets callers wrap or derive a store — e.g. layer a decorator (caching,
+    /// metrics, fault injection) over a backend built elsewhere — while
+    /// keeping the provider's key handling identical to a
+    /// [`from_uri`](Self::from_uri)-built provider. `scheme` and `bucket`
+    /// label the provider in logs and error messages only; the store itself
+    /// decides where bytes actually go. `prefix` is joined ahead of every
+    /// relative key exactly as in [`from_uri`](Self::from_uri).
+    pub fn from_store(
+        store: Arc<dyn ObjectStore>,
+        scheme: impl Into<String>,
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+    ) -> Self {
+        Self {
+            store,
+            scheme: scheme.into(),
+            bucket: bucket.into(),
+            prefix: prefix.into(),
+        }
+    }
+
     /// The URI scheme (`"s3"`, `"gs"`, `"file"`, etc.).
     pub fn scheme(&self) -> &str {
         &self.scheme
@@ -483,6 +506,30 @@ mod tests {
             leftover.is_empty(),
             "no .tmp file should remain after an atomic download"
         );
+    }
+
+    /// `from_store` must behave exactly like a `from_uri`-built provider for
+    /// the wrapped backend: keys resolve under the given prefix and the full
+    /// get/put/exists surface round-trips.
+    #[tokio::test]
+    async fn from_store_round_trip() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let provider = ObjectStoreProvider::from_store(Arc::clone(&inner), "s3", "test", "pfx");
+        assert_eq!(provider.scheme(), "s3");
+        assert_eq!(provider.bucket(), "test");
+
+        assert!(!provider.exists("k").await.unwrap());
+        provider
+            .put("k", Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+        assert!(provider.exists("k").await.unwrap());
+        assert_eq!(provider.get("k").await.unwrap().as_ref(), b"payload");
+
+        // The provider wraps the SAME store it was given (no copy): the raw
+        // backend sees the object at the prefix-qualified path.
+        let raw = inner.get(&ObjectPath::from("pfx/k")).await.unwrap();
+        assert_eq!(raw.bytes().await.unwrap().as_ref(), b"payload");
     }
 
     #[test]

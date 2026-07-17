@@ -4139,6 +4139,7 @@ dependencies = [
  "redis",
  "regex",
  "reqwest 0.12.28",
+ "rocky-core",
  "rocky-duckdb",
  "rocky-ir",
  "rocky-sql",

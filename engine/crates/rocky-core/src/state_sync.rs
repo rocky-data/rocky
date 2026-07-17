@@ -135,9 +135,20 @@ fn cloud_provider(
     // `test_support::install`, route every object-store construction to it so
     // the real `upload_state → strip → dispatch → upload_to_object_store` path
     // can be exercised end-to-end without a live cloud client. Production
-    // builds never compile this branch.
-    #[cfg(test)]
+    // builds never compile this branch — the `test-support` feature exists for
+    // test targets only and the `rocky` binary never enables it.
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(provider) = test_support::current_override() {
+        return Ok(provider);
+    }
+
+    // The process-global override (installed by the cross-pod test harness) is
+    // consulted AFTER the thread-local one, so a test that needs a
+    // this-thread-only provider can still shadow a harness-installed global.
+    // Unlike the thread-local seam, this one survives OS-thread hops (e.g.
+    // rocky-cli's `block_on_state_sync` dedicated runtime thread).
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(provider) = test_support::current_global_override() {
         return Ok(provider);
     }
 
@@ -151,16 +162,24 @@ fn cloud_provider(
 }
 
 /// Test-only support for injecting an in-memory object store into the upload
-/// dispatch path. Lets a `#[cfg(test)]` test drive the real
+/// dispatch path. Lets a test drive the real
 /// `upload_state → strip → dispatch → upload_to_object_store → cloud_provider`
 /// chain against [`ObjectStoreProvider::in_memory`] instead of a live cloud
 /// client, so it observes the *actual* remote key the upload path computes
 /// (the round-trip-via-`provider.upload_file` test cannot, because it
 /// precomputes the key and skips dispatch entirely).
-#[cfg(test)]
+///
+/// Two override seams coexist:
+/// - the **thread-local** [`install`] used by this file's unit tests, and
+/// - the **process-global** [`install_global`] used by integration tests
+///   (re-exported via [`super::remote_testing`] under the `test-support`
+///   feature), which is visible from every OS thread and is consulted only
+///   when no thread-local override is installed.
+#[cfg(any(test, feature = "test-support"))]
 mod test_support {
     use super::ObjectStoreProvider;
     use std::cell::{Cell, RefCell};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
 
     thread_local! {
         static PROVIDER_OVERRIDE: RefCell<Option<ObjectStoreProvider>> =
@@ -173,6 +192,7 @@ mod test_support {
 
     /// Arm a one-shot fault so the next `probe_exists` returns `Err`. Consumed
     /// (cleared) on read so it can't leak into a later leg/test on this thread.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn arm_object_store_exists_fault() {
         OBJECT_STORE_EXISTS_FAULT.with(|c| c.set(true));
     }
@@ -184,6 +204,7 @@ mod test_support {
 
     /// Arm a one-shot fault so the next `download_from_valkey` reports a MISS
     /// (`Absent`) without touching a live Valkey peer.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn arm_valkey_miss_fault() {
         VALKEY_MISS_FAULT.with(|c| c.set(true));
     }
@@ -197,6 +218,7 @@ mod test_support {
     /// out on this thread. Returns a clone so the caller retains a handle to
     /// assert on after the upload (the in-memory store is `Arc`-backed, so the
     /// clone shares storage with the installed copy).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn install(provider: ObjectStoreProvider) -> ObjectStoreProvider {
         let handle = provider.clone();
         PROVIDER_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(provider));
@@ -213,11 +235,105 @@ mod test_support {
 
     /// Clear any installed override and armed faults so nothing leaks into a
     /// later test on the same worker thread.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn clear() {
         PROVIDER_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
         OBJECT_STORE_EXISTS_FAULT.with(|c| c.set(false));
         VALKEY_MISS_FAULT.with(|c| c.set(false));
     }
+
+    /// Process-global provider override, consulted by
+    /// [`super::cloud_provider`] AFTER the thread-local one.
+    static GLOBAL_PROVIDER_OVERRIDE: Mutex<Option<ObjectStoreProvider>> = Mutex::new(None);
+
+    /// Serializes tests that install the global override (see
+    /// [`serial_guard`]).
+    static GLOBAL_OVERRIDE_SERIAL: Mutex<()> = Mutex::new(());
+
+    fn lock_global() -> MutexGuard<'static, Option<ObjectStoreProvider>> {
+        GLOBAL_PROVIDER_OVERRIDE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Install `provider` as the PROCESS-GLOBAL provider every
+    /// [`super::cloud_provider`] call resolves to (unless a thread-local
+    /// override shadows it). Returns a guard that clears the override on drop.
+    ///
+    /// Unlike the thread-local [`install`], the global override is visible
+    /// from every OS thread — including the dedicated runtime threads
+    /// rocky-cli's `block_on_state_sync` hops to — so integration tests can
+    /// drive the real download/upload paths end to end.
+    ///
+    /// The override is process-wide shared state: tests that use it must hold
+    /// [`serial_guard`] for their whole duration or they will clobber each
+    /// other's provider.
+    pub fn install_global(provider: ObjectStoreProvider) -> GlobalOverrideGuard {
+        *lock_global() = Some(provider);
+        GlobalOverrideGuard { _priv: () }
+    }
+
+    /// RAII guard returned by [`install_global`]; clears the process-global
+    /// override on drop so nothing leaks into a later test.
+    #[derive(Debug)]
+    pub struct GlobalOverrideGuard {
+        _priv: (),
+    }
+
+    impl Drop for GlobalOverrideGuard {
+        fn drop(&mut self) {
+            *lock_global() = None;
+        }
+    }
+
+    /// Serialize tests that use [`install_global`]: the override is
+    /// process-global, so two concurrently-running tests in one test binary
+    /// would clobber each other's provider. Hold the returned guard for the
+    /// duration of the test. Lock poisoning (a panicking test) is deliberately
+    /// ignored — the next test proceeds with a clean override either way,
+    /// because the panicking test's [`GlobalOverrideGuard`] already cleared it.
+    pub fn serial_guard() -> SerialGuard {
+        SerialGuard(
+            GLOBAL_OVERRIDE_SERIAL
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// Guard returned by [`serial_guard`].
+    ///
+    /// Deliberately a newtype (not a bare `MutexGuard`) because tests hold it
+    /// across `.await` points for their WHOLE duration — that is the entire
+    /// point of the serialization — and that is sound here: contenders are
+    /// other tests' dedicated OS threads blocking in `lock()`, never tasks on
+    /// this test's runtime, so no async task is starved and no deadlock is
+    /// possible. A bare `MutexGuard` would trip `clippy::await_holding_lock`
+    /// in every consuming test file for a pattern that is intentional.
+    #[derive(Debug)]
+    pub struct SerialGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    /// Clone the process-global override, if any. Like [`current_override`],
+    /// cloning (rather than taking) keeps every object-store construction —
+    /// e.g. both legs of a tiered transfer — on the same `Arc`-backed store.
+    pub(super) fn current_global_override() -> Option<ObjectStoreProvider> {
+        lock_global().clone()
+    }
+}
+
+/// Public remote-state testing seams, compiled only with the `test-support`
+/// cargo feature (or for the crate's own tests). The `rocky` binary never
+/// enables the feature, so none of this exists in a release build.
+///
+/// Integration tests (`rocky-core/tests/`, `rocky-cli/tests/`) cannot reach
+/// the crate-private `test_support` seam, and its thread-local override is
+/// invisible to code that hops OS threads. This module re-exports the
+/// process-global override so out-of-crate tests can inject a shared
+/// in-memory (or fault-decorated — see [`crate::fault_store`]) store into the
+/// real state-sync decision paths. See [`crate::test_harness`] for the
+/// ready-made cross-pod harness built on top of it.
+#[cfg(any(test, feature = "test-support"))]
+pub mod remote_testing {
+    pub use super::test_support::{GlobalOverrideGuard, SerialGuard, install_global, serial_guard};
 }
 
 /// Resolve the per-transfer wall-clock budget from `StateConfig`.
@@ -959,7 +1075,7 @@ fn apply_upload_failure_policy(
 /// provider never errors on `exists`, so this is the only in-crate way to prove
 /// the fail-closed propagation is RED before the fix and GREEN after it.
 async fn probe_exists(provider: &ObjectStoreProvider, key: &str) -> Result<bool, StateSyncError> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if test_support::take_object_store_exists_fault() {
         return Err(StateSyncError::S3Download(
             "injected existence-check failure (test seam)".into(),
@@ -1131,7 +1247,7 @@ async fn download_from_valkey(
     // Test seam: force a Valkey MISS without a live Valkey peer, so the tiered
     // fall-through-to-S3 path (and the "stale local file is not a hit" fix) can
     // be exercised deterministically. See [`test_support::arm_valkey_miss_fault`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if test_support::take_valkey_miss_fault() {
         return Ok(DownloadOutcome::Absent);
     }

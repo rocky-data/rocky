@@ -40,9 +40,23 @@ blake3 = { workspace = true }
 # implements it today). The default impl just errors, but the symbol is
 # referenced in the trait signature so the dep stays unconditional.
 arrow = { workspace = true }
+# Only compiled under the `test-support` feature (used by the cross-pod state
+# test harness). Release builds of the `rocky` binary never enable it.
+tempfile = { version = "3", optional = true }
+
+[features]
+# Deterministic remote-state test rig: the fault-injecting object store
+# (`fault_store`), the cross-pod harness (`test_harness`), and the public
+# provider-override seam (`state_sync::remote_testing`). Test-target-only —
+# the `rocky` binary never enables it, so release artifacts are unchanged.
+test-support = ["dep:tempfile"]
 
 [dev-dependencies]
 tempfile = "3"
+# Self-referential dev-dependency: turns `test-support` on for this crate's
+# own test targets, so `cargo test -p rocky-core` compiles the feature-gated
+# integration tests without extra flags.
+rocky-core = { path = ".", features = ["test-support"] }
 rocky-duckdb = { path = "../rocky-duckdb" }
 tokio = { workspace = true }
 # JSON Schema validator used in `tests/adapter_schema.rs` to assert every
@@ -52,6 +66,21 @@ jsonschema = { version = "0.46", default-features = false }
 criterion = { version = "0.8", features = ["html_reports"] }
 # Used by `tests/state_sync_timeout_test.rs` to front-end a hung S3 endpoint.
 wiremock = { workspace = true }
+
+# The remote-state rig tests need the `test-support` seams. The feature is
+# already on for all test targets via the self-referential dev-dependency;
+# `required-features` makes the dependency explicit per target.
+[[test]]
+name = "state_sync_cross_pod"
+required-features = ["test-support"]
+
+[[test]]
+name = "state_sync_live_store"
+required-features = ["test-support"]
+
+[[test]]
+name = "state_sync_s3_live"
+required-features = ["test-support"]
 
 [[bench]]
 name = "dag_execute"
