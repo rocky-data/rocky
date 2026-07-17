@@ -1246,6 +1246,26 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
 }
 
 /// Refine explicit casts by parsing their target types from the model SQL.
+///
+/// Only columns that lineage left `Unknown` **and** that are produced by an
+/// explicit `Cast` edge whose input type is known are refined, substituting the
+/// parsed cast target (so `CAST(id AS STRING) AS id` resolves to `String`, not
+/// the source's pre-cast type — see #1145).
+///
+/// Two deliberate restrictions, both erring toward `Unknown` — the safe
+/// "cannot type-check" state, where a contract on the column is skipped rather
+/// than validated against a fabricated type:
+///
+/// - **No alias-based fallback.** A remaining `Unknown` column is not resolved
+///   by matching its output name against an upstream column. That lookup was
+///   unsound: an expression aliased back to a source name (e.g.
+///   `amount_cents / 100 AS amount`) would inherit the source type even though
+///   the expression can change it. Such columns are left `Unknown`.
+/// - **Unknown input stays Unknown.** The cast target is knowable from the SQL
+///   alone, but the target is only applied when the cast's *input* column
+///   resolves to a known type. This avoids fabricating a type for a cast over a
+///   missing or unresolved column, whose input reads as `Unknown` for the same
+///   reason a broken reference would.
 fn enhanced_inference(
     model_name: &str,
     graph: &SemanticGraph,
@@ -2336,6 +2356,44 @@ mod tests {
                 .iter()
                 .any(|diagnostic| &*diagnostic.code == "E011")
         );
+    }
+
+    #[test]
+    fn test_cast_over_unknown_input_stays_unknown() {
+        // The cast target (`STRING`) is knowable from the SQL alone, but when the
+        // cast's input column resolves to `Unknown` — e.g. a source type Rocky
+        // can't map, or a missing/unresolved reference — the output is left
+        // `Unknown` rather than asserting the parsed target. This is the
+        // conservative branch of the cast-alias fix (#1145): a contract on the
+        // column is skipped instead of validated against a fabricated type.
+        let models = vec![make_model(
+            "cast_unknown",
+            "SELECT CAST(id AS STRING) AS id FROM source.raw.users",
+        )];
+        let project = Project::from_models(models).unwrap();
+
+        let mut external = HashMap::new();
+        external.insert(
+            "source.raw.users".to_string(),
+            vec![rocky_ir::ColumnInfo {
+                name: "id".to_string(),
+                data_type: "SOME_UNMAPPED_TYPE".to_string(),
+                nullable: true,
+            }],
+        );
+        let graph = build_semantic_graph(&project, &external).unwrap();
+
+        // The typed source column resolves to Unknown, so `input_is_known` is
+        // false and the cast output must remain Unknown.
+        let mut sources = HashMap::new();
+        sources.insert(
+            "source.raw.users".to_string(),
+            source_schema(&[("id", RockyType::Unknown, true)]),
+        );
+
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let cast_id = &result.typed_models["cast_unknown"][0];
+        assert_eq!(cast_id.data_type, RockyType::Unknown);
     }
 
     #[test]
