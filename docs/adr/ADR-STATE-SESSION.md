@@ -1,6 +1,6 @@
 # ADR-STATE-SESSION — `RemoteStateSession`, config-snapshot threading, bypass closure, and governance-from-gated-snapshot (#1093)
 
-**Status:** Proposed (PR-0 design gate — stop for maintainer sign-off before implementation)
+**Status:** Accepted (signed off at the PR-0 design gate; implemented by PR-B)
 
 **Work package:** WP-01 (remote-state protocol redesign) · **PR-B (Spine)**
 **Closes:** audit finding **RD-003** (state-sync bypass), issue **#1120** (config-swap TOCTOU), issue **#1093** (governance reconcile fresh-compiles from disk)

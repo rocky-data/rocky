@@ -1527,7 +1527,11 @@ pub(crate) async fn run_gc_apply_in_with(
         .unwrap_or_default();
     let remote_state = !matches!(state_cfg.backend, StateBackend::Local);
     if remote_state {
-        rocky_core::state_sync::download_state(&state_cfg, state_path)
+        // PR-A (RD-001): bind the typed authority — a successful download of
+        // either usable variant means the local ledger now mirrors remote
+        // truth; failure still `?`-bails fail-closed (unchanged). PR-B
+        // branches on the value.
+        let _authority = rocky_core::state_sync::download_state(&state_cfg, state_path)
             .await
             .with_context(|| {
                 "failed to download remote state before gc apply; a remote-backend gc apply \

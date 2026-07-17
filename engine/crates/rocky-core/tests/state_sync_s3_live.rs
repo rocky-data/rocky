@@ -123,9 +123,13 @@ async fn live_round_trip() {
     // "Pod B": download into a fresh dir and read it back.
     let down_dir = tempfile::tempdir().unwrap();
     let down_path = down_dir.path().join(".rocky-state.redb");
-    download_state(&cfg, &down_path)
-        .await
-        .expect("live download");
+    assert_eq!(
+        download_state(&cfg, &down_path)
+            .await
+            .expect("live download"),
+        rocky_core::state_sync::StateAuthority::Authoritative,
+        "the just-uploaded object must restore as Authoritative"
+    );
     {
         let store = StateStore::open(&down_path).unwrap();
         assert!(
