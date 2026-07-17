@@ -185,9 +185,8 @@ pub fn run_branch_list(state_path: &Path, json: bool) -> Result<()> {
 /// whose `schema_override` points at the branch's schema. Mirrors how
 /// `rocky run --branch <name>` wires the same prefix into the write path.
 ///
-/// Branches with no materialized tables yet surface as missing rows/columns
-/// on the production side of the diff rather than crashing — the underlying
-/// compare path uses `unwrap_or_default` for describe/count failures.
+/// Branches with no materialized tables yet surface as failed comparisons
+/// rather than crashing.
 pub async fn run_branch_compare(
     state_path: &Path,
     config_path: &Path,

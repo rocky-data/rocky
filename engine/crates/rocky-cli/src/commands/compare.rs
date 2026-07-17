@@ -101,11 +101,25 @@ pub async fn compare(
             let shadow_target = rocky_core::shadow::shadow_target(&prod_target, shadow_config);
 
             // Get row counts
-            let prod_count = get_row_count(&*adapter, &prod_target).await.unwrap_or(0);
-            let shadow_count = get_row_count(&*adapter, &shadow_target).await.unwrap_or(0);
+            let (prod_count, prod_count_error) = read_or_default(
+                get_row_count(&*adapter, &prod_target).await,
+                &format!(
+                    "failed to read production row count for {}",
+                    prod_target.full_name()
+                ),
+            );
+            let (shadow_count, shadow_count_error) = read_or_default(
+                get_row_count(&*adapter, &shadow_target).await,
+                &format!(
+                    "failed to read shadow row count for {}",
+                    shadow_target.full_name()
+                ),
+            );
+            let counts_read = prod_count_error.is_none() && shadow_count_error.is_none();
 
             let (row_count_match, row_count_diff, row_count_diff_pct) =
                 compare::compare_row_counts(shadow_count, prod_count);
+            let row_count_match = counts_read && row_count_match;
 
             // Get schemas
             let prod_table_ref = rocky_ir::TableRef {
@@ -119,17 +133,24 @@ pub async fn compare(
                 table: shadow_target.table.clone(),
             };
 
-            let prod_cols = adapter
-                .describe_table(&prod_table_ref)
-                .await
-                .unwrap_or_default();
-            let shadow_cols = adapter
-                .describe_table(&shadow_table_ref)
-                .await
-                .unwrap_or_default();
+            let (prod_cols, prod_schema_error) = read_or_default(
+                adapter.describe_table(&prod_table_ref).await,
+                &format!(
+                    "failed to read production schema for {}",
+                    prod_target.full_name()
+                ),
+            );
+            let (shadow_cols, shadow_schema_error) = read_or_default(
+                adapter.describe_table(&shadow_table_ref).await,
+                &format!(
+                    "failed to read shadow schema for {}",
+                    shadow_target.full_name()
+                ),
+            );
+            let schemas_read = prod_schema_error.is_none() && shadow_schema_error.is_none();
 
             let schema_diffs = compare::compare_schemas(&shadow_cols, &prod_cols);
-            let schema_match = schema_diffs.is_empty();
+            let schema_match = schemas_read && schema_diffs.is_empty();
 
             // Build comparison result and evaluate
             let comparison = ComparisonResult {
@@ -145,7 +166,20 @@ pub async fn compare(
                 sample_mismatches: vec![],
             };
 
-            let verdict = compare::evaluate_comparison(&comparison, thresholds);
+            let read_failures: Vec<String> = [
+                prod_count_error,
+                shadow_count_error,
+                prod_schema_error,
+                shadow_schema_error,
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let verdict = if read_failures.is_empty() {
+                compare::evaluate_comparison(&comparison, thresholds)
+            } else {
+                ComparisonVerdict::Fail(read_failures)
+            };
 
             let verdict_str = match &verdict {
                 ComparisonVerdict::Pass => "pass",
@@ -232,7 +266,24 @@ pub async fn compare(
     Ok(())
 }
 
-/// Get row count for a target table, returning 0 if table doesn't exist.
+fn read_or_default<T: Default, E: std::fmt::Display>(
+    result: std::result::Result<T, E>,
+    context: &str,
+) -> (T, Option<String>) {
+    match result {
+        Ok(value) => (value, None),
+        Err(error) => (T::default(), Some(format!("{context}: {error}"))),
+    }
+}
+
+/// Get the row count for a target table.
+///
+/// Returns `Err` when the `COUNT(*)` result is absent or not a non-negative
+/// integer, so a garbled read fails the comparison closed instead of silently
+/// counting as zero. Parsing goes through `cell_as_u64`, which handles the
+/// JSON-integer (Trino), integer-as-string (Databricks/Snowflake/DuckDB), and
+/// integral-float cell shapes adapters return — a bare `as_str()` would drop
+/// numeric cells to `0` and let a real mismatch pass.
 async fn get_row_count(adapter: &dyn WarehouseAdapter, target: &TargetRef) -> Result<u64> {
     let table_name = target
         .validated_full_name()
@@ -242,9 +293,72 @@ async fn get_row_count(adapter: &dyn WarehouseAdapter, target: &TargetRef) -> Re
         .execute_query(&sql)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let count = result.rows[0][0]
-        .as_str()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    Ok(count)
+    rocky_core::checks::cell_as_u64(result.rows.first().and_then(|row| row.first()))
+        .ok_or_else(|| anyhow::anyhow!("COUNT(*) for {table_name} returned no parseable row count"))
+}
+
+#[cfg(all(test, feature = "duckdb"))]
+mod tests {
+    use super::*;
+    use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+    #[tokio::test]
+    async fn unreadable_target_pair_fails_comparison() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let db_path = temp.path().join("compare.duckdb");
+
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&db_path).expect("open DuckDB");
+            adapter
+                .execute_statement("CREATE SCHEMA raw__orders")
+                .await
+                .expect("create source schema");
+            adapter
+                .execute_statement("CREATE TABLE raw__orders.orders (id INTEGER)")
+                .await
+                .expect("create source table");
+        }
+
+        let config_path = temp.path().join("rocky.toml");
+        let escaped_db_path = db_path.to_string_lossy().replace('\\', "\\\\");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{escaped_db_path}"
+
+[pipeline.poc]
+strategy = "full_refresh"
+
+[pipeline.poc.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.poc.target]
+catalog_template = "compare"
+schema_template = "staging__{{source}}"
+"#
+            ),
+        )
+        .expect("write config");
+
+        let error = compare(
+            &config_path,
+            Some("source=orders"),
+            None,
+            &ShadowConfig::default(),
+            &ComparisonThresholds::default(),
+            false,
+        )
+        .await
+        .expect_err("two unreadable targets must not pass comparison");
+
+        assert!(
+            error.to_string().contains("1 table(s) failed comparison"),
+            "unexpected error: {error:#}"
+        );
+    }
 }
