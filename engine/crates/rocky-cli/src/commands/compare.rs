@@ -277,6 +277,13 @@ fn read_or_default<T: Default, E: std::fmt::Display>(
 }
 
 /// Get the row count for a target table.
+///
+/// Returns `Err` when the `COUNT(*)` result is absent or not a non-negative
+/// integer, so a garbled read fails the comparison closed instead of silently
+/// counting as zero. Parsing goes through `cell_as_u64`, which handles the
+/// JSON-integer (Trino), integer-as-string (Databricks/Snowflake/DuckDB), and
+/// integral-float cell shapes adapters return — a bare `as_str()` would drop
+/// numeric cells to `0` and let a real mismatch pass.
 async fn get_row_count(adapter: &dyn WarehouseAdapter, target: &TargetRef) -> Result<u64> {
     let table_name = target
         .validated_full_name()
@@ -286,11 +293,8 @@ async fn get_row_count(adapter: &dyn WarehouseAdapter, target: &TargetRef) -> Re
         .execute_query(&sql)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let count = result.rows[0][0]
-        .as_str()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    Ok(count)
+    rocky_core::checks::cell_as_u64(result.rows.first().and_then(|row| row.first()))
+        .ok_or_else(|| anyhow::anyhow!("COUNT(*) for {table_name} returned no parseable row count"))
 }
 
 #[cfg(all(test, feature = "duckdb"))]
