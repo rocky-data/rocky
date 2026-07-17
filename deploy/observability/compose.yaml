@@ -1,0 +1,107 @@
+# Rocky observability quickstart — single-node LGTM stack (dev-grade).
+#
+# Receives Rocky's OpenTelemetry over OTLP (gRPC :4317 / HTTP :4318 on the
+# host) and renders runs in Grafana. See README.md for the 3-command
+# quickstart. This is NOT a hardened production deployment.
+#
+# Data flow:
+#   rocky (OTLP/gRPC) -> alloy -> tempo   (traces)
+#                             \-> prometheus (metrics, remote-write)
+#                             \-> loki     (logs: OTLP + a file-tail example)
+#   grafana <- tempo / prometheus / loki  (provisioned datasources)
+
+name: rocky-observability
+
+services:
+  # OpenTelemetry collector. The only container that publishes OTLP ports to
+  # the host, so Rocky on the host exports to 127.0.0.1:4317.
+  alloy:
+    image: grafana/alloy:v1.5.1
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    ports:
+      - "4317:4317" # OTLP gRPC  (OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317)
+      - "4318:4318" # OTLP HTTP  (for a synthetic-span smoke test / non-gRPC clients)
+      - "12345:12345" # Alloy diagnostic UI (http://localhost:12345)
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      # Mount the host log directory so the file-tail example can pick up
+      # Rocky's stderr JSON when you redirect it here (see README).
+      - ./logs:/rocky-logs:ro
+      - alloy-data:/var/lib/alloy/data
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+    restart: unless-stopped
+
+  # Trace store + TraceQL search API on :3200.
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    ports:
+      - "3200:3200" # Tempo HTTP API (trace search / evidence curl)
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    restart: unless-stopped
+
+  # Log store on :3100 (native OTLP endpoint at /otlp/v1/logs).
+  loki:
+    image: grafana/loki:3.3.2
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki
+    restart: unless-stopped
+
+  # Metric store on :9090. Remote-write receiver enabled so Alloy can push
+  # the OTLP metrics it converts.
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-remote-write-receiver
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+
+  # Grafana on :3000 (anonymous admin; datasources + dashboard + alerts
+  # provisioned from disk). Default login admin/admin if you disable anon.
+  grafana:
+    image: grafana/grafana:11.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor"
+    volumes:
+      - ./grafana/provisioning/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - ./grafana/provisioning/dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
+      - ./grafana/alerting/rocky-alerts.yaml:/etc/grafana/provisioning/alerting/rocky-alerts.yaml:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  alloy-data:
+  tempo-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:

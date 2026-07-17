@@ -1,0 +1,35 @@
+# Tempo — single-binary, local-filesystem storage (dev-grade).
+# Receives traces over OTLP gRPC on :4317 (in-container) and serves the
+# search/query API on :3200. Short flush windows keep freshly-received
+# traces searchable within a few seconds for the quickstart.
+
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+ingester:
+  # Flush live traces quickly so `rocky` spans are searchable moments after
+  # a run finishes (defaults are minutes; fine for prod, slow for a demo).
+  trace_idle_period: 5s
+  max_block_duration: 10s
+
+compactor:
+  compaction:
+    block_retention: 24h
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+usage_report:
+  reporting_enabled: false

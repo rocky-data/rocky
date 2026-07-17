@@ -1,0 +1,47 @@
+# Loki — single-binary, filesystem storage, TSDB schema v13 (dev-grade).
+# Accepts logs on the native Loki push API (/loki/api/v1/push) and the
+# native OTLP endpoint (/otlp/v1/logs). Structured metadata is enabled so
+# the trace_id extracted from Rocky's stderr JSON can be attached without
+# exploding label cardinality.
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  allow_structured_metadata: true
+  volume_enabled: true
+  retention_period: 24h
+
+compactor:
+  working_directory: /loki/compactor
+  delete_request_store: filesystem
+  retention_enabled: true
+
+analytics:
+  reporting_enabled: false

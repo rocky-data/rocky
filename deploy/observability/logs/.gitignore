@@ -1,0 +1,4 @@
+# Runtime log files land here (see alloy/config.alloy file-tail example).
+# Keep the directory, ignore its contents.
+*
+!.gitignore

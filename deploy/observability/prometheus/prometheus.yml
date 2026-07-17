@@ -1,0 +1,13 @@
+# Prometheus — dev-grade. Metrics arrive via the remote-write receiver
+# (enabled with --web.enable-remote-write-receiver in compose.yaml); Alloy
+# converts Rocky's OTLP metrics and pushes them to /api/v1/write. Prometheus
+# also scrapes itself so the stack is self-observable.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

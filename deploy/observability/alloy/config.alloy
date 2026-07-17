@@ -1,0 +1,137 @@
+// Alloy — OTLP collector for the Rocky quickstart stack.
+//
+// Receives Rocky's OpenTelemetry over OTLP (gRPC :4317 / HTTP :4318) and
+// fans it out:
+//   traces  -> Tempo       (OTLP gRPC, plaintext)
+//   metrics -> Prometheus  (converted to Prometheus, remote-written)
+//   logs    -> Loki        (native OTLP endpoint)
+//
+// A separate file-tail pipeline (bottom of this file) picks up Rocky's
+// stderr JSON logs when you redirect them to ./logs (see README).
+
+// ---------------------------------------------------------------------------
+// OTLP receiver — the endpoint Rocky exports to.
+// ---------------------------------------------------------------------------
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    traces  = [otelcol.exporter.otlp.tempo.input]
+    metrics = [otelcol.exporter.prometheus.default.input]
+    logs    = [otelcol.exporter.otlphttp.loki.input]
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Traces -> Tempo (plaintext OTLP gRPC on the internal network).
+// ---------------------------------------------------------------------------
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "tempo:4317"
+    tls {
+      insecure = true
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Metrics -> Prometheus. Convert OTLP metrics to Prometheus, then
+// remote-write. add_metric_suffixes = false keeps names clean and
+// predictable ("rocky.table_duration_ms" -> "rocky_table_duration_ms")
+// instead of appending unit/type suffixes, so dashboard queries match.
+// ---------------------------------------------------------------------------
+otelcol.exporter.prometheus "default" {
+  add_metric_suffixes = false
+  forward_to          = [prometheus.remote_write.default.receiver]
+}
+
+prometheus.remote_write "default" {
+  endpoint {
+    url = "http://prometheus:9090/api/v1/write"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Logs -> Loki via its native OTLP endpoint. Rocky does not export OTLP
+// logs today (it writes structured JSON to stderr — see the file-tail
+// pipeline below), but this route is wired so any OTLP-logs source, or a
+// future Rocky OTLP-logs exporter, lands in Loki with no config change.
+// ---------------------------------------------------------------------------
+otelcol.exporter.otlphttp "loki" {
+  client {
+    endpoint = "http://loki:3100/otlp"
+  }
+}
+
+// ===========================================================================
+// File-tail example: Rocky's stderr JSON -> Loki.
+//
+// Rocky writes structured JSON log lines to stderr. Redirect them to a file
+// under ./logs (mounted read-only into this container at /rocky-logs) and
+// this pipeline parses each line, promotes `level` to a label, and attaches
+// `trace_id`/`span_id` as structured metadata so a trace in Tempo links to
+// its logs in Loki. Example (from the repo root):
+//
+//   OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 OTEL_SERVICE_NAME=rocky \
+//     rocky run 2> deploy/observability/logs/rocky.jsonl
+// ===========================================================================
+local.file_match "rocky" {
+  path_targets = [{
+    __path__ = "/rocky-logs/*.jsonl",
+    service  = "rocky",
+  }]
+}
+
+loki.source.file "rocky" {
+  targets    = local.file_match.rocky.targets
+  forward_to = [loki.process.rocky.receiver]
+}
+
+loki.process "rocky" {
+  // Rocky's stderr lines are JSON objects with (at least) level/target/
+  // fields; runs with OTel enabled also carry span context.
+  stage.json {
+    expressions = {
+      level    = "level",
+      target   = "target",
+      trace_id = "trace_id",
+      span_id  = "span_id",
+    }
+  }
+
+  // Low-cardinality label only.
+  stage.labels {
+    values = {
+      level = "",
+    }
+  }
+
+  // Trace correlation without label-cardinality blow-up.
+  stage.structured_metadata {
+    values = {
+      trace_id = "",
+      span_id  = "",
+      target   = "",
+    }
+  }
+
+  stage.static_labels {
+    values = {
+      service = "rocky",
+      job     = "rocky-cli",
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
