@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins};
+use sqlparser::ast::{
+    CastKind, Expr, Query, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+};
 use sqlparser::parser::Parser;
 
 use crate::dialect::DatabricksDialect;
@@ -12,12 +14,30 @@ use crate::dialect::DatabricksDialect;
 pub enum TransformKind {
     /// Direct column reference (no transformation).
     Direct,
-    /// Explicit type cast.
+    /// Infallible type cast (`CAST(...)` or `expr :: type`). Preserves the
+    /// input's nullability — a non-null input yields a non-null output.
     Cast,
+    /// Fallible type cast (`TRY_CAST(...)` / `SAFE_CAST(...)`) that returns
+    /// `NULL` when the conversion fails. The output is nullable regardless of
+    /// the input's nullability.
+    TryCast,
     /// Aggregate function (SUM, COUNT, etc.).
     Aggregation(String),
     /// Complex expression (arithmetic, CASE, etc.).
     Expression,
+}
+
+impl TransformKind {
+    /// Whether this edge is a type cast — either the infallible [`Cast`] form or
+    /// the fallible [`TryCast`] form. The two differ only in output nullability;
+    /// both let the compiler recover the cast's target type from the SQL.
+    ///
+    /// [`Cast`]: TransformKind::Cast
+    /// [`TryCast`]: TransformKind::TryCast
+    #[must_use]
+    pub fn is_cast(&self) -> bool {
+        matches!(self, TransformKind::Cast | TransformKind::TryCast)
+    }
 }
 
 impl fmt::Display for TransformKind {
@@ -25,6 +45,7 @@ impl fmt::Display for TransformKind {
         match self {
             TransformKind::Direct => write!(f, "direct"),
             TransformKind::Cast => write!(f, "cast"),
+            TransformKind::TryCast => write!(f, "try_cast"),
             TransformKind::Aggregation(func) => write!(f, "aggregation: {}", func.to_lowercase()),
             TransformKind::Expression => write!(f, "expression"),
         }
@@ -334,9 +355,30 @@ fn extract_expr_lineage(
                 transform: TransformKind::Direct,
             })
         }
-        Expr::Cast { expr, .. } => {
+        Expr::Cast { expr, kind, .. } => {
             let mut lineage = extract_expr_lineage(expr, alias_map, source_tables)?;
-            lineage.transform = TransformKind::Cast;
+            // A fallible cast (`TRY_CAST` / `SAFE_CAST`) yields NULL on a failed
+            // conversion, so its output is nullable even over a non-null input.
+            // Track it distinctly so typecheck doesn't carry the input's
+            // non-null bit through (#1148).
+            lineage.transform = match kind {
+                // Fallible outer cast: nullable output regardless of the inner.
+                CastKind::TryCast | CastKind::SafeCast => TransformKind::TryCast,
+                // Infallible outer cast: fallibility is sticky — an inner edge
+                // already classified `TryCast` (e.g.
+                // `CAST(TRY_CAST(x AS INT) AS BIGINT)`) still returns NULL when
+                // the inner conversion fails, so the output stays nullable. A
+                // cast chain with no fallible link keeps the plain `Cast`
+                // classification (the outer cast's target type is recovered in
+                // typecheck Step 2 either way).
+                CastKind::Cast | CastKind::DoubleColon => {
+                    if lineage.transform == TransformKind::TryCast {
+                        TransformKind::TryCast
+                    } else {
+                        TransformKind::Cast
+                    }
+                }
+            };
             Some(lineage)
         }
         Expr::Function(func) => {
@@ -578,8 +620,72 @@ mod tests {
     }
 
     #[test]
+    fn test_transform_kind_display_try_cast() {
+        assert_eq!(TransformKind::TryCast.to_string(), "try_cast");
+    }
+
+    #[test]
     fn test_transform_kind_display_expression() {
         assert_eq!(TransformKind::Expression.to_string(), "expression");
+    }
+
+    #[test]
+    fn test_transform_kind_is_cast() {
+        assert!(TransformKind::Cast.is_cast());
+        assert!(TransformKind::TryCast.is_cast());
+        assert!(!TransformKind::Direct.is_cast());
+        assert!(!TransformKind::Expression.is_cast());
+        assert!(!TransformKind::Aggregation("SUM".to_string()).is_cast());
+    }
+
+    #[test]
+    fn test_fallible_casts_classified_distinctly() {
+        // TRY_CAST / SAFE_CAST return NULL on a failed conversion, so lineage
+        // must classify them as `TryCast` (nullable output) rather than the
+        // infallible `Cast` — the input's non-null bit must not carry through
+        // (#1148). `CAST` and `::` stay `Cast`.
+        let try_cast =
+            extract_lineage("SELECT TRY_CAST(id AS BIGINT) AS id FROM catalog.schema.users")
+                .unwrap();
+        assert_eq!(try_cast.columns[0].transform, TransformKind::TryCast);
+
+        let safe_cast =
+            extract_lineage("SELECT SAFE_CAST(id AS BIGINT) AS id FROM catalog.schema.users")
+                .unwrap();
+        assert_eq!(safe_cast.columns[0].transform, TransformKind::TryCast);
+
+        let plain_cast =
+            extract_lineage("SELECT CAST(id AS BIGINT) AS id FROM catalog.schema.users").unwrap();
+        assert_eq!(plain_cast.columns[0].transform, TransformKind::Cast);
+
+        let double_colon =
+            extract_lineage("SELECT id::BIGINT AS id FROM catalog.schema.users").unwrap();
+        assert_eq!(double_colon.columns[0].transform, TransformKind::Cast);
+    }
+
+    #[test]
+    fn test_fallible_cast_nested_in_infallible_stays_try_cast() {
+        // Fallibility is sticky: an infallible `CAST` / `::` wrapping an inner
+        // `TRY_CAST` still returns NULL when the inner conversion fails, so the
+        // whole edge must remain `TryCast` — the outer cast must not overwrite
+        // the inner fallibility back to `Cast` (#1148).
+        let nested_cast = extract_lineage(
+            "SELECT CAST(TRY_CAST(id AS INT) AS BIGINT) AS id FROM catalog.schema.users",
+        )
+        .unwrap();
+        assert_eq!(nested_cast.columns[0].transform, TransformKind::TryCast);
+
+        let nested_colon =
+            extract_lineage("SELECT TRY_CAST(id AS INT)::BIGINT AS id FROM catalog.schema.users")
+                .unwrap();
+        assert_eq!(nested_colon.columns[0].transform, TransformKind::TryCast);
+
+        // Two infallible casts with no fallible link stay `Cast`.
+        let nested_plain = extract_lineage(
+            "SELECT CAST(CAST(id AS STRING) AS BIGINT) AS id FROM catalog.schema.users",
+        )
+        .unwrap();
+        assert_eq!(nested_plain.columns[0].transform, TransformKind::Cast);
     }
 
     #[test]

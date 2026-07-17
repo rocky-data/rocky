@@ -463,7 +463,14 @@ fn compute_model_typecheck(
 
             match &edge.transform {
                 rocky_sql::lineage::TransformKind::Direct => upstream_type,
+                // Infallible cast: type is refined in Step 2; nullability is the
+                // input's (a non-null input stays non-null).
                 rocky_sql::lineage::TransformKind::Cast => (RockyType::Unknown, upstream_type.1),
+                // Fallible cast (`TRY_CAST` / `SAFE_CAST`): returns NULL on a
+                // failed conversion, so the output is nullable regardless of the
+                // input's nullability (#1148). The target type is still refined
+                // in Step 2 — only the nullable bit differs from `Cast`.
+                rocky_sql::lineage::TransformKind::TryCast => (RockyType::Unknown, true),
                 rocky_sql::lineage::TransformKind::Aggregation(func) => {
                     let func_upper = func.to_uppercase();
                     infer_aggregation_type(&func_upper, &upstream_type.0)
@@ -486,9 +493,7 @@ fn compute_model_typecheck(
         col.data_type == RockyType::Unknown
             && graph
                 .producing_edge(model_name, &col.name)
-                .is_some_and(|edge| {
-                    matches!(&edge.transform, rocky_sql::lineage::TransformKind::Cast)
-                })
+                .is_some_and(|edge| edge.transform.is_cast())
     });
     let inferred_cols = if has_unknown_cast {
         model_by_name
@@ -1247,10 +1252,16 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
 
 /// Refine explicit casts by parsing their target types from the model SQL.
 ///
-/// Only columns that lineage left `Unknown` **and** that are produced by an
-/// explicit `Cast` edge whose input type is known are refined, substituting the
-/// parsed cast target (so `CAST(id AS STRING) AS id` resolves to `String`, not
-/// the source's pre-cast type — see #1145).
+/// Only columns that lineage left `Unknown` **and** that are produced by a cast
+/// edge — infallible [`Cast`] or fallible [`TryCast`] — whose input type is
+/// known are refined, substituting the parsed cast target (so `CAST(id AS
+/// STRING) AS id` resolves to `String`, not the source's pre-cast type — see
+/// #1145). This refines only the *type*; the nullable bit was already set in
+/// Step 1 (a `TryCast` output is nullable regardless of input — #1148) and is
+/// left untouched here.
+///
+/// [`Cast`]: rocky_sql::lineage::TransformKind::Cast
+/// [`TryCast`]: rocky_sql::lineage::TransformKind::TryCast
 ///
 /// Two deliberate restrictions, both erring toward `Unknown` — the safe
 /// "cannot type-check" state, where a contract on the column is skipped rather
@@ -1284,7 +1295,7 @@ fn enhanced_inference(
         let Some(edge) = graph.producing_edge(model_name, &col.name) else {
             continue;
         };
-        if !matches!(&edge.transform, rocky_sql::lineage::TransformKind::Cast) {
+        if !edge.transform.is_cast() {
             continue;
         }
 
@@ -2394,6 +2405,128 @@ mod tests {
         let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
         let cast_id = &result.typed_models["cast_unknown"][0];
         assert_eq!(cast_id.data_type, RockyType::Unknown);
+    }
+
+    #[test]
+    fn test_try_cast_over_non_null_is_nullable() {
+        // A fallible cast (`TRY_CAST` / `SAFE_CAST`) returns NULL on a failed
+        // conversion, so its output is nullable even when the input column is
+        // non-null. The target type is still refined from the SQL (Int64), only
+        // the nullable bit differs from a plain `CAST`. A `nullable = false`
+        // contract on such a column must fail with the nullability diagnostic
+        // E012 (#1148).
+        for cast in ["TRY_CAST", "SAFE_CAST"] {
+            let models = vec![make_model(
+                "casted",
+                &format!("SELECT {cast}(id AS BIGINT) AS id FROM source.raw.users"),
+            )];
+            let project = Project::from_models(models).unwrap();
+
+            let mut external = HashMap::new();
+            external.insert(
+                "source.raw.users".to_string(),
+                vec![rocky_ir::ColumnInfo {
+                    name: "id".to_string(),
+                    data_type: "BIGINT".to_string(),
+                    nullable: false,
+                }],
+            );
+            let graph = build_semantic_graph(&project, &external).unwrap();
+
+            let mut sources = HashMap::new();
+            sources.insert(
+                "source.raw.users".to_string(),
+                source_schema(&[("id", RockyType::Int64, false)]),
+            );
+
+            let result =
+                typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+            let casted = &result.typed_models["casted"][0];
+            assert_eq!(
+                casted.data_type,
+                RockyType::Int64,
+                "{cast} target type should still resolve"
+            );
+            assert!(
+                casted.nullable,
+                "{cast} output must be nullable even over a non-null input"
+            );
+
+            // Contract type matches (Int64) so only the nullability mismatch
+            // surfaces — E012, not E011.
+            let wrong_contract = CompilerContract {
+                columns: vec![ContractColumn {
+                    name: "id".to_string(),
+                    type_name: Some("Int64".to_string()),
+                    nullable: Some(false),
+                    description: None,
+                }],
+                rules: ContractRules::default(),
+            };
+            let diags = validate_contract("casted", std::slice::from_ref(casted), &wrong_contract);
+            assert!(
+                diags.iter().any(|diagnostic| &*diagnostic.code == "E012"),
+                "{cast}: expected E012 nullability diagnostic, got {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_infallible_cast_over_fallible_cast_is_nullable() {
+        // Fallibility is sticky through an outer infallible cast:
+        // `CAST(TRY_CAST(id AS INT) AS BIGINT)` still returns NULL when the
+        // inner conversion fails, so the output must be nullable even over a
+        // non-null input. The target type is the outer cast's (BIGINT → Int64).
+        // Regression guard for the nested-cast hole (#1148).
+        let models = vec![make_model(
+            "casted",
+            "SELECT CAST(TRY_CAST(id AS INT) AS BIGINT) AS id FROM source.raw.users",
+        )];
+        let project = Project::from_models(models).unwrap();
+
+        let mut external = HashMap::new();
+        external.insert(
+            "source.raw.users".to_string(),
+            vec![rocky_ir::ColumnInfo {
+                name: "id".to_string(),
+                data_type: "STRING".to_string(),
+                nullable: false,
+            }],
+        );
+        let graph = build_semantic_graph(&project, &external).unwrap();
+
+        let mut sources = HashMap::new();
+        sources.insert(
+            "source.raw.users".to_string(),
+            source_schema(&[("id", RockyType::String, false)]),
+        );
+
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let casted = &result.typed_models["casted"][0];
+        assert_eq!(
+            casted.data_type,
+            RockyType::Int64,
+            "outer cast target (BIGINT) should resolve"
+        );
+        assert!(
+            casted.nullable,
+            "an infallible cast over a fallible one must stay nullable"
+        );
+
+        let wrong_contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "id".to_string(),
+                type_name: Some("Int64".to_string()),
+                nullable: Some(false),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let diags = validate_contract("casted", std::slice::from_ref(casted), &wrong_contract);
+        assert!(
+            diags.iter().any(|diagnostic| &*diagnostic.code == "E012"),
+            "expected E012 nullability diagnostic, got {diags:?}"
+        );
     }
 
     #[test]
