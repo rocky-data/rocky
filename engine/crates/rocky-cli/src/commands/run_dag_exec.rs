@@ -25,17 +25,19 @@ use crate::output::{DagRunNodeOutput, DagRunOutput, print_json};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Runs one pipeline sub-run: `(config_path, state_path, pipeline_name,
-/// model_name, skip_opts) -> Result<(), String>`.
+/// Runs one pipeline sub-run: `(config_path, loaded, state_path,
+/// pipeline_name, model_name, skip_opts) -> Result<(), String>`.
 ///
 /// Injected into [`CliDispatcher`] so the escape-hatch flags flow to a single,
 /// observable seam. Production wraps [`super::run::run`] with the DAG sub-run's
 /// fixed arguments ([`default_sub_runner`]); tests substitute a recorder that
-/// captures the exact [`SkipRunOptions`] the dispatch passes — so reverting the
-/// dispatch to `SkipRunOptions::default()` is caught.
+/// captures the exact [`SkipRunOptions`] and `Arc<LoadedConfig>` the dispatch
+/// passes — so reverting the dispatch to `SkipRunOptions::default()` (or to a
+/// per-node config reload) is caught.
 type SubRunner = Arc<
     dyn Fn(
             PathBuf,
+            Arc<rocky_core::config::LoadedConfig>,
             PathBuf,
             String,
             Option<String>,
@@ -47,11 +49,15 @@ type SubRunner = Arc<
 
 /// The production [`SubRunner`]: drives one pipeline through [`super::run::run`]
 /// with the DAG sub-run's fixed arguments (no `--defer`/`--var`, config-derived
-/// TTL, no idempotency key). Transformation nodes supply their model name so
-/// each node materializes only itself; other pipeline nodes pass `None`.
+/// TTL, no idempotency key). Only `config`, `loaded`, `state`, `pipeline`,
+/// `model_name`, and `skip_opts` vary per node — `loaded` is always a clone of
+/// the ONE snapshot `run_with_dag` captured, never a per-node reload, and
+/// transformation nodes supply their model name so each node materializes only
+/// itself; other pipeline nodes pass `None`.
 fn default_sub_runner() -> SubRunner {
     Arc::new(
         |config_path: PathBuf,
+         loaded: Arc<rocky_core::config::LoadedConfig>,
          state_path: PathBuf,
          pipeline_name: String,
          model_name: Option<String>,
@@ -69,6 +75,7 @@ fn default_sub_runner() -> SubRunner {
                 };
                 super::run::run(
                     &config_path,
+                    loaded,
                     None,
                     Some(&pipeline_name),
                     &state_path,
@@ -146,10 +153,16 @@ pub async fn run_with_dag(
         crate::output::reserve_stdout_for_json();
     }
 
-    let cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
-        "failed to load config from {}",
-        config_path.display()
-    ))?;
+    // ONE fingerprinted config snapshot for the WHOLE DAG (#1120): the DAG
+    // build below and every per-node sub-run execute this same instance
+    // (`Arc::clone` per node in the dispatcher), so a `rocky.toml` swap
+    // mid-DAG cannot make later nodes execute a different config than the
+    // one the DAG was built from.
+    let loaded = std::sync::Arc::new(
+        rocky_core::config::load_rocky_config_fingerprinted(config_path)
+            .with_context(|| format!("failed to load config from {}", config_path.display()))?,
+    );
+    let cfg = &loaded.config;
 
     // Load models from the conventional `models/` directory next to the config.
     let config_dir = config_path.parent().unwrap_or(Path::new("."));
@@ -167,7 +180,7 @@ pub async fn run_with_dag(
         Vec::new()
     };
 
-    let mut dag = unified_dag::build_unified_dag(&cfg, &models, &seeds)
+    let mut dag = unified_dag::build_unified_dag(cfg, &models, &seeds)
         .context("failed to build unified DAG")?;
 
     // Infer cross-step edges from each model's SQL `FROM` references so a
@@ -197,6 +210,7 @@ pub async fn run_with_dag(
 
     let dispatcher = CliDispatcher {
         config_path: config_path.to_path_buf(),
+        loaded: std::sync::Arc::clone(&loaded),
         state_path: state_path.to_path_buf(),
         seeds_dir,
         node_pipelines,
@@ -272,6 +286,11 @@ fn status_str(s: &NodeStatus) -> &'static str {
 /// `Test` nodes are no-ops, and `Source` nodes are markers.
 struct CliDispatcher {
     config_path: std::path::PathBuf,
+    /// The ONE fingerprinted config snapshot captured by `run_with_dag`.
+    /// Every pipeline-bound sub-run receives an `Arc::clone` of this same
+    /// instance — never a per-node reload — so a `rocky.toml` swap mid-DAG
+    /// cannot redirect later nodes (#1120).
+    loaded: Arc<rocky_core::config::LoadedConfig>,
     /// Canonical state path threaded from the caller. Every sub-run drives
     /// `run()` against this shared path so the unified-DAG path reads and
     /// writes the project's canonical `.rocky-state.redb` (or the namespaced
@@ -294,6 +313,8 @@ struct CliDispatcher {
 impl NodeDispatcher for CliDispatcher {
     fn dispatch(&self, id: &NodeId, kind: NodeKind, label: &str) -> Option<NodeFuture> {
         let config_path = self.config_path.clone();
+        // `Arc::clone`, NOT a reload: every node executes the one snapshot.
+        let loaded = Arc::clone(&self.loaded);
         let state_path = self.state_path.clone();
         let skip_opts = self.skip_opts;
         let sub_runner = self.sub_runner.clone();
@@ -318,10 +339,14 @@ impl NodeDispatcher for CliDispatcher {
                 // fail with "pipeline '<seed>' not found in config". Load the
                 // matching CSV directly via `run_seed` (which fires the seed's
                 // pre/post hooks). The node label is the seed name, so a name
-                // filter selects exactly this seed.
+                // filter selects exactly this seed. The dispatcher's captured
+                // snapshot is threaded in — `run_seed` performs no config
+                // re-read (#1120), so a `rocky.toml` swap mid-DAG cannot make
+                // a warehouse-mutating seed node execute config B while the
+                // rest of the DAG runs A.
                 let seeds_dir = self.seeds_dir.clone();
                 Some(Box::pin(async move {
-                    super::seed::run_seed(&config_path, &seeds_dir, None, Some(&label), false)
+                    super::seed::run_seed(&loaded, &seeds_dir, None, Some(&label), false)
                         .await
                         .map_err(|e| e.to_string())
                 }))
@@ -353,6 +378,7 @@ impl NodeDispatcher for CliDispatcher {
                 Some(Box::pin(async move {
                     (sub_runner)(
                         config_path,
+                        loaded,
                         state_path,
                         pipeline_name,
                         model_name,
@@ -371,6 +397,7 @@ mod skip_opts_threading_tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
+    use rocky_core::config::LoadedConfig;
     use rocky_core::dag_executor::NodeDispatcher;
     use rocky_core::unified_dag::{NodeId, NodeKind};
 
@@ -388,6 +415,47 @@ mod skip_opts_threading_tests {
             Some(PathBuf::from("project/models"))
         );
         assert_eq!(models_dir_for_model_scope(config_path, None), None);
+    }
+
+    /// A loaded snapshot for dispatcher tests, built through the real
+    /// fingerprinted loader over a minimal temp config.
+    fn test_loaded_config() -> Arc<LoadedConfig> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapter.db]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n",
+        )
+        .unwrap();
+        Arc::new(rocky_core::config::load_rocky_config_fingerprinted(&path).unwrap())
+    }
+
+    /// Build a dispatcher over `n` transformation nodes wired to `recorder`,
+    /// returning the dispatcher and the node ids in dispatch order.
+    fn dispatcher_with_nodes(
+        loaded: Arc<LoadedConfig>,
+        skip_opts: SkipRunOptions,
+        recorder: SubRunner,
+        n: usize,
+    ) -> (CliDispatcher, Vec<NodeId>) {
+        let mut node_pipelines = HashMap::new();
+        let node_ids: Vec<NodeId> = (0..n)
+            .map(|i| {
+                let id = NodeId::new("transformation", &format!("dim_orders_{i}"));
+                node_pipelines.insert(id.clone(), "analytics".to_string());
+                id
+            })
+            .collect();
+        let dispatcher = CliDispatcher {
+            config_path: std::path::PathBuf::from("rocky.toml"),
+            loaded,
+            state_path: std::path::PathBuf::from(".rocky-state.redb"),
+            seeds_dir: std::path::PathBuf::from("seeds"),
+            node_pipelines,
+            skip_opts,
+            sub_runner: recorder,
+        };
+        (dispatcher, node_ids)
     }
 
     /// 🔴 DEFECT 3 regression: `rocky run --dag --force-rebuild` / `--no-reuse`
@@ -408,14 +476,15 @@ mod skip_opts_threading_tests {
         let sink = recorded.clone();
         // A recorder sub-runner: capture the skip_opts and return Ok without
         // running a real pipeline.
-        let recorder: SubRunner =
-            Arc::new(move |_config, _state, _pipeline, model_name, skip_opts| {
+        let recorder: SubRunner = Arc::new(
+            move |_config, _loaded, _state, _pipeline, model_name, skip_opts| {
                 let sink = sink.clone();
                 Box::pin(async move {
                     sink.lock().unwrap().push((model_name, skip_opts));
                     Ok(())
                 })
-            });
+            },
+        );
 
         let skip_opts = SkipRunOptions {
             skip_unchanged: false,
@@ -423,27 +492,22 @@ mod skip_opts_threading_tests {
             no_reuse: true,
             no_prune: false,
         };
-        let mut node_pipelines = HashMap::new();
-        let node_id = NodeId::new("transformation", "dim_orders");
-        node_pipelines.insert(node_id.clone(), "analytics".to_string());
-        let dispatcher = CliDispatcher {
-            config_path: std::path::PathBuf::from("rocky.toml"),
-            state_path: std::path::PathBuf::from(".rocky-state.redb"),
-            seeds_dir: std::path::PathBuf::from("seeds"),
-            node_pipelines,
-            skip_opts,
-            sub_runner: recorder,
-        };
+        let (dispatcher, node_ids) =
+            dispatcher_with_nodes(test_loaded_config(), skip_opts, recorder, 1);
 
         // Drive a real pipeline-node dispatch through the production path.
         let fut = dispatcher
-            .dispatch(&node_id, NodeKind::Transformation, "dim_orders")
+            .dispatch(&node_ids[0], NodeKind::Transformation, "dim_orders_0")
             .expect("a pipeline node dispatches a future");
         fut.await.expect("recorder sub-runner returns Ok");
 
         let got = recorded.lock().unwrap();
         assert_eq!(got.len(), 1, "exactly one sub-run was dispatched");
-        assert_eq!(got[0].0.as_deref(), Some("dim_orders"));
+        assert_eq!(
+            got[0].0.as_deref(),
+            Some("dim_orders_0"),
+            "a transformation node's dispatched label is its model scope"
+        );
         assert!(
             got[0].1.force_rebuild,
             "--force-rebuild must reach the sub-run, not be dropped to default()"
@@ -452,6 +516,49 @@ mod skip_opts_threading_tests {
             got[0].1.no_reuse,
             "--no-reuse must reach the sub-run, not be dropped to default()"
         );
+    }
+
+    /// WP-01 PR-B (#1120): every DAG sub-run receives the SAME
+    /// `Arc<LoadedConfig>` instance — an `Arc::clone` of the one snapshot
+    /// `run_with_dag` captured, never a per-node reload.
+    ///
+    /// Non-vacuous: the recorder captures the exact `Arc` each dispatch
+    /// passes; `Arc::ptr_eq` fails if the dispatch is ever reverted to
+    /// loading (or rebuilding) a config per node, even if the contents were
+    /// equal.
+    #[tokio::test]
+    async fn dispatch_passes_the_same_loaded_config_arc_to_every_sub_run() {
+        let recorded: Arc<Mutex<Vec<Arc<LoadedConfig>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        let recorder: SubRunner =
+            Arc::new(move |_config, loaded, _state, _pipeline, _model, _skip| {
+                let sink = sink.clone();
+                Box::pin(async move {
+                    sink.lock().unwrap().push(loaded);
+                    Ok(())
+                })
+            });
+
+        let loaded = test_loaded_config();
+        let (dispatcher, node_ids) =
+            dispatcher_with_nodes(Arc::clone(&loaded), SkipRunOptions::default(), recorder, 3);
+
+        for (i, id) in node_ids.iter().enumerate() {
+            let fut = dispatcher
+                .dispatch(id, NodeKind::Transformation, &format!("dim_orders_{i}"))
+                .expect("a pipeline node dispatches a future");
+            fut.await.expect("recorder sub-runner returns Ok");
+        }
+
+        let got = recorded.lock().unwrap();
+        assert_eq!(got.len(), 3, "all three sub-runs were dispatched");
+        for (i, received) in got.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(received, &loaded),
+                "sub-run {i} must receive the dispatcher's own Arc (one snapshot per DAG), \
+                 not a reloaded/rebuilt config"
+            );
+        }
     }
 }
 
@@ -465,6 +572,97 @@ mod tests {
         v.as_i64()
             .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             .unwrap_or_else(|| panic!("expected integer cell, got {v:?}"))
+    }
+
+    /// Red-team (#1120, seed leg): a `Seed` node dispatch executes the
+    /// dispatcher's CAPTURED config snapshot, not a fresh `rocky.toml` read.
+    /// The drill: capture the snapshot (adapter → warehouse A), swap
+    /// `rocky.toml` to point at warehouse B, then dispatch the seed node —
+    /// the rows must land in A and B must never be created. Pre-fix,
+    /// `run_seed` took the config PATH and reloaded it internally, so the
+    /// warehouse-mutating seed node executed config B while the rest of the
+    /// DAG ran A. (The signature change — `run_seed(&LoadedConfig, …)` —
+    /// enforces "no config read" at compile time; this proves the dispatch
+    /// threads the right instance.)
+    #[tokio::test]
+    async fn seed_dispatch_executes_the_captured_snapshot_not_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        std::fs::write(
+            root.join("seeds/countries.csv"),
+            "code,name\nUS,United States\nGB,United Kingdom\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("seeds/countries.toml"),
+            "name = \"countries\"\n\n\
+             [target]\n\
+             catalog = \"wh\"\n\
+             schema = \"seeds\"\n\
+             table = \"countries\"\n",
+        )
+        .unwrap();
+
+        // Both configs use the SAME catalog name (`wh` — the DuckDB file
+        // stem), so the seed SQL is valid under either; only the physical
+        // warehouse file differs. Whichever config executes decides where
+        // the rows land.
+        let config_path = root.join("rocky.toml");
+        let db_a = root.join("a/wh.duckdb");
+        let db_b = root.join("b/wh.duckdb");
+        let config_for = |db: &std::path::Path| {
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n",
+                db.display()
+            )
+        };
+        std::fs::write(&config_path, config_for(&db_a)).unwrap();
+        let loaded = Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path)
+                .expect("load snapshot A"),
+        );
+        // The mid-DAG swap: after the capture, rocky.toml points at B.
+        std::fs::write(&config_path, config_for(&db_b)).unwrap();
+
+        let dispatcher = CliDispatcher {
+            config_path: config_path.clone(),
+            loaded,
+            state_path: root.join(".rocky-state.redb"),
+            seeds_dir: root.join("seeds"),
+            node_pipelines: HashMap::new(),
+            skip_opts: SkipRunOptions::default(),
+            sub_runner: default_sub_runner(),
+        };
+        let id = NodeId::new("seed", "countries");
+        let fut = dispatcher
+            .dispatch(&id, NodeKind::Seed, "countries")
+            .expect("a seed node dispatches a future");
+        fut.await.expect("seed node loads");
+
+        assert!(
+            !db_b.exists(),
+            "the seed must never touch the swapped-in config's warehouse (B)"
+        );
+        let adapter = DuckDbWarehouseAdapter::open(&db_a).expect("warehouse A exists");
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard
+            .execute_sql("SELECT COUNT(*) FROM wh.seeds.countries")
+            .unwrap();
+        assert_eq!(
+            cell_i64(&rows.rows[0][0]),
+            2,
+            "the seed's rows must land in the CAPTURED snapshot's warehouse (A)"
+        );
     }
 
     /// End-to-end acceptance for B6: under `run --dag`, a `Seed` node loads its

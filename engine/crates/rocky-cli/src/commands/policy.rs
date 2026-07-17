@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 use rocky_compiler::compile::{self, CompilerConfig};
 use rocky_core::config::{
     ConfigError, PolicyCapability, PolicyConfig, PolicyEffect, PolicyPrincipal, StateBackend,
-    StateConfig, StateUploadFailureMode,
+    StateConfig,
 };
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::state::{PolicyDecisionRecord, StateStore};
@@ -469,13 +469,13 @@ pub fn run_policy_freeze(
     // (overwriting the local file) BEFORE opening the store, so the freeze is
     // recorded on top of other pods' decisions rather than over an empty local.
     if remote_state {
-        // PR-A (RD-001): bind the typed authority — a successful download of
-        // either usable variant means the local ledger now mirrors remote
-        // truth; failure still `?`-bails fail-closed (unchanged). PR-B
-        // branches on the value.
-        let _authority = block_on_state_sync(rocky_core::state_sync::download_state(
-            &state_cfg, state_path,
-        ))
+        // WP-01 PR-B (2b): the session half-seam owns the download shape; a
+        // successful download of either usable variant means the local ledger
+        // now mirrors remote truth; failure still `?`-bails fail-closed
+        // (unchanged).
+        let _authority = block_on_state_sync(
+            rocky_core::state_sync::RemoteStateSession::download_only(&state_cfg, state_path),
+        )
         .with_context(|| {
             "failed to download remote state before recording the policy freeze; \
                  a remote-backend freeze requires the state backend to be reachable"
@@ -545,14 +545,15 @@ pub fn run_policy_freeze(
     // unfrozen. A failed upload aborts (finding 5).
     drop(store);
     if remote_state {
-        let upload_cfg = StateConfig {
-            on_upload_failure: StateUploadFailureMode::Fail,
-            ..state_cfg.clone()
-        };
-        block_on_state_sync(rocky_core::state_sync::upload_state(
-            &upload_cfg,
-            state_path,
-        ))
+        // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability
+        // policy (previously a local `StateConfig` clone here).
+        block_on_state_sync(
+            rocky_core::state_sync::RemoteStateSession::upload_only_fail_closed(
+                &state_cfg,
+                state_path,
+                "policy freeze",
+            ),
+        )
         .with_context(|| "failed to upload remote state after recording the policy freeze")?;
     }
 

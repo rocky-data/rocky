@@ -5618,7 +5618,15 @@ fn adapter_role_active(adapter: &AdapterConfig, role: AdapterKind) -> bool {
 /// instead of bailing on the first one. Production code paths should
 /// use [`load_rocky_config`] so misuse fails fast.
 pub fn parse_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
-    let raw = std::fs::read_to_string(path).map_err(|e| {
+    let raw = read_config_file(path)?;
+    parse_rocky_config_str(&raw)
+}
+
+/// Read the raw config file bytes, mapping a missing file to
+/// [`ConfigError::FileNotFound`]. The single read site for every loader in
+/// this module — the fingerprinted loader hashes exactly this string's bytes.
+fn read_config_file(path: &Path) -> Result<String, ConfigError> {
+    std::fs::read_to_string(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             ConfigError::FileNotFound {
                 path: path.to_path_buf(),
@@ -5626,8 +5634,14 @@ pub fn parse_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
         } else {
             ConfigError::ReadFile(e)
         }
-    })?;
-    let (substituted, substitutions) = substitute_env_vars_with_report(&raw)?;
+    })
+}
+
+/// Parse an already-read raw config string — env-var substitution,
+/// deprecation remapping, and shorthand normalization included; `kind`
+/// validation excluded (see [`parse_rocky_config`]).
+fn parse_rocky_config_str(raw: &str) -> Result<RockyConfig, ConfigError> {
+    let (substituted, substitutions) = substitute_env_vars_with_report(raw)?;
     let env_var_hint = format_env_var_hint(&substitutions);
     let to_parse_err = |source: toml::de::Error| -> ConfigError {
         if env_var_hint.is_empty() {
@@ -5707,31 +5721,98 @@ fn apply_single_adapter_discovery_default(config: &mut RockyConfig) {
 /// directly so it can emit every issue as its own diagnostic.
 pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     let config = parse_rocky_config(path)?;
-    if let Some(first) = validate_adapter_kinds(&config).into_iter().next() {
+    validate_loaded_config(&config)?;
+    Ok(config)
+}
+
+/// The fail-fast validation chain shared by [`load_rocky_config`] and
+/// [`load_rocky_config_fingerprinted`]. Returns the first issue, matching
+/// `load_rocky_config`'s historical behavior.
+fn validate_loaded_config(config: &RockyConfig) -> Result<(), ConfigError> {
+    if let Some(first) = validate_adapter_kinds(config).into_iter().next() {
         return Err(first);
     }
-    if let Some(first) = validate_replication_strategies(&config).into_iter().next() {
+    if let Some(first) = validate_replication_strategies(config).into_iter().next() {
         return Err(first);
     }
-    if let Some(first) = validate_schema_pattern_reserved_components(&config)
+    if let Some(first) = validate_schema_pattern_reserved_components(config)
         .into_iter()
         .next()
     {
         return Err(first);
     }
-    if let Some(first) = validate_replication_overrides(&config).into_iter().next() {
+    if let Some(first) = validate_replication_overrides(config).into_iter().next() {
         return Err(first);
     }
-    if let Some(first) = validate_fivetran_cache(&config).into_iter().next() {
+    if let Some(first) = validate_fivetran_cache(config).into_iter().next() {
         return Err(first);
     }
-    if let Some(first) = validate_fivetran_resilience(&config).into_iter().next() {
+    if let Some(first) = validate_fivetran_resilience(config).into_iter().next() {
         return Err(first);
     }
-    if let Some(first) = validate_policy(&config).into_iter().next() {
+    if let Some(first) = validate_policy(config).into_iter().next() {
         return Err(first);
     }
-    Ok(config)
+    Ok(())
+}
+
+/// A parsed [`RockyConfig`] paired with the fingerprint of the exact raw
+/// bytes it was loaded from.
+///
+/// The execute-from-owned unit for config-snapshot threading (#1120): a
+/// decision gate loads ONE `LoadedConfig` and threads it (usually as an
+/// `Arc<LoadedConfig>`) through every downstream read and into execution, so
+/// a `rocky.toml` swap timed between the gate and execution can neither
+/// redirect what runs nor desynchronize the recorded `config_hash` from the
+/// config that actually executed.
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    /// The parsed, validated configuration.
+    pub config: RockyConfig,
+    /// 16-hex-char fingerprint of the raw file bytes captured at load time —
+    /// see [`config_fingerprint_bytes`].
+    pub fingerprint: String,
+}
+
+/// Stable 16-char hex fingerprint of a config file's raw bytes.
+///
+/// Uses [`std::hash::DefaultHasher`] (SipHash with fixed keys), so the value
+/// is deterministic across processes for the same bytes — intra-release
+/// stable, not cross-release stable. Deliberately hashes the RAW bytes, never
+/// a serde serialization of the parsed config: `FreshnessConfig::overrides`
+/// is a `std::collections::HashMap` reachable from [`RockyConfig`], so a
+/// serialized form would have nondeterministic ordering across processes.
+///
+/// This is the single hashing implementation behind both the CLI's
+/// path-based `config_fingerprint` (rocky-cli `output.rs`) and
+/// [`load_rocky_config_fingerprinted`], so fingerprints of an unswapped file
+/// are byte-identical wherever they are computed (`RunRecord::config_hash`
+/// history stays comparable).
+pub fn config_fingerprint_bytes(raw: &[u8]) -> String {
+    use std::hash::{DefaultHasher, Hasher};
+    let mut hasher = DefaultHasher::new();
+    hasher.write(raw);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Loads, parses, and validates a Rocky configuration (like
+/// [`load_rocky_config`]), additionally capturing the fingerprint of the
+/// exact raw bytes read — hashed BEFORE env-var substitution and parsing, so
+/// the fingerprint describes the on-disk snapshot this config came from.
+///
+/// # Errors
+///
+/// Same error surface as [`load_rocky_config`]: read, parse, and the
+/// fail-fast validation chain.
+pub fn load_rocky_config_fingerprinted(path: &Path) -> Result<LoadedConfig, ConfigError> {
+    let raw = read_config_file(path)?;
+    let fingerprint = config_fingerprint_bytes(raw.as_bytes());
+    let config = parse_rocky_config_str(&raw)?;
+    validate_loaded_config(&config)?;
+    Ok(LoadedConfig {
+        config,
+        fingerprint,
+    })
 }
 
 /// Validate every `[adapter.<name>.cache]` block's cross-field
@@ -5896,6 +5977,76 @@ mod tests {
         let hint = format_env_var_hint(&subs); // must not panic
         assert!(hint.contains("SECRET"));
         assert!(hint.contains('…'));
+    }
+
+    /// WP-01 PR-B: `load_rocky_config_fingerprinted` is deterministic across
+    /// repeated loads — including for a config whose `FreshnessConfig::
+    /// overrides` `HashMap` carries multiple keys. The fingerprint hashes the
+    /// RAW file bytes (never a serde serialization), so `HashMap` iteration
+    /// order cannot leak into the value. A serialization-based fingerprint
+    /// would flake this test across processes/seeds.
+    #[test]
+    fn fingerprinted_load_is_deterministic_across_repeated_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            r#"
+[adapter.db]
+type = "duckdb"
+path = "wh.duckdb"
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+
+[pipeline.silver.target]
+adapter = "db"
+
+[pipeline.silver.checks]
+enabled = true
+
+[pipeline.silver.checks.freshness]
+threshold_seconds = 3600
+
+[pipeline.silver.checks.freshness.overrides]
+"raw__us_west__shopify" = 7200
+"raw__eu__stripe" = 1800
+"raw__apac__ads" = 900
+"#,
+        )
+        .unwrap();
+
+        let first = load_rocky_config_fingerprinted(&path).unwrap();
+        assert_eq!(
+            first.config.pipelines["silver"]
+                .as_transformation()
+                .unwrap()
+                .checks
+                .freshness
+                .as_ref()
+                .unwrap()
+                .overrides
+                .len(),
+            3,
+            "the overrides HashMap must actually carry multiple keys"
+        );
+        assert_eq!(
+            first.fingerprint,
+            config_fingerprint_bytes(&std::fs::read(&path).unwrap()),
+            "the captured fingerprint is the raw-bytes fingerprint of the file"
+        );
+        for _ in 0..50 {
+            let again = load_rocky_config_fingerprinted(&path).unwrap();
+            assert_eq!(again.fingerprint, first.fingerprint);
+        }
+
+        // A single-byte change to the raw file moves the fingerprint.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).unwrap();
+        let swapped = load_rocky_config_fingerprinted(&path).unwrap();
+        assert_ne!(swapped.fingerprint, first.fingerprint);
     }
 
     #[test]

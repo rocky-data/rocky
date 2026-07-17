@@ -3324,13 +3324,25 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             pipeline,
             truncate,
         } => {
+            // WP-01 PR-B (2b): load the fingerprinted snapshot ONCE and thread
+            // it (#1120 — `run_load` no longer self-loads), plus the SAME
+            // canonical `state_path` resolved above for every command (the Run
+            // dispatch passes the identical binding), replacing load's legacy
+            // `<config_dir>/.rocky_state`. A standalone `rocky load` is never
+            // plan-gated, so its terminal-upload durability follows the
+            // configured `[state] on_upload_failure` (`ConfigDefault`).
+            let loaded = rocky_core::config::load_rocky_config_fingerprinted(&cli.config)
+                .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
             rocky_cli::commands::run_load(
                 &cli.config,
+                &loaded,
+                &state_path,
                 source_dir.as_deref(),
                 format.as_deref(),
                 target.as_deref(),
                 pipeline.as_deref(),
                 truncate,
+                rocky_core::state_sync::FinalizeDurability::ConfigDefault,
                 json,
             )
             .await
@@ -3340,8 +3352,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             pipeline,
             filter,
         } => {
+            // One fingerprinted load, threaded in — `run_seed` performs no
+            // internal config re-read (#1120), so the executed adapter is the
+            // one this load resolved.
+            let loaded = rocky_core::config::load_rocky_config_fingerprinted(&cli.config)
+                .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
             rocky_cli::commands::run_seed(
-                &cli.config,
+                &loaded,
                 &seeds,
                 pipeline.as_deref(),
                 filter.as_deref(),

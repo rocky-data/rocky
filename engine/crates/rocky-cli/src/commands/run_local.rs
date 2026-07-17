@@ -5,7 +5,7 @@
 //! provides production-grade execution (parallel processing, drift detection,
 //! batched checks, governance, checkpoint/resume) for ALL adapters.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -19,14 +19,43 @@ use rocky_ir::*;
 use crate::output::*;
 use crate::registry::AdapterRegistry;
 
+/// The transformation run's single models-directory decision.
+///
+/// Resolved ONCE by the dispatch site in `run::run` — the same decision that
+/// governs whether the transformation arm carries a
+/// [`RemoteStateSession`][rocky_core::state_sync::RemoteStateSession] — and
+/// threaded into [`run_transformation`], which consumes it INSTEAD of
+/// re-checking the filesystem. Before this type existed, the session decision
+/// (run.rs) and the execution decision (here) were two separate `exists()`
+/// checks: a directory created (or a symlink retargeted) between them made
+/// `run_transformation` open a state store, execute models, and persist a
+/// `RunRecord` with NO session — the RD-003 sessionless-mutation shape
+/// re-opened through a filesystem race. With one threaded decision, `Absent`
+/// guarantees a no-op regardless of what the filesystem holds at execution
+/// time. Both variants carry the resolved path (config-dir-joined `models`
+/// glob base) for execution and diagnostics.
+pub enum ModelsDirDecision {
+    /// The models directory existed at decision time — execute from it.
+    Present(PathBuf),
+    /// The models directory was absent at decision time — the run is a
+    /// sessionless no-op (or the governed `expects_models` fail-closed
+    /// bail), even if a directory exists on disk by execution time.
+    Absent(PathBuf),
+}
+
 /// Execute `rocky run` for a transformation pipeline.
 ///
-/// Compiles and executes models from the pipeline's `models` glob using the
-/// target adapter. Reuses the existing [`super::run::execute_models`] path.
+/// Compiles and executes models from the caller-resolved
+/// [`ModelsDirDecision`] using the target adapter. Reuses the existing
+/// [`super::run::execute_models`] path.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run_transformation")]
 pub async fn run_transformation(
-    config_path: &Path,
+    // The single models-directory decision (see [`ModelsDirDecision`]),
+    // resolved by the dispatch site in `run::run` at the SAME instant it
+    // decided whether to create this run's `RemoteStateSession`. This
+    // function must never re-check the filesystem for the models dir.
+    models_dir: ModelsDirDecision,
     pipeline: &rocky_core::config::TransformationPipelineConfig,
     rocky_cfg: &rocky_core::config::RockyConfig,
     output_json: bool,
@@ -99,129 +128,129 @@ pub async fn run_transformation(
     let mut output = RunOutput::new(String::new(), 0, concurrency);
     output.pipeline_type = Some("transformation".to_string());
 
-    // Resolve models directory relative to the config file
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
-    let models_base = pipeline
-        .models
-        .split("**")
-        .next()
-        .unwrap_or(&pipeline.models)
-        .trim_end_matches('/');
-    let models_dir = config_dir.join(models_base);
-
     // Open the canonical state store up front so it stays in scope through
-    // cost population + `persist_run_record` below. Only opened when there's
-    // a models directory to execute — a no-op run must not create a state
-    // file. `persist_run_record` accepts `Option<&StateStore>`, so the
-    // `None` arm flows through cleanly.
+    // cost population + `persist_run_record` below. Only opened when the
+    // dispatch site's single models-dir decision resolved `Present` — a
+    // no-op run must not create a state file. The PASSED decision governs,
+    // never a fresh `exists()` check: re-checking here would re-open the
+    // two-check race [`ModelsDirDecision`] exists to close (a dir created
+    // between the session decision and execution would mutate state with no
+    // session). `persist_run_record` accepts `Option<&StateStore>`, so the
+    // `Absent` arm flows through cleanly.
     let mut state_store: Option<StateStore> = None;
-    if models_dir.exists() {
-        let store = StateStore::open(state_path)
-            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    match &models_dir {
+        ModelsDirDecision::Present(models_dir) => {
+            let store = StateStore::open(state_path).with_context(|| {
+                format!("failed to open state store at {}", state_path.display())
+            })?;
 
-        // Finding #1: baseline failures so a soft model failure skips governance.
-        let failures_before = output.tables_failed;
-        let exec_result = super::run::execute_models(
-            &models_dir,
-            warehouse_adapter.as_ref(),
-            Some(&store),
-            partition_opts,
-            run_id,
-            None, // no model filter in local execution path
-            None, // no backfill model-set scope in local execution path
-            &mut output,
-            None, // run_local doesn't build a HookRegistry
-            None,
-            schema_cache_cfg,
-            pipeline.target.governance.auto_create_schemas,
-            // run_local has no `--model` selection; defer is a no-op here.
-            &super::run::DeferOptions::default(),
-            skip_gate,
-            // Reuse is active iff `[reuse]` is enabled AND `--no-reuse` was
-            // not passed (clause 1 of the fail-closed decision) — same
-            // resolution as the replication / model-only entry points.
-            rocky_cfg.reuse.enabled && !no_reuse,
-            // Content-addressed column-level skip (its own `[reuse]`
-            // sub-key), likewise disabled by the `--no-reuse` escape hatch.
-            rocky_cfg.reuse.column_level && !no_reuse,
-            run_vars,
-            rocky_cfg.resilience.clone(),
-            super::resilience::retry_policy_allows(rocky_cfg),
-            exec_fp_gate,
-            // Finding #4: the transformation route reconciles no masks.
-            false,
-        )
-        .await;
+            // Finding #1: baseline failures so a soft model failure skips governance.
+            let failures_before = output.tables_failed;
+            let exec_result = super::run::execute_models(
+                models_dir,
+                warehouse_adapter.as_ref(),
+                Some(&store),
+                partition_opts,
+                run_id,
+                None, // no model filter in local execution path
+                None, // no backfill model-set scope in local execution path
+                &mut output,
+                None, // run_local doesn't build a HookRegistry
+                None,
+                schema_cache_cfg,
+                pipeline.target.governance.auto_create_schemas,
+                // run_local has no `--model` selection; defer is a no-op here.
+                &super::run::DeferOptions::default(),
+                skip_gate,
+                // Reuse is active iff `[reuse]` is enabled AND `--no-reuse` was
+                // not passed (clause 1 of the fail-closed decision) — same
+                // resolution as the replication / model-only entry points.
+                rocky_cfg.reuse.enabled && !no_reuse,
+                // Content-addressed column-level skip (its own `[reuse]`
+                // sub-key), likewise disabled by the `--no-reuse` escape hatch.
+                rocky_cfg.reuse.column_level && !no_reuse,
+                run_vars,
+                rocky_cfg.resilience.clone(),
+                super::resilience::retry_policy_allows(rocky_cfg),
+                exec_fp_gate,
+                // Finding #4: the transformation route reconciles no masks.
+                false,
+            )
+            .await;
 
-        match exec_result {
-            // Finding #1: only when the model phase is CLEAN (no new soft
-            // failures) — a soft failure returns `Ok(())`.
-            Ok(()) if output.tables_failed == failures_before => {
-                // --- Governance: per-model `[governance.tags]` ---
-                //
-                // After every model materializes, apply each model's
-                // `[governance.tags]` to its target securable. `None` filter:
-                // the full-DAG path builds every model, so every model is
-                // tagged. Best-effort; no-op on DuckDB's Noop adapter.
-                let governance_adapter =
-                    adapter_registry.governance_adapter(&pipeline.target.adapter);
-                super::run::apply_model_governance_tags(
-                    &models_dir,
-                    governance_adapter.as_ref(),
-                    rocky_cfg,
-                    run_vars,
-                    None,
-                )
-                .await;
+            match exec_result {
+                // Finding #1: only when the model phase is CLEAN (no new soft
+                // failures) — a soft failure returns `Ok`.
+                Ok(snapshot) if output.tables_failed == failures_before => {
+                    // --- Governance: per-model `[governance.tags]` ---
+                    //
+                    // After every model materializes, apply each model's
+                    // `[governance.tags]` to its target securable. `None` filter:
+                    // the full-DAG path builds every model, so every model is
+                    // tagged. Best-effort; no-op on DuckDB's Noop adapter.
+                    // #1093: reads the snapshot `execute_models` captured at the
+                    // fingerprint gate, never a fresh disk compile.
+                    let governance_adapter =
+                        adapter_registry.governance_adapter(&pipeline.target.adapter);
+                    super::run::apply_model_governance_tags(
+                        &snapshot,
+                        governance_adapter.as_ref(),
+                        None,
+                    )
+                    .await;
+                }
+                // Soft model failure — skip governance, fall through.
+                Ok(_) => {}
+                Err(e) => {
+                    // A runtime model failure (warehouse rejected the SQL, an
+                    // unresolved upstream, ...) surfaces here as `Err`. Record it
+                    // as a first-class run failure so the JSON `RunOutput` below
+                    // still emits with `status` / `errors[]` / any sibling
+                    // materializations BEFORE the non-zero exit, mirroring the
+                    // compile-error path which records into `output` and returns
+                    // `Ok`. Without this the `?` short-circuited before the JSON
+                    // emit, leaving an orchestrator (Dagster) consuming
+                    // `--output json` with empty stdout on a runtime failure. The
+                    // terminal-status exit contract is honoured by
+                    // `run_status_exit_result` below.
+                    output.tables_failed += 1;
+                    output.errors.push(crate::output::TableErrorOutput {
+                        asset_key: vec!["<runtime>".to_string()],
+                        error: format!("{e:#}"),
+                        failure_kind: crate::output::FailureKind::Unknown,
+                        cooldown_seconds: None,
+                    });
+                }
             }
-            // Soft model failure — skip governance, fall through.
-            Ok(()) => {}
-            Err(e) => {
-                // A runtime model failure (warehouse rejected the SQL, an
-                // unresolved upstream, ...) surfaces here as `Err`. Record it
-                // as a first-class run failure so the JSON `RunOutput` below
-                // still emits with `status` / `errors[]` / any sibling
-                // materializations BEFORE the non-zero exit, mirroring the
-                // compile-error path which records into `output` and returns
-                // `Ok`. Without this the `?` short-circuited before the JSON
-                // emit, leaving an orchestrator (Dagster) consuming
-                // `--output json` with empty stdout on a runtime failure. The
-                // terminal-status exit contract is honoured by
-                // `run_status_exit_result` below.
-                output.tables_failed += 1;
-                output.errors.push(crate::output::TableErrorOutput {
-                    asset_key: vec!["<runtime>".to_string()],
-                    error: format!("{e:#}"),
-                    failure_kind: crate::output::FailureKind::Unknown,
-                    cooldown_seconds: None,
-                });
-            }
+
+            state_store = Some(store);
         }
-
-        state_store = Some(store);
-    } else if expects_models {
-        // ‼️ Finding #2 (missing-dir), transformation executor leg: this is the
-        // PRIMARY guard for the transformation path — the apply seam does not
-        // check here because `run_local` resolves `config_dir.join(models_base)`
-        // from the pipeline config (this `models_dir`), which the seam's
-        // `run_plan.models_dir` does not match. A governed apply whose plan
-        // reviewed a non-empty model set but whose (config-resolved) models
-        // directory is absent at execution must FAIL CLOSED rather than silently
-        // succeed with nothing built. Fires before the state store is opened —
-        // no warehouse mutation. A bare `rocky run` / an empty reviewed set has
-        // `expects_models == false` and keeps the silent no-op below.
-        anyhow::bail!(
-            "refusing to complete governed apply: the reviewed models directory '{}' does not \
-             exist at execution (deleted or renamed since the plan was authorized), so its \
-             planned models cannot run — refusing rather than reporting success for models that \
-             never executed. Re-plan with `rocky plan` before applying.",
-            models_dir.display()
-        );
-    } else {
-        warn!(
-            models_dir = %models_dir.display(),
-            "models directory not found — nothing to execute"
-        );
+        ModelsDirDecision::Absent(models_dir) if expects_models => {
+            // ‼️ Finding #2 (missing-dir), transformation executor leg: this is
+            // the PRIMARY guard for the transformation path — the apply seam
+            // does not check here because the dispatch site resolves
+            // `config_dir.join(models_base)` from the pipeline config (this
+            // decision's path), which the seam's `run_plan.models_dir` does not
+            // match. A governed apply whose plan reviewed a non-empty model set
+            // but whose (config-resolved) models directory was absent at the
+            // decision must FAIL CLOSED rather than silently succeed with
+            // nothing built. Fires before the state store is opened — no
+            // warehouse mutation. A bare `rocky run` / an empty reviewed set
+            // has `expects_models == false` and keeps the silent no-op below.
+            anyhow::bail!(
+                "refusing to complete governed apply: the reviewed models directory '{}' does \
+                 not exist at execution (deleted or renamed since the plan was authorized), so \
+                 its planned models cannot run — refusing rather than reporting success for \
+                 models that never executed. Re-plan with `rocky plan` before applying.",
+                models_dir.display()
+            );
+        }
+        ModelsDirDecision::Absent(models_dir) => {
+            warn!(
+                models_dir = %models_dir.display(),
+                "models directory not found — nothing to execute"
+            );
+        }
     }
 
     output.duration_ms = start.elapsed().as_millis() as u64;
@@ -1078,6 +1107,9 @@ mod tests {
         };
         super::super::run::run(
             config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap(),
+            ),
             None, // filter
             None, // pipeline_name_arg — single pipeline resolves
             state_path,
@@ -1266,6 +1298,9 @@ auto_create_schemas = true
         let opts = PartitionRunOptions::default();
         super::super::run::run(
             &config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            ),
             None, // filter
             None, // pipeline_name_arg — single pipeline resolves
             &state_path,
@@ -1425,6 +1460,9 @@ auto_create_schemas = true
         let opts = PartitionRunOptions::default();
         super::super::run::run(
             &config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            ),
             None,
             None,
             &state_path,
@@ -1502,6 +1540,9 @@ auto_create_schemas = true
         let opts = PartitionRunOptions::default();
         let result = super::super::run::run(
             &config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            ),
             None,
             None,
             &state_path,
@@ -1589,5 +1630,81 @@ auto_create_schemas = true
             "an unparseable count must fail the check, not pass on a defaulted 0"
         );
         assert!(results[1].passed, "a genuine 0 <= threshold still passes");
+    }
+
+    /// Single-decision lazy gate: the dispatch site's resolved
+    /// [`super::ModelsDirDecision`] — not a fresh filesystem check — governs
+    /// whether `run_transformation` executes. The models directory EXISTS on
+    /// disk with a compilable model, but the passed decision says `Absent`
+    /// (modeling a directory created between `run()`'s session decision and
+    /// execution): the run must be a guaranteed no-op — no state store opened
+    /// (no state file created), nothing built. Pre-fix RED:
+    /// `run_transformation` re-checked `models_dir.exists()` itself, so the
+    /// on-disk directory resurrected execution and persisted a `RunRecord`
+    /// with NO session (the RD-003 sessionless-mutation shape via a race).
+    #[tokio::test]
+    async fn passed_absent_decision_governs_even_when_dir_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = dir.join("t.duckdb");
+        let state_path = dir.join(".rocky-state.redb");
+
+        seed_src(&db, 3).await;
+        write_model(&models_dir, "stg", "SELECT id FROM main.src", &[]);
+        write_config(dir, &db, "");
+        let loaded =
+            rocky_core::config::load_rocky_config_fingerprinted(&dir.join("rocky.toml")).unwrap();
+        let rocky_cfg = &loaded.config;
+        let (_, pipeline_config) =
+            crate::registry::resolve_pipeline(rocky_cfg, None).expect("resolve pipeline");
+        let rocky_core::config::PipelineConfig::Transformation(t) = pipeline_config else {
+            panic!("test config must resolve to a transformation pipeline");
+        };
+
+        super::run_transformation(
+            super::ModelsDirDecision::Absent(models_dir.clone()),
+            t,
+            rocky_cfg,
+            false, // output_json
+            &PartitionRunOptions::default(),
+            &rocky_core::config::SchemaCacheConfig::default(),
+            super::super::run::SkipGateConfig::off(),
+            false, // no_reuse
+            &state_path,
+            "run-decision-governs",
+            chrono::Utc::now(),
+            "cfg-hash-test",
+            None, // pipeline_name — no schedule attribution in this no-op drill
+            None, // idempotency_key
+            &rocky_core::run_vars::RunVars::new(),
+            None,  // exec_fp_gate
+            false, // expects_models
+        )
+        .await
+        .expect("an Absent decision is the silent no-op, even with the dir on disk");
+
+        assert!(
+            !state_path.exists(),
+            "the PASSED decision must govern: no state store may be opened (no state \
+             file created) even though the models directory exists on disk"
+        );
+        let a = DuckDbWarehouseAdapter::open(&db).expect("open db");
+        let r = a
+            .execute_query(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'main' AND table_name = 'stg'",
+            )
+            .await
+            .unwrap();
+        let built = r.rows[0][0]
+            .as_i64()
+            .or_else(|| r.rows[0][0].as_str().and_then(|s| s.parse().ok()))
+            .unwrap();
+        assert_eq!(
+            built, 0,
+            "nothing may materialize on an Absent decision, even with the dir on disk"
+        );
     }
 }

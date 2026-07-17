@@ -31,27 +31,37 @@ const STAGING_SUFFIX: &str = "__rocky_stg";
 ///
 /// CLI args override values from the load pipeline config. When `--source-dir`
 /// is omitted, the pipeline's `source_dir` from `rocky.toml` is used.
+///
+/// WP-01 PR-B (2b, RD-003): executes from the caller's fingerprinted `loaded`
+/// snapshot (never a self-load — #1120) against the caller's canonical
+/// `state_path` (never the legacy `<config_dir>/.rocky_state`), and owns a
+/// [`RemoteStateSession`][rocky_core::state_sync::RemoteStateSession] around
+/// its state mutation: acquire + unconditional `require_synced` before the
+/// store open, capture the per-file results, ALWAYS finalize, then propagate.
+/// `config_path` remains for directory resolution only (`source_dir`, the
+/// legacy state file's location).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_load(
     config_path: &Path,
+    loaded: &rocky_core::config::LoadedConfig,
+    state_path: &Path,
     cli_source_dir: Option<&Path>,
     format: Option<&str>,
     target_table: Option<&str>,
     pipeline: Option<&str>,
     truncate: bool,
+    durability: rocky_core::state_sync::FinalizeDurability,
     json: bool,
 ) -> Result<()> {
     let start = Instant::now();
 
-    // Load config and build adapter registry.
-    let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
-        "failed to load config from {}",
-        config_path.display()
-    ))?;
-    let registry = AdapterRegistry::from_config(&rocky_cfg)?;
+    // The caller's threaded snapshot (formerly a self-load here — #1120).
+    let rocky_cfg = &loaded.config;
+    let registry = AdapterRegistry::from_config(rocky_cfg)?;
 
     // Resolve pipeline to get the target adapter.
     let (pipeline_name, pipeline_cfg) =
-        resolve_pipeline(&rocky_cfg, pipeline).context("failed to resolve pipeline for load")?;
+        resolve_pipeline(rocky_cfg, pipeline).context("failed to resolve pipeline for load")?;
     let load_cfg = pipeline_cfg.as_load();
 
     // Resolve source directory: CLI overrides config.
@@ -98,13 +108,6 @@ pub async fn run_load(
         .as_ref()
         .map(|lc| config_options_to_sdk(&lc.options))
         .unwrap_or_default();
-
-    // Open the state store for tracking loaded files.
-    let state_path = config_dir.join(".rocky_state");
-    let state_store = StateStore::open(&state_path).context(format!(
-        "failed to open state store at {}",
-        state_path.display()
-    ))?;
 
     let adapter_name = pipeline_cfg.target_adapter();
 
@@ -155,7 +158,145 @@ pub async fn run_load(
         } else {
             println!("No loadable files found in {}", source_dir.display());
         }
+        // Pre-session early return: an empty load performs NO state mutation,
+        // so it does no remote I/O at all (the ADR's lazy contract).
         return Ok(());
+    }
+
+    // -----------------------------------------------------------------------
+    // Remote-state session (WP-01 PR-B 2b, RD-003) — acquired only once there
+    // is at least one file to load, BEFORE the store open below.
+    // -----------------------------------------------------------------------
+    let mut session =
+        rocky_core::state_sync::RemoteStateSession::new(&rocky_cfg.state, state_path, durability);
+    if let Err(e) = session.acquire().await {
+        // Unreachable on a fresh session (`Err` = double-acquire misuse);
+        // consume defensively so no exit path can leak the session.
+        session.abandon("load acquire misuse").await;
+        return Err(e.into());
+    }
+    // UNCONDITIONAL fail-closed guard (unlike the run arms' governed-only
+    // bail): a load is a mutating single-purpose command, and proceeding
+    // blind on shared state it could not read is wrong for it regardless of
+    // governance. A genuine fresh start (`FreshStart`) proceeds; only
+    // `Indeterminate` refuses.
+    //
+    // DELIBERATE exception to the general ungoverned degraded-continue
+    // contract (documented in ADR-STATE-SESSION §3). Honest scope
+    // (re-review corrected): NOTHING in the engine consults `loaded_files`
+    // to skip a load today — the loop below loads every discovered file
+    // without reading the ledger and records only after success — so a
+    // missing remote record does not by itself cause duplicate ingestion.
+    // The rationale is ledger integrity, not dedup: `loaded_files` is the
+    // replicated cross-pod record of what each pod ingested (the audit
+    // trail and the foundation any future incremental-skip consumer reads),
+    // and proceeding degraded would silently orphan it — the Indeterminate
+    // authority suppresses the terminal upload, so this run's records would
+    // be stranded locally, invisible to every other pod. Refusing beats
+    // silently losing replicated ledger rows for a command whose only job
+    // is the mutation being recorded. Pinned by
+    // `download_failure_fails_closed_load` (tests/remote_state_bypass.rs).
+    if let Err(e) = session.require_synced() {
+        session.abandon("load download failure (fail-closed)").await;
+        return Err(anyhow::Error::new(e).context(
+            "failed to download remote state before the load; a remote-backend load \
+             requires the state backend reachable to read the authoritative loaded-files \
+             ledger (fail-closed)",
+        ));
+    }
+
+    // Open the CANONICAL state store for tracking loaded files — the same
+    // path + `on_schema_mismatch` policy as `rocky run` (load previously
+    // hard-`open`ed a legacy `<config_dir>/.rocky_state`).
+    let state_store =
+        match StateStore::open_with_policy(state_path, rocky_cfg.state.on_schema_mismatch) {
+            Ok(store) => store,
+            Err(e) => {
+                session.abandon("load state store open failed").await;
+                return Err(anyhow::Error::new(e).context(format!(
+                    "failed to open state store at {}",
+                    state_path.display()
+                )));
+            }
+        };
+    // Forward-incompat recreate ⇒ never push the downgraded ledger back over
+    // newer shared state (parity with the run path's suppression).
+    if state_store.was_recreated_for_forward_incompat() {
+        session.set_suppress_upload("forward-incompat recreate");
+    }
+
+    // Legacy-state migration: a LOGICAL IMPORT, never a rename (ADR §3). The
+    // legacy `<config_dir>/.rocky_state` and the canonical state file map to
+    // the SAME remote object (`remote_state_key` keys on the parent directory
+    // name), so a rename would be erased by the next remote download —
+    // LOADED_FILES is a replicated table that downloads replace wholesale —
+    // and a shared legacy DB can hold OTHER pipelines' rows (keys are
+    // `pipeline|file_path`), which must not be moved out from under them.
+    // So: import ONLY the selected pipeline's rows into the canonical store,
+    // idempotently (existing canonical keys win), and leave the legacy file
+    // in place. A legacy file that fails to open is warned about and skipped
+    // — never aborts the load.
+    let legacy_state_path = config_dir.join(".rocky_state");
+    let same_as_canonical = match (legacy_state_path.canonicalize(), state_path.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => legacy_state_path == state_path,
+    };
+    if legacy_state_path.exists() && !same_as_canonical {
+        match StateStore::open_read_only(&legacy_state_path) {
+            Ok(legacy_store) => match legacy_store.list_loaded_files(pipeline_name) {
+                Ok(rows) => {
+                    let mut imported = 0usize;
+                    for (file_path, record) in rows {
+                        let already = state_store
+                            .get_loaded_file(pipeline_name, &file_path)
+                            .ok()
+                            .flatten()
+                            .is_some();
+                        if already {
+                            continue;
+                        }
+                        if let Err(e) =
+                            state_store.record_loaded_file(pipeline_name, &file_path, &record)
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                file = %file_path,
+                                "failed to import a legacy loaded-file record; its ledger \
+                                 entry remains only in the legacy state file"
+                            );
+                        } else {
+                            imported += 1;
+                        }
+                    }
+                    if imported > 0 {
+                        tracing::warn!(
+                            legacy_state = %legacy_state_path.display(),
+                            pipeline = pipeline_name,
+                            imported,
+                            "imported legacy loaded-file records into the canonical state \
+                             store; the legacy file is left in place (other pipelines may \
+                             still reference it) and is no longer read by this pipeline"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        legacy_state = %legacy_state_path.display(),
+                        "failed to read legacy loaded-file records; skipping the one-time \
+                         import (their ledger entries remain only in the legacy state file)"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    legacy_state = %legacy_state_path.display(),
+                    "failed to open the legacy load state file; skipping the one-time \
+                     import (its ledger entries remain only in the legacy state file)"
+                );
+            }
+        }
     }
 
     let mut file_results: Vec<LoadFileOutput> = Vec::new();
@@ -294,6 +435,19 @@ pub async fn run_load(
     }
 
     let duration_ms = start.elapsed().as_millis() as u64;
+
+    // Per-file results captured → ALWAYS finalize → then propagate. `run_load`
+    // records successes per-file and reports errors only after all files (the
+    // `files_failed` bail below), so `abandon` on a partial failure would drop
+    // file A's just-recorded ledger entry from the shared remote — the
+    // successful files' records must ride the terminal upload regardless of a
+    // later file's failure. The store is dropped first (advisory-lock release
+    // + flush), matching the gc/policy/restore seam ordering.
+    drop(state_store);
+    session.finalize().await.context(
+        "refusing to exit 0: the loaded-file state could not be persisted to the \
+         remote [state] backend",
+    )?;
 
     if json {
         let output = LoadOutput {
@@ -982,6 +1136,32 @@ required_columns = [
         );
     }
 
+    /// Drive `run_load` the way the CLI entries do: a fingerprinted config
+    /// snapshot + a canonical state path beside the config, `ConfigDefault`
+    /// durability (these projects use the Local backend, so the session is a
+    /// zero-I/O no-op).
+    #[cfg(feature = "duckdb")]
+    async fn drive_load(config_path: &Path, json: bool) -> Result<()> {
+        let loaded = rocky_core::config::load_rocky_config_fingerprinted(config_path)?;
+        let state_path = config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(".rocky-state.redb");
+        run_load(
+            config_path,
+            &loaded,
+            &state_path,
+            None,
+            None,
+            None,
+            None,
+            false,
+            rocky_core::state_sync::FinalizeDurability::ConfigDefault,
+            json,
+        )
+        .await
+    }
+
     /// (a) A CSV satisfying the contract loads and lands rows in the target.
     #[cfg(feature = "duckdb")]
     #[tokio::test]
@@ -998,7 +1178,7 @@ required_columns = [
         let db_path = dir.path().join("wh.duckdb");
         let config_path = write_contract_config(dir.path(), &db_path);
 
-        run_load(&config_path, None, None, None, None, false, false)
+        drive_load(&config_path, false)
             .await
             .expect("contract-satisfying load should succeed");
 
@@ -1026,7 +1206,7 @@ required_columns = [
         let db_path = dir.path().join("wh.duckdb");
         let config_path = write_contract_config(dir.path(), &db_path);
 
-        let err = run_load(&config_path, None, None, None, None, false, false)
+        let err = drive_load(&config_path, false)
             .await
             .expect_err("contract-violating load must fail");
         let msg = format!("{err:#}");
@@ -1062,7 +1242,7 @@ required_columns = [
         let config_path = write_contract_config(dir.path(), &db_path);
 
         // JSON mode still fails (non-zero) but should not panic.
-        let err = run_load(&config_path, None, None, None, None, false, true)
+        let err = drive_load(&config_path, true)
             .await
             .expect_err("contract-violating load must fail in json mode too");
         assert!(format!("{err:#}").contains("failed to load"));

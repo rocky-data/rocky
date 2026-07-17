@@ -65,10 +65,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tracing::warn;
 
-use rocky_core::config::{
-    PolicyCapability, PolicyPrincipal, StateBackend, StateConfig, StateUploadFailureMode,
-    load_rocky_config,
-};
+use rocky_core::config::{PolicyCapability, PolicyPrincipal, StateBackend, load_rocky_config};
 use rocky_core::cost::{WarehouseType, compute_observed_cost_usd, warehouse_size_to_dbu_per_hour};
 use rocky_core::state::{
     ArtifactRecord, EvictOutcome, ModelExecution, ProvenanceRecord, RunRecord, StateStore,
@@ -1527,16 +1524,17 @@ pub(crate) async fn run_gc_apply_in_with(
         .unwrap_or_default();
     let remote_state = !matches!(state_cfg.backend, StateBackend::Local);
     if remote_state {
-        // PR-A (RD-001): bind the typed authority — a successful download of
-        // either usable variant means the local ledger now mirrors remote
-        // truth; failure still `?`-bails fail-closed (unchanged). PR-B
-        // branches on the value.
-        let _authority = rocky_core::state_sync::download_state(&state_cfg, state_path)
-            .await
-            .with_context(|| {
-                "failed to download remote state before gc apply; a remote-backend gc apply \
+        // WP-01 PR-B (2b): the session half-seam owns the download shape; a
+        // successful download of either usable variant means the local ledger
+        // now mirrors remote truth; failure still `?`-bails fail-closed
+        // (unchanged).
+        let _authority =
+            rocky_core::state_sync::RemoteStateSession::download_only(&state_cfg, state_path)
+                .await
+                .with_context(|| {
+                    "failed to download remote state before gc apply; a remote-backend gc apply \
                  requires the state backend to be reachable"
-            })?;
+                })?;
     }
 
     // Finding 1: gate on the SAME `loaded_cfg` snapshot used for the state
@@ -1608,13 +1606,13 @@ pub(crate) async fn run_gc_apply_in_with(
     // the configured `on_upload_failure` (default `skip`) — a failed upload
     // aborts (finding 5).
     if remote_state {
-        let upload_cfg = StateConfig {
-            on_upload_failure: StateUploadFailureMode::Fail,
-            ..state_cfg.clone()
-        };
-        rocky_core::state_sync::upload_state(&upload_cfg, state_path)
-            .await
-            .with_context(|| "failed to upload remote state after gc apply")?;
+        // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability
+        // policy (previously a local `StateConfig` clone here).
+        rocky_core::state_sync::RemoteStateSession::upload_only_fail_closed(
+            &state_cfg, state_path, "gc apply",
+        )
+        .await
+        .with_context(|| "failed to upload remote state after gc apply")?;
     }
 
     if json {

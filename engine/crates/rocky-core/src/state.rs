@@ -63,8 +63,9 @@ const GRACE_PERIODS: TableDefinition<&str, &[u8]> = TableDefinition::new("grace_
 ///
 /// Key format: `"{pipeline_name}|{file_path}"` (e.g.
 /// `"ingest|data/orders.csv"`). Value: serialized [`LoadedFileRecord`].
-/// Used for incremental loads: files already recorded with a matching hash
-/// can be skipped.
+/// The replicated cross-pod record of what each pod ingested — an audit
+/// trail today (`rocky load` loads every discovered file without reading
+/// this table) and the foundation for a future incremental-skip consumer.
 const LOADED_FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("loaded_files");
 /// Named virtual branches (schema-prefix branches).
 ///
@@ -521,6 +522,36 @@ pub struct StateStore {
 /// opening a store. See [`CURRENT_SCHEMA_VERSION`].
 pub fn current_schema_version() -> u32 {
     CURRENT_SCHEMA_VERSION
+}
+
+/// Stamps the on-disk `schema_version` metadata at `path` to an arbitrary
+/// value, bypassing the compatibility checks. **Test support only.**
+///
+/// Lets tests fabricate a store "written by a newer binary" to drive the
+/// forward-incompatibility paths
+/// ([`StateStore::was_recreated_for_forward_incompat`]) without faking a
+/// binary upgrade. Compiled only for this crate's tests or under the
+/// `test-support` feature — the `rocky` binary never enables either.
+///
+/// # Panics
+///
+/// Panics if the store cannot be opened or the stamp cannot be committed —
+/// a broken fixture must fail the test loudly.
+#[cfg(any(test, feature = "test-support"))]
+pub fn force_schema_version(path: &Path, version: &str) {
+    let store = StateStore::open(path).expect("open store to stamp schema version");
+    let txn = store
+        .db
+        .begin_write()
+        .expect("begin schema-version stamp txn");
+    {
+        let mut metadata = txn.open_table(METADATA).expect("open metadata table");
+        metadata
+            .insert("schema_version", version)
+            .expect("stamp schema_version");
+    }
+    txn.commit().expect("commit schema-version stamp");
+    // `store` drops here, releasing the advisory lock.
 }
 
 /// Outcome of [`StateStore::init_db`].
@@ -8490,18 +8521,9 @@ mod tests {
     // Forward-incompat / schema-mismatch policy (deploy safety)
     // -----------------------------------------------------------------------
 
-    /// Stamp an arbitrary `schema_version` onto an existing store file, then
-    /// release the lock. Used to simulate a store written by a *newer* binary.
-    fn force_schema_version(path: &Path, version: &str) {
-        let store = StateStore::open(path).unwrap();
-        let txn = store.db.begin_write().unwrap();
-        {
-            let mut metadata = txn.open_table(METADATA).unwrap();
-            metadata.insert("schema_version", version).unwrap();
-        }
-        txn.commit().unwrap();
-        // `store` drops here, releasing the advisory lock.
-    }
+    // Forward-incompat stamping goes through the module-level test-support
+    // `force_schema_version` (resolved via `use super::*`), shared with the
+    // CLI integration tests.
 
     fn sample_watermark() -> WatermarkState {
         let now = Utc::now();

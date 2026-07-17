@@ -21,8 +21,14 @@ use crate::registry::{AdapterRegistry, resolve_pipeline};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Execute `rocky seed`: discover, infer, create, and load seed tables.
+///
+/// Executes from the caller's threaded, fingerprinted config snapshot —
+/// never an internal `rocky.toml` re-read (#1120). The signature enforces
+/// it: there is no config path to read, so a `rocky.toml` swap timed after
+/// the caller's load (e.g. mid-DAG under `rocky run --dag`) cannot redirect
+/// the seed's adapter to a different warehouse than the rest of the run.
 pub async fn run_seed(
-    config_path: &Path,
+    loaded: &rocky_core::config::LoadedConfig,
     seeds_dir: &Path,
     pipeline: Option<&str>,
     filter: Option<&str>,
@@ -30,16 +36,13 @@ pub async fn run_seed(
 ) -> Result<()> {
     let start = Instant::now();
 
-    // Load config and build adapter registry.
-    let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
-        "failed to load config from {}",
-        config_path.display()
-    ))?;
-    let registry = AdapterRegistry::from_config(&rocky_cfg)?;
+    // Build the adapter registry from the caller's snapshot.
+    let rocky_cfg = &loaded.config;
+    let registry = AdapterRegistry::from_config(rocky_cfg)?;
 
     // Resolve pipeline to get the target adapter.
     let (_pipeline_name, pipeline_cfg) =
-        resolve_pipeline(&rocky_cfg, pipeline).context("failed to resolve pipeline for seed")?;
+        resolve_pipeline(rocky_cfg, pipeline).context("failed to resolve pipeline for seed")?;
     let adapter_name = pipeline_cfg.target_adapter();
     let adapter = registry.warehouse_adapter(adapter_name)?;
     let dialect = adapter.dialect();

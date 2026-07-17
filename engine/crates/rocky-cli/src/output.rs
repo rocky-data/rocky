@@ -51,18 +51,20 @@ pub fn sql_fingerprint(statements: &[String]) -> String {
 ///
 /// Stored on [`rocky_core::state::RunRecord::config_hash`] so consumers can
 /// detect "did the config change between these two runs?" without diffing
-/// full TOML bodies. Uses the same [`DefaultHasher`] (SipHash) as
-/// [`sql_fingerprint`] — intra-release-stable, not cross-release-stable.
+/// full TOML bodies. Hashing delegates to
+/// [`rocky_core::config::config_fingerprint_bytes`] — the same
+/// implementation `load_rocky_config_fingerprinted` captures at load time —
+/// so a path-based fingerprint of an unswapped file is byte-identical to the
+/// loaded snapshot's `LoadedConfig::fingerprint`. Intra-release-stable, not
+/// cross-release-stable.
 ///
+/// Output-only convenience: the execution paths thread the fingerprint
+/// captured at their single load site instead of re-reading the path (#1120).
 /// Returns `"unknown"` on read failure — record persistence should never
 /// fail because the config file became unreadable between load and finalize.
 pub fn config_fingerprint(config_path: &std::path::Path) -> String {
     match std::fs::read(config_path) {
-        Ok(bytes) => {
-            let mut hasher = DefaultHasher::new();
-            hasher.write(&bytes);
-            format!("{:016x}", hasher.finish())
-        }
+        Ok(bytes) => rocky_core::config::config_fingerprint_bytes(&bytes),
         Err(_) => "unknown".to_string(),
     }
 }
