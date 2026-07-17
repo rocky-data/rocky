@@ -1434,6 +1434,14 @@ pub async fn run(
         );
 
         let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
+        // An explicit `--pipeline` alongside `--model` (also how the unified-DAG
+        // sub-runner drives each transformation node) resolves the model against
+        // THAT pipeline's target adapter and schema-creation policy — not the
+        // first-transformation-adapter fallback used when no pipeline is named.
+        // A model only has meaning under a transformation pipeline, so pointing
+        // `--model` at a non-transformation pipeline fails fast rather than
+        // silently running against an unrelated adapter. Bare `rocky run --model
+        // <X>` (no `--pipeline`) keeps the fallback via the `else` arm below.
         let (target_adapter_name, auto_create_schemas) = if let Some(pipeline_name) =
             pipeline_name_arg
         {
