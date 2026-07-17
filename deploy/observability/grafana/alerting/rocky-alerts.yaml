@@ -1,0 +1,133 @@
+# Provisioned Grafana alert rules for Rocky runs. Deliberately few — this is
+# a quickstart, not an SRE program. Wire a contact point in Grafana (or add
+# one under provisioning/alerting/) to actually deliver these.
+#
+# Note on the metric shape: rocky.tables_failed and rocky.error_rate_pct are
+# emitted as last-value gauges (one value per run), NOT cumulative counters —
+# so "increase over 15m" is expressed as "any run in the last 15m reported a
+# non-zero value" via max_over_time(...[15m]), which is the honest reading of
+# a per-run gauge. Do not switch these to increase()/rate(); those assume a
+# monotonic counter and would silently produce nothing.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: rocky-runs
+    folder: Rocky
+    interval: 1m
+    rules:
+      # Any run in the last 15 minutes reported one or more failed tables.
+      - uid: rocky-tables-failed
+        title: Rocky run reported failed tables
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: "A Rocky run reported failed tables in the last 15m."
+          description: "rocky.tables_failed was > 0 for at least one run in the last 15 minutes."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: A
+              editorMode: code
+              expr: max_over_time(rocky_tables_failed[15m])
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator:
+                    type: gt
+                    params: [0]
+
+      # Error rate above 5% sustained for 15 minutes.
+      - uid: rocky-error-rate
+        title: Rocky error rate above 5 percent
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: "Rocky error rate has been above 5% for 15m."
+          description: "rocky.error_rate_pct has stayed above 5 for the last 15 minutes."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: A
+              editorMode: code
+              expr: max(rocky_error_rate_pct)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator:
+                    type: gt
+                    params: [5]
+
+# ---------------------------------------------------------------------------
+# Scheduler alerts (stub — arrives with the native-scheduler work).
+#
+# Once `rocky serve --scheduler` / `rocky tick` ship their telemetry, a
+# consecutive-failures alert belongs here. Left commented until those metrics
+# exist so provisioning never references a metric that isn't emitted yet.
+#
+#      - uid: rocky-scheduler-consecutive-failures
+#        title: Rocky scheduled pipeline is failing repeatedly
+#        condition: C
+#        for: 0m
+#        labels:
+#          severity: critical
+#        annotations:
+#          summary: "A scheduled Rocky pipeline has failed repeatedly."
+#        data:
+#          - refId: A
+#            relativeTimeRange: { from: 900, to: 0 }
+#            datasourceUid: prometheus
+#            model:
+#              refId: A
+#              editorMode: code
+#              expr: max(rocky_scheduler_consecutive_failures) by (pipeline)
+#              instant: true
+#          - refId: C
+#            datasourceUid: __expr__
+#            model:
+#              refId: C
+#              type: threshold
+#              expression: A
+#              conditions:
+#                - type: query
+#                  evaluator: { type: gt, params: [3] }
