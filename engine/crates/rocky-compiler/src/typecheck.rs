@@ -443,36 +443,7 @@ fn compute_model_typecheck(
         ReferenceMap::default()
     };
 
-    // Step 1: Build type scope from upstream models
-    let mut scope = TypeScope::new();
-
-    for upstream_name in &model_schema.upstream {
-        if let Some(upstream_cols) = typed_models.get(upstream_name) {
-            for col in upstream_cols {
-                scope.columns.insert(
-                    CiKey::owned(col.name.clone()),
-                    (col.data_type.clone(), col.nullable),
-                );
-            }
-        }
-    }
-    // Also inject from external sources via lineage edges
-    for edge in graph.edges_targeting(model_name) {
-        if let Some(source_cols) = typed_models.get(&*edge.source.model) {
-            let col = col_index
-                .get(&*edge.source.model)
-                .and_then(|idx| idx.get(&*edge.source.column))
-                .map(|&i| &source_cols[i]);
-            if let Some(col) = col {
-                scope.columns.insert(
-                    CiKey::owned(edge.source.column.to_string()),
-                    (col.data_type.clone(), col.nullable),
-                );
-            }
-        }
-    }
-
-    // Step 2: Lineage-based type propagation
+    // Step 1: Lineage-based type propagation
     let mut typed_cols: Vec<TypedColumn> = Vec::with_capacity(model_schema.columns.len());
 
     for col_def in &model_schema.columns {
@@ -510,11 +481,33 @@ fn compute_model_typecheck(
         });
     }
 
-    // Step 3: Enhanced inference — refine Unknown types from scope.
-    let enhanced_diags = enhanced_inference(model_name, &scope, &mut typed_cols);
+    // Step 2: Parse cast target types that lineage intentionally leaves Unknown.
+    let has_unknown_cast = typed_cols.iter().any(|col| {
+        col.data_type == RockyType::Unknown
+            && graph
+                .producing_edge(model_name, &col.name)
+                .is_some_and(|edge| {
+                    matches!(&edge.transform, rocky_sql::lineage::TransformKind::Cast)
+                })
+    });
+    let inferred_cols = if has_unknown_cast {
+        model_by_name
+            .get(model_name)
+            .and_then(|model| infer_select_types(&model.sql, &HashMap::new(), model_name).ok())
+    } else {
+        None
+    };
+    let enhanced_diags = enhanced_inference(
+        model_name,
+        graph,
+        typed_models,
+        col_index,
+        inferred_cols.as_deref(),
+        &mut typed_cols,
+    );
     diagnostics.extend(enhanced_diags);
 
-    // Step 4: SELECT * warning
+    // Step 3: SELECT * warning
     if model_schema.has_star {
         let has_unknown_upstream = model_schema
             .upstream
@@ -536,7 +529,7 @@ fn compute_model_typecheck(
         }
     }
 
-    // Step 5: Join key compatibility (timed if accumulator provided).
+    // Step 4: Join key compatibility (timed if accumulator provided).
     let jk_start = join_keys_acc.map(|_| Instant::now());
     let join_diags = check_join_keys(model_name, typed_models, graph);
     if let (Some(start), Some(acc)) = (jk_start, join_keys_acc) {
@@ -544,7 +537,7 @@ fn compute_model_typecheck(
     }
     diagnostics.extend(join_diags);
 
-    // Step 6: time_interval strategy validation. For models declaring
+    // Step 5: time_interval strategy validation. For models declaring
     // `[strategy] type = "time_interval"` we need to confirm the partition
     // column is real, has the right type, isn't nullable, etc. — see
     // `check_time_interval_strategy` for the full list of E020-E026 + W003.
@@ -552,7 +545,7 @@ fn compute_model_typecheck(
         diagnostics.extend(check_time_interval_strategy(model, &typed_cols));
     }
 
-    // Step 7: Enrich diagnostics with the model's file path as a SourceSpan
+    // Step 6: Enrich diagnostics with the model's file path as a SourceSpan
     // when they don't already have one. This gives miette a file to render.
     if let Some(model) = model_by_name.get(model_name) {
         let file_path = &model.file_path;
@@ -1252,28 +1245,15 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
     }
 }
 
-/// Enhanced type inference by parsing SQL and walking SELECT item expressions.
-///
-/// This catches types that lineage-based propagation misses:
-/// - CAST(x AS TYPE) → parse the target type
-/// - Literal values (42 → Int64, 'hello' → String, TRUE → Boolean)
-/// - Arithmetic expressions → numeric type promotion
-/// - Comparison expressions → Boolean
-/// - COALESCE → common supertype, non-nullable
+/// Refine explicit casts by parsing their target types from the model SQL.
 fn enhanced_inference(
     model_name: &str,
-    scope: &TypeScope,
+    graph: &SemanticGraph,
+    typed_models: &IndexMap<String, Vec<TypedColumn>>,
+    col_index: &HashMap<String, HashMap<String, usize>>,
+    inferred_cols: Option<&[TypedColumn]>,
     typed_cols: &mut [TypedColumn],
 ) -> Vec<Diagnostic> {
-    // We need to get the model's SQL, but it's not stored in the semantic graph.
-    // The semantic graph has column defs and edges. We'll use the `model_name`
-    // to look up SQL from the project. Since we don't have the project here,
-    // we rely on the lineage + transform kind already captured.
-    //
-    // However, for columns with Unknown type, we can still refine:
-    // - If all upstream columns in scope are known, we can infer expression types
-    //   by matching column names against the scope.
-
     let mut diagnostics = Vec::new();
 
     for col in typed_cols.iter_mut() {
@@ -1281,11 +1261,31 @@ fn enhanced_inference(
             continue; // Already has a type from lineage
         }
 
-        // Try to resolve from scope by column name
-        let (scope_type, scope_nullable) = scope.lookup(&col.name);
-        if scope_type != RockyType::Unknown {
-            col.data_type = scope_type;
-            col.nullable = scope_nullable;
+        let Some(edge) = graph.producing_edge(model_name, &col.name) else {
+            continue;
+        };
+        if !matches!(&edge.transform, rocky_sql::lineage::TransformKind::Cast) {
+            continue;
+        }
+
+        let input_is_known = typed_models
+            .get(&*edge.source.model)
+            .and_then(|columns| {
+                col_index
+                    .get(&*edge.source.model)
+                    .and_then(|index| index.get(&*edge.source.column))
+                    .map(|&index| &columns[index])
+            })
+            .is_some_and(|input| input.data_type != RockyType::Unknown);
+        if !input_is_known {
+            continue;
+        }
+
+        if let Some(inferred) = inferred_cols
+            .and_then(|columns| columns.iter().find(|inferred| inferred.name == col.name))
+            .filter(|inferred| inferred.data_type != RockyType::Unknown)
+        {
+            col.data_type = inferred.data_type.clone();
         }
     }
 
@@ -2055,6 +2055,7 @@ fn emit_join_key_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::{CompilerContract, ContractColumn, ContractRules, validate_contract};
     use crate::project::Project;
     use crate::semantic::build_semantic_graph;
     use rocky_core::models::{Model, ModelConfig, StrategyConfig, TargetConfig};
@@ -2289,6 +2290,52 @@ mod tests {
         assert_eq!(b_cols.len(), 2);
         assert_eq!(b_cols[0].data_type, RockyType::Int64);
         assert_eq!(b_cols[1].data_type, RockyType::String);
+    }
+
+    #[test]
+    fn test_cast_alias_uses_cast_type_not_source_type() {
+        let models = vec![make_model(
+            "cast_id",
+            "SELECT CAST(id AS STRING) AS id FROM source.raw.users",
+        )];
+        let project = Project::from_models(models).unwrap();
+
+        let mut external = HashMap::new();
+        external.insert(
+            "source.raw.users".to_string(),
+            vec![rocky_ir::ColumnInfo {
+                name: "id".to_string(),
+                data_type: "BIGINT".to_string(),
+                nullable: false,
+            }],
+        );
+        let graph = build_semantic_graph(&project, &external).unwrap();
+
+        let mut sources = HashMap::new();
+        sources.insert(
+            "source.raw.users".to_string(),
+            source_schema(&[("id", RockyType::Int64, false)]),
+        );
+
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let cast_id = &result.typed_models["cast_id"][0];
+        assert_eq!(cast_id.data_type, RockyType::String);
+        assert!(!cast_id.nullable);
+
+        let wrong_contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "id".to_string(),
+                type_name: Some("Int64".to_string()),
+                nullable: Some(false),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        assert!(
+            validate_contract("cast_id", std::slice::from_ref(cast_id), &wrong_contract)
+                .iter()
+                .any(|diagnostic| &*diagnostic.code == "E011")
+        );
     }
 
     #[test]
