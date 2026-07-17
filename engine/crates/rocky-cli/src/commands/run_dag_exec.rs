@@ -26,7 +26,7 @@ use crate::output::{DagRunNodeOutput, DagRunOutput, print_json};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Runs one pipeline sub-run: `(config_path, state_path, pipeline_name,
-/// skip_opts) -> Result<(), String>`.
+/// model_name, skip_opts) -> Result<(), String>`.
 ///
 /// Injected into [`CliDispatcher`] so the escape-hatch flags flow to a single,
 /// observable seam. Production wraps [`super::run::run`] with the DAG sub-run's
@@ -38,6 +38,7 @@ type SubRunner = Arc<
             PathBuf,
             PathBuf,
             String,
+            Option<String>,
             SkipRunOptions,
         ) -> Pin<Box<dyn Future<Output = std::result::Result<(), String>> + Send>>
         + Send
@@ -45,13 +46,18 @@ type SubRunner = Arc<
 >;
 
 /// The production [`SubRunner`]: drives one pipeline through [`super::run::run`]
-/// with the DAG sub-run's fixed arguments (no `--model`/`--defer`/`--var`,
-/// config-derived TTL, no idempotency key). Only `config`, `state`, `pipeline`,
-/// and `skip_opts` vary per node.
+/// with the DAG sub-run's fixed arguments (no `--defer`/`--var`, config-derived
+/// TTL, no idempotency key). Transformation nodes supply their model name so
+/// each node materializes only itself; other pipeline nodes pass `None`.
 fn default_sub_runner() -> SubRunner {
     Arc::new(
-        |config_path: PathBuf, state_path: PathBuf, pipeline_name: String, skip_opts| {
+        |config_path: PathBuf,
+         state_path: PathBuf,
+         pipeline_name: String,
+         model_name: Option<String>,
+         skip_opts| {
             Box::pin(async move {
+                let models_dir = models_dir_for_model_scope(&config_path, model_name.as_deref());
                 let partition_opts = super::PartitionRunOptions {
                     partition: None,
                     from: None,
@@ -68,20 +74,19 @@ fn default_sub_runner() -> SubRunner {
                     &state_path,
                     None,
                     false, // json — sub-runs print to stdout if not silenced
-                    None,
+                    models_dir.as_deref(),
                     false,
                     None,
                     false,
                     None,
                     &partition_opts,
-                    None,
+                    model_name.as_deref(),
                     // DAG sub-runs inherit config-derived TTL.
                     None,
                     // DAG sub-runs do not accept `--idempotency-key`.
                     None,
                     // DAG sub-runs inherit no `--env`.
                     None,
-                    // DAG sub-runs build full pipelines (no `--model` selection).
                     &super::run::DeferOptions::default(),
                     // The build-escape-hatch overlay (`--force-rebuild` /
                     // `--no-reuse`) threaded from the outer `rocky run --dag`.
@@ -100,6 +105,18 @@ fn default_sub_runner() -> SubRunner {
             })
         },
     )
+}
+
+/// Returns the conventional models directory only for a model-scoped
+/// transformation sub-run. Supplying it to replication/load sub-runs makes
+/// `run()` execute every transformation model after the pipeline itself.
+fn models_dir_for_model_scope(config_path: &Path, model_name: Option<&str>) -> Option<PathBuf> {
+    model_name.map(|_| {
+        config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("models")
+    })
 }
 
 /// Execute `rocky run --dag`: run every pipeline in dependency order.
@@ -248,14 +265,11 @@ fn status_str(s: &NodeStatus) -> &'static str {
 /// Dispatcher that turns each `NodeKind` into a future calling the matching
 /// CLI command function.
 ///
-/// Each pipeline-bound node (transformation / load / quality / snapshot, plus
-/// the replication sugar's load node) is dispatched via `super::run::run()`
-/// against its owning pipeline — looked up in `node_pipelines`, since a
-/// per-model node's *label* is the model name, not the pipeline. `Seed` nodes
-/// load their CSV (and fire pre/post hooks) via `super::seed::run_seed()`
-/// rather than `run()`, because a seed is not a pipeline. `Test` nodes are
-/// no-ops (tests run implicitly inside their parent transformation); `Source`
-/// nodes are markers for the replication extract side.
+/// Each pipeline-bound node is dispatched via `super::run::run()` against its
+/// owning pipeline. Transformation nodes also pass their model label so each
+/// per-model node materializes only itself; load / quality / snapshot nodes
+/// continue to run their whole pipeline. `Seed` nodes load their CSV directly,
+/// `Test` nodes are no-ops, and `Source` nodes are markers.
 struct CliDispatcher {
     config_path: std::path::PathBuf,
     /// Canonical state path threaded from the caller. Every sub-run drives
@@ -328,6 +342,7 @@ impl NodeDispatcher for CliDispatcher {
                         }));
                     }
                 };
+                let model_name = matches!(kind, NodeKind::Transformation).then_some(label.clone());
                 // Drive the sub-run through the injected [`SubRunner`] against
                 // the canonical state path the caller resolved, threading the
                 // build-escape-hatch `skip_opts` (`--force-rebuild` /
@@ -336,7 +351,14 @@ impl NodeDispatcher for CliDispatcher {
                 // `skip_opts` here reintroduces the silent-drop bug, which the
                 // `sub_runner` recorder test catches.
                 Some(Box::pin(async move {
-                    (sub_runner)(config_path, state_path, pipeline_name, skip_opts).await
+                    (sub_runner)(
+                        config_path,
+                        state_path,
+                        pipeline_name,
+                        model_name,
+                        skip_opts,
+                    )
+                    .await
                 }))
             }
         }
@@ -346,13 +368,27 @@ impl NodeDispatcher for CliDispatcher {
 #[cfg(test)]
 mod skip_opts_threading_tests {
     use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     use rocky_core::dag_executor::NodeDispatcher;
     use rocky_core::unified_dag::{NodeId, NodeKind};
 
     use super::super::run::SkipRunOptions;
-    use super::{CliDispatcher, SubRunner};
+    use super::{CliDispatcher, SubRunner, models_dir_for_model_scope};
+
+    type RecordedSubRun = (Option<String>, SkipRunOptions);
+
+    #[test]
+    fn models_dir_is_only_set_for_model_scoped_sub_runs() {
+        let config_path = Path::new("project/rocky.toml");
+
+        assert_eq!(
+            models_dir_for_model_scope(config_path, Some("dim_orders")),
+            Some(PathBuf::from("project/models"))
+        );
+        assert_eq!(models_dir_for_model_scope(config_path, None), None);
+    }
 
     /// 🔴 DEFECT 3 regression: `rocky run --dag --force-rebuild` / `--no-reuse`
     /// must reach each sub-run. Pre-fix, `run_with_dag` passed
@@ -368,17 +404,18 @@ mod skip_opts_threading_tests {
     /// live sandbox.)
     #[tokio::test]
     async fn dispatch_passes_the_threaded_skip_opts_to_each_sub_run() {
-        let recorded: Arc<Mutex<Vec<SkipRunOptions>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded: Arc<Mutex<Vec<RecordedSubRun>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = recorded.clone();
         // A recorder sub-runner: capture the skip_opts and return Ok without
         // running a real pipeline.
-        let recorder: SubRunner = Arc::new(move |_config, _state, _pipeline, skip_opts| {
-            let sink = sink.clone();
-            Box::pin(async move {
-                sink.lock().unwrap().push(skip_opts);
-                Ok(())
-            })
-        });
+        let recorder: SubRunner =
+            Arc::new(move |_config, _state, _pipeline, model_name, skip_opts| {
+                let sink = sink.clone();
+                Box::pin(async move {
+                    sink.lock().unwrap().push((model_name, skip_opts));
+                    Ok(())
+                })
+            });
 
         let skip_opts = SkipRunOptions {
             skip_unchanged: false,
@@ -406,12 +443,13 @@ mod skip_opts_threading_tests {
 
         let got = recorded.lock().unwrap();
         assert_eq!(got.len(), 1, "exactly one sub-run was dispatched");
+        assert_eq!(got[0].0.as_deref(), Some("dim_orders"));
         assert!(
-            got[0].force_rebuild,
+            got[0].1.force_rebuild,
             "--force-rebuild must reach the sub-run, not be dropped to default()"
         );
         assert!(
-            got[0].no_reuse,
+            got[0].1.no_reuse,
             "--no-reuse must reach the sub-run, not be dropped to default()"
         );
     }
@@ -535,5 +573,88 @@ mod tests {
             .execute_sql("SELECT COUNT(*) FROM proj.silver.dim_country")
             .unwrap();
         assert_eq!(cell_i64(&model_rows.rows[0][0]), 2, "model rows");
+    }
+
+    #[tokio::test]
+    async fn transformation_nodes_execute_only_their_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir(&models).unwrap();
+
+        let db_path = root.join("proj.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        std::fs::write(
+            models.join("a.sql"),
+            "SELECT 1 AS id, TIMESTAMP '2026-01-01 00:00:00' AS ts\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("a.toml"),
+            "name = \"a\"\n\n\
+             [strategy]\n\
+             type = \"incremental\"\n\
+             timestamp_column = \"ts\"\n\n\
+             [target]\n\
+             catalog = \"proj\"\n\
+             schema = \"silver\"\n\
+             table = \"a\"\n",
+        )
+        .unwrap();
+
+        std::fs::write(models.join("b.sql"), "SELECT id, ts FROM proj.silver.a\n").unwrap();
+        std::fs::write(
+            models.join("b.toml"),
+            "name = \"b\"\n\
+             depends_on = [\"a\"]\n\n\
+             [strategy]\n\
+             type = \"incremental\"\n\
+             timestamp_column = \"ts\"\n\n\
+             [target]\n\
+             catalog = \"proj\"\n\
+             schema = \"silver\"\n\
+             table = \"b\"\n",
+        )
+        .unwrap();
+
+        run_with_dag(
+            &root.join("rocky.toml"),
+            &root.join(".rocky-state.redb"),
+            false,
+            &crate::commands::run::SkipRunOptions::default(),
+        )
+        .await
+        .expect("run --dag should succeed");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        for table in ["a", "b"] {
+            let rows = guard
+                .execute_sql(&format!("SELECT COUNT(*) FROM proj.silver.{table}"))
+                .unwrap();
+            assert_eq!(
+                cell_i64(&rows.rows[0][0]),
+                1,
+                "{table} must materialize exactly once"
+            );
+        }
     }
 }
