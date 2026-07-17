@@ -939,6 +939,7 @@ mod tests {
             gc: Default::default(),
             policy: None,
             resilience: Default::default(),
+            schedule: Default::default(),
         }
     }
 
@@ -972,6 +973,7 @@ mod tests {
             depends_on: depends_on.into_iter().map(String::from).collect(),
             table_overrides: vec![],
             prune_unchanged: false,
+            schedule: None,
         }))
     }
 
@@ -986,6 +988,7 @@ mod tests {
             checks: ChecksConfig::default(),
             execution: ExecutionConfig::default(),
             depends_on: depends_on.into_iter().map(String::from).collect(),
+            schedule: None,
         }))
     }
 
@@ -1002,6 +1005,7 @@ mod tests {
             },
             execution: ExecutionConfig::default(),
             depends_on: depends_on.into_iter().map(String::from).collect(),
+            schedule: None,
         }))
     }
 

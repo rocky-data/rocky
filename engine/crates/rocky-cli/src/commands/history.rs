@@ -613,6 +613,8 @@ mod tests {
             hostname: "dev-laptop".to_string(),
             rocky_version: "1.16.0".to_string(),
             check_outcomes: Vec::new(),
+            pipeline: None,
+            submission_id: None,
         }
     }
 
@@ -700,6 +702,8 @@ mod tests {
             hostname: "host".to_string(),
             rocky_version: "0.0.0-test".to_string(),
             check_outcomes: Vec::new(),
+            pipeline: None,
+            submission_id: None,
         }
     }
 

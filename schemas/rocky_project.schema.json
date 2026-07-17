@@ -1641,6 +1641,17 @@
           },
           "description": "Load options (batch size, create/truncate behavior, CSV settings)."
         },
+        "schedule": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ScheduleConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional native-schedule declaration. See [`ScheduleConfig`]."
+        },
         "source_dir": {
           "description": "Directory or glob pattern for source files, relative to the config file.",
           "type": "string"
@@ -2919,6 +2930,17 @@
           },
           "description": "Execution settings (concurrency, retries, etc.)."
         },
+        "schedule": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ScheduleConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional native-schedule declaration. See [`ScheduleConfig`]."
+        },
         "tables": {
           "default": [],
           "description": "Tables to check. Each entry specifies catalog + schema, and optionally a specific table (omit for all tables in the schema).",
@@ -3091,6 +3113,17 @@
           "default": false,
           "description": "When `true`, the replication runner skips (\"prunes\") any table whose source is provably unchanged since the last successful copy — detected via the adapter's `source_change_marker` (a `DESCRIBE DETAIL`-derived marker on Databricks; adapters without a cheap change signal always copy). A pruned table runs no copy and no data checks: the runner emits no materialization and records it under `excluded_tables` with reason `\"unchanged_since_last_copy\"`.\n\nDownstream continuity — and preserving the table's prior check results — is then the orchestrator's job. The Dagster integration treats a pruned, unmaterialized key as unchanged via `satisfy_empty_outputs`; enabling pruning without an orchestrator that handles unmaterialized keys drops the table from the run.\n\nDefaults to `false` — opt in per pipeline, since silently skipping copies is a behavior change. The marker is compared against the target's recorded last-copied value (never wall-clock), so a failed prior run cannot cause a false skip. Pass `--no-prune` to `rocky run` to force a full pass (e.g. after a manual target-side mutation).",
           "type": "boolean"
+        },
+        "schedule": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ScheduleConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional native-schedule declaration. See [`ScheduleConfig`]."
         },
         "source": {
           "allOf": [
@@ -3371,6 +3404,100 @@
       },
       "type": "object"
     },
+    "ScheduleConfig": {
+      "additionalProperties": false,
+      "description": "Per-pipeline schedule declaration for native demand reconciliation.\n\nEvery field is optional; an absent `[pipeline.<name>.schedule]` block leaves the pipeline with today's behavior (it runs only when invoked directly). A pipeline may combine demand sources — `cron`, `after`, and `freshness` union, so any one of them makes the pipeline due.\n\nUnlike the five pipeline variant structs (which deliberately omit `deny_unknown_fields` so the IDE schema can inject the `type` discriminator), this struct **denies unknown fields**: a typo inside `[…schedule]` is a silent scheduling bug — a misspelled `corn` key would leave a pipeline unscheduled with no error — so the deserializer rejects it outright.",
+      "properties": {
+        "after": {
+          "description": "Upstream pipelines this one runs after. The pipeline is due once every listed pipeline has a successful run that completed after this pipeline's own latest success started (a partial-success run does not count as an upstream success).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "catchup": {
+          "default": "latest",
+          "description": "Catch-up policy when more than one cron occurrence elapsed since the last fire: `\"latest\"` (default) fires one demand at the most recent missed occurrence; `\"skip\"` advances the anchor and runs nothing. `\"all\"` is rejected at validation — runs are watermark-driven, not windowed, so replaying every missed occurrence is pure cost.",
+          "type": "string"
+        },
+        "cron": {
+          "description": "Standard 5-field cron expression (minute hour day-of-month month day-of-week). When set, the pipeline is due at each occurrence.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": true,
+          "description": "When `false`, demand is suppressed but the config is kept. Default `true`.",
+          "type": "boolean"
+        },
+        "freshness": {
+          "default": false,
+          "description": "When `true`, the pipeline is due once its own run-staleness exceeds its freshness budget (resolved from per-model `max_lag_seconds`, falling back to the project `[freshness].expected_lag_seconds`). This is run-staleness only — the reconciler never queries the warehouse.",
+          "type": "boolean"
+        },
+        "retry": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ScheduleRetryConfig"
+            }
+          ],
+          "default": {
+            "max": 0
+          },
+          "description": "In-tick immediate re-submissions on failure. The reconciler never sleeps between attempts; minutes-scale spacing is the always-on cross-tick throttle, not this knob. Default `0` (off)."
+        },
+        "timeout_minutes": {
+          "default": 0,
+          "description": "Scheduler-level timeout in minutes for a launched run. `0` (default) means no scheduler-level timeout — the run's own limits apply.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "timezone": {
+          "description": "IANA timezone name (e.g. `\"Europe/Lisbon\"`) the `cron` occurrences are evaluated in. Falls back to the project `[schedule].timezone`, which itself defaults to `\"UTC\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ScheduleDefaultsConfig": {
+      "additionalProperties": false,
+      "description": "Project-level schedule defaults (`[schedule]`).\n\nSupplies the fallback timezone for per-pipeline `cron` blocks that omit their own, plus the resident-loop poll cadence consumed by a later phase.",
+      "properties": {
+        "poll_interval_seconds": {
+          "default": 15,
+          "description": "Poll cadence in seconds for the resident scheduler loop. Not consumed by the one-shot tick; reserved for the resident-loop phase. Default `15`.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "timezone": {
+          "default": "UTC",
+          "description": "Default IANA timezone for per-pipeline cron evaluation. Default `\"UTC\"`.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ScheduleRetryConfig": {
+      "additionalProperties": false,
+      "description": "In-tick retry budget for a scheduled pipeline.",
+      "properties": {
+        "max": {
+          "default": 0,
+          "description": "Maximum number of *additional* immediate re-submissions after the first attempt fails. `0` means the first attempt is the only one.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "SchemaCacheConfig": {
       "additionalProperties": false,
       "description": "`[cache.schemas]` — schema cache configuration.\n\nControls the DESCRIBE-result cache. Defaults are chosen so the feature is useful out of the box: the cache is on, entries live for 24 hours, and nothing replicates off-machine until the user opts in.",
@@ -3501,6 +3628,17 @@
           "default": false,
           "description": "When true, rows deleted from the source get their `valid_to` set to the current timestamp in the target. Default: false.",
           "type": "boolean"
+        },
+        "schedule": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ScheduleConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional native-schedule declaration. See [`ScheduleConfig`]."
         },
         "source": {
           "allOf": [
@@ -4075,6 +4213,17 @@
           "description": "Glob pattern for model files, relative to the config file directory. Default: `\"models/**\"`.",
           "type": "string"
         },
+        "schedule": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ScheduleConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional native-schedule declaration. See [`ScheduleConfig`]."
+        },
         "target": {
           "allOf": [
             {
@@ -4478,6 +4627,18 @@
         "skip_unchanged": false
       },
       "description": "Opt-in run-execution tuning for the `--skip-unchanged` model-skip gate. Default-OFF: an absent `[run]` block (or one that leaves every field at its default) keeps `rocky run`'s behavior byte-identical to before the gate existed. See [`RunConfig`]."
+    },
+    "schedule": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ScheduleDefaultsConfig"
+        }
+      ],
+      "default": {
+        "poll_interval_seconds": 15,
+        "timezone": "UTC"
+      },
+      "description": "Project-level schedule defaults for native demand reconciliation. Supplies the fallback timezone for per-pipeline `[…schedule]` cron blocks and the resident-loop poll cadence. See [`ScheduleDefaultsConfig`]."
     },
     "schema_evolution": {
       "allOf": [

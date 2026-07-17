@@ -202,6 +202,32 @@ const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
 /// eviction trail is global ground truth, not machine-local scratch. Remote
 /// keys are schema-version-qualified by `state_sync`.
 const TOMBSTONES: TableDefinition<&str, &[u8]> = TableDefinition::new("tombstones");
+/// Per-pipeline schedule cursor for the native demand reconciler.
+///
+/// Key: the pipeline name. Value: serialized
+/// [`crate::schedule::record::ScheduleStateRecord`] — the catch-up anchor, the
+/// last attempt time/outcome, and the consecutive-failure count that drives the
+/// cross-tick backoff.
+///
+/// **Local-only** (listed in [`LOCAL_ONLY_TABLE_NAMES`]): scheduler cursors are
+/// per-instance state, one `rocky.toml` + state per scheduler instance. Their
+/// remote-sync would intersect the open remote-state integrity redesign, and
+/// the catch-up policy already covers restarts — so they are deliberately
+/// excluded from the remote snapshot.
+const SCHEDULE_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("schedule_state");
+/// Per-demand claim records for the native demand reconciler's state machine.
+///
+/// Key: the claim storage key — `<pipeline>\u{1f}<source>\u{1f}<discriminator>`
+/// where the discriminator is the cron/after/freshness `logical_ts` (RFC3339)
+/// or, for a webhook demand, its minted `demand_uid`. Value: serialized
+/// [`crate::schedule::claim::ClaimRecord`]. Every due demand takes this claim by
+/// compare-and-swap inside a write transaction *before* its child is spawned:
+/// redb serializes writers, so exactly one reconciler lands the `submitted`
+/// transition and a lost CAS is a stand-down.
+///
+/// **Local-only** (listed in [`LOCAL_ONLY_TABLE_NAMES`]): like the cursor above,
+/// claims are per-instance reconciler state.
+const SCHEDULE_CLAIMS: TableDefinition<&str, &[u8]> = TableDefinition::new("schedule_claims");
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -217,7 +243,11 @@ const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 ///   not inherit another machine's stale types).
 /// - `jobs` — ephemeral per-node `rocky serve` job records (see [`JOBS`]). Not
 ///   a governance ledger; replicating it across pods would clobber peers.
-pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache", "jobs"];
+/// - `schedule_state` / `schedule_claims` — per-instance reconciler cursors and
+///   claims (see [`SCHEDULE_STATE`], [`SCHEDULE_CLAIMS`]). One scheduler
+///   instance per project; the catch-up policy covers restarts.
+pub const LOCAL_ONLY_TABLE_NAMES: &[&str] =
+    &["schema_cache", "jobs", "schedule_state", "schedule_claims"];
 
 /// Schema version for the current set of state tables.
 ///
@@ -351,7 +381,18 @@ pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &["schema_cache", "jobs"];
 ///   by `test_v19_tombstone_forward_deserializes_restore_fields_none`. The
 ///   bump tracks the record-shape addition so `[state] on_schema_mismatch`
 ///   engages as usual; no blob walk.
-const CURRENT_SCHEMA_VERSION: u32 = 20;
+/// - **v21** — adds the [`SCHEDULE_STATE`] + [`SCHEDULE_CLAIMS`] tables for the
+///   native demand reconciler, and two serde-additive [`RunRecord`] fields
+///   (`pipeline`, `submission_id`) that let the reconciler join a scheduled
+///   demand to its run. The tables are a pure additive schema change (same
+///   shape as the v14 [`POLICY_DECISIONS`] add): v20 databases auto-create both
+///   empty tables on next open and stamp themselves as v21. The `RunRecord`
+///   fields forward-deserialize as `None` on a v20 blob, guarded by
+///   `test_v20_run_record_forward_deserializes_schedule_fields_none`. No blob
+///   migration needed; existing tables are untouched. Both tables stay empty
+///   until a scheduled pipeline is evaluated, so pre-existing state resumes
+///   unchanged.
+const CURRENT_SCHEMA_VERSION: u32 = 21;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -838,6 +879,8 @@ impl StateStore {
             let _table = txn.open_table(POLICY_DECISIONS)?;
             let _table = txn.open_table(JOBS)?;
             let _table = txn.open_table(TOMBSTONES)?;
+            let _table = txn.open_table(SCHEDULE_STATE)?;
+            let _table = txn.open_table(SCHEDULE_CLAIMS)?;
         }
         txn.commit()?;
         Ok(InitOutcome::Ready)
@@ -1185,6 +1228,21 @@ pub enum RunStatus {
     /// The run was short-circuited because another caller held the
     /// idempotency key's in-flight claim. No work was done.
     SkippedInFlight,
+}
+
+impl RunStatus {
+    /// Map a run status to the schedule reconciler's terminal outcome, or
+    /// `None` for the non-terminal skip statuses (which did no work and so
+    /// never satisfy or dissatisfy a demand).
+    pub fn terminal_outcome(self) -> Option<crate::schedule::claim::TerminalOutcome> {
+        use crate::schedule::claim::TerminalOutcome;
+        match self {
+            RunStatus::Success => Some(TerminalOutcome::Success),
+            RunStatus::PartialFailure => Some(TerminalOutcome::Partial),
+            RunStatus::Failure => Some(TerminalOutcome::Failure),
+            RunStatus::SkippedIdempotent | RunStatus::SkippedInFlight => None,
+        }
+    }
 }
 
 /// What triggered the run.
@@ -1599,6 +1657,23 @@ pub struct RunRecord {
     /// `verify_after` post-apply gate to confirm named checks passed.
     #[serde(default)]
     pub check_outcomes: Vec<CheckOutcome>,
+
+    /// The pipeline this run built, when it was a pipeline run (`None` for a
+    /// model-only run and for records predating the field). Stamped from the
+    /// resolved `--pipeline` name. The schedule reconciler reads it to answer
+    /// "did upstream pipeline X succeed?" for `after`/`freshness` demands — a
+    /// `None` record is invisible to those checks, so a downstream *waits*
+    /// rather than false-firing, and self-heals on the next upstream run.
+    #[serde(default)]
+    pub pipeline: Option<String>,
+
+    /// The schedule submission id that launched this run, when the run was
+    /// launched by the reconciler (from `ROCKY_SUBMISSION_ID`). `None` for
+    /// directly-invoked runs and for records predating the field. It is the
+    /// precise join key between a scheduled demand and *its* run — recovery
+    /// must never match a demand to a run by pipeline + time.
+    #[serde(default)]
+    pub submission_id: Option<String>,
 }
 
 /// One executed data-quality check's pass/fail outcome, captured on a
@@ -2743,6 +2818,279 @@ impl StateStore {
         }
         txn.commit()?;
         Ok(removed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schedule reconciler state (see `crate::schedule`)
+// ---------------------------------------------------------------------------
+
+impl StateStore {
+    /// Read the schedule cursor for a pipeline, or `None` if it was never
+    /// evaluated.
+    pub fn get_schedule_state(
+        &self,
+        pipeline: &str,
+    ) -> Result<Option<crate::schedule::record::ScheduleStateRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(SCHEDULE_STATE)?;
+        match table.get(pipeline)? {
+            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert or replace the schedule cursor for a pipeline.
+    pub fn put_schedule_state(
+        &self,
+        pipeline: &str,
+        record: &crate::schedule::record::ScheduleStateRecord,
+    ) -> Result<(), StateError> {
+        let bytes = serde_json::to_vec(record)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SCHEDULE_STATE)?;
+            table.insert(pipeline, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Stamp `last_evaluated_at = now` for a pipeline (monotonically), creating
+    /// the cursor if absent. Called for every evaluated pipeline — due or not —
+    /// so `doctor` can detect a dead timer. `now` is injected; this method never
+    /// reads the clock.
+    pub fn touch_schedule_evaluated(
+        &self,
+        pipeline: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StateError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SCHEDULE_STATE)?;
+            let mut record: crate::schedule::record::ScheduleStateRecord =
+                match table.get(pipeline)? {
+                    Some(value) => serde_json::from_slice(value.value())?,
+                    None => Default::default(),
+                };
+            let advance = match record
+                .last_evaluated_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            {
+                Some(prev) => now > prev.with_timezone(&chrono::Utc),
+                None => true,
+            };
+            if advance {
+                record.last_evaluated_at = Some(now.to_rfc3339());
+                let bytes = serde_json::to_vec(&record)?;
+                table.insert(pipeline, bytes.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Advance a pipeline's catch-up fire anchor to `logical_ts`, monotonically,
+    /// with no claim — used to record a first-sight cron anchor or a catch-up
+    /// skip that fires nothing. Delegates to
+    /// [`crate::schedule::record::ScheduleStateRecord::advance_fire_anchor`], so
+    /// a value at or before the current anchor is a no-op. `logical_ts` is
+    /// injected; this method never reads the clock.
+    pub fn advance_schedule_fire_anchor(
+        &self,
+        pipeline: &str,
+        logical_ts: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StateError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SCHEDULE_STATE)?;
+            let mut record: crate::schedule::record::ScheduleStateRecord =
+                match table.get(pipeline)? {
+                    Some(value) => serde_json::from_slice(value.value())?,
+                    None => Default::default(),
+                };
+            record.advance_fire_anchor(logical_ts);
+            let bytes = serde_json::to_vec(&record)?;
+            table.insert(pipeline, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Read a claim by its storage key.
+    pub fn get_schedule_claim(
+        &self,
+        claim_key: &str,
+    ) -> Result<Option<crate::schedule::claim::ClaimRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(SCHEDULE_CLAIMS)?;
+        match table.get(claim_key)? {
+            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Atomically compare-and-swap a claim, applying a cursor mutation in the
+    /// same write transaction.
+    ///
+    /// The CAS asserts the stored claim still equals `expected` (`None` = expect
+    /// absent). On a match, `new_claim` is written and `mutation` is applied to
+    /// the pipeline's cursor, then committed — [`ClaimCas::Won`]. On a mismatch,
+    /// nothing is written (the transaction rolls back) — [`ClaimCas::Lost`] with
+    /// the current stored claim, and the caller must stand down.
+    ///
+    /// Because redb serializes writers and holds the state lock, two reconcilers
+    /// racing the same key cannot both win: the second sees the first's write
+    /// and its CAS fails.
+    pub fn schedule_claim_cas(
+        &self,
+        claim_key: &str,
+        expected: Option<&crate::schedule::claim::ClaimRecord>,
+        new_claim: &crate::schedule::claim::ClaimRecord,
+        pipeline: &str,
+        mutation: &crate::schedule::record::ScheduleStateMutation,
+    ) -> Result<crate::schedule::claim::ClaimCas, StateError> {
+        use crate::schedule::claim::{ClaimCas, ClaimRecord};
+        use crate::schedule::record::ScheduleStateRecord;
+
+        let txn = self.db.begin_write()?;
+        let current: Option<ClaimRecord>;
+        let won;
+        {
+            let mut claims = txn.open_table(SCHEDULE_CLAIMS)?;
+            current = match claims.get(claim_key)? {
+                Some(value) => Some(serde_json::from_slice(value.value())?),
+                None => None,
+            };
+            let matches = match (expected, &current) {
+                (None, None) => true,
+                (Some(e), Some(c)) => e == c,
+                _ => false,
+            };
+            if matches {
+                let bytes = serde_json::to_vec(new_claim)?;
+                claims.insert(claim_key, bytes.as_slice())?;
+
+                let mut states = txn.open_table(SCHEDULE_STATE)?;
+                let mut record: ScheduleStateRecord = match states.get(pipeline)? {
+                    Some(value) => serde_json::from_slice(value.value())?,
+                    None => Default::default(),
+                };
+                mutation.apply(&mut record);
+                let sbytes = serde_json::to_vec(&record)?;
+                states.insert(pipeline, sbytes.as_slice())?;
+                won = true;
+            } else {
+                won = false;
+            }
+        }
+        if won {
+            txn.commit()?;
+            Ok(ClaimCas::Won)
+        } else {
+            drop(txn);
+            Ok(ClaimCas::Lost(current))
+        }
+    }
+
+    /// Find the newest terminal run record carrying `submission_id`, used by the
+    /// stuck-claim resolver to derive an outcome. Skip statuses (which did no
+    /// work) are ignored.
+    pub fn find_terminal_run_by_submission_id(
+        &self,
+        submission_id: &str,
+    ) -> Result<Option<RunRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(RUN_HISTORY)?;
+        let mut best: Option<RunRecord> = None;
+        for entry in table.iter()? {
+            let (_, value) = entry?;
+            let run: RunRecord = serde_json::from_slice(value.value())?;
+            if run.submission_id.as_deref() == Some(submission_id)
+                && run.status.terminal_outcome().is_some()
+                && best.as_ref().is_none_or(|b| run.started_at > b.started_at)
+            {
+                best = Some(run);
+            }
+        }
+        Ok(best)
+    }
+
+    /// The most recent successful run for a pipeline, or `None`. Used to
+    /// evaluate `after` (upstream success completion) and `freshness` (own run
+    /// staleness). A `None`-pipeline record — a model-only run, or one predating
+    /// the field — never matches, so it can neither satisfy nor block a demand.
+    pub fn latest_successful_run(&self, pipeline: &str) -> Result<Option<RunRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(RUN_HISTORY)?;
+        let mut best: Option<RunRecord> = None;
+        for entry in table.iter()? {
+            let (_, value) = entry?;
+            let run: RunRecord = serde_json::from_slice(value.value())?;
+            if run.pipeline.as_deref() == Some(pipeline)
+                && run.status == RunStatus::Success
+                && best
+                    .as_ref()
+                    .is_none_or(|b| run.finished_at > b.finished_at)
+            {
+                best = Some(run);
+            }
+        }
+        Ok(best)
+    }
+
+    /// Garbage-collect terminal (`completed`) claims whose last transition is
+    /// older than `cutoff`. Returns the number removed. `cutoff` is injected;
+    /// this method never reads the clock.
+    pub fn gc_schedule_claims(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, StateError> {
+        use crate::schedule::claim::ClaimRecord;
+
+        let txn = self.db.begin_write()?;
+        let mut removed = 0usize;
+        {
+            let mut table = txn.open_table(SCHEDULE_CLAIMS)?;
+            let mut stale_keys: Vec<String> = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                let claim: ClaimRecord = serde_json::from_slice(value.value())?;
+                if !claim.is_completed() {
+                    continue;
+                }
+                let old = claim
+                    .last_transition_at
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .is_some_and(|dt| dt.with_timezone(&chrono::Utc) < cutoff);
+                if old {
+                    stale_keys.push(key.value().to_string());
+                }
+            }
+            for key in stale_keys {
+                table.remove(key.as_str())?;
+                removed += 1;
+            }
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+
+    /// Test-only: write a byte blob under a `run_history` key that is not valid
+    /// `RunRecord` JSON, so a later scan (`latest_successful_run` /
+    /// `find_terminal_run_by_submission_id`) hits a deserialization error. Used
+    /// to prove the schedule reconciler fails closed on a corrupt history row.
+    #[cfg(test)]
+    pub(crate) fn insert_corrupt_run_history_row(&self, key: &str) -> Result<(), StateError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(RUN_HISTORY)?;
+            table.insert(key, b"{not valid run record json".as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 }
 
@@ -4992,6 +5340,8 @@ mod tests {
             hostname: "test-host".to_string(),
             rocky_version: "0.0.0-test".to_string(),
             check_outcomes: Vec::new(),
+            pipeline: None,
+            submission_id: None,
         }
     }
 
@@ -5033,6 +5383,57 @@ mod tests {
         let round: RunRecord =
             serde_json::from_slice(&serde_json::to_vec(&with_outcomes).unwrap()).unwrap();
         assert_eq!(round.check_outcomes, with_outcomes.check_outcomes);
+    }
+
+    #[test]
+    fn test_v20_run_record_forward_deserializes_schedule_fields_none() {
+        // A full pre-v21 record serialized with `pipeline` + `submission_id`
+        // stripped must forward-deserialize with both `None`.
+        let mut value = serde_json::to_value(minimal_run_record("run-v20", vec![]))
+            .expect("serialize run record");
+        let obj = value.as_object_mut().expect("record is an object");
+        obj.remove("pipeline");
+        obj.remove("submission_id");
+        let blob = serde_json::to_vec(&value).expect("reserialize without fields");
+
+        let record: RunRecord =
+            serde_json::from_slice(&blob).expect("pre-v21 RunRecord must forward-deserialize");
+        assert_eq!(record.run_id, "run-v20");
+        assert!(record.pipeline.is_none(), "pre-v21 record has no pipeline");
+        assert!(
+            record.submission_id.is_none(),
+            "pre-v21 record has no submission id"
+        );
+
+        // A v21 record carrying both fields round-trips losslessly.
+        let mut stamped = minimal_run_record("run-v21", vec![]);
+        stamped.pipeline = Some("raw".to_string());
+        stamped.submission_id = Some("sub-123".to_string());
+        let round: RunRecord =
+            serde_json::from_slice(&serde_json::to_vec(&stamped).unwrap()).unwrap();
+        assert_eq!(round.pipeline.as_deref(), Some("raw"));
+        assert_eq!(round.submission_id.as_deref(), Some("sub-123"));
+    }
+
+    #[test]
+    fn test_v21_opens_and_creates_schedule_tables() {
+        // A store freshly opened under the current binary materializes the
+        // `schedule_state` + `schedule_claims` tables (part of the eager
+        // EXPECTED_TABLES set) and stamps itself at v21. Reads succeed against
+        // empty tables.
+        let (store, _dir) = temp_store();
+        assert!(
+            current_schema_version() >= 21,
+            "schedule tables exist from schema v21 onward"
+        );
+        assert!(
+            store.get_schedule_state("nonexistent").unwrap().is_none(),
+            "a fresh store has an empty schedule cursor table"
+        );
+        assert!(
+            store.get_schedule_claim("nonexistent").unwrap().is_none(),
+            "a fresh store has an empty schedule claims table"
+        );
     }
 
     #[test]
@@ -8385,7 +8786,13 @@ mod tests {
         // restore` custody stamps), serde-additive fields — the redb table set
         // is untouched, only the version moves; guarded by
         // `test_v19_tombstone_forward_deserializes_restore_fields_none`.
-        const EXPECTED_VERSION: u32 = 20;
+        // v21 adds the `schedule_state` + `schedule_claims` tables (native
+        // demand reconciler) — new tables, so they ARE in EXPECTED_TABLES below;
+        // guarded by `test_v21_opens_and_creates_schedule_tables`. The paired
+        // serde-additive `RunRecord::pipeline` / `submission_id` fields do not
+        // change the table set; guarded by
+        // `test_v20_run_record_forward_deserializes_schedule_fields_none`.
+        const EXPECTED_VERSION: u32 = 21;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
@@ -8405,6 +8812,8 @@ mod tests {
             "run_history",
             "run_progress",
             "run_progress_entries",
+            "schedule_claims",
+            "schedule_state",
             "schema_cache",
             "source_markers",
             "tombstones",

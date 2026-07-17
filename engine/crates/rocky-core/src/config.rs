@@ -2500,6 +2500,13 @@ pub struct RockyConfig {
     #[serde(default)]
     pub freshness: ProjectFreshnessConfig,
 
+    /// Project-level schedule defaults for native demand reconciliation.
+    /// Supplies the fallback timezone for per-pipeline `[…schedule]` cron
+    /// blocks and the resident-loop poll cadence. See
+    /// [`ScheduleDefaultsConfig`].
+    #[serde(default)]
+    pub schedule: ScheduleDefaultsConfig,
+
     /// Imported producer-project snapshots, keyed by import name.
     ///
     /// Each `[imports.<name>]` block points at a vendored snapshot of a
@@ -4186,6 +4193,18 @@ impl PipelineConfig {
         }
     }
 
+    /// Returns the optional `[schedule]` block for native demand
+    /// reconciliation, or `None` when the pipeline declares no schedule.
+    pub fn schedule(&self) -> Option<&ScheduleConfig> {
+        match self {
+            Self::Replication(r) => r.schedule.as_ref(),
+            Self::Transformation(t) => t.schedule.as_ref(),
+            Self::Quality(q) => q.schedule.as_ref(),
+            Self::Snapshot(s) => s.schedule.as_ref(),
+            Self::Load(l) => l.schedule.as_ref(),
+        }
+    }
+
     /// Unwraps the replication config, returning `None` for other types.
     pub fn as_replication(&self) -> Option<&ReplicationPipelineConfig> {
         match self {
@@ -4225,6 +4244,120 @@ impl PipelineConfig {
             _ => None,
         }
     }
+}
+
+/// Per-pipeline schedule declaration for native demand reconciliation.
+///
+/// Every field is optional; an absent `[pipeline.<name>.schedule]` block leaves
+/// the pipeline with today's behavior (it runs only when invoked directly). A
+/// pipeline may combine demand sources — `cron`, `after`, and `freshness` union,
+/// so any one of them makes the pipeline due.
+///
+/// Unlike the five pipeline variant structs (which deliberately omit
+/// `deny_unknown_fields` so the IDE schema can inject the `type` discriminator),
+/// this struct **denies unknown fields**: a typo inside `[…schedule]` is a
+/// silent scheduling bug — a misspelled `corn` key would leave a pipeline
+/// unscheduled with no error — so the deserializer rejects it outright.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleConfig {
+    /// Standard 5-field cron expression (minute hour day-of-month month
+    /// day-of-week). When set, the pipeline is due at each occurrence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+
+    /// IANA timezone name (e.g. `"Europe/Lisbon"`) the `cron` occurrences are
+    /// evaluated in. Falls back to the project `[schedule].timezone`, which
+    /// itself defaults to `"UTC"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+
+    /// Upstream pipelines this one runs after. The pipeline is due once every
+    /// listed pipeline has a successful run that completed after this
+    /// pipeline's own latest success started (a partial-success run does not
+    /// count as an upstream success).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+
+    /// When `true`, the pipeline is due once its own run-staleness exceeds its
+    /// freshness budget (resolved from per-model `max_lag_seconds`, falling
+    /// back to the project `[freshness].expected_lag_seconds`). This is
+    /// run-staleness only — the reconciler never queries the warehouse.
+    #[serde(default)]
+    pub freshness: bool,
+
+    /// Catch-up policy when more than one cron occurrence elapsed since the
+    /// last fire: `"latest"` (default) fires one demand at the most recent
+    /// missed occurrence; `"skip"` advances the anchor and runs nothing.
+    /// `"all"` is rejected at validation — runs are watermark-driven, not
+    /// windowed, so replaying every missed occurrence is pure cost.
+    #[serde(default = "default_catchup")]
+    pub catchup: String,
+
+    /// In-tick immediate re-submissions on failure. The reconciler never
+    /// sleeps between attempts; minutes-scale spacing is the always-on
+    /// cross-tick throttle, not this knob. Default `0` (off).
+    #[serde(default)]
+    pub retry: ScheduleRetryConfig,
+
+    /// Scheduler-level timeout in minutes for a launched run. `0` (default)
+    /// means no scheduler-level timeout — the run's own limits apply.
+    #[serde(default)]
+    pub timeout_minutes: u64,
+
+    /// When `false`, demand is suppressed but the config is kept. Default
+    /// `true`.
+    #[serde(default = "default_true_config")]
+    pub enabled: bool,
+}
+
+/// In-tick retry budget for a scheduled pipeline.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleRetryConfig {
+    /// Maximum number of *additional* immediate re-submissions after the first
+    /// attempt fails. `0` means the first attempt is the only one.
+    #[serde(default)]
+    pub max: u32,
+}
+
+/// Project-level schedule defaults (`[schedule]`).
+///
+/// Supplies the fallback timezone for per-pipeline `cron` blocks that omit
+/// their own, plus the resident-loop poll cadence consumed by a later phase.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleDefaultsConfig {
+    /// Default IANA timezone for per-pipeline cron evaluation. Default `"UTC"`.
+    #[serde(default = "default_schedule_timezone")]
+    pub timezone: String,
+
+    /// Poll cadence in seconds for the resident scheduler loop. Not consumed
+    /// by the one-shot tick; reserved for the resident-loop phase. Default
+    /// `15`.
+    #[serde(default = "default_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
+}
+
+impl Default for ScheduleDefaultsConfig {
+    fn default() -> Self {
+        Self {
+            timezone: default_schedule_timezone(),
+            poll_interval_seconds: default_poll_interval_seconds(),
+        }
+    }
+}
+
+fn default_catchup() -> String {
+    "latest".to_string()
+}
+
+fn default_schedule_timezone() -> String {
+    "UTC".to_string()
+}
+
+fn default_poll_interval_seconds() -> u64 {
+    15
 }
 
 /// Replication pipeline configuration.
@@ -4305,6 +4438,10 @@ pub struct ReplicationPipelineConfig {
     /// Pipeline dependencies for chaining.
     #[serde(default)]
     pub depends_on: Vec<String>,
+
+    /// Optional native-schedule declaration. See [`ScheduleConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleConfig>,
 
     /// Per-`(connector, table)` overrides applied on top of the pipeline
     /// defaults. Each rule matches against a discovered connector +
@@ -4727,6 +4864,10 @@ pub struct TransformationPipelineConfig {
     /// Pipeline dependencies for chaining.
     #[serde(default)]
     pub depends_on: Vec<String>,
+
+    /// Optional native-schedule declaration. See [`ScheduleConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleConfig>,
 }
 
 fn default_models_glob() -> String {
@@ -4794,6 +4935,10 @@ pub struct QualityPipelineConfig {
     /// Pipeline dependencies for chaining.
     #[serde(default)]
     pub depends_on: Vec<String>,
+
+    /// Optional native-schedule declaration. See [`ScheduleConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleConfig>,
 }
 
 /// Target configuration for quality pipelines (adapter reference only).
@@ -4873,6 +5018,10 @@ pub struct SnapshotPipelineConfig {
     /// Pipeline dependencies for chaining.
     #[serde(default)]
     pub depends_on: Vec<String>,
+
+    /// Optional native-schedule declaration. See [`ScheduleConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleConfig>,
 }
 
 /// Source table for a snapshot pipeline (explicit single-table reference).
@@ -4961,6 +5110,10 @@ pub struct LoadPipelineConfig {
     /// Pipeline dependencies for chaining.
     #[serde(default)]
     pub depends_on: Vec<String>,
+
+    /// Optional native-schedule declaration. See [`ScheduleConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleConfig>,
 }
 
 /// File format for load pipelines, parsed from TOML.

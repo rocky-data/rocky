@@ -49,6 +49,9 @@ large_enum_variant = "warn"
 [workspace.dependencies]
 # Async traits
 async-trait = "0.1"
+# Unix signal delivery (SIGTERM to a scheduled child before SIGKILL). Only used
+# on unix; the schedule spawner falls back to the platform kill elsewhere.
+libc = "0.2"
 
 # Machine hostname detection for governance audit trail
 # (portable across Linux/macOS/Windows — std::env::var("HOSTNAME")
@@ -62,6 +65,12 @@ serde_yaml = "0.9"
 indexmap = { version = "2", features = ["serde"] }
 toml = "1"
 chrono = { version = "0.4", features = ["serde"] }
+# IANA timezone database for chrono (schedule cron evaluation in a named tz).
+chrono-tz = "0.10"
+# Cron occurrence math for the schedule reconciler. croner declares no MSRV,
+# so the version is pinned exactly — a patch bump could raise the required
+# toolchain past the workspace's 1.88 floor without warning.
+croner = "=3.0.1"
 
 # JSON Schema generation (Phase 2 — codegen source of truth for dagster + vscode types)
 schemars = { version = "0.8", features = ["chrono", "indexmap2"] }

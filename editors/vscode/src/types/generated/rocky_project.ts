@@ -492,6 +492,10 @@ export interface RockyConfig {
    */
   run?: RunConfig;
   /**
+   * Project-level schedule defaults for native demand reconciliation. Supplies the fallback timezone for per-pipeline `[…schedule]` cron blocks and the resident-loop poll cadence. See [`ScheduleDefaultsConfig`].
+   */
+  schedule?: ScheduleDefaultsConfig;
+  /**
    * Schema evolution configuration (grace-period column drops).
    */
   schema_evolution?: SchemaEvolutionConfig;
@@ -1103,6 +1107,10 @@ export interface ReplicationPipelineConfig {
    */
   prune_unchanged?: boolean;
   /**
+   * Optional native-schedule declaration. See [`ScheduleConfig`].
+   */
+  schedule?: ScheduleConfig | null;
+  /**
    * Source configuration.
    */
   source: PipelineSourceConfig;
@@ -1289,6 +1297,56 @@ export interface MetadataColumnConfig {
   name: string;
   type: string;
   value: string;
+}
+/**
+ * Per-pipeline schedule declaration for native demand reconciliation.
+ *
+ * Every field is optional; an absent `[pipeline.<name>.schedule]` block leaves the pipeline with today's behavior (it runs only when invoked directly). A pipeline may combine demand sources — `cron`, `after`, and `freshness` union, so any one of them makes the pipeline due.
+ *
+ * Unlike the five pipeline variant structs (which deliberately omit `deny_unknown_fields` so the IDE schema can inject the `type` discriminator), this struct **denies unknown fields**: a typo inside `[…schedule]` is a silent scheduling bug — a misspelled `corn` key would leave a pipeline unscheduled with no error — so the deserializer rejects it outright.
+ */
+export interface ScheduleConfig {
+  /**
+   * Upstream pipelines this one runs after. The pipeline is due once every listed pipeline has a successful run that completed after this pipeline's own latest success started (a partial-success run does not count as an upstream success).
+   */
+  after?: string[];
+  /**
+   * Catch-up policy when more than one cron occurrence elapsed since the last fire: `"latest"` (default) fires one demand at the most recent missed occurrence; `"skip"` advances the anchor and runs nothing. `"all"` is rejected at validation — runs are watermark-driven, not windowed, so replaying every missed occurrence is pure cost.
+   */
+  catchup?: string;
+  /**
+   * Standard 5-field cron expression (minute hour day-of-month month day-of-week). When set, the pipeline is due at each occurrence.
+   */
+  cron?: string | null;
+  /**
+   * When `false`, demand is suppressed but the config is kept. Default `true`.
+   */
+  enabled?: boolean;
+  /**
+   * When `true`, the pipeline is due once its own run-staleness exceeds its freshness budget (resolved from per-model `max_lag_seconds`, falling back to the project `[freshness].expected_lag_seconds`). This is run-staleness only — the reconciler never queries the warehouse.
+   */
+  freshness?: boolean;
+  /**
+   * In-tick immediate re-submissions on failure. The reconciler never sleeps between attempts; minutes-scale spacing is the always-on cross-tick throttle, not this knob. Default `0` (off).
+   */
+  retry?: ScheduleRetryConfig;
+  /**
+   * Scheduler-level timeout in minutes for a launched run. `0` (default) means no scheduler-level timeout — the run's own limits apply.
+   */
+  timeout_minutes?: number;
+  /**
+   * IANA timezone name (e.g. `"Europe/Lisbon"`) the `cron` occurrences are evaluated in. Falls back to the project `[schedule].timezone`, which itself defaults to `"UTC"`.
+   */
+  timezone?: string | null;
+}
+/**
+ * In-tick retry budget for a scheduled pipeline.
+ */
+export interface ScheduleRetryConfig {
+  /**
+   * Maximum number of *additional* immediate re-submissions after the first attempt fails. `0` means the first attempt is the only one.
+   */
+  max?: number;
 }
 /**
  * Pipeline source configuration.
@@ -1508,6 +1566,10 @@ export interface TransformationPipelineConfig {
    */
   models?: string;
   /**
+   * Optional native-schedule declaration. See [`ScheduleConfig`].
+   */
+  schedule?: ScheduleConfig | null;
+  /**
    * Target configuration (adapter + governance).
    */
   target: TransformationTargetConfig;
@@ -1554,6 +1616,10 @@ export interface QualityPipelineConfig {
    * Execution settings (concurrency, retries, etc.).
    */
   execution?: ExecutionConfig;
+  /**
+   * Optional native-schedule declaration. See [`ScheduleConfig`].
+   */
+  schedule?: ScheduleConfig | null;
   /**
    * Tables to check. Each entry specifies catalog + schema, and optionally a specific table (omit for all tables in the schema).
    */
@@ -1612,6 +1678,10 @@ export interface SnapshotPipelineConfig {
    * When true, rows deleted from the source get their `valid_to` set to the current timestamp in the target. Default: false.
    */
   invalidate_hard_deletes?: boolean;
+  /**
+   * Optional native-schedule declaration. See [`ScheduleConfig`].
+   */
+  schedule?: ScheduleConfig | null;
   /**
    * Source table reference (single table, not pattern-based discovery).
    */
@@ -1691,6 +1761,10 @@ export interface LoadPipelineConfig {
    * Load options (batch size, create/truncate behavior, CSV settings).
    */
   options?: LoadOptionsConfig;
+  /**
+   * Optional native-schedule declaration. See [`ScheduleConfig`].
+   */
+  schedule?: ScheduleConfig | null;
   /**
    * Directory or glob pattern for source files, relative to the config file.
    */
@@ -2095,6 +2169,21 @@ export interface RunConfig {
    * Master switch for the model-skip gate. `false` (default) ⇒ every selected model always builds, exactly as before. The `--skip-unchanged` CLI flag turns the gate on for a single invocation regardless of this value.
    */
   skip_unchanged?: boolean;
+}
+/**
+ * Project-level schedule defaults (`[schedule]`).
+ *
+ * Supplies the fallback timezone for per-pipeline `cron` blocks that omit their own, plus the resident-loop poll cadence consumed by a later phase.
+ */
+export interface ScheduleDefaultsConfig {
+  /**
+   * Poll cadence in seconds for the resident scheduler loop. Not consumed by the one-shot tick; reserved for the resident-loop phase. Default `15`.
+   */
+  poll_interval_seconds?: number;
+  /**
+   * Default IANA timezone for per-pipeline cron evaluation. Default `"UTC"`.
+   */
+  timezone?: string;
 }
 /**
  * Schema evolution configuration.

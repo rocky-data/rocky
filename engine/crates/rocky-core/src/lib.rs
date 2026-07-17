@@ -45,6 +45,7 @@ pub mod retry_budget;
 pub mod reuse;
 pub mod role_graph;
 pub mod run_vars;
+pub mod schedule;
 pub mod schema;
 pub mod schema_cache;
 pub mod seeds;

@@ -16,6 +16,9 @@ schemars = { workspace = true }
 indexmap = { workspace = true }
 toml = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
+croner = { workspace = true }
+uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 redb = { workspace = true }
@@ -35,6 +38,9 @@ lasso = { version = "0.7", features = ["multi-threaded"] }
 memmap2 = "0.9"
 rayon = "1"
 blake3 = { workspace = true }
+# Unix SIGTERM delivery for the schedule spawner's graceful-then-forced child
+# termination. Usage is `#[cfg(unix)]`-gated; the crate is a no-op shim elsewhere.
+libc = { workspace = true }
 # Apache Arrow appears in the `WarehouseAdapter::fetch_arrow_batch` return
 # type (proof-of-concept inter-adapter wire format — only rocky-duckdb
 # implements it today). The default impl just errors, but the symbol is
