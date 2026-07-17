@@ -23,15 +23,17 @@
 //! - **error-path exits abandon without uploading** (parity pin — error /
 //!   interrupted paths never uploaded).
 //!
-//! The GOVERNED `Durable` half of delta (i) — a governed run failing on a lost
-//! terminal upload even under the default `skip` — is driven at the session
-//! level in `rocky-core::state_sync::tests` (`session_durable_forces_fail_…`):
-//! constructing a full governed apply context (plan + `[policy]` plane +
-//! execution-fingerprint gate) in this rig is disproportionately heavy, and
-//! the run-level wiring it would re-prove (`governed_with_policy` selecting
-//! `FinalizeDurability::Durable`) is a one-line construction at the seam. The
-//! ungoverned explicit-`fail` run-level test below exercises the same
-//! propagation path through `finalize`.
+//! The GOVERNED `Durable` half of delta (i) is driven both at the session
+//! level in `rocky-core::state_sync::tests` (`session_durable_forces_fail_…`)
+//! and at run level below
+//! (`governed_without_policy_still_fails_on_lost_terminal_upload`): a
+//! legacy-shaped [`GovernedRunContext`] (no fingerprint, `require:
+//! false`) is cheap to construct directly and passes the execution gate, so
+//! the run-level durability selection — `Durable` iff the governed context is
+//! present, with NO `[policy]` conjunction (ADR-AUTHORITY §5: ledger
+//! durability is orthogonal to policy enforcement) — is proven where it is
+//! wired. The ungoverned explicit-`fail` run-level test below exercises the
+//! same propagation path through `finalize`.
 
 #![cfg(feature = "duckdb")]
 
@@ -171,6 +173,55 @@ async fn drive_run(
     .await
 }
 
+/// Drive the same replication path GOVERNED: a directly-constructed,
+/// legacy-shaped [`rocky_cli::commands::apply::GovernedRunContext`] (no bound
+/// fingerprint, `require_fingerprint: false`, no reviewed schemas), which the
+/// execution fingerprint gate lets through. Crucially the project config has
+/// NO `[policy]` block — the point of the durability red-team test below.
+async fn drive_run_governed(config_path: &Path, state_path: &Path) -> anyhow::Result<()> {
+    let root = config_path.parent().expect("project root").to_path_buf();
+    let ctx = rocky_cli::commands::apply::GovernedRunContext {
+        principal: rocky_core::config::PolicyPrincipal::Agent,
+        plan_id: "plan-durability-redteam",
+        root: &root,
+        config_path,
+        expected_ir_fingerprint: None,
+        expected_config_identity: None,
+        require_fingerprint: false,
+        reviewed_source_schemas: None,
+        expects_models: false,
+    };
+    let loaded = std::sync::Arc::new(rocky_core::config::load_rocky_config_fingerprinted(
+        config_path,
+    )?);
+    rocky_cli::commands::run(
+        config_path,
+        loaded,
+        None, // filter
+        None, // pipeline_name_arg — single pipeline resolves
+        state_path,
+        None,  // governance_override
+        false, // output_json
+        None,  // models_dir
+        false, // run_all
+        None,  // resume_run_id
+        false, // resume_latest
+        None,  // shadow_config
+        &rocky_cli::commands::PartitionRunOptions::default(),
+        None, // model_name_filter
+        None, // cache_ttl_override
+        None, // idempotency_key
+        None, // env
+        &rocky_cli::commands::DeferOptions::default(),
+        &rocky_cli::commands::SkipRunOptions::default(),
+        &rocky_core::run_vars::RunVars::new(),
+        None, // run_id_override
+        Some(&ctx),
+        false, // assume_fresh_state
+    )
+    .await
+}
+
 /// Behavior delta (ii): the terminal state writes precede the terminal upload,
 /// so they RIDE it — after a successful run, a second pod's start-download
 /// sees this run's record. RED before stage 2a: `persist_run_record` ran after
@@ -225,6 +276,42 @@ async fn ungoverned_explicit_fail_exits_nonzero_on_terminal_upload_failure() {
     let err = drive_run(&project.config_path, &project.state_path, None)
         .await
         .expect_err("a failed terminal upload under explicit `fail` must err the run");
+
+    harness.faults.clear();
+    assert!(
+        format!("{err:#}").contains("could not be persisted to the remote [state] backend"),
+        "the exit must cite the refused state persistence; got: {err:#}"
+    );
+    assert!(
+        harness.faults.count(FaultOp::Put) >= 1,
+        "the terminal upload must have been attempted"
+    );
+}
+
+/// Red-team (ADR-AUTHORITY §5): a GOVERNED run with NO `[policy]` block must
+/// still select `FinalizeDurability::Durable` — ledger durability is
+/// orthogonal to policy enforcement. Pre-fix RED: the replication seam
+/// selected durability via `exec_fp_gate.is_some() && rocky_cfg.policy
+/// .is_some()`, so a governed apply without a `[policy]` plane fell to
+/// `ConfigDefault` and the default `skip` swallowed the lost terminal upload
+/// into exit 0 — non-durable run/custody/idempotency state on a governed
+/// apply.
+#[tokio::test]
+async fn governed_without_policy_still_fails_on_lost_terminal_upload() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+    // No `state_extra`: the `[state]` block keeps the DEFAULT
+    // `on_upload_failure = "skip"`, and the config has NO `[policy]` block —
+    // only `Durable` (forcing `Fail`) can make this run exit nonzero.
+    let project = TestProject::new("", false).await;
+
+    harness.faults.arm(FaultOp::Put, FaultMode::FailAll);
+
+    let err = drive_run_governed(&project.config_path, &project.state_path)
+        .await
+        .expect_err(
+            "a governed run (even without [policy]) must refuse exit 0 on a lost terminal upload",
+        );
 
     harness.faults.clear();
     assert!(

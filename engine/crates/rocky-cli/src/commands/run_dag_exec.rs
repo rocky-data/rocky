@@ -326,10 +326,14 @@ impl NodeDispatcher for CliDispatcher {
                 // fail with "pipeline '<seed>' not found in config". Load the
                 // matching CSV directly via `run_seed` (which fires the seed's
                 // pre/post hooks). The node label is the seed name, so a name
-                // filter selects exactly this seed.
+                // filter selects exactly this seed. The dispatcher's captured
+                // snapshot is threaded in — `run_seed` performs no config
+                // re-read (#1120), so a `rocky.toml` swap mid-DAG cannot make
+                // a warehouse-mutating seed node execute config B while the
+                // rest of the DAG runs A.
                 let seeds_dir = self.seeds_dir.clone();
                 Some(Box::pin(async move {
-                    super::seed::run_seed(&config_path, &seeds_dir, None, Some(&label), false)
+                    super::seed::run_seed(&loaded, &seeds_dir, None, Some(&label), false)
                         .await
                         .map_err(|e| e.to_string())
                 }))
@@ -525,6 +529,97 @@ mod tests {
         v.as_i64()
             .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             .unwrap_or_else(|| panic!("expected integer cell, got {v:?}"))
+    }
+
+    /// Red-team (#1120, seed leg): a `Seed` node dispatch executes the
+    /// dispatcher's CAPTURED config snapshot, not a fresh `rocky.toml` read.
+    /// The drill: capture the snapshot (adapter → warehouse A), swap
+    /// `rocky.toml` to point at warehouse B, then dispatch the seed node —
+    /// the rows must land in A and B must never be created. Pre-fix,
+    /// `run_seed` took the config PATH and reloaded it internally, so the
+    /// warehouse-mutating seed node executed config B while the rest of the
+    /// DAG ran A. (The signature change — `run_seed(&LoadedConfig, …)` —
+    /// enforces "no config read" at compile time; this proves the dispatch
+    /// threads the right instance.)
+    #[tokio::test]
+    async fn seed_dispatch_executes_the_captured_snapshot_not_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        std::fs::write(
+            root.join("seeds/countries.csv"),
+            "code,name\nUS,United States\nGB,United Kingdom\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("seeds/countries.toml"),
+            "name = \"countries\"\n\n\
+             [target]\n\
+             catalog = \"wh\"\n\
+             schema = \"seeds\"\n\
+             table = \"countries\"\n",
+        )
+        .unwrap();
+
+        // Both configs use the SAME catalog name (`wh` — the DuckDB file
+        // stem), so the seed SQL is valid under either; only the physical
+        // warehouse file differs. Whichever config executes decides where
+        // the rows land.
+        let config_path = root.join("rocky.toml");
+        let db_a = root.join("a/wh.duckdb");
+        let db_b = root.join("b/wh.duckdb");
+        let config_for = |db: &std::path::Path| {
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n",
+                db.display()
+            )
+        };
+        std::fs::write(&config_path, config_for(&db_a)).unwrap();
+        let loaded = Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path)
+                .expect("load snapshot A"),
+        );
+        // The mid-DAG swap: after the capture, rocky.toml points at B.
+        std::fs::write(&config_path, config_for(&db_b)).unwrap();
+
+        let dispatcher = CliDispatcher {
+            config_path: config_path.clone(),
+            loaded,
+            state_path: root.join(".rocky-state.redb"),
+            seeds_dir: root.join("seeds"),
+            node_pipelines: HashMap::new(),
+            skip_opts: SkipRunOptions::default(),
+            sub_runner: default_sub_runner(),
+        };
+        let id = NodeId::new("seed", "countries");
+        let fut = dispatcher
+            .dispatch(&id, NodeKind::Seed, "countries")
+            .expect("a seed node dispatches a future");
+        fut.await.expect("seed node loads");
+
+        assert!(
+            !db_b.exists(),
+            "the seed must never touch the swapped-in config's warehouse (B)"
+        );
+        let adapter = DuckDbWarehouseAdapter::open(&db_a).expect("warehouse A exists");
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard
+            .execute_sql("SELECT COUNT(*) FROM wh.seeds.countries")
+            .unwrap();
+        assert_eq!(
+            cell_i64(&rows.rows[0][0]),
+            2,
+            "the seed's rows must land in the CAPTURED snapshot's warehouse (A)"
+        );
     }
 
     /// End-to-end acceptance for B6: under `run --dag`, a `Seed` node loads its

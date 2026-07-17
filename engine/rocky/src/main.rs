@@ -3352,8 +3352,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             pipeline,
             filter,
         } => {
+            // One fingerprinted load, threaded in — `run_seed` performs no
+            // internal config re-read (#1120), so the executed adapter is the
+            // one this load resolved.
+            let loaded = rocky_core::config::load_rocky_config_fingerprinted(&cli.config)
+                .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
             rocky_cli::commands::run_seed(
-                &cli.config,
+                &loaded,
                 &seeds,
                 pipeline.as_deref(),
                 filter.as_deref(),

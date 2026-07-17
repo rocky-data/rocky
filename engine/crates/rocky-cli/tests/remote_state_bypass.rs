@@ -36,6 +36,17 @@
 //!   so it is a regression guard, not RED-before;
 //!   `backfill_finalizes_even_on_execution_failure` pins parity with the
 //!   deleted upload-even-on-failure.
+//!
+//! Red-team round (RED against the pre-fix 2b tree):
+//! - `governed_without_policy_durable_*`: durability selection was
+//!   conjoined with `[policy]`, so a governed apply without a policy plane
+//!   exited 0 on a lost terminal upload (FIX 1).
+//! - `backfill_forward_incompat_recreate_suppresses_upload`: the backfill
+//!   executor uploaded a downgraded recreated blob over newer shared state
+//!   (FIX 2).
+//! - `noop_transformation_without_models_dir_does_no_remote_io`: the
+//!   transformation arm acquired + finalized a session for a run that
+//!   mutates no state (FIX 3).
 
 #![cfg(feature = "duckdb")]
 
@@ -92,14 +103,26 @@ struct ModelProject {
 
 impl ModelProject {
     fn new(model_sql: &str) -> Self {
+        Self::new_inner(Some(model_sql))
+    }
+
+    /// A project whose `rocky.toml` declares `models = "models/**"` but whose
+    /// models directory does NOT exist — the transformation no-op path
+    /// (`run_local` opens no state store, executes nothing).
+    fn without_models_dir() -> Self {
+        Self::new_inner(None)
+    }
+
+    fn new_inner(model_sql: Option<&str>) -> Self {
         let dir = tempfile::tempdir().expect("create project temp dir");
         let db = dir.path().join("wh.duckdb");
         let models_dir = dir.path().join("models");
-        std::fs::create_dir(&models_dir).expect("create models dir");
-        std::fs::write(models_dir.join("m1.sql"), model_sql).expect("write m1.sql");
-        std::fs::write(
-            models_dir.join("m1.toml"),
-            r#"
+        if let Some(model_sql) = model_sql {
+            std::fs::create_dir(&models_dir).expect("create models dir");
+            std::fs::write(models_dir.join("m1.sql"), model_sql).expect("write m1.sql");
+            std::fs::write(
+                models_dir.join("m1.toml"),
+                r#"
 name = "m1"
 
 [strategy]
@@ -110,8 +133,9 @@ catalog = "wh"
 schema = "main"
 table = "m1"
 "#,
-        )
-        .expect("write m1.toml");
+            )
+            .expect("write m1.toml");
+        }
         let config_path = dir.path().join("rocky.toml");
         std::fs::write(
             &config_path,
@@ -182,6 +206,61 @@ async fn drive_run(
         &rocky_core::run_vars::RunVars::new(),
         run_id_override,
         None,  // governed_ctx
+        false, // assume_fresh_state
+    )
+    .await
+}
+
+/// Drive the real `commands::run` GOVERNED, against a config that has NO
+/// `[policy]` block: a directly-constructed legacy-shaped
+/// [`rocky_cli::commands::apply::GovernedRunContext`] (no bound fingerprint,
+/// `require_fingerprint: false`, no reviewed schemas), which every governed
+/// gate lets through. `model` selects the model-only arm; `None` dispatches
+/// on the resolved pipeline (transformation or load).
+async fn drive_run_governed(
+    config_path: &Path,
+    state_path: &Path,
+    models_dir: Option<&Path>,
+    model: Option<&str>,
+) -> anyhow::Result<()> {
+    let root = config_path.parent().expect("project root").to_path_buf();
+    let ctx = rocky_cli::commands::apply::GovernedRunContext {
+        principal: rocky_core::config::PolicyPrincipal::Agent,
+        plan_id: "plan-durability-redteam",
+        root: &root,
+        config_path,
+        expected_ir_fingerprint: None,
+        expected_config_identity: None,
+        require_fingerprint: false,
+        reviewed_source_schemas: None,
+        expects_models: false,
+    };
+    let loaded = std::sync::Arc::new(rocky_core::config::load_rocky_config_fingerprinted(
+        config_path,
+    )?);
+    rocky_cli::commands::run(
+        config_path,
+        loaded,
+        None, // filter
+        None, // pipeline_name_arg — single pipeline resolves
+        state_path,
+        None,  // governance_override
+        false, // output_json
+        models_dir,
+        false, // run_all
+        None,  // resume_run_id
+        false, // resume_latest
+        None,  // shadow_config
+        &rocky_cli::commands::PartitionRunOptions::default(),
+        model,
+        None, // cache_ttl_override
+        None, // idempotency_key
+        None, // env
+        &rocky_cli::commands::DeferOptions::default(),
+        &rocky_cli::commands::SkipRunOptions::default(),
+        &rocky_core::run_vars::RunVars::new(),
+        None, // run_id_override
+        Some(&ctx),
         false, // assume_fresh_state
     )
     .await
@@ -416,6 +495,14 @@ async fn final_persistence_load() {
 /// Load is a mutating single-purpose command ⇒ `require_synced` is
 /// UNCONDITIONAL: a failed download refuses the load (fail-closed) and never
 /// uploads. RED before 2b: load ignored the remote entirely and succeeded.
+///
+/// This is a DELIBERATE, documented exception to the general ungoverned
+/// degraded-continue contract (ADR-STATE-SESSION §3): load's replicated
+/// `loaded_files` records ARE its dedup correctness. Proceeding degraded
+/// would strand this run's records locally (the Indeterminate authority
+/// suppresses the upload), so the next pod's download would not see them and
+/// would re-load the same files — duplicate rows in warehouse tables, worse
+/// than refusing. Do NOT "fix" this to the run arms' governed-only bail.
 #[tokio::test]
 async fn download_failure_fails_closed_load() {
     let _serial = remote_testing::serial_guard();
@@ -478,6 +565,118 @@ async fn ungoverned_continues_and_suppresses_transformation() {
         harness.faults.count(FaultOp::Put),
         0,
         "an Indeterminate-authority transformation run must suppress the terminal upload"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// durability decoupled from [policy] (red-team FIX 1, ADR-AUTHORITY §5)
+// ---------------------------------------------------------------------------
+//
+// "Ledger durability is orthogonal to policy enforcement — a governed apply
+// that recorded any state mutation must persist it, whether or not a
+// `[policy]` plane is present." Each arm's durability selection must key on
+// the governed context ALONE; `&& rocky_cfg.policy.is_some()` stays only on
+// the download-failure fail-closed bail. Pre-fix RED (all three): the arms
+// selected `Durable` via `exec_fp_gate.is_some() && rocky_cfg.policy
+// .is_some()`, so a governed apply without `[policy]` fell to
+// `ConfigDefault` + default `skip` and exited 0 on a lost terminal upload.
+// (The replication seam's twin lives in `remote_state_session.rs`.)
+
+#[tokio::test]
+async fn governed_without_policy_durable_model_only() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+    let project = ModelProject::new("SELECT 1 AS id\n");
+
+    harness.faults.arm(FaultOp::Put, FaultMode::FailAll);
+    let err = drive_run_governed(
+        &project.config_path,
+        &project.state_path,
+        Some(&project.models_dir),
+        Some("m1"),
+    )
+    .await
+    .expect_err("a governed model-only run must refuse exit 0 on a lost terminal upload");
+    harness.faults.clear();
+
+    assert!(
+        format!("{err:#}").contains("could not be persisted to the remote [state] backend"),
+        "the exit must cite the refused state persistence; got: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn governed_without_policy_durable_transformation() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+    let project = ModelProject::new("SELECT 1 AS id\n");
+
+    harness.faults.arm(FaultOp::Put, FaultMode::FailAll);
+    let err = drive_run_governed(
+        &project.config_path,
+        &project.state_path,
+        Some(&project.models_dir),
+        None,
+    )
+    .await
+    .expect_err("a governed transformation run must refuse exit 0 on a lost terminal upload");
+    harness.faults.clear();
+
+    assert!(
+        format!("{err:#}").contains("could not be persisted to the remote [state] backend"),
+        "the exit must cite the refused state persistence; got: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn governed_without_policy_durable_load_arm() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+    let project = LoadProject::remote(false);
+
+    harness.faults.arm(FaultOp::Put, FaultMode::FailAll);
+    let err = drive_run_governed(&project.config_path, &project.state_path, None, None)
+        .await
+        .expect_err("a governed load-arm run must refuse exit 0 on a lost terminal upload");
+    harness.faults.clear();
+
+    assert!(
+        format!("{err:#}").contains("could not be persisted to the"),
+        "the exit must cite the refused state persistence; got: {err:#}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// lazy finalize: the no-op transformation does ZERO remote I/O (red-team FIX 3)
+// ---------------------------------------------------------------------------
+
+/// ADR-STATE-SESSION (lazy finalize): a transformation run whose models
+/// directory does not exist executes nothing and opens no state store
+/// (`run_local`), so it must perform NO remote state I/O at all — the
+/// session is not even created (mirroring load's empty-file pre-session
+/// return). Uploading the unchanged blob anyway would be a pure
+/// last-writer-wins erasure vector against concurrent pods. Pre-fix RED: the
+/// transformation arm acquired + finalized unconditionally (a `Head`/`Get`
+/// on acquire, a `Put` on finalize).
+#[tokio::test]
+async fn noop_transformation_without_models_dir_does_no_remote_io() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+    let project = ModelProject::without_models_dir();
+
+    drive_run(&project, None, None)
+        .await
+        .expect("a no-op transformation run (no models dir) exits 0");
+
+    assert_eq!(
+        harness.faults.count(FaultOp::Put),
+        0,
+        "no state mutation occurred — nothing may be uploaded"
+    );
+    assert_eq!(
+        harness.faults.count(FaultOp::Get) + harness.faults.count(FaultOp::Head),
+        0,
+        "no session at all: the no-op arm must not even download"
     );
 }
 
@@ -655,18 +854,24 @@ async fn load_partial_failure_still_finalizes() {
 // backfill: one session, acquired before the gate (R3-4)
 // ---------------------------------------------------------------------------
 
-/// Build a backfill project (transformation model + `[policy]` plane +
-/// remote state), persist a Backfill plan + review marker, and return
-/// `(project, plan_id)`.
+/// Build a backfill project (transformation model + optional `[policy]`
+/// plane + remote state), persist a Backfill plan + review marker, and
+/// return `(project, plan_id)`.
 fn backfill_fixture(model_sql: &str) -> (ModelProject, String) {
+    backfill_fixture_with(model_sql, true)
+}
+
+fn backfill_fixture_with(model_sql: &str, with_policy: bool) -> (ModelProject, String) {
     let project = ModelProject::new(model_sql);
     let root = project.config_path.parent().unwrap().to_path_buf();
-    // Add a `[policy]` plane so the gate writes a decision row. No rules:
-    // the default agent effect (`require_review`) is satisfied by the review
-    // marker the always-on backfill gate demands anyway.
-    let mut cfg = std::fs::read_to_string(&project.config_path).expect("read config");
-    cfg.push_str("\n[policy]\nversion = 1\n");
-    std::fs::write(&project.config_path, cfg).expect("append policy block");
+    if with_policy {
+        // Add a `[policy]` plane so the gate writes a decision row. No rules:
+        // the default agent effect (`require_review`) is satisfied by the
+        // review marker the always-on backfill gate demands anyway.
+        let mut cfg = std::fs::read_to_string(&project.config_path).expect("read config");
+        cfg.push_str("\n[policy]\nversion = 1\n");
+        std::fs::write(&project.config_path, cfg).expect("append policy block");
+    }
 
     let plan_id = rocky_cli::plan_store::write_plan(
         &root,
@@ -760,5 +965,76 @@ async fn backfill_finalizes_even_on_execution_failure() {
         "the backfill session must ALWAYS finalize — even on execution failure — so \
          partial ledger mutations reach the remote (the old upload-even-on-failure \
          contract)"
+    );
+}
+
+/// Red-team FIX 2: a backfill whose canonical store was RECREATED because the
+/// on-disk schema was forward-incompatible (written by a NEWER binary, under
+/// the default `on_schema_mismatch = "recreate"`) must SUPPRESS its terminal
+/// upload — pushing the downgraded recreated blob would clobber the newer
+/// shared state upgraded pods depend on (the `state.rs` caller obligation
+/// every other arm honors: replication, model-only, load). The
+/// always-finalize shape stays: a suppressed finalize consumes the session
+/// without uploading. Pre-fix RED: `execute_backfill_set` never consulted
+/// `was_recreated_for_forward_incompat()` and always uploaded — the final
+/// Put count grew and pod B's download saw the DOWNGRADED (current-version)
+/// blob instead of the newer pod's state.
+///
+/// The forward-incompat state arrives the way it does in production: a
+/// NEWER pod uploaded its (v+1) ledger to the shared remote, and this
+/// (older) binary's backfill session restores it on acquire. Stamping only
+/// the local file cannot drive this path — an absent-remote download
+/// rebuilds the local file fresh (replicated tables reset), erasing a local
+/// stamp before the executor ever opens the store.
+///
+/// No `[policy]` plane: suppression is policy-independent, and a forward-
+/// incompatible ledger under a `[policy]` plane is refused earlier by the
+/// gate's own unreadable-ledger fail-closed deny.
+#[tokio::test]
+async fn backfill_forward_incompat_recreate_suppresses_upload() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+    let (project, plan_id) = backfill_fixture_with("SELECT 1 AS id\n", false);
+    let future_version = rocky_core::state::current_schema_version() + 1;
+
+    // Pod A is the "newer binary": its uploaded ledger carries schema v+1.
+    // (`upload_state` copies the file raw + drops local-only tables via redb
+    // directly — no version check — so the stamp survives to the remote.)
+    rocky_core::state::force_schema_version(&harness.pod_a.state_path, &future_version.to_string());
+    harness
+        .upload(&harness.pod_a)
+        .await
+        .expect("newer pod's upload");
+    let puts_before = harness.faults.count(FaultOp::Put);
+
+    drive_backfill_apply(&project, &plan_id)
+        .await
+        .expect("a recreate-policy backfill proceeds as a fresh full rebuild");
+
+    assert_eq!(
+        harness.faults.count(FaultOp::Put),
+        puts_before,
+        "a forward-incompat recreated store must suppress the backfill's terminal upload \
+         — uploading would push the downgraded blob over the newer shared state"
+    );
+    // Non-vacuous: the recreate really fired — the acquire restored the v+1
+    // blob and the executor's open re-bootstrapped it at this binary's
+    // version.
+    assert_eq!(
+        StateStore::peek_schema_version(&project.state_path).expect("peek recreated version"),
+        Some(rocky_core::state::current_schema_version()),
+        "the executor must have recreated the store (proves the suppression path was \
+         reachable, not vacuously skipped)"
+    );
+    // The no-clobber end state: a fresh pod's download still restores the
+    // NEWER pod's v+1 blob.
+    let _authority = harness
+        .download(&harness.pod_b)
+        .await
+        .expect("pod B start-download");
+    assert_eq!(
+        StateStore::peek_schema_version(&harness.pod_b.state_path).expect("peek pod B version"),
+        Some(future_version),
+        "the shared remote must still carry the newer pod's state, not a downgraded blob"
     );
 }

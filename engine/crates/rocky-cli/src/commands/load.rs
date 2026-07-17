@@ -181,6 +181,16 @@ pub async fn run_load(
     // (stale `loaded_files`) and blind-clobber the shared ledger on the
     // terminal upload. A genuine fresh start (`FreshStart`) proceeds;
     // only `Indeterminate` refuses.
+    //
+    // DELIBERATE exception to the general ungoverned degraded-continue
+    // contract (documented in ADR-STATE-SESSION §3): load's replicated
+    // `loaded_files` records ARE its dedup correctness. Proceeding degraded
+    // would strand this run's records locally — the Indeterminate authority
+    // suppresses the terminal upload — so the next pod's start-download
+    // would not see them and would re-load the same files, producing
+    // duplicate rows in warehouse tables. An unreadable remote therefore
+    // fails the load rather than risking duplicate ingestion. Pinned by
+    // `download_failure_fails_closed_load` (tests/remote_state_bypass.rs).
     if let Err(e) = session.require_synced() {
         session.abandon("load download failure (fail-closed)").await;
         return Err(anyhow::Error::new(e).context(

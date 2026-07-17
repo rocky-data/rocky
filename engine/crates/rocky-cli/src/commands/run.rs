@@ -1428,11 +1428,22 @@ pub async fn run(
         // store open) abandon explicitly before returning; every exit after
         // `finalize` (`print_json?`, `budget_result?`, the status-derived
         // return) is session-free because `finalize` consumed it.
-        let governed_with_policy = exec_fp_gate.is_some() && rocky_cfg.policy.is_some();
+        // Durability (ADR-AUTHORITY §5): ledger durability is orthogonal to
+        // policy enforcement — a governed apply that recorded any state
+        // mutation must persist it whether or not a `[policy]` plane is
+        // present. So `Durable` keys on the governed context ALONE:
+        // `exec_fp_gate.is_some()` ⇔ `governed_ctx.is_some()` by construction
+        // (the gate is `governed_ctx.map(..)` above); this arm reads the gate
+        // binding it already holds. The `&& rocky_cfg.policy.is_some()`
+        // conjunction remains ONLY on the download-failure fail-closed bail
+        // below — with no policy plane there is no cross-pod freeze/budget to
+        // enforce, so availability wins there (#1089's no-policy no-abort).
+        let governed = exec_fp_gate.is_some();
+        let governed_with_policy = governed && rocky_cfg.policy.is_some();
         let mut model_session = rocky_core::state_sync::RemoteStateSession::new(
             &loaded.config.state,
             state_path,
-            if governed_with_policy {
+            if governed {
                 rocky_core::state_sync::FinalizeDurability::Durable
             } else {
                 rocky_core::state_sync::FinalizeDurability::ConfigDefault
@@ -1712,42 +1723,76 @@ pub async fn run(
             // upload — and abandon on the delegated `Err` (error exits never
             // uploaded; parity with the replication error choke-point). Both
             // outcomes consume the session before this arm returns.
-            let governed_with_policy = exec_fp_gate.is_some() && rocky_cfg.policy.is_some();
-            let mut tx_session = rocky_core::state_sync::RemoteStateSession::new(
-                &loaded.config.state,
-                state_path,
-                if governed_with_policy {
-                    rocky_core::state_sync::FinalizeDurability::Durable
-                } else {
-                    rocky_core::state_sync::FinalizeDurability::ConfigDefault
-                },
-            );
-            if let Err(e) = tx_session.acquire().await {
-                // Unreachable on a fresh session (`Err` = double-acquire
-                // misuse); consume defensively so no exit leaks the session.
-                tx_session.abandon("transformation acquire misuse").await;
-                return Err(e.into());
-            }
-            match tx_session.require_synced() {
-                // #1089 fail-closed: a governed run whose remote download
-                // failed cannot see a cross-pod freeze/budget.
-                Err(e) if governed_with_policy => {
-                    tx_session
-                        .abandon("governed transformation download failure (fail-closed)")
-                        .await;
-                    return Err(anyhow::Error::new(e).context(
-                        "refusing a governed run: the remote state download failed, so a \
-                         cross-pod freeze/budget in the durable state ledger cannot be seen \
-                         (fail-closed). Retry once the `[state]` backend is reachable.",
-                    ));
+            //
+            // Durability (ADR-AUTHORITY §5): `Durable` keys on the governed
+            // context ALONE (`exec_fp_gate.is_some()` ⇔ `governed_ctx
+            // .is_some()` by construction — this arm reads the gate binding
+            // it already threads to the executor); `[policy]` remains only on
+            // the download-failure bail (see the model-only arm's note).
+            let governed = exec_fp_gate.is_some();
+            let governed_with_policy = governed && rocky_cfg.policy.is_some();
+            // Lazy session (ADR-STATE-SESSION "lazy finalize"):
+            // `run_transformation` opens a state store ONLY when its models
+            // directory exists (run_local.rs) — a no-op run mutates no state,
+            // and uploading the unchanged blob anyway would be a pure
+            // last-writer-wins erasure vector against concurrent pods.
+            // Resolve the directory EXACTLY the way `run_transformation`
+            // does (config-dir-relative `models` glob base) and create NO
+            // session when it is absent — zero remote I/O, mirroring load's
+            // empty-file pre-session return (load.rs). `run_transformation`'s
+            // own re-check stays the executing one: a dir created between
+            // the two checks runs one time without a session (the next run
+            // syncs); a dir deleted between them is the governed
+            // `expects_models` bail / ungoverned warn no-op, an
+            // unchanged-blob upload at worst.
+            let tx_config_dir = config_path.parent().unwrap_or(Path::new("."));
+            let tx_models_base = t
+                .models
+                .split("**")
+                .next()
+                .unwrap_or(&t.models)
+                .trim_end_matches('/');
+            let mut tx_session = None;
+            if tx_config_dir.join(tx_models_base).exists() {
+                let mut session = rocky_core::state_sync::RemoteStateSession::new(
+                    &loaded.config.state,
+                    state_path,
+                    if governed {
+                        rocky_core::state_sync::FinalizeDurability::Durable
+                    } else {
+                        rocky_core::state_sync::FinalizeDurability::ConfigDefault
+                    },
+                );
+                if let Err(e) = session.acquire().await {
+                    // Unreachable on a fresh session (`Err` = double-acquire
+                    // misuse); consume defensively so no exit leaks the
+                    // session.
+                    session.abandon("transformation acquire misuse").await;
+                    return Err(e.into());
                 }
-                // Ungoverned Indeterminate: continue on local state, but never
-                // push the unread remote over — blind last-writer-wins.
-                Err(e) => {
-                    warn!(error = %e, "state download failed, continuing with local state");
-                    tx_session.set_suppress_upload("indeterminate download");
+                match session.require_synced() {
+                    // #1089 fail-closed: a governed run whose remote download
+                    // failed cannot see a cross-pod freeze/budget.
+                    Err(e) if governed_with_policy => {
+                        session
+                            .abandon("governed transformation download failure (fail-closed)")
+                            .await;
+                        return Err(anyhow::Error::new(e).context(
+                            "refusing a governed run: the remote state download failed, so a \
+                             cross-pod freeze/budget in the durable state ledger cannot be seen \
+                             (fail-closed). Retry once the `[state]` backend is reachable.",
+                        ));
+                    }
+                    // Ungoverned Indeterminate: continue on local state, but
+                    // never push the unread remote over — blind
+                    // last-writer-wins.
+                    Err(e) => {
+                        warn!(error = %e, "state download failed, continuing with local state");
+                        session.set_suppress_upload("indeterminate download");
+                    }
+                    Ok(()) => {}
                 }
-                Ok(()) => {}
+                tx_session = Some(session);
             }
             let dispatch_result = super::run_local::run_transformation(
                 config_path,
@@ -1796,19 +1841,24 @@ pub async fn run(
                         .await;
                     // Terminal upload AFTER the idempotency stamp so it rides
                     // the upload — the same reposition as the replication
-                    // seam. Consumes the session.
-                    tx_session.finalize().await.context(
-                        "refusing to exit 0: the state ledger mutation could not be persisted \
-                         to the remote [state] backend",
-                    )?;
+                    // seam. Consumes the session (`None` = the lazy no-op
+                    // run: no state mutation, no session, nothing to upload).
+                    if let Some(session) = tx_session {
+                        session.finalize().await.context(
+                            "refusing to exit 0: the state ledger mutation could not be \
+                             persisted to the remote [state] backend",
+                        )?;
+                    }
                     return Ok(());
                 }
                 Err(e) => {
                     // Error exits never uploaded; the `?` this replaces would
                     // have leaked the session past this arm's return.
-                    tx_session
-                        .abandon("transformation exited before terminal state writes")
-                        .await;
+                    if let Some(session) = tx_session {
+                        session
+                            .abandon("transformation exited before terminal state writes")
+                            .await;
+                    }
                     return Err(e);
                 }
             }
@@ -1834,7 +1884,14 @@ pub async fn run(
             // self-load + the legacy `<config_dir>/.rocky_state`), and owns its
             // remote-state session internally — consumed on every `run_load`
             // exit, so run()'s `session_opt` stays `None` on this arm.
-            let governed_with_policy = exec_fp_gate.is_some() && rocky_cfg.policy.is_some();
+            //
+            // Durability (ADR-AUTHORITY §5): `Durable` keys on the governed
+            // context ALONE (`exec_fp_gate.is_some()` ⇔ `governed_ctx
+            // .is_some()` by construction — the gate binding is what this
+            // dispatch site has in scope); `[policy]` plays no role here at
+            // all — `run_load`'s own `require_synced` is unconditional (see
+            // the deliberate-exception note in load.rs).
+            let governed = exec_fp_gate.is_some();
             super::load::run_load(
                 config_path,
                 &loaded,
@@ -1844,7 +1901,7 @@ pub async fn run(
                 None, // target_table — take from config
                 Some(pipeline_name),
                 false, // truncate — honour config only
-                if governed_with_policy {
+                if governed {
                     rocky_core::state_sync::FinalizeDurability::Durable
                 } else {
                     rocky_core::state_sync::FinalizeDurability::ConfigDefault
@@ -1902,11 +1959,21 @@ pub async fn run(
     // Durability split (delta i): a governed run's terminal upload is
     // `Durable` (forces `on_upload_failure = Fail` — a lost audit/custody
     // mutation must not exit 0); an ungoverned run honors the configured mode.
-    let governed_with_policy = exec_fp_gate.is_some() && rocky_cfg.policy.is_some();
+    // ADR-AUTHORITY §5: durability keys on the governed context ALONE
+    // (`exec_fp_gate.is_some()` ⇔ `governed_ctx.is_some()` by construction at
+    // the `exec_fp_gate` binding) — ledger durability is orthogonal to policy
+    // enforcement, so a governed apply WITHOUT a `[policy]` plane still
+    // refuses to exit 0 on a lost terminal upload. `governed_with_policy`
+    // (the `&& rocky_cfg.policy.is_some()` conjunction) gates ONLY the
+    // download-failure fail-closed bail below — with no policy plane there is
+    // nothing cross-pod to enforce, so a failed download degrades like an
+    // ungoverned run (#1089's no-policy no-abort).
+    let governed = exec_fp_gate.is_some();
+    let governed_with_policy = governed && rocky_cfg.policy.is_some();
     let session = session_opt.insert(rocky_core::state_sync::RemoteStateSession::new(
         &loaded.config.state,
         state_path,
-        if governed_with_policy {
+        if governed {
             rocky_core::state_sync::FinalizeDurability::Durable
         } else {
             rocky_core::state_sync::FinalizeDurability::ConfigDefault
@@ -5302,7 +5369,9 @@ pub(crate) async fn execute_backfill_set(
     // `POLICY_DECISIONS` table and erase the decision row the gate wrote
     // between the caller's download and this execution — which is why the
     // session arrives already-acquired instead of this function syncing.
-    session: rocky_core::state_sync::RemoteStateSession,
+    // `mut`: the store open below may flag a forward-incompat recreate, which
+    // records an upload suppression on the session.
+    mut session: rocky_core::state_sync::RemoteStateSession,
     state_path: &Path,
     models_dir: &Path,
     model_set: &std::collections::BTreeSet<String>,
@@ -5363,6 +5432,17 @@ pub(crate) async fn execute_backfill_set(
             )
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?,
         );
+        // Forward-incompat recreate ⇒ never push the downgraded ledger back
+        // over newer shared state (the state.rs caller obligation; same
+        // suppression as the replication / model-only / load arms). The
+        // ALWAYS-finalize shape below stays — a suppressed finalize consumes
+        // the session without uploading.
+        if state_store
+            .as_ref()
+            .is_some_and(rocky_core::state::StateStore::was_recreated_for_forward_incompat)
+        {
+            session.set_suppress_upload("forward-incompat recreate");
+        }
 
         let mut output = RunOutput::new(String::new(), 0, 1);
 
