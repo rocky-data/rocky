@@ -63,8 +63,9 @@ const GRACE_PERIODS: TableDefinition<&str, &[u8]> = TableDefinition::new("grace_
 ///
 /// Key format: `"{pipeline_name}|{file_path}"` (e.g.
 /// `"ingest|data/orders.csv"`). Value: serialized [`LoadedFileRecord`].
-/// Used for incremental loads: files already recorded with a matching hash
-/// can be skipped.
+/// The replicated cross-pod record of what each pod ingested — an audit
+/// trail today (`rocky load` loads every discovered file without reading
+/// this table) and the foundation for a future incremental-skip consumer.
 const LOADED_FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("loaded_files");
 /// Named virtual branches (schema-prefix branches).
 ///

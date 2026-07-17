@@ -47,6 +47,15 @@
 //! - `noop_transformation_without_models_dir_does_no_remote_io`: the
 //!   transformation arm acquired + finalized a session for a run that
 //!   mutates no state (FIX 3).
+//!
+//! Re-review round (RED against the pre-fix red-team tree):
+//! - `noop_transformation_with_existing_state_file_skips_sessionless_sweep`:
+//!   the no-op arm fell through to the end-of-run retention auto-sweep,
+//!   which opened + stamped the state store with NO session (FIX B); the
+//!   fresh-file FIX 3 test missed it via the sweep's absent-file early
+//!   return. The single-decision gate half (FIX A) is pinned by
+//!   `passed_absent_decision_governs_even_when_dir_exists` in
+//!   `run_local.rs`'s unit tests (it needs the private entry point).
 
 #![cfg(feature = "duckdb")]
 
@@ -484,7 +493,7 @@ async fn final_persistence_load() {
             .expect("read loaded-file row")
             .is_some(),
         "the loaded-file record must ride the terminal upload: a second pod's download \
-         sees it (it will not re-load the file)"
+         sees the shared ledger entry"
     );
 }
 
@@ -497,12 +506,19 @@ async fn final_persistence_load() {
 /// uploads. RED before 2b: load ignored the remote entirely and succeeded.
 ///
 /// This is a DELIBERATE, documented exception to the general ungoverned
-/// degraded-continue contract (ADR-STATE-SESSION §3): load's replicated
-/// `loaded_files` records ARE its dedup correctness. Proceeding degraded
-/// would strand this run's records locally (the Indeterminate authority
-/// suppresses the upload), so the next pod's download would not see them and
-/// would re-load the same files — duplicate rows in warehouse tables, worse
-/// than refusing. Do NOT "fix" this to the run arms' governed-only bail.
+/// degraded-continue contract (ADR-STATE-SESSION §3). Honest scope
+/// (re-review corrected): nothing in the engine consults `loaded_files` to
+/// skip a load today — `run_load` loads every discovered file without
+/// reading the ledger and records only after success — so a missing remote
+/// record does not by itself cause duplicate ingestion. The rationale is
+/// ledger integrity, not dedup: `loaded_files` is the replicated cross-pod
+/// record of what each pod ingested (the audit trail and the foundation any
+/// future incremental-skip consumer reads), and proceeding degraded would
+/// silently orphan it (the Indeterminate authority suppresses the upload,
+/// stranding this run's records locally, invisible to other pods). Refusing
+/// beats proceeding blind on unreadable shared state for a command whose
+/// only job is the mutation being recorded. Do NOT "fix" this to the run
+/// arms' governed-only bail.
 #[tokio::test]
 async fn download_failure_fails_closed_load() {
     let _serial = remote_testing::serial_guard();
@@ -680,6 +696,60 @@ async fn noop_transformation_without_models_dir_does_no_remote_io() {
     );
 }
 
+/// Re-review FIX B: the same no-op transformation on a pod WITH an existing
+/// state file — the fresh-project test above let the sweep's
+/// `!state_path.exists()` early return mask this. "Mutates no state" must
+/// include `run()`'s end-of-run retention auto-sweep: pre-fix RED, the no-op
+/// arm's `return` only exited the inner `run_result` async block, fell
+/// through to `auto_sweep_retention_at_end_of_run`, opened the store, swept
+/// (default retention domains are non-empty), and stamped
+/// `last_retention_sweep_at` — a sessionless state mutation (RD-003 shape) on
+/// the one path DEFINED by mutating nothing. Post-fix: zero remote I/O AND
+/// the state file byte-identical, with no sweep stamp.
+#[tokio::test]
+async fn noop_transformation_with_existing_state_file_skips_sessionless_sweep() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+    let project = ModelProject::without_models_dir();
+
+    // A pre-existing local state file with NO prior sweep stamp — the pod
+    // shape the fresh-absent-file test misses.
+    {
+        let store = StateStore::open(&project.state_path).expect("seed state file");
+        store
+            .record_loaded_file("seed", "local.csv", &marker_record())
+            .expect("seed a row");
+    }
+    let before = std::fs::read(&project.state_path).expect("read state file before");
+
+    drive_run(&project, None, None)
+        .await
+        .expect("a no-op transformation run (no models dir) exits 0");
+
+    assert_eq!(
+        harness.faults.count(FaultOp::Put)
+            + harness.faults.count(FaultOp::Get)
+            + harness.faults.count(FaultOp::Head),
+        0,
+        "the no-op arm performs zero remote I/O even when local state exists"
+    );
+    let after = std::fs::read(&project.state_path).expect("read state file after");
+    assert_eq!(
+        before, after,
+        "a no-op run mutates NOTHING: the end-of-run retention sweep must not \
+         open + mutate the state store sessionlessly"
+    );
+    let store = StateStore::open_read_only(&project.state_path).expect("open read-only");
+    assert!(
+        store
+            .get_last_retention_sweep_at()
+            .expect("read sweep stamp")
+            .is_none(),
+        "the sessionless retention sweep must be SKIPPED on the no-op path — \
+         no last_retention_sweep_at stamp"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // load: canonical-object collision regression + legacy logical import
 // ---------------------------------------------------------------------------
@@ -845,8 +915,8 @@ async fn load_partial_failure_still_finalizes() {
             .expect("read loaded-file row")
             .is_some(),
         "file A's record must survive file B's failure: the session captures per-file \
-         results and ALWAYS finalizes — an abandon would drop file A's state and the \
-         next pod would re-load it"
+         results and ALWAYS finalizes — an abandon would drop file A's ledger entry \
+         from the shared remote"
     );
 }
 

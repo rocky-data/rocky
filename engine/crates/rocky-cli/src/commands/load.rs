@@ -176,20 +176,25 @@ pub async fn run_load(
         return Err(e.into());
     }
     // UNCONDITIONAL fail-closed guard (unlike the run arms' governed-only
-    // bail): a load is a mutating single-purpose command — running it on an
-    // unreadable remote would both skip files another pod already loaded
-    // (stale `loaded_files`) and blind-clobber the shared ledger on the
-    // terminal upload. A genuine fresh start (`FreshStart`) proceeds;
-    // only `Indeterminate` refuses.
+    // bail): a load is a mutating single-purpose command, and proceeding
+    // blind on shared state it could not read is wrong for it regardless of
+    // governance. A genuine fresh start (`FreshStart`) proceeds; only
+    // `Indeterminate` refuses.
     //
     // DELIBERATE exception to the general ungoverned degraded-continue
-    // contract (documented in ADR-STATE-SESSION §3): load's replicated
-    // `loaded_files` records ARE its dedup correctness. Proceeding degraded
-    // would strand this run's records locally — the Indeterminate authority
-    // suppresses the terminal upload — so the next pod's start-download
-    // would not see them and would re-load the same files, producing
-    // duplicate rows in warehouse tables. An unreadable remote therefore
-    // fails the load rather than risking duplicate ingestion. Pinned by
+    // contract (documented in ADR-STATE-SESSION §3). Honest scope
+    // (re-review corrected): NOTHING in the engine consults `loaded_files`
+    // to skip a load today — the loop below loads every discovered file
+    // without reading the ledger and records only after success — so a
+    // missing remote record does not by itself cause duplicate ingestion.
+    // The rationale is ledger integrity, not dedup: `loaded_files` is the
+    // replicated cross-pod record of what each pod ingested (the audit
+    // trail and the foundation any future incremental-skip consumer reads),
+    // and proceeding degraded would silently orphan it — the Indeterminate
+    // authority suppresses the terminal upload, so this run's records would
+    // be stranded locally, invisible to every other pod. Refusing beats
+    // silently losing replicated ledger rows for a command whose only job
+    // is the mutation being recorded. Pinned by
     // `download_failure_fails_closed_load` (tests/remote_state_bypass.rs).
     if let Err(e) = session.require_synced() {
         session.abandon("load download failure (fail-closed)").await;
@@ -256,8 +261,8 @@ pub async fn run_load(
                             tracing::warn!(
                                 error = %e,
                                 file = %file_path,
-                                "failed to import a legacy loaded-file record; the file may \
-                                 be re-loaded"
+                                "failed to import a legacy loaded-file record; its ledger \
+                                 entry remains only in the legacy state file"
                             );
                         } else {
                             imported += 1;
@@ -279,7 +284,7 @@ pub async fn run_load(
                         error = %e,
                         legacy_state = %legacy_state_path.display(),
                         "failed to read legacy loaded-file records; skipping the one-time \
-                         import (previously loaded files may be re-loaded)"
+                         import (their ledger entries remain only in the legacy state file)"
                     );
                 }
             },
@@ -288,7 +293,7 @@ pub async fn run_load(
                     error = %e,
                     legacy_state = %legacy_state_path.display(),
                     "failed to open the legacy load state file; skipping the one-time \
-                     import (previously loaded files may be re-loaded)"
+                     import (its ledger entries remain only in the legacy state file)"
                 );
             }
         }
@@ -434,7 +439,7 @@ pub async fn run_load(
     // Per-file results captured → ALWAYS finalize → then propagate. `run_load`
     // records successes per-file and reports errors only after all files (the
     // `files_failed` bail below), so `abandon` on a partial failure would drop
-    // file A's just-recorded state and the next pod would re-load it — the
+    // file A's just-recorded ledger entry from the shared remote — the
     // successful files' records must ride the terminal upload regardless of a
     // later file's failure. The store is dropped first (advisory-lock release
     // + flush), matching the gc/policy/restore seam ordering.

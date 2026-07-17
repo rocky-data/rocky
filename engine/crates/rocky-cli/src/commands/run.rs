@@ -1327,6 +1327,16 @@ pub async fn run(
     // returns; quality/snapshot open no state store and carry none.
     let mut session_opt: Option<rocky_core::state_sync::RemoteStateSession> = None;
 
+    // Set by the transformation arm when its single models-dir decision
+    // resolves `Absent`: that run is a sessionless no-op that mutates NO
+    // state, so the end-of-run retention auto-sweep below the run body must
+    // not open + mutate the state store on its behalf either — a sessionless
+    // sweep + `last_retention_sweep_at` stamp is exactly the RD-003
+    // sessionless-mutation shape, on the one path DEFINED by "mutates
+    // nothing". Declared outside the body (like `session_opt`) so the
+    // post-body sweep hook can read it.
+    let mut skip_end_of_run_sweep = false;
+
     // FR-004 F1: wrap the entire run body so that any `?` / `bail!` /
     // early error return *after the claim* still releases the idempotency
     // stamp. Without this wrapper, a run that errored before the existing
@@ -1731,20 +1741,21 @@ pub async fn run(
             // the download-failure bail (see the model-only arm's note).
             let governed = exec_fp_gate.is_some();
             let governed_with_policy = governed && rocky_cfg.policy.is_some();
-            // Lazy session (ADR-STATE-SESSION "lazy finalize"):
-            // `run_transformation` opens a state store ONLY when its models
-            // directory exists (run_local.rs) — a no-op run mutates no state,
+            // Lazy session (ADR-STATE-SESSION "lazy finalize"), single-decision
+            // gate: resolve the models directory ONCE (config-dir-relative
+            // `models` glob base) into a `ModelsDirDecision` and thread THAT
+            // into `run_transformation` — the session decision here and the
+            // execution decision there consume the same filesystem check.
+            // `Absent` ⇒ no session is created (a no-op run mutates no state,
             // and uploading the unchanged blob anyway would be a pure
-            // last-writer-wins erasure vector against concurrent pods.
-            // Resolve the directory EXACTLY the way `run_transformation`
-            // does (config-dir-relative `models` glob base) and create NO
-            // session when it is absent — zero remote I/O, mirroring load's
-            // empty-file pre-session return (load.rs). `run_transformation`'s
-            // own re-check stays the executing one: a dir created between
-            // the two checks runs one time without a session (the next run
-            // syncs); a dir deleted between them is the governed
-            // `expects_models` bail / ungoverned warn no-op, an
-            // unchanged-blob upload at worst.
+            // last-writer-wins erasure vector against concurrent pods — zero
+            // remote I/O, mirroring load's empty-file pre-session return in
+            // load.rs) AND `run_transformation` is told "no models dir", so
+            // the run is a guaranteed no-op regardless of what the filesystem
+            // holds by execution time. Before this, `run_transformation`
+            // re-checked `exists()` itself: a dir created (or a symlink
+            // retargeted) between the two checks executed models and persisted
+            // state with NO session — the RD-003 shape through a race.
             let tx_config_dir = config_path.parent().unwrap_or(Path::new("."));
             let tx_models_base = t
                 .models
@@ -1752,8 +1763,24 @@ pub async fn run(
                 .next()
                 .unwrap_or(&t.models)
                 .trim_end_matches('/');
+            let tx_models_dir = tx_config_dir.join(tx_models_base);
+            let models_dir_decision = if tx_models_dir.exists() {
+                super::run_local::ModelsDirDecision::Present(tx_models_dir)
+            } else {
+                super::run_local::ModelsDirDecision::Absent(tx_models_dir)
+            };
+            let tx_noop = matches!(
+                models_dir_decision,
+                super::run_local::ModelsDirDecision::Absent(_)
+            );
+            // A no-op (no-session) transformation run mutates NO state, so
+            // the end-of-run retention auto-sweep below the run body must not
+            // open + mutate the store sessionlessly on its behalf either.
+            // Covers both `Absent` exits: the silent no-op AND the governed
+            // `expects_models` fail-closed bail — neither opens a store.
+            skip_end_of_run_sweep = tx_noop;
             let mut tx_session = None;
-            if tx_config_dir.join(tx_models_base).exists() {
+            if !tx_noop {
                 let mut session = rocky_core::state_sync::RemoteStateSession::new(
                     &loaded.config.state,
                     state_path,
@@ -1795,7 +1822,7 @@ pub async fn run(
                 tx_session = Some(session);
             }
             let dispatch_result = super::run_local::run_transformation(
-                config_path,
+                models_dir_decision,
                 t,
                 rocky_cfg,
                 output_json,
@@ -4831,14 +4858,31 @@ pub async fn run(
     // End-of-run retention auto-sweep. Wires `StateStore::sweep_retention`
     // into the run loop so retention "just works" without an external cron
     // — the manual `rocky state retention sweep` subcommand stays as the
-    // operator escape hatch. Runs unconditionally on both Ok and Err
-    // paths: a failed run shouldn't postpone state cleanup, and the
-    // interval gate inside `auto_sweep_retention_at_end_of_run` still
-    // suppresses thrash. All errors swallowed as `tracing::warn` — the
-    // run's exit code reflects the run, never the sweep. Placed before
-    // the idempotency error-path finalize so an over-budget sweep never
-    // delays the InFlight stamp release.
-    auto_sweep_retention_at_end_of_run(state_path, &loaded.config.state.retention).await;
+    // operator escape hatch. Runs on both Ok and Err paths: a failed run
+    // shouldn't postpone state cleanup, and the interval gate inside
+    // `auto_sweep_retention_at_end_of_run` still suppresses thrash. All
+    // errors swallowed as `tracing::warn` — the run's exit code reflects
+    // the run, never the sweep. Placed before the idempotency error-path
+    // finalize so an over-budget sweep never delays the InFlight stamp
+    // release.
+    //
+    // ONE exception: the no-op (no-session) transformation path. Its
+    // `return` exits only the `run_result` async block above, so control
+    // still reaches this hook — and on a pod with an existing state file
+    // the sweep would open the store, delete retention rows, and stamp
+    // `last_retention_sweep_at` with NO `RemoteStateSession` (the RD-003
+    // sessionless-mutation shape) on the one path whose contract is
+    // "mutates nothing" (its remote no-op depends on that). The arm
+    // threads its single models-dir decision here via
+    // `skip_end_of_run_sweep`; a skipped sweep simply runs on the next
+    // real run.
+    if skip_end_of_run_sweep {
+        tracing::debug!(
+            "auto-sweep: skipped — no-op transformation run (no models dir) mutates no state"
+        );
+    } else {
+        auto_sweep_retention_at_end_of_run(state_path, &loaded.config.state.retention).await;
+    }
 
     // FR-004 F1 error-path finalize. If the body returned `Err`, the
     // claim is almost certainly still `InFlight` (the happy/interrupted/
