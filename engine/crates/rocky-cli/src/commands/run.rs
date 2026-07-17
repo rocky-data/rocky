@@ -1125,6 +1125,14 @@ pub(crate) fn refuse_governed_side_effects(
 ///
 /// The governed bail deliberately takes precedence over `assume_fresh_state`:
 /// an operator assertion must not un-gate a governed run's fail-closed check.
+///
+/// Specification/test surface (WP-01 PR-B): `run()` now routes through
+/// [`RemoteStateSession`][rocky_core::state_sync::RemoteStateSession] —
+/// `acquire` records a failed download as `Indeterminate` and the election
+/// below is inlined at the seam with identical semantics (byte-identical bail
+/// text, same audit warn, same precedence). This function and its tests remain
+/// the pinned specification of those election semantics.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn resolve_replication_authority(
     download: Result<
         rocky_core::state_sync::StateAuthority,
@@ -1306,6 +1314,16 @@ pub async fn run(
         }
         None => None,
     };
+
+    // WP-01 PR-B (stage 2a): the replication path's remote-state lifecycle
+    // owner. Declared OUTSIDE the `run_result` body so both terminal consumers
+    // can take it: the happy path finalizes inside the block (terminal upload
+    // repositioned AFTER the terminal state writes), and the error choke-point
+    // below the block abandons whatever is left (error/interrupted exits never
+    // uploaded — parity). Stays `None` on the non-replication arms (model-only
+    // / transformation / quality / snapshot / Load), which early-return before
+    // the replication seam — their bypass closure is stage 2b's business.
+    let mut session_opt: Option<rocky_core::state_sync::RemoteStateSession> = None;
 
     // FR-004 F1: wrap the entire run body so that any `?` / `bail!` /
     // early error return *after the claim* still releases the idempotency
@@ -1713,17 +1731,69 @@ pub async fn run(
     let pattern = pipeline.schema_pattern()?;
     let parsed_filter = filter.map(parse_filter).transpose()?;
 
-    // Download state from remote storage (S3/GCS/Valkey) if configured. The
-    // typed [`StateAuthority`] answers "may the local ledger back a governed
-    // decision?": `Authoritative` (remote restored, or the Local backend's
-    // on-disk truth), `FreshStart` (no remote object — a genuine bootstrap), or
-    // the caller-synthesized `Indeterminate` when an ungoverned run elects to
-    // continue past a failed download (see [`resolve_replication_authority`]).
-    let authority = resolve_replication_authority(
-        rocky_core::state_sync::download_state(&rocky_cfg.state, state_path).await,
-        exec_fp_gate.is_some() && rocky_cfg.policy.is_some(),
-        assume_fresh_state,
-    )?;
+    // Download state from remote storage (S3/GCS/Valkey) if configured, via
+    // the run-scoped [`RemoteStateSession`] (WP-01 PR-B). `acquire` performs
+    // the download-before-read and records the typed [`StateAuthority`] that
+    // answers "may the local ledger back a governed decision?":
+    // `Authoritative` (remote restored, or the Local backend's on-disk truth),
+    // `FreshStart` (no remote object — a genuine bootstrap), or
+    // `Indeterminate` when the download failed (the session retains the error
+    // for the fail-closed messaging below). The ELECTION past a failure stays
+    // right here, caller-side, with semantics identical to
+    // [`resolve_replication_authority`] — which remains the tested
+    // specification of this three-way election.
+    //
+    // Durability split (delta i): a governed run's terminal upload is
+    // `Durable` (forces `on_upload_failure = Fail` — a lost audit/custody
+    // mutation must not exit 0); an ungoverned run honors the configured mode.
+    let governed_with_policy = exec_fp_gate.is_some() && rocky_cfg.policy.is_some();
+    let session = session_opt.insert(rocky_core::state_sync::RemoteStateSession::new(
+        &loaded.config.state,
+        state_path,
+        if governed_with_policy {
+            rocky_core::state_sync::FinalizeDurability::Durable
+        } else {
+            rocky_core::state_sync::FinalizeDurability::ConfigDefault
+        },
+    ));
+    let authority = session.acquire().await?;
+    let authority = if authority.is_usable() {
+        authority
+    } else {
+        let cause = session
+            .last_download_error()
+            .unwrap_or("download failure not recorded")
+            .to_string();
+        // #2 (red-team): a GOVERNED run whose remote-state download failed
+        // cannot see a cross-pod freeze/budget recorded by another pod. If a
+        // `[policy]` plane is configured (the in-run gate WILL consult
+        // POLICY_DECISIONS), fail-closed rather than evaluate the freeze from
+        // stale local state and fail OPEN. With no `[policy]` there is nothing
+        // to enforce, so continue — same as an ungoverned run, no availability
+        // regression. The governed bail deliberately takes precedence over
+        // `assume_fresh_state`: an operator assertion must not un-gate a
+        // governed run's fail-closed check.
+        if governed_with_policy {
+            anyhow::bail!(
+                "refusing a governed run: remote state download failed ({cause}), so a \
+                 cross-pod freeze/budget in the durable state ledger cannot be seen \
+                 (fail-closed). Retry once the `[state]` backend is reachable."
+            );
+        }
+        if assume_fresh_state {
+            tracing::warn!(
+                target: "rocky::state_authority",
+                reason = %cause,
+                "operator asserted --assume-fresh-state: treating failed download as an \
+                 intentional fresh start"
+            );
+            session.assume_fresh_start();
+            session.authority()
+        } else {
+            warn!(error = %cause, "state download failed, continuing with local state");
+            authority
+        }
+    };
 
     // Build adapter registry and resolve adapters
     let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
@@ -1765,8 +1835,14 @@ pub async fn run(
     // - the download authority is `Indeterminate` (an ungoverned run elected
     //   past a failed download) — pushing the local ledger over a remote this
     //   run could not read would be a blind last-writer-wins over unseen state.
-    // Both upload paths key on this variable: the periodic uploader's spawn
-    // gate and the terminal `upload_state_unless_recreated` call.
+    // The session's suppress reason drives the terminal `finalize`; the local
+    // bool keeps the periodic uploader's spawn gate on the same derivation.
+    if state_store.was_recreated_for_forward_incompat() {
+        session.set_suppress_upload("forward-incompat recreate");
+    }
+    if !authority.is_usable() {
+        session.set_suppress_upload("indeterminate download");
+    }
     let suppress_state_upload =
         state_store.was_recreated_for_forward_incompat() || !authority.is_usable();
 
@@ -2680,27 +2756,19 @@ pub async fn run(
     // exposure for long runs. Runs shorter than ~1 minute skip it entirely.
     let estimated_run_secs =
         (tables_to_process.len() as u64).saturating_mul(3) / (concurrency.max(1) as u64);
-    let state_sync_handle = if estimated_run_secs < 60 || suppress_state_upload {
-        None
-    } else {
+    if estimated_run_secs >= 60 && !suppress_state_upload {
         // Target one upload per quarter of the estimated run, capped at 30s.
+        // The session owns the spawned loop (its config snapshot + state
+        // path), so the stop sites below abort AND join it (RD-004).
         let cadence_secs = std::cmp::min(30, estimated_run_secs / 4).max(10);
-        let cadence = Duration::from_secs(cadence_secs);
-        let state_cfg = rocky_cfg.state.clone();
-        let state_p = state_path.to_path_buf();
         info!(
             estimated_run_secs,
             cadence_secs, "adaptive state-sync cadence configured"
         );
-        Some(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(cadence).await;
-                if let Err(e) = rocky_core::state_sync::upload_state(&state_cfg, &state_p).await {
-                    warn!(error = %e, "periodic state sync failed");
-                }
-            }
-        }))
-    };
+        if let Some(session) = session_opt.as_mut() {
+            session.start_periodic_uploader(Duration::from_secs(cadence_secs));
+        }
+    }
 
     // Track the semaphore's effective capacity so we can adjust it when the
     // throttle changes. Starts at `concurrency` and is adjusted after each
@@ -3175,8 +3243,12 @@ pub async fn run(
             }
         }
 
-        if let Some(h) = &state_sync_handle {
-            h.abort();
+        // Stop the periodic uploader through the session — abort AND join
+        // (RD-004), so no upload task is still mid-`put` while the interrupted
+        // exit below runs. The session itself is abandoned (no terminal
+        // upload) at the error choke-point after the run body.
+        if let Some(session) = session_opt.as_mut() {
+            session.stop_periodic().await;
         }
 
         output.duration_ms = start.elapsed().as_millis() as u64;
@@ -3317,9 +3389,11 @@ pub async fn run(
         }
     }
 
-    // Stop background state sync and reclaim resources for post-run phase
-    if let Some(h) = state_sync_handle.as_ref() {
-        h.abort();
+    // Stop background state sync and reclaim resources for post-run phase —
+    // abort AND join through the session (RD-004), so the periodic task can't
+    // still be mid-`put` when the terminal finalize below uploads.
+    if let Some(session) = session_opt.as_mut() {
+        session.stop_periodic().await;
     }
 
     // --- Batch watermark updates (no lock contention — sequential post-run) ---
@@ -4296,8 +4370,9 @@ pub async fn run(
     output.metrics = Some(rocky_observe::metrics::METRICS.snapshot());
 
     // Sweep expired idempotency stamps + stale InFlight corpses before
-    // the remote upload so the uploaded snapshot doesn't carry dead
-    // state. Swallow errors — the sweep is purely opportunistic.
+    // the remote upload (the session finalize further below) so the
+    // uploaded snapshot doesn't carry dead state. Swallow errors — the
+    // sweep is purely opportunistic.
     sweep_idempotency_best_effort(
         idempotency_ctx.as_ref(),
         state_store.as_ref(),
@@ -4305,30 +4380,13 @@ pub async fn run(
     )
     .await;
 
-    // Upload state to remote storage — unless suppressed: the store was
-    // bootstrapped fresh from a forward-incompatible on-disk schema (the local
-    // state is a downgrade; persisting it back would clobber the newer state
-    // that already-upgraded pods depend on), or the download authority was
-    // `Indeterminate` (pushing local state over a remote this run could not
-    // read would be a blind last-writer-wins over unseen state). The periodic
-    // mid-run uploader above is gated by the same flag.
-    if let Err(e) = rocky_core::state_sync::upload_state_unless_recreated(
-        suppress_state_upload,
-        &rocky_cfg.state,
-        state_path,
-    )
-    .await
-    {
-        warn!(error = %e, "state upload failed");
-    }
-
-    // §P2.6 emit: state_synced — final upload is done (either
-    // successfully or the warn above tells the operator it failed;
-    // the hook still fires so downstream observers can tick the
-    // "sync attempted" lifecycle marker).
-    let _ = hook_registry
-        .fire(&HookContext::state_synced(&run_id, pipeline_name))
-        .await;
+    // WP-01 PR-B (§5): the terminal state upload is REPOSITIONED — it now
+    // happens via `session.finalize()` AFTER the terminal state writes
+    // (`persist_run_record` → verify-after custody → `finalize_idempotency`),
+    // so those writes ride the upload and the next pod's start-download sees
+    // them. The suppression cases (forward-incompat recreate, indeterminate
+    // download) were recorded on the session at the seam above; `finalize`
+    // honors them. The `state_synced` hook moves with the upload.
 
     output.execution.tables_processed = output.tables_copied + table_errors.len();
     output.execution.tables_failed = table_errors.len();
@@ -4426,6 +4484,30 @@ pub async fn run(
             &output,
         )
         .await;
+        // WP-01 PR-B: finalize the state session on this failure branch too,
+        // so the failing verify-after's custody row (re-persisted just above)
+        // reaches the remote ledger — a deliberate improvement: before the
+        // reposition the custody row was written AFTER the upload and never
+        // traveled. The custody failure stays the primary error: a finalize
+        // failure is logged, and the run still exits with `verify_after_result`
+        // (nonzero either way, so the Durable fail-closed contract holds).
+        if let Some(session) = session_opt.take() {
+            match session.finalize().await {
+                Ok(()) => {
+                    // §P2.6 emit: state_synced — fires where the upload
+                    // actually happens now.
+                    let _ = hook_registry
+                        .fire(&HookContext::state_synced(&run_id, pipeline_name))
+                        .await;
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "terminal state upload failed on the verify-after failure path"
+                    );
+                }
+            }
+        }
         let msg = format!("verify_after gate failed for run {run_id}");
         let _ = hook_registry
             .fire(&HookContext::pipeline_error(&run_id, pipeline_name, &msg))
@@ -4448,6 +4530,30 @@ pub async fn run(
         &output,
     )
     .await;
+
+    // WP-01 PR-B (§5): the terminal state upload, repositioned AFTER the
+    // terminal state writes (run record → verify-after custody → idempotency
+    // stamp) so they ride it — the next pod's start-download sees this run's
+    // record instead of a snapshot captured before it existed (delta ii).
+    // Sits BEFORE the partial-failure/compile-failure exits below, matching
+    // the old upload position's coverage of those exits. Durability is split
+    // by governance class (delta i): a governed run (`Durable`) fails on a
+    // lost terminal upload even under the default `on_upload_failure = skip`;
+    // an ungoverned run honors the configured mode — `skip` swallows inside
+    // `upload_state` (warn + Ok), an explicit `fail` now propagates here (the
+    // configured contract, previously swallowed by the old warn-and-continue).
+    if let Some(session) = session_opt.take() {
+        session.finalize().await.context(
+            "refusing to exit 0: the state ledger mutation could not be persisted to the \
+             remote [state] backend",
+        )?;
+    }
+    // §P2.6 emit: state_synced — the terminal upload (or its deliberate
+    // suppression) just completed; the hook fires where the upload actually
+    // happens now.
+    let _ = hook_registry
+        .fire(&HookContext::state_synced(&run_id, pipeline_name))
+        .await;
 
     // Fire the `on_budget_breach` hook for each recorded breach so
     // shell hooks / webhooks configured via `[hook.on_budget_breach]`
@@ -4611,6 +4717,21 @@ pub async fn run(
     // the idempotency record of a genuinely-successful run).
     if run_result.is_err() {
         finalize_idempotency_on_error(&mut idempotency_ctx, state_path, &run_id).await;
+        // WP-01 PR-B: the error-path abandon choke-point. Any `?`/`bail!`/
+        // interrupted exit inside the run body leaves the session un-finalized
+        // here; consume it deliberately WITHOUT uploading — error and
+        // interrupted paths never uploaded (the old end-of-run upload sat past
+        // every error return), and the terminal state writes that would ride
+        // the upload did not happen. Also stops (aborts + joins) any live
+        // periodic uploader and disarms the session's Drop tripwire. On an
+        // `Ok` result the happy path already finalized (took the session), so
+        // there is nothing here to consume — and a hypothetical Ok-path leak
+        // should trip the tripwire, not be silently abandoned.
+        if let Some(session) = session_opt.take() {
+            session
+                .abandon("run exited before terminal state writes")
+                .await;
+        }
     }
 
     run_result

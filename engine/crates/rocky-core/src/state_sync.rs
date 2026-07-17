@@ -395,6 +395,347 @@ impl StateAuthority {
     }
 }
 
+/// How [`RemoteStateSession::finalize`] treats a failed terminal upload.
+///
+/// The split is by governance class, not by backend: a governed run's terminal
+/// state writes (run record, verify-after custody, idempotency stamp) are part
+/// of the audited decision trail, so losing the upload that carries them must
+/// fail the run even when the operator left the liveness-friendly default
+/// `on_upload_failure = "skip"` in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeDurability {
+    /// Force `on_upload_failure = Fail` for the terminal upload, regardless of
+    /// the configured mode. Used by governed runs: a lost terminal upload is a
+    /// lost audit/custody mutation, so the run must exit nonzero.
+    Durable,
+    /// Honor the configured `[state] on_upload_failure` as-is: the default
+    /// `skip` warns-and-continues (state re-derives next run), an explicit
+    /// `fail` propagates. Used by ungoverned runs — a successful warehouse run
+    /// must not turn nonzero on a failed state PUT unless the operator asked
+    /// for exactly that.
+    ConfigDefault,
+}
+
+/// The lifecycle owner for one run's remote `[state]` interaction.
+///
+/// Replaces the inline download/periodic/terminal-upload seams with a single
+/// object that owns the whole `acquire → (periodic) → finalize | abandon`
+/// lifecycle. Constructed from an **owned [`StateConfig`] snapshot** — never a
+/// config path — so no seam can be redirected by a `rocky.toml` swap timed
+/// after the caller's gate (execute-from-owned by construction).
+///
+/// # Lifecycle
+///
+/// - [`acquire`][Self::acquire] — download-before-read. Resolves and records
+///   the [`StateAuthority`]. A download *failure* is recorded as
+///   [`Indeterminate`][StateAuthority::Indeterminate] (with the error retained
+///   for [`require_synced`][Self::require_synced] and the caller's fail-closed
+///   messaging) and returned as `Ok` — the session is the electing caller the
+///   [`download_state`] contract requires; `Err` is reserved for internal
+///   misuse (double-acquire).
+/// - [`start_periodic_uploader`][Self::start_periodic_uploader] /
+///   [`stop_periodic`][Self::stop_periodic] — the owned mid-run uploader;
+///   `stop_periodic` aborts **and joins** the task (the RD-004
+///   abort-without-await fix).
+/// - [`finalize`][Self::finalize] — one-shot upload-after, positioned by the
+///   caller AFTER the run's terminal state writes so they ride the upload.
+///   Suppressed uploads (forward-incompat recreate, indeterminate download)
+///   return `Ok` without touching the remote.
+/// - [`abandon`][Self::abandon] — deliberate no-upload consumption for
+///   error/interrupted exits (which never uploaded, and must not start to).
+///
+/// # What the session does NOT own
+///
+/// - **The `StateStore`.** A hard lock-ordering constraint: [`download_state`]
+///   internally takes the same advisory writer lock `StateStore::open` takes
+///   (around its merge + atomic publish), so a session-held store would
+///   contend with the download's publish. Callers open/close their store
+///   around the session as today.
+/// - **A `base` generation.** Deliberately absent this stage: the observed
+///   remote generation (the field the CAS PR reads and CAS-writes at
+///   `finalize`) is the concurrency PR's forward extension of this struct, not
+///   part of the lifecycle spine.
+///
+/// # Drop tripwire
+///
+/// Dropping a session that was neither finalized nor abandoned is a bug in the
+/// calling run path: it `warn!`s, `debug_assert!`s, and aborts (without
+/// joining — `Drop` cannot await) any live periodic task so a leaked handle
+/// cannot outlive the run. The tripwire is a diagnostic + resource net, NOT a
+/// durability guarantee — a panic between mutation and `finalize` still skips
+/// the upload.
+#[derive(Debug)]
+pub struct RemoteStateSession {
+    /// Owned config snapshot — never a path (execute-from-owned).
+    cfg: StateConfig,
+    /// The local ledger this session syncs.
+    state_path: PathBuf,
+    /// Guards double-acquire (the one internal-misuse `Err`).
+    acquired: bool,
+    /// Starts `Indeterminate` (fail-closed until `acquire` resolves it).
+    authority: StateAuthority,
+    /// The download failure `acquire` elected past, verbatim — powers
+    /// `require_synced`'s message and the caller's fail-closed bail text.
+    last_download_error: Option<String>,
+    durability: FinalizeDurability,
+    /// `Some(reason)` once an upload suppression is recorded; first reason
+    /// wins. A suppressed `finalize` performs no upload.
+    suppress_reason: Option<&'static str>,
+    /// One-shot: set by `finalize`/`abandon`; arms the Drop tripwire while
+    /// false.
+    finalized: bool,
+    /// The owned mid-run periodic uploader, when started.
+    periodic: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RemoteStateSession {
+    /// Build a session over an owned snapshot of `cfg` for the ledger at
+    /// `state_path`. Performs no I/O; call [`acquire`][Self::acquire] before
+    /// the first state read.
+    pub fn new(cfg: &StateConfig, state_path: &Path, durability: FinalizeDurability) -> Self {
+        Self {
+            cfg: cfg.clone(),
+            state_path: state_path.to_path_buf(),
+            acquired: false,
+            authority: StateAuthority::Indeterminate,
+            last_download_error: None,
+            durability,
+            suppress_reason: None,
+            finalized: false,
+            periodic: None,
+        }
+    }
+
+    /// Download-before-read: resolve, record, and return the ledger's
+    /// [`StateAuthority`].
+    ///
+    /// - [`StateBackend::Local`] is a **zero-I/O** `Authoritative` no-op (the
+    ///   on-disk file IS the single source of truth) — the only skip.
+    /// - A successful [`download_state`] records and returns its authority.
+    /// - A download **failure** records
+    ///   [`Indeterminate`][StateAuthority::Indeterminate] plus the error
+    ///   string and returns `Ok(Indeterminate)` — the session IS the electing
+    ///   caller that [`download_state`]'s failure-stays-`Err` contract
+    ///   requires; the election past the failure (bail, `--assume-fresh-state`,
+    ///   degraded continue) stays with the caller, which reads the retained
+    ///   error via [`last_download_error`][Self::last_download_error].
+    ///
+    /// # Errors
+    ///
+    /// Never `Err` for a download failure. `Err` is reserved for internal
+    /// misuse: calling `acquire` twice on one session.
+    pub async fn acquire(&mut self) -> Result<StateAuthority, StateSyncError> {
+        if self.acquired {
+            return Err(StateSyncError::Io(std::io::Error::other(
+                "RemoteStateSession::acquire called twice — the session is one-shot per run \
+                 (internal misuse)",
+            )));
+        }
+        self.acquired = true;
+
+        // Local backend: the on-disk redb file is the single source of truth —
+        // nothing to download, nothing to fail. Zero I/O by construction
+        // (`download_state`'s Local arm is also a no-op, but skipping the call
+        // keeps the invariant self-evident and cheap).
+        if matches!(self.cfg.backend, StateBackend::Local) {
+            self.authority = StateAuthority::Authoritative;
+            return Ok(self.authority);
+        }
+
+        match download_state(&self.cfg, &self.state_path).await {
+            Ok(authority) => {
+                self.authority = authority;
+                Ok(authority)
+            }
+            Err(e) => {
+                self.last_download_error = Some(e.to_string());
+                self.authority = StateAuthority::Indeterminate;
+                Ok(StateAuthority::Indeterminate)
+            }
+        }
+    }
+
+    /// The recorded [`StateAuthority`] (fail-closed `Indeterminate` before
+    /// [`acquire`][Self::acquire] resolves it). The return type is itself
+    /// `#[must_use]`.
+    pub fn authority(&self) -> StateAuthority {
+        self.authority
+    }
+
+    /// The download failure [`acquire`][Self::acquire] elected past, if any.
+    /// Callers use it to source fail-closed bail messages from the actual
+    /// transport error rather than a generic placeholder.
+    #[must_use]
+    pub fn last_download_error(&self) -> Option<&str> {
+        self.last_download_error.as_deref()
+    }
+
+    /// Fail-closed guard: `Err` **iff** the recorded authority is
+    /// [`Indeterminate`][StateAuthority::Indeterminate], carrying the retained
+    /// download error so the operator sees the root cause, not just the
+    /// refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the ledger cannot back a governed decision — the
+    /// download failed (or `acquire` has not run) and no explicit election
+    /// (`assume_fresh_start`) has cleared it.
+    pub fn require_synced(&self) -> Result<(), StateSyncError> {
+        if self.authority != StateAuthority::Indeterminate {
+            return Ok(());
+        }
+        let cause = self
+            .last_download_error
+            .as_deref()
+            .unwrap_or("no download was attempted");
+        Err(StateSyncError::Io(std::io::Error::other(format!(
+            "remote state download failed ({cause}); the local ledger is non-authoritative \
+             and cannot back this run (fail-closed)"
+        ))))
+    }
+
+    /// The audited operator election: flip a recorded
+    /// [`Indeterminate`][StateAuthority::Indeterminate] to
+    /// [`FreshStart`][StateAuthority::FreshStart] (`--assume-fresh-state`).
+    /// The caller emits the structured audit warn — the session only records
+    /// the elected authority. A no-op when the authority is already usable.
+    pub fn assume_fresh_start(&mut self) {
+        if self.authority == StateAuthority::Indeterminate {
+            self.authority = StateAuthority::FreshStart;
+        }
+    }
+
+    /// Start the owned mid-run periodic uploader: [`upload_state`] on the
+    /// session's config/path every `cadence`. The caller applies its own
+    /// spawn gating (estimated duration, suppression) — the session only owns
+    /// the task so [`stop_periodic`][Self::stop_periodic] /
+    /// [`finalize`][Self::finalize] can abort **and join** it. A no-op when a
+    /// periodic task is already running.
+    pub fn start_periodic_uploader(&mut self, cadence: Duration) {
+        if self.periodic.is_some() {
+            return;
+        }
+        let cfg = self.cfg.clone();
+        let path = self.state_path.clone();
+        self.periodic = Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(cadence).await;
+                if let Err(e) = upload_state(&cfg, &path).await {
+                    warn!(error = %e, "periodic state sync failed");
+                }
+            }
+        }));
+    }
+
+    /// Abort AND JOIN the periodic uploader (the RD-004 abort-without-await
+    /// fix: an aborted-but-unjoined task could still be mid-`put` when the
+    /// caller proceeds to its terminal upload). Idempotent — a no-op when no
+    /// periodic task is running.
+    pub async fn stop_periodic(&mut self) {
+        if let Some(handle) = self.periodic.take() {
+            handle.abort();
+            // Cancelled is the expected outcome; a JoinError panics-variant is
+            // surfaced by the task's own panic hook, not here.
+            let _ = handle.await;
+        }
+    }
+
+    /// Record an upload suppression: [`finalize`][Self::finalize] will skip
+    /// the terminal upload (and return `Ok`). First recorded reason wins.
+    ///
+    /// Used for the two no-clobber cases: a store recreated after a
+    /// forward-incompatible schema mismatch (uploading the downgraded state
+    /// would overwrite newer shared state), and an
+    /// [`Indeterminate`][StateAuthority::Indeterminate] download (pushing
+    /// local state over a remote this run could not read is a blind
+    /// last-writer-wins).
+    pub fn set_suppress_upload(&mut self, reason: &'static str) {
+        self.suppress_reason.get_or_insert(reason);
+    }
+
+    /// One-shot terminal upload. Stops (aborts + joins) the periodic uploader,
+    /// then — unless suppressed — uploads via [`upload_state`]:
+    ///
+    /// - [`FinalizeDurability::Durable`]: `on_upload_failure` is **forced to
+    ///   `Fail`** (same forcing as the apply path's fail-closed ledger
+    ///   upload), so a lost governed terminal upload errs regardless of the
+    ///   configured liveness default.
+    /// - [`FinalizeDurability::ConfigDefault`]: the configured mode is honored
+    ///   — `skip` swallows-with-warn inside [`upload_state`], an explicit
+    ///   `fail` propagates.
+    ///
+    /// Callers position this AFTER the run's terminal state writes so the run
+    /// record / custody rows / idempotency stamp ride the upload.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the upload failure per the durability policy above. The
+    /// session counts as consumed either way (no Drop tripwire).
+    pub async fn finalize(mut self) -> Result<(), StateSyncError> {
+        self.stop_periodic().await;
+        // Deliberately consumed even when the upload below fails: the caller
+        // made the terminal decision and handles the Err; the tripwire exists
+        // for *forgotten* sessions.
+        self.finalized = true;
+        if let Some(reason) = self.suppress_reason {
+            info!(
+                reason,
+                outcome = "suppressed",
+                "skipping end-of-run state upload"
+            );
+            return Ok(());
+        }
+        match self.durability {
+            FinalizeDurability::Durable => {
+                let durable_cfg = StateConfig {
+                    on_upload_failure: StateUploadFailureMode::Fail,
+                    ..self.cfg.clone()
+                };
+                upload_state(&durable_cfg, &self.state_path).await
+            }
+            FinalizeDurability::ConfigDefault => upload_state(&self.cfg, &self.state_path).await,
+        }
+    }
+
+    /// Deliberate no-upload consumption for error/interrupted exits: stops
+    /// (aborts + joins) the periodic uploader and disarms the Drop tripwire
+    /// without touching the remote. Error paths never uploaded — the run's
+    /// terminal state writes did not happen, so there is nothing durable to
+    /// persist.
+    pub async fn abandon(mut self, reason: &str) {
+        self.stop_periodic().await;
+        self.finalized = true;
+        debug!(
+            reason,
+            "remote-state session abandoned without a terminal upload"
+        );
+    }
+}
+
+impl Drop for RemoteStateSession {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        // Resource net first (the debug_assert below panics in debug builds):
+        // a leaked periodic handle must not outlive the run. Abort only —
+        // `Drop` cannot await a join.
+        if let Some(handle) = self.periodic.take() {
+            handle.abort();
+        }
+        warn!(
+            state_path = %self.state_path.display(),
+            "RemoteStateSession dropped without finalize/abandon — the terminal state upload \
+             was skipped (tripwire; this is a bug in the calling run path)"
+        );
+        debug_assert!(
+            false,
+            "RemoteStateSession dropped without finalize/abandon (state_path: {})",
+            self.state_path.display()
+        );
+    }
+}
+
 /// Downloads state from remote storage to a local file before a run.
 ///
 /// Returns the typed [`StateAuthority`] of the local ledger after the download:
@@ -3136,6 +3477,316 @@ mod tests {
             burned, 1,
             "the rule-decision + verify-custody pair must survive the remote round-trip so the \
              failed apply burns rule 0's budget (finding 3)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // WP-01 PR-B (2a) — RemoteStateSession lifecycle state machine
+    // -----------------------------------------------------------------------
+
+    /// Install a fault-counting in-memory provider (thread-local) and return
+    /// its control handle, so a session test can both arm faults and prove
+    /// call counts (e.g. the Local backend's zero-I/O contract).
+    fn install_counting_provider() -> crate::fault_store::FaultHandle {
+        let (store, faults) = crate::fault_store::FaultingStore::wrap(std::sync::Arc::new(
+            object_store::memory::InMemory::new(),
+        ));
+        test_support::install(ObjectStoreProvider::from_store(store, "s3", "bucket", ""));
+        faults
+    }
+
+    /// Seed a real (empty) redb state file at `path` so the upload path has a
+    /// file to strip/dispatch.
+    fn seed_state_file(path: &Path) {
+        let store = StateStore::open(path).expect("seed session state file");
+        drop(store);
+    }
+
+    fn s3_session_config(on_upload_failure: StateUploadFailureMode) -> StateConfig {
+        StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            on_upload_failure,
+            // No retries: the armed-fault tests assert on the FIRST terminal
+            // attempt, and backoff sleep would only slow the suite down.
+            retry: RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The Local backend acquires as a zero-I/O `Authoritative` no-op — the
+    /// installed fault-counting provider proves not a single object-store call
+    /// is made across the whole acquire→finalize lifecycle.
+    #[tokio::test]
+    async fn session_local_acquire_and_finalize_are_zero_io() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        let mut session = RemoteStateSession::new(
+            &StateConfig::default(),
+            &local,
+            FinalizeDurability::ConfigDefault,
+        );
+        let authority = session.acquire().await.expect("Local acquire");
+        assert_eq!(authority, StateAuthority::Authoritative);
+        assert_eq!(session.authority(), StateAuthority::Authoritative);
+        session.require_synced().expect("Local ledger is usable");
+        session.finalize().await.expect("Local finalize is a no-op");
+        test_support::clear();
+
+        for op in [
+            crate::fault_store::FaultOp::Get,
+            crate::fault_store::FaultOp::Put,
+            crate::fault_store::FaultOp::Head,
+            crate::fault_store::FaultOp::List,
+        ] {
+            assert_eq!(
+                faults.count(op),
+                0,
+                "Local backend must be zero-I/O ({op:?} was called)"
+            );
+        }
+    }
+
+    /// A download failure is recorded — NOT propagated: `acquire` returns
+    /// `Ok(Indeterminate)`, retains the error string, and `require_synced`
+    /// fails closed carrying it. This is the session electing past the
+    /// `download_state` `Err` (the PR-B Indeterminate-as-a-value migration);
+    /// the callee itself still returns `Err`.
+    #[tokio::test]
+    async fn session_acquire_failure_is_ok_indeterminate_and_require_synced_errs() {
+        test_support::clear();
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+        test_support::arm_object_store_exists_fault();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        let mut session = RemoteStateSession::new(
+            &s3_session_config(StateUploadFailureMode::Skip),
+            &local,
+            FinalizeDurability::ConfigDefault,
+        );
+        let authority = session.acquire().await.expect(
+            "a download failure must be recorded as Ok(Indeterminate), never propagated as Err",
+        );
+        assert_eq!(authority, StateAuthority::Indeterminate);
+        let cause = session
+            .last_download_error()
+            .expect("the elected-past download error is retained")
+            .to_string();
+        assert!(
+            cause.contains("injected existence-check failure"),
+            "the retained error must be the transport error verbatim; got: {cause}"
+        );
+        let err = session
+            .require_synced()
+            .expect_err("Indeterminate must fail require_synced");
+        assert!(
+            err.to_string().contains("injected existence-check failure"),
+            "require_synced must carry the stored download error; got: {err}"
+        );
+        session.abandon("test teardown").await;
+        test_support::clear();
+    }
+
+    /// `assume_fresh_start` is the audited operator election: it flips a
+    /// recorded `Indeterminate` to `FreshStart`, after which `require_synced`
+    /// passes and the upload is no longer authority-suppressed.
+    #[tokio::test]
+    async fn session_assume_fresh_start_flips_indeterminate() {
+        test_support::clear();
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+        test_support::arm_object_store_exists_fault();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        let mut session = RemoteStateSession::new(
+            &s3_session_config(StateUploadFailureMode::Skip),
+            &local,
+            FinalizeDurability::ConfigDefault,
+        );
+        assert_eq!(
+            session.acquire().await.unwrap(),
+            StateAuthority::Indeterminate
+        );
+        session.assume_fresh_start();
+        assert_eq!(session.authority(), StateAuthority::FreshStart);
+        session
+            .require_synced()
+            .expect("an elected fresh start is usable");
+        session.abandon("test teardown").await;
+        test_support::clear();
+    }
+
+    /// Double-acquire is the one internal-misuse `Err` — the session is
+    /// one-shot per run.
+    #[tokio::test]
+    async fn session_double_acquire_is_internal_misuse() {
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let mut session = RemoteStateSession::new(
+            &StateConfig::default(),
+            &local,
+            FinalizeDurability::ConfigDefault,
+        );
+        let _ = session.acquire().await.expect("first acquire");
+        let err = session
+            .acquire()
+            .await
+            .expect_err("a second acquire must err (one-shot)");
+        assert!(err.to_string().contains("called twice"), "got: {err}");
+        session.abandon("test teardown").await;
+    }
+
+    /// Dropping a session that was neither finalized nor abandoned trips the
+    /// tripwire (`debug_assert!` — tests run with debug assertions on).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "dropped without finalize/abandon")]
+    fn session_drop_unfinalized_trips_tripwire() {
+        let session = RemoteStateSession::new(
+            &StateConfig::default(),
+            Path::new("/nonexistent/.rocky-state.redb"),
+            FinalizeDurability::ConfigDefault,
+        );
+        drop(session);
+    }
+
+    /// `abandon` disarms the tripwire — a deliberate no-upload consumption
+    /// must not panic on drop.
+    #[tokio::test]
+    async fn session_abandon_disarms_tripwire() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+
+        let mut session = RemoteStateSession::new(
+            &s3_session_config(StateUploadFailureMode::Fail),
+            &local,
+            FinalizeDurability::Durable,
+        );
+        let _ = session.acquire().await.unwrap();
+        session.abandon("error-path exit (test)").await;
+        test_support::clear();
+        assert_eq!(
+            faults.count(crate::fault_store::FaultOp::Put),
+            0,
+            "abandon must never upload"
+        );
+    }
+
+    /// A suppressed finalize performs no upload and returns Ok — even under
+    /// `Durable` (suppression is the deliberate no-clobber election, checked
+    /// before durability).
+    #[tokio::test]
+    async fn session_suppressed_finalize_skips_upload() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+
+        let mut session = RemoteStateSession::new(
+            &s3_session_config(StateUploadFailureMode::Fail),
+            &local,
+            FinalizeDurability::Durable,
+        );
+        let _ = session.acquire().await.unwrap();
+        session.set_suppress_upload("forward-incompat recreate");
+        // First reason wins; a second suppression must not replace it.
+        session.set_suppress_upload("indeterminate download");
+        session
+            .finalize()
+            .await
+            .expect("a suppressed finalize is Ok without uploading");
+        test_support::clear();
+        assert_eq!(
+            faults.count(crate::fault_store::FaultOp::Put),
+            0,
+            "a suppressed finalize must not touch the remote"
+        );
+    }
+
+    /// `Durable` forces `on_upload_failure = Fail`: an armed terminal-Put
+    /// fault errs the finalize even though the config says `skip` (the
+    /// governed fail-closed split). `ConfigDefault` under the same `skip`
+    /// config swallows the same fault (warn + Ok — the liveness contract).
+    #[tokio::test]
+    async fn session_durable_forces_fail_while_config_default_skip_swallows() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        faults.arm(
+            crate::fault_store::FaultOp::Put,
+            crate::fault_store::FaultMode::FailAll,
+        );
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let skip_cfg = s3_session_config(StateUploadFailureMode::Skip);
+
+        // Durable + configured skip ⇒ the forced Fail propagates the Put fault.
+        let mut durable = RemoteStateSession::new(&skip_cfg, &local, FinalizeDurability::Durable);
+        let _ = durable.acquire().await.unwrap();
+        let err = durable
+            .finalize()
+            .await
+            .expect_err("Durable must force on_upload_failure=Fail over the configured skip");
+        assert!(
+            err.to_string().contains("injected fault"),
+            "the propagated error must be the upload failure; got: {err}"
+        );
+
+        // ConfigDefault + configured skip ⇒ the same fault is swallowed (Ok).
+        let mut config_default =
+            RemoteStateSession::new(&skip_cfg, &local, FinalizeDurability::ConfigDefault);
+        let _ = config_default.acquire().await.unwrap();
+        config_default
+            .finalize()
+            .await
+            .expect("ConfigDefault must honor the configured skip (warn-and-Ok)");
+        test_support::clear();
+    }
+
+    /// `stop_periodic` aborts AND joins, and is idempotent; `finalize` stops
+    /// the uploader before its terminal upload.
+    #[tokio::test]
+    async fn session_stop_periodic_is_idempotent_and_finalize_stops_it() {
+        test_support::clear();
+        let faults = install_counting_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+
+        let mut session = RemoteStateSession::new(
+            &s3_session_config(StateUploadFailureMode::Fail),
+            &local,
+            FinalizeDurability::ConfigDefault,
+        );
+        let _ = session.acquire().await.unwrap();
+        // A cadence far beyond the test's lifetime: the loop must never fire,
+        // so the only Put observed below is the terminal finalize upload.
+        session.start_periodic_uploader(Duration::from_secs(3600));
+        // Idempotent no-op while one is running.
+        session.start_periodic_uploader(Duration::from_secs(3600));
+        session.stop_periodic().await;
+        session.stop_periodic().await; // idempotent after stop
+        session.start_periodic_uploader(Duration::from_secs(3600));
+        session
+            .finalize()
+            .await
+            .expect("finalize stops the periodic task and uploads");
+        test_support::clear();
+        assert_eq!(
+            faults.count(crate::fault_store::FaultOp::Put),
+            1,
+            "exactly the terminal upload — the periodic loop must never have fired"
         );
     }
 }
