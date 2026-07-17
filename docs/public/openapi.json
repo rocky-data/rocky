@@ -15555,6 +15555,7 @@
             ],
             "default": {
               "backend": "local",
+              "freeze_marker_writes": false,
               "gcs_bucket": null,
               "gcs_prefix": null,
               "idempotency": {
@@ -16945,6 +16946,11 @@
             ],
             "default": "local",
             "description": "Storage backend: local (default), s3, gcs, valkey, or tiered (valkey + s3 fallback)"
+          },
+          "freeze_marker_writes": {
+            "default": false,
+            "description": "Enable writing durable freeze/unfreeze marker objects (under `<prefix>/freeze/` and `<prefix>/unfreeze/`, beside the remote state file) when `rocky policy freeze` / `unfreeze` run against an object-store backend. Marker reading and enforcement are always on wherever a durable object tier exists; this flag gates only the write side, so a fleet can be upgraded to marker readers everywhere before any marker is written. Default `false`. Requires a backend with a durable object tier (`s3`, `gcs`, or `tiered`).",
+            "type": "boolean"
           },
           "gcs_bucket": {
             "description": "GCS bucket for state persistence",

@@ -92,6 +92,13 @@ pub(crate) struct DriftGovernor {
     /// budget recorded elsewhere is invisible, so auto-apply must refuse
     /// (fail-closed) rather than proceed with no memory of it.
     ledger_authoritative: bool,
+    /// The durable freeze-marker set projected at run entry, OR-ed into the
+    /// dynamic freeze breaker beside the ledger projection — a marker-only
+    /// freeze (its ledger row erased by a concurrent state upload) must refuse
+    /// auto-apply too. This is the run-entry snapshot; per-`govern` refreshes
+    /// would be one LIST per drifted table, so mid-run freezes are instead
+    /// caught by the run's freeze fence at the documented boundaries.
+    marker_freezes: Vec<rocky_core::freeze_marker::ActiveMarkerFreeze>,
 }
 
 impl DriftGovernor {
@@ -113,6 +120,7 @@ impl DriftGovernor {
         run_id: &str,
         model_name: &str,
         ledger_authoritative: bool,
+        marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
     ) -> Option<Self> {
         if !cfg.resilience.auto_apply_additive_drift {
             return None;
@@ -140,6 +148,7 @@ impl DriftGovernor {
                 policy: None,
                 attrs,
                 ledger_authoritative,
+                marker_freezes: marker_freezes.to_vec(),
             });
         };
         let decision = policy::evaluate(
@@ -163,6 +172,7 @@ impl DriftGovernor {
             policy: Some(policy.clone()),
             attrs,
             ledger_authoritative,
+            marker_freezes: marker_freezes.to_vec(),
         })
     }
 
@@ -228,6 +238,7 @@ impl DriftGovernor {
                             PolicyPrincipal::Agent,
                             &self.attrs,
                             &prior,
+                            &self.marker_freezes,
                             chrono::Utc::now(),
                         );
                         (effect, degradation.reason_suffix())
@@ -661,7 +672,7 @@ mod tests {
         // a breaking change ungoverned. Pre-fix, `build` returned `None` and the
         // `.expect` below panics; post-fix it governs and refuses.
         let cfg = cfg_opt_in_no_policy();
-        let gov = DriftGovernor::build(&cfg, "run-x", "wh.raw.orders", true)
+        let gov = DriftGovernor::build(&cfg, "run-x", "wh.raw.orders", true, &[])
             .expect("opt-in on ⇒ a governor must exist even without a [policy] block");
         assert_eq!(
             gov.effect,
@@ -717,8 +728,8 @@ mod tests {
         // grant ⇒ nothing auto-applies) — recording a require-review custody
         // row and never authorising a mutation.
         let cfg = cfg_opt_in_no_policy();
-        let gov =
-            DriftGovernor::build(&cfg, "run-x", "wh.raw.orders", true).expect("governor present");
+        let gov = DriftGovernor::build(&cfg, "run-x", "wh.raw.orders", true, &[])
+            .expect("governor present");
         let (store, _d) = temp_store();
         let state = Arc::new(store);
 
@@ -960,8 +971,8 @@ mod tests {
     #[tokio::test]
     async fn active_freeze_blocks_auto_apply_even_with_a_granting_rule() {
         let cfg = cfg_opt_in_with_policy(granting_policy(&[], None));
-        let gov =
-            DriftGovernor::build(&cfg, "run-fz", "wh.raw.orders", true).expect("governor present");
+        let gov = DriftGovernor::build(&cfg, "run-fz", "wh.raw.orders", true, &[])
+            .expect("governor present");
         assert_eq!(
             gov.effect,
             PolicyEffect::Allow,
@@ -1000,7 +1011,8 @@ mod tests {
     #[tokio::test]
     async fn human_scoped_freeze_does_not_block_agent_auto_apply() {
         let cfg = cfg_opt_in_with_policy(granting_policy(&[], None));
-        let gov = DriftGovernor::build(&cfg, "run-hfz", "wh.raw.orders", true).expect("governor");
+        let gov =
+            DriftGovernor::build(&cfg, "run-hfz", "wh.raw.orders", true, &[]).expect("governor");
         let (store, _d) = temp_store();
         store
             .record_policy_decision(&freeze_record(PolicyPrincipal::Human, "any"))
@@ -1026,7 +1038,8 @@ mod tests {
             window: "7d".to_string(),
         };
         let cfg = cfg_opt_in_with_policy(granting_policy(&["row_count"], Some(budget)));
-        let gov = DriftGovernor::build(&cfg, "run-b2", "wh.raw.orders", true).expect("governor");
+        let gov =
+            DriftGovernor::build(&cfg, "run-b2", "wh.raw.orders", true, &[]).expect("governor");
         assert_eq!(gov.effect, PolicyEffect::Allow);
 
         let (store, _d) = temp_store();
@@ -1076,7 +1089,8 @@ mod tests {
     async fn auto_heal_verify_failure_burns_the_granting_rules_budget() {
         let policy = granting_policy(&["row_count"], None);
         let cfg = cfg_opt_in_with_policy(policy.clone());
-        let gov = DriftGovernor::build(&cfg, "run-burn", "wh.raw.orders", true).expect("governor");
+        let gov =
+            DriftGovernor::build(&cfg, "run-burn", "wh.raw.orders", true, &[]).expect("governor");
 
         let (store, _d) = temp_store();
         let state = Arc::new(store);
@@ -1145,6 +1159,7 @@ mod tests {
             "run-na",
             "wh.raw.orders",
             /* authoritative */ false,
+            &[],
         )
         .expect("governor");
         let (store, _d) = temp_store();
@@ -1162,7 +1177,8 @@ mod tests {
         );
         // Sanity: the SAME governor with an authoritative ledger applies — proves
         // the refusal is authority-driven, not policy-driven (non-vacuous).
-        let gov_ok = DriftGovernor::build(&cfg, "run-ok", "wh.raw.orders", true).expect("governor");
+        let gov_ok =
+            DriftGovernor::build(&cfg, "run-ok", "wh.raw.orders", true, &[]).expect("governor");
         let (store2, _d2) = temp_store();
         let d2 = gov_ok
             .govern(&additive_add_drift(), "wh.raw.orders", &Arc::new(store2))
@@ -1190,8 +1206,9 @@ mod tests {
         // false: authority alone decides.
         let ledger_authoritative = authority.is_usable();
         assert!(!ledger_authoritative);
-        let gov_dl = DriftGovernor::build(&cfg, "run-dl", "wh.raw.orders", ledger_authoritative)
-            .expect("governor");
+        let gov_dl =
+            DriftGovernor::build(&cfg, "run-dl", "wh.raw.orders", ledger_authoritative, &[])
+                .expect("governor");
         let (store3, _d3) = temp_store();
         let d3 = gov_dl
             .govern(&additive_add_drift(), "wh.raw.orders", &Arc::new(store3))
@@ -1215,7 +1232,8 @@ mod tests {
     #[tokio::test]
     async fn freeze_plus_non_additive_records_deny_not_require_review() {
         let cfg = cfg_opt_in_with_policy(granting_policy(&[], None));
-        let gov = DriftGovernor::build(&cfg, "run-d6", "wh.raw.orders", true).expect("governor");
+        let gov =
+            DriftGovernor::build(&cfg, "run-d6", "wh.raw.orders", true, &[]).expect("governor");
         let (store, _d) = temp_store();
         store
             .record_policy_decision(&freeze_record(PolicyPrincipal::Agent, "any"))

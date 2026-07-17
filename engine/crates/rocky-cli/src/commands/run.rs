@@ -160,6 +160,21 @@ pub struct PartialFailure {
     pub run_id: String,
 }
 
+/// Sentinel error signalling that `rocky run` completed its terminal state
+/// writes with no successful materialization (`RunStatus::Failure`). The
+/// message keeps the generic exit-1 contract (no `main.rs` mapping); the
+/// TYPE exists so a dispatch site that still holds the arm's remote-state
+/// session (the transformation arm) can distinguish this post-terminal
+/// recorded failure — whose persisted `RunRecord` and recorded errors must
+/// ride the terminal upload via `finalize` — from a pre-terminal hard error,
+/// which must abandon the session without uploading.
+#[derive(Debug, thiserror::Error)]
+#[error("{count} model(s) failed (run_id: {run_id}, see the `errors` array in the JSON output)")]
+pub struct RunFailed {
+    pub count: usize,
+    pub run_id: String,
+}
+
 /// Map a finalized [`RunOutput`]'s derived status onto the CLI exit-code
 /// contract for the transformation / model-only execution paths.
 ///
@@ -181,10 +196,11 @@ pub(crate) fn run_status_exit_result(output: &RunOutput, run_id: &str) -> Result
             run_id: run_id.to_string(),
         }
         .into()),
-        rocky_core::state::RunStatus::Failure => anyhow::bail!(
-            "{} model(s) failed (run_id: {run_id}, see the `errors` array in the JSON output)",
-            output.tables_failed
-        ),
+        rocky_core::state::RunStatus::Failure => Err(RunFailed {
+            count: output.tables_failed,
+            run_id: run_id.to_string(),
+        }
+        .into()),
         _ => Ok(()),
     }
 }
@@ -1508,6 +1524,17 @@ pub async fn run(
         // enforce, so availability wins there (#1089's no-policy no-abort).
         let governed = exec_fp_gate.is_some();
         let governed_with_policy = governed && rocky_cfg.policy.is_some();
+        // Freeze fence (ADR-CONCURRENCY.md D3 fence granularity): fresh
+        // durable-tier marker LISTs at this arm's boundaries — the
+        // exec-fingerprint choke-point / layer boundaries inside
+        // `execute_models` and the pre-governance-reconcile check below. Keys
+        // on `[policy]` presence, never the governed context. Built BEFORE
+        // the session so a fail-closed build error leaks nothing.
+        let freeze_fence = super::freeze_fence::FreezeFence::build(
+            &loaded.config.state,
+            rocky_cfg.policy.is_some(),
+            governed_ctx.map(|c| c.principal),
+        )?;
         let mut model_session = rocky_core::state_sync::RemoteStateSession::new(
             &loaded.config.state,
             state_path,
@@ -1618,6 +1645,7 @@ pub async fn run(
             rocky_cfg.resilience.clone(),
             super::resilience::retry_policy_allows(rocky_cfg),
             exec_fp_gate.as_ref(),
+            Some(&freeze_fence),
             // Finding #4: the `--model` path reconciles no masks.
             false,
         )
@@ -1640,25 +1668,54 @@ pub async fn run(
             // a soft compile/runtime failure returns `Ok`, so `Ok` alone is
             // not enough to authorize governance/manifest writes.
             Ok(snapshot) if output.tables_failed == failures_before => {
-                // Per-model `[governance.tags]` apply (scoped to the built
-                // model). The model-only path is one of the entry points the
-                // SDK / Dagster drive; without this its tags were silently
-                // dropped. Best-effort; no-op on DuckDB's Noop adapter.
-                // #1093: reads the snapshot `execute_models` captured at the
-                // fingerprint gate, never a fresh disk compile.
-                let governance_adapter =
-                    adapter_registry.governance_adapter(&target_adapter_name);
-                apply_model_governance_tags(
-                    &snapshot,
-                    governance_adapter.as_ref(),
-                    Some(target_model),
-                )
-                .await;
-                // Write the recipe-identity attestation into the built table's
-                // warehouse metadata (Databricks Delta TBLPROPERTIES; no-op
-                // elsewhere). Reads the triple off the materialization; never
-                // recomputes it.
-                write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
+                // Pre-reconcile freeze fence (fresh LIST): a freeze landing
+                // after the model built must withhold the governance
+                // reconcile, recorded as a failure so the terminal path
+                // (persist + session finalize) still runs on the committed
+                // build.
+                if let Some(msg) = freeze_fence
+                    .check_withhold(
+                        // Only the EXECUTING model — the captured snapshot
+                        // carries every COMPILED model, so a freeze on an
+                        // unselected model must not withhold this `--model`
+                        // run's reconcile (the reconcile itself is scoped to
+                        // `target_model` below).
+                        snapshot
+                            .models
+                            .iter()
+                            .map(|m| m.name.as_str())
+                            .filter(|name| *name == target_model),
+                    )
+                    .await
+                {
+                    output.tables_failed += 1;
+                    output.errors.push(crate::output::TableErrorOutput {
+                        asset_key: vec!["<freeze>".to_string()],
+                        error: msg,
+                        failure_kind: crate::output::FailureKind::Unknown,
+                        cooldown_seconds: None,
+                    });
+                } else {
+                    // Per-model `[governance.tags]` apply (scoped to the built
+                    // model). The model-only path is one of the entry points the
+                    // SDK / Dagster drive; without this its tags were silently
+                    // dropped. Best-effort; no-op on DuckDB's Noop adapter.
+                    // #1093: reads the snapshot `execute_models` captured at the
+                    // fingerprint gate, never a fresh disk compile.
+                    let governance_adapter =
+                        adapter_registry.governance_adapter(&target_adapter_name);
+                    apply_model_governance_tags(
+                        &snapshot,
+                        governance_adapter.as_ref(),
+                        Some(target_model),
+                    )
+                    .await;
+                    // Write the recipe-identity attestation into the built table's
+                    // warehouse metadata (Databricks Delta TBLPROPERTIES; no-op
+                    // elsewhere). Reads the triple off the materialization; never
+                    // recomputes it.
+                    write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
+                }
             }
             // Finding #1: a SOFT model failure (`Ok` but a new failure was
             // recorded) — skip governance/manifest, fall through to the failure
@@ -1840,7 +1897,19 @@ pub async fn run(
             // `expects_models` fail-closed bail — neither opens a store.
             skip_end_of_run_sweep = tx_noop;
             let mut tx_session = None;
+            let mut tx_freeze_fence = None;
             if !tx_noop {
+                // Freeze fence (ADR-CONCURRENCY.md D3): fresh marker LISTs at
+                // this arm's boundaries — layer boundaries inside
+                // `execute_models` plus its pre-reconcile check. Built BEFORE
+                // the session so a fail-closed build error leaks nothing; a
+                // no-op run (no models dir) mutates nothing and needs no
+                // fence.
+                tx_freeze_fence = Some(super::freeze_fence::FreezeFence::build(
+                    &loaded.config.state,
+                    rocky_cfg.policy.is_some(),
+                    governed_ctx.map(|c| c.principal),
+                )?);
                 let mut session = rocky_core::state_sync::RemoteStateSession::new(
                     &loaded.config.state,
                     state_path,
@@ -1920,6 +1989,7 @@ pub async fn run(
                 // values (or inline defaults) at compile time.
                 run_vars,
                 exec_fp_gate.as_ref(),
+                tx_freeze_fence.as_ref(),
                 // Finding #2 (missing-dir): fail closed at the transformation
                 // executor when a governed plan reviewed a non-empty model set but
                 // its models directory is gone. `false` for a bare run.
@@ -1943,12 +2013,30 @@ pub async fn run(
                     return Ok(());
                 }
                 Err(e) => {
-                    // Error exits never uploaded; the `?` this replaces would
-                    // have leaked the session past this arm's return.
+                    // A typed run-status failure (`RunFailed` / the
+                    // `PartialFailure` sentinel) means `run_transformation`
+                    // completed its terminal state writes — the recorded
+                    // errors and the `RunRecord` are already persisted — so
+                    // the session must FINALIZE: the Failure record and any
+                    // committed models' state ride the terminal upload. A
+                    // freeze-fence withhold or a failed model is a partial
+                    // failure, never state loss (docs/adr/ADR-CONCURRENCY.md
+                    // D3); abandoning here stranded the persisted record
+                    // locally, invisible to every other pod. Every other
+                    // error is a pre-terminal hard exit: abandon, never
+                    // upload (the `?` this replaces would have leaked the
+                    // session past this arm's return).
                     if let Some(session) = tx_session {
-                        session
-                            .abandon("transformation exited before terminal state writes")
-                            .await;
+                        if e.is::<RunFailed>() || e.is::<PartialFailure>() {
+                            session.finalize().await.context(
+                                "the run's recorded failure state could not be persisted to \
+                                 the remote [state] backend",
+                            )?;
+                        } else {
+                            session
+                                .abandon("transformation exited before terminal state writes")
+                                .await;
+                        }
                     }
                     return Err(e);
                 }
@@ -2108,6 +2196,23 @@ pub async fn run(
             authority
         }
     };
+
+    // Freeze fence (ADR-CONCURRENCY.md D3 fence granularity): fresh
+    // durable-tier marker LISTs at this run's boundaries — before the
+    // replication fan-out, at each execution-layer boundary inside
+    // `execute_models`, and before the post-run governance reconcile. The
+    // entry snapshot below (ONE LIST) additionally feeds the seams that
+    // consume a projection: the in-run replication gate and the drift
+    // auto-apply governor. Keys on `[policy]` presence, never the governed
+    // context; entry failures are fail-closed under a `[policy]` plane (the
+    // `?` routes to the outer session-abandon wrapper — nothing has executed
+    // yet, so nothing is stranded).
+    let freeze_fence = super::freeze_fence::FreezeFence::build(
+        &loaded.config.state,
+        rocky_cfg.policy.is_some(),
+        governed_ctx.map(|c| c.principal),
+    )?;
+    let entry_marker_freezes = freeze_fence.active_snapshot().await?;
 
     // Build adapter registry and resolve adapters
     let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
@@ -2275,7 +2380,15 @@ pub async fn run(
         // Finding 1: thread `run`'s single `rocky_cfg` snapshot into the in-run
         // replication gate so it evaluates `[policy]` / models-dir from the config
         // `run` executed against, not a reload a mid-run swap could redirect.
-        ctx.gate_replication_targets(&replication_targets, &state_store, rocky_cfg)?;
+        // `entry_marker_freezes` is the run-entry durable freeze-marker
+        // projection (ONE LIST, taken above) — a marker-only freeze must deny
+        // here too; mid-run freezes are the fence's job.
+        ctx.gate_replication_targets(
+            &replication_targets,
+            &state_store,
+            rocky_cfg,
+            &entry_marker_freezes,
+        )?;
     }
 
     // --- Sequential: catalog/schema setup + table collection ---
@@ -2779,6 +2892,9 @@ pub async fn run(
                         &run_id,
                         &table.name,
                         ledger_authoritative,
+                        // The run-entry durable freeze-marker projection — a
+                        // marker-only freeze must refuse auto-apply too.
+                        &entry_marker_freezes,
                     ),
                 });
             }
@@ -3114,8 +3230,31 @@ pub async fn run(
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
     let mut interrupted = false;
 
+    // Freeze fence — ONE fresh LIST bounding the gate-to-copy window (the
+    // replication fan-out has no layer boundaries, so this is the documented
+    // recheck for it; no in-fan-out rechecks — the pre-reconcile fence covers
+    // the tail). On a hit (or a fail-closed LIST failure) the copy tasks are
+    // withheld rather than spawned, recorded as a failure so the normal
+    // drain/terminal path (stop-periodic, persist run record, session
+    // finalize) still runs over the committed setup phase.
+    let freeze_withheld = freeze_fence
+        .check_withhold(tables_to_process.iter().map(|t| t.table_name.as_str()))
+        .await;
+    if let Some(msg) = &freeze_withheld {
+        table_errors.push(TableError {
+            asset_key: vec!["<freeze>".to_string()],
+            error: format!(
+                "{msg} — {} replication table task(s) withheld",
+                tables_to_process.len()
+            ),
+            task_index: None,
+            failure_kind: crate::output::FailureKind::Unknown,
+            cooldown_seconds: None,
+        });
+    }
+
     for (idx, task) in tables_to_process.iter().enumerate() {
-        if interrupted {
+        if interrupted || freeze_withheld.is_some() {
             break;
         }
 
@@ -4438,6 +4577,7 @@ pub async fn run(
                     rocky_cfg.resilience.clone(),
                     super::resilience::retry_policy_allows(rocky_cfg),
                     exec_fp_gate.as_ref(),
+                    Some(&freeze_fence),
                     // Finding #4: THE mask-reconciling path — bind the mask.
                     true,
                 )
@@ -4454,7 +4594,7 @@ pub async fn run(
             // governance to the warehouse *despite the gate detecting the change*.
             // On any failure we record it and SKIP all post-model governance
             // below, falling through to the failure payload + non-zero exit.
-            let exec_ok = model_phase_ok(&exec_result, failures_before, output.tables_failed);
+            let mut exec_ok = model_phase_ok(&exec_result, failures_before, output.tables_failed);
             model_phase_clean = exec_ok;
             let governance_snapshot = match exec_result {
                 // #1093: keep the gated snapshot for the reconcile below.
@@ -4482,6 +4622,28 @@ pub async fn run(
                     None
                 }
             };
+
+            // Pre-reconcile freeze fence (fresh LIST): a freeze landing after
+            // the final layer must withhold the mask/classification,
+            // role-graph, and recipe-manifest reconciles below, while the
+            // terminal writes + session finalize run unchanged (recorded
+            // failure, never an `Err` — see the fence's withhold contract).
+            if exec_ok
+                && let Some(snapshot) = &governance_snapshot
+                && let Some(msg) = freeze_fence
+                    .check_withhold(snapshot.models.iter().map(|m| m.name.as_str()))
+                    .await
+            {
+                exec_ok = false;
+                model_phase_clean = false;
+                table_errors.push(TableError {
+                    asset_key: vec!["<freeze>".to_string()],
+                    error: msg,
+                    task_index: None,
+                    failure_kind: crate::output::FailureKind::Unknown,
+                    cooldown_seconds: None,
+                });
+            }
 
             // Governance: column classification + masking reconcile (§1.1 + §1.2).
             // Walks the model set after a successful DAG run and applies
@@ -5489,6 +5651,10 @@ pub(crate) async fn execute_backfill_set(
     partition_opts: &PartitionRunOptions,
     // Governed-apply TOCTOU gate (E) — `Some` for an agent backfill apply.
     exec_fp_gate: Option<&crate::commands::apply::ExecFingerprintGate>,
+    // Mid-run freeze fence, built by the caller from the same verified config
+    // snapshot — threaded like `exec_fp_gate` (see the `execute_models`
+    // parameter docs for the withhold contract).
+    freeze_fence: Option<&super::freeze_fence::FreezeFence>,
     output_json: bool,
 ) -> Result<()> {
     // The whole body runs inside a captured block so EVERY exit — the early
@@ -5605,6 +5771,7 @@ pub(crate) async fn execute_backfill_set(
             rocky_cfg.resilience.clone(),
             super::resilience::retry_policy_allows(rocky_cfg),
             exec_fp_gate,
+            freeze_fence,
             // Finding #4: a backfill reconciles only tags, not masks.
             false,
         )
@@ -5613,23 +5780,58 @@ pub(crate) async fn execute_backfill_set(
         match exec_result {
             // Finding #1: only when the model phase is CLEAN (no new soft failures).
             Ok(snapshot) if output.tables_failed == failures_before => {
-                // Re-apply each rebuilt model's `[governance.tags]`, scoped to the
-                // closure so unrelated models are untouched.
-                // #1093: every iteration reuses the ONE snapshot captured at
-                // the fingerprint gate inside `execute_models` — the old
-                // signature fresh-compiled the whole project from disk once
-                // PER model in the closure (N recompiles), and each of those
-                // compiles could pick up a post-execution sidecar edit.
-                let governance_adapter = adapter_registry.governance_adapter(&target_adapter_name);
-                for model in model_set {
-                    apply_model_governance_tags(
-                        &snapshot,
-                        governance_adapter.as_ref(),
-                        Some(model.as_str()),
-                    )
-                    .await;
+                // Pre-reconcile freeze fence (fresh LIST): a freeze landing
+                // after the rebuild must withhold the governance reconcile,
+                // recorded so the ALWAYS-finalize below still uploads the
+                // committed rebuild state.
+                let fence_withhold = match freeze_fence {
+                    Some(fence) => {
+                        fence
+                            .check_withhold(
+                                // Only the EXECUTING backfill closure — the
+                                // captured snapshot carries every COMPILED
+                                // model, so a freeze on a model outside this
+                                // backfill's `model_set` must not withhold its
+                                // reconcile (the reconcile below iterates
+                                // exactly `model_set`).
+                                snapshot
+                                    .models
+                                    .iter()
+                                    .map(|m| m.name.as_str())
+                                    .filter(|name| model_set.contains(*name)),
+                            )
+                            .await
+                    }
+                    None => None,
+                };
+                if let Some(msg) = fence_withhold {
+                    output.tables_failed += 1;
+                    output.errors.push(crate::output::TableErrorOutput {
+                        asset_key: vec!["<freeze>".to_string()],
+                        error: msg,
+                        failure_kind: crate::output::FailureKind::Unknown,
+                        cooldown_seconds: None,
+                    });
+                } else {
+                    // Re-apply each rebuilt model's `[governance.tags]`, scoped to the
+                    // closure so unrelated models are untouched.
+                    // #1093: every iteration reuses the ONE snapshot captured at
+                    // the fingerprint gate inside `execute_models` — the old
+                    // signature fresh-compiled the whole project from disk once
+                    // PER model in the closure (N recompiles), and each of those
+                    // compiles could pick up a post-execution sidecar edit.
+                    let governance_adapter =
+                        adapter_registry.governance_adapter(&target_adapter_name);
+                    for model in model_set {
+                        apply_model_governance_tags(
+                            &snapshot,
+                            governance_adapter.as_ref(),
+                            Some(model.as_str()),
+                        )
+                        .await;
+                    }
+                    write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
                 }
-                write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
             }
             // Soft model failure — skip governance/manifest, fall through.
             Ok(_) => {}
@@ -5965,6 +6167,15 @@ pub(crate) async fn execute_models(
     // EXACT set about to execute and refuses (fail-closed) on mismatch —
     // checked == executed. `None` for bare `rocky run` and human applies.
     exec_fp_gate: Option<&crate::commands::apply::ExecFingerprintGate>,
+    // Mid-run freeze fence (ADR-CONCURRENCY.md D3 fence granularity): a fresh
+    // durable freeze-marker LIST at the exec-fingerprint choke-point and at
+    // each execution-layer boundary. On a hit (or a fail-closed LIST failure)
+    // the remaining layers are withheld as a RECORDED failure and this
+    // function returns `Ok` — never `Err` — so already-committed layers'
+    // state flows to the caller's terminal persist + session finalize instead
+    // of being abandoned. `None` on the inert paths (`rocky local` / watch /
+    // tests), which build no fence.
+    freeze_fence: Option<&super::freeze_fence::FreezeFence>,
     // Finding #4: `true` ONLY at the full replication `--all` call site, the sole
     // path that reconciles masks post-model. On every other path (model-only,
     // backfill, the transformation route) masking is NOT reconciled, so the mask
@@ -6085,6 +6296,59 @@ pub(crate) async fn execute_models(
     // `rocky run` loads exactly once, as before — byte-identical.
     let surrogate_keys = rocky_core::models::load_surrogate_keys_from_dir(models_dir)
         .context("invalid surrogate_key configuration")?;
+
+    // Freeze fence at the exec-fingerprint choke-point (governed paths): a
+    // freeze landing between the entry gate's LIST and this execution must
+    // withhold it before any model runs. The governance snapshot is not yet
+    // captured here, so a withhold records the failure and returns the
+    // default (empty) snapshot — mirroring the compile-failure exit above.
+    // Models that failed to compile are excluded from execution (the
+    // `compile_failed_models` set is built just below, after this
+    // choke-point), so a freeze on one must not withhold the run's valid
+    // models here either. Derived locally because that set does not exist yet.
+    let exec_compile_failed: std::collections::BTreeSet<&str> = if compile_result.has_errors {
+        compile_result
+            .diagnostics
+            .iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.model.as_str())
+            .collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    if let Some(gate) = exec_fp_gate
+        && let Some(fence) = freeze_fence
+        && let Some(msg) = fence
+            .check_withhold(
+                // Only the EXECUTING models — the same `model_name_filter` /
+                // `model_set` / compile-failure narrowing the layer loop
+                // applies below — so a freeze on a model this run won't build
+                // (unselected, or failed to compile) never withholds the
+                // models it does build.
+                compile_result
+                    .project
+                    .models
+                    .iter()
+                    .map(|m| m.config.name.as_str())
+                    .filter(|name| model_name_filter.is_none_or(|target| target == *name))
+                    .filter(|name| model_set.is_none_or(|set| set.contains(*name)))
+                    .filter(|name| !exec_compile_failed.contains(name)),
+            )
+            .await
+    {
+        warn!(
+            plan_id = gate.plan_id.as_str(),
+            "freeze fence hit before execution"
+        );
+        output.tables_failed += 1;
+        output.errors.push(crate::output::TableErrorOutput {
+            asset_key: vec!["<freeze>".to_string()],
+            error: msg,
+            failure_kind: crate::output::FailureKind::Unknown,
+            cooldown_seconds: None,
+        });
+        return Ok(GovernanceSnapshot::default());
+    }
 
     // ‼️ Governed-apply TOCTOU gate (E) — the single execution choke-point. The
     // fingerprint is recomputed over the EXACT compiled set about to execute
@@ -6446,6 +6710,44 @@ pub(crate) async fn execute_models(
     };
 
     for layer in execution_layers {
+        // Freeze fence — one fresh LIST per execution-layer boundary
+        // (ADR-CONCURRENCY.md D3 fence granularity): a freeze landing mid-run
+        // withholds this and all remaining layers fail-closed. The `Ok`
+        // return is load-bearing: it flows to the caller's terminal persist +
+        // session finalize, so already-committed layers' state is uploaded —
+        // partial failure, never state loss (an `Err` would route to
+        // `session.abandon`). A fail-closed LIST failure records the same
+        // withhold.
+        if let Some(fence) = freeze_fence
+            && let Some(msg) = fence
+                .check_withhold(
+                    // Only this layer's SELECTED, COMPILABLE names — the same
+                    // `model_name_filter` / `model_set` / compile-failure
+                    // narrowing the matched set below applies — so a freeze on
+                    // a model this run won't actually build (unselected, or one
+                    // that failed to compile) never withholds the models it
+                    // does build.
+                    layer
+                        .iter()
+                        .filter(|name| {
+                            model_name_filter.is_none_or(|target| target == name.as_str())
+                        })
+                        .filter(|name| model_set.is_none_or(|set| set.contains(name.as_str())))
+                        .filter(|name| !compile_failed_models.contains(name.as_str()))
+                        .map(String::as_str),
+                )
+                .await
+        {
+            output.tables_failed += 1;
+            output.errors.push(crate::output::TableErrorOutput {
+                asset_key: vec!["<freeze>".to_string()],
+                error: msg,
+                failure_kind: crate::output::FailureKind::Unknown,
+                cooldown_seconds: None,
+            });
+            return Ok(governance_snapshot);
+        }
+
         // Collect this layer's matched models (honouring the name filter),
         // tagged with their stable within-layer index so concurrent results
         // can be re-ordered to match serial output exactly.
@@ -13149,6 +13451,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             None, // exec_fp_gate (test)
+            None, // freeze_fence (test)
             false,
         )
         .await;
@@ -13225,6 +13528,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             Some(&gate),
+            None, // freeze_fence (test)
             false,
         )
         .await;
@@ -13261,6 +13565,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             Some(&gate),
+            None, // freeze_fence (test)
             false,
         )
         .await
@@ -13447,6 +13752,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             Some(&gate),
+            None, // freeze_fence (test)
             reconciles_masks,
         )
         .await
@@ -13686,6 +13992,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             Some(&gate),
+            None, // freeze_fence (test)
             false,
         )
         .await
@@ -13772,6 +14079,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             Some(&gate),
+            None, // freeze_fence (test)
             false,
         )
         .await
@@ -13827,6 +14135,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             Some(&gate),
+            None, // freeze_fence (test)
             false,
         )
         .await
@@ -14014,6 +14323,7 @@ merge_keys = ["id"]
             resilience,
             true,
             None, // exec_fp_gate (test)
+            None, // freeze_fence (test)
             false,
         )
         .await;
@@ -14057,6 +14367,7 @@ merge_keys = ["id"]
             resilience,
             true,
             None, // exec_fp_gate (test)
+            None, // freeze_fence (test)
             false,
         )
         .await;
@@ -14106,6 +14417,7 @@ merge_keys = ["id"]
             resilience,
             true,
             None, // exec_fp_gate (test)
+            None, // freeze_fence (test)
             false,
         )
         .await;
@@ -15185,6 +15497,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             None, // exec_fp_gate (test)
+            None, // freeze_fence (test)
             false,
         )
         .await
@@ -15292,6 +15605,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             None, // exec_fp_gate (test)
+            None, // freeze_fence (test)
             false,
         )
         .await
@@ -15414,6 +15728,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             None, // exec_fp_gate (test)
+            None, // freeze_fence (test)
             false,
         )
         .await;
@@ -15697,6 +16012,7 @@ merge_keys = ["id"]
                 rocky_core::config::ResilienceConfig::default(),
                 true,
                 None, // exec_fp_gate (test)
+                None, // freeze_fence (test)
                 false,
             )
             .await
@@ -15823,6 +16139,7 @@ merge_keys = ["id"]
             rocky_core::config::ResilienceConfig::default(),
             true,
             None, // exec_fp_gate (test)
+            None, // freeze_fence (test)
             false,
         )
         .await
@@ -16799,6 +17116,7 @@ merge_keys = ["id"]
                 rocky_core::config::ResilienceConfig::default(),
                 true,
                 None, // exec_fp_gate (test)
+                None, // freeze_fence (test)
                 false,
             )
             .await

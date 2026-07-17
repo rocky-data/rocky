@@ -262,6 +262,10 @@ async fn run_apply_run_plan(
     // the gate reads it, so a cross-pod freeze is enforced (fail-closed). Skipped
     // when the gate won't read the ledger (no policy / empty touched — finding 8).
     sync_remote_ledger_before_gate(&loaded.config, state_path, &touched).await?;
+    // The durable freeze-marker LIST, hoisted beside the ledger sync — a
+    // marker-only freeze (its ledger row erased by a concurrent state upload)
+    // must still deny at this gate. Same guard, fail-closed on transport error.
+    let marker_freezes = marker_freezes_before_gate(&loaded.config, &touched).await?;
     let gate = evaluate_apply_policy_with_policy(
         loaded.config.policy.as_ref(),
         plan_id,
@@ -269,6 +273,7 @@ async fn run_apply_run_plan(
         &touched,
         models_dir,
         state_path,
+        &marker_freezes,
     );
     apply_policy_gate(root, plan_id, gate)?;
 
@@ -889,6 +894,79 @@ fn sync_remote_ledger_before_gate_blocking(
     Ok(())
 }
 
+/// Resolve the durable-tier object-store provider for a governed gate's
+/// freeze-marker LIST, or `None` when the gate will not read markers.
+///
+/// Guarded exactly like [`remote_state_backend_for_gate`]: an empty `touched`
+/// set or a missing `[policy]` block means the gate reads nothing, so no LIST
+/// is performed. A backend with no durable object tier (Local, Valkey-only)
+/// also yields `None` — a documented limitation; ledger-row enforcement is
+/// unchanged there. FAIL-CLOSED: with a `[policy]` plane configured, a
+/// provider-resolution failure (e.g. a missing bucket) is an `Err` — an
+/// unresolvable durable tier means an active freeze marker cannot be seen.
+fn marker_gate_provider(
+    cfg: &rocky_core::config::RockyConfig,
+    touched: &BTreeMap<String, PolicyCapability>,
+) -> Result<Option<rocky_core::object_store::ObjectStoreProvider>> {
+    if touched.is_empty() || cfg.policy.is_none() {
+        return Ok(None);
+    }
+    rocky_core::state_sync::durable_tier_provider(&cfg.state).with_context(|| {
+        "refusing a governed mutation: the durable `[state]` tier for freeze markers could not \
+         be resolved, so an active freeze marker cannot be seen (fail-closed)"
+    })
+}
+
+/// Async: durable-tier freeze-marker LIST + projection for a governed gate.
+///
+/// Returns the projected active marker set the caller threads into the
+/// `evaluate_apply_policy*` stack (which is synchronous — the async LIST
+/// hoists to each async command entry, beside the pre-gate ledger sync).
+/// Guarded like [`sync_remote_ledger_before_gate`]: empty `touched` or no
+/// `[policy]` ⇒ the gate reads nothing ⇒ `Ok(vec![])`; no durable tier
+/// (Local / Valkey-only) ⇒ `Ok(vec![])` — documented limitation. FAIL-CLOSED:
+/// with a `[policy]` plane configured and a durable tier present, a LIST/GET
+/// transport failure is an `Err` — an error is never an empty active set.
+///
+/// `pub` (not `pub(crate)`) because the MCP `propose`/draft gates hoist the
+/// same LIST out-of-crate, mirroring `evaluate_apply_policy`'s visibility.
+pub async fn marker_freezes_before_gate(
+    cfg: &rocky_core::config::RockyConfig,
+    touched: &BTreeMap<String, PolicyCapability>,
+) -> Result<Vec<rocky_core::freeze_marker::ActiveMarkerFreeze>> {
+    let Some(provider) = marker_gate_provider(cfg, touched)? else {
+        return Ok(Vec::new());
+    };
+    rocky_core::freeze_marker::load_active_marker_freezes(&provider)
+        .await
+        .with_context(marker_list_fail_closed_context)
+}
+
+/// Blocking sibling of [`marker_freezes_before_gate`] for the SYNC promote
+/// gate ([`gate_promote_plan`]) — drives the same LIST on a dedicated
+/// state-sync runtime (mirrors [`sync_remote_ledger_before_gate_blocking`]).
+fn marker_freezes_before_gate_blocking(
+    cfg: &rocky_core::config::RockyConfig,
+    touched: &BTreeMap<String, PolicyCapability>,
+) -> Result<Vec<rocky_core::freeze_marker::ActiveMarkerFreeze>> {
+    let Some(provider) = marker_gate_provider(cfg, touched)? else {
+        return Ok(Vec::new());
+    };
+    crate::commands::policy::block_on_state_sync(async {
+        rocky_core::freeze_marker::load_active_marker_freezes(&provider)
+            .await
+            .map_err(rocky_core::state_sync::StateSyncError::ObjectStore)
+    })
+    .with_context(marker_list_fail_closed_context)
+}
+
+/// The shared fail-closed context for a marker LIST failure at a governed
+/// gate. Mirrors the governed download-fail posture in `run`.
+fn marker_list_fail_closed_context() -> &'static str {
+    "refusing a governed mutation: durable freeze-marker listing failed, so an active freeze \
+     marker cannot be seen (fail-closed). Retry once the `[state]` backend is reachable."
+}
+
 /// Download the remote `[state]` ledger UNCONDITIONALLY for a remote backend
 /// (fail-closed), regardless of `[policy]` presence.
 ///
@@ -979,6 +1057,7 @@ pub fn evaluate_apply_policy(
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     state_path: &Path,
+    marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
 ) -> PolicyGate {
     // Load the config here for callers that don't already hold a snapshot (gc,
     // the MCP propose gate, tests). Governed apply/restore/promote paths call
@@ -996,6 +1075,7 @@ pub fn evaluate_apply_policy(
         touched,
         models_dir,
         state_path,
+        marker_freezes,
     )
 }
 
@@ -1007,6 +1087,12 @@ pub fn evaluate_apply_policy(
 /// remote-state sync decision AND this evaluation, so a config that gains a
 /// `[policy]` block between the two can't make the guard skip the sync while this
 /// gate then reads stale local decisions (finding A).
+///
+/// `marker_freezes` is the projected durable freeze-marker set the async entry
+/// hoisted via [`marker_freezes_before_gate`] — OR-ed into the freeze breaker
+/// beside the ledger projection so a marker-only freeze (its ledger row erased
+/// by a concurrent state upload) still denies.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_apply_policy_with_policy(
     policy: Option<&rocky_core::config::PolicyConfig>,
     plan_id: &str,
@@ -1014,6 +1100,7 @@ pub fn evaluate_apply_policy_with_policy(
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     state_path: &Path,
+    marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
 ) -> PolicyGate {
     let (policy, attrs_map) = match resolve_policy_and_attrs(policy, touched, models_dir) {
         Ok(pair) => pair,
@@ -1059,6 +1146,7 @@ pub fn evaluate_apply_policy_with_policy(
         touched,
         &attrs_map,
         &prior_decisions,
+        marker_freezes,
         snapshot_unreadable,
         |record| {
             // Durability is critical only when THIS record's WINNING rule uses an
@@ -1176,6 +1264,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
     ledger: &StateStore,
+    marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
 ) -> PolicyGate {
     // Finding 1: takes the SAME `[policy]` snapshot `run` already holds (its L1212
     // `rocky_cfg`), not a reload — the in-run replication gate must evaluate the
@@ -1198,6 +1287,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
         touched,
         &attrs_map,
         &prior_decisions,
+        marker_freezes,
         snapshot_unreadable,
         |record| {
             if let Err(e) = ledger.record_policy_decision(record) {
@@ -1249,6 +1339,11 @@ fn evaluate_apply_policy_core(
     touched: &BTreeMap<String, PolicyCapability>,
     attrs_map: &BTreeMap<String, ModelAttributes>,
     prior_decisions: &[PolicyDecisionRecord],
+    // The projected durable freeze-marker set, hoisted at the async command
+    // entry. OR-ed with the ledger freeze projection inside
+    // `autonomy_degradation` — a marker-only freeze must deny even when the
+    // ledger row was erased by a concurrent whole-blob state upload.
+    marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
     // Fail-closed floor: when the snapshot is genuinely unreadable (a corrupt /
     // forward-incompatible store, or a real cross-process run holding a live
     // redb handle so even the read-only open exhausts its retries), an AGENT
@@ -1287,6 +1382,7 @@ fn evaluate_apply_policy_core(
             principal,
             attrs,
             prior_decisions,
+            marker_freezes,
             now,
         );
         let mut reason = decision.reason;
@@ -1977,6 +2073,7 @@ impl GovernedRunContext<'_> {
         target_names: &BTreeSet<String>,
         ledger: &StateStore,
         cfg: &rocky_core::config::RockyConfig,
+        marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
     ) -> Result<()> {
         if target_names.is_empty() {
             return Ok(());
@@ -1998,6 +2095,7 @@ impl GovernedRunContext<'_> {
             &touched,
             &models_dir,
             ledger,
+            marker_freezes,
         );
         apply_policy_gate(self.root, self.plan_id, gate)?;
 
@@ -2070,6 +2168,9 @@ pub(crate) fn gate_promote_plan(
     // `rocky branch promote --plan`) are covered. Fail-closed, but skipped when
     // the gate won't read the ledger (no policy / empty touched — finding 8).
     sync_remote_ledger_before_gate_blocking(&loaded.config, state_path, &touched)?;
+    // Durable freeze-marker LIST beside the ledger sync — one blocking seam
+    // covers both promote entry points (same guard, fail-closed).
+    let marker_freezes = marker_freezes_before_gate_blocking(&loaded.config, &touched)?;
     let gate = evaluate_apply_policy_with_policy(
         loaded.config.policy.as_ref(),
         plan_id,
@@ -2077,6 +2178,7 @@ pub(crate) fn gate_promote_plan(
         &touched,
         &promote_models_dir,
         state_path,
+        &marker_freezes,
     );
     apply_policy_gate(root, plan_id, gate)?;
     Ok(loaded)
@@ -2435,6 +2537,9 @@ async fn run_apply_ai_authored_plan(
     // the gate reads it, so a cross-pod freeze is enforced (fail-closed). Skipped
     // when the gate won't read the ledger (no policy / empty touched — finding 8).
     sync_remote_ledger_before_gate(&loaded.config, state_path, &touched).await?;
+    // Durable freeze-marker LIST, hoisted beside the ledger sync (same guard,
+    // fail-closed) — see the twin note in `run_apply_run_plan`.
+    let marker_freezes = marker_freezes_before_gate(&loaded.config, &touched).await?;
     let gate = evaluate_apply_policy_with_policy(
         loaded.config.policy.as_ref(),
         plan_id,
@@ -2442,6 +2547,7 @@ async fn run_apply_ai_authored_plan(
         &touched,
         models_dir,
         state_path,
+        &marker_freezes,
     );
     match gate {
         PolicyGate::NotConfigured => {
@@ -2633,6 +2739,23 @@ async fn run_apply_backfill_plan(
         ));
     }
 
+    // Durable freeze-marker LIST for the gate below, hoisted here (the `prep`
+    // closure is synchronous) so a fail-closed refusal abandons the session
+    // like every other pre-execution refusal. An absent config has no
+    // `[policy]` to enforce ⇒ empty set.
+    let marker_freezes = match cfg.as_ref() {
+        Some(loaded) => match marker_freezes_before_gate(&loaded.config, &touched).await {
+            Ok(markers) => markers,
+            Err(e) => {
+                session
+                    .abandon("backfill marker listing failure (fail-closed)")
+                    .await;
+                return Err(e);
+            }
+        },
+        None => Vec::new(),
+    };
+
     // Gate + preparation, captured so EVERY pre-execution refusal (policy
     // deny, malformed plan window, snapshot preflight, routing mismatch,
     // unloadable config) consumes the session before returning — a refused
@@ -2653,6 +2776,7 @@ async fn run_apply_backfill_plan(
             &touched,
             models_dir,
             state_path,
+            &marker_freezes,
         );
         if let PolicyGate::Deny {
             model,
@@ -2759,6 +2883,26 @@ async fn run_apply_backfill_plan(
         }
     };
 
+    // Mid-run freeze fence for the rebuild, built from the SAME verified
+    // config snapshot and threaded alongside `exec_fp_gate`. Fail-closed
+    // build errors abandon the session like the other pre-execution refusals.
+    let freeze_fence = match crate::commands::freeze_fence::FreezeFence::build(
+        &loaded.config.state,
+        loaded.config.policy.is_some(),
+        // The same enforcement principal the backfill gate uses (a backfill is
+        // agent-by-kind even when a human applies it) so the fence withholds
+        // exactly what the gate would deny.
+        Some(plan.enforcement_principal(runtime_principal)),
+    ) {
+        Ok(fence) => fence,
+        Err(e) => {
+            session
+                .abandon("backfill freeze-fence build failure (fail-closed)")
+                .await;
+            return Err(e);
+        }
+    };
+
     // Finding 5: a backfill MUTATES the warehouse + local ledger (run/artifact/
     // provenance rows) as it executes, so a mid-run failure can still have
     // committed state. The session moves into `execute_backfill_set`, whose
@@ -2773,6 +2917,7 @@ async fn run_apply_backfill_plan(
         &set,
         &partition_opts,
         exec_fp_gate.as_ref(),
+        Some(&freeze_fence),
         output_json,
     )
     .await
@@ -3871,6 +4016,7 @@ effect = "deny"
             &touched,
             &models_dir,
             &state,
+            &[],
         );
         assert!(
             matches!(gate, PolicyGate::Deny { .. }),
@@ -3885,6 +4031,7 @@ effect = "deny"
             &touched,
             &models_dir,
             &state,
+            &[],
         );
         assert!(
             matches!(gate_none, PolicyGate::NotConfigured),
@@ -3915,6 +4062,7 @@ effect = "deny"
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
+            &[],
         );
         assert!(matches!(gate, PolicyGate::Deny { .. }), "got {gate:?}");
         Ok(())
@@ -3943,6 +4091,7 @@ effect = "deny"
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
+            &[],
         );
         assert_eq!(gate, PolicyGate::Allow);
         Ok(())
@@ -3961,6 +4110,7 @@ effect = "deny"
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
+            &[],
         );
         assert_eq!(gate, PolicyGate::NotConfigured);
         Ok(())
@@ -3994,6 +4144,7 @@ effect = "deny"
             &BTreeMap::new(),
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
+            &[],
         );
         assert_eq!(
             gate,
@@ -4041,6 +4192,7 @@ effect = "deny"
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
+            &[],
         );
         assert!(
             matches!(gate, PolicyGate::Deny { .. }),
@@ -4077,6 +4229,7 @@ effect = "deny"
             &touched,
             &dir.path().join("models"),
             &state,
+            &[],
         );
         assert!(
             matches!(gate, PolicyGate::Deny { .. }),
@@ -4107,6 +4260,7 @@ effect = "deny"
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
+            &[],
         );
         assert_eq!(gate, PolicyGate::Allow, "a human is never gated in v0");
         Ok(())
@@ -4192,6 +4346,7 @@ effect = "deny"
             &touched,
             &models_dir,
             &dir.path().join("state.redb"),
+            &[],
         );
         assert!(
             matches!(gate, PolicyGate::Deny { .. }),
@@ -4240,6 +4395,7 @@ effect = "deny"
             &touched,
             &models_dir,
             &dir.path().join("state.redb"),
+            &[],
         );
         assert!(
             !matches!(gate, PolicyGate::Deny { .. }),
@@ -4296,6 +4452,7 @@ effect = "allow"
             &touched,
             &dir.path().join("models"),
             &dir.path().join("state.redb"),
+            &[],
         );
         assert!(
             matches!(gate, PolicyGate::Deny { .. }),
@@ -4344,6 +4501,7 @@ effect = "allow"
             &touched,
             &dir.path().join("models"),
             &state,
+            &[],
         );
         FileExt::unlock(&external_lock).ok();
         assert!(
@@ -4391,6 +4549,7 @@ effect = "allow"
             &touched,
             &dir.path().join("models"),
             &state,
+            &[],
         );
         assert!(
             matches!(gate, PolicyGate::Deny { .. }),
@@ -4438,6 +4597,7 @@ effect = "allow"
             &touched,
             &dir.path().join("models"),
             &state,
+            &[],
         );
         assert!(
             matches!(gate, PolicyGate::Deny { .. }),
@@ -4466,6 +4626,7 @@ effect = "allow"
             &touched,
             &dir.path().join("models"),
             &state,
+            &[],
         );
         assert_eq!(gate, PolicyGate::Allow, "a human is never gated in v0");
         Ok(())
@@ -5210,12 +5371,12 @@ effect = "deny"
         let loaded_cfg = rocky_core::config::load_rocky_config(&config)?;
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         let err = ctx
-            .gate_replication_targets(&targets, &ledger, &loaded_cfg)
+            .gate_replication_targets(&targets, &ledger, &loaded_cfg, &[])
             .expect_err("an agent replication under a deny rule must be refused");
         assert!(err.to_string().contains("DENIES"), "got: {err}");
 
         // An empty target set is a no-op (nothing executes).
-        ctx.gate_replication_targets(&BTreeSet::new(), &ledger, &loaded_cfg)
+        ctx.gate_replication_targets(&BTreeSet::new(), &ledger, &loaded_cfg, &[])
             .expect("no targets ⇒ nothing to gate");
         Ok(())
     }
@@ -5259,7 +5420,7 @@ effect = "allow"
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
 
         // Through the held handle → reads fine → allow (no spurious deny).
-        ctx.gate_replication_targets(&targets, &held, &loaded_cfg)
+        ctx.gate_replication_targets(&targets, &held, &loaded_cfg, &[])
             .expect(
                 "the replication gate must read through the held handle and not spuriously deny \
                  under an `allow` rule",
@@ -5279,6 +5440,7 @@ effect = "allow"
             &touched,
             &dir.path().join("models"),
             &state,
+            &[],
         );
         assert!(
             matches!(reopen_gate, PolicyGate::Deny { .. }),
@@ -5309,7 +5471,7 @@ effect = "allow"
         let loaded_cfg =
             rocky_core::config::load_rocky_config(&dir.path().join("rocky.toml")).unwrap();
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
-        ctx.gate_replication_targets(&targets, &ledger, &loaded_cfg)
+        ctx.gate_replication_targets(&targets, &ledger, &loaded_cfg, &[])
             .expect("no [policy] block ⇒ replication gate is a no-op");
         Ok(())
     }
@@ -5348,7 +5510,7 @@ verify_after = ["row_count"]
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
         let err = ctx
-            .gate_replication_targets(&targets, &ledger, &loaded_cfg)
+            .gate_replication_targets(&targets, &ledger, &loaded_cfg, &[])
             .expect_err(
                 "a replication apply under a verify_after rule must be refused (finding 7)",
             );
@@ -5393,6 +5555,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &touched,
             &dir.path().join("models"),
             &state,
+            &[],
         );
         drop(held);
         assert!(
@@ -5450,6 +5613,7 @@ effect = "allow"
             &touched,
             &models,
             &state,
+            &[],
         );
         assert!(
             !matches!(&gate_a, PolicyGate::Deny { reason, .. } if reason.contains("fail-closed")),
@@ -5478,6 +5642,7 @@ autonomy_budget = { failures = 3, window = "7d" }
             &touched,
             &models,
             &state,
+            &[],
         );
         assert!(
             matches!(&gate_b, PolicyGate::Deny { reason, .. } if reason.contains("fail-closed")),

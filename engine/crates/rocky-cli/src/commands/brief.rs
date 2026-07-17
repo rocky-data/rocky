@@ -20,7 +20,7 @@
 //! is the machine surface for a Dagster asset or the governor's own agent.
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -698,16 +698,21 @@ fn build_budget(ceiling: f64, per_run: &[BriefRunCost]) -> BriefBudgetStatus {
 /// Build the autonomy section: rules whose autonomy budget is exhausted right
 /// now (auto-degraded to `require_review`) and policy freezes in force.
 ///
-/// Freezes come from the ledger alone; budget degradations additionally need
-/// the `[policy]` block to know which rules carry a budget and its window. Both
-/// are current-state projections over the full `decisions` slice. Fails closed:
-/// an unreadable config still shows freezes but notes budgets are unavailable.
+/// Freezes come from two sources, merged: the ledger projection and — when the
+/// `[state]` backend has a durable object tier — the durable freeze-marker
+/// set, so reporting cannot disagree with enforcement (a marker-only freeze,
+/// its ledger row erased by a concurrent state upload, still shows here).
+/// Budget degradations additionally need the `[policy]` block to know which
+/// rules carry a budget and its window. All are current-state projections.
+/// Fails closed: an unreadable config still shows ledger freezes but notes
+/// budgets are unavailable, and an unreachable marker tier sets the section
+/// note rather than silently rendering ledger-only.
 fn build_autonomy(
     config_path: &Path,
     decisions: &[PolicyDecisionRecord],
     now: DateTime<Utc>,
 ) -> BriefAutonomySection {
-    let active_freezes: Vec<BriefActiveFreeze> = policy::active_freezes(decisions)
+    let mut active_freezes: Vec<BriefActiveFreeze> = policy::active_freezes(decisions)
         .into_iter()
         .map(|f| BriefActiveFreeze {
             principal: f.principal,
@@ -720,6 +725,41 @@ fn build_autonomy(
     let cfg = load_rocky_config(config_path).ok();
     let mut degraded_rules: Vec<BriefDegradedRule> = Vec::new();
     let mut note: Option<String> = None;
+
+    // Durable freeze-marker merge. Not gated on `[policy]` presence — the
+    // brief is reporting, and `rocky policy freeze` works without a `[policy]`
+    // block. Skipped when there is no durable object tier (Local /
+    // Valkey-only). Driven on the dedicated state-sync runtime so this is
+    // safe from both the sync CLI arm and the async MCP `estate_brief` tool.
+    let marker_note: Option<String> = match cfg.as_ref() {
+        None => None, // config note below already covers the unloadable case
+        Some(cfg) => match rocky_core::state_sync::durable_tier_provider(&cfg.state) {
+            Ok(None) => None,
+            Ok(Some(provider)) => {
+                let listed = crate::commands::policy::block_on_state_sync(async {
+                    rocky_core::freeze_marker::load_active_marker_freezes(&provider)
+                        .await
+                        .map_err(rocky_core::state_sync::StateSyncError::ObjectStore)
+                });
+                match listed {
+                    Ok(markers) => {
+                        merge_marker_freezes(&mut active_freezes, markers);
+                        None
+                    }
+                    // Never a silent all-clear: an unreadable marker tier is
+                    // surfaced as a note while enforcement fails closed.
+                    Err(e) => Some(format!(
+                        "durable freeze markers unreachable ({e}) — marker freezes not shown; \
+                         enforcement fails closed where `[policy]` is configured"
+                    )),
+                }
+            }
+            Err(e) => Some(format!(
+                "durable `[state]` tier unresolvable ({e}) — marker freezes not shown; \
+                 enforcement fails closed where `[policy]` is configured"
+            )),
+        },
+    };
 
     match cfg.as_ref() {
         Some(cfg) => match &cfg.policy {
@@ -753,6 +793,13 @@ fn build_autonomy(
         }
     }
 
+    // Fold the marker-tier note in — it must survive both availability arms
+    // below (an unreadable marker tier is never an unqualified all-clear).
+    let note = match (note, marker_note) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    };
+
     if degraded_rules.is_empty() && active_freezes.is_empty() {
         return BriefAutonomySection {
             availability: SectionAvailability::NoData,
@@ -769,6 +816,44 @@ fn build_autonomy(
         note,
         degraded_rules,
         active_freezes,
+    }
+}
+
+/// Merge the durable freeze-marker projection into the ledger-projected
+/// freeze list — union with dedupe on `(principal, scope)`, keeping the
+/// ledger entry when both exist (a marker-writing freeze records both). A
+/// marker whose `principal` is `None` (unreadable body, conservatively
+/// matching both principals) maps to one entry per principal — display parity
+/// with enforcement. The marker's `freeze:<freeze_id>` citation fills the
+/// `plan_id` slot, distinguishing marker entries from ledger ones
+/// (`freeze:<principal>:<rfc3339>`).
+fn merge_marker_freezes(
+    active: &mut Vec<BriefActiveFreeze>,
+    markers: Vec<rocky_core::freeze_marker::ActiveMarkerFreeze>,
+) {
+    let existing: BTreeSet<(u8, String)> = active
+        .iter()
+        .map(|f| (principal_rank(f.principal), f.scope.clone()))
+        .collect();
+    for marker in markers {
+        let principals = match marker.principal {
+            Some(p) => vec![p],
+            None => vec![PolicyPrincipal::Agent, PolicyPrincipal::Human],
+        };
+        for principal in principals {
+            if existing.contains(&(principal_rank(principal), marker.scope.clone())) {
+                continue;
+            }
+            active.push(BriefActiveFreeze {
+                principal,
+                scope: marker.scope.clone(),
+                frozen_at: marker
+                    .created_at
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_default(),
+                plan_id: format!("freeze:{}", marker.freeze_id),
+            });
+        }
     }
 }
 

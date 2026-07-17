@@ -25,8 +25,10 @@ use rocky_core::config::{
     ConfigError, PolicyCapability, PolicyConfig, PolicyEffect, PolicyPrincipal, StateBackend,
     StateConfig,
 };
+use rocky_core::freeze_marker::{self, FreezeMarker, FreezeMarkerError, UnfreezeMarker};
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::state::{PolicyDecisionRecord, StateStore};
+use rocky_core::state_sync::StateSyncError;
 
 use crate::output::{
     PolicyCheckOutput, PolicyFreezeEntry, PolicyFreezeOutput, PolicyModelAttributes,
@@ -377,6 +379,16 @@ where
     })
 }
 
+/// Map a freeze-marker write error into the state-sync error type
+/// [`block_on_state_sync`] is typed over, preserving the object-store variant
+/// verbatim so transport causes stay legible in the fail-closed context.
+fn marker_error_to_sync(e: FreezeMarkerError) -> StateSyncError {
+    match e {
+        FreezeMarkerError::ObjectStore(inner) => StateSyncError::ObjectStore(inner),
+        other => StateSyncError::Io(std::io::Error::other(other.to_string())),
+    }
+}
+
 /// Execute `rocky policy freeze` — the kill switch.
 ///
 /// Flips every matched `(principal, scope)` to `deny` by recording a **freeze
@@ -402,24 +414,30 @@ where
 /// switch, failing loudly beats appearing to engage and then silently
 /// disengaging.
 ///
-/// KNOWN LIMITATION — no-CAS concurrent overwrite (finding 4): this closes only
-/// the *sequential* between-runs clobber. The remote state object is a
-/// whole-file blob published with a plain last-writer-wins upload and **no
-/// compare-and-swap**, so a concurrent writer — e.g. a `rocky run` whose
-/// start-download completed *before* this freeze — can still overwrite the
-/// freeze on its own end-upload (a cross-pod / concurrent-writer lost update).
-/// This narrows the window, it does NOT make concurrent writes safe. A
-/// **reliable cross-pod kill switch** cannot be built on whole-file
-/// last-writer-wins; it needs one of: an atomic **compare-and-swap** publish
-/// (conditional PUT / `If-Match`), a **separate monotonic freeze object** that a
-/// run-upload can never clobber (a freeze marker written to its own key and only
-/// ever OR-ed into the gate), or **serialization** of writers (a lease/lock).
-/// Tracked as a follow-up; out of scope here.
+/// # Durable freeze markers — the un-erasable enforcement half
+///
+/// The seam-scoped sync above closes only the *sequential* between-runs
+/// clobber: the remote state object is a whole-file blob published
+/// last-writer-wins, so a concurrent `rocky run` whose start-download
+/// preceded this freeze can still erase the ledger row on its own end-upload.
+/// The enforcement truth that survives that is a separate **add-wins marker
+/// set** beside the state file (see [`rocky_core::freeze_marker`]): `freeze`
+/// writes one create-once object `<prefix>/freeze/<freeze_id>.json` per
+/// principal, `unfreeze` writes `<prefix>/unfreeze/<unfreeze_id>.json` naming
+/// the exact `freeze_id`s it lifts, and enforcement projects the
+/// order-independent active set from the durable object tier — which a run's
+/// blob upload can never clobber. Marker **writes** are gated by `[state]
+/// freeze_marker_writes` so a fleet can be upgraded to marker readers
+/// everywhere before the first marker is written; reading and enforcement are
+/// always on wherever a durable object tier exists. The ledger row stays as
+/// the audit trail and the feed for the ledger-based apply gate;
+/// compare-and-swap on the row itself is a separate follow-up.
 pub fn run_policy_freeze(
     config_path: &Path,
     state_path: &Path,
     principal: Option<PolicyPrincipal>,
     scope: Option<String>,
+    reason: Option<String>,
     lift: bool,
     json: bool,
 ) -> Result<()> {
@@ -436,7 +454,7 @@ pub fn run_policy_freeze(
     // freeze binds nothing. Recording it is still useful (it takes effect the
     // moment a `[policy]` block is added), so this is a loud warning — stderr +
     // an output note — not an error; the exit code stays 0.
-    let notes = freeze_enforcement_notes(config_path, lift);
+    let mut notes = freeze_enforcement_notes(config_path, lift);
     for note in &notes {
         eprintln!("warning: {note}");
     }
@@ -464,6 +482,29 @@ pub fn run_policy_freeze(
         }
     };
     let remote_state = !matches!(state_cfg.backend, StateBackend::Local);
+
+    // Durable marker writes (two-phase rollout, write side): resolved up
+    // front so a `freeze_marker_writes` flag pointing at a tier that cannot
+    // hold markers aborts BEFORE anything is recorded. Config validation
+    // already rejects the local/valkey-only combinations at load; the
+    // re-check here is defensive. See docs/adr/ADR-CONCURRENCY.md (D3).
+    let marker_provider = if remote_state && state_cfg.freeze_marker_writes {
+        match rocky_core::state_sync::durable_tier_provider(&state_cfg)
+            .context("resolving the durable object tier for freeze markers")?
+        {
+            Some(provider) => Some(provider),
+            None => {
+                bail!(
+                    "[state] freeze_marker_writes = true requires a backend with a durable \
+                     object tier (s3, gcs, or tiered); backend = \"{}\" cannot store durable \
+                     freeze markers",
+                    state_cfg.backend
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     // SEAM-SCOPED SYNC — download half. Pull the authoritative remote ledger
     // (overwriting the local file) BEFORE opening the store, so the freeze is
@@ -493,7 +534,8 @@ pub fn run_policy_freeze(
     };
 
     let mut entries = Vec::new();
-    for p in principals {
+    let mut freeze_markers: Vec<FreezeMarker> = Vec::new();
+    for p in principals.iter().copied() {
         let principal_label = serde_plain(&p);
         // The plan_id carries the principal so a "freeze all" (two records at
         // the same timestamp + scope) does not collide on the ledger key
@@ -504,11 +546,29 @@ pub fn run_policy_freeze(
         } else {
             PolicyEffect::Deny
         };
-        let reason = if lift {
-            format!("policy unfreeze: lifted freeze for {principal_label} on scope '{scope}'")
-        } else {
-            format!("policy freeze: {principal_label} actions on scope '{scope}' frozen to deny")
-        };
+        // The operator-supplied `--reason` is shared by the ledger row and
+        // the durable marker; the synthesized description is the fallback.
+        let reason = reason.clone().unwrap_or_else(|| {
+            if lift {
+                format!("policy unfreeze: lifted freeze for {principal_label} on scope '{scope}'")
+            } else {
+                format!(
+                    "policy freeze: {principal_label} actions on scope '{scope}' frozen to deny"
+                )
+            }
+        });
+        // One durable marker per principal, mirroring the per-principal
+        // ledger rows: fresh UUID, same `now`, same resolved reason. Minted
+        // here, written after the store is dropped (see below).
+        if !lift && marker_provider.is_some() {
+            freeze_markers.push(FreezeMarker {
+                freeze_id: uuid::Uuid::new_v4().to_string(),
+                principal: p,
+                scope: scope.clone(),
+                reason: reason.clone(),
+                created_at: now,
+            });
+        }
         let record = PolicyDecisionRecord {
             timestamp: now,
             plan_id: plan_id.clone(),
@@ -544,6 +604,30 @@ pub fn run_policy_freeze(
     // remote — while the command reports success — would leave every other pod
     // unfrozen. A failed upload aborts (finding 5).
     drop(store);
+
+    // Durable freeze markers are written BEFORE the ledger upload (engage
+    // early): if the blob upload then fails, the un-erasable marker is
+    // already durable — the kill switch engaged even though the command exits
+    // non-zero. Over-enforcement is the monotone-safe direction; the inverse
+    // (unfreeze) writes its marker AFTER the upload, below.
+    if !lift && let Some(provider) = &marker_provider {
+        for marker in &freeze_markers {
+            let key = freeze_marker::freeze_marker_key(&marker.freeze_id);
+            block_on_state_sync(async {
+                freeze_marker::write_freeze_marker(provider, marker)
+                    .await
+                    .map_err(marker_error_to_sync)
+            })
+            .with_context(|| {
+                format!("failed to write durable freeze marker '{key}' (fail-closed)")
+            })?;
+            notes.push(format!(
+                "durable freeze marker written: {key} ({})",
+                serde_plain(&marker.principal)
+            ));
+        }
+    }
+
     if remote_state {
         // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability
         // policy (previously a local `StateConfig` clone here).
@@ -555,6 +639,66 @@ pub fn run_policy_freeze(
             ),
         )
         .with_context(|| "failed to upload remote state after recording the policy freeze")?;
+    }
+
+    // The unfreeze marker lands only once the superseding audit row is
+    // durably visible (lift late) — until then other pods keep denying,
+    // which is the safe direction (over-restriction).
+    if lift && let Some(provider) = &marker_provider {
+        // A kill-switch lift must not guess: a LIST/GET transport failure
+        // aborts the command rather than lifting blind.
+        let active = block_on_state_sync(async {
+            freeze_marker::load_active_marker_freezes(provider)
+                .await
+                .map_err(StateSyncError::from)
+        })
+        .context(
+            "failed to list durable freeze markers before lifting; an unfreeze must name the \
+             exact markers it lifts (fail-closed)",
+        )?;
+
+        // Selection mirrors the ledger's `(principal, scope-string)` keying:
+        // exact selector-string equality, not selector-overlap semantics. An
+        // unreadable marker body (conservatively active for both principals
+        // on scope "any") is lifted only by the broadest possible explicit
+        // lift — no `--principal`, scope "any" — the deliberate escape hatch
+        // for a corrupt marker.
+        let covers_both_principals = principals.len() == 2;
+        let lifted_ids: Vec<String> = active
+            .iter()
+            .filter(|m| match m.principal {
+                Some(p) => principals.contains(&p) && m.scope == scope,
+                None => covers_both_principals && scope == "any",
+            })
+            .map(|m| m.freeze_id.clone())
+            .collect();
+
+        if lifted_ids.is_empty() {
+            // Writing a tombstone that lifts nothing would be noise.
+            notes.push("no matching active freeze markers to lift".to_string());
+        } else {
+            let marker = UnfreezeMarker {
+                unfreeze_id: uuid::Uuid::new_v4().to_string(),
+                lifts: lifted_ids,
+                principal: (principals.len() == 1).then_some(principals[0]),
+                // Last use of the `--reason` argument: moved, not cloned.
+                reason,
+                created_at: now,
+            };
+            let key = freeze_marker::unfreeze_marker_key(&marker.unfreeze_id);
+            block_on_state_sync(async {
+                freeze_marker::write_unfreeze_marker(provider, &marker)
+                    .await
+                    .map_err(marker_error_to_sync)
+            })
+            .with_context(|| {
+                format!("failed to write durable unfreeze marker '{key}' (fail-closed)")
+            })?;
+            notes.push(format!(
+                "durable unfreeze marker written: {key} lifting [{}]",
+                marker.lifts.join(", ")
+            ));
+        }
     }
 
     let output = PolicyFreezeOutput {
@@ -922,6 +1066,7 @@ expect = \"deny\"
             &state,
             Some(PolicyPrincipal::Agent),
             None,
+            None,
             false,
             true,
         )
@@ -951,6 +1096,7 @@ expect = \"deny\"
             &path,
             &state,
             Some(PolicyPrincipal::Agent),
+            None,
             None,
             false,
             true,
@@ -1066,6 +1212,7 @@ expcet = \"deny\"
             &state,
             Some(PolicyPrincipal::Agent),
             None,
+            None,
             false,
             true,
         )
@@ -1094,6 +1241,7 @@ expcet = \"deny\"
             &path,
             &state,
             Some(PolicyPrincipal::Agent),
+            None,
             None,
             false,
             true,

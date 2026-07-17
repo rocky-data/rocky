@@ -1843,10 +1843,15 @@ impl RockyMcpServer {
     /// `propose` tool share (`evaluate_apply_policy`) so a write into a governed
     /// scope gets a structured verdict WITH the write. Absent a `[policy]` block
     /// this resolves to `NotConfigured` and behaviour is unchanged.
+    ///
+    /// `marker_freezes` is the durable freeze-marker set hoisted by the async
+    /// tool body (via [`Self::draft_marker_freezes`]) — the evaluation itself
+    /// is synchronous.
     fn evaluate_draft_policy(
         &self,
         stem: &str,
         decision_id: &str,
+        marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
     ) -> rocky_cli::commands::PolicyGate {
         let touched: std::collections::BTreeMap<String, rocky_core::config::PolicyCapability> =
             std::iter::once((
@@ -1861,7 +1866,42 @@ impl RockyMcpServer {
             &touched,
             &self.models_dir,
             &self.state_path(),
+            marker_freezes,
         )
+    }
+
+    /// Durable freeze-marker LIST for a draft-class gate over `stem` — a
+    /// frozen agent must not keep minting drafts, so the draft tools consult
+    /// the same marker set the propose/apply gates enforce. Bounded by the
+    /// shared gate guard (no `[policy]` ⇒ no LIST ⇒ zero behavior change; an
+    /// unloadable config resolves to `NotConfigured` in the gate, so it reads
+    /// no markers either). Fail-closed on a transport failure, mirroring the
+    /// governed apply seams.
+    async fn draft_marker_freezes(
+        &self,
+        stem: &str,
+    ) -> Result<
+        Vec<rocky_core::freeze_marker::ActiveMarkerFreeze>,
+        rmcp::handler::server::wrapper::Json<ToolError>,
+    > {
+        let Ok(cfg) = rocky_core::config::load_rocky_config(&self.config_path) else {
+            return Ok(Vec::new());
+        };
+        let touched: std::collections::BTreeMap<String, rocky_core::config::PolicyCapability> =
+            std::iter::once((
+                stem.to_string(),
+                rocky_core::config::PolicyCapability::Propose,
+            ))
+            .collect();
+        rocky_cli::commands::marker_freezes_before_gate(&cfg, &touched)
+            .await
+            .map_err(|e| {
+                ToolError::internal(
+                    format!("failed to list durable freeze markers before the policy gate: {e:#}"),
+                    "The durable `[state]` tier must be reachable so an active freeze marker is \
+                     enforced before authoring into a governed scope (fail-closed).",
+                )
+            })
     }
 
     /// Compile the project scoped to `stem` and reduce it to the lite
@@ -1983,6 +2023,10 @@ impl RockyMcpServer {
         // A draft has no plan; the decision is recorded against a draft-scoped id
         // so the audit ledger stays honest about what it is.
         let decision_id = format!("draft:{}", paths.stem);
+        // Durable freeze-marker LIST, hoisted here (the gate is synchronous) —
+        // a frozen agent must not keep minting drafts. Fail-closed; bounded by
+        // the shared guard (no `[policy]` ⇒ no LIST ⇒ zero behavior change).
+        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
         let gate = rocky_cli::commands::evaluate_apply_policy(
             &self.config_path,
             &decision_id,
@@ -1990,6 +2034,7 @@ impl RockyMcpServer {
             &touched,
             &self.models_dir,
             &state_path,
+            &marker_freezes,
         );
 
         match gate {
@@ -2108,7 +2153,10 @@ impl RockyMcpServer {
         let compiled = self.compile_drafted(&paths.stem)?;
 
         let decision_id = format!("draft-contract:{}", paths.stem);
-        match self.evaluate_draft_policy(&paths.stem, &decision_id) {
+        // Durable freeze-marker LIST, hoisted in the async body (the gate is
+        // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
+        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
+        match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
             rocky_cli::commands::PolicyGate::NotConfigured
             | rocky_cli::commands::PolicyGate::Allow => {
                 rollback.defuse();
@@ -2241,7 +2289,10 @@ impl RockyMcpServer {
         let compiled = self.compile_drafted(&paths.stem)?;
 
         let decision_id = format!("draft-check:{}", paths.stem);
-        match self.evaluate_draft_policy(&paths.stem, &decision_id) {
+        // Durable freeze-marker LIST, hoisted in the async body (the gate is
+        // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
+        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
+        match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
             rocky_cli::commands::PolicyGate::NotConfigured
             | rocky_cli::commands::PolicyGate::Allow => {
                 rollback.defuse();
@@ -2414,6 +2465,25 @@ impl RockyMcpServer {
                     )
                 })?;
         }
+        // Durable freeze-marker LIST, hoisted beside the ledger download —
+        // a marker-only freeze (its ledger row erased by a concurrent state
+        // upload) must still deny the propose. Same guard shape (the helper
+        // short-circuits without `[policy]` / an empty touched set /
+        // no durable tier); fail-closed on a transport failure.
+        let marker_freezes = match &cfg {
+            Some(cfg) => rocky_cli::commands::marker_freezes_before_gate(cfg, &touched)
+                .await
+                .map_err(|e| {
+                    ToolError::internal(
+                        format!(
+                            "failed to list durable freeze markers before the policy gate: {e:#}"
+                        ),
+                        "The durable `[state]` tier must be reachable so an active freeze marker \
+                         is enforced before proposing a plan (fail-closed).",
+                    )
+                })?,
+            None => Vec::new(),
+        };
         let gate = rocky_cli::commands::evaluate_apply_policy_with_policy(
             cfg.as_ref().and_then(|c| c.policy.as_ref()),
             &plan_id,
@@ -2421,6 +2491,7 @@ impl RockyMcpServer {
             &touched,
             &self.models_dir,
             &state_path,
+            &marker_freezes,
         );
 
         let write_plan = || {

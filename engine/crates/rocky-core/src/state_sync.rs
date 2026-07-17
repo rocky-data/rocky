@@ -161,6 +161,44 @@ fn cloud_provider(
     Ok(ObjectStoreProvider::from_uri(&uri)?)
 }
 
+/// Object-store handle for the **durable tier** of a remote `[state]`
+/// backend, or `None` when no durable object tier exists (`local`,
+/// `valkey`-only).
+///
+/// The single place the backend enum maps to a marker-capable tier for
+/// [`crate::freeze_marker`]: `tiered` resolves to its S3 leg — Valkey is
+/// bypassed entirely, so a stale cached blob can never shadow a durable
+/// freeze marker. Bucket resolution mirrors the state download/upload
+/// dispatch (`MissingConfig` when the required bucket is absent), and
+/// construction goes through [`cloud_provider`] so the test-override seams
+/// intercept it exactly like every other state transfer.
+///
+/// # Errors
+///
+/// [`StateSyncError::MissingConfig`] when the backend has a durable tier but
+/// its bucket is not configured; provider-construction failures propagate.
+pub fn durable_tier_provider(
+    config: &StateConfig,
+) -> Result<Option<ObjectStoreProvider>, StateSyncError> {
+    match config.backend {
+        StateBackend::S3 | StateBackend::Tiered => {
+            let bucket = config.s3_bucket.as_deref().ok_or_else(|| {
+                StateSyncError::MissingConfig("s3".into(), "state.s3_bucket".into())
+            })?;
+            let prefix = config.s3_prefix.as_deref().unwrap_or(DEFAULT_S3_PREFIX);
+            Ok(Some(cloud_provider("s3", bucket, prefix)?))
+        }
+        StateBackend::Gcs => {
+            let bucket = config.gcs_bucket.as_deref().ok_or_else(|| {
+                StateSyncError::MissingConfig("gcs".into(), "state.gcs_bucket".into())
+            })?;
+            let prefix = config.gcs_prefix.as_deref().unwrap_or(DEFAULT_GCS_PREFIX);
+            Ok(Some(cloud_provider("gs", bucket, prefix)?))
+        }
+        StateBackend::Local | StateBackend::Valkey => Ok(None),
+    }
+}
+
 /// Test-only support for injecting an in-memory object store into the upload
 /// dispatch path. Lets a test drive the real
 /// `upload_state → strip → dispatch → upload_to_object_store → cloud_provider`
@@ -2222,6 +2260,67 @@ mod tests {
     #[test]
     fn test_state_backend_display_includes_gcs() {
         assert_eq!(StateBackend::Gcs.to_string(), "gcs");
+    }
+
+    /// `durable_tier_provider` maps each backend to its marker-capable tier:
+    /// s3/gcs directly, tiered to its S3 leg (never Valkey), and local /
+    /// valkey-only to `None`. A durable backend with no bucket is
+    /// `MissingConfig`, mirroring the transfer dispatch.
+    #[test]
+    fn durable_tier_provider_maps_backends() {
+        // Route provider construction to an in-memory store so no cloud
+        // client (or credentials) is needed.
+        let _handle = test_support::install(ObjectStoreProvider::in_memory());
+
+        let s3 = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        assert!(durable_tier_provider(&s3).unwrap().is_some());
+
+        let gcs = StateConfig {
+            backend: StateBackend::Gcs,
+            gcs_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        assert!(durable_tier_provider(&gcs).unwrap().is_some());
+
+        let tiered = StateConfig {
+            backend: StateBackend::Tiered,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        assert!(
+            durable_tier_provider(&tiered).unwrap().is_some(),
+            "tiered maps to its durable S3 leg"
+        );
+
+        assert!(
+            durable_tier_provider(&StateConfig::default())
+                .unwrap()
+                .is_none(),
+            "local has no durable object tier"
+        );
+        let valkey = StateConfig {
+            backend: StateBackend::Valkey,
+            ..Default::default()
+        };
+        assert!(
+            durable_tier_provider(&valkey).unwrap().is_none(),
+            "valkey-only has no durable object tier"
+        );
+
+        let s3_no_bucket = StateConfig {
+            backend: StateBackend::S3,
+            ..Default::default()
+        };
+        assert!(matches!(
+            durable_tier_provider(&s3_no_bucket),
+            Err(StateSyncError::MissingConfig(..))
+        ));
+
+        test_support::clear();
     }
 
     // R8 (part 1) — remote key derivation. The legacy global file maps to the
