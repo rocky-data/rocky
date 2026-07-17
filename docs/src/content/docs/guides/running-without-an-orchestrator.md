@@ -9,19 +9,19 @@ You do not need Dagster, Airflow, or any orchestration platform to run Rocky on 
 
 This guide shows how to drive `rocky run` from cron, a systemd timer, GitHub Actions, or a warehouse-native scheduler, how to read the exit codes so your alerting is honest, and how to get failure notifications and health checks without a control plane.
 
-If you already run Dagster or Airflow, keep them. The [`dagster-rocky`](/dagster/resource/) integration is first-class and Rocky honors the `TRACEPARENT` your orchestrator sets so runs join the caller's trace. This page is for the estates where a timer is enough.
+If you already run Dagster or Airflow, keep them. The [`dagster-rocky`](/dagster/resource/) integration is first-class. This page is for the estates where a timer is enough.
 
 ## What the engine already does
 
 A single `rocky run` is not a bare SQL script. Inside one invocation the engine:
 
 - **Executes the model DAG in dependency order**, with configurable concurrency across independent branches.
-- **Retries and self-heals within the run.** Failed statements are retried up to `max_retries`, and a per-adapter circuit breaker trips after a run of consecutive failures so one broken warehouse connection does not hammer the rest of the run. See the [retry and circuit-breaker settings](/reference/configuration/#retry).
+- **Retries and self-heals within the run.** Failed statements are retried up to `max_retries`, and on the Databricks and Snowflake adapters a circuit breaker trips after a run of consecutive failures so one broken warehouse connection does not hammer the rest of the run. See the [retry and circuit-breaker settings](/reference/configuration/#retry).
 - **Reports partial success instead of losing good work.** When some models materialize and others fail, the run does not discard what succeeded: it finishes with a partial-success exit code and enumerates the failures, so you keep the current data and know exactly what broke. See [per-table error containment](/advanced/per-table-error-containment/).
-- **Records every run into embedded state** (a local redb store), so `rocky history`, `rocky resume`, and the audit trail work with no external database.
-- **Resumes a failed run** with `rocky run --resume-latest` (or `--resume <run_id>`), which mints a fresh `run_id` and records `resumed_from` for the lineage.
-- **Deduplicates with idempotency keys.** Pass `rocky run --idempotency-key <key>` and a re-run under the same key is skipped rather than double-applied, so a retrying timer cannot stack duplicate runs.
-- **Fires lifecycle [hooks](/concepts/hooks/)** on pipeline events, including failures, so notifications live in the pipeline definition rather than in the scheduler.
+- **Records runs into embedded state** (a local redb store), so `rocky history` and the audit trail work with no external database. Run-record persistence is best-effort and most complete for replication and transformation runs today.
+- **Resumes a failed replication run** with `rocky run --resume-latest` (or `--resume <run_id>`) — a flag on `rocky run`, not a separate command. It picks up from the latest recorded progress for the pipeline.
+- **Deduplicates with idempotency keys.** Pass `rocky run --idempotency-key <key>`; an in-flight or previously *successful* run under the same key is skipped rather than double-applied. By default a *failed* run leaves the key claimable so a retry can proceed; set `dedup_on = "any"` to also skip after a failure (which forgoes retry under that key). Idempotency keys and resume cannot be combined.
+- **Fires lifecycle [hooks](/concepts/hooks/)** on pipeline events, so notifications can live in the pipeline definition rather than in the scheduler. Hook coverage is still filling in — the failure hooks fire most reliably on the replication path today — so pair them with the exit-code routing below rather than relying on them alone.
 
 What a timer adds is the trigger and, if you want it, retention of logs. Everything about *how the run behaves* is already in `rocky.toml` and the engine. That is the whole idea: the run's behavior lives with the pipeline definition, not in a separate system you have to keep in sync.
 
@@ -32,11 +32,11 @@ Every recipe below keys off the process exit code. Rocky uses a distinct code pe
 | Code | Meaning | Emitted by |
 |------|---------|------------|
 | `0` | Success | every command |
-| `1` | Total or generic failure (nothing materialized, config error, unreadable state) | every command |
+| `1` | Generic hard failure (config error, unreadable state, or an error raised *after* some models already materialized — a budget breach, say) | most commands |
 | `2` | **Partial success** — some models materialized, some failed | `rocky run` |
 | `3` | A Critical health check | `rocky doctor` |
 | `4` | Compile and tests passed but advisory warnings were emitted | `rocky ci` |
-| `130` | Interrupted by SIGINT or SIGTERM | every command |
+| `130` | Interrupted by SIGINT or SIGTERM | `rocky run` |
 
 For a scheduled `rocky run` you will see `0`, `1`, `2`, or `130`. Codes `3` and `4` come from `rocky doctor` and `rocky ci`, which you may run as a pre-flight (below) or in CI.
 
@@ -44,7 +44,7 @@ For a scheduled `rocky run` you will see `0`, `1`, `2`, or `130`. Codes `3` and 
 
 Alert on any non-zero exit. Beyond that, one rule earns its keep:
 
-**Give exit `2` its own channel.** A partial success means the run kept going and produced real, current data for the models that worked, while a subset failed. That is a different operational situation from a total failure (exit `1`), where nothing landed. Routing them to the same place trains people to ignore the alert. A total failure is a page; a partial success is a ticket for the on-call to look at the failed models before the next run.
+**Give exit `2` its own channel.** A partial success means the run kept going and produced real, current data for the models that worked, while a subset failed. That is a different operational situation from a hard failure (exit `1`). Note that exit `1` is generic: it often means nothing materialized, but it can also fire *after* some models landed (a budget breach, for one), so inspect the run's `--output json` result or `rocky history` rather than assume the estate is empty. Routing exit `1` and exit `2` to the same place trains people to ignore the alert. A hard failure is a page; a partial success is a ticket for the on-call to look at the failed models before the next run.
 
 `130` (interrupted) usually means a deploy or a machine restart cut the run short; treat it as informational unless it repeats.
 
@@ -108,7 +108,7 @@ OnFailure=rocky-analytics-failed@%n.service
 Type=oneshot
 User=dataeng
 WorkingDirectory=/srv/analytics
-# Pre-flight: fail fast (exit 3) if config, state, or connectivity is broken.
+# Pre-flight: fail fast (exit 3) if config or warehouse connectivity is broken.
 ExecStartPre=/usr/local/bin/rocky doctor
 ExecStart=/srv/analytics/rocky-run.sh
 # The wrapper already routes partial success (exit 2) to its own channel, so tell
@@ -247,7 +247,7 @@ curl -fsS -X POST "$SLACK_WEBHOOK_URL" \
 
 A webhook hook and a command hook are two different things: the `[hook.webhooks.*]` block posts the event context over HTTP by itself, while a `[[hook.*]]` command block runs a program you provide (which is what lets it shell out to `rocky brief`). Use the webhook for a fast "it failed" ping and the command hook when you want the full digest.
 
-To confirm Rocky picked up either block, run `rocky validate` (it parses the whole config, the hook tables included) and `rocky hooks list` (it prints the command hooks Rocky loaded, so your hook showing up there confirms the event key is one it recognizes). An unknown or misspelled `on_<event>` key is skipped with a warning rather than firing.
+To confirm Rocky picked up either block, run `rocky validate` — it parses the whole config, both hook tables included. `rocky hooks list` prints the *command* hooks Rocky loaded (a `[hook.webhooks.*]` block will not appear there), so a command hook showing up confirms its event key is one Rocky recognizes. An unknown or misspelled `on_<event>` key is skipped with a warning rather than firing.
 
 One detail bites timers specifically. Config values like `${SLACK_WEBHOOK_URL}` are substituted from the environment, and a referenced variable that is not set makes config loading fail outright (`rocky validate` returns `1`, and so does the run). cron and systemd start with a nearly empty environment, so export the secrets your config references in the timer's own environment (`Environment=` or `EnvironmentFile=` for systemd, a sourced file for cron) or the run will not even start.
 
@@ -257,7 +257,7 @@ Two commands turn a blind timer into an observable one.
 
 ### rocky doctor as a pre-flight
 
-`rocky doctor` runs config, state, adapter, and auth checks and **exits `3` if any check is Critical**. Putting it before `rocky run` (the `ExecStartPre` and pre-flight steps above) turns a broken config or an unreachable warehouse into a clean, early failure instead of a half-completed run. Run the full battery, or scope to a single check with `--check`:
+`rocky doctor` runs config, state, adapter, and auth checks and **exits `3` if any check is Critical**. Putting it before `rocky run` (the `ExecStartPre` and pre-flight steps above) turns a broken config or an unreachable warehouse into a clean, early failure instead of a half-completed run — config problems and an unreachable warehouse are Critical. A degraded or unreadable local state store surfaces as a Warning (exit `0`), so it will not by itself fail the pre-flight. Run the full battery, or scope to a single check with `--check`:
 
 ```bash
 rocky doctor                  # all checks, exits 3 on any Critical
@@ -267,7 +267,7 @@ rocky doctor --check auth     # ping the warehouse to catch a rotated credential
 
 ### rocky history for run archaeology
 
-Every run is in the embedded state store. `rocky history` reads it back with no warehouse round-trip, so it works from the same host your timer runs on:
+Runs are recorded in the embedded state store — most completely for replication and transformation runs today. `rocky history` reads it back with no warehouse round-trip, so it works from the same host your timer runs on:
 
 ```bash
 rocky history                       # recent runs: id, start, status, model count, trigger
@@ -276,7 +276,7 @@ rocky history --since 2026-03-01    # runs on or after a date
 rocky history --audit               # include the governance audit trail
 ```
 
-The `status` column tells partial from total after the fact (`Success`, `PartialFailure`, `Failure`), and `trigger` records how each run was started. Combined with `rocky run --resume-latest`, this is enough to see what a scheduled run did overnight and pick up a failed one where it left off.
+The `status` column tells partial from total after the fact (`Success`, `PartialFailure`, `Failure`), and `trigger` records how the run was started (CLI runs currently record `manual`). Combined with `rocky run --resume-latest` for replication pipelines, this is enough to see what a scheduled run did overnight and pick up a failed one where it left off.
 
 ## Where to go next
 
