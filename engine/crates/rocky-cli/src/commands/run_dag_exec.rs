@@ -97,6 +97,8 @@ fn default_sub_runner() -> SubRunner {
                     None,
                     // DAG sub-runs are not governed two-step applies — no gate.
                     None,
+                    // `--assume-fresh-state` is not surfaced on the DAG path.
+                    false,
                 )
                 .await
                 .map_err(|e| e.to_string())

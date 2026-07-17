@@ -292,6 +292,9 @@ async fn iter_once(
         None,
         // `--watch` is a dev loop, never a governed two-step apply — no gate.
         None,
+        // `--assume-fresh-state` is not surfaced on the watch path (clap
+        // rejects the combination at parse time).
+        false,
     )
     .await;
     let elapsed_ms = started.elapsed().as_millis();

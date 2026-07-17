@@ -2400,7 +2400,11 @@ impl RockyMcpServer {
             && !touched.is_empty()
             && !matches!(cfg.state.backend, rocky_core::config::StateBackend::Local)
         {
-            rocky_core::state_sync::download_state(&cfg.state, &state_path)
+            // PR-A (RD-001): bind the typed authority — a successful download
+            // of either usable variant means the local ledger now mirrors
+            // remote truth; failure still `?`-bails fail-closed (unchanged).
+            // PR-B branches on the value.
+            let _authority = rocky_core::state_sync::download_state(&cfg.state, &state_path)
                 .await
                 .map_err(|e| {
                     ToolError::internal(

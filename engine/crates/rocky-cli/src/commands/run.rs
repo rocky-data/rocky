@@ -1105,6 +1105,67 @@ pub(crate) fn refuse_governed_side_effects(
     Ok(())
 }
 
+/// Fold the replication run's remote-state download result into a typed
+/// [`StateAuthority`] — the ONE site where `Indeterminate` may be synthesized.
+///
+/// `download_state` never returns `Indeterminate` (failure stays `Err`, the F7
+/// safe-standalone property); a caller that elects to continue past a download
+/// `Err` must do so explicitly, and this is that election:
+///
+/// - `Ok(authority)` passes through unchanged;
+/// - `Err` + `governed_with_policy` — the existing #1089 fail-closed bail: a
+///   governed run with a `[policy]` plane cannot see a cross-pod freeze/budget
+///   from stale local state;
+/// - `Err` + `assume_fresh_state` — the audited operator escape hatch (§6):
+///   treat the failure as an *intentional* fresh start (disaster recovery,
+///   the remote is known-gone) and emit a structured audit warn;
+/// - `Err` otherwise — continue in degraded mode with an explicitly
+///   non-authoritative ledger: auto-applies are refused and both state uploads
+///   are suppressed downstream.
+///
+/// The governed bail deliberately takes precedence over `assume_fresh_state`:
+/// an operator assertion must not un-gate a governed run's fail-closed check.
+pub(crate) fn resolve_replication_authority(
+    download: Result<
+        rocky_core::state_sync::StateAuthority,
+        rocky_core::state_sync::StateSyncError,
+    >,
+    governed_with_policy: bool,
+    assume_fresh_state: bool,
+) -> Result<rocky_core::state_sync::StateAuthority> {
+    use rocky_core::state_sync::StateAuthority;
+    match download {
+        Ok(authority) => Ok(authority),
+        Err(e) => {
+            // #2 (red-team): a GOVERNED run whose remote-state download failed
+            // cannot see a cross-pod freeze/budget recorded by another pod. If a
+            // `[policy]` plane is configured (the in-run gate WILL consult
+            // POLICY_DECISIONS), fail-closed rather than evaluate the freeze from
+            // stale local state and fail OPEN. With no `[policy]` there is nothing
+            // to enforce, so continue — same as an ungoverned run, no availability
+            // regression (red-team #8's no-policy false-abort avoided).
+            if governed_with_policy {
+                anyhow::bail!(
+                    "refusing a governed run: remote state download failed ({e}), so a \
+                     cross-pod freeze/budget in the durable state ledger cannot be seen \
+                     (fail-closed). Retry once the `[state]` backend is reachable."
+                );
+            }
+            if assume_fresh_state {
+                tracing::warn!(
+                    target: "rocky::state_authority",
+                    reason = %e,
+                    "operator asserted --assume-fresh-state: treating failed download as an \
+                     intentional fresh start"
+                );
+                return Ok(StateAuthority::FreshStart);
+            }
+            warn!(error = %e, "state download failed, continuing with local state");
+            Ok(StateAuthority::Indeterminate)
+        }
+    }
+}
+
 /// Execute `rocky run` — full pipeline.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run", fields(run_id))]
@@ -1166,6 +1227,13 @@ pub async fn run(
     // (TOCTOU models-drift reject + post-discovery replication gate) are
     // skipped and behaviour is byte-identical. See [`GovernedRunContext`].
     governed_ctx: Option<&crate::commands::apply::GovernedRunContext<'_>>,
+    // `--assume-fresh-state`: audited disaster-recovery escape hatch. When a
+    // configured remote `[state]` download fails, treat it as an *intentional*
+    // fresh start (`StateAuthority::FreshStart`) instead of the fail-closed
+    // `Indeterminate`. Caller-validated remote-only (main.rs rejects it on the
+    // Local backend); it never overrides the governed fail-closed bail. See
+    // [`resolve_replication_authority`].
+    assume_fresh_state: bool,
 ) -> Result<()> {
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
@@ -1662,34 +1730,17 @@ pub async fn run(
     let pattern = pipeline.schema_pattern()?;
     let parsed_filter = filter.map(parse_filter).transpose()?;
 
-    // Download state from remote storage (S3/GCS/Valkey) if configured.
-    // A no-op `Ok(())` when no remote is configured; an `Err` when a configured
-    // remote download failed — in which case the local ledger may be missing
-    // freeze/budget history recorded by another pod, so it is not authoritative
-    // for the auto-apply governor below (fail-closed).
-    let state_download_ok = match rocky_core::state_sync::download_state(&rocky_cfg.state, state_path)
-        .await
-    {
-        Ok(()) => true,
-        Err(e) => {
-            // #2 (red-team): a GOVERNED run whose remote-state download failed
-            // cannot see a cross-pod freeze/budget recorded by another pod. If a
-            // `[policy]` plane is configured (the in-run gate WILL consult
-            // POLICY_DECISIONS), fail-closed rather than evaluate the freeze from
-            // stale local state and fail OPEN. With no `[policy]` there is nothing
-            // to enforce, so continue — same as an ungoverned run, no availability
-            // regression (red-team #8's no-policy false-abort avoided).
-            if exec_fp_gate.is_some() && rocky_cfg.policy.is_some() {
-                anyhow::bail!(
-                    "refusing a governed run: remote state download failed ({e}), so a \
-                     cross-pod freeze/budget in the durable state ledger cannot be seen \
-                     (fail-closed). Retry once the `[state]` backend is reachable."
-                );
-            }
-            warn!(error = %e, "state download failed, continuing with local state");
-            false
-        }
-    };
+    // Download state from remote storage (S3/GCS/Valkey) if configured. The
+    // typed [`StateAuthority`] answers "may the local ledger back a governed
+    // decision?": `Authoritative` (remote restored, or the Local backend's
+    // on-disk truth), `FreshStart` (no remote object — a genuine bootstrap), or
+    // the caller-synthesized `Indeterminate` when an ungoverned run elects to
+    // continue past a failed download (see [`resolve_replication_authority`]).
+    let authority = resolve_replication_authority(
+        rocky_core::state_sync::download_state(&rocky_cfg.state, state_path).await,
+        exec_fp_gate.is_some() && rocky_cfg.policy.is_some(),
+        assume_fresh_state,
+    )?;
 
     // Build adapter registry and resolve adapters
     let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
@@ -1723,21 +1774,30 @@ pub async fn run(
             state_path.display()
         ))?;
 
-    // When the on-disk state was forward-incompatible (newer schema than this
-    // binary) and `on_schema_mismatch = recreate`, the store was bootstrapped
-    // fresh locally. We must NOT write that downgraded state back to a shared
-    // remote tier — doing so would clobber the newer state that already-upgraded
-    // pods depend on. Suppress both the periodic and the end-of-run upload.
-    let suppress_state_upload = state_store.was_recreated_for_forward_incompat();
+    // Suppress both the periodic and the end-of-run upload when either:
+    // - the on-disk state was forward-incompatible (newer schema than this
+    //   binary) and `on_schema_mismatch = recreate` bootstrapped it fresh —
+    //   writing that downgraded state back would clobber the newer state
+    //   already-upgraded pods depend on; or
+    // - the download authority is `Indeterminate` (an ungoverned run elected
+    //   past a failed download) — pushing the local ledger over a remote this
+    //   run could not read would be a blind last-writer-wins over unseen state.
+    // Both upload paths key on this variable: the periodic uploader's spawn
+    // gate and the terminal `upload_state_unless_recreated` call.
+    let suppress_state_upload =
+        state_store.was_recreated_for_forward_incompat() || !authority.is_usable();
 
     // The decision ledger is authoritative for the auto-apply governor only
-    // when it carries the estate's real freeze/budget history: the store was
-    // NOT bootstrapped fresh for a forward-incompatible schema, AND any
-    // configured remote download succeeded. When it is non-authoritative an
-    // active freeze / exhausted budget recorded elsewhere would be invisible,
-    // so the governor refuses every auto-apply (fail-closed).
+    // when it carries the estate's real freeze/budget history: the download
+    // authority is usable (`Authoritative` or `FreshStart`), AND the store was
+    // NOT bootstrapped fresh for a forward-incompatible schema. When it is
+    // non-authoritative an active freeze / exhausted budget recorded elsewhere
+    // would be invisible, so the governor refuses every auto-apply
+    // (fail-closed). The forward-incompat fact stays a caller-side AND: it is
+    // a property of the `StateStore` opened above, known only after the
+    // download resolved its authority.
     let ledger_authoritative =
-        !state_store.was_recreated_for_forward_incompat() && state_download_ok;
+        authority.is_usable() && !state_store.was_recreated_for_forward_incompat();
 
     // Discover sources
     let discovery_result = async {
@@ -4262,11 +4322,13 @@ pub async fn run(
     )
     .await;
 
-    // Upload state to remote storage — unless this store was bootstrapped
-    // fresh from a forward-incompatible on-disk schema. In that case the local
+    // Upload state to remote storage — unless suppressed: the store was
+    // bootstrapped fresh from a forward-incompatible on-disk schema (the local
     // state is a downgrade; persisting it back would clobber the newer state
-    // that already-upgraded pods depend on, so the upload is deliberately
-    // skipped (the periodic mid-run uploader above is gated by the same flag).
+    // that already-upgraded pods depend on), or the download authority was
+    // `Indeterminate` (pushing local state over a remote this run could not
+    // read would be a blind last-writer-wins over unseen state). The periodic
+    // mid-run uploader above is gated by the same flag.
     if let Err(e) = rocky_core::state_sync::upload_state_unless_recreated(
         suppress_state_upload,
         &rocky_cfg.state,
@@ -9432,6 +9494,79 @@ mod tests {
     use super::*;
     use rocky_core::plan_partition::PartitionSelection;
 
+    // -------------------------------------------------------------------
+    // PR-A (RD-001) — `resolve_replication_authority`, the ONE site where
+    // `Indeterminate` may be synthesized.
+    // -------------------------------------------------------------------
+
+    use rocky_core::state_sync::{StateAuthority, StateSyncError};
+
+    fn injected_download_failure() -> Result<StateAuthority, StateSyncError> {
+        Err(StateSyncError::S3Download("injected (test)".into()))
+    }
+
+    /// Governed (`exec_fp_gate` + `[policy]`) + failed download ⇒ the existing
+    /// #1089 fail-closed bail, message text unchanged.
+    #[test]
+    fn resolve_authority_governed_failure_bails() {
+        let err = resolve_replication_authority(injected_download_failure(), true, false)
+            .expect_err("a governed run must fail closed on a failed download");
+        assert!(
+            err.to_string()
+                .contains("refusing a governed run: remote state download failed"),
+            "the #1089 bail text must be preserved; got: {err:#}"
+        );
+    }
+
+    /// Ungoverned + failed download ⇒ continue in degraded mode with an
+    /// explicitly non-authoritative (`Indeterminate`) ledger.
+    #[test]
+    fn resolve_authority_ungoverned_failure_is_indeterminate() {
+        let authority = resolve_replication_authority(injected_download_failure(), false, false)
+            .expect("an ungoverned run continues past a failed download");
+        assert_eq!(authority, StateAuthority::Indeterminate);
+        assert!(!authority.is_usable(), "Indeterminate is fail-closed");
+    }
+
+    /// A successful download passes its authority through untouched.
+    #[test]
+    fn resolve_authority_success_passthrough() {
+        for authority in [StateAuthority::Authoritative, StateAuthority::FreshStart] {
+            assert_eq!(
+                resolve_replication_authority(Ok(authority), false, false).unwrap(),
+                authority
+            );
+            // The governed flag is irrelevant on the Ok path.
+            assert_eq!(
+                resolve_replication_authority(Ok(authority), true, false).unwrap(),
+                authority
+            );
+        }
+    }
+
+    /// `--assume-fresh-state` + failed download ⇒ the audited operator escape
+    /// hatch synthesizes a trusted `FreshStart` instead of `Indeterminate`.
+    #[test]
+    fn resolve_authority_assume_fresh_synthesizes_fresh_start() {
+        let authority = resolve_replication_authority(injected_download_failure(), false, true)
+            .expect("--assume-fresh-state elects past the failed download");
+        assert_eq!(authority, StateAuthority::FreshStart);
+        assert!(authority.is_usable(), "an asserted fresh start is trusted");
+    }
+
+    /// The governed fail-closed bail takes precedence: an operator assertion
+    /// must not un-gate a governed run whose download failed.
+    #[test]
+    fn resolve_authority_assume_fresh_does_not_override_governed_bail() {
+        let err = resolve_replication_authority(injected_download_failure(), true, true)
+            .expect_err("--assume-fresh-state must not override the governed bail");
+        assert!(
+            err.to_string()
+                .contains("refusing a governed run: remote state download failed"),
+            "the #1089 bail text must be preserved; got: {err:#}"
+        );
+    }
+
     /// A recording [`GovernanceAdapter`] that captures every
     /// `write_recipe_manifest` call — the coverage-proof analogue of the
     /// `set_tags`-recording `CountingGovernance` mock below.
@@ -10332,8 +10467,9 @@ adapter = "default"
             &DeferOptions::default(),
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
-            None, // no run_id override — mint the usual timestamp id
-            None, // no governance ctx (test)
+            None,  // no run_id override — mint the usual timestamp id
+            None,  // no governance ctx (test)
+            false, // assume_fresh_state (test)
         )
         .await
         .expect("transformation run should succeed");
@@ -10441,8 +10577,9 @@ schema = "mart"
             &DeferOptions::default(),
             &SkipRunOptions::default(),
             &rocky_core::run_vars::RunVars::new(),
-            None, // no run_id override — mint the usual timestamp id
-            None, // no governance ctx (test)
+            None,  // no run_id override — mint the usual timestamp id
+            None,  // no governance ctx (test)
+            false, // assume_fresh_state (test)
         )
         .await
         .expect(

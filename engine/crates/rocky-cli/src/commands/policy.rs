@@ -351,9 +351,10 @@ fn serde_plain<T: serde::Serialize>(value: &T) -> String {
 /// ([`crate::commands::apply::gate_promote_plan`]) — reached from two async
 /// entry points — can pull remote state before it reads the freeze ledger,
 /// without threading an async download through each caller.
-pub(crate) fn block_on_state_sync<F>(fut: F) -> Result<(), rocky_core::state_sync::StateSyncError>
+pub(crate) fn block_on_state_sync<T, F>(fut: F) -> Result<T, rocky_core::state_sync::StateSyncError>
 where
-    F: std::future::Future<Output = Result<(), rocky_core::state_sync::StateSyncError>> + Send,
+    T: Send,
+    F: std::future::Future<Output = Result<T, rocky_core::state_sync::StateSyncError>> + Send,
 {
     std::thread::scope(|scope| {
         scope
@@ -468,7 +469,11 @@ pub fn run_policy_freeze(
     // (overwriting the local file) BEFORE opening the store, so the freeze is
     // recorded on top of other pods' decisions rather than over an empty local.
     if remote_state {
-        block_on_state_sync(rocky_core::state_sync::download_state(
+        // PR-A (RD-001): bind the typed authority — a successful download of
+        // either usable variant means the local ledger now mirrors remote
+        // truth; failure still `?`-bails fail-closed (unchanged). PR-B
+        // branches on the value.
+        let _authority = block_on_state_sync(rocky_core::state_sync::download_state(
             &state_cfg, state_path,
         ))
         .with_context(|| {

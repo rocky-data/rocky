@@ -655,6 +655,9 @@ async fn execute_run_plan(
         Some(apply_run_id),
         // Governance context: the in-run TOCTOU reject + replication gate.
         governed_ctx,
+        // `--assume-fresh-state` is a `rocky run` runtime flag, never part of
+        // a persisted plan — the two-step apply path always runs without it.
+        false,
     )
     .await
     .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))?;
@@ -826,7 +829,10 @@ pub(crate) async fn sync_remote_ledger_before_gate(
     let Some(state_cfg) = remote_state_backend_for_gate(cfg, touched) else {
         return Ok(());
     };
-    rocky_core::state_sync::download_state(&state_cfg, state_path)
+    // PR-A (RD-001): bind the typed authority — a successful download of either
+    // usable variant means the local ledger now mirrors remote truth; failure
+    // still `?`-bails fail-closed (unchanged). PR-B branches on the value.
+    let _authority = rocky_core::state_sync::download_state(&state_cfg, state_path)
         .await
         .with_context(|| {
             "failed to download remote state before the agent-policy gate; a remote-backend \
@@ -851,9 +857,10 @@ fn sync_remote_ledger_before_gate_blocking(
     let Some(state_cfg) = remote_state_backend_for_gate(cfg, touched) else {
         return Ok(());
     };
-    crate::commands::policy::block_on_state_sync(rocky_core::state_sync::download_state(
-        &state_cfg, state_path,
-    ))
+    // PR-A (RD-001): bind the typed authority — see `sync_remote_ledger_before_gate`.
+    let _authority = crate::commands::policy::block_on_state_sync(
+        rocky_core::state_sync::download_state(&state_cfg, state_path),
+    )
     .with_context(|| {
         "failed to download remote state before the promote policy gate; a remote-backend \
          governed promote requires the state backend reachable so a cross-pod freeze/budget \
@@ -881,7 +888,8 @@ pub(crate) async fn download_remote_ledger_unconditional(
     if matches!(cfg.state.backend, StateBackend::Local) {
         return Ok(());
     }
-    rocky_core::state_sync::download_state(&cfg.state, state_path)
+    // PR-A (RD-001): bind the typed authority — see `sync_remote_ledger_before_gate`.
+    let _authority = rocky_core::state_sync::download_state(&cfg.state, state_path)
         .await
         .with_context(|| {
             format!(
@@ -2840,6 +2848,9 @@ async fn run_apply_replication_plan(
         // Replication apply has no `verify_after` gate; mint the usual id.
         None,
         governed.as_ref(),
+        // `--assume-fresh-state` is a `rocky run` runtime flag, never part of
+        // a persisted plan — the replication apply path always runs without it.
+        false,
     )
     .await
     .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
@@ -3222,6 +3233,7 @@ pub async fn run_apply_inline_for_run(
     defer_opts: &crate::commands::run::DeferOptions,
     skip_opts: &crate::commands::run::SkipRunOptions,
     run_vars: &rocky_core::run_vars::RunVars,
+    assume_fresh_state: bool,
 ) -> Result<()> {
     // Thin passthrough — routes to the existing run implementation.
     crate::commands::run::run(
@@ -3249,6 +3261,9 @@ pub async fn run_apply_inline_for_run(
         None,
         // Inline `rocky run` is never a governed two-step apply — no gate.
         None,
+        // `--assume-fresh-state` threads through from the CLI (main.rs
+        // validated it against the configured `[state]` backend).
+        assume_fresh_state,
     )
     .await
 }

@@ -81,10 +81,14 @@ async fn download_publish_waits_for_writer_release() {
     .await;
 
     // Writer released — the download's remaining lock retries can publish.
-    download
-        .await
-        .expect("download task join")
-        .expect("download must succeed once the writer releases within the retry budget");
+    assert_eq!(
+        download
+            .await
+            .expect("download task join")
+            .expect("download must succeed once the writer releases within the retry budget"),
+        rocky_core::state_sync::StateAuthority::Authoritative,
+        "the seeded remote object restores as Authoritative"
+    );
 
     let store = harness.open_store(&harness.pod_b);
     assert!(

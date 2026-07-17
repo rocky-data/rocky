@@ -11,7 +11,7 @@
 
 use chrono::Utc;
 use rocky_core::fault_store::FaultOp;
-use rocky_core::state_sync::{self, remote_testing};
+use rocky_core::state_sync::{self, StateAuthority, remote_testing};
 use rocky_core::test_harness::CrossPodHarness;
 use rocky_ir::WatermarkState;
 
@@ -39,10 +39,15 @@ async fn pod_b_sees_pod_a_watermark() {
     harness.upload(&harness.pod_a).await.expect("pod A upload");
 
     // Pod B: pull the remote and read pod A's watermark.
-    harness
+    let authority = harness
         .download(&harness.pod_b)
         .await
         .expect("pod B download");
+    assert_eq!(
+        authority,
+        StateAuthority::Authoritative,
+        "a restored remote object is Authoritative"
+    );
     let store = harness.open_store(&harness.pod_b);
     assert!(
         store.get_watermark("cat.sch.orders").unwrap().is_some(),
@@ -66,8 +71,15 @@ async fn interleaved_writers_last_writer_wins_documented() {
     let harness = CrossPodHarness::new_s3_like();
 
     // Both pods sync from the same (empty) remote — neither sees the other.
-    harness.download(&harness.pod_a).await.unwrap();
-    harness.download(&harness.pod_b).await.unwrap();
+    assert_eq!(
+        harness.download(&harness.pod_a).await.unwrap(),
+        StateAuthority::FreshStart,
+        "an empty remote is a genuine fresh start"
+    );
+    assert_eq!(
+        harness.download(&harness.pod_b).await.unwrap(),
+        StateAuthority::FreshStart
+    );
 
     // Pod A writes and uploads first...
     {
@@ -85,7 +97,10 @@ async fn interleaved_writers_last_writer_wins_documented() {
 
     // A fresh download now serves pod B's file wholesale: pod A's watermark
     // is gone from the shared remote.
-    harness.download(&harness.pod_a).await.unwrap();
+    assert_eq!(
+        harness.download(&harness.pod_a).await.unwrap(),
+        StateAuthority::Authoritative
+    );
     let store = harness.open_store(&harness.pod_a);
     assert!(
         store.get_watermark("cat.sch.from_b").unwrap().is_some(),
@@ -138,10 +153,13 @@ async fn global_override_visible_across_threads() {
     );
 
     // ...and this thread can download what that thread uploaded.
-    harness
-        .download(&harness.pod_b)
-        .await
-        .expect("pod B download");
+    assert_eq!(
+        harness
+            .download(&harness.pod_b)
+            .await
+            .expect("pod B download"),
+        StateAuthority::Authoritative
+    );
     let store = harness.open_store(&harness.pod_b);
     assert!(
         store

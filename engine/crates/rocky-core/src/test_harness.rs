@@ -25,7 +25,7 @@ use crate::fault_store::{FaultHandle, FaultingStore};
 use crate::object_store::ObjectStoreProvider;
 use crate::state::StateStore;
 use crate::state_sync::remote_testing::{GlobalOverrideGuard, install_global};
-use crate::state_sync::{self, StateSyncError};
+use crate::state_sync::{self, StateAuthority, StateSyncError};
 
 /// One simulated ephemeral pod: an isolated temp dir, a pod-local state file
 /// path inside it, and a `StateConfig` pointing at the harness's shared
@@ -98,8 +98,9 @@ impl CrossPodHarness {
     }
 
     /// Run the real [`state_sync::download_state`] for `pod` (staging file,
-    /// writer-lock publish serialization, local-only merge — the whole path).
-    pub async fn download(&self, pod: &Pod) -> Result<(), StateSyncError> {
+    /// writer-lock publish serialization, local-only merge — the whole path),
+    /// propagating the typed [`StateAuthority`] the download resolved.
+    pub async fn download(&self, pod: &Pod) -> Result<StateAuthority, StateSyncError> {
         state_sync::download_state(&pod.cfg, &pod.state_path).await
     }
 
