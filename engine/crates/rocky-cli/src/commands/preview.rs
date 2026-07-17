@@ -2299,6 +2299,8 @@ mod tests {
             hostname: "test".into(),
             rocky_version: "0.0.0-test".into(),
             check_outcomes: Vec::new(),
+            pipeline: None,
+            submission_id: None,
         }
     }
 

@@ -648,6 +648,7 @@ mod tests {
                 auto_apply_additive_drift: true,
                 ..Default::default()
             },
+            schedule: Default::default(),
         }
     }
 
@@ -848,6 +849,8 @@ mod tests {
                     passed: *p,
                 })
                 .collect(),
+            pipeline: None,
+            submission_id: None,
         }
     }
 

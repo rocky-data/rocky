@@ -954,6 +954,7 @@ mod tests {
             checks: ChecksConfig::default(),
             execution: ExecutionConfig::default(),
             depends_on: vec![],
+            schedule: None,
         };
 
         let config = SnapshotConfig::from_pipeline_config(&pipeline_cfg);

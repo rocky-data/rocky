@@ -547,6 +547,7 @@ mod tests {
             depends_on,
             table_overrides: vec![],
             prune_unchanged: false,
+            schedule: None,
         }))
     }
 
@@ -561,6 +562,7 @@ mod tests {
             checks: ChecksConfig::default(),
             execution: ExecutionConfig::default(),
             depends_on,
+            schedule: None,
         }))
     }
 
@@ -597,6 +599,7 @@ mod tests {
             gc: Default::default(),
             policy: None,
             resilience: Default::default(),
+            schedule: Default::default(),
         }
     }
 
@@ -709,6 +712,7 @@ mod tests {
                         checks: ChecksConfig::default(),
                         execution: ExecutionConfig::default(),
                         depends_on: vec!["transform".into()],
+                        schedule: None,
                     })),
                 ),
             ],
@@ -877,6 +881,7 @@ mod tests {
                     checks: ChecksConfig::default(),
                     execution: ExecutionConfig::default(),
                     depends_on: vec![],
+                    schedule: None,
                 })),
             )],
         );

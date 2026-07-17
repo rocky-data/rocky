@@ -61,6 +61,10 @@ pub async fn run_transformation(
     // Config fingerprint computed once in `run()` (mirrors every other
     // `persist_run_record` call site).
     config_hash: &str,
+    // The resolved `--pipeline` name, stamped onto the persisted `RunRecord`
+    // so the schedule reconciler can answer `after`/`freshness` demands on this
+    // transformation pipeline. `None` for a non-pipeline invocation.
+    pipeline_name: Option<&str>,
     // Caller-supplied `--idempotency-key` (verbatim, as `run()` received
     // it). Threaded so the persisted audit records the claimed key — the
     // model-only (`run.rs`) and replication paths pass the same value into
@@ -265,6 +269,7 @@ pub async fn run_transformation(
         started_at,
         config_hash,
         &audit,
+        pipeline_name,
     );
 
     // Stamp the terminal status onto the emitted payload so a JSON

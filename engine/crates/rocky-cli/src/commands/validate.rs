@@ -148,10 +148,20 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
             for msg in inert_config_messages(name, pc) {
                 out.push(msg);
             }
+
+            // Validate the optional `[schedule]` block (native demand
+            // reconciliation) — invalid cron/tz/catchup/freshness, unknown
+            // after targets, inert blocks, and the run-record persistence gap.
+            for msg in schedule_messages(name, pc, &cfg) {
+                out.push(msg);
+            }
         }
 
         // Validate pipeline dependency graph (depends_on)
         validate_pipeline_dag(&cfg, &mut out);
+
+        // Validate the schedule `after` graph is acyclic (mutual `after` hangs).
+        validate_schedule_dag(&cfg, &mut out);
     }
 
     // Validate models directory if it exists
@@ -532,6 +542,218 @@ fn inert_config_messages(
     }
 
     msgs
+}
+
+/// Whether a pipeline type persists a `RunRecord` on a successful run — the
+/// ground truth `after`/`freshness` demands read. Replication and transformation
+/// do; quality, snapshot, and load do not (yet), so a demand that reads one of
+/// their records would wait forever. Surfaced as an experimental limitation.
+fn schedule_persists_run_records(pc: &rocky_core::config::PipelineConfig) -> bool {
+    use rocky_core::config::PipelineConfig;
+    matches!(
+        pc,
+        PipelineConfig::Replication(_) | PipelineConfig::Transformation(_)
+    )
+}
+
+/// Validation for a pipeline's optional `[schedule]` block (native demand
+/// reconciliation). Core validity is driven by the reconciler's own
+/// [`resolve_schedule`](rocky_core::schedule::resolve_schedule) so `rocky
+/// validate` and `rocky tick` never disagree on what is invalid; the remaining
+/// checks catch unknown `after` targets, inert blocks, and the run-record
+/// persistence gap.
+fn schedule_messages(
+    name: &str,
+    pc: &rocky_core::config::PipelineConfig,
+    cfg: &rocky_core::config::RockyConfig,
+) -> Vec<ValidateMessage> {
+    use rocky_core::schedule::{ScheduleConfigError, resolve_schedule};
+
+    let Some(sched) = pc.schedule() else {
+        return Vec::new();
+    };
+    let mut msgs = Vec::new();
+    let field = format!("pipeline.{name}.schedule");
+
+    // Core validity — the same resolution the reconciler runs. Reports the first
+    // blocking error found.
+    if let Err(e) = resolve_schedule(
+        name,
+        sched,
+        &cfg.schedule.timezone,
+        &[],
+        cfg.freshness.expected_lag_seconds,
+    ) {
+        let (code, message) = match e {
+            ScheduleConfigError::BadCron(expr) => (
+                "V036",
+                format!(
+                    "pipeline.{name}: schedule.cron \"{expr}\" is not a valid cron expression."
+                ),
+            ),
+            ScheduleConfigError::BadTimezone(tz) => (
+                "V036",
+                format!(
+                    "pipeline.{name}: schedule.timezone \"{tz}\" is not a known IANA timezone name."
+                ),
+            ),
+            ScheduleConfigError::BadCatchup(v) if v == "all" => (
+                "V037",
+                format!(
+                    "pipeline.{name}: schedule.catchup = \"all\" is not supported — Rocky runs are watermark-driven, not windowed, so replaying every missed occurrence is pure cost. Use \"latest\" (default: one run at the most recent missed occurrence) or \"skip\"."
+                ),
+            ),
+            ScheduleConfigError::BadCatchup(v) => (
+                "V037",
+                format!(
+                    "pipeline.{name}: schedule.catchup \"{v}\" is invalid — expected \"latest\" or \"skip\"."
+                ),
+            ),
+            ScheduleConfigError::FreshnessNoBudget => (
+                "V038",
+                format!(
+                    "pipeline.{name}: schedule.freshness = true but no freshness budget resolves — set [freshness].expected_lag_seconds or a per-model max_lag_seconds."
+                ),
+            ),
+        };
+        msgs.push(ValidateMessage {
+            severity: "error".into(),
+            code: code.into(),
+            message,
+            file: None,
+            field: Some(field.clone()),
+        });
+    }
+
+    // Unknown `after` targets.
+    for up in &sched.after {
+        if !cfg.pipelines.contains_key(up) {
+            msgs.push(ValidateMessage {
+                severity: "error".into(),
+                code: "V039".into(),
+                message: format!(
+                    "pipeline.{name}: schedule.after references unknown pipeline \"{up}\"."
+                ),
+                file: None,
+                field: Some(format!("{field}.after")),
+            });
+        }
+    }
+
+    // An enabled schedule with no demand source is inert (never scheduled).
+    if sched.enabled && sched.cron.is_none() && sched.after.is_empty() && !sched.freshness {
+        msgs.push(ValidateMessage {
+            severity: "warn".into(),
+            code: "V040".into(),
+            message: format!(
+                "pipeline.{name}: [schedule] declares no cron, after, or freshness — the block is inert and the pipeline is never scheduled. Add a demand source or remove the block."
+            ),
+            file: None,
+            field: Some(field.clone()),
+        });
+    }
+
+    // Run-record persistence gap (experimental limitation): an `after` on, or
+    // `freshness = true` for, a pipeline type that persists no run record cannot
+    // observe the success it waits on, so the demand never fires.
+    for up in &sched.after {
+        if let Some(up_pc) = cfg.pipelines.get(up)
+            && !schedule_persists_run_records(up_pc)
+        {
+            msgs.push(ValidateMessage {
+                severity: "warn".into(),
+                code: "V041".into(),
+                message: format!(
+                    "pipeline.{name}: schedule.after references \"{up}\", a {} pipeline that does not persist a run record — this `after` demand cannot observe its success and will not fire (experimental limitation).",
+                    up_pc.pipeline_type_str()
+                ),
+                file: None,
+                field: Some(format!("{field}.after")),
+            });
+        }
+    }
+    if sched.freshness && !schedule_persists_run_records(pc) {
+        msgs.push(ValidateMessage {
+            severity: "warn".into(),
+            code: "V041".into(),
+            message: format!(
+                "pipeline.{name}: schedule.freshness = true on a {} pipeline that does not persist a run record — its run-staleness cannot be observed, so the demand will not fire (experimental limitation).",
+                pc.pipeline_type_str()
+            ),
+            file: None,
+            field: Some(format!("{field}.freshness")),
+        });
+    }
+
+    // The reconciler resolves the freshness budget from the PROJECT
+    // [freshness].expected_lag_seconds in this version; per-model
+    // `max_lag_seconds` is not consulted (that resolution needs per-pipeline
+    // model loading, which lands with the `rocky tick` verb). A member model
+    // with a tighter budget would therefore under-fire silently — surface the
+    // limitation loudly whenever a project budget exists (the no-budget case is
+    // already the V038 error).
+    if sched.freshness
+        && schedule_persists_run_records(pc)
+        && cfg.freshness.expected_lag_seconds.is_some()
+    {
+        msgs.push(ValidateMessage {
+            severity: "warn".into(),
+            code: "V043".into(),
+            message: format!(
+                "pipeline.{name}: schedule.freshness resolves its budget from the project [freshness].expected_lag_seconds ({}s) in this version — per-model max_lag_seconds is NOT consulted, so a member model that declares a tighter budget will under-fire. Set the project budget to the tightest member value until per-model resolution lands (experimental limitation).",
+                cfg.freshness.expected_lag_seconds.unwrap_or_default()
+            ),
+            file: None,
+            field: Some(format!("{field}.freshness")),
+        });
+    }
+
+    msgs
+}
+
+/// Validates the schedule `after` graph is acyclic — a mutual `after` would make
+/// the reconciler refuse to run rather than pick an ambiguous order. Only edges
+/// to existing pipelines are considered (unknown targets are the V039 error).
+fn validate_schedule_dag(cfg: &rocky_core::config::RockyConfig, out: &mut ValidateOutput) {
+    let names: std::collections::HashSet<&str> = cfg.pipelines.keys().map(String::as_str).collect();
+    let mut has_after = false;
+    let dag_nodes: Vec<rocky_ir::dag::DagNode> = cfg
+        .pipelines
+        .iter()
+        .map(|(name, pc)| {
+            let after: Vec<String> = pc
+                .schedule()
+                .map(|s| {
+                    s.after
+                        .iter()
+                        .filter(|u| names.contains(u.as_str()))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !after.is_empty() {
+                has_after = true;
+            }
+            rocky_ir::dag::DagNode {
+                name: name.clone(),
+                depends_on: after,
+            }
+        })
+        .collect();
+    if !has_after {
+        return;
+    }
+    if let Err(e) = rocky_ir::dag::topological_sort(&dag_nodes) {
+        out.push(ValidateMessage {
+            severity: "error".into(),
+            code: "V042".into(),
+            message: format!(
+                "schedule.after graph has a cycle — a pipeline cannot run after itself, transitively ({e})."
+            ),
+            file: None,
+            field: None,
+        });
+    }
 }
 
 /// The `[checks]` sub-field name for a [`CheckKind`], used to point the
@@ -1122,6 +1344,244 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(toml_str.as_bytes()).unwrap();
         validate_inner(f.path()).unwrap()
+    }
+
+    #[test]
+    fn schedule_catchup_all_is_rejected_v037() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[pipeline.raw.schedule]
+cron = "0 3 * * *"
+catchup = "all"
+"#,
+        );
+        let v037: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V037" && m.severity == "error")
+            .collect();
+        assert_eq!(v037.len(), 1, "expected one V037: {:?}", out.messages);
+        assert!(v037[0].message.contains("watermark-driven"));
+        assert!(!out.valid);
+    }
+
+    #[test]
+    fn schedule_unknown_after_target_is_v039() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.staging]
+type = "transformation"
+[pipeline.staging.target]
+adapter = "db"
+[pipeline.staging.schedule]
+after = ["ghost"]
+"#,
+        );
+        assert!(
+            out.messages
+                .iter()
+                .any(|m| m.code == "V039" && m.severity == "error"),
+            "{:?}",
+            out.messages
+        );
+        assert!(!out.valid);
+    }
+
+    #[test]
+    fn schedule_after_cycle_is_v042() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.a]
+type = "transformation"
+[pipeline.a.target]
+adapter = "db"
+[pipeline.a.schedule]
+after = ["b"]
+[pipeline.b]
+type = "transformation"
+[pipeline.b.target]
+adapter = "db"
+[pipeline.b.schedule]
+after = ["a"]
+"#,
+        );
+        assert!(
+            out.messages
+                .iter()
+                .any(|m| m.code == "V042" && m.severity == "error"),
+            "{:?}",
+            out.messages
+        );
+        assert!(!out.valid);
+    }
+
+    #[test]
+    fn schedule_freshness_without_budget_is_v038() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[pipeline.raw.schedule]
+freshness = true
+"#,
+        );
+        assert!(
+            out.messages
+                .iter()
+                .any(|m| m.code == "V038" && m.severity == "error"),
+            "{:?}",
+            out.messages
+        );
+        assert!(!out.valid);
+    }
+
+    #[test]
+    fn schedule_inert_block_is_v040_warning() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[pipeline.raw.schedule]
+enabled = true
+"#,
+        );
+        assert!(
+            out.messages
+                .iter()
+                .any(|m| m.code == "V040" && m.severity == "warn"),
+            "{:?}",
+            out.messages
+        );
+        assert!(out.valid, "inert schedule is a warning, not an error");
+    }
+
+    #[test]
+    fn schedule_after_non_persisting_type_is_v041_warning() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.dq]
+type = "quality"
+[pipeline.dq.target]
+adapter = "db"
+[pipeline.dq.checks]
+enabled = true
+[pipeline.staging]
+type = "transformation"
+[pipeline.staging.target]
+adapter = "db"
+[pipeline.staging.schedule]
+after = ["dq"]
+"#,
+        );
+        let v041: Vec<_> = out.messages.iter().filter(|m| m.code == "V041").collect();
+        assert_eq!(v041.len(), 1, "expected one V041: {:?}", out.messages);
+        assert_eq!(v041[0].severity, "warn");
+        assert!(out.valid, "the persistence gap is a warning, not an error");
+    }
+
+    #[test]
+    fn schedule_freshness_per_model_budget_gap_is_v043_warning() {
+        // freshness = true with a project budget → the reconciler resolves the
+        // project value only (per-model max_lag_seconds not consulted in v1), so
+        // the under-fire limitation is surfaced loudly as a warning.
+        let out = validate_toml(
+            r#"
+[freshness]
+expected_lag_seconds = 3600
+[adapter.db]
+type = "duckdb"
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[pipeline.raw.schedule]
+freshness = true
+"#,
+        );
+        let v043: Vec<_> = out.messages.iter().filter(|m| m.code == "V043").collect();
+        assert_eq!(v043.len(), 1, "expected one V043: {:?}", out.messages);
+        assert_eq!(v043[0].severity, "warn");
+        assert!(
+            out.valid,
+            "the per-model budget gap is a warning, not an error"
+        );
+        // No project budget → this is the V038 error instead, not V043.
+        let out2 = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[pipeline.raw.schedule]
+freshness = true
+"#,
+        );
+        assert!(
+            out2.messages.iter().all(|m| m.code != "V043"),
+            "no project budget → V038 error, not V043"
+        );
+        assert!(
+            out2.messages
+                .iter()
+                .any(|m| m.code == "V038" && m.severity == "error")
+        );
+    }
+
+    #[test]
+    fn schedule_valid_config_has_no_schedule_errors() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[pipeline.raw.schedule]
+cron = "0 3 * * *"
+timezone = "Europe/Lisbon"
+[pipeline.staging]
+type = "transformation"
+[pipeline.staging.target]
+adapter = "db"
+[pipeline.staging.schedule]
+after = ["raw"]
+"#,
+        );
+        let sched_errs: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| {
+                ["V036", "V037", "V038", "V039", "V040", "V041", "V042"].contains(&m.code.as_str())
+                    && m.severity == "error"
+            })
+            .collect();
+        assert!(
+            sched_errs.is_empty(),
+            "valid schedule should have no errors: {sched_errs:?}"
+        );
     }
 
     #[test]

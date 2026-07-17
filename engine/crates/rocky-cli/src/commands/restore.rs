@@ -1386,6 +1386,8 @@ mod tests {
                     hostname: "restore-test".to_string(),
                     rocky_version: "0.0.0-test".to_string(),
                     check_outcomes: Vec::new(),
+                    pipeline: None,
+                    submission_id: None,
                 })
                 .unwrap();
         }
@@ -2205,6 +2207,8 @@ mod tests {
                         hostname: "restore-live".to_string(),
                         rocky_version: VERSION.to_string(),
                         check_outcomes: Vec::new(),
+                        pipeline: None,
+                        submission_id: None,
                     })
                     .unwrap();
 

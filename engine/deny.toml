@@ -15,4 +15,7 @@ multiple-versions = "deny"
 # duplicate is intentional and accepted.
 skip = [
     { crate = "schemars", reason = "rmcp 1.7 (schemars 1.x) vs Rocky's *Output cascade (schemars 0.8) — disjoint majors, compiles cleanly" },
+    { crate = "darling", reason = "croner (schedule cron parser) pulls a darling major that the wider workspace also uses at a different major — a build-time proc-macro derive helper, disjoint from any runtime code" },
+    { crate = "darling_core", reason = "transitive with darling (see above)" },
+    { crate = "darling_macro", reason = "transitive with darling (see above)" },
 ]

@@ -1455,6 +1455,40 @@ class RunRetryConfig(BaseModel):
     """
 
 
+class ScheduleDefaultsConfig(BaseModel):
+    """
+    Project-level schedule defaults (`[schedule]`).
+
+    Supplies the fallback timezone for per-pipeline `cron` blocks that omit their own, plus the resident-loop poll cadence consumed by a later phase.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    poll_interval_seconds: conint(ge=0) | None = 15
+    """
+    Poll cadence in seconds for the resident scheduler loop. Not consumed by the one-shot tick; reserved for the resident-loop phase. Default `15`.
+    """
+    timezone: str | None = "UTC"
+    """
+    Default IANA timezone for per-pipeline cron evaluation. Default `"UTC"`.
+    """
+
+
+class ScheduleRetryConfig(BaseModel):
+    """
+    In-tick retry budget for a scheduled pipeline.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    max: conint(ge=0) | None = 0
+    """
+    Maximum number of *additional* immediate re-submissions after the first attempt fails. `0` means the first attempt is the only one.
+    """
+
+
 class SchemaCacheConfig(BaseModel):
     """
     `[cache.schemas]` — schema cache configuration.
@@ -2770,6 +2804,52 @@ class QuarantineConfig(BaseModel):
     """
 
 
+class ScheduleConfig(BaseModel):
+    """
+    Per-pipeline schedule declaration for native demand reconciliation.
+
+    Every field is optional; an absent `[pipeline.<name>.schedule]` block leaves the pipeline with today's behavior (it runs only when invoked directly). A pipeline may combine demand sources — `cron`, `after`, and `freshness` union, so any one of them makes the pipeline due.
+
+    Unlike the five pipeline variant structs (which deliberately omit `deny_unknown_fields` so the IDE schema can inject the `type` discriminator), this struct **denies unknown fields**: a typo inside `[…schedule]` is a silent scheduling bug — a misspelled `corn` key would leave a pipeline unscheduled with no error — so the deserializer rejects it outright.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    after: list[str] | None = None
+    """
+    Upstream pipelines this one runs after. The pipeline is due once every listed pipeline has a successful run that completed after this pipeline's own latest success started (a partial-success run does not count as an upstream success).
+    """
+    catchup: str | None = "latest"
+    """
+    Catch-up policy when more than one cron occurrence elapsed since the last fire: `"latest"` (default) fires one demand at the most recent missed occurrence; `"skip"` advances the anchor and runs nothing. `"all"` is rejected at validation — runs are watermark-driven, not windowed, so replaying every missed occurrence is pure cost.
+    """
+    cron: str | None = None
+    """
+    Standard 5-field cron expression (minute hour day-of-month month day-of-week). When set, the pipeline is due at each occurrence.
+    """
+    enabled: bool | None = True
+    """
+    When `false`, demand is suppressed but the config is kept. Default `true`.
+    """
+    freshness: bool | None = False
+    """
+    When `true`, the pipeline is due once its own run-staleness exceeds its freshness budget (resolved from per-model `max_lag_seconds`, falling back to the project `[freshness].expected_lag_seconds`). This is run-staleness only — the reconciler never queries the warehouse.
+    """
+    retry: ScheduleRetryConfig | None = Field({"max": 0}, validate_default=True)
+    """
+    In-tick immediate re-submissions on failure. The reconciler never sleeps between attempts; minutes-scale spacing is the always-on cross-tick throttle, not this knob. Default `0` (off).
+    """
+    timeout_minutes: conint(ge=0) | None = 0
+    """
+    Scheduler-level timeout in minutes for a launched run. `0` (default) means no scheduler-level timeout — the run's own limits apply.
+    """
+    timezone: str | None = None
+    """
+    IANA timezone name (e.g. `"Europe/Lisbon"`) the `cron` occurrences are evaluated in. Falls back to the project `[schedule].timezone`, which itself defaults to `"UTC"`.
+    """
+
+
 class StateRetentionConfig(BaseModel):
     """
     State-store retention policy.
@@ -3057,6 +3137,10 @@ class QualityPipelineConfig(BaseModel):
     """
     Execution settings (concurrency, retries, etc.).
     """
+    schedule: ScheduleConfig | None = None
+    """
+    Optional native-schedule declaration. See [`ScheduleConfig`].
+    """
     tables: list[TableRef] | None = Field([], validate_default=True)
     """
     Tables to check. Each entry specifies catalog + schema, and optionally a specific table (omit for all tables in the schema).
@@ -3131,6 +3215,10 @@ class ReplicationPipelineConfig(BaseModel):
     Downstream continuity — and preserving the table's prior check results — is then the orchestrator's job. The Dagster integration treats a pruned, unmaterialized key as unchanged via `satisfy_empty_outputs`; enabling pruning without an orchestrator that handles unmaterialized keys drops the table from the run.
 
     Defaults to `false` — opt in per pipeline, since silently skipping copies is a behavior change. The marker is compared against the target's recorded last-copied value (never wall-clock), so a failed prior run cannot cause a false skip. Pass `--no-prune` to `rocky run` to force a full pass (e.g. after a manual target-side mutation).
+    """
+    schedule: ScheduleConfig | None = None
+    """
+    Optional native-schedule declaration. See [`ScheduleConfig`].
     """
     source: PipelineSourceConfig
     """
@@ -3395,6 +3483,10 @@ class LoadPipelineConfig(BaseModel):
     """
     Load options (batch size, create/truncate behavior, CSV settings).
     """
+    schedule: ScheduleConfig | None = None
+    """
+    Optional native-schedule declaration. See [`ScheduleConfig`].
+    """
     source_dir: str
     """
     Directory or glob pattern for source files, relative to the config file.
@@ -3480,6 +3572,10 @@ class SnapshotPipelineConfig(BaseModel):
     """
     When true, rows deleted from the source get their `valid_to` set to the current timestamp in the target. Default: false.
     """
+    schedule: ScheduleConfig | None = None
+    """
+    Optional native-schedule declaration. See [`ScheduleConfig`].
+    """
     source: SnapshotSourceConfig
     """
     Source table reference (single table, not pattern-based discovery).
@@ -3548,6 +3644,10 @@ class TransformationPipelineConfig(BaseModel):
     models: str | None = "models/**"
     """
     Glob pattern for model files, relative to the config file directory. Default: `"models/**"`.
+    """
+    schedule: ScheduleConfig | None = None
+    """
+    Optional native-schedule declaration. See [`ScheduleConfig`].
     """
     target: TransformationTargetConfig
     """
@@ -3763,6 +3863,12 @@ class RockyConfig(BaseModel):
     )
     """
     Opt-in run-execution tuning for the `--skip-unchanged` model-skip gate. Default-OFF: an absent `[run]` block (or one that leaves every field at its default) keeps `rocky run`'s behavior byte-identical to before the gate existed. See [`RunConfig`].
+    """
+    schedule: ScheduleDefaultsConfig | None = Field(
+        {"poll_interval_seconds": 15, "timezone": "UTC"}, validate_default=True
+    )
+    """
+    Project-level schedule defaults for native demand reconciliation. Supplies the fallback timezone for per-pipeline `[…schedule]` cron blocks and the resident-loop poll cadence. See [`ScheduleDefaultsConfig`].
     """
     schema_evolution: SchemaEvolutionConfig | None = Field(
         {"grace_period_days": 7}, validate_default=True
