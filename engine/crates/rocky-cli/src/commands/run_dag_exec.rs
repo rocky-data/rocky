@@ -54,6 +54,15 @@ type SubRunner = Arc<
 /// the ONE snapshot `run_with_dag` captured, never a per-node reload, and
 /// transformation nodes supply their model name so each node materializes only
 /// itself; other pipeline nodes pass `None`.
+///
+/// Because each transformation model runs as its own sub-run — with its own
+/// [`super::skip_gate::SkipGate`] instance — `--skip-unchanged` cannot observe a
+/// sibling model's this-run build/skip verdict across nodes. A model with a
+/// Rocky-model upstream therefore always rebuilds under `--dag --skip-unchanged`:
+/// the gate treats an upstream carrying no in-run verdict as changed (see
+/// `SkipGate::upstream_unchanged`). That is fail-safe — never a stale skip — but
+/// more conservative than a single monolithic run, where the per-layer barrier
+/// makes every upstream verdict visible. Raw-source freshness skips still apply.
 fn default_sub_runner() -> SubRunner {
     Arc::new(
         |config_path: PathBuf,
