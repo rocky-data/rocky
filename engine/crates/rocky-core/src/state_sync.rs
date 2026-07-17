@@ -710,6 +710,67 @@ impl RemoteStateSession {
             "remote-state session abandoned without a terminal upload"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Half-seams — download-XOR-upload lifecycle shapes (WP-01 PR-B §1)
+    // -----------------------------------------------------------------------
+
+    /// Half-seam download for the single-record ledger seams (policy freeze,
+    /// gc apply, restore apply, the governed-apply pre-gate sync): pull the
+    /// authoritative remote ledger before the seam reads it.
+    ///
+    /// A *lifecycle shape*, not a session: no `acquire`/`finalize` pairing, no
+    /// Drop tripwire. [`StateBackend::Local`] is a zero-I/O
+    /// [`Authoritative`][StateAuthority::Authoritative] no-op (mirroring
+    /// [`acquire`][Self::acquire]); otherwise this delegates to
+    /// [`download_state`] and propagates its result UNCHANGED — these seams
+    /// stay fail-closed `?`-bail and never synthesize
+    /// [`Indeterminate`][StateAuthority::Indeterminate].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`download_state`]'s failure verbatim (the caller attaches
+    /// its seam-specific fail-closed context).
+    pub async fn download_only(
+        cfg: &StateConfig,
+        state_path: &Path,
+    ) -> Result<StateAuthority, StateSyncError> {
+        if matches!(cfg.backend, StateBackend::Local) {
+            return Ok(StateAuthority::Authoritative);
+        }
+        download_state(cfg, state_path).await
+    }
+
+    /// Half-seam upload for the single-record ledger seams: push the local
+    /// ledger to the remote backend with `on_upload_failure` **forced to
+    /// [`Fail`][StateUploadFailureMode::Fail]**, regardless of the configured
+    /// liveness default — a ledger mutation (freeze row, gc tombstone,
+    /// restore custody, budget pair) that commits locally but never reaches
+    /// the remote would be silently reverted by the next run's
+    /// start-download while the command reported success.
+    ///
+    /// [`StateBackend::Local`] is a no-op. `reason` names the seam in the
+    /// upload's structured log line; error context stays with the caller.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the upload failure (never swallowed — the forced `Fail`
+    /// disables the configured `skip` liveness contract for this seam).
+    pub async fn upload_only_fail_closed(
+        cfg: &StateConfig,
+        state_path: &Path,
+        reason: &str,
+    ) -> Result<(), StateSyncError> {
+        if matches!(cfg.backend, StateBackend::Local) {
+            return Ok(());
+        }
+        debug!(reason, "fail-closed ledger upload (half-seam)");
+        let upload_cfg = StateConfig {
+            on_upload_failure: StateUploadFailureMode::Fail,
+            ..cfg.clone()
+        };
+        upload_state(&upload_cfg, state_path).await
+    }
 }
 
 impl Drop for RemoteStateSession {
@@ -2084,6 +2145,27 @@ fn is_transient(err: &StateSyncError) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// WP-01 PR-B (2b) — the `rocky load` remote-key collision mechanism (ADR
+    /// §3): `remote_state_key` keys on the parent *directory name*, so load's
+    /// legacy `<config_dir>/.rocky_state` and the canonical
+    /// `models/.rocky-state.redb` both map to the SAME remote object
+    /// `state.redb`. Syncing load's legacy path as-is would therefore clobber
+    /// the pipeline's canonical remote ledger on upload (and overwrite load's
+    /// local state on download) — which is why `run_load` is unified onto the
+    /// canonical threaded state path instead of syncing its legacy file.
+    #[test]
+    fn legacy_load_path_collides_with_canonical_remote_key() {
+        let legacy = remote_state_key(Path::new("/proj/.rocky_state"));
+        let canonical = remote_state_key(Path::new("/proj/models/.rocky-state.redb"));
+        assert_eq!(legacy, "state.redb");
+        assert_eq!(canonical, "state.redb");
+        assert_eq!(
+            legacy, canonical,
+            "legacy load path and canonical state path map to ONE remote object — \
+             the collision that forces load onto the canonical path"
+        );
+    }
 
     #[tokio::test]
     async fn test_local_download_noop() {

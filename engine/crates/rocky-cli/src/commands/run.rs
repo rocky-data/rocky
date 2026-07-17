@@ -1322,7 +1322,9 @@ pub async fn run(
     // below the block abandons whatever is left (error/interrupted exits never
     // uploaded — parity). Stays `None` on the non-replication arms (model-only
     // / transformation / quality / snapshot / Load), which early-return before
-    // the replication seam — their bypass closure is stage 2b's business.
+    // the replication seam — the mutating ones (model-only, transformation,
+    // Load) own their OWN sessions (stage 2b), each consumed before the arm
+    // returns; quality/snapshot open no state store and carry none.
     let mut session_opt: Option<rocky_core::state_sync::RemoteStateSession> = None;
 
     // FR-004 F1: wrap the entire run body so that any `?` / `bail!` /
@@ -1414,20 +1416,84 @@ pub async fn run(
             .unwrap_or_else(|| "default".to_string());
 
         let warehouse = adapter_registry.warehouse_adapter(&target_adapter_name)?;
+
+        // WP-01 PR-B (2b, RD-003): the model-only arm was a live remote-state
+        // bypass — it opened the store and mutated watermark/run-history/
+        // budget state with no download-before-read and no upload-after. Wrap
+        // it in its OWN session (never run()'s `session_opt`, which belongs to
+        // the replication seam and must stay `None` on this arm): acquire
+        // before the store open, finalize after the arm's terminal state
+        // writes. Session consumption on every exit: the two fallible sites
+        // between `acquire` and `finalize` (the `require_synced` bail and the
+        // store open) abandon explicitly before returning; every exit after
+        // `finalize` (`print_json?`, `budget_result?`, the status-derived
+        // return) is session-free because `finalize` consumed it.
+        let governed_with_policy = exec_fp_gate.is_some() && rocky_cfg.policy.is_some();
+        let mut model_session = rocky_core::state_sync::RemoteStateSession::new(
+            &loaded.config.state,
+            state_path,
+            if governed_with_policy {
+                rocky_core::state_sync::FinalizeDurability::Durable
+            } else {
+                rocky_core::state_sync::FinalizeDurability::ConfigDefault
+            },
+        );
+        if let Err(e) = model_session.acquire().await {
+            // Unreachable on a fresh session (`Err` = double-acquire misuse);
+            // consume defensively so no exit path can leak the session.
+            model_session.abandon("model-only acquire misuse").await;
+            return Err(e.into());
+        }
+        match model_session.require_synced() {
+            // #1089 fail-closed: a governed run whose remote download failed
+            // cannot see a cross-pod freeze/budget — same election as the
+            // replication seam.
+            Err(e) if governed_with_policy => {
+                model_session
+                    .abandon("governed model-only download failure (fail-closed)")
+                    .await;
+                return Err(anyhow::Error::new(e).context(
+                    "refusing a governed run: the remote state download failed, so a \
+                     cross-pod freeze/budget in the durable state ledger cannot be seen \
+                     (fail-closed). Retry once the `[state]` backend is reachable.",
+                ));
+            }
+            // Ungoverned Indeterminate: continue on local state, but never
+            // push the unread remote over — blind last-writer-wins.
+            Err(e) => {
+                warn!(error = %e, "state download failed, continuing with local state");
+                model_session.set_suppress_upload("indeterminate download");
+            }
+            Ok(()) => {}
+        }
+
         // Propagate state-store open errors with context, matching the
         // full-pipeline run path below. The previous `.ok()` silently
         // disabled state persistence (lost watermarks, missing run history)
         // whenever the state file was corrupted or unreadable.
-        let state_store = Some(
-            rocky_core::state::StateStore::open_with_policy(
-                state_path,
-                rocky_cfg.state.on_schema_mismatch,
-            )
-            .context(format!(
-                "failed to open state store at {}",
-                state_path.display()
-            ))?,
-        );
+        let state_store = match rocky_core::state::StateStore::open_with_policy(
+            state_path,
+            rocky_cfg.state.on_schema_mismatch,
+        ) {
+            Ok(store) => Some(store),
+            Err(e) => {
+                model_session
+                    .abandon("model-only state store open failed")
+                    .await;
+                return Err(anyhow::Error::new(e).context(format!(
+                    "failed to open state store at {}",
+                    state_path.display()
+                )));
+            }
+        };
+        // Forward-incompat recreate ⇒ never push the downgraded ledger back
+        // over newer shared state (same suppression as the replication seam).
+        if state_store
+            .as_ref()
+            .is_some_and(rocky_core::state::StateStore::was_recreated_for_forward_incompat)
+        {
+            model_session.set_suppress_upload("forward-incompat recreate");
+        }
         // `run_id` minted at the top of `run()` — model-only, replication,
         // and idempotency-claim paths all share one identifier.
         let mut output = RunOutput::new(
@@ -1569,6 +1635,17 @@ pub async fn run(
         )
         .await;
 
+        // WP-01 PR-B (2b): terminal upload AFTER the arm's terminal state
+        // writes (run record → idempotency stamp) so they ride it — the same
+        // reposition as the replication seam. Runs before the soft-failure
+        // exit below (matching the replication finalize's coverage of its
+        // partial/compile-failure exits), so a failed model's Failure record
+        // still reaches the remote. Consumes the session on both outcomes.
+        model_session.finalize().await.context(
+            "refusing to exit 0: the state ledger mutation could not be persisted to the \
+             remote [state] backend",
+        )?;
+
         // Stamp the terminal status so the JSON payload reports the run
         // outcome directly (a compile-failed target makes this `Failure`).
         output.status = output.derive_run_status();
@@ -1627,7 +1704,52 @@ pub async fn run(
     // `InFlight` stamp. FR-004 F2.
     match pipeline_config {
         rocky_core::config::PipelineConfig::Transformation(t) => {
-            super::run_local::run_transformation(
+            // WP-01 PR-B (2b, RD-003): the transformation arm was a live
+            // remote-state bypass (`run_local.rs` opens the store with no
+            // sync). Wrap the dispatch in its OWN session (never run()'s
+            // `session_opt`): acquire before the dispatch, finalize after the
+            // delegated `Ok` — past the idempotency stamp, so it rides the
+            // upload — and abandon on the delegated `Err` (error exits never
+            // uploaded; parity with the replication error choke-point). Both
+            // outcomes consume the session before this arm returns.
+            let governed_with_policy = exec_fp_gate.is_some() && rocky_cfg.policy.is_some();
+            let mut tx_session = rocky_core::state_sync::RemoteStateSession::new(
+                &loaded.config.state,
+                state_path,
+                if governed_with_policy {
+                    rocky_core::state_sync::FinalizeDurability::Durable
+                } else {
+                    rocky_core::state_sync::FinalizeDurability::ConfigDefault
+                },
+            );
+            if let Err(e) = tx_session.acquire().await {
+                // Unreachable on a fresh session (`Err` = double-acquire
+                // misuse); consume defensively so no exit leaks the session.
+                tx_session.abandon("transformation acquire misuse").await;
+                return Err(e.into());
+            }
+            match tx_session.require_synced() {
+                // #1089 fail-closed: a governed run whose remote download
+                // failed cannot see a cross-pod freeze/budget.
+                Err(e) if governed_with_policy => {
+                    tx_session
+                        .abandon("governed transformation download failure (fail-closed)")
+                        .await;
+                    return Err(anyhow::Error::new(e).context(
+                        "refusing a governed run: the remote state download failed, so a \
+                         cross-pod freeze/budget in the durable state ledger cannot be seen \
+                         (fail-closed). Retry once the `[state]` backend is reachable.",
+                    ));
+                }
+                // Ungoverned Indeterminate: continue on local state, but never
+                // push the unread remote over — blind last-writer-wins.
+                Err(e) => {
+                    warn!(error = %e, "state download failed, continuing with local state");
+                    tx_session.set_suppress_upload("indeterminate download");
+                }
+                Ok(()) => {}
+            }
+            let dispatch_result = super::run_local::run_transformation(
                 config_path,
                 t,
                 rocky_cfg,
@@ -1667,9 +1789,29 @@ pub async fn run(
                 // its models directory is gone. `false` for a bare run.
                 governed_ctx.is_some_and(|c| c.expects_models),
             )
-            .await?;
-            finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
-            return Ok(());
+            .await;
+            match dispatch_result {
+                Ok(()) => {
+                    finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id)
+                        .await;
+                    // Terminal upload AFTER the idempotency stamp so it rides
+                    // the upload — the same reposition as the replication
+                    // seam. Consumes the session.
+                    tx_session.finalize().await.context(
+                        "refusing to exit 0: the state ledger mutation could not be persisted \
+                         to the remote [state] backend",
+                    )?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Error exits never uploaded; the `?` this replaces would
+                    // have leaked the session past this arm's return.
+                    tx_session
+                        .abandon("transformation exited before terminal state writes")
+                        .await;
+                    return Err(e);
+                }
+            }
         }
         rocky_core::config::PipelineConfig::Quality(q) => {
             super::run_local::run_quality(config_path, q, rocky_cfg, output_json).await?;
@@ -1686,13 +1828,27 @@ pub async fn run(
             // Delegate to the `rocky load` command, driving with the pipeline's
             // own source_dir/format/target. This lets `rocky run --pipeline X`
             // work uniformly across all pipeline types.
+            //
+            // WP-01 PR-B (2b, RD-003): `run_load` executes from THIS caller's
+            // fingerprinted snapshot and the canonical `state_path` (formerly a
+            // self-load + the legacy `<config_dir>/.rocky_state`), and owns its
+            // remote-state session internally — consumed on every `run_load`
+            // exit, so run()'s `session_opt` stays `None` on this arm.
+            let governed_with_policy = exec_fp_gate.is_some() && rocky_cfg.policy.is_some();
             super::load::run_load(
                 config_path,
+                &loaded,
+                state_path,
                 None, // cli_source_dir — take from config
                 None, // format — take from config
                 None, // target_table — take from config
                 Some(pipeline_name),
                 false, // truncate — honour config only
+                if governed_with_policy {
+                    rocky_core::state_sync::FinalizeDurability::Durable
+                } else {
+                    rocky_core::state_sync::FinalizeDurability::ConfigDefault
+                },
                 output_json,
             )
             .await?;
@@ -5227,6 +5383,15 @@ pub(crate) async fn execute_backfill_set(
     // `config_hash` describes the executed snapshot too (formerly a separate
     // path re-read — #1120/F10).
     loaded: &rocky_core::config::LoadedConfig,
+    // WP-01 PR-B (2b, R3-4): the ONE backfill session, constructed + acquired
+    // + `require_synced` by the caller (`run_apply_backfill_plan`) BEFORE the
+    // policy gate. Moved in (not borrowed) so the executor owns the terminal
+    // half: capture the execution result → ALWAYS finalize → propagate. A
+    // second in-executor download here would wholesale-replace the replicated
+    // `POLICY_DECISIONS` table and erase the decision row the gate wrote
+    // between the caller's download and this execution — which is why the
+    // session arrives already-acquired instead of this function syncing.
+    session: rocky_core::state_sync::RemoteStateSession,
     state_path: &Path,
     models_dir: &Path,
     model_set: &std::collections::BTreeSet<String>,
@@ -5235,164 +5400,189 @@ pub(crate) async fn execute_backfill_set(
     exec_fp_gate: Option<&crate::commands::apply::ExecFingerprintGate>,
     output_json: bool,
 ) -> Result<()> {
-    if output_json {
-        crate::output::reserve_stdout_for_json();
-    }
+    // The whole body runs inside a captured block so EVERY exit — the early
+    // `ensure!`/adapter/store-open bails, the budget `?`, and the
+    // status-derived return — funnels through the single finalize below. The
+    // block's locals (including the open `StateStore`) drop before the
+    // finalize uploads.
+    let exec_result: Result<()> = async {
+        if output_json {
+            crate::output::reserve_stdout_for_json();
+        }
 
-    let rocky_cfg = &loaded.config;
-    let start = Instant::now();
-    let started_at = Utc::now();
-    let run_id = format!("run-{}", started_at.format("%Y%m%d-%H%M%S-%3f"));
-    let config_hash = loaded.fingerprint.clone();
+        let rocky_cfg = &loaded.config;
+        let start = Instant::now();
+        let started_at = Utc::now();
+        let run_id = format!("run-{}", started_at.format("%Y%m%d-%H%M%S-%3f"));
+        let config_hash = loaded.fingerprint.clone();
 
-    anyhow::ensure!(
-        models_dir.exists(),
-        "models directory '{}' not found (required for backfill)",
-        models_dir.display()
-    );
+        anyhow::ensure!(
+            models_dir.exists(),
+            "models directory '{}' not found (required for backfill)",
+            models_dir.display()
+        );
 
-    let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
-    // Mirror the `--model` path: the first transformation pipeline's target
-    // adapter, falling back to the first replication pipeline's.
-    let target_adapter_name = rocky_cfg
-        .pipelines
-        .values()
-        .find_map(|p| match p {
-            rocky_core::config::PipelineConfig::Transformation(t) => Some(t.target.adapter.clone()),
-            _ => None,
-        })
-        .or_else(|| {
-            rocky_cfg.pipelines.values().find_map(|p| match p {
-                rocky_core::config::PipelineConfig::Replication(r) => {
-                    Some(r.target.adapter.clone())
+        let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
+        // Mirror the `--model` path: the first transformation pipeline's target
+        // adapter, falling back to the first replication pipeline's.
+        let target_adapter_name = rocky_cfg
+            .pipelines
+            .values()
+            .find_map(|p| match p {
+                rocky_core::config::PipelineConfig::Transformation(t) => {
+                    Some(t.target.adapter.clone())
                 }
                 _ => None,
             })
-        })
-        .unwrap_or_else(|| "default".to_string());
+            .or_else(|| {
+                rocky_cfg.pipelines.values().find_map(|p| match p {
+                    rocky_core::config::PipelineConfig::Replication(r) => {
+                        Some(r.target.adapter.clone())
+                    }
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| "default".to_string());
 
-    let warehouse = adapter_registry.warehouse_adapter(&target_adapter_name)?;
-    let state_store = Some(
-        rocky_core::state::StateStore::open_with_policy(
-            state_path,
-            rocky_cfg.state.on_schema_mismatch,
+        let warehouse = adapter_registry.warehouse_adapter(&target_adapter_name)?;
+        let state_store = Some(
+            rocky_core::state::StateStore::open_with_policy(
+                state_path,
+                rocky_cfg.state.on_schema_mismatch,
+            )
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?,
+        );
+
+        let mut output = RunOutput::new(String::new(), 0, 1);
+
+        let schema_cache_cfg = rocky_cfg.cache.schemas.clone().with_ttl_override(None);
+        // A backfill is an explicit, reviewed rebuild order, so the plain skip
+        // gate must never adjudicate it — its signals (upstream `MAX(ts)` /
+        // rowcount) are blind to exactly the backdated corrections backfills
+        // exist to repair, and `[run] skip_unchanged = true` would otherwise
+        // silently no-op the whole approved recovery. `force_rebuild` makes the
+        // gate inert (`is_active()` = false) and pins the content-addressed
+        // column-skip off (belt over `backfill_reuse_gates`' suspenders), while
+        // point-to reuse stays governed by `backfill_reuse_gates` alone — a
+        // byte-identical reuse still satisfies a rebuild order.
+        let skip_gate = SkipGateConfig::resolve(
+            &SkipRunOptions {
+                force_rebuild: true,
+                ..Default::default()
+            },
+            &rocky_cfg.run,
+            false,
+        );
+        let run_vars = rocky_core::run_vars::RunVars::new();
+        // A backfill is an explicit rebuild order: point-to reuse may still
+        // satisfy it byte-identically, but the column-level skip never may.
+        let (reuse_enabled, column_level_enabled) = backfill_reuse_gates(rocky_cfg);
+
+        // Finding #1: baseline failures so a soft model failure skips governance.
+        let failures_before = output.tables_failed;
+        let exec_result = execute_models(
+            models_dir,
+            warehouse.as_ref(),
+            state_store.as_ref(),
+            partition_opts,
+            &run_id,
+            None, // selection is driven by `model_set`, not the single-name filter
+            Some(model_set),
+            &mut output,
+            None, // backfill has no pipeline hook context
+            None,
+            &schema_cache_cfg,
+            // Target schemas already exist (the closure was built before); do not
+            // auto-create, matching the `--model` entry point.
+            false,
+            &DeferOptions::default(),
+            skip_gate,
+            reuse_enabled,
+            column_level_enabled,
+            &run_vars,
+            rocky_cfg.resilience.clone(),
+            super::resilience::retry_policy_allows(rocky_cfg),
+            exec_fp_gate,
+            // Finding #4: a backfill reconciles only tags, not masks.
+            false,
         )
-        .with_context(|| format!("failed to open state store at {}", state_path.display()))?,
-    );
+        .await;
 
-    let mut output = RunOutput::new(String::new(), 0, 1);
+        match exec_result {
+            // Finding #1: only when the model phase is CLEAN (no new soft failures).
+            Ok(()) if output.tables_failed == failures_before => {
+                // Re-apply each rebuilt model's `[governance.tags]`, scoped to the
+                // closure so unrelated models are untouched.
+                let governance_adapter = adapter_registry.governance_adapter(&target_adapter_name);
+                for model in model_set {
+                    apply_model_governance_tags(
+                        models_dir,
+                        governance_adapter.as_ref(),
+                        rocky_cfg,
+                        &run_vars,
+                        Some(model.as_str()),
+                    )
+                    .await;
+                }
+                write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
+            }
+            // Soft model failure — skip governance/manifest, fall through.
+            Ok(()) => {}
+            Err(e) => {
+                output.tables_failed += 1;
+                output.errors.push(crate::output::TableErrorOutput {
+                    asset_key: vec!["backfill".to_string()],
+                    error: format!("{e:#}"),
+                    failure_kind: crate::output::FailureKind::Unknown,
+                    cooldown_seconds: None,
+                });
+            }
+        }
 
-    let schema_cache_cfg = rocky_cfg.cache.schemas.clone().with_ttl_override(None);
-    // A backfill is an explicit, reviewed rebuild order, so the plain skip
-    // gate must never adjudicate it — its signals (upstream `MAX(ts)` /
-    // rowcount) are blind to exactly the backdated corrections backfills
-    // exist to repair, and `[run] skip_unchanged = true` would otherwise
-    // silently no-op the whole approved recovery. `force_rebuild` makes the
-    // gate inert (`is_active()` = false) and pins the content-addressed
-    // column-skip off (belt over `backfill_reuse_gates`' suspenders), while
-    // point-to reuse stays governed by `backfill_reuse_gates` alone — a
-    // byte-identical reuse still satisfies a rebuild order.
-    let skip_gate = SkipGateConfig::resolve(
-        &SkipRunOptions {
-            force_rebuild: true,
-            ..Default::default()
-        },
-        &rocky_cfg.run,
-        false,
-    );
-    let run_vars = rocky_core::run_vars::RunVars::new();
-    // A backfill is an explicit rebuild order: point-to reuse may still
-    // satisfy it byte-identically, but the column-level skip never may.
-    let (reuse_enabled, column_level_enabled) = backfill_reuse_gates(rocky_cfg);
+        output.duration_ms = start.elapsed().as_millis() as u64;
 
-    // Finding #1: baseline failures so a soft model failure skips governance.
-    let failures_before = output.tables_failed;
-    let exec_result = execute_models(
-        models_dir,
-        warehouse.as_ref(),
-        state_store.as_ref(),
-        partition_opts,
-        &run_id,
-        None, // selection is driven by `model_set`, not the single-name filter
-        Some(model_set),
-        &mut output,
-        None, // backfill has no pipeline hook context
-        None,
-        &schema_cache_cfg,
-        // Target schemas already exist (the closure was built before); do not
-        // auto-create, matching the `--model` entry point.
-        false,
-        &DeferOptions::default(),
-        skip_gate,
-        reuse_enabled,
-        column_level_enabled,
-        &run_vars,
-        rocky_cfg.resilience.clone(),
-        super::resilience::retry_policy_allows(rocky_cfg),
-        exec_fp_gate,
-        // Finding #4: a backfill reconciles only tags, not masks.
-        false,
-    )
+        let adapter_type = rocky_cfg
+            .adapters
+            .get(&target_adapter_name)
+            .map(|a| a.adapter_type.clone())
+            .unwrap_or_default();
+        output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
+        let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
+
+        let audit_ctx = AuditContext::detect(None, None);
+        let audit = audit_to_record(&audit_ctx);
+        persist_run_record(
+            state_store.as_ref(),
+            &output,
+            &run_id,
+            started_at,
+            &config_hash,
+            &audit,
+        );
+
+        output.status = output.derive_run_status();
+        if output_json {
+            print_json(&output)?;
+        }
+        budget_result?;
+        run_status_exit_result(&output, &run_id)
+    }
     .await;
 
-    match exec_result {
-        // Finding #1: only when the model phase is CLEAN (no new soft failures).
-        Ok(()) if output.tables_failed == failures_before => {
-            // Re-apply each rebuilt model's `[governance.tags]`, scoped to the
-            // closure so unrelated models are untouched.
-            let governance_adapter = adapter_registry.governance_adapter(&target_adapter_name);
-            for model in model_set {
-                apply_model_governance_tags(
-                    models_dir,
-                    governance_adapter.as_ref(),
-                    rocky_cfg,
-                    &run_vars,
-                    Some(model.as_str()),
-                )
-                .await;
-            }
-            write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
-        }
-        // Soft model failure — skip governance/manifest, fall through.
-        Ok(()) => {}
-        Err(e) => {
-            output.tables_failed += 1;
-            output.errors.push(crate::output::TableErrorOutput {
-                asset_key: vec!["backfill".to_string()],
-                error: format!("{e:#}"),
-                failure_kind: crate::output::FailureKind::Unknown,
-                cooldown_seconds: None,
-            });
-        }
-    }
-
-    output.duration_ms = start.elapsed().as_millis() as u64;
-
-    let adapter_type = rocky_cfg
-        .adapters
-        .get(&target_adapter_name)
-        .map(|a| a.adapter_type.clone())
-        .unwrap_or_default();
-    output.populate_cost_summary(&adapter_type, &rocky_cfg.cost);
-    let budget_result = output.check_and_record_budget(&rocky_cfg.budget, Some(&run_id));
-
-    let audit_ctx = AuditContext::detect(None, None);
-    let audit = audit_to_record(&audit_ctx);
-    persist_run_record(
-        state_store.as_ref(),
-        &output,
-        &run_id,
-        started_at,
-        &config_hash,
-        &audit,
-    );
-
-    output.status = output.derive_run_status();
-    if output_json {
-        print_json(&output)?;
-    }
-    budget_result?;
-    run_status_exit_result(&output, &run_id)
+    // WP-01 PR-B (2b): ALWAYS finalize — even when the backfill failed. A
+    // mid-run failure can still have committed run/artifact/provenance rows
+    // locally, and skipping the upload would let the next run's start-download
+    // silently revert them (the contract the deleted
+    // `upload_remote_ledger_fail_closed`-even-on-failure call in
+    // `run_apply_backfill_plan` used to provide). `Durable` forces the upload
+    // fail-closed regardless of the configured liveness default, and a
+    // finalize failure takes precedence over the captured execution error —
+    // parity with the old `upload…?` before `exec_result`.
+    session
+        .finalize()
+        .await
+        .with_context(|| "failed to upload remote state after backfill apply (fail-closed)")?;
+    exec_result
 }
 
 #[tracing::instrument(skip_all, name = "execute_models")]

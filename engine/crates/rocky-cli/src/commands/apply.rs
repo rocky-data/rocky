@@ -37,10 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use rocky_core::config::{
-    PolicyCapability, PolicyEffect, PolicyPrincipal, StateBackend, StateConfig,
-    StateUploadFailureMode,
-};
+use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal, StateBackend};
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::schema::SchemaPattern;
 use rocky_core::state::{PolicyDecisionRecord, StateStore};
@@ -851,16 +848,17 @@ pub(crate) async fn sync_remote_ledger_before_gate(
     let Some(state_cfg) = remote_state_backend_for_gate(cfg, touched) else {
         return Ok(());
     };
-    // PR-A (RD-001): bind the typed authority — a successful download of either
-    // usable variant means the local ledger now mirrors remote truth; failure
-    // still `?`-bails fail-closed (unchanged). PR-B branches on the value.
-    let _authority = rocky_core::state_sync::download_state(&state_cfg, state_path)
-        .await
-        .with_context(|| {
-            "failed to download remote state before the agent-policy gate; a remote-backend \
+    // WP-01 PR-B (2b): the session half-seam owns the download shape; a
+    // successful download of either usable variant means the local ledger now
+    // mirrors remote truth; failure still `?`-bails fail-closed (unchanged).
+    let _authority =
+        rocky_core::state_sync::RemoteStateSession::download_only(&state_cfg, state_path)
+            .await
+            .with_context(|| {
+                "failed to download remote state before the agent-policy gate; a remote-backend \
              governed apply requires the state backend reachable so a cross-pod freeze/budget \
              decision is enforced"
-        })?;
+            })?;
     Ok(())
 }
 
@@ -879,9 +877,9 @@ fn sync_remote_ledger_before_gate_blocking(
     let Some(state_cfg) = remote_state_backend_for_gate(cfg, touched) else {
         return Ok(());
     };
-    // PR-A (RD-001): bind the typed authority — see `sync_remote_ledger_before_gate`.
+    // WP-01 PR-B (2b): half-seam download — see `sync_remote_ledger_before_gate`.
     let _authority = crate::commands::policy::block_on_state_sync(
-        rocky_core::state_sync::download_state(&state_cfg, state_path),
+        rocky_core::state_sync::RemoteStateSession::download_only(&state_cfg, state_path),
     )
     .with_context(|| {
         "failed to download remote state before the promote policy gate; a remote-backend \
@@ -910,16 +908,17 @@ pub(crate) async fn download_remote_ledger_unconditional(
     if matches!(cfg.state.backend, StateBackend::Local) {
         return Ok(());
     }
-    // PR-A (RD-001): bind the typed authority — see `sync_remote_ledger_before_gate`.
-    let _authority = rocky_core::state_sync::download_state(&cfg.state, state_path)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to download remote state before {context_label}; a remote-backend \
+    // WP-01 PR-B (2b): half-seam download — see `sync_remote_ledger_before_gate`.
+    let _authority =
+        rocky_core::state_sync::RemoteStateSession::download_only(&cfg.state, state_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to download remote state before {context_label}; a remote-backend \
                  {context_label} requires the state backend reachable to read the authoritative \
                  ledger"
-            )
-        })?;
+                )
+            })?;
     Ok(())
 }
 
@@ -940,15 +939,16 @@ pub(crate) async fn upload_remote_ledger_fail_closed(
     if matches!(cfg.state.backend, StateBackend::Local) {
         return Ok(());
     }
-    let upload_cfg = StateConfig {
-        on_upload_failure: StateUploadFailureMode::Fail,
-        ..cfg.state.clone()
-    };
-    rocky_core::state_sync::upload_state(&upload_cfg, state_path)
-        .await
-        .with_context(|| {
-            format!("failed to upload remote state after {context_label} (fail-closed)")
-        })?;
+    // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability policy.
+    rocky_core::state_sync::RemoteStateSession::upload_only_fail_closed(
+        &cfg.state,
+        state_path,
+        context_label,
+    )
+    .await
+    .with_context(|| {
+        format!("failed to upload remote state after {context_label} (fail-closed)")
+    })?;
     Ok(())
 }
 
@@ -2594,129 +2594,180 @@ async fn run_apply_backfill_plan(
     // engine composed and will execute (see `execute_backfill_set` below), not
     // an informational hint — gate on it directly.
     let touched = touched_models_for_run(&plan, &run_plan.models);
-    // Finding 2c (download-before): a backfill writes on top of the artifact/run/
-    // provenance ledger, so pull the authoritative remote state UNCONDITIONALLY
-    // for a remote backend (fail-closed) — not gated on policy — so it neither
-    // reads stale local state nor clobbers newer remote state on the upload-after.
-    // This also refreshes the freeze ledger the gate reads.
-    download_remote_ledger_unconditional(
-        cfg.as_ref().map(|l| &l.config),
+    // WP-01 PR-B (2b, R3-4): ONE session for the whole backfill apply,
+    // acquired BEFORE the policy gate and threaded into
+    // `execute_backfill_set` (which owns the always-finalize terminal half).
+    // This replaces the unconditional `download_remote_ledger_unconditional`
+    // that stood here: a backfill writes on top of the artifact/run/provenance
+    // ledger, so the download is unconditional for a remote backend (not
+    // gated on policy) and fail-closed via `require_synced` — and it must
+    // happen exactly ONCE, here. A second in-executor download after the gate
+    // would wholesale-replace the replicated `POLICY_DECISIONS` table
+    // (downloads replace replicated tables) and erase the decision row the
+    // policy gate below writes between the two downloads — the decision must
+    // survive to the terminal upload. `Durable`: a backfill is always
+    // review-gated, so a lost terminal upload must fail the apply.
+    let backfill_state_cfg = cfg
+        .as_ref()
+        .map(|l| l.config.state.clone())
+        .unwrap_or_default();
+    let mut session = rocky_core::state_sync::RemoteStateSession::new(
+        &backfill_state_cfg,
         state_path,
-        "backfill apply",
-    )
-    .await?;
-    let gate = evaluate_apply_policy_with_policy(
-        cfg.as_ref().and_then(|l| l.config.policy.as_ref()),
-        plan_id,
-        plan.enforcement_principal(runtime_principal),
-        &touched,
-        models_dir,
-        state_path,
+        rocky_core::state_sync::FinalizeDurability::Durable,
     );
-    if let PolicyGate::Deny {
-        model,
-        rule_id,
-        reason,
-    } = gate
-    {
-        let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
-        bail!(
-            "policy DENIES backfill plan '{plan_id}': model '{model}'{rule} — {reason}. \
-             A deny cannot be satisfied by review; re-scope the backfill or have a \
-             human apply it."
+    if let Err(e) = session.acquire().await {
+        // Unreachable on a fresh session (`Err` = double-acquire misuse);
+        // consume defensively so no exit path can leak the session.
+        session.abandon("backfill acquire misuse").await;
+        return Err(e.into());
+    }
+    if let Err(e) = session.require_synced() {
+        session
+            .abandon("backfill download failure (fail-closed)")
+            .await;
+        return Err(anyhow::Error::new(e).context(
+            "failed to download remote state before backfill apply; a remote-backend \
+             backfill apply requires the state backend reachable to read the authoritative \
+             ledger",
+        ));
+    }
+
+    // Gate + preparation, captured so EVERY pre-execution refusal (policy
+    // deny, malformed plan window, snapshot preflight, routing mismatch,
+    // unloadable config) consumes the session before returning — a refused
+    // apply mutated nothing this session must persist, so it abandons
+    // (no upload), matching the old shape where the upload-after only ran
+    // once execution had been reached.
+    #[allow(clippy::type_complexity)]
+    let prep: Result<(
+        BTreeSet<String>,
+        crate::commands::run::PartitionRunOptions,
+        Option<ExecFingerprintGate>,
+        rocky_core::config::LoadedConfig,
+    )> = (|| {
+        let gate = evaluate_apply_policy_with_policy(
+            cfg.as_ref().and_then(|l| l.config.policy.as_ref()),
+            plan_id,
+            plan.enforcement_principal(runtime_principal),
+            &touched,
+            models_dir,
+            state_path,
         );
-    }
-
-    let set: BTreeSet<String> = run_plan.models.iter().cloned().collect();
-    if set.is_empty() {
-        bail!("backfill plan '{plan_id}' names no models to rebuild");
-    }
-
-    // A half-open window must never execute: `to_selection` only yields a
-    // Range when BOTH bounds are present, so a lone bound would silently fall
-    // through to `PartitionSelection::Latest` — rebuilding one partition of a
-    // scope the reviewer approved as "from January". The CLI now rejects lone
-    // bounds at parse time; this guards plans persisted before that (or
-    // hand-authored plan files).
-    if run_plan.partition_from.is_some() != run_plan.partition_to.is_some() {
-        bail!(
-            "backfill plan '{plan_id}' carries a half-open partition window \
-             (from: {:?}, to: {:?}) — executing it would rebuild only the \
-             latest partition, not the approved range. Re-compose the backfill \
-             with both --from and --to (or neither).",
-            run_plan.partition_from,
-            run_plan.partition_to,
-        );
-    }
-
-    // Only the partition window carries over — a backfill never resumes,
-    // shadows, or runs `--latest`/`--missing`.
-    let partition_opts = crate::commands::run::PartitionRunOptions {
-        partition: None,
-        from: run_plan.partition_from.clone(),
-        to: run_plan.partition_to.clone(),
-        latest: false,
-        missing: false,
-        lookback: None,
-        parallel: run_plan.parallel,
-    };
-
-    // Governed-apply TOCTOU gate (E) for the backfill path — an agent backfill
-    // apply refuses if the compiled IR / config changed since the plan.
-    let governed = governed_run_context(
-        &plan,
-        plan.enforcement_principal(runtime_principal),
-        plan_id,
-        root,
-        config_path,
-        // A backfill executes its `model_set`; carry the reviewed-set signal (it
-        // routes through `execute_backfill_set`, not the seam-guarded legs, but
-        // keep the derivation consistent).
-        !run_plan.models.is_empty(),
-    );
-    // ‼️ Finding #2: a backfill ALWAYS executes models (its `model_set`) —
-    // preflight the reviewed source-schema snapshot before any warehouse mutation.
-    preflight_snapshot(governed.as_ref(), plan_id, true)?;
-    // Finding 1: the routing verification below runs against the SAME `cfg`
-    // snapshot the gate/sync used — not a fresh `backfill_cfg` reload.
-    let exec_fp_gate = match (governed.as_ref(), cfg.as_ref()) {
-        (Some(ctx), Some(l)) => {
-            // Fail-closed (#4/#5): verify the routing identity before executing.
-            ctx.verify_routing_identity(&l.config)?;
-            // The governance identity resolves the plan's persisted `--env` (a
-            // backfill persists `None`), matching the plan-side fingerprint.
-            Some(ctx.exec_fingerprint_gate(&l.config, run_plan.env.as_deref()))
+        if let PolicyGate::Deny {
+            model,
+            rule_id,
+            reason,
+        } = gate
+        {
+            let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+            bail!(
+                "policy DENIES backfill plan '{plan_id}': model '{model}'{rule} — {reason}. \
+                 A deny cannot be satisfied by review; re-scope the backfill or have a \
+                 human apply it."
+            );
         }
-        // Fail-closed (#7): a governed backfill whose config would not load
-        // cannot be routing-verified — refuse rather than execute ungated.
-        (Some(_), None) => bail!(
-            "refusing to apply governed backfill plan '{plan_id}': the config at {} could not be \
-             loaded, so the execution's routing/identity cannot be verified against the plan. \
-             Fix the config and re-run `rocky apply {plan_id}`.",
-            config_path.display()
-        ),
-        _ => None,
-    };
 
-    // Execute-from-owned (finding B): hand the SAME verified snapshot
-    // `verify_routing_identity` checked to `execute_backfill_set`, rather than a
-    // reload a timed `rocky.toml` swap could redirect. A config that will not load
-    // cannot be executed against; bail.
-    let loaded = cfg.with_context(|| {
-        format!(
-            "failed to load config from {} (required for backfill)",
-            config_path.display()
-        )
-    })?;
+        let set: BTreeSet<String> = run_plan.models.iter().cloned().collect();
+        if set.is_empty() {
+            bail!("backfill plan '{plan_id}' names no models to rebuild");
+        }
+
+        // A half-open window must never execute: `to_selection` only yields a
+        // Range when BOTH bounds are present, so a lone bound would silently fall
+        // through to `PartitionSelection::Latest` — rebuilding one partition of a
+        // scope the reviewer approved as "from January". The CLI now rejects lone
+        // bounds at parse time; this guards plans persisted before that (or
+        // hand-authored plan files).
+        if run_plan.partition_from.is_some() != run_plan.partition_to.is_some() {
+            bail!(
+                "backfill plan '{plan_id}' carries a half-open partition window \
+                 (from: {:?}, to: {:?}) — executing it would rebuild only the \
+                 latest partition, not the approved range. Re-compose the backfill \
+                 with both --from and --to (or neither).",
+                run_plan.partition_from,
+                run_plan.partition_to,
+            );
+        }
+
+        // Only the partition window carries over — a backfill never resumes,
+        // shadows, or runs `--latest`/`--missing`.
+        let partition_opts = crate::commands::run::PartitionRunOptions {
+            partition: None,
+            from: run_plan.partition_from.clone(),
+            to: run_plan.partition_to.clone(),
+            latest: false,
+            missing: false,
+            lookback: None,
+            parallel: run_plan.parallel,
+        };
+
+        // Governed-apply TOCTOU gate (E) for the backfill path — an agent backfill
+        // apply refuses if the compiled IR / config changed since the plan.
+        let governed = governed_run_context(
+            &plan,
+            plan.enforcement_principal(runtime_principal),
+            plan_id,
+            root,
+            config_path,
+            // A backfill executes its `model_set`; carry the reviewed-set signal (it
+            // routes through `execute_backfill_set`, not the seam-guarded legs, but
+            // keep the derivation consistent).
+            !run_plan.models.is_empty(),
+        );
+        // ‼️ Finding #2: a backfill ALWAYS executes models (its `model_set`) —
+        // preflight the reviewed source-schema snapshot before any warehouse mutation.
+        preflight_snapshot(governed.as_ref(), plan_id, true)?;
+        // Finding 1: the routing verification below runs against the SAME `cfg`
+        // snapshot the gate/sync used — not a fresh `backfill_cfg` reload.
+        let exec_fp_gate = match (governed.as_ref(), cfg.as_ref()) {
+            (Some(ctx), Some(l)) => {
+                // Fail-closed (#4/#5): verify the routing identity before executing.
+                ctx.verify_routing_identity(&l.config)?;
+                // The governance identity resolves the plan's persisted `--env` (a
+                // backfill persists `None`), matching the plan-side fingerprint.
+                Some(ctx.exec_fingerprint_gate(&l.config, run_plan.env.as_deref()))
+            }
+            // Fail-closed (#7): a governed backfill whose config would not load
+            // cannot be routing-verified — refuse rather than execute ungated.
+            (Some(_), None) => bail!(
+                "refusing to apply governed backfill plan '{plan_id}': the config at {} could not be \
+                 loaded, so the execution's routing/identity cannot be verified against the plan. \
+                 Fix the config and re-run `rocky apply {plan_id}`.",
+                config_path.display()
+            ),
+            _ => None,
+        };
+
+        // Execute-from-owned (finding B): hand the SAME verified snapshot
+        // `verify_routing_identity` checked to `execute_backfill_set`, rather than a
+        // reload a timed `rocky.toml` swap could redirect. A config that will not load
+        // cannot be executed against; bail.
+        let loaded = cfg.with_context(|| {
+            format!(
+                "failed to load config from {} (required for backfill)",
+                config_path.display()
+            )
+        })?;
+        Ok((set, partition_opts, exec_fp_gate, loaded))
+    })();
+    let (set, partition_opts, exec_fp_gate, loaded) = match prep {
+        Ok(v) => v,
+        Err(e) => {
+            session.abandon("backfill refused before execution").await;
+            return Err(e);
+        }
+    };
 
     // Finding 5: a backfill MUTATES the warehouse + local ledger (run/artifact/
     // provenance rows) as it executes, so a mid-run failure can still have
-    // committed state. CAPTURE the result (don't `?` it) and ALWAYS run the
-    // fail-closed upload-after before returning — otherwise a failed backfill
-    // leaves its partial mutations local-only, and the next run's start-download
-    // silently reverts them. The upload is not gated on success.
-    let exec_result = crate::commands::run::execute_backfill_set(
+    // committed state. The session moves into `execute_backfill_set`, whose
+    // capture-result → ALWAYS-finalize → propagate shape preserves the old
+    // unconditional fail-closed upload-after (the upload is not gated on
+    // success).
+    crate::commands::run::execute_backfill_set(
         &loaded,
+        session,
         state_path,
         models_dir,
         &set,
@@ -2725,13 +2776,7 @@ async fn run_apply_backfill_plan(
         output_json,
     )
     .await
-    .with_context(|| format!("rocky apply backfill plan '{plan_id}' failed"));
-
-    // Finding 2c + 5 (upload-after, unconditional): push whatever the backfill
-    // wrote to local state to the remote backend (fail-closed) so it is durable.
-    upload_remote_ledger_fail_closed(Some(&loaded.config), state_path, "backfill apply").await?;
-
-    exec_result
+    .with_context(|| format!("rocky apply backfill plan '{plan_id}' failed"))
 }
 
 /// Apply a `PlanKind::Replication` plan by re-running discovery, asserting
