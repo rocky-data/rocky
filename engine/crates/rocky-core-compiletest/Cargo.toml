@@ -1,0 +1,22 @@
+[package]
+name = "rocky-core-compiletest"
+version = "0.0.0"
+description = "Compile-fail (trybuild) guards for rocky-core's #[must_use] boundaries"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# `rocky-core` is the crate whose public API the compile-fail cases exercise.
+# `trybuild` copies these `[dependencies]` into the case project it builds, so
+# the cases can `use rocky_core::...`. Deliberately NOT depending on
+# `rocky-duckdb` (a rocky-core *dev*-dependency): that is exactly the heavyweight
+# build this crate exists to keep out of `target/tests/trybuild/`.
+[dependencies]
+rocky-core = { path = "../rocky-core" }
+
+[dev-dependencies]
+trybuild = { workspace = true }
+
+[lints]
+workspace = true
