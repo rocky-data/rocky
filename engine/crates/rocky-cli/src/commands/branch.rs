@@ -773,17 +773,19 @@ pub(crate) fn run_breaking_change_gate_for_plan(
 ///
 /// Stops on the first failure (same policy as the bare-verb path).
 pub(crate) async fn run_promote_apply(
-    config_path: &Path,
+    // The gate-verified config snapshot threaded from `gate_promote_plan`
+    // (#1120): the adapter/destination the promote SQL executes against is
+    // resolved from THIS instance — this function performs NO config load of
+    // its own (its former reload was a swap window that could redirect the
+    // promote at a warehouse the gate never verified).
+    loaded: &rocky_core::config::LoadedConfig,
     targets: &[crate::output::PromoteTargetPlan],
 ) -> Result<(Vec<crate::output::PromoteTarget>, bool)> {
     use crate::registry::AdapterRegistry;
 
-    let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
-        "failed to load config from {}",
-        config_path.display()
-    ))?;
-    let registry = AdapterRegistry::from_config(&rocky_cfg)?;
-    let (_pipeline_name, pipeline) = crate::registry::resolve_pipeline(&rocky_cfg, None)?;
+    let rocky_cfg = &loaded.config;
+    let registry = AdapterRegistry::from_config(rocky_cfg)?;
+    let (_pipeline_name, pipeline) = crate::registry::resolve_pipeline(rocky_cfg, None)?;
     let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
 
     let mut targets_out: Vec<crate::output::PromoteTarget> = Vec::new();
@@ -1655,8 +1657,10 @@ pub async fn run_branch_promote_from_plan(
     // any target SQL executes — the same gate `rocky apply <promote-plan>`
     // runs. Without this, an agent-authored Promote plan a `deny agent promote`
     // rule (or freeze) would refuse could still execute here directly. The
-    // plan's stamped principal binds (an agent plan evaluates as agent).
-    crate::commands::apply::gate_promote_plan(
+    // plan's stamped principal binds (an agent plan evaluates as agent). The
+    // gate returns the ONE config snapshot it verified; `run_promote_apply`
+    // below resolves its adapter from that same instance (#1120).
+    let loaded = crate::commands::apply::gate_promote_plan(
         root,
         config_path,
         plan_id,
@@ -1684,8 +1688,7 @@ pub async fn run_branch_promote_from_plan(
         breaking_changes: None,
     });
 
-    let (targets_out, overall_success) =
-        run_promote_apply(config_path, &promote_plan.targets).await?;
+    let (targets_out, overall_success) = run_promote_apply(&loaded, &promote_plan.targets).await?;
 
     audit.push(AuditEvent {
         kind: if overall_success {
@@ -2908,6 +2911,94 @@ adapter = "default"
                 "warehouse.marts.dim_customers <- warehouse.branch__fix-price.dim_customers"
             ),
             "dim_customers pairing missing: {fqns:?}"
+        );
+    }
+
+    /// WP-01 PR-B swap drill (#1120, Codex F5): a `rocky.toml` swap between
+    /// the promote GATE and the promote EXECUTOR cannot redirect the promote
+    /// SQL at a different warehouse. `gate_promote_plan` loads config A
+    /// (warehouse `a.duckdb`) and returns the owned snapshot; the on-disk
+    /// file is then swapped to config B (`b.duckdb`); `run_promote_apply`
+    /// executes from the THREADED snapshot, so the statement lands in
+    /// `a.duckdb` and `b.duckdb` is never even created.
+    ///
+    /// RED before this stage: `run_promote_apply` re-loaded `rocky.toml`
+    /// internally (the old branch.rs reload), so the swapped config B's
+    /// adapter was resolved and the statement executed against `b.duckdb`.
+    #[tokio::test]
+    async fn promote_swap_cannot_redirect_adapter() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let a_db = dir.join("a.duckdb");
+        let b_db = dir.join("b.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+
+        let config_for = |db: &std::path::Path| {
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.t]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.t.target]\nadapter = \"default\"\n",
+                db.display()
+            )
+        };
+        std::fs::write(&config_path, config_for(&a_db)).unwrap();
+
+        let promote_plan = crate::output::PromotePlan {
+            branch_name: "fix-price".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "deadbeef".to_string(),
+            branch_state_hash: "hash".to_string(),
+            approvals_used: Vec::new(),
+            approvals_rejected: Vec::new(),
+            breaking_changes: None,
+            allow_breaking: false,
+            targets: vec![crate::output::PromoteTargetPlan {
+                target: "main.promoted".to_string(),
+                source: "main.branch_src".to_string(),
+                statement: "CREATE TABLE promoted AS SELECT 42 AS answer".to_string(),
+            }],
+            plan_audit: Vec::new(),
+            created_at: Utc::now(),
+        };
+
+        // GATE: loads config A (fingerprinted) and returns the owned snapshot.
+        // No `[policy]` block ⇒ NotConfigured ⇒ allowed (human promote).
+        let loaded = crate::commands::apply::gate_promote_plan(
+            dir,
+            &config_path,
+            "plan-swap-drill",
+            rocky_core::config::PolicyPrincipal::Human,
+            &promote_plan,
+            &state_path,
+        )
+        .expect("an ungoverned promote gate allows and returns the snapshot");
+
+        // SWAP: point the on-disk config at a DIFFERENT physical warehouse.
+        std::fs::write(&config_path, config_for(&b_db)).unwrap();
+
+        // EXECUTE from the threaded snapshot.
+        let (targets_out, ok) = run_promote_apply(&loaded, &promote_plan.targets)
+            .await
+            .expect("promote apply executes");
+        assert!(ok, "the promote statement must succeed: {targets_out:?}");
+
+        // The statement executed against A's warehouse …
+        let a = DuckDbWarehouseAdapter::open(&a_db).unwrap();
+        let conn = a.shared_connector();
+        let guard = conn.lock().unwrap();
+        let out = guard
+            .execute_sql("SELECT answer FROM promoted")
+            .expect("config A's warehouse holds the promoted table");
+        assert_eq!(out.rows.len(), 1);
+
+        // … and the swapped-in B warehouse was never touched (the executor
+        // performed no config reload, so B's adapter was never constructed).
+        assert!(
+            !b_db.exists(),
+            "the swap must not redirect the promote: b.duckdb must never be created"
         );
     }
 

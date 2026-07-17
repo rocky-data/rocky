@@ -1073,6 +1073,9 @@ mod tests {
         };
         super::super::run::run(
             config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap(),
+            ),
             None, // filter
             None, // pipeline_name_arg — single pipeline resolves
             state_path,
@@ -1261,6 +1264,9 @@ auto_create_schemas = true
         let opts = PartitionRunOptions::default();
         super::super::run::run(
             &config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            ),
             None, // filter
             None, // pipeline_name_arg — single pipeline resolves
             &state_path,
@@ -1420,6 +1426,9 @@ auto_create_schemas = true
         let opts = PartitionRunOptions::default();
         super::super::run::run(
             &config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            ),
             None,
             None,
             &state_path,
@@ -1497,6 +1506,9 @@ auto_create_schemas = true
         let opts = PartitionRunOptions::default();
         let result = super::super::run::run(
             &config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            ),
             None,
             None,
             &state_path,

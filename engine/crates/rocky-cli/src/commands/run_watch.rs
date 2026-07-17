@@ -245,6 +245,10 @@ pub async fn run_watch(
 /// `Interrupted` (inner SIGINT) is treated like any other run error here;
 /// the outer loop's own `ctrl_c` arm will pick up a *second* SIGINT to
 /// exit the watcher itself.
+///
+/// Returns the fingerprint of the config snapshot this iteration loaded
+/// (`None` when the load failed), so the per-iteration-reload contract is
+/// directly testable. Production callers ignore it.
 #[allow(clippy::too_many_arguments)]
 async fn iter_once(
     config_path: &Path,
@@ -260,10 +264,32 @@ async fn iter_once(
     cache_ttl_override: Option<u64>,
     env: Option<&str>,
     skip_opts: &super::run::SkipRunOptions,
-) {
+) -> Option<String> {
     let started = std::time::Instant::now();
+    // Load the config FRESH for THIS iteration — deliberately NEVER hoisted
+    // above the watch loop into a single load (#1120 threads ONE snapshot per
+    // invocation, and for `--watch` the invocation is the iteration): editing
+    // `rocky.toml` mid-watch must take effect on the next iteration
+    // (live-reload, the pre-existing behavior of `run()`'s internal load),
+    // and a broken config must fail only this iteration — logged via the
+    // same "[watch] run failed" line the inner run's load error used to
+    // produce — with the watcher continuing.
+    let loaded = match rocky_core::config::load_rocky_config_fingerprinted(config_path) {
+        Ok(loaded) => std::sync::Arc::new(loaded),
+        Err(e) => {
+            let elapsed_ms = started.elapsed().as_millis();
+            let e = anyhow::Error::new(e).context(format!(
+                "failed to load config from {}",
+                config_path.display()
+            ));
+            eprintln!("[watch] run failed in {elapsed_ms}ms: {e:#}");
+            return None;
+        }
+    };
+    let fingerprint = loaded.fingerprint.clone();
     let result = run(
         config_path,
+        loaded,
         filter,
         pipeline_name_arg,
         state_path,
@@ -311,6 +337,7 @@ async fn iter_once(
             eprintln!("[watch] run failed in {elapsed_ms}ms: {e:#}");
         }
     }
+    Some(fingerprint)
 }
 
 /// Filter incoming filesystem events against the watcher's relevant set.
@@ -474,6 +501,84 @@ mod tests {
         // Sleep elapsed at least the debounce window.
         assert!(start.elapsed() >= Duration::from_millis(DEBOUNCE_MS));
         assert_eq!(drained.len(), 2);
+    }
+
+    /// WP-01 PR-B (#1120 / watch live-reload): `iter_once` loads the config
+    /// FRESH each iteration — two iterations straddling a `rocky.toml` edit
+    /// observe different fingerprints, and a broken config fails only its own
+    /// iteration (returns `None`, never panics/propagates). This is the
+    /// executable pin for the "never hoist one load above the loop" comment
+    /// in `iter_once`.
+    ///
+    /// The inner `run()` fails fast here (no pipeline is configured) — that's
+    /// fine: `iter_once` swallows run errors by contract, and the property
+    /// under test is the per-iteration config load, which happens before it.
+    /// Write `body` to the watched config and drive one watch iteration,
+    /// returning the fingerprint that iteration loaded (`iter_once`'s own
+    /// return).
+    async fn drive_iteration(config_path: &Path, state_path: &Path, body: &str) -> Option<String> {
+        std::fs::write(config_path, body).unwrap();
+        iter_once(
+            config_path,
+            None,
+            None,
+            state_path,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            &super::super::run::SkipRunOptions::default(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn iter_once_reloads_the_config_every_iteration() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join(".rocky-state.redb");
+
+        let fp1 = drive_iteration(
+            &config_path,
+            &state_path,
+            "[adapter.db]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n# v1\n",
+        )
+        .await;
+        let fp2 = drive_iteration(
+            &config_path,
+            &state_path,
+            "[adapter.db]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n# v2\n",
+        )
+        .await;
+        assert!(
+            fp1.is_some() && fp2.is_some(),
+            "both iterations must load their config snapshot"
+        );
+        assert_ne!(
+            fp1, fp2,
+            "an edit between iterations must be observed by the next iteration \
+             (fresh load per iteration — the load is never hoisted above the loop)"
+        );
+
+        // A broken config fails only this iteration: no panic, no propagation.
+        let fp3 = drive_iteration(&config_path, &state_path, "this is [not toml").await;
+        assert_eq!(fp3, None, "a broken config yields no snapshot");
+
+        // ...and the next iteration recovers with a fresh, successful load.
+        let fp4 = drive_iteration(
+            &config_path,
+            &state_path,
+            "[adapter.db]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n# v1\n",
+        )
+        .await;
+        assert_eq!(
+            fp4, fp1,
+            "identical bytes reproduce the identical fingerprint"
+        );
     }
 
     /// Mirror of the production drain logic. Kept as a free fn so the

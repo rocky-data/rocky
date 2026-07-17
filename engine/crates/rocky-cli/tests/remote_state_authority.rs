@@ -106,8 +106,14 @@ async fn drive_run(
     state_path: &Path,
     assume_fresh_state: bool,
 ) -> anyhow::Result<()> {
+    // PR-B: `run` executes from the caller's owned fingerprinted snapshot;
+    // this driver loads it the way every production entry point does.
+    let loaded = std::sync::Arc::new(rocky_core::config::load_rocky_config_fingerprinted(
+        config_path,
+    )?);
     rocky_cli::commands::run(
         config_path,
+        loaded,
         None, // filter
         None, // pipeline_name_arg — single pipeline resolves
         state_path,

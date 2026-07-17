@@ -1170,7 +1170,18 @@ pub(crate) fn resolve_replication_authority(
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run", fields(run_id))]
 pub async fn run(
+    // Kept for directory resolution and sub-paths (models dir defaults,
+    // hooks, the DAG replay) — NEVER re-read as a config: the parsed config
+    // and its fingerprint arrive via `loaded` below.
     config_path: &Path,
+    // The caller's ONE fingerprinted config snapshot (#1120 config-swap
+    // TOCTOU). Every internal config read — idempotency dispatch, the main
+    // run body, the end-of-run retention sweep — and the recorded
+    // `RunRecord::config_hash` come from THIS instance, so a `rocky.toml`
+    // swap timed after the caller's gate can neither redirect execution nor
+    // stamp a fingerprint that differs from what executed. `Arc` so the DAG
+    // runner shares one snapshot across every sub-run.
+    loaded: std::sync::Arc<rocky_core::config::LoadedConfig>,
     filter: Option<&str>,
     pipeline_name_arg: Option<&str>,
     state_path: &Path,
@@ -1265,11 +1276,9 @@ pub async fn run(
     // -------------------------------------------------------------------
     // Idempotency check + claim (before any state mutation / run_id mint).
     // Dispatch on the configured state backend; short-circuit with a typed
-    // `RunOutput` + exit 0 when the key dedups.
+    // `RunOutput` + exit 0 when the key dedups. Reads the threaded snapshot
+    // (formerly a separate disk load — #1120).
     // -------------------------------------------------------------------
-    let rocky_cfg_for_idemp = rocky_core::config::load_rocky_config(config_path).context(
-        format!("failed to load config from {}", config_path.display()),
-    )?;
 
     // OTLP **metrics** exporter (feature-gated). Auto-initialises when
     // `OTEL_EXPORTER_OTLP_ENDPOINT` is set so operators can opt in by
@@ -1288,14 +1297,8 @@ pub async fn run(
 
     let mut idempotency_ctx = match idempotency_key {
         Some(key) => {
-            match try_claim_idempotency(
-                &rocky_cfg_for_idemp.state,
-                state_path,
-                key,
-                &run_id,
-                output_json,
-            )
-            .await?
+            match try_claim_idempotency(&loaded.config.state, state_path, key, &run_id, output_json)
+                .await?
             {
                 IdempotencyOutcome::Skipped => return Ok(()),
                 IdempotencyOutcome::Proceed(ctx) => Some(ctx),
@@ -1326,12 +1329,12 @@ pub async fn run(
         p.log("INFO", "rocky run starting");
     }
 
-    // Load config (v2 format)
-    let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
-        "failed to load config from {}",
-        config_path.display()
-    ))?;
-    let config_hash = crate::output::config_fingerprint(config_path);
+    // The caller's threaded snapshot (formerly a second disk load — #1120).
+    // The fingerprint was captured over the exact bytes THIS config parsed
+    // from, so `RunRecord::config_hash` always describes the executed config
+    // (the F10 gate-path fix), never a re-read a swap could redirect.
+    let rocky_cfg = &loaded.config;
+    let config_hash = loaded.fingerprint.clone();
 
     // #1095(c): refuse a governed apply that configures `[hook]`/`[hook.webhooks]`
     // BEFORE any hook is built or fired — hooks run outside (and before) the
@@ -1341,7 +1344,7 @@ pub async fn run(
     // Governed-apply TOCTOU gate (E) — pairs the plan-authorized IR fingerprint
     // with THIS run's config identity; verified at the execution choke-point
     // (`execute_models`). `None` for bare run / human apply.
-    let exec_fp_gate = governed_ctx.map(|c| c.exec_fingerprint_gate(&rocky_cfg, env));
+    let exec_fp_gate = governed_ctx.map(|c| c.exec_fingerprint_gate(rocky_cfg, env));
 
     // Apply the optional `--cache-ttl` override once at the top of the
     // run. All downstream `execute_models` calls receive this already-
@@ -1370,7 +1373,7 @@ pub async fn run(
             mdir.display()
         );
 
-        let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
+        let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
         // Use the first transformation pipeline's target adapter, or fall back
         // to the first replication pipeline's target adapter.
         let target_adapter_name = rocky_cfg
@@ -1450,7 +1453,7 @@ pub async fn run(
             rocky_cfg.reuse.column_level && !skip_opts.no_reuse,
             run_vars,
             rocky_cfg.resilience.clone(),
-            super::resilience::retry_policy_allows(&rocky_cfg),
+            super::resilience::retry_policy_allows(rocky_cfg),
             exec_fp_gate.as_ref(),
             // Finding #4: the `--model` path reconciles no masks.
             false,
@@ -1483,7 +1486,7 @@ pub async fn run(
                 apply_model_governance_tags(
                     mdir,
                     governance_adapter.as_ref(),
-                    &rocky_cfg,
+                    rocky_cfg,
                     run_vars,
                     Some(target_model),
                 )
@@ -1564,7 +1567,7 @@ pub async fn run(
     }
 
     let (pipeline_name, pipeline_config) =
-        registry::resolve_pipeline(&rocky_cfg, pipeline_name_arg)?;
+        registry::resolve_pipeline(rocky_cfg, pipeline_name_arg)?;
 
     info!(
         pipeline = pipeline_name,
@@ -1609,7 +1612,7 @@ pub async fn run(
             super::run_local::run_transformation(
                 config_path,
                 t,
-                &rocky_cfg,
+                rocky_cfg,
                 output_json,
                 partition_opts,
                 &schema_cache_cfg,
@@ -1651,12 +1654,12 @@ pub async fn run(
             return Ok(());
         }
         rocky_core::config::PipelineConfig::Quality(q) => {
-            super::run_local::run_quality(config_path, q, &rocky_cfg, output_json).await?;
+            super::run_local::run_quality(config_path, q, rocky_cfg, output_json).await?;
             finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
             return Ok(());
         }
         rocky_core::config::PipelineConfig::Snapshot(s) => {
-            super::run_local::run_snapshot(config_path, s, &rocky_cfg, output_json).await?;
+            super::run_local::run_snapshot(config_path, s, rocky_cfg, output_json).await?;
             finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
             return Ok(());
         }
@@ -1723,7 +1726,7 @@ pub async fn run(
     )?;
 
     // Build adapter registry and resolve adapters
-    let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
+    let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
     let warehouse_adapter = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
 
     // Batch check adapter (optional): present when the warehouse has an
@@ -1862,7 +1865,7 @@ pub async fn run(
         // a `path`/adapter/target swap (e.g. duckdb→snowflake, a.duckdb→b.duckdb)
         // between plan and apply would mutate a DIFFERENT physical destination —
         // refuse before the replication DDL below, not after it.
-        ctx.verify_routing_identity(&rocky_cfg)?;
+        ctx.verify_routing_identity(rocky_cfg)?;
 
         let replication_targets: std::collections::BTreeSet<String> = connectors
             .iter()
@@ -1882,7 +1885,7 @@ pub async fn run(
         // Finding 1: thread `run`'s single `rocky_cfg` snapshot into the in-run
         // replication gate so it evaluates `[policy]` / models-dir from the config
         // `run` executed against, not a reload a mid-run swap could redirect.
-        ctx.gate_replication_targets(&replication_targets, &state_store, &rocky_cfg)?;
+        ctx.gate_replication_targets(&replication_targets, &state_store, rocky_cfg)?;
     }
 
     // --- Sequential: catalog/schema setup + table collection ---
@@ -2382,7 +2385,7 @@ pub async fn run(
                     // block are both configured. Scoped by the logical table
                     // name so a `[policy]` rule can target `models = [...]`.
                     auto_apply_gate: super::drift_governance::DriftGovernor::build(
-                        &rocky_cfg,
+                        rocky_cfg,
                         &run_id,
                         &table.name,
                         ledger_authoritative,
@@ -4040,7 +4043,7 @@ pub async fn run(
                     rocky_cfg.reuse.column_level && !skip_opts.no_reuse,
                     run_vars,
                     rocky_cfg.resilience.clone(),
-                    super::resilience::retry_policy_allows(&rocky_cfg),
+                    super::resilience::retry_policy_allows(rocky_cfg),
                     exec_fp_gate.as_ref(),
                     // Finding #4: THE mask-reconciling path — bind the mask.
                     true,
@@ -4595,7 +4598,7 @@ pub async fn run(
     // run's exit code reflects the run, never the sweep. Placed before
     // the idempotency error-path finalize so an over-budget sweep never
     // delays the InFlight stamp release.
-    auto_sweep_retention_at_end_of_run(state_path, &rocky_cfg_for_idemp.state.retention).await;
+    auto_sweep_retention_at_end_of_run(state_path, &loaded.config.state.retention).await;
 
     // FR-004 F1 error-path finalize. If the body returned `Err`, the
     // claim is almost certainly still `InFlight` (the happy/interrupted/
@@ -5093,14 +5096,16 @@ fn backfill_reuse_gates(cfg: &rocky_core::config::RockyConfig) -> (bool, bool) {
 /// window; the "what to fix" question is out of scope by construction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_backfill_set(
-    config_path: &Path,
-    // The VERIFIED, already-loaded config (execute-from-owned, finding B). The
-    // caller (`apply`) loaded this instance and ran `verify_routing_identity`
-    // against it BEFORE building the gate, so the adapter/destination selected
-    // below is the one authorization was checked against — no internal reload
-    // that a timed `rocky.toml` swap could point at a different, unverified
-    // destination while the gate held the old identity.
-    rocky_cfg: &rocky_core::config::RockyConfig,
+    // The VERIFIED, already-loaded config snapshot (execute-from-owned,
+    // finding B). The caller (`apply`) loaded this instance and ran
+    // `verify_routing_identity` against it BEFORE building the gate, so the
+    // adapter/destination selected below is the one authorization was checked
+    // against — no internal reload that a timed `rocky.toml` swap could point
+    // at a different, unverified destination while the gate held the old
+    // identity. Carries the load-time fingerprint, so the recorded
+    // `config_hash` describes the executed snapshot too (formerly a separate
+    // path re-read — #1120/F10).
+    loaded: &rocky_core::config::LoadedConfig,
     state_path: &Path,
     models_dir: &Path,
     model_set: &std::collections::BTreeSet<String>,
@@ -5113,10 +5118,11 @@ pub(crate) async fn execute_backfill_set(
         crate::output::reserve_stdout_for_json();
     }
 
+    let rocky_cfg = &loaded.config;
     let start = Instant::now();
     let started_at = Utc::now();
     let run_id = format!("run-{}", started_at.format("%Y%m%d-%H%M%S-%3f"));
-    let config_hash = crate::output::config_fingerprint(config_path);
+    let config_hash = loaded.fingerprint.clone();
 
     anyhow::ensure!(
         models_dir.exists(),
@@ -10429,6 +10435,9 @@ adapter = "default"
         // returns Ok(()) and (post-F2) fires `finalize_idempotency_on_success`.
         super::run(
             &config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            ),
             None,
             None,
             &state_path,
@@ -10539,6 +10548,9 @@ schema = "mart"
 
         super::run(
             &config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            ),
             None,
             Some("t"),
             &state_path,
