@@ -3046,6 +3046,21 @@ impl StateStore {
         txn.commit()?;
         Ok(removed)
     }
+
+    /// Test-only: write a byte blob under a `run_history` key that is not valid
+    /// `RunRecord` JSON, so a later scan (`latest_successful_run` /
+    /// `find_terminal_run_by_submission_id`) hits a deserialization error. Used
+    /// to prove the schedule reconciler fails closed on a corrupt history row.
+    #[cfg(test)]
+    pub(crate) fn insert_corrupt_run_history_row(&self, key: &str) -> Result<(), StateError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(RUN_HISTORY)?;
+            table.insert(key, b"{not valid run record json".as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

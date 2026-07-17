@@ -685,6 +685,29 @@ fn schedule_messages(
         });
     }
 
+    // The reconciler resolves the freshness budget from the PROJECT
+    // [freshness].expected_lag_seconds in this version; per-model
+    // `max_lag_seconds` is not consulted (that resolution needs per-pipeline
+    // model loading, which lands with the `rocky tick` verb). A member model
+    // with a tighter budget would therefore under-fire silently — surface the
+    // limitation loudly whenever a project budget exists (the no-budget case is
+    // already the V038 error).
+    if sched.freshness
+        && schedule_persists_run_records(pc)
+        && cfg.freshness.expected_lag_seconds.is_some()
+    {
+        msgs.push(ValidateMessage {
+            severity: "warn".into(),
+            code: "V043".into(),
+            message: format!(
+                "pipeline.{name}: schedule.freshness resolves its budget from the project [freshness].expected_lag_seconds ({}s) in this version — per-model max_lag_seconds is NOT consulted, so a member model that declares a tighter budget will under-fire. Set the project budget to the tightest member value until per-model resolution lands (experimental limitation).",
+                cfg.freshness.expected_lag_seconds.unwrap_or_default()
+            ),
+            file: None,
+            field: Some(format!("{field}.freshness")),
+        });
+    }
+
     msgs
 }
 
@@ -1474,6 +1497,56 @@ after = ["dq"]
         assert_eq!(v041.len(), 1, "expected one V041: {:?}", out.messages);
         assert_eq!(v041[0].severity, "warn");
         assert!(out.valid, "the persistence gap is a warning, not an error");
+    }
+
+    #[test]
+    fn schedule_freshness_per_model_budget_gap_is_v043_warning() {
+        // freshness = true with a project budget → the reconciler resolves the
+        // project value only (per-model max_lag_seconds not consulted in v1), so
+        // the under-fire limitation is surfaced loudly as a warning.
+        let out = validate_toml(
+            r#"
+[freshness]
+expected_lag_seconds = 3600
+[adapter.db]
+type = "duckdb"
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[pipeline.raw.schedule]
+freshness = true
+"#,
+        );
+        let v043: Vec<_> = out.messages.iter().filter(|m| m.code == "V043").collect();
+        assert_eq!(v043.len(), 1, "expected one V043: {:?}", out.messages);
+        assert_eq!(v043[0].severity, "warn");
+        assert!(
+            out.valid,
+            "the per-model budget gap is a warning, not an error"
+        );
+        // No project budget → this is the V038 error instead, not V043.
+        let out2 = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[pipeline.raw.schedule]
+freshness = true
+"#,
+        );
+        assert!(
+            out2.messages.iter().all(|m| m.code != "V043"),
+            "no project budget → V038 error, not V043"
+        );
+        assert!(
+            out2.messages
+                .iter()
+                .any(|m| m.code == "V038" && m.severity == "error")
+        );
     }
 
     #[test]

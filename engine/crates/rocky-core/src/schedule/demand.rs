@@ -199,6 +199,10 @@ pub enum SkipReason {
     },
     /// A higher-priority source already produced the demand this tick.
     Superseded,
+    /// The run history could not be read (store fault or a corrupt row), so a
+    /// standing demand was skipped rather than misclassified. Fail-closed: never
+    /// a false-skip (`after`) or false-fire (`freshness`).
+    HistoryError,
 }
 
 /// A per-source skip record.
@@ -243,10 +247,32 @@ pub trait ScheduleStateView {
     fn get(&self, pipeline: &str) -> ScheduleStateRecord;
 }
 
+/// A run-history read that could not be completed (a store fault or a corrupt
+/// row). It is **never** conflated with "no successful run": a read error must
+/// fail closed — skip the demand loudly — rather than misread as "never ran",
+/// which would false-skip an `after` demand or false-fire a `freshness` one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryError(pub String);
+
+impl std::fmt::Display for HistoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "run-history read failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for HistoryError {}
+
 /// Read-only view of the run history, per pipeline.
 pub trait RunHistoryView {
-    /// The most recent *successful* run for a pipeline, or `None`.
-    fn latest_successful_run(&self, pipeline: &str) -> Option<RunSuccess>;
+    /// The most recent *successful* run for a pipeline, `Ok(None)` when there is
+    /// genuinely none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HistoryError`] when the history cannot be read (store fault or
+    /// a corrupt row). Callers MUST fail closed on this — never treat it as "no
+    /// successful run".
+    fn latest_successful_run(&self, pipeline: &str) -> Result<Option<RunSuccess>, HistoryError>;
 }
 
 /// A stable reference instant for a freshness claim when the pipeline has never
@@ -311,54 +337,64 @@ fn evaluate_cron(
 
 /// Whether `after` is due, and if so the logical timestamp
 /// (`max(upstream success completions)`).
+///
+/// # Errors
+///
+/// Propagates a [`HistoryError`] from any history read — the caller fails closed
+/// (a read error is never a "not due").
 fn evaluate_after(
     pipeline: &str,
     upstreams: &[String],
     history: &dyn RunHistoryView,
-) -> Option<DateTime<Utc>> {
+) -> Result<Option<DateTime<Utc>>, HistoryError> {
     if upstreams.is_empty() {
-        return None;
+        return Ok(None);
     }
     // My baseline: the start of my latest success. If I never succeeded, every
     // upstream success counts (baseline = epoch).
     let my_baseline = history
-        .latest_successful_run(pipeline)
+        .latest_successful_run(pipeline)?
         .map(|r| r.started_at)
         .unwrap_or_else(never_ran_reference);
 
     let mut max_completion: Option<DateTime<Utc>> = None;
     for upstream in upstreams {
-        let Some(u) = history.latest_successful_run(upstream) else {
+        let Some(u) = history.latest_successful_run(upstream)? else {
             // An upstream with no success at all — not due.
-            return None;
+            return Ok(None);
         };
         // The upstream must have completed AFTER my latest success started
         // (completion-vs-start asymmetry closes the overlap stale-forever case).
         if u.finished_at <= my_baseline {
-            return None;
+            return Ok(None);
         }
         max_completion = Some(match max_completion {
             Some(m) if m >= u.finished_at => m,
             _ => u.finished_at,
         });
     }
-    max_completion
+    Ok(max_completion)
 }
 
 /// Whether `freshness` is due, and if so the (stable) logical timestamp.
+///
+/// # Errors
+///
+/// Propagates a [`HistoryError`] — a read error must NOT be read as "never ran"
+/// (which would fire the epoch occurrence). The caller fails closed.
 fn evaluate_freshness(
     pipeline: &str,
     budget: Duration,
     history: &dyn RunHistoryView,
     now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
-    match history.latest_successful_run(pipeline) {
-        None => Some(never_ran_reference()),
+) -> Result<Option<DateTime<Utc>>, HistoryError> {
+    match history.latest_successful_run(pipeline)? {
+        None => Ok(Some(never_ran_reference())),
         Some(r) => {
             if now - r.finished_at > budget {
-                Some(r.finished_at)
+                Ok(Some(r.finished_at))
             } else {
-                None
+                Ok(None)
             }
         }
     }
@@ -451,57 +487,71 @@ pub fn evaluate_one(
     }
 
     // --- after --------------------------------------------------------------
-    let after_due = evaluate_after(&schedule.pipeline, &schedule.after, history);
+    // A history read error fails CLOSED: record the skip, never fire on data we
+    // could not read (a false "not due" would silently drop a due demand).
     if !schedule.after.is_empty() {
-        match after_due {
-            Some(logical_ts) if out.due.is_none() => match apply_standing_throttle(&cursor, now) {
-                Ok(()) => {
-                    out.due = Some(Demand {
-                        pipeline: schedule.pipeline.clone(),
+        match evaluate_after(&schedule.pipeline, &schedule.after, history) {
+            Ok(Some(logical_ts)) if out.due.is_none() => {
+                match apply_standing_throttle(&cursor, now) {
+                    Ok(()) => {
+                        out.due = Some(Demand {
+                            pipeline: schedule.pipeline.clone(),
+                            source: DemandKind::After,
+                            logical_ts,
+                        });
+                    }
+                    Err(reason) => out.skips.push(SourceSkip {
                         source: DemandKind::After,
-                        logical_ts,
-                    });
+                        reason,
+                    }),
                 }
-                Err(reason) => out.skips.push(SourceSkip {
-                    source: DemandKind::After,
-                    reason,
-                }),
-            },
-            Some(_) => out.skips.push(SourceSkip {
+            }
+            Ok(Some(_)) => out.skips.push(SourceSkip {
                 source: DemandKind::After,
                 reason: SkipReason::Superseded,
             }),
-            None => out.skips.push(SourceSkip {
+            Ok(None) => out.skips.push(SourceSkip {
                 source: DemandKind::After,
                 reason: SkipReason::NotDue,
+            }),
+            Err(_) => out.skips.push(SourceSkip {
+                source: DemandKind::After,
+                reason: SkipReason::HistoryError,
             }),
         }
     }
 
     // --- freshness ----------------------------------------------------------
+    // A history read error fails CLOSED: skip rather than treat "unreadable" as
+    // "never ran" (which would fire — and re-fire — the epoch occurrence).
     if let Some(budget) = schedule.freshness_budget {
-        let fresh_due = evaluate_freshness(&schedule.pipeline, budget, history, now);
-        match fresh_due {
-            Some(logical_ts) if out.due.is_none() => match apply_standing_throttle(&cursor, now) {
-                Ok(()) => {
-                    out.due = Some(Demand {
-                        pipeline: schedule.pipeline.clone(),
+        match evaluate_freshness(&schedule.pipeline, budget, history, now) {
+            Ok(Some(logical_ts)) if out.due.is_none() => {
+                match apply_standing_throttle(&cursor, now) {
+                    Ok(()) => {
+                        out.due = Some(Demand {
+                            pipeline: schedule.pipeline.clone(),
+                            source: DemandKind::Freshness,
+                            logical_ts,
+                        });
+                    }
+                    Err(reason) => out.skips.push(SourceSkip {
                         source: DemandKind::Freshness,
-                        logical_ts,
-                    });
+                        reason,
+                    }),
                 }
-                Err(reason) => out.skips.push(SourceSkip {
-                    source: DemandKind::Freshness,
-                    reason,
-                }),
-            },
-            Some(_) => out.skips.push(SourceSkip {
+            }
+            Ok(Some(_)) => out.skips.push(SourceSkip {
                 source: DemandKind::Freshness,
                 reason: SkipReason::Superseded,
             }),
-            None => out.skips.push(SourceSkip {
+            Ok(None) => out.skips.push(SourceSkip {
                 source: DemandKind::Freshness,
                 reason: SkipReason::NotDue,
+            }),
+            Err(_) => out.skips.push(SourceSkip {
+                source: DemandKind::Freshness,
+                reason: SkipReason::HistoryError,
             }),
         }
     }
@@ -542,8 +592,29 @@ mod tests {
     #[derive(Default)]
     struct History(HashMap<String, RunSuccess>);
     impl RunHistoryView for History {
-        fn latest_successful_run(&self, pipeline: &str) -> Option<RunSuccess> {
-            self.0.get(pipeline).copied()
+        fn latest_successful_run(
+            &self,
+            pipeline: &str,
+        ) -> Result<Option<RunSuccess>, HistoryError> {
+            Ok(self.0.get(pipeline).copied())
+        }
+    }
+
+    /// A history view that faults for a specific pipeline — models a corrupt
+    /// `run_history` row so the fail-closed path is testable at this layer.
+    struct FaultyHistory {
+        ok: History,
+        fault_for: &'static str,
+    }
+    impl RunHistoryView for FaultyHistory {
+        fn latest_successful_run(
+            &self,
+            pipeline: &str,
+        ) -> Result<Option<RunSuccess>, HistoryError> {
+            if pipeline == self.fault_for {
+                return Err(HistoryError("corrupt run_history row (test)".into()));
+            }
+            self.ok.latest_successful_run(pipeline)
         }
     }
 
@@ -951,5 +1022,71 @@ mod tests {
             "falls back to project"
         );
         assert_eq!(resolve_freshness_budget(&[], None), None, "unresolvable");
+    }
+
+    // --- fail-closed on a history read fault (F4/F5) -------------------------
+
+    #[test]
+    fn after_history_read_error_fails_closed_no_false_skip() {
+        // The upstream's run-history read faults. A due `after` must NOT be
+        // silently dropped as "not due" — it records a HistoryError skip and
+        // fires nothing.
+        let s = after_schedule("staging", "raw");
+        let states = States::default();
+        let mut ok = History::default();
+        // Even though `raw` genuinely succeeded, the read for it faults.
+        ok.0.insert(
+            "raw".into(),
+            RunSuccess {
+                started_at: ts(2026, 5, 1, 10, 0),
+                finished_at: ts(2026, 5, 1, 11, 0),
+            },
+        );
+        let history = FaultyHistory {
+            ok,
+            fault_for: "raw",
+        };
+        let e = evaluate_one(&s, &states, &history, ts(2026, 5, 1, 12, 0));
+        assert!(e.due.is_none(), "a read fault must never fire");
+        assert!(
+            e.skips
+                .iter()
+                .any(|k| k.source == DemandKind::After && k.reason == SkipReason::HistoryError),
+            "the fault is recorded, not elided: {:?}",
+            e.skips
+        );
+    }
+
+    #[test]
+    fn freshness_history_read_error_fails_closed_no_false_fire() {
+        // The pipeline's own run-history read faults. Freshness must NOT read
+        // the fault as "never ran" and fire the epoch occurrence.
+        let s = ResolvedSchedule {
+            pipeline: "raw".into(),
+            enabled: true,
+            cron: None,
+            after: vec![],
+            freshness_budget: Some(Duration::hours(1)),
+            catchup: Catchup::Latest,
+            retry_max: 0,
+            timeout: None,
+        };
+        let states = States::default();
+        let history = FaultyHistory {
+            ok: History::default(),
+            fault_for: "raw",
+        };
+        let e = evaluate_one(&s, &states, &history, ts(2026, 5, 1, 12, 0));
+        assert!(
+            e.due.is_none(),
+            "a read fault must never fire the epoch occurrence"
+        );
+        assert!(
+            e.skips
+                .iter()
+                .any(|k| k.source == DemandKind::Freshness && k.reason == SkipReason::HistoryError),
+            "the fault is recorded: {:?}",
+            e.skips
+        );
     }
 }

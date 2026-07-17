@@ -23,7 +23,7 @@ pub use claim::{
     decide_resolver,
 };
 pub use demand::{
-    Catchup, Demand, EvaluatedPipeline, ResolvedSchedule, RunHistoryView, RunSuccess,
+    Catchup, Demand, EvaluatedPipeline, HistoryError, ResolvedSchedule, RunHistoryView, RunSuccess,
     ScheduleConfigError, ScheduleStateView, SkipReason, evaluate_demands, evaluate_one,
     resolve_freshness_budget, resolve_schedule,
 };

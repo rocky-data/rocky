@@ -43,8 +43,8 @@ use super::claim::{
     decide_post_attempt, decide_pre_spawn, decide_resolver,
 };
 use super::demand::{
-    Demand, EvaluatedPipeline, ResolvedSchedule, RunHistoryView, RunSuccess, ScheduleStateView,
-    SkipReason, SourceSkip, evaluate_one, resolve_schedule,
+    Demand, EvaluatedPipeline, HistoryError, ResolvedSchedule, RunHistoryView, RunSuccess,
+    ScheduleStateView, SkipReason, SourceSkip, evaluate_one, resolve_schedule,
 };
 use super::lock::{TickAcquire, TickLock};
 use super::record::{ScheduleStateMutation, ScheduleStateRecord};
@@ -139,6 +139,10 @@ pub enum TickSkipReason {
     /// The demand's key is already terminal (`completed`), or its run was
     /// observed and finalized by this tick's resolver — it will not run again.
     Dedup,
+    /// The run history could not be read (store fault or a corrupt row), so the
+    /// standing demand was skipped rather than misclassified — fail-closed, and
+    /// surfaced loudly rather than silently dropped.
+    HistoryUnavailable,
 }
 
 /// A per-demand skip record for the tick report.
@@ -315,18 +319,18 @@ impl ScheduleStateView for StoreState<'_> {
 struct StoreHistory<'a>(&'a StateStore);
 
 impl RunHistoryView for StoreHistory<'_> {
-    fn latest_successful_run(&self, pipeline: &str) -> Option<RunSuccess> {
-        // A state read fault degrades to "no success": an `after` upstream then
-        // waits rather than false-firing (fail closed for the soundness-critical
-        // direction); a persistent fault surfaces on the next write path.
-        self.0
-            .latest_successful_run(pipeline)
-            .ok()
-            .flatten()
-            .map(|r| RunSuccess {
+    fn latest_successful_run(&self, pipeline: &str) -> Result<Option<RunSuccess>, HistoryError> {
+        // A read fault (store error or a corrupt `run_history` row) is surfaced
+        // as an error, NOT swallowed to "no success" — the caller fails closed
+        // and records a skip, so a bad row can neither false-skip an `after`
+        // demand nor false-fire a `freshness` one.
+        match self.0.latest_successful_run(pipeline) {
+            Ok(run) => Ok(run.map(|r| RunSuccess {
                 started_at: r.started_at,
                 finished_at: r.finished_at,
-            })
+            })),
+            Err(e) => Err(HistoryError(e.to_string())),
+        }
     }
 }
 
@@ -442,6 +446,8 @@ fn map_skip(pipeline: &str, skip: &SourceSkip) -> Option<SkippedDemand> {
         SkipReason::PartialBackoff { resume_at } => TickSkipReason::PartialBackoff {
             resume_at: *resume_at,
         },
+        // Recorded, never elided — a read fault must be visible in the report.
+        SkipReason::HistoryError => TickSkipReason::HistoryUnavailable,
     };
     Some(SkippedDemand {
         pipeline: pipeline.to_string(),
@@ -1534,6 +1540,99 @@ after = ["raw"]
             before,
             store.get_schedule_state("raw").unwrap(),
             "dry run writes no state"
+        );
+    }
+
+    // --- fail-closed on a corrupt run_history row (F4/F5), end to end ---------
+
+    const FRESHNESS_ONLY: &str = r#"
+[freshness]
+expected_lag_seconds = 3600
+
+[adapter.db]
+type = "duckdb"
+
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[pipeline.raw.schedule]
+freshness = true
+"#;
+
+    #[test]
+    fn after_corrupt_history_row_fails_closed_no_spawn() {
+        let (store, _dir, opts) = temp_env();
+        let config = cfg(AFTER_ONLY);
+        // A genuine upstream success — `after` would be due...
+        seed_run(
+            &store,
+            "raw",
+            None,
+            RunStatus::Success,
+            at(2026, 5, 2, 3, 5),
+            at(2026, 5, 2, 3, 10),
+        );
+        // ...but a corrupt row in run_history makes the scan error.
+        store.insert_corrupt_run_history_row("run-corrupt").unwrap();
+
+        let spawner = CapturingSpawner::new(0);
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &store,
+                at(2026, 5, 2, 4, 0),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            spawner.run_count(),
+            0,
+            "a history read fault must never spawn on data it could not read"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.pipeline == "staging" && s.reason == TickSkipReason::HistoryUnavailable),
+            "the fault is recorded loudly, not a silent drop: {:?}",
+            report.skipped
+        );
+    }
+
+    #[test]
+    fn freshness_corrupt_history_row_does_not_fire_epoch() {
+        let (store, _dir, opts) = temp_env();
+        let config = cfg(FRESHNESS_ONLY);
+        // No successful run at all + a corrupt row: freshness must NOT read the
+        // fault as "never ran" and fire the epoch occurrence.
+        store.insert_corrupt_run_history_row("run-corrupt").unwrap();
+
+        let spawner = CapturingSpawner::new(0);
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &store,
+                at(2026, 5, 2, 4, 0),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            spawner.run_count(),
+            0,
+            "a read fault must not fire the epoch occurrence"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.pipeline == "raw" && s.reason == TickSkipReason::HistoryUnavailable),
+            "recorded fail-closed: {:?}",
+            report.skipped
         );
     }
 }
