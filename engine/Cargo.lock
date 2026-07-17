@@ -4266,10 +4266,17 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "trybuild",
  "url",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "rocky-core-compiletest"
+version = "0.0.0"
+dependencies = [
+ "rocky-core",
+ "trybuild",
 ]
 
 [[package]]
