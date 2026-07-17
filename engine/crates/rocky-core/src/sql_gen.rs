@@ -588,20 +588,16 @@ pub fn generate_transformation_initial_ddl(
 /// Substitute `@start_date` / `@end_date` placeholders in the model SQL with
 /// quoted timestamp literals from the partition window.
 ///
-/// Word-boundary aware via simple string replace — `@start_date_extra` would
-/// not be matched by a more careful tokenizer, but the compiler's
-/// `check_time_interval_placeholders` already rejects models that don't
-/// reference the bare placeholders, so a malformed `@start_date_extra`
-/// reference would have failed compilation upstream.
+/// The documented form is bare, but tolerate an already single-quoted
+/// placeholder without adding a second pair of quotes.
 fn substitute_partition_placeholders(sql: &str, window: &PartitionWindow) -> String {
-    sql.replace(
-        "@start_date",
-        &format!("'{}'", window.start.format("%Y-%m-%d %H:%M:%S")),
-    )
-    .replace(
-        "@end_date",
-        &format!("'{}'", window.end.format("%Y-%m-%d %H:%M:%S")),
-    )
+    let start = format!("'{}'", window.start.format("%Y-%m-%d %H:%M:%S"));
+    let end = format!("'{}'", window.end.format("%Y-%m-%d %H:%M:%S"));
+
+    sql.replace("'@start_date'", &start)
+        .replace("@start_date", &start)
+        .replace("'@end_date'", &end)
+        .replace("@end_date", &end)
 }
 
 /// Generates CREATE OR REPLACE VIEW SQL for a transformation model.
@@ -1912,6 +1908,17 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         // Direct unit test for the placeholder substitution helper.
         let win = april_7_window();
         let sql = "SELECT * FROM t WHERE ts >= @start_date AND ts < @end_date";
+        let out = substitute_partition_placeholders(sql, &win);
+        assert_eq!(
+            out,
+            "SELECT * FROM t WHERE ts >= '2026-04-07 00:00:00' AND ts < '2026-04-08 00:00:00'"
+        );
+    }
+
+    #[test]
+    fn test_substitute_partition_placeholders_does_not_double_quote() {
+        let win = april_7_window();
+        let sql = "SELECT * FROM t WHERE ts >= '@start_date' AND ts < '@end_date'";
         let out = substitute_partition_placeholders(sql, &win);
         assert_eq!(
             out,
