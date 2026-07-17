@@ -57,10 +57,7 @@ fn default_sub_runner() -> SubRunner {
          model_name: Option<String>,
          skip_opts| {
             Box::pin(async move {
-                let models_dir = config_path
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .join("models");
+                let models_dir = models_dir_for_model_scope(&config_path, model_name.as_deref());
                 let partition_opts = super::PartitionRunOptions {
                     partition: None,
                     from: None,
@@ -77,7 +74,7 @@ fn default_sub_runner() -> SubRunner {
                     &state_path,
                     None,
                     false, // json — sub-runs print to stdout if not silenced
-                    Some(&models_dir),
+                    models_dir.as_deref(),
                     false,
                     None,
                     false,
@@ -106,6 +103,18 @@ fn default_sub_runner() -> SubRunner {
             })
         },
     )
+}
+
+/// Returns the conventional models directory only for a model-scoped
+/// transformation sub-run. Supplying it to replication/load sub-runs makes
+/// `run()` execute every transformation model after the pipeline itself.
+fn models_dir_for_model_scope(config_path: &Path, model_name: Option<&str>) -> Option<PathBuf> {
+    model_name.map(|_| {
+        config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("models")
+    })
 }
 
 /// Execute `rocky run --dag`: run every pipeline in dependency order.
@@ -357,15 +366,27 @@ impl NodeDispatcher for CliDispatcher {
 #[cfg(test)]
 mod skip_opts_threading_tests {
     use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     use rocky_core::dag_executor::NodeDispatcher;
     use rocky_core::unified_dag::{NodeId, NodeKind};
 
     use super::super::run::SkipRunOptions;
-    use super::{CliDispatcher, SubRunner};
+    use super::{CliDispatcher, SubRunner, models_dir_for_model_scope};
 
     type RecordedSubRun = (Option<String>, SkipRunOptions);
+
+    #[test]
+    fn models_dir_is_only_set_for_model_scoped_sub_runs() {
+        let config_path = Path::new("project/rocky.toml");
+
+        assert_eq!(
+            models_dir_for_model_scope(config_path, Some("dim_orders")),
+            Some(PathBuf::from("project/models"))
+        );
+        assert_eq!(models_dir_for_model_scope(config_path, None), None);
+    }
 
     /// 🔴 DEFECT 3 regression: `rocky run --dag --force-rebuild` / `--no-reuse`
     /// must reach each sub-run. Pre-fix, `run_with_dag` passed
