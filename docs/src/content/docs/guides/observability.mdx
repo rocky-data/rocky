@@ -1,0 +1,161 @@
+---
+title: Observability
+description: Export Rocky's traces and metrics over OTLP, read its structured logs, and stand up a local Grafana stack to watch runs
+sidebar:
+  order: 8.5
+---
+
+Rocky is instrumented from the inside. A run emits OpenTelemetry spans and metrics, writes structured JSON logs to stderr, and keeps a local JSONL copy of every span on disk. You point the exporter at a collector, or you read the local files, and you can see exactly what a run did without adding a single line of code to your models.
+
+This guide covers what Rocky emits, how to turn on OTLP export, and how to stand up a local Grafana stack that renders it.
+
+## What Rocky emits
+
+Four signals come out of every run:
+
+- **Traces** — OpenTelemetry spans for the phases of a run, exported over OTLP gRPC.
+- **Metrics** — run counters and duration histograms, also exported over OTLP.
+- **Structured logs** — one JSON object per log line on stderr.
+- **Local trace files** — the same spans persisted as JSONL under `.rocky/traces/`.
+
+The OTLP signals are opt-in (set one environment variable). The structured logs and local trace files are always on.
+
+### Spans
+
+Spans are created where the work happens, so a trace reads as the shape of the run:
+
+| Span | Emitted by | What it covers |
+|---|---|---|
+| `discover_sources` | source discovery | resolving configured sources before planning |
+| `governance_setup` | governance phase | preparing permission and policy reconciliation |
+| `batched_checks` | quality phase | running data-quality checks |
+| `materialize.table` | model execution | building one model; one span per model, carrying `rocky.model.fqn` and `rocky.model.kind` |
+| `statement.execute` | warehouse adapter | one SQL statement sent to the warehouse, carrying `rocky.adapter.name`, `rocky.statement.kind`, and `rocky.warehouse.name` |
+| `state.download` / `state.upload` / `state.probe` | object-store state sync | reading and writing remote state, carrying the `backend` and `bucket` |
+
+When Rocky drives a warehouse, the `statement.execute` spans nest under the `materialize.table` span for the model being built, so a single model's SQL is grouped under it.
+
+Two honest limits worth knowing:
+
+- **`statement.execute` spans come from the warehouse adapters.** The Databricks, Snowflake, BigQuery, and Trino adapters emit them. The embedded DuckDB engine runs statements in-process and does not, so local DuckDB runs show model-level spans but no per-statement spans.
+- **`rocky.query_duration_ms` is populated by the Databricks adapter today.** Other adapters record their statement spans without feeding that metric yet.
+
+### Metrics
+
+Metrics are recorded in-process and pushed to the collector on a 30-second interval, with a final flush when the run exits. Counters are exported as gauges (the last value wins over the run) and durations as histograms so the backend computes its own percentiles.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `rocky.tables_processed` | gauge | tables materialized in the run |
+| `rocky.tables_failed` | gauge | tables that failed |
+| `rocky.statements_executed` | gauge | SQL statements executed |
+| `rocky.retries_attempted` | gauge | retries attempted |
+| `rocky.retries_succeeded` | gauge | retries that recovered |
+| `rocky.anomalies_detected` | gauge | anomalies flagged by checks |
+| `rocky.error_rate_pct` | gauge | failed tables as a percentage |
+| `rocky.table_duration_ms` | histogram | per-table materialization time, in milliseconds |
+| `rocky.query_duration_ms` | histogram | per-statement warehouse time, in milliseconds |
+
+### Structured logs
+
+Rocky writes logs to stderr as JSON (stdout stays reserved for the `--output json` result of `discover`, `plan`, and `run`). Run-scoped events carry a `run_id` field, which is the same id you see in `rocky history` and `rocky trace`, so a log line ties back to a specific run.
+
+```json
+{"timestamp":"2026-07-17T09:14:22.481Z","level":"INFO","fields":{"message":"idempotency key claimed — proceeding","run_id":"20260717-091422-481-a1b2c3","backend":"redb"},"target":"rocky::run"}
+```
+
+Log verbosity is controlled by `RUST_LOG`. The default keeps Rocky's own spans at `info` while quieting the query-cache trace:
+
+```bash
+RUST_LOG=info rocky run -c rocky.toml
+```
+
+### Local trace files
+
+Independently of any collector, Rocky writes one JSONL file per process under `.rocky/traces/`, named `{timestamp}-{pid}.jsonl`. Each line is a span record with its timestamp, level, target, fields, and the active span chain. This is on by default and needs no configuration.
+
+- The last 20 files are kept; set `ROCKY_TRACE_RETAIN_RUNS` to change the count.
+- Set `ROCKY_TRACE_DISABLE=1` to turn the files off entirely (useful on a shared filesystem or under tight disk quota).
+
+These files are raw span data you can inspect directly or ship to any log tool. They are separate from `rocky trace` and `rocky replay`, which render a run's timeline from the persisted run record in Rocky's state store rather than from these files.
+
+## Turning on OTLP export
+
+Export activates when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. That single variable switches on both traces and metrics; when it is unset, the exporter is never constructed and there is no runtime cost.
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+export OTEL_SERVICE_NAME=rocky   # optional; defaults to "rocky"
+rocky run -c rocky.toml
+```
+
+- `OTEL_EXPORTER_OTLP_ENDPOINT` is the gRPC endpoint of your OTLP collector.
+- `OTEL_SERVICE_NAME` sets the `service.name` resource attribute, which is how you filter Rocky's data in the backend. It defaults to `rocky`.
+
+If the endpoint is unreachable, Rocky logs a warning and keeps running; export is best-effort and never fails a run.
+
+OTLP export requires the current Rocky release. Earlier release binaries were built without the exporter compiled in, so setting these variables had no effect on them. Upgrade to the current release before relying on export.
+
+## A local Grafana stack
+
+The repository ships a single-node Grafana, Alloy, Tempo, Loki, and Prometheus stack under [`deploy/observability/`](https://github.com/rocky-data/rocky/tree/main/deploy/observability) for watching runs locally. It is a development-grade quickstart, not a hardened production deployment.
+
+From that directory:
+
+```bash
+# 1. Start the stack (Grafana, Alloy, Tempo, Loki, Prometheus).
+docker compose up -d
+
+# 2. Run a pipeline with export pointed at Alloy's OTLP receiver.
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+OTEL_SERVICE_NAME=rocky \
+  rocky run -c rocky.toml
+
+# 3. Open Grafana at http://localhost:3000.
+```
+
+In Grafana, open the Tempo data source and search for traces where `service.name` is `rocky`. Pick a recent trace to see the run laid out span by span: the model-level `materialize.table` spans, and the `statement.execute` spans nested under them when the run drives a warehouse. The provisioned dashboard renders the run metrics (tables processed and failed, error rate, and the duration histograms) from Prometheus.
+
+Tear the stack down when you are done. The exact commands, ports, and dashboard details live in the `deploy/observability/` README.
+
+## Collecting the structured logs
+
+Traces and metrics reach the backend over OTLP. To get Rocky's structured JSON logs into the same place, tail them with Alloy and lift the `run_id` into a label so log lines line up with run records.
+
+Capture Rocky's stderr to a file, for example when cron or a systemd unit runs it:
+
+```bash
+rocky run -c rocky.toml 2>> /var/log/rocky/run.jsonl
+```
+
+Then have Alloy tail that file, parse each JSON line, and label it by `run_id`:
+
+```
+local.file_match "rocky_logs" {
+  path_targets = [{ __path__ = "/var/log/rocky/*.jsonl" }]
+}
+
+loki.source.file "rocky_logs" {
+  targets    = local.file_match.rocky_logs.targets
+  forward_to = [loki.process.rocky.receiver]
+}
+
+loki.process "rocky" {
+  // Pull run_id out of each log line's fields.
+  stage.json {
+    expressions = { run_id = "fields.run_id" }
+  }
+  stage.labels {
+    values = { run_id = "" }
+  }
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+```
+
+Because `run_id` is the same id `rocky history` and `rocky trace` report, filtering Loki by a `run_id` gives you every log line for a run, and you can cross-reference it against the run's record in Rocky's own state.
