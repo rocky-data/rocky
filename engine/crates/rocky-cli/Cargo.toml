@@ -59,6 +59,10 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+# Turns on rocky-core's remote-state test rig (fault store, cross-pod
+# harness, provider-override seam) for THIS crate's test targets only — the
+# `rocky` binary build never sees the feature.
+rocky-core = { path = "../rocky-core", features = ["test-support"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 # Holds the advisory write lock directly (no redb handle) in the policy-ledger
