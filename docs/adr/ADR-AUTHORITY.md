@@ -1,7 +1,7 @@
 # ADR-AUTHORITY — Typed remote-state authority (RD-001)
 
 **ADR:** WP-01 / PR-A
-**Status:** **Proposed** — PR-0 design gate. This ADR blocks implementation; no code lands until it is signed off. It is the keystone of the WP-01 remote-state redesign and is engineered to land **standalone** ahead of the `RemoteStateSession` spine (PR-B).
+**Status:** **Accepted** — signed off; PR-A implements §1–§4 + §6 (§5 is deferred to PR-B). It is the keystone of the WP-01 remote-state redesign and is engineered to land **standalone** ahead of the `RemoteStateSession` spine (PR-B).
 
 ---
 

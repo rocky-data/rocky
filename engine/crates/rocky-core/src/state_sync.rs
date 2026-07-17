@@ -358,11 +358,58 @@ enum DownloadOutcome {
     Absent,
 }
 
+/// Whether a run may trust its local state ledger to back a governed decision.
+///
+/// Returned by [`download_state`] on success. The variants carry the one
+/// distinction every downstream governance gate needs — *authoritative vs.
+/// genuinely-empty vs. don't-know*:
+///
+/// - a download **failure stays `Err(StateSyncError)`** — it is never mapped to
+///   `Ok(Indeterminate)`. [`Indeterminate`][StateAuthority::Indeterminate] is
+///   **caller-synthesized**: it exists only when a caller explicitly elects to
+///   continue past a download `Err`. Keeping failure as `Err` means every
+///   fail-closed `download_state(...)?` seam keeps bailing unchanged — a caller
+///   must make an *explicit* choice to proceed on non-authoritative state.
+#[must_use = "the download's authority decides whether the local ledger may back a governed decision"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateAuthority {
+    /// The remote object existed and was restored (or the backend is Local,
+    /// whose on-disk file IS the authority). The ledger reflects durable truth.
+    Authoritative,
+    /// No remote object existed for this key — a genuine fresh start. The
+    /// ledger is trustworthy AND may bootstrap an empty ledger.
+    FreshStart,
+    /// A download / existence-check failure was elected-past by a caller. The
+    /// ledger is NON-authoritative: an active freeze / exhausted budget
+    /// recorded elsewhere may be invisible. Fail-closed.
+    Indeterminate,
+}
+
+impl StateAuthority {
+    /// The ledger may back a governed decision: the download restored the
+    /// authoritative remote or proved a genuine fresh start.
+    /// [`Indeterminate`][StateAuthority::Indeterminate] is NOT usable.
+    #[must_use]
+    pub fn is_usable(self) -> bool {
+        matches!(self, Self::Authoritative | Self::FreshStart)
+    }
+}
+
 /// Downloads state from remote storage to a local file before a run.
 ///
-/// A missing remote object is **non-fatal** (`Ok(())`, a fresh start). A real
-/// download/existence-check *failure* is **propagated** as `Err` so the caller
-/// can fail closed — see [`download_from_object_store`].
+/// Returns the typed [`StateAuthority`] of the local ledger after the download:
+///
+/// - the remote object existed and was restored ⇒ [`StateAuthority::Authoritative`];
+/// - no remote object existed (a genuine fresh start) ⇒ [`StateAuthority::FreshStart`]
+///   — **non-fatal** by design;
+/// - the **Local** backend ⇒ [`StateAuthority::Authoritative`] (the on-disk
+///   file is the single source of truth — see the explicit arm below).
+///
+/// A real download/existence-check *failure* is **propagated** as `Err` so the
+/// caller can fail closed — see [`download_from_object_store`]. It is never
+/// mapped to `Ok(StateAuthority::Indeterminate)`: that variant is synthesized
+/// only by a caller that explicitly elects to continue past an `Err`, so every
+/// fail-closed `download_state(...)?` seam keeps bailing unchanged.
 ///
 /// # Local-only-preserving merge (findings 6 + 7)
 ///
@@ -410,13 +457,23 @@ enum DownloadOutcome {
 /// a live writer's file. Crucially, the local-only tables are re-read from the
 /// CURRENT local file *under the lock*, so a concurrent run's just-committed
 /// `jobs` are captured rather than lost.
-pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(), StateSyncError> {
+pub async fn download_state(
+    config: &StateConfig,
+    local_path: &Path,
+) -> Result<StateAuthority, StateSyncError> {
     let remote_key = remote_state_key(local_path);
 
     // Local backend never replaces the file — nothing to stage, merge, or lock.
+    //
+    // Local is `Authoritative`, NOT `FreshStart`: the inner dispatch reports
+    // `Absent` for Local (there is no remote object to restore), but a naive
+    // outcome map would mislabel that as a bootstrappable fresh start. There is
+    // no remote to be "fresh" against — the on-disk redb file IS the single
+    // source of truth and must never be treated as an empty ledger to
+    // bootstrap over.
     if matches!(config.backend, StateBackend::Local) {
         download_state_inner(config, local_path, &remote_key).await?;
-        return Ok(());
+        return Ok(StateAuthority::Authoritative);
     }
 
     // 1. Download the remote into a STAGING file (no lock). `local_path` is left
@@ -448,7 +505,11 @@ pub async fn download_state(config: &StateConfig, local_path: &Path) -> Result<(
 
     drop(lock);
     let _ = std::fs::remove_file(&staged);
-    result
+    result?;
+    Ok(match outcome {
+        DownloadOutcome::Restored => StateAuthority::Authoritative,
+        DownloadOutcome::Absent => StateAuthority::FreshStart,
+    })
 }
 
 /// Acquire the StateStore writer lock for `local_path` (the same lock
@@ -2301,12 +2362,100 @@ mod tests {
         test_support::clear();
 
         assert!(
-            result.is_ok(),
-            "an absent remote object must be a fresh start (Ok); got {result:?}"
+            matches!(result, Ok(StateAuthority::FreshStart)),
+            "an absent remote object must be a fresh start (Ok(FreshStart)); got {result:?}"
         );
         assert!(
             !local.exists(),
             "nothing to restore, so no local file is written"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR-A (RD-001) — typed StateAuthority across the download boundary
+    // -----------------------------------------------------------------------
+
+    /// An existing remote object restores and maps to `Ok(Authoritative)`.
+    #[tokio::test]
+    async fn download_maps_restored_to_authoritative() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_bytes = build_remote_object_bytes(dir.path(), "remote.fresh");
+        let provider = test_support::install(ObjectStoreProvider::in_memory());
+        let key = object_store_state_key(&remote_state_key(&local));
+        provider.put(&key, Bytes::from(remote_bytes)).await.unwrap();
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let result = download_state(&config, &local).await;
+        test_support::clear();
+        assert!(
+            matches!(result, Ok(StateAuthority::Authoritative)),
+            "a restored remote object must map to Ok(Authoritative); got {result:?}"
+        );
+    }
+
+    /// A genuinely-absent remote object maps to `Ok(FreshStart)`.
+    #[tokio::test]
+    async fn download_maps_absent_to_fresh_start() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let result = download_state(&config, &local).await;
+        test_support::clear();
+        assert!(
+            matches!(result, Ok(StateAuthority::FreshStart)),
+            "an absent remote object must map to Ok(FreshStart); got {result:?}"
+        );
+    }
+
+    /// The F7 safe-standalone property: a download failure stays `Err` — it is
+    /// NEVER collapsed into `Ok(Indeterminate)`. If it were, every fail-closed
+    /// `download_state(...)?` seam would have its `?` succeed on a failed
+    /// download and silently proceed on stale local state.
+    #[tokio::test]
+    async fn download_failure_stays_err_never_indeterminate() {
+        test_support::clear();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let _provider = test_support::install(ObjectStoreProvider::in_memory());
+        test_support::arm_object_store_exists_fault();
+
+        let config = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            ..Default::default()
+        };
+        let result = download_state(&config, &local).await;
+        test_support::clear();
+        assert!(
+            matches!(result, Err(StateSyncError::S3Download(_))),
+            "a failed download must stay Err — never Ok(Indeterminate); got {result:?}"
+        );
+    }
+
+    /// The Local backend maps to `Authoritative`, NOT `FreshStart`: the on-disk
+    /// redb file IS the authority — there is no remote to be "fresh" against,
+    /// and it must never be treated as a bootstrappable empty ledger.
+    #[tokio::test]
+    async fn local_backend_is_authoritative_not_fresh_start() {
+        let config = StateConfig::default();
+        let dir = TempDir::new().unwrap();
+        let result = download_state(&config, &dir.path().join("state.redb")).await;
+        assert!(
+            matches!(result, Ok(StateAuthority::Authoritative)),
+            "the Local backend's on-disk file is the authority; got {result:?}"
         );
     }
 
@@ -2494,10 +2643,15 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        download_state(&config, &local)
+        let authority = download_state(&config, &local)
             .await
             .expect("restored download should succeed");
         test_support::clear();
+        assert_eq!(
+            authority,
+            StateAuthority::Authoritative,
+            "a restored remote object maps to Authoritative"
+        );
 
         let store = StateStore::open(&local).unwrap();
         assert!(
@@ -2540,10 +2694,15 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        download_state(&config, &local)
+        let authority = download_state(&config, &local)
             .await
             .expect("an absent remote is a fresh start");
         test_support::clear();
+        assert_eq!(
+            authority,
+            StateAuthority::FreshStart,
+            "an absent remote object maps to FreshStart"
+        );
 
         let store = StateStore::open(&local).unwrap();
         assert!(
@@ -2729,10 +2888,11 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        download_state(&config, &local)
+        let authority = download_state(&config, &local)
             .await
             .expect("restored download should succeed");
         test_support::clear();
+        assert_eq!(authority, StateAuthority::Authoritative);
 
         let store = StateStore::open(&local).unwrap();
         assert!(
@@ -2823,10 +2983,11 @@ mod tests {
         // Release the lock; a fresh download now applies the remote + preserves
         // the local-only `jobs`.
         drop(held);
-        download_state(&config, &local)
+        let authority = download_state(&config, &local)
             .await
             .expect("download should succeed once the writer lock is free");
         test_support::clear();
+        assert_eq!(authority, StateAuthority::Authoritative);
 
         let store = StateStore::open(&local).unwrap();
         assert!(
@@ -2957,7 +3118,10 @@ mod tests {
         // Pod B: a fresh pod downloads the remote state.
         let dir_b = TempDir::new().unwrap();
         let pod_b = dir_b.path().join(".rocky-state.redb");
-        download_state(&config, &pod_b).await.unwrap();
+        assert_eq!(
+            download_state(&config, &pod_b).await.unwrap(),
+            StateAuthority::Authoritative
+        );
         test_support::clear();
 
         let store = StateStore::open(&pod_b).unwrap();

@@ -1036,6 +1036,21 @@ enum Command {
         /// distinct from `${ENV}` config-time interpolation in `rocky.toml`.
         #[arg(long = "var", value_name = "NAME=VALUE")]
         var: Vec<String>,
+
+        /// Audited disaster-recovery escape hatch: treat a failed remote-state
+        /// download as an intentional fresh start. Requires a remote `[state]`
+        /// backend (s3, gcs, valkey, or tiered).
+        ///
+        /// By default a failed download leaves the local ledger explicitly
+        /// non-authoritative (fail-closed): auto-applies are refused and the
+        /// run's state uploads are suppressed so local state is never pushed
+        /// over a remote it could not read. When the remote is known-gone and
+        /// the estate is being rebuilt, this flag asserts the fresh start is
+        /// deliberate — the run proceeds with a trusted empty ledger, uploads
+        /// re-enabled, and a structured audit record is emitted. It never
+        /// overrides the governed-run fail-closed bail.
+        #[arg(long, conflicts_with_all = ["dag", "watch"])]
+        assume_fresh_state: bool,
     },
 
     /// Compare shadow tables against production tables
@@ -3094,6 +3109,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             no_reuse,
             no_prune,
             var,
+            assume_fresh_state,
         } => {
             // Parse `--var name=value` pairs into the run-variable map. A
             // malformed pair (no `=`, empty/invalid name) is a clear CLI error.
@@ -3118,6 +3134,34 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     "--idempotency-key cannot be combined with --resume / --resume-latest \
                      (resume is an explicit override of idempotent skip)"
                 );
+            }
+            // --assume-fresh-state only makes sense against a remote `[state]`
+            // backend: it elects past a FAILED remote download. On the Local
+            // backend there is no remote download to elect past, so the flag
+            // can only mean operator confusion — reject it before any work. A
+            // genuinely-absent config resolves to the Local default; any other
+            // config error aborts (the run would refuse the same config).
+            if assume_fresh_state {
+                let backend = match rocky_core::config::load_rocky_config(&cli.config) {
+                    Ok(cfg) => cfg.state.backend,
+                    Err(rocky_core::config::ConfigError::FileNotFound { .. }) => {
+                        rocky_core::config::StateBackend::Local
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::new(e).context(format!(
+                            "cannot validate --assume-fresh-state: {} failed to load, so the \
+                             [state] backend cannot be resolved",
+                            cli.config.display()
+                        )));
+                    }
+                };
+                if matches!(backend, rocky_core::config::StateBackend::Local) {
+                    anyhow::bail!(
+                        "--assume-fresh-state requires a remote `[state]` backend (s3, gcs, \
+                         valkey, or tiered): with the local backend there is no remote-state \
+                         download whose failure could be treated as a fresh start"
+                    );
+                }
             }
             // Parse governance override (JSON string or @file.json)
             let gov_override = parse_governance_override(governance_override.as_deref())?;
@@ -3240,6 +3284,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &defer_opts,
                     &skip_opts,
                     &run_vars,
+                    assume_fresh_state,
                 )
                 .await
             }

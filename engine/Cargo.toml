@@ -210,6 +210,9 @@ wasm-bindgen = "0.2"
 
 # Testing
 wiremock = "0.6"
+# Compile-fail guard: pins the `#[must_use]`-through-`?` lint mechanism the
+# remote-state authority seams rely on (rocky-core/tests/must_use_guard.rs).
+trybuild = "1"
 
 # UUID v4 — used by Snowflake stage-name generation to avoid collisions on
 # parallel loads. `SystemTime::now().subsec_nanos()` resolves to

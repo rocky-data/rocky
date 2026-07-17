@@ -1168,6 +1168,38 @@ mod tests {
             matches!(d2, GovernDecision::Apply),
             "the same grant on an authoritative ledger must apply"
         );
+
+        // Download-failure origin (PR-A / RD-001, derivation parity): derive
+        // `ledger_authoritative` exactly as `run()` does — an ungoverned run's
+        // failed download resolves to `Indeterminate`, whose `is_usable()` is
+        // false — and the governor must refuse just like the literal `false`
+        // above. This pins the elect-past `Err` path to the same fail-closed
+        // refusal as the forward-incompat origin.
+        let authority = crate::commands::run::resolve_replication_authority(
+            Err(rocky_core::state_sync::StateSyncError::S3Download(
+                "injected (test)".into(),
+            )),
+            /* governed_with_policy */ false,
+            /* assume_fresh_state */ false,
+        )
+        .expect("an ungoverned run continues past a failed download");
+        // The run.rs derivation with `was_recreated_for_forward_incompat()`
+        // false: authority alone decides.
+        let ledger_authoritative = authority.is_usable();
+        assert!(!ledger_authoritative);
+        let gov_dl = DriftGovernor::build(&cfg, "run-dl", "wh.raw.orders", ledger_authoritative)
+            .expect("governor");
+        let (store3, _d3) = temp_store();
+        let d3 = gov_dl
+            .govern(&additive_add_drift(), "wh.raw.orders", &Arc::new(store3))
+            .await;
+        let GovernDecision::Refuse(reason) = d3 else {
+            panic!("a download-failure (Indeterminate) ledger must refuse the auto-apply");
+        };
+        assert!(
+            reason.contains("non-authoritative"),
+            "refusal must cite the non-authoritative ledger: {reason}"
+        );
     }
 
     /// 🔴 D6 regression: freeze composition records the tightened policy

@@ -1,6 +1,6 @@
 # ADR-CONCURRENCY — Cross-pod remote-state concurrency + freeze kill-switch
 
-**Status:** Proposed (PR-0 design gate — stops for maintainer sign-off before any implementation)
+**Status:** Accepted (signed off at the PR-0 design gate; implemented by the later WP-01 PRs)
 
 **Scope:** WP-01 fast-follow (PR-C consistent snapshot → PR-D CAS) plus the spine-urgent PR-F freeze marker. Closes audit finding **RD-002** (Critical, active) and the **#1120** freeze-erasure residual. Companion docs: **ADR-AUTHORITY** (RD-001 — the `StateAuthority` type this ADR's writer-class refusal reports through) and **ADR-STATE-SESSION** (PR-B — the `RemoteStateSession` spine whose `finalize` write choke-point and `base` `Generation` field this ADR's CAS hooks into). Read both first.
 

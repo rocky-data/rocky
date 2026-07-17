@@ -66,6 +66,10 @@ jsonschema = { version = "0.46", default-features = false }
 criterion = { version = "0.8", features = ["html_reports"] }
 # Used by `tests/state_sync_timeout_test.rs` to front-end a hung S3 endpoint.
 wiremock = { workspace = true }
+# Compile-fail guard for the `#[must_use] StateAuthority`-through-`?` lint
+# (`tests/must_use_guard.rs`): proves a discarding `download_state(...)?;`
+# fails to compile under `deny(unused_must_use)`.
+trybuild = { workspace = true }
 
 # The remote-state rig tests need the `test-support` seams. The feature is
 # already on for all test targets via the self-referential dev-dependency;

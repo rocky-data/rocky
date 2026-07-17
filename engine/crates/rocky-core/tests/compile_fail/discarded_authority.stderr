@@ -1,0 +1,16 @@
+error: unused `StateAuthority` that must be used
+  --> tests/compile_fail/discarded_authority.rs:15:5
+   |
+15 |     rocky_core::state_sync::download_state(cfg, state_path).await?;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: the download's authority decides whether the local ledger may back a governed decision
+note: the lint level is defined here
+  --> tests/compile_fail/discarded_authority.rs:6:9
+   |
+ 6 | #![deny(unused_must_use)]
+   |         ^^^^^^^^^^^^^^^
+help: use `let _ = ...` to ignore the resulting value
+   |
+15 |     let _ = rocky_core::state_sync::download_state(cfg, state_path).await?;
+   |     +++++++
