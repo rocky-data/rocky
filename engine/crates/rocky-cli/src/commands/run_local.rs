@@ -108,6 +108,11 @@ pub async fn run_transformation(
     run_vars: &rocky_core::run_vars::RunVars,
     // Governed-apply TOCTOU gate (E) — `Some` for an agent transformation apply.
     exec_fp_gate: Option<&super::apply::ExecFingerprintGate>,
+    // Mid-run freeze fence, built by the dispatch site beside this arm's
+    // session — threaded like `exec_fp_gate` (see the `execute_models`
+    // parameter docs for the withhold contract). `None` only for the no-op
+    // (no-models-dir) dispatch, which executes nothing.
+    freeze_fence: Option<&super::freeze_fence::FreezeFence>,
     // Finding #2 (missing-dir): the governed plan reviewed a non-empty model set,
     // so a missing models directory at execution is a fail-closed error rather than
     // the legitimate no-op silent-skip. `false` for a bare `rocky run` and for a
@@ -173,6 +178,7 @@ pub async fn run_transformation(
                 rocky_cfg.resilience.clone(),
                 super::resilience::retry_policy_allows(rocky_cfg),
                 exec_fp_gate,
+                freeze_fence,
                 // Finding #4: the transformation route reconciles no masks.
                 false,
             )
@@ -182,22 +188,44 @@ pub async fn run_transformation(
                 // Finding #1: only when the model phase is CLEAN (no new soft
                 // failures) — a soft failure returns `Ok`.
                 Ok(snapshot) if output.tables_failed == failures_before => {
-                    // --- Governance: per-model `[governance.tags]` ---
-                    //
-                    // After every model materializes, apply each model's
-                    // `[governance.tags]` to its target securable. `None` filter:
-                    // the full-DAG path builds every model, so every model is
-                    // tagged. Best-effort; no-op on DuckDB's Noop adapter.
-                    // #1093: reads the snapshot `execute_models` captured at the
-                    // fingerprint gate, never a fresh disk compile.
-                    let governance_adapter =
-                        adapter_registry.governance_adapter(&pipeline.target.adapter);
-                    super::run::apply_model_governance_tags(
-                        &snapshot,
-                        governance_adapter.as_ref(),
-                        None,
-                    )
-                    .await;
+                    // Pre-reconcile freeze fence (fresh LIST): a freeze landing
+                    // after the final layer must withhold the governance
+                    // reconcile, recorded so the terminal persist below still
+                    // covers the committed build.
+                    let fence_withhold = match freeze_fence {
+                        Some(fence) => {
+                            fence
+                                .check_withhold(snapshot.models.iter().map(|m| m.name.as_str()))
+                                .await
+                        }
+                        None => None,
+                    };
+                    if let Some(msg) = fence_withhold {
+                        output.tables_failed += 1;
+                        output.errors.push(crate::output::TableErrorOutput {
+                            asset_key: vec!["<freeze>".to_string()],
+                            error: msg,
+                            failure_kind: crate::output::FailureKind::Unknown,
+                            cooldown_seconds: None,
+                        });
+                    } else {
+                        // --- Governance: per-model `[governance.tags]` ---
+                        //
+                        // After every model materializes, apply each model's
+                        // `[governance.tags]` to its target securable. `None` filter:
+                        // the full-DAG path builds every model, so every model is
+                        // tagged. Best-effort; no-op on DuckDB's Noop adapter.
+                        // #1093: reads the snapshot `execute_models` captured at the
+                        // fingerprint gate, never a fresh disk compile.
+                        let governance_adapter =
+                            adapter_registry.governance_adapter(&pipeline.target.adapter);
+                        super::run::apply_model_governance_tags(
+                            &snapshot,
+                            governance_adapter.as_ref(),
+                            None,
+                        )
+                        .await;
+                    }
                 }
                 // Soft model failure — skip governance, fall through.
                 Ok(_) => {}
@@ -1680,6 +1708,7 @@ auto_create_schemas = true
             None, // idempotency_key
             &rocky_core::run_vars::RunVars::new(),
             None,  // exec_fp_gate
+            None,  // freeze_fence
             false, // expects_models
         )
         .await

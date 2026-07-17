@@ -951,6 +951,14 @@ pub(crate) async fn run_restore_apply_in_with(
         "restore apply",
     )
     .await?;
+    // Durable freeze-marker LIST for the gate below (same guard as the
+    // governed apply seams, fail-closed) — a marker-only freeze whose ledger
+    // row was erased by a concurrent state upload must still deny this
+    // restore. An absent config has no `[policy]` to enforce ⇒ empty set.
+    let marker_freezes = match loaded_cfg.as_ref() {
+        Some(cfg) => crate::commands::apply::marker_freezes_before_gate(cfg, &touched).await?,
+        None => Vec::new(),
+    };
     let gate = evaluate_apply_policy_with_policy(
         loaded_cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
@@ -958,6 +966,7 @@ pub(crate) async fn run_restore_apply_in_with(
         &touched,
         &models_dir,
         state_path,
+        &marker_freezes,
     );
     if let PolicyGate::Deny {
         model,

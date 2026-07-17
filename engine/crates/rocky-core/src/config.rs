@@ -322,6 +322,14 @@ pub enum ConfigError {
          allow at least one failure before it degrades the rule (use `failures = 1` or higher)"
     )]
     PolicyBudgetZeroFailures { rule_index: usize },
+
+    #[error(
+        "[state] freeze_marker_writes = true requires a backend with a durable object tier \
+         (s3, gcs, or tiered); backend = \"{backend}\" cannot store durable freeze markers — \
+         a silent no-op would report the kill switch as engaged without durably engaging it. \
+         Disable the flag or switch the [state] backend."
+    )]
+    StateFreezeMarkerWritesUnsupportedBackend { backend: String },
 }
 
 /// Concurrency strategy for table processing.
@@ -698,6 +706,16 @@ pub struct StateConfig {
     /// a forward-incompatible store. See [`SchemaMismatchPolicy`].
     #[serde(default)]
     pub on_schema_mismatch: SchemaMismatchPolicy,
+    /// Enable writing durable freeze/unfreeze marker objects (under
+    /// `<prefix>/freeze/` and `<prefix>/unfreeze/`, beside the remote state
+    /// file) when `rocky policy freeze` / `unfreeze` run against an
+    /// object-store backend. Marker reading and enforcement are always on
+    /// wherever a durable object tier exists; this flag gates only the write
+    /// side, so a fleet can be upgraded to marker readers everywhere before
+    /// any marker is written. Default `false`. Requires a backend with a
+    /// durable object tier (`s3`, `gcs`, or `tiered`).
+    #[serde(default)]
+    pub freeze_marker_writes: bool,
 }
 
 impl Default for StateConfig {
@@ -717,6 +735,7 @@ impl Default for StateConfig {
             retention: crate::retention::StateRetentionConfig::default(),
             namespacing: StateNamespacing::default(),
             on_schema_mismatch: SchemaMismatchPolicy::default(),
+            freeze_marker_writes: false,
         }
     }
 }
@@ -3068,6 +3087,28 @@ pub fn validate_policy(config: &RockyConfig) -> Vec<ConfigError> {
                 });
             }
         }
+    }
+    errors
+}
+
+/// Validate the `[state] freeze_marker_writes` flag against the backend.
+///
+/// Enabling marker writes on a backend with no durable object tier (`local`,
+/// `valkey`-only) is a **hard error**, not a silent no-op: the flag promises
+/// kill-switch durability those backends cannot deliver, and a freeze that
+/// reports success without writing a durable marker would be a false sense of
+/// engagement. Mirrors the `[gc] physical_delete` fail-loud posture.
+pub fn validate_freeze_marker_writes(config: &RockyConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+    if config.state.freeze_marker_writes
+        && matches!(
+            config.state.backend,
+            StateBackend::Local | StateBackend::Valkey
+        )
+    {
+        errors.push(ConfigError::StateFreezeMarkerWritesUnsupportedBackend {
+            backend: config.state.backend.to_string(),
+        });
     }
     errors
 }
@@ -5753,6 +5794,9 @@ fn validate_loaded_config(config: &RockyConfig) -> Result<(), ConfigError> {
     if let Some(first) = validate_policy(config).into_iter().next() {
         return Err(first);
     }
+    if let Some(first) = validate_freeze_marker_writes(config).into_iter().next() {
+        return Err(first);
+    }
     Ok(())
 }
 
@@ -6611,6 +6655,53 @@ autonomy_budget = { failures = 2, window = "banana" }
             ),
             "got {errors:?}"
         );
+    }
+
+    // --- [state] freeze_marker_writes validation ---
+
+    /// `freeze_marker_writes = true` on a backend with no durable object
+    /// tier is a hard error — the flag would otherwise be a silent no-op
+    /// that reports the kill switch as engaged without durably engaging it.
+    #[test]
+    fn freeze_marker_writes_rejected_without_durable_tier() {
+        for backend in ["local", "valkey"] {
+            let cfg = parse(&format!(
+                "[state]\nbackend = \"{backend}\"\nfreeze_marker_writes = true\n"
+            ));
+            let errors = validate_freeze_marker_writes(&cfg);
+            assert!(
+                matches!(
+                    errors.as_slice(),
+                    [ConfigError::StateFreezeMarkerWritesUnsupportedBackend { backend: got }]
+                        if got == backend
+                ),
+                "backend {backend}: got {errors:?}"
+            );
+            // The load-time chain rejects it too.
+            assert!(validate_loaded_config(&cfg).is_err());
+        }
+    }
+
+    /// The flag is accepted on every backend with a durable object tier, and
+    /// the default (unset) is valid everywhere.
+    #[test]
+    fn freeze_marker_writes_accepted_on_durable_tiers_and_defaults_off() {
+        for backend in ["s3", "gcs", "tiered"] {
+            let cfg = parse(&format!(
+                "[state]\nbackend = \"{backend}\"\nfreeze_marker_writes = true\n"
+            ));
+            assert!(
+                validate_freeze_marker_writes(&cfg).is_empty(),
+                "backend {backend} has a durable tier and must accept the flag"
+            );
+        }
+        // Default off — valid even on valkey/local.
+        let cfg = parse("[state]\nbackend = \"valkey\"\n");
+        assert!(
+            !cfg.state.freeze_marker_writes,
+            "flag must default to false"
+        );
+        assert!(validate_freeze_marker_writes(&cfg).is_empty());
     }
 
     #[test]

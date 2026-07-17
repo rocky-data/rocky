@@ -25,7 +25,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use chrono::Utc;
-use rocky_core::config::{StateBackend, StateConfig, StateUploadFailureMode};
+use rocky_core::config::{PolicyPrincipal, StateBackend, StateConfig, StateUploadFailureMode};
+use rocky_core::freeze_marker::{
+    FreezeMarker, FreezeMarkerError, UnfreezeMarker, load_active_marker_freezes,
+    write_freeze_marker, write_unfreeze_marker,
+};
 use rocky_core::object_store::{ObjectStoreProvider, PutIfNotExistsOutcome};
 use rocky_core::state::StateStore;
 use rocky_core::state_sync::{download_state, upload_state};
@@ -192,4 +196,82 @@ async fn live_put_if_not_exists_conflict() {
     );
 
     provider.delete(&key).await.expect("cleanup delete");
+}
+
+/// The freeze-marker LIST + Create roundtrip against a REAL bucket — the
+/// OR-set projection over a real (unordered, paginated) object listing, not
+/// InMemory-only: freeze A and B, unfreeze lifting A, and the active set
+/// projects exactly {B}. A duplicate Create on an existing marker key must
+/// report the collision rather than overwrite — the create-once primitive
+/// the un-erasable kill switch stands on.
+#[tokio::test]
+#[ignore]
+async fn live_freeze_marker_list_create_roundtrip() {
+    let _serial = live_serial();
+    let Some(live) = live_s3_from_env() else {
+        eprintln!("SKIP live_freeze_marker_list_create_roundtrip: ROCKY_TEST_S3_* env not set");
+        return;
+    };
+    // A per-run prefix sandbox so cleanup can sweep everything it wrote.
+    let run_prefix = format!("{}/freeze-markers-{}", live.prefix, unique_suffix());
+    let provider = ObjectStoreProvider::from_uri(&format!("s3://{}/{run_prefix}", live.bucket))
+        .expect("live provider");
+
+    let marker = |id: &str| FreezeMarker {
+        freeze_id: id.to_string(),
+        principal: PolicyPrincipal::Agent,
+        scope: "any".to_string(),
+        reason: format!("live marker probe {id}"),
+        created_at: Utc::now(),
+    };
+    write_freeze_marker(&provider, &marker("live-a"))
+        .await
+        .expect("create live-a");
+    write_freeze_marker(&provider, &marker("live-b"))
+        .await
+        .expect("create live-b");
+    write_unfreeze_marker(
+        &provider,
+        &UnfreezeMarker {
+            unfreeze_id: "live-u".to_string(),
+            lifts: vec!["live-a".to_string()],
+            principal: Some(PolicyPrincipal::Agent),
+            reason: Some("lift live-a".to_string()),
+            created_at: Utc::now(),
+        },
+    )
+    .await
+    .expect("create live-u");
+
+    let active = load_active_marker_freezes(&provider)
+        .await
+        .expect("project the active set against the real bucket listing");
+    let ids: Vec<&str> = active.iter().map(|m| m.freeze_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["live-b"],
+        "the OR-set projection must lift live-a and keep live-b"
+    );
+
+    // Duplicate Create on live-a's still-present key: refused, never an
+    // overwrite.
+    let err = write_freeze_marker(&provider, &marker("live-a"))
+        .await
+        .expect_err("a duplicate Create on an existing marker key must be refused");
+    assert!(
+        matches!(err, FreezeMarkerError::IdCollision { .. }),
+        "the collision must surface as the hard id-collision error, got: {err}"
+    );
+
+    // Best-effort cleanup: sweep the per-run prefix (all three markers).
+    match provider.list("").await {
+        Ok(keys) => {
+            for key in keys {
+                if let Err(e) = provider.delete(&key).await {
+                    eprintln!("cleanup: failed to delete {key}: {e}");
+                }
+            }
+        }
+        Err(e) => eprintln!("cleanup: failed to list {run_prefix}: {e}"),
+    }
 }

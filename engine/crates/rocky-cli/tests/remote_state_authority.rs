@@ -235,6 +235,7 @@ fn policy_freeze_download_failure_fails_closed() {
         &state_path,
         None,  // principal — both
         None,  // scope — any
+        None,  // reason — synthesized
         false, // lift
         false, // json
     )

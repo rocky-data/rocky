@@ -2209,6 +2209,10 @@ export interface StateConfig {
    */
   backend?: StateBackend & string;
   /**
+   * Enable writing durable freeze/unfreeze marker objects (under `<prefix>/freeze/` and `<prefix>/unfreeze/`, beside the remote state file) when `rocky policy freeze` / `unfreeze` run against an object-store backend. Marker reading and enforcement are always on wherever a durable object tier exists; this flag gates only the write side, so a fleet can be upgraded to marker readers everywhere before any marker is written. Default `false`. Requires a backend with a durable object tier (`s3`, `gcs`, or `tiered`).
+   */
+  freeze_marker_writes?: boolean;
+  /**
    * GCS bucket for state persistence
    */
   gcs_bucket?: string | null;

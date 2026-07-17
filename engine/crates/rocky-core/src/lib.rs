@@ -22,6 +22,7 @@ pub mod drift;
 pub mod failure_class;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fault_store;
+pub mod freeze_marker;
 pub mod hooks;
 pub mod idempotency;
 pub mod imports;

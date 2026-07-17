@@ -1537,6 +1537,16 @@ pub(crate) async fn run_gc_apply_in_with(
                 })?;
     }
 
+    // Durable freeze-marker LIST for the gate below, hoisted beside the ledger
+    // download above (same guard as the governed apply seams, fail-closed) — a
+    // marker-only freeze whose ledger row was erased by a concurrent state
+    // upload must still deny this gc. An absent config has no `[policy]` to
+    // enforce ⇒ empty set.
+    let marker_freezes = match loaded_cfg.as_ref() {
+        Some(cfg) => crate::commands::apply::marker_freezes_before_gate(cfg, &touched).await?,
+        None => Vec::new(),
+    };
+
     // Finding 1: gate on the SAME `loaded_cfg` snapshot used for the state
     // backend + models-dir above, rather than reloading the config inside
     // `evaluate_apply_policy` — a `rocky.toml` swap between the loads must not let
@@ -1548,6 +1558,7 @@ pub(crate) async fn run_gc_apply_in_with(
         &touched,
         &models_dir,
         state_path,
+        &marker_freezes,
     );
     if let PolicyGate::Deny {
         model,

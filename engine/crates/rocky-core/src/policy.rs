@@ -792,6 +792,28 @@ pub fn validate_scope_selector(selector: &str) -> Result<(), String> {
     ))
 }
 
+/// Whether an active marker freeze binds a given subject principal + model.
+///
+/// The single match predicate shared by the entry gate ([`autonomy_degradation`])
+/// and the mid-run freeze fence, so principal handling can never drift between
+/// them. Two orthogonal conditions, both required:
+///
+/// - **Principal.** `subject = Some(p)` binds a marker whose principal is `p`,
+///   or `None` (an unreadable body, which conservatively matches BOTH
+///   principals). `subject = None` means the caller does not know the acting
+///   principal — the coarse bare-run fence case — and binds any marker
+///   principal.
+/// - **Scope.** [`scope_selector_matches`] against the model's attributes.
+#[must_use]
+pub fn marker_freeze_binds(
+    marker: &crate::freeze_marker::ActiveMarkerFreeze,
+    subject: Option<PolicyPrincipal>,
+    attrs: &ModelAttributes,
+) -> bool {
+    (subject.is_none() || marker.principal.is_none() || marker.principal == subject)
+        && scope_selector_matches(&marker.scope, attrs)
+}
+
 /// Apply the dynamic breakers to a base effect: an active freeze forces `deny`;
 /// an exhausted autonomy budget on the winning rule degrades `allow` to
 /// `require_review`. Returns the (possibly tightened) effect and a description
@@ -803,8 +825,16 @@ pub fn validate_scope_selector(selector: &str) -> Result<(), String> {
 /// decision ledger snapshot read before the current action's rows are written.
 ///
 /// Freeze is checked first and independent of `matched_rule`, so it overrides
-/// even the default posture; budget applies only to the winning rule.
+/// even the default posture; budget applies only to the winning rule. Two
+/// freeze sources are consulted and OR-ed: the ledger projection
+/// ([`active_freezes`] over `decisions`) and `marker_freezes` — the durable
+/// object-store marker set the caller LISTed from the `[state]` backend's
+/// durable tier. A marker-only freeze (no ledger row visible, e.g. because a
+/// concurrent state upload erased the row) still denies; a marker whose
+/// `principal` is `None` (unreadable body) conservatively matches BOTH
+/// principals. Callers on a backend with no durable object tier pass `&[]`.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn autonomy_degradation(
     base: PolicyEffect,
     matched_rule: Option<usize>,
@@ -812,6 +842,7 @@ pub fn autonomy_degradation(
     principal: PolicyPrincipal,
     attrs: &ModelAttributes,
     decisions: &[PolicyDecisionRecord],
+    marker_freezes: &[crate::freeze_marker::ActiveMarkerFreeze],
     now: DateTime<Utc>,
 ) -> (PolicyEffect, AutonomyDegradation) {
     // 1. Freeze — a kill switch that forces deny for a matching principal+scope.
@@ -823,6 +854,22 @@ pub fn autonomy_degradation(
                     principal,
                     scope: freeze.scope,
                     plan_id: freeze.plan_id,
+                },
+            );
+        }
+    }
+    // 1b. Marker freezes — the durable object-store OR-set. Independent of the
+    // ledger row above: the marker survives a concurrent whole-blob state
+    // upload, so it must deny even when no ledger row is visible (see
+    // docs/adr/ADR-CONCURRENCY.md, D3).
+    for marker in marker_freezes {
+        if marker_freeze_binds(marker, Some(principal), attrs) {
+            return (
+                tighten_to_at_least(base, PolicyEffect::Deny),
+                AutonomyDegradation::Frozen {
+                    principal,
+                    scope: marker.scope.clone(),
+                    plan_id: format!("{FREEZE_PLAN_PREFIX}{}", marker.freeze_id),
                 },
             );
         }
@@ -1723,6 +1770,7 @@ mod tests {
             PolicyPrincipal::Agent,
             &attrs,
             &two,
+            &[],
             n,
         );
         assert_eq!(effect, PolicyEffect::Allow, "2 < 3 must not degrade");
@@ -1737,6 +1785,7 @@ mod tests {
             PolicyPrincipal::Agent,
             &attrs,
             &three,
+            &[],
             n,
         );
         assert_eq!(effect, PolicyEffect::RequireReview, "3 >= 3 must degrade");
@@ -1785,6 +1834,7 @@ mod tests {
                     PolicyPrincipal::Agent,
                     &attrs,
                     ledger,
+                    &[],
                     n,
                 );
                 assert!(
@@ -1847,6 +1897,7 @@ mod tests {
             PolicyPrincipal::Agent,
             &attrs,
             &ledger,
+            &[],
             n,
         );
         assert_eq!(effect, PolicyEffect::Deny);
@@ -1883,6 +1934,7 @@ mod tests {
             PolicyPrincipal::Agent,
             &bronze,
             &ledger,
+            &[],
             n,
         );
         let (silver_effect, _) = autonomy_degradation(
@@ -1892,6 +1944,7 @@ mod tests {
             PolicyPrincipal::Agent,
             &silver,
             &ledger,
+            &[],
             n,
         );
         assert_eq!(bronze_effect, PolicyEffect::Deny, "bronze is frozen");
@@ -1917,6 +1970,7 @@ mod tests {
             PolicyPrincipal::Human,
             &attrs,
             &ledger,
+            &[],
             n,
         );
         assert_eq!(
@@ -1971,5 +2025,139 @@ mod tests {
         assert!(validate_scope_selector("layer=").is_err());
         assert!(validate_scope_selector("tag==prod").is_err());
         assert!(validate_scope_selector("nonsense").is_err());
+    }
+
+    fn marker(
+        id: &str,
+        principal: Option<PolicyPrincipal>,
+        scope: &str,
+    ) -> crate::freeze_marker::ActiveMarkerFreeze {
+        crate::freeze_marker::ActiveMarkerFreeze {
+            freeze_id: id.to_string(),
+            principal,
+            scope: scope.to_string(),
+            reason: "test marker".to_string(),
+            created_at: Some(now()),
+        }
+    }
+
+    /// A durable marker freeze forces deny for a matching principal + scope,
+    /// citing the marker's `freeze:<id>` plan id.
+    #[test]
+    fn marker_freeze_forces_deny_for_matching_principal_and_scope() {
+        let n = now();
+        let attrs = bronze_additive_model(Some(0));
+        let markers = [marker("m-1", Some(PolicyPrincipal::Agent), "any")];
+        let p = policy(vec![]);
+        let (effect, deg) = autonomy_degradation(
+            PolicyEffect::Allow,
+            None,
+            &p,
+            PolicyPrincipal::Agent,
+            &attrs,
+            &[],
+            &markers,
+            n,
+        );
+        assert_eq!(effect, PolicyEffect::Deny);
+        assert!(matches!(
+            deg,
+            AutonomyDegradation::Frozen { ref plan_id, .. } if plan_id == "freeze:m-1"
+        ));
+    }
+
+    /// A marker-only freeze — no ledger row visible at all (e.g. a concurrent
+    /// state upload erased it) — MUST still deny. This is the un-erasable
+    /// enforcement path the marker set exists for.
+    #[test]
+    fn marker_only_freeze_denies_with_empty_ledger() {
+        let n = now();
+        let attrs = bronze_additive_model(Some(0));
+        let markers = [marker("m-only", Some(PolicyPrincipal::Agent), "any")];
+        let p = budget_policy(3, "7d");
+        let (effect, deg) = autonomy_degradation(
+            PolicyEffect::Allow,
+            Some(0),
+            &p,
+            PolicyPrincipal::Agent,
+            &attrs,
+            &[], // empty ledger — the erasure scenario
+            &markers,
+            n,
+        );
+        assert_eq!(effect, PolicyEffect::Deny);
+        assert!(matches!(deg, AutonomyDegradation::Frozen { .. }));
+    }
+
+    /// A marker with `principal: None` (unreadable body, conservatively
+    /// widened) denies BOTH principals.
+    #[test]
+    fn unreadable_marker_denies_both_principals() {
+        let n = now();
+        let attrs = bronze_additive_model(Some(0));
+        let markers = [marker("m-corrupt", None, "any")];
+        let p = policy(vec![]);
+        for principal in [PolicyPrincipal::Agent, PolicyPrincipal::Human] {
+            let (effect, _) = autonomy_degradation(
+                PolicyEffect::Allow,
+                None,
+                &p,
+                principal,
+                &attrs,
+                &[],
+                &markers,
+                n,
+            );
+            assert_eq!(
+                effect,
+                PolicyEffect::Deny,
+                "an unreadable-body marker must deny {principal:?}"
+            );
+        }
+    }
+
+    /// A scoped marker freeze only bites models its selector matches, through
+    /// the same [`scope_selector_matches`] grammar as ledger freezes.
+    #[test]
+    fn marker_freeze_respects_scope_selector() {
+        let n = now();
+        let markers = [marker(
+            "m-scoped",
+            Some(PolicyPrincipal::Agent),
+            "layer=bronze",
+        )];
+        let p = policy(vec![]);
+        let bronze = ModelAttributes {
+            name: "raw_events".to_string(),
+            layer: Some("bronze".to_string()),
+            ..Default::default()
+        };
+        let silver = ModelAttributes {
+            name: "dim_customer".to_string(),
+            layer: Some("silver".to_string()),
+            ..Default::default()
+        };
+        let (bronze_effect, _) = autonomy_degradation(
+            PolicyEffect::Allow,
+            None,
+            &p,
+            PolicyPrincipal::Agent,
+            &bronze,
+            &[],
+            &markers,
+            n,
+        );
+        let (silver_effect, _) = autonomy_degradation(
+            PolicyEffect::Allow,
+            None,
+            &p,
+            PolicyPrincipal::Agent,
+            &silver,
+            &[],
+            &markers,
+            n,
+        );
+        assert_eq!(bronze_effect, PolicyEffect::Deny, "bronze is frozen");
+        assert_eq!(silver_effect, PolicyEffect::Allow, "silver is not frozen");
     }
 }

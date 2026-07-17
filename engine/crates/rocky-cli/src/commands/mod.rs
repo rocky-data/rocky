@@ -31,6 +31,7 @@ mod estimate;
 mod export_openapi;
 mod export_schemas;
 mod fmt;
+mod freeze_fence;
 mod gc;
 pub mod groups;
 mod history;
@@ -89,8 +90,8 @@ pub use ai::{
 };
 pub use ai_contract::run_ai_contract;
 pub use apply::{
-    PolicyGate, evaluate_apply_policy, evaluate_apply_policy_with_policy, run_apply,
-    run_apply_inline_for_run,
+    PolicyGate, evaluate_apply_policy, evaluate_apply_policy_with_policy,
+    marker_freezes_before_gate, run_apply, run_apply_inline_for_run,
 };
 pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
 pub use audit::{
